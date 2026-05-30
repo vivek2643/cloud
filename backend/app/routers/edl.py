@@ -232,6 +232,36 @@ def _enqueue_render(render_id: str) -> bool:
 # Endpoints
 # ---------------------------------------------------------------------------
 
+class EnsureProjectBody(BaseModel):
+    source_file_ids: List[str] = []
+    name: str = "Untitled"
+
+
+class ProjectMeta(BaseModel):
+    id: str
+    name: str
+    source_file_ids: List[str]
+
+
+@router.post("/projects/ensure", response_model=ProjectMeta)
+def ensure_project(body: EnsureProjectBody, user_id: str = Depends(get_current_user_id)):
+    """
+    Find-or-create the default project for a source set, mirroring the chat
+    flow's project resolution. Lets the manual editor persist edits (e.g. a raw
+    file dropped onto an empty timeline) before any AI turn has created one.
+    """
+    project = edl_store.find_or_create_default_project(
+        user_id=user_id,
+        source_file_ids=body.source_file_ids,
+        name=body.name,
+    )
+    return ProjectMeta(
+        id=project["id"],
+        name=project.get("name") or "Untitled",
+        source_file_ids=project.get("source_file_ids") or [],
+    )
+
+
 @router.get("/projects/{project_id}/latest", response_model=Optional[EnrichedEdlResponse])
 def get_latest_edl(project_id: str, user_id: str = Depends(get_current_user_id)):
     _require_project(project_id, user_id)

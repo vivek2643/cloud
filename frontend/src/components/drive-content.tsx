@@ -1,10 +1,22 @@
 "use client";
 
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useDriveStore } from "@/stores/drive-store";
+import { useAuthStore } from "@/stores/auth-store";
 import { FileIcon } from "./file-icon";
 import { formatBytes, formatDuration } from "@/lib/utils";
-import { MoreHorizontal, Loader2, Sparkles, X, CheckCircle2, Circle } from "lucide-react";
+import { getFilePlaybackUrl } from "@/lib/api";
+import {
+  MoreHorizontal,
+  Loader2,
+  Play,
+  Pause,
+  Volume2,
+  VolumeX,
+  CheckCircle2,
+  Circle,
+} from "lucide-react";
 import type { Folder, FileRecord } from "@/lib/api";
 
 interface DriveContentProps {
@@ -14,70 +26,56 @@ interface DriveContentProps {
 
 export function DriveContent({ onFileContextMenu, onFolderContextMenu }: DriveContentProps) {
   const router = useRouter();
-  const { folders, files, viewMode, loading, selectedIds, toggleSelected, clearSelection } = useDriveStore();
+  const {
+    folders,
+    files,
+    viewMode,
+    loading,
+    selectedIds,
+    searchQuery,
+    aiPanelOpen,
+    toggleSelected,
+  } = useDriveStore();
+
+  // Client-side filter driven by the top search bar.
+  const q = searchQuery.trim().toLowerCase();
+  const visibleFolders = useMemo(
+    () => (q ? folders.filter((f) => f.name.toLowerCase().includes(q)) : folders),
+    [folders, q],
+  );
+  const visibleFiles = useMemo(
+    () => (q ? files.filter((f) => f.name.toLowerCase().includes(q)) : files),
+    [files, q],
+  );
 
   if (loading) {
     return (
       <div className="flex flex-1 items-center justify-center py-20">
-        <Loader2 size={24} className="animate-spin" style={{ color: "var(--muted)" }} />
+        <Loader2 size={24} className="animate-spin" style={{ color: "var(--accent)" }} />
       </div>
     );
   }
 
-  if (folders.length === 0 && files.length === 0) {
+  if (visibleFolders.length === 0 && visibleFiles.length === 0) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center py-20">
-        <div className="text-4xl">📁</div>
-        <p className="mt-3 text-sm font-medium">This folder is empty</p>
+        <div className="text-4xl">{q ? "🔍" : "📁"}</div>
+        <p className="mt-3 text-sm font-medium">
+          {q ? "No matches" : "This folder is empty"}
+        </p>
         <p className="mt-1 text-xs" style={{ color: "var(--muted)" }}>
-          Drag and drop files here or create a new folder
+          {q ? "Try a different search" : "Drag and drop videos here or upload"}
         </p>
       </div>
     );
   }
 
-  function handleEditSelected() {
-    const ids = Array.from(selectedIds);
-    if (ids.length === 0) return;
-    // Stash selected file metadata in sessionStorage so the chat can render
-    // names without an extra round-trip. The URL still carries the IDs as the
-    // source of truth (so a refresh keeps the scope).
-    const idToFile = new Map(files.map((f) => [f.id, f]));
-    const payload = ids
-      .map((id) => idToFile.get(id))
-      .filter((f): f is FileRecord => !!f)
-      .map((f) => ({ id: f.id, name: f.name, file_type: f.file_type }));
-    try {
-      window.sessionStorage.setItem("edso_edit_scope_v1", JSON.stringify({ files: payload, ts: Date.now() }));
-    } catch {
-      // sessionStorage failure is non-fatal -- the URL still has the ids.
-    }
-    const qs = new URLSearchParams({ file_ids: ids.join(",") });
-    router.push(`/edit?${qs.toString()}`);
-  }
-
-  // Anything that's selected AND is in the current files list is the user's
-  // pool. We only count "video" files toward the Edit affordance because
-  // the editor only operates on indexed video.
-  const selectedVideoCount = files.filter(
-    (f) => selectedIds.has(f.id) && f.file_type === "video",
-  ).length;
-
   return (
     <div className="space-y-4">
-      {selectedIds.size > 0 && (
-        <SelectionBar
-          totalSelected={selectedIds.size}
-          videoSelected={selectedVideoCount}
-          onEdit={handleEditSelected}
-          onClear={clearSelection}
-        />
-      )}
-
       {viewMode === "list" ? (
         <ListView
-          folders={folders}
-          files={files}
+          folders={visibleFolders}
+          files={visibleFiles}
           selectedIds={selectedIds}
           onToggleSelect={toggleSelected}
           onNavigate={(id) => router.push(`/drive/folder/${id}`)}
@@ -87,9 +85,10 @@ export function DriveContent({ onFileContextMenu, onFolderContextMenu }: DriveCo
         />
       ) : (
         <GridView
-          folders={folders}
-          files={files}
+          folders={visibleFolders}
+          files={visibleFiles}
           selectedIds={selectedIds}
+          compact={aiPanelOpen}
           onToggleSelect={toggleSelected}
           onNavigate={(id) => router.push(`/drive/folder/${id}`)}
           onOpenFile={(id) => router.push(`/file/${id}`)}
@@ -97,63 +96,6 @@ export function DriveContent({ onFileContextMenu, onFolderContextMenu }: DriveCo
           onFolderContextMenu={onFolderContextMenu}
         />
       )}
-    </div>
-  );
-}
-
-// --- Selection Bar ---
-
-function SelectionBar({
-  totalSelected,
-  videoSelected,
-  onEdit,
-  onClear,
-}: {
-  totalSelected: number;
-  videoSelected: number;
-  onEdit: () => void;
-  onClear: () => void;
-}) {
-  return (
-    <div
-      className="sticky top-0 z-10 flex items-center justify-between gap-3 rounded-lg border px-3 py-2 shadow-sm"
-      style={{
-        borderColor: "var(--accent)",
-        background: "var(--background)",
-      }}
-    >
-      <div className="flex items-center gap-2 text-sm">
-        <CheckCircle2 size={16} style={{ color: "var(--accent)" }} />
-        <span className="font-medium">
-          {totalSelected} selected
-        </span>
-        {videoSelected !== totalSelected && (
-          <span className="text-xs" style={{ color: "var(--muted)" }}>
-            ({videoSelected} video{videoSelected === 1 ? "" : "s"} eligible to edit)
-          </span>
-        )}
-      </div>
-      <div className="flex items-center gap-2">
-        <button
-          onClick={onEdit}
-          disabled={videoSelected === 0}
-          className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium text-white transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-          style={{ background: "var(--accent)" }}
-          title={videoSelected === 0 ? "Select at least one video" : "Open the AI editor scoped to these videos"}
-        >
-          <Sparkles size={14} />
-          Edit ({videoSelected})
-        </button>
-        <button
-          onClick={onClear}
-          className="flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm transition-colors hover:opacity-80"
-          style={{ borderColor: "var(--border)" }}
-          title="Clear selection"
-        >
-          <X size={14} />
-          Clear
-        </button>
-      </div>
     </div>
   );
 }
@@ -164,6 +106,7 @@ function GridView({
   folders,
   files,
   selectedIds,
+  compact = false,
   onToggleSelect,
   onNavigate,
   onOpenFile,
@@ -173,14 +116,20 @@ function GridView({
   folders: Folder[];
   files: FileRecord[];
   selectedIds: Set<string>;
+  compact?: boolean;
   onToggleSelect: (id: string) => void;
   onNavigate: (id: string) => void;
   onOpenFile: (id: string) => void;
   onFileContextMenu?: (f: FileRecord, e: React.MouseEvent) => void;
   onFolderContextMenu?: (f: Folder, e: React.MouseEvent) => void;
 }) {
+  // When the AI panel is docked the main column is narrower, so we drop to
+  // fewer columns so everything still fits without horizontal scroll.
+  const fileGridCls = compact
+    ? "grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3"
+    : "grid grid-cols-2 gap-4 md:grid-cols-3 2xl:grid-cols-4";
   return (
-    <div className="space-y-6">
+    <div className="space-y-7">
       {folders.length > 0 && (
         <section>
           <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--muted)" }}>
@@ -192,7 +141,7 @@ function GridView({
                 key={folder.id}
                 onDoubleClick={() => onNavigate(folder.id)}
                 onContextMenu={(e) => { e.preventDefault(); onFolderContextMenu?.(folder, e); }}
-                className="flex items-center gap-2.5 rounded-lg border p-3 text-left transition-colors hover:border-blue-300"
+                className="flex items-center gap-2.5 rounded-lg border p-3 text-left transition-colors hover:border-[var(--accent)]"
                 style={{ borderColor: "var(--border)" }}
               >
                 <FileIcon type="folder" />
@@ -206,16 +155,18 @@ function GridView({
       {files.length > 0 && (
         <section>
           <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--muted)" }}>
-            Files
+            Videos
           </h3>
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+          {/* Enlarged cards: one per row on phones, up to three on wide screens
+              so each preview is big enough to watch inline. */}
+          <div className={fileGridCls}>
             {files.map((file) => (
-              <FileCard
+              <VideoCard
                 key={file.id}
                 file={file}
                 selected={selectedIds.has(file.id)}
                 onToggleSelect={() => onToggleSelect(file.id)}
-                onClick={() => onOpenFile(file.id)}
+                onOpen={() => onOpenFile(file.id)}
                 onContextMenu={(e) => { e.preventDefault(); onFileContextMenu?.(file, e); }}
               />
             ))}
@@ -226,98 +177,227 @@ function GridView({
   );
 }
 
-function FileCard({
+function VideoCard({
   file,
   selected,
   onToggleSelect,
-  onClick,
+  onOpen,
   onContextMenu,
 }: {
   file: FileRecord;
   selected: boolean;
   onToggleSelect: () => void;
-  onClick: () => void;
+  onOpen: () => void;
   onContextMenu: (e: React.MouseEvent) => void;
 }) {
+  const session = useAuthStore((s) => s.session);
+  const [playUrl, setPlayUrl] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [muted, setMuted] = useState(true);
+  // `desiredPlaying` is our intent; `playing` reflects what the element is
+  // actually doing. A "pinned" play (via the center button) survives the
+  // mouse leaving, whereas a hover-preview stops when the cursor moves away.
+  const [desiredPlaying, setDesiredPlaying] = useState(false);
+  const [playing, setPlaying] = useState(false);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const pinnedRef = useRef(false);
+
   const isProcessing = file.status === "processing" || file.status === "uploading";
+  const isVideo = file.file_type === "video";
+  const canPlay = isVideo && file.status === "ready";
+
+  async function ensureUrl(): Promise<void> {
+    if (playUrl) return;
+    if (!session?.access_token) {
+      setError("Sign in to play");
+      return;
+    }
+    setError(null);
+    try {
+      const { url } = await getFilePlaybackUrl(file.id, session.access_token);
+      setPlayUrl(url);
+    } catch {
+      setError("Could not load video");
+    }
+  }
+
+  // Keep the element's mute flag in sync.
+  useEffect(() => {
+    if (videoRef.current) videoRef.current.muted = muted;
+  }, [muted, playUrl]);
+
+  // Drive play/pause from intent once a source is available.
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v || !playUrl) return;
+    if (desiredPlaying) {
+      v.muted = muted;
+      v.play().then(() => setPlaying(true)).catch(() => {});
+    } else {
+      v.pause();
+      setPlaying(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [desiredPlaying, playUrl]);
+
+  async function handleEnter() {
+    if (!canPlay || pinnedRef.current) return;
+    await ensureUrl();
+    setDesiredPlaying(true);
+  }
+
+  function handleLeave() {
+    if (pinnedRef.current) return;
+    setDesiredPlaying(false);
+    const v = videoRef.current;
+    if (v) {
+      try { v.currentTime = 0; } catch { /* ignore */ }
+    }
+  }
+
+  async function handleCenterToggle(e: React.MouseEvent) {
+    e.stopPropagation();
+    if (!canPlay) return;
+    if (desiredPlaying) {
+      pinnedRef.current = false;
+      setDesiredPlaying(false);
+    } else {
+      pinnedRef.current = true;
+      await ensureUrl();
+      setDesiredPlaying(true);
+    }
+  }
+
+  function handleMuteToggle(e: React.MouseEvent) {
+    e.stopPropagation();
+    setMuted((m) => !m);
+  }
 
   return (
     <div
       onContextMenu={onContextMenu}
-      className="group relative flex flex-col overflow-hidden rounded-lg border text-left transition-colors hover:border-blue-300"
+      className="group relative flex flex-col overflow-hidden rounded-xl border transition-colors hover:border-[var(--accent)]"
       style={{
         borderColor: selected ? "var(--accent)" : "var(--border)",
         boxShadow: selected ? "0 0 0 1px var(--accent)" : undefined,
+        background: "var(--background)",
       }}
     >
-      {/* Selection toggle (sits on top of the thumb so it's reachable without
-          opening the file). Uses stopPropagation so toggling doesn't navigate. */}
-      <button
-        onClick={(e) => {
-          e.stopPropagation();
-          onToggleSelect();
+      {/* Clicking anywhere on the video selects it. The control buttons below
+          stop propagation so they don't toggle selection. Dragging it drops
+          the clip onto the AI editor timeline. */}
+      <div
+        onClick={onToggleSelect}
+        onMouseEnter={handleEnter}
+        onMouseLeave={handleLeave}
+        draggable={canPlay}
+        onDragStart={(e) => {
+          if (!canPlay) return;
+          const payload = JSON.stringify({
+            file_id: file.id,
+            file_name: file.name,
+            duration_seconds: file.duration_seconds ?? undefined,
+          });
+          e.dataTransfer.setData("application/edso-clip", payload);
+          e.dataTransfer.setData("text/plain", payload);
+          e.dataTransfer.effectAllowed = "copy";
         }}
-        className="absolute left-1.5 top-1.5 z-10 rounded-full p-0.5 transition-opacity"
-        style={{
-          background: "rgba(0,0,0,0.5)",
-          color: "white",
-          opacity: selected ? 1 : 0,
-        }}
-        // We force-show on hover for unselected items via a class below.
-        title={selected ? "Deselect" : "Select for AI Editor"}
+        className="relative flex aspect-video cursor-pointer items-center justify-center overflow-hidden"
+        style={{ background: "#000" }}
+        title={selected ? "Click to deselect" : "Click to select"}
       >
-        {selected ? <CheckCircle2 size={18} /> : <Circle size={18} />}
-      </button>
-      {/* Force-visible-on-hover when not selected */}
-      {!selected && (
-        <style>{`
-          .group:hover > button[title="Select for AI Editor"] { opacity: 1 !important; }
-        `}</style>
-      )}
+        {playUrl && (
+          <video
+            ref={videoRef}
+            src={playUrl}
+            playsInline
+            loop
+            muted={muted}
+            className="h-full w-full bg-black object-contain"
+          />
+        )}
+        {!playUrl && <FileIcon type={file.file_type as "video"} size={36} />}
 
-      <button
-        onClick={onClick}
-        className="flex flex-col text-left"
-      >
-        <div
-          className="relative flex aspect-video items-center justify-center"
-          style={{ background: "var(--sidebar)" }}
+        {/* Selection indicator (top-left). Visible when selected, and on hover. */}
+        <span
+          className="video-sel-indicator pointer-events-none absolute left-2 top-2 z-20 rounded-full p-0.5 transition-opacity"
+          style={{
+            background: "rgba(0,0,0,0.55)",
+            color: selected ? "var(--accent)" : "white",
+            opacity: selected ? 1 : 0,
+          }}
         >
-          {file.r2_thumbnail_key ? (
-            <div className="h-full w-full bg-neutral-800" />
-          ) : (
-            <FileIcon type={file.file_type as "video"} size={32} />
-          )}
+          {selected ? <CheckCircle2 size={18} /> : <Circle size={18} />}
+        </span>
+        {!selected && (
+          <style>{`.group:hover .video-sel-indicator { opacity: 1 !important; }`}</style>
+        )}
 
-          {isProcessing && (
-            <div className="absolute inset-0 flex items-center justify-center bg-black/30">
-              <Loader2 size={20} className="animate-spin text-white" />
-            </div>
-          )}
-
-          {file.file_type === "video" && file.duration_seconds && (
-            <span className="absolute bottom-1.5 right-1.5 rounded bg-black/70 px-1.5 py-0.5 text-[10px] font-medium text-white">
-              {formatDuration(file.duration_seconds)}
-            </span>
-          )}
-        </div>
-
-        <div className="flex items-start gap-1.5 p-2.5">
-          <div className="min-w-0 flex-1">
-            <div className="truncate text-sm">{file.name}</div>
-            <div className="text-xs" style={{ color: "var(--muted)" }}>
-              {formatBytes(file.file_size)}
-            </div>
-          </div>
+        {/* Center play / pause control. */}
+        {canPlay && (
           <button
-            onClick={(e) => { e.stopPropagation(); onContextMenu(e); }}
-            className="shrink-0 rounded p-0.5 opacity-0 transition-opacity group-hover:opacity-100"
-            style={{ color: "var(--muted)" }}
+            onClick={handleCenterToggle}
+            className={`absolute left-1/2 top-1/2 z-20 flex h-12 w-12 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full shadow-lg transition-all ${
+              playing ? "opacity-0 group-hover:opacity-100" : "opacity-100"
+            }`}
+            style={{ background: "var(--accent)" }}
+            title={playing ? "Pause" : "Play"}
           >
-            <MoreHorizontal size={14} />
+            {playing ? (
+              <Pause size={22} className="text-white" fill="white" />
+            ) : (
+              <Play size={22} className="ml-0.5 text-white" fill="white" />
+            )}
           </button>
-        </div>
-      </button>
+        )}
+
+        {/* Mute / unmute (top-right). */}
+        {canPlay && (
+          <button
+            onClick={handleMuteToggle}
+            className="absolute right-2 top-2 z-20 flex items-center justify-center rounded-full p-1.5 text-white transition-colors hover:bg-black/40"
+            style={{ background: "rgba(0,0,0,0.55)" }}
+            title={muted ? "Unmute" : "Mute"}
+          >
+            {muted ? <VolumeX size={15} /> : <Volume2 size={15} />}
+          </button>
+        )}
+
+        {isProcessing && (
+          <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-black/40">
+            <Loader2 size={20} className="animate-spin text-white" />
+            <span className="text-xs text-white/80">Processing…</span>
+          </div>
+        )}
+
+        {error && (
+          <span className="absolute bottom-2 left-2 z-20 rounded bg-black/70 px-2 py-0.5 text-[11px] text-white">
+            {error}
+          </span>
+        )}
+
+        {isVideo && file.duration_seconds != null && !playing && (
+          <span className="absolute bottom-2 right-2 z-10 rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-medium text-white">
+            {formatDuration(file.duration_seconds)}
+          </span>
+        )}
+      </div>
+
+      <div className="flex items-start gap-2 p-2.5">
+        <button onClick={onOpen} className="min-w-0 flex-1 text-left" title="Open details">
+          <div className="truncate text-sm font-medium">{file.name}</div>
+          <div className="mt-0.5 text-xs" style={{ color: "var(--muted)" }}>
+            {formatBytes(file.file_size)}
+          </div>
+        </button>
+        <button
+          onClick={(e) => { e.stopPropagation(); onContextMenu(e); }}
+          className="shrink-0 rounded p-1 opacity-0 transition-opacity group-hover:opacity-100"
+          style={{ color: "var(--muted)" }}
+        >
+          <MoreHorizontal size={16} />
+        </button>
+      </div>
     </div>
   );
 }
@@ -361,7 +441,7 @@ function ListView({
               key={folder.id}
               onDoubleClick={() => onNavigate(folder.id)}
               onContextMenu={(e) => { e.preventDefault(); onFolderContextMenu?.(folder, e); }}
-              className="cursor-pointer border-b transition-colors hover:bg-blue-50 dark:hover:bg-blue-950/20"
+              className="cursor-pointer border-b transition-colors hover:bg-[var(--accent-soft)]"
               style={{ borderColor: "var(--border)" }}
             >
               <td className="w-8" />
@@ -383,10 +463,10 @@ function ListView({
                 key={file.id}
                 onClick={() => onOpenFile(file.id)}
                 onContextMenu={(e) => { e.preventDefault(); onFileContextMenu?.(file, e); }}
-                className="group cursor-pointer border-b transition-colors hover:bg-blue-50 dark:hover:bg-blue-950/20"
+                className="group cursor-pointer border-b transition-colors hover:bg-[var(--accent-soft)]"
                 style={{
                   borderColor: "var(--border)",
-                  background: sel ? "rgba(59,130,246,0.06)" : undefined,
+                  background: sel ? "var(--accent-soft)" : undefined,
                 }}
               >
                 <td className="w-8 px-2 py-2.5">

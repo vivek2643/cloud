@@ -116,6 +116,23 @@ export function getFileDownloadUrl(id: string, token: string) {
   return request<{ url: string }>(`/api/files/${id}/download`, { token });
 }
 
+export interface FileShot {
+  shot_id: string;
+  shot_index: number | null;
+  start_ms: number | null;
+  end_ms: number | null;
+}
+
+export interface FileShotsResponse {
+  file_id: string;
+  duration_ms: number | null;
+  shots: FileShot[];
+}
+
+export function getFileShots(id: string, token: string) {
+  return request<FileShotsResponse>(`/api/files/${id}/shots`, { token });
+}
+
 // --- Upload ---
 
 export interface PresignResponse {
@@ -641,6 +658,20 @@ export interface SearchShot {
   score: number;
   thumbnail_url?: string | null;
   transcript_text?: string | null;
+}
+
+export interface ProjectMeta {
+  id: string;
+  name: string;
+  source_file_ids: string[];
+}
+
+export function ensureProject(sourceFileIds: string[], token: string, name = "Untitled") {
+  return request<ProjectMeta>(`/api/edl/projects/ensure`, {
+    method: "POST",
+    body: JSON.stringify({ source_file_ids: sourceFileIds, name }),
+    token,
+  });
 }
 
 export function getLatestEdl(projectId: string, token: string) {

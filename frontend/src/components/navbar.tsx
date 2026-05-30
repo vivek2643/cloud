@@ -4,7 +4,7 @@ import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase";
 import { useAuthStore } from "@/stores/auth-store";
 import { useDriveStore, type ViewMode } from "@/stores/drive-store";
-import { LogOut, Grid3X3, List, Search, HardDrive } from "lucide-react";
+import { LogOut, Grid3X3, List, HardDrive } from "lucide-react";
 
 export function Navbar() {
   const router = useRouter();
@@ -25,27 +25,10 @@ export function Navbar() {
     >
       <div className="flex items-center gap-2 font-semibold">
         <HardDrive size={20} style={{ color: "var(--accent)" }} />
-        <span>AeroDrive</span>
+        <span>EDSO</span>
       </div>
 
-      <div className="relative mx-auto w-full max-w-md">
-        <Search
-          size={16}
-          className="absolute left-3 top-1/2 -translate-y-1/2"
-          style={{ color: "var(--muted)" }}
-        />
-        <input
-          type="text"
-          placeholder="Search files..."
-          className="w-full rounded-lg border py-1.5 pl-9 pr-3 text-sm outline-none focus:ring-2"
-          style={{
-            borderColor: "var(--border)",
-            background: "var(--sidebar)",
-          }}
-        />
-      </div>
-
-      <div className="flex items-center gap-1">
+      <div className="ml-auto flex items-center gap-1">
         <ViewToggle mode="grid" current={viewMode} onChange={setViewMode} />
         <ViewToggle mode="list" current={viewMode} onChange={setViewMode} />
       </div>

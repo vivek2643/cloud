@@ -972,7 +972,7 @@ export default function TimelineEditorPage() {
                         className="flex w-full items-start gap-2 rounded-lg border p-2 text-left transition-colors hover:opacity-80"
                         style={{
                           borderColor: isBase ? "var(--accent)" : "var(--border)",
-                          background: isBase ? "rgba(59,130,246,0.06)" : "transparent",
+                          background: isBase ? "var(--accent-soft)" : "transparent",
                         }}
                       >
                         {v.author_kind === "user" ? (
@@ -1352,12 +1352,12 @@ function DiffOverlay({
   const badge = (id: string) => {
     if (addedIds.has(id)) return { t: "NEW", c: "#22c55e" };
     if (trimmedIds.has(id)) return { t: "TRIMMED", c: "#f59e0b" };
-    if (movedIds.has(id)) return { t: "MOVED", c: "#3b82f6" };
+    if (movedIds.has(id)) return { t: "MOVED", c: "#f97316" };
     return null;
   };
 
   return (
-    <div className="mx-auto max-w-3xl rounded-xl border p-4" style={{ borderColor: "var(--accent)", background: "rgba(59,130,246,0.05)" }}>
+    <div className="mx-auto max-w-3xl rounded-xl border p-4" style={{ borderColor: "var(--accent)", background: "var(--accent-soft)" }}>
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-start gap-2">
           <Sparkles size={16} className="mt-0.5 shrink-0" style={{ color: "var(--accent)" }} />

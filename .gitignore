@@ -17,6 +17,10 @@ out/
 dist/
 build/
 *.egg-info/
+*.tsbuildinfo
+
+# Runtime logs (analysis/edit/render output written at runtime)
+backend/logs/
 
 # IDE
 .vscode/

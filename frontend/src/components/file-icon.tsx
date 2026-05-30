@@ -22,9 +22,9 @@ const TYPE_COLORS = {
   video: "#8b5cf6",
   image: "#ec4899",
   audio: "#f59e0b",
-  document: "#3b82f6",
+  document: "#f97316",
   other: "#6b7280",
-  folder: "#3b82f6",
+  folder: "#f97316",
 };
 
 export function FileIcon({
