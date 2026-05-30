@@ -1,0 +1,373 @@
+{
+  "logged_at": "2026-05-29T18:40:14+00:00",
+  "prompt": "Make a 10s teaser highlighting the build moment",
+  "status": "ok",
+  "stages": {
+    "candidates_l1_only": [
+      {
+        "shot_id": "0ae81754-4739-4c34-8b0e-08f9f873739a",
+        "file_id": "5501ac6e-0c72-4e10-a5be-760b79886e8f",
+        "file_name": "EDSO_Demo.mp4",
+        "shot_index": 12,
+        "start_ms": 44200,
+        "end_ms": 48200,
+        "duration_ms": 4000,
+        "score": 0.0539097870169365,
+        "intra_shot_variance": 0.0154631,
+        "peak_motion_ms": 44200,
+        "blur_min": 117.582
+      },
+      {
+        "shot_id": "2f86500a-187f-4565-8c9a-6a7fd2afa467",
+        "file_id": "5501ac6e-0c72-4e10-a5be-760b79886e8f",
+        "file_name": "EDSO_Demo.mp4",
+        "shot_index": 9,
+        "start_ms": 32200,
+        "end_ms": 36200,
+        "duration_ms": 4000,
+        "score": 0.0498389027476511,
+        "intra_shot_variance": 0.0116649,
+        "peak_motion_ms": 36200,
+        "blur_min": 118.351
+      },
+      {
+        "shot_id": "ea8581bb-019f-42ae-bdce-54670855a3f7",
+        "file_id": "5501ac6e-0c72-4e10-a5be-760b79886e8f",
+        "file_name": "EDSO_Demo.mp4",
+        "shot_index": 10,
+        "start_ms": 36200,
+        "end_ms": 40200,
+        "duration_ms": 4000,
+        "score": 0.0457425002556712,
+        "intra_shot_variance": 0.0124823,
+        "peak_motion_ms": 36563,
+        "blur_min": 116.808
+      },
+      {
+        "shot_id": "e1c6d06c-c060-44c1-8c75-c0ab375f806c",
+        "file_id": "5501ac6e-0c72-4e10-a5be-760b79886e8f",
+        "file_name": "EDSO_Demo.mp4",
+        "shot_index": 11,
+        "start_ms": 40200,
+        "end_ms": 44200,
+        "duration_ms": 4000,
+        "score": 0.0448707596225549,
+        "intra_shot_variance": 0.00166553,
+        "peak_motion_ms": 41290,
+        "blur_min": 115.462
+      },
+      {
+        "shot_id": "852d8fbc-ec58-405d-bdeb-44a72468ecc0",
+        "file_id": "5501ac6e-0c72-4e10-a5be-760b79886e8f",
+        "file_name": "EDSO_Demo.mp4",
+        "shot_index": 5,
+        "start_ms": 20000,
+        "end_ms": 24000,
+        "duration_ms": 4000,
+        "score": 0.0413236005706263,
+        "intra_shot_variance": 0.0108174,
+        "peak_motion_ms": 22909,
+        "blur_min": 81.1575
+      },
+      {
+        "shot_id": "2d414d4c-0926-4053-b00f-735090afe3c1",
+        "file_id": "5501ac6e-0c72-4e10-a5be-760b79886e8f",
+        "file_name": "EDSO_Demo.mp4",
+        "shot_index": 2,
+        "start_ms": 8000,
+        "end_ms": 12000,
+        "duration_ms": 4000,
+        "score": 0.0411697037161199,
+        "intra_shot_variance": 0.00207609,
+        "peak_motion_ms": 8363,
+        "blur_min": 81.9015
+      },
+      {
+        "shot_id": "2090cab1-7389-407e-a54a-272d1114b59e",
+        "file_id": "5501ac6e-0c72-4e10-a5be-760b79886e8f",
+        "file_name": "EDSO_Demo.mp4",
+        "shot_index": 3,
+        "start_ms": 12000,
+        "end_ms": 16000,
+        "duration_ms": 4000,
+        "score": 0.0399378653096838,
+        "intra_shot_variance": 0.000134051,
+        "peak_motion_ms": 13454,
+        "blur_min": 81.6903
+      },
+      {
+        "shot_id": "fe526e77-eab5-4a20-8e9c-33c9ceb789c3",
+        "file_id": "5501ac6e-0c72-4e10-a5be-760b79886e8f",
+        "file_name": "EDSO_Demo.mp4",
+        "shot_index": 4,
+        "start_ms": 16000,
+        "end_ms": 20000,
+        "duration_ms": 4000,
+        "score": 0.0393017220261798,
+        "intra_shot_variance": 0.00110567,
+        "peak_motion_ms": 18909,
+        "blur_min": 81.7048
+      },
+      {
+        "shot_id": "075329ed-2e20-43d6-8cf3-0cd5923149f9",
+        "file_id": "5501ac6e-0c72-4e10-a5be-760b79886e8f",
+        "file_name": "EDSO_Demo.mp4",
+        "shot_index": 8,
+        "start_ms": 28200,
+        "end_ms": 32200,
+        "duration_ms": 4000,
+        "score": 0.0390889440739233,
+        "intra_shot_variance": 0.134684,
+        "peak_motion_ms": 32200,
+        "blur_min": 83.0743
+      },
+      {
+        "shot_id": "9f8027fc-a42a-4436-a08a-467b75dc29bf",
+        "file_id": "5501ac6e-0c72-4e10-a5be-760b79886e8f",
+        "file_name": "EDSO_Demo.mp4",
+        "shot_index": 0,
+        "start_ms": 0,
+        "end_ms": 4000,
+        "duration_ms": 4000,
+        "score": 0.0390469251778705,
+        "intra_shot_variance": 0.00136018,
+        "peak_motion_ms": 2909,
+        "blur_min": 80.9866
+      },
+      {
+        "shot_id": "4c957acc-d3b8-4cc5-a006-9b494f0a2cf9",
+        "file_id": "5501ac6e-0c72-4e10-a5be-760b79886e8f",
+        "file_name": "EDSO_Demo.mp4",
+        "shot_index": 6,
+        "start_ms": 24000,
+        "end_ms": 28000,
+        "duration_ms": 4000,
+        "score": 0.0389809094658299,
+        "intra_shot_variance": 0.242774,
+        "peak_motion_ms": 27636,
+        "blur_min": 79.1841
+      },
+      {
+        "shot_id": "664bf2cf-8ad9-4fa9-855d-a8ffccadd64b",
+        "file_id": "5501ac6e-0c72-4e10-a5be-760b79886e8f",
+        "file_name": "EDSO_Demo.mp4",
+        "shot_index": 1,
+        "start_ms": 4000,
+        "end_ms": 8000,
+        "duration_ms": 4000,
+        "score": 0.0388476783626017,
+        "intra_shot_variance": 0.000582576,
+        "peak_motion_ms": 4363,
+        "blur_min": 82.1507
+      },
+      {
+        "shot_id": "c9223a6a-8d14-4bfc-951e-0d37bc938ca4",
+        "file_id": "5501ac6e-0c72-4e10-a5be-760b79886e8f",
+        "file_name": "EDSO_Demo.mp4",
+        "shot_index": 17,
+        "start_ms": 64200,
+        "end_ms": 68200,
+        "duration_ms": 4000,
+        "score": 0.0286557699162399,
+        "intra_shot_variance": 0.00280219,
+        "peak_motion_ms": 67836,
+        "blur_min": 141.18
+      },
+      {
+        "shot_id": "4ec9a45b-642e-4c05-89d2-4e94a32def63",
+        "file_id": "5501ac6e-0c72-4e10-a5be-760b79886e8f",
+        "file_name": "EDSO_Demo.mp4",
+        "shot_index": 14,
+        "start_ms": 52200,
+        "end_ms": 56200,
+        "duration_ms": 4000,
+        "score": 0.0263254845634046,
+        "intra_shot_variance": 0.00518626,
+        "peak_motion_ms": 55109,
+        "blur_min": 119.559
+      },
+      {
+        "shot_id": "7dbab232-87b1-440e-a145-f5ff35d2e2f7",
+        "file_id": "5501ac6e-0c72-4e10-a5be-760b79886e8f",
+        "file_name": "EDSO_Demo.mp4",
+        "shot_index": 15,
+        "start_ms": 56200,
+        "end_ms": 60200,
+        "duration_ms": 4000,
+        "score": 0.0245995800938875,
+        "intra_shot_variance": 0.00300986,
+        "peak_motion_ms": 58745,
+        "blur_min": 120.841
+      },
+      {
+        "shot_id": "addf0d09-7573-490c-aef8-d03671d6dd96",
+        "file_id": "5501ac6e-0c72-4e10-a5be-760b79886e8f",
+        "file_name": "EDSO_Demo.mp4",
+        "shot_index": 19,
+        "start_ms": 72200,
+        "end_ms": 76000,
+        "duration_ms": 3800,
+        "score": 0.0222656699422775,
+        "intra_shot_variance": 0.0444237,
+        "peak_motion_ms": 74618,
+        "blur_min": 137.621
+      },
+      {
+        "shot_id": "bcad9f05-e5de-47e2-93bd-8f96e196806a",
+        "file_id": "5501ac6e-0c72-4e10-a5be-760b79886e8f",
+        "file_name": "EDSO_Demo.mp4",
+        "shot_index": 16,
+        "start_ms": 60200,
+        "end_ms": 64200,
+        "duration_ms": 4000,
+        "score": 0.0211889190358141,
+        "intra_shot_variance": 0.0018695,
+        "peak_motion_ms": 61654,
+        "blur_min": 125.669
+      },
+      {
+        "shot_id": "4d8eff46-5e9b-4038-bbd0-f3e4e327e3e1",
+        "file_id": "5501ac6e-0c72-4e10-a5be-760b79886e8f",
+        "file_name": "EDSO_Demo.mp4",
+        "shot_index": 13,
+        "start_ms": 48200,
+        "end_ms": 52200,
+        "duration_ms": 4000,
+        "score": 0.0209663745020745,
+        "intra_shot_variance": 0.000945687,
+        "peak_motion_ms": 50745,
+        "blur_min": 117.556
+      },
+      {
+        "shot_id": "85effa09-1cb6-4d47-8d3f-f03a1ae741de",
+        "file_id": "5501ac6e-0c72-4e10-a5be-760b79886e8f",
+        "file_name": "EDSO_Demo.mp4",
+        "shot_index": 7,
+        "start_ms": 28000,
+        "end_ms": 28200,
+        "duration_ms": 200,
+        "score": 0.0198531446314104,
+        "intra_shot_variance": 0.133557,
+        "peak_motion_ms": 28200,
+        "blur_min": 79.1237
+      },
+      {
+        "shot_id": "2781b59b-f70b-40dc-a57f-0d08dc96a769",
+        "file_id": "5501ac6e-0c72-4e10-a5be-760b79886e8f",
+        "file_name": "EDSO_Demo.mp4",
+        "shot_index": 18,
+        "start_ms": 68200,
+        "end_ms": 72200,
+        "duration_ms": 4000,
+        "score": 0.017302269248693,
+        "intra_shot_variance": 0.00587249,
+        "peak_motion_ms": 70745,
+        "blur_min": 135.558
+      }
+    ],
+    "editor_user_message": "CONVERSATION HISTORY (oldest first):\n(no prior turns yet)\n\nLATEST USER MESSAGE:\nMake a 10s teaser highlighting the build moment\n\nDURATION TARGET (this turn): (not specified -- preserve prior length unless the user asked otherwise)\n\n--- Full transcript of EDSO_Demo.mp4 ---\nHey, thanks for your time. My name is Vivek and I'm the founder of Edso. So the initial thought behind, uh, starting Edso was say, if you could actually give LLM, uh, all the access to editing tools, um, and making them understand videos, can they actually edit? That was the question I started with and I've started building up a prototype to solve that. And this is my first prototype. Uh, I'll just quickly demo what I've built. So I'm just uploading a few sample videos and audios. Um, so they get analyzed at upload. And I'm trying to, uh, edit by giving a comment and make a comedy read. So this is where there's a, uh, the analysis passed through to LLM, uh, along with some editing prompting and all. And LLM decides what editing commands have to be done. And those commands get executed. So you can see the final output after the LLM edits. This is how it looks. It also adds text, audios, and video. Thank you.\n\n========================================\nCATALOG\n========================================\n\nSHOT 0  id=0ae81754-4739-4c34-8b0e-08f9f873739a  start=44200ms  end=48200ms  duration=4.0s\n  visual:    A person is editing and attempting to add a comedic comment to a video or text.\n  framing:   MS          camera: Handheld\n  role:      setup   valence: 0.30\n  blur_min:  117.58                   intra_var: 0.0155\n  audio:     speech, silence, music\n  transcript: \"And I'm trying to, uh, edit by giving a comment and make a comedy read.\"\n\nSHOT 1  id=2f86500a-187f-4565-8c9a-6a7fd2afa467  start=32200ms  end=36200ms  duration=4.0s\n  visual:    A person explains that uploaded content gets analyzed during the upload process, with minimal interface changes visible.\n  framing:   MS          camera: Pan\n  role:      setup   valence: 0.00\n  blur_min:  118.35                   intra_var: 0.0117\n  audio:     speech, silence, music\n  transcript: \"Um, so they get analyzed at upload.\"\n\nSHOT 2  id=ea8581bb-019f-42ae-bdce-54670855a3f7  start=36200ms  end=40200ms  duration=4.0s\n  visual:    A static screen displaying a video player interface with a light gray and black split view, showing minimal activity in the bottom left corner.\n  framing:   MS          camera: Pan\n  role:      transition   valence: 0.00\n  blur_min:  116.81                   intra_var: 0.0125\n  audio:     speech, silence, music\n  transcript: \"\"\n\nSHOT 3  id=e1c6d06c-c060-44c1-8c75-c0ab375f806c  start=40200ms  end=44200ms  duration=4.0s\n  visual:    A person discusses their attempt to edit and create comedic content through commentary.\n  framing:   MS          camera: Pan\n  role:      setup   valence: 0.30\n  blur_min:  115.46                   intra_var: 0.0017\n  audio:     speech, silence, music\n  transcript: \"And I'm trying to, uh, edit by giving a comment and make a comedy read.\"\n\nSHOT 4  id=852d8fbc-ec58-405d-bdeb-44a72468ecc0  start=20000ms  end=24000ms  duration=4.0s\n  visual:    A speaker introduces and prepares to demonstrate their first prototype built to solve a stated question.\n  framing:   MS          camera: Static\n  role:      transition   valence: 0.30\n  blur_min:  81.16                   intra_var: 0.0108\n  audio:     speech, silence, music\n  transcript: \"That was the question I started with and I've started building up a prototype to solve that. And this is my first prototype. Uh, I'll just quickly demo what I've built.\"\n\nSHOT 5  id=2d414d4c-0926-4053-b00f-735090afe3c1  start=8000ms  end=12000ms  duration=4.0s\n  visual:    A person discusses the founding concept of Edso, explaining the idea of giving LLMs access to editing tools to enable them to edit videos.\n  framing:   MS          camera: Static\n  role:      setup   valence: 0.30\n  blur_min:  81.90                   intra_var: 0.0021\n  audio:     speech, silence, music\n  transcript: \"So the initial thought behind, uh, starting Edso was say, if you could actually give LLM, uh, all the access to editing tools, um, and making them understand videos, can they actually edit?\"\n\nSHOT 6  id=2090cab1-7389-407e-a54a-272d1114b59e  start=12000ms  end=16000ms  duration=4.0s\n  visual:    A static logo screen for EDSO is displayed with an orange icon and white text on a black background, with a small orange button below.\n  framing:   MS          camera: Static\n  role:      aside   valence: 0.00\n  blur_min:  81.69                   intra_var: 0.0001\n  audio:     speech, silence, music\n  transcript: \"So the initial thought behind, uh, starting Edso was say, if you could actually give LLM, uh, all the access to editing tools, um, and making them understand videos, can they actually edit? That was the question I started with and I've started building up a prototype to solve that.\"\n\nSHOT 7  id=fe526e77-eab5-4a20-8e9c-33c9ceb789c3  start=16000ms  end=20000ms  duration=4.0s\n  visual:    A presenter introduces the problem that motivated them to build a prototype solution.\n  framing:   MS          camera: Static\n  role:      setup   valence: 0.10\n  blur_min:  81.70                   intra_var: 0.0011\n  audio:     speech, silence, music\n  transcript: \"That was the question I started with and I've started building up a prototype to solve that.\"\n\nSHOT 8  id=075329ed-2e20-43d6-8cf3-0cd5923149f9  start=28200ms  end=32200ms  duration=4.0s\n  visual:    A person uploads sample video and audio files to a media management interface for analysis.\n  framing:   MS          camera: Handheld\n  role:      setup   valence: 0.10\n  blur_min:  83.07                   intra_var: 0.1347\n  audio:     speech, silence, music\n  transcript: \"So I'm just uploading a few sample videos and audios. Um, so they get analyzed at upload.\"\n\nSHOT 9  id=9f8027fc-a42a-4436-a08a-467b75dc29bf  start=0ms  end=4000ms  duration=4.0s\n  visual:    A founder named Vivek introduces his company Edso and explains the concept of giving AI language models access to video editing tools.\n  framing:   MS          camera: Static\n  role:      setup   valence: 0.30\n  blur_min:  80.99                   intra_var: 0.0014\n  audio:     speech, silence, music\n  transcript: \"Hey, thanks for your time. My name is Vivek and I'm the founder of Edso. So the initial thought behind, uh, starting Edso was say, if you could actually give LLM, uh, all the access to editing tools, um, and making them understand videos, can they actually edit?\"\n\nSHOT 10  id=4c957acc-d3b8-4cc5-a006-9b494f0a2cf9  start=24000ms  end=28000ms  duration=4.0s\n  visual:    A person begins to demonstrate a built project showing the EDSO interface with an audio player.\n  framing:   MS          camera: Static\n  role:      setup   valence: 0.30\n  blur_min:  79.18                   intra_var: 0.2428\n  audio:     speech, silence, music\n  transcript: \"Uh, I'll just quickly demo what I've built.\"\n\nSHOT 11  id=664bf2cf-8ad9-4fa9-855d-a8ffccadd64b  start=4000ms  end=8000ms  duration=4.0s\n  visual:    An introduction to Edso, showing the company logo and branding as the speaker explains the initial concept behind creating an AI-powered video editing tool.\n  framing:   MS          camera: Static\n  role:      setup   valence: 0.30\n  blur_min:  82.15                   intra_var: 0.0006\n  audio:     speech, silence, music\n  transcript: \"So the initial thought behind, uh, starting Edso was say, if you could actually give LLM, uh, all the access to editing tools, um, and making them understand videos, can they actually edit?\"\n\nSHOT 12  id=c9223a6a-8d14-4bfc-951e-0d37bc938ca4  start=64200ms  end=68200ms  duration=4.0s\n  visual:    A demonstration shows the final edited output with yellow envelope imagery, featuring added text, audio, and video elements in a timeline interface.\n  framing:   MS          camera: Static\n  role:      payoff   valence: 0.60\n  blur_min:  141.18                   intra_var: 0.0028\n  audio:     speech, silence, music\n  transcript: \"So you can see the final output after the LLM edits. This is how it looks. It also adds text, audios, and video.\"\n\nSHOT 13  id=4ec9a45b-642e-4c05-89d2-4e94a32def63  start=52200ms  end=56200ms  duration=4.0s\n  visual:    A person holds a yellow notebook with a beaded necklace while explaining that analysis is passed through to an LLM with editing prompting.\n  framing:   MS          camera: Static\n  role:      setup   valence: 0.10\n  blur_min:  119.56                   intra_var: 0.0052\n  audio:     speech, silence, music\n  transcript: \"So this is where there's a, uh, the analysis passed through to LLM, uh, along with some editing prompting and all.\"\n\nSHOT 14  id=7dbab232-87b1-440e-a145-f5ff35d2e2f7  start=56200ms  end=60200ms  duration=4.0s\n  visual:    A presenter explains how an LLM analyzes data and determines editing commands using prompting.\n  framing:   MS          camera: Pan\n  role:      setup   valence: 0.10\n  blur_min:  120.84                   intra_var: 0.0030\n  audio:     speech, silence, music\n  transcript: \"So this is where there's a, uh, the analysis passed through to LLM, uh, along with some editing prompting and all. And LLM decides what editing commands have to be done.\"\n\nSHOT 15  id=addf0d09-7573-490c-aef8-d03671d6dd96  start=72200ms  end=76000ms  duration=3.8s\n  visual:    A video player interface appears over a still image showing a yellow envelope with a necklace, with playback controls visible in the center.\n  framing:   MS          camera: Static\n  role:      transition   valence: 0.00\n  blur_min:  137.62                   intra_var: 0.0444\n  audio:     speech, silence, music\n  transcript: \"\"\n\nSHOT 16  id=bcad9f05-e5de-47e2-93bd-8f96e196806a  start=60200ms  end=64200ms  duration=4.0s\n  visual:    A video editing interface displays a yellow notebook and necklace while demonstrating an AI-powered editing workflow with timeline controls visible.\n  framing:   MS          camera: Pan\n  role:      payoff   valence: 0.60\n  blur_min:  125.67                   intra_var: 0.0019\n  audio:     speech, silence, music\n  transcript: \"And LLM decides what editing commands have to be done. And those commands get executed. So you can see the final output after the LLM edits.\"\n\nSHOT 17  id=4d8eff46-5e9b-4038-bbd0-f3e4e327e3e1  start=48200ms  end=52200ms  duration=4.0s\n  visual:    A speaker discusses a technical process where analysis passes through to an LLM with editing prompting, while a hand holds a yellow card or notebook with a beaded necklace.\n  framing:   MS          camera: Handheld\n  role:      setup   valence: 0.00\n  blur_min:  117.56                   intra_var: 0.0009\n  audio:     speech, silence, music\n  transcript: \"So this is where there's a, uh, the analysis passed through to LLM, uh, along with some editing prompting and all.\"\n\nSHOT 18  id=85effa09-1cb6-4d47-8d3f-f03a1ae741de  start=28000ms  end=28200ms  duration=0.2s\n  visual:    A video player interface appears and moves upward against a black background, with loading and playback controls visible.\n  framing:   MS          camera: Static\n  role:      setup   valence: 0.00\n  blur_min:  79.12                   intra_var: 0.1336\n  audio:     speech, silence, music\n  transcript: \"\"\n\nSHOT 19  id=2781b59b-f70b-40dc-a57f-0d08dc96a769  start=68200ms  end=72200ms  duration=4.0s\n  visual:    A screen recording demonstrates adding text, audio, and video to a project, showing a yellow notebook with a necklace in the preview window and a timeline at the bottom.\n  framing:   MS          camera: Pan\n  role:      payoff   valence: 0.60\n  blur_min:  135.56                   intra_var: 0.0059\n  audio:     speech, silence, music\n  transcript: \"It also adds text, audios, and video. Thank you.\"\n\nReturn the JSON object specified in your instructions. JSON only, no other text.",
+    "editor_raw_response": {
+      "reasoning": "The user wants a 10s teaser highlighting 'the build moment'. In the transcript, the build happens when Vivek explains how the system works: analysis \u2192 LLM \u2192 commands \u2192 execution. I'll structure this as hook (quick intro) \u2192 build (the technical explanation) \u2192 payoff (showing it works). Starting with shot 9 (0-2s: 'Hey, I'm Vivek, founder of Edso'), then shot 13 (2-5.5s: 'analysis passed through to LLM with editing prompting'), then shot 14 (5.5-9s: 'LLM decides what editing commands have to be done'), ending with shot 16 (9-10s: quick payoff glimpse 'commands get executed'). This captures the build momentum in exactly 10s.",
+      "timeline": [
+        {
+          "shot_id": "9f8027fc-a42a-4436-a08a-467b75dc29bf",
+          "source_in_ms": 0,
+          "source_out_ms": 2000,
+          "role_in_edit": "hook",
+          "why": "Quick intro establishing Vivek and Edso to ground the viewer"
+        },
+        {
+          "shot_id": "4ec9a45b-642e-4c05-89d2-4e94a32def63",
+          "source_in_ms": 52200,
+          "source_out_ms": 55700,
+          "role_in_edit": "build",
+          "why": "First part of the build: analysis passed through to LLM with prompting"
+        },
+        {
+          "shot_id": "7dbab232-87b1-440e-a145-f5ff35d2e2f7",
+          "source_in_ms": 56200,
+          "source_out_ms": 59700,
+          "role_in_edit": "build",
+          "why": "Core build moment: LLM decides what editing commands to execute"
+        },
+        {
+          "shot_id": "bcad9f05-e5de-47e2-93bd-8f96e196806a",
+          "source_in_ms": 60200,
+          "source_out_ms": 61200,
+          "role_in_edit": "payoff",
+          "why": "Quick payoff glimpse showing commands executed and final output"
+        }
+      ],
+      "post_processing": {
+        "rhythm_lock": false,
+        "preserve_full_shots": false
+      },
+      "warnings": []
+    },
+    "editor_reasoning": "The user wants a 10s teaser highlighting 'the build moment'. In the transcript, the build happens when Vivek explains how the system works: analysis \u2192 LLM \u2192 commands \u2192 execution. I'll structure this as hook (quick intro) \u2192 build (the technical explanation) \u2192 payoff (showing it works). Starting with shot 9 (0-2s: 'Hey, I'm Vivek, founder of Edso'), then shot 13 (2-5.5s: 'analysis passed through to LLM with editing prompting'), then shot 14 (5.5-9s: 'LLM decides what editing commands have to be done'), ending with shot 16 (9-10s: quick payoff glimpse 'commands get executed'). This captures the build momentum in exactly 10s.",
+    "editor_warnings": [],
+    "editor_post_processing": {
+      "rhythm_lock": false,
+      "preserve_full_shots": false
+    },
+    "timeline": [
+      {
+        "file_name": "EDSO_Demo.mp4",
+        "source_in_ms": 0,
+        "source_out_ms": 2000,
+        "duration_ms": 2000,
+        "timeline_start_ms": 0,
+        "timeline_end_ms": 2000,
+        "score": 0.0390469251778705,
+        "trimmed_around_ms": null
+      },
+      {
+        "file_name": "EDSO_Demo.mp4",
+        "source_in_ms": 52200,
+        "source_out_ms": 55700,
+        "duration_ms": 3500,
+        "timeline_start_ms": 2000,
+        "timeline_end_ms": 5500,
+        "score": 0.0263254845634046,
+        "trimmed_around_ms": null
+      },
+      {
+        "file_name": "EDSO_Demo.mp4",
+        "source_in_ms": 56200,
+        "source_out_ms": 59700,
+        "duration_ms": 3500,
+        "timeline_start_ms": 5500,
+        "timeline_end_ms": 9000,
+        "score": 0.0245995800938875,
+        "trimmed_around_ms": null
+      },
+      {
+        "file_name": "EDSO_Demo.mp4",
+        "source_in_ms": 60200,
+        "source_out_ms": 61200,
+        "duration_ms": 1000,
+        "timeline_start_ms": 9000,
+        "timeline_end_ms": 10000,
+        "score": 0.0211889190358141,
+        "trimmed_around_ms": null
+      }
+    ],
+    "timeline_summary": {
+      "clip_count": 4,
+      "actual_duration_ms": 10000,
+      "actual_duration_s": 10.0
+    }
+  },
+  "user_id": "00000000-0000-0000-0000-000000000001",
+  "folder_id": null,
+  "file_ids": [
+    "5501ac6e-0c72-4e10-a5be-760b79886e8f"
+  ],
+  "mode": "chat",
+  "turns_in_history": 1,
+  "catalog_size": 20,
+  "fcp7_xml_chars": 4852,
+  "project_id": "894dbde8-1cd5-497f-adee-2ef712b63f24",
+  "edl_version_id": "0cbe4aa6-8308-4161-b61b-34b759d87d3b",
+  "render_id": "14063c29-d41b-4814-bca7-458b4dade48d"
+}

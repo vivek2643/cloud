@@ -1,0 +1,107 @@
+import logging
+import uuid
+
+from fastapi import APIRouter, Depends, HTTPException
+
+from app.auth import get_current_user_id
+from app.services.r2 import generate_presigned_put
+from app.services.supabase_client import get_supabase
+from app.models.schemas import PresignRequest, PresignResponse, FileResponse
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api/upload", tags=["upload"])
+
+
+def _detect_file_type(content_type: str) -> str:
+    if content_type.startswith("video/"):
+        return "video"
+    if content_type.startswith("image/"):
+        return "image"
+    if content_type.startswith("audio/"):
+        return "audio"
+    if content_type.startswith("application/pdf") or content_type.startswith("text/"):
+        return "document"
+    return "other"
+
+
+@router.post("/presign", response_model=PresignResponse)
+def presign_upload(
+    body: PresignRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    sb = get_supabase()
+
+    if body.folder_id:
+        folder = sb.table("folders").select("id").eq("id", body.folder_id).eq("user_id", user_id).execute()
+        if not folder.data:
+            raise HTTPException(status_code=404, detail="Folder not found")
+
+    file_id = str(uuid.uuid4())
+    r2_key = f"raw/{user_id}/{file_id}/{body.filename}"
+
+    sb.table("files").insert({
+        "id": file_id,
+        "user_id": user_id,
+        "folder_id": body.folder_id,
+        "name": body.filename,
+        "filename": body.filename,
+        "mime_type": body.content_type,
+        "file_size": body.file_size,
+        "file_type": _detect_file_type(body.content_type),
+        "r2_key": r2_key,
+        "status": "uploading",
+    }).execute()
+
+    upload_url = generate_presigned_put(r2_key, body.content_type)
+
+    return PresignResponse(file_id=file_id, upload_url=upload_url)
+
+
+def _enqueue_l1(file_id: str, r2_key: str) -> bool:
+    """
+    Defer the L1 orchestrator onto procrastinate. Returns True on success.
+
+    Falls back gracefully so that completing the upload still succeeds even if
+    the worker DB connection isn't configured -- the file just stays in
+    l1_status='pending' until DATABASE_URL is set and a worker is running.
+    """
+    try:
+        from app.services.jobs import app as proc_app, register_tasks
+
+        register_tasks()
+        with proc_app.open():
+            proc_app.tasks["l1_orchestrate"].defer(file_id=file_id, r2_key=r2_key)
+        return True
+    except Exception:
+        logger.exception("Could not enqueue L1 job for %s; file is still uploaded.", file_id)
+        return False
+
+
+@router.post("/{file_id}/complete", response_model=FileResponse)
+def complete_upload(
+    file_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    sb = get_supabase()
+
+    file_result = sb.table("files").select("*").eq("id", file_id).eq("user_id", user_id).execute()
+    if not file_result.data:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    file_record = file_result.data[0]
+    if file_record["status"] != "uploading":
+        raise HTTPException(status_code=400, detail="File is not in uploading state")
+
+    new_status = "processing" if file_record["file_type"] == "video" else "ready"
+
+    result = (
+        sb.table("files")
+        .update({"status": new_status})
+        .eq("id", file_id)
+        .execute()
+    )
+
+    if new_status == "processing":
+        _enqueue_l1(file_id, file_record["r2_key"])
+
+    return result.data[0]

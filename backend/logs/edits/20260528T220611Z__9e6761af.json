@@ -1,0 +1,16 @@
+{
+  "logged_at": "2026-05-28T22:06:11+00:00",
+  "prompt": "Make a 15s teaser",
+  "status": "ok",
+  "stages": {
+    "candidates_l1_only": []
+  },
+  "user_id": "00000000-0000-0000-0000-000000000001",
+  "folder_id": null,
+  "file_ids": [
+    "00000000-0000-0000-0000-000000000999"
+  ],
+  "mode": "chat",
+  "turns_in_history": 1,
+  "catalog_size": 0
+}
