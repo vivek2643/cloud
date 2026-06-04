@@ -132,6 +132,51 @@ def _enqueue_l2_if_needed(file_id: str) -> None:
 
 # --- Stage 1: proxy + thumb (refactor of existing process_video) ---------
 
+def _gpu_available() -> bool:
+    try:
+        from app.services.ml_device import torch_device
+        return torch_device() == "cuda"
+    except Exception:
+        return False
+
+
+def _encode_proxy(raw_path: str, proxy_path: str) -> None:
+    """1080p H.264 proxy. Uses the GPU's NVENC encoder when present (an order
+    of magnitude faster than CPU libx264), falling back to libx264 if NVENC
+    isn't available or fails."""
+    base_in = ["ffmpeg", "-y"]
+    common_out = [
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        proxy_path,
+    ]
+    if _gpu_available():
+        # NVDEC decode + scale_npp + NVENC encode keeps frames on the GPU.
+        nvenc = base_in + [
+            "-hwaccel", "cuda",
+            "-i", raw_path,
+            "-vf", "scale=-2:1080",
+            "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "25",
+        ] + common_out
+        try:
+            subprocess.run(nvenc, check=True, capture_output=True)
+            return
+        except subprocess.CalledProcessError as e:
+            logger.warning(
+                "NVENC proxy encode failed (%s); falling back to libx264.",
+                (e.stderr or b"")[-300:],
+            )
+    # CPU fallback (veryfast is ~2x quicker than fast at similar size).
+    subprocess.run(
+        base_in + [
+            "-i", raw_path,
+            "-vf", "scale=-2:1080",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        ] + common_out,
+        check=True, capture_output=True,
+    )
+
+
 def _stage1_proxy(file_id: str, raw_path: str, tmpdir: str) -> tuple[float, int, int]:
     """Probe + 1080p proxy + thumbnail. Returns (duration, w, h)."""
     sb = get_supabase()
@@ -147,17 +192,7 @@ def _stage1_proxy(file_id: str, raw_path: str, tmpdir: str) -> tuple[float, int,
             height = int(stream.get("height", 0))
             break
 
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-i", raw_path,
-            "-vf", "scale=-2:1080",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
-            proxy_path,
-        ],
-        check=True, capture_output=True,
-    )
+    _encode_proxy(raw_path, proxy_path)
     proxy_key = f"proxies/{file_id}/proxy.mp4"
     _upload_to_r2(proxy_path, proxy_key, "video/mp4")
 
@@ -230,22 +265,27 @@ def _stage2_transcript(file_id: str, wav_path: str, conn: psycopg.Connection) ->
 
 def _stage3_shots(
     file_id: str,
-    raw_path: str,
+    video_path: str,
     duration_s: float,
     tmpdir: str,
     conn: psycopg.Connection,
 ) -> List[shots_mod.Shot]:
     """
     Detect shots + extract 3 keyframes per shot. For each keyframe:
-      - keep the full-res JPEG locally (used by SigLIP embedding stage)
+      - keep the JPEG locally (used by SigLIP embedding stage)
       - downscale to 224x224 and upload that compact copy to R2
+
+    `video_path` is the 1080p proxy when available (set by the orchestrator),
+    which makes detection/keyframe/telemetry decode a small file instead of a
+    full-res raw. Shot boundaries are in milliseconds, so they map cleanly back
+    onto the raw video for later L2 keyframe extraction.
     """
     shots_dir = os.path.join(tmpdir, "keyframes")
     r2_dir = os.path.join(tmpdir, "keyframes_r2")
     os.makedirs(shots_dir, exist_ok=True)
     os.makedirs(r2_dir, exist_ok=True)
 
-    shots = shots_mod.detect_shots(raw_path, duration_s, shots_dir)
+    shots = shots_mod.detect_shots(video_path, duration_s, shots_dir)
 
     conn.execute("delete from shots where file_id = %s", (file_id,))
 
@@ -478,9 +518,16 @@ def l1_orchestrate(file_id: str, r2_key: str) -> None:
 
                 _demux_wav(raw_path, wav_path)
 
+                # Prefer the 1080p proxy for shot detection / keyframes /
+                # telemetry (much cheaper to decode than a 4K raw). It exists
+                # locally whenever the proxy stage ran in this invocation; on a
+                # rare retry where it doesn't, fall back to the raw file.
+                proxy_local = os.path.join(tmpdir, "proxy.mp4")
+                shot_source = proxy_local if os.path.exists(proxy_local) else raw_path
+
                 shots_result = _run_stage(
                     conn, file_id, "shots",
-                    _stage3_shots, file_id, raw_path, duration_s, tmpdir, conn,
+                    _stage3_shots, file_id, shot_source, duration_s, tmpdir, conn,
                 )
 
                 # Re-hydrate shot list from disk so the embeddings stage can

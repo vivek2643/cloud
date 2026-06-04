@@ -69,8 +69,13 @@ class Shot:
 
 # --- PySceneDetect wrapper -----------------------------------------------
 
-def detect_raw_shots(video_path: str, downscale: int = 1) -> List[Tuple[int, int]]:
-    """Return raw shot boundaries from PySceneDetect as a list of (start_ms, end_ms)."""
+def detect_raw_shots(video_path: str, downscale: int = 1, frame_skip: int = 0) -> List[Tuple[int, int]]:
+    """Return raw shot boundaries from PySceneDetect as a list of (start_ms, end_ms).
+
+    `downscale` shrinks each frame before the content comparison (huge speed
+    win, negligible accuracy loss). `frame_skip` analyses every Nth frame for
+    a further ~Nx speedup on long clips at the cost of boundary precision.
+    """
     from scenedetect import ContentDetector, open_video, SceneManager
 
     video = open_video(video_path)
@@ -78,7 +83,7 @@ def detect_raw_shots(video_path: str, downscale: int = 1) -> List[Tuple[int, int
     manager.add_detector(ContentDetector(threshold=27.0))
     if downscale > 1:
         manager.downscale = downscale
-    manager.detect_scenes(video=video, show_progress=False)
+    manager.detect_scenes(video=video, show_progress=False, frame_skip=frame_skip)
     scenes = manager.get_scene_list()
 
     if not scenes:
@@ -163,9 +168,18 @@ def detect_shots(video_path: str, duration_s: float, output_dir: str) -> List[Sh
     """
     Detect shots, extract 3 keyframes per shot, compute telemetry.
     Returns Shot rows ready for the orchestrator to upload + persist.
+
+    `video_path` should be the 1080p proxy when available: detection,
+    keyframe extraction and optical-flow telemetry all decode this file, so
+    running them against the proxy instead of a 4K raw is a large speedup with
+    no loss (keyframes are downscaled to 224px for SigLIP anyway).
     """
-    downscale = 2 if duration_s > 1800 else 1
-    raw = detect_raw_shots(video_path, downscale=downscale)
+    # Always downscale the detector input; skip frames on longer clips. With a
+    # 1080p proxy, downscale=2 -> ~960x540 comparison frames, which is plenty
+    # for ContentDetector and an order of magnitude cheaper than full-res.
+    downscale = 3 if duration_s > 1800 else 2
+    frame_skip = 1 if duration_s > 600 else 0
+    raw = detect_raw_shots(video_path, downscale=downscale, frame_skip=frame_skip)
     bounded = apply_form_factor_constraints(raw, duration_s)
 
     shots: List[Shot] = []
