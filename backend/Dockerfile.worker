@@ -14,12 +14,14 @@ ENV PYTHONUNBUFFERED=1 \
     TORCH_HOME=/models
 
 # System libs: ffmpeg (transcode/slice), libGL + glib (opencv-headless),
-# git (some pip deps fetch from VCS).
+# git (some pip deps fetch from VCS), build-essential (insightface builds a
+# C++/Cython extension from source — the base image ships no compiler).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         libgl1 \
         libglib2.0-0 \
         git \
+        build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app/backend
