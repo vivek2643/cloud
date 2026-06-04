@@ -4,6 +4,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.auth import get_current_user_id
+from app.config import get_settings
 from app.services.r2 import generate_presigned_put
 from app.services.supabase_client import get_supabase
 from app.models.schemas import PresignRequest, PresignResponse, FileResponse
@@ -61,16 +62,24 @@ def _enqueue_l1(file_id: str, r2_key: str) -> bool:
     """
     Defer the L1 orchestrator onto procrastinate. Returns True on success.
 
-    Falls back gracefully so that completing the upload still succeeds even if
-    the worker DB connection isn't configured -- the file just stays in
-    l1_status='pending' until DATABASE_URL is set and a worker is running.
+    Uses a short-lived App with its OWN connector per call instead of the shared
+    global `proc_app`. FastAPI runs these sync endpoints in a threadpool, so two
+    uploads finishing at once both ran `with proc_app.open(): ... ` on the same
+    global app -- the first thread's context-exit closed the connector pool out
+    from under the second thread's defer(), which then raised, got swallowed, and
+    left that file stuck at l1_status='pending' with no job ever enqueued. A
+    per-call connector is isolated, so concurrent completes can't race.
+
+    `configure_task` defers by task name, so the API process doesn't import the
+    heavy ML task modules. Still best-effort: if DATABASE_URL isn't set the
+    upload itself succeeds and the file stays pending until a worker is up.
     """
     try:
-        from app.services.jobs import app as proc_app, register_tasks
+        from procrastinate import App, PsycopgConnector
 
-        register_tasks()
-        with proc_app.open():
-            proc_app.tasks["l1_orchestrate"].defer(file_id=file_id, r2_key=r2_key)
+        enqueue_app = App(connector=PsycopgConnector(conninfo=get_settings().database_url))
+        with enqueue_app.open():
+            enqueue_app.configure_task("l1_orchestrate").defer(file_id=file_id, r2_key=r2_key)
         return True
     except Exception:
         logger.exception("Could not enqueue L1 job for %s; file is still uploaded.", file_id)
