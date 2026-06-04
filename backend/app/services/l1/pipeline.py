@@ -101,6 +101,35 @@ def _set_l1_status(file_id: str, status: str) -> None:
     sb.table("files").update({"l1_status": status}).eq("id", file_id).execute()
 
 
+def _enqueue_l2_if_needed(file_id: str) -> None:
+    """Chain deep L2 enrichment after a successful L1 run so every video gets
+    enriched in the background without any manual trigger.
+
+    Best-effort: uses a short-lived App/connector so it never collides with the
+    worker's own (already-open, async) procrastinate app, and is skipped when
+    L2 is already running/ready (L2 itself is idempotent, but this avoids
+    redundant queue churn on an L1 re-run).
+    """
+    try:
+        with _pg_conn() as conn:
+            row = conn.execute(
+                "select l2_status from files where id = %s", (file_id,)
+            ).fetchone()
+        l2 = row[0] if row else None
+        if l2 in ("running", "ready"):
+            logger.info("L2 already %s for %s; not re-enqueuing.", l2, file_id)
+            return
+
+        from procrastinate import App, PsycopgConnector
+
+        enqueue_app = App(connector=PsycopgConnector(conninfo=get_settings().database_url))
+        with enqueue_app.open():
+            enqueue_app.configure_task("l2_enrich_file").defer(file_id=file_id)
+        logger.info("Auto-enqueued L2 enrichment for %s.", file_id)
+    except Exception:
+        logger.exception("L1 done but auto-enqueue of L2 failed for %s.", file_id)
+
+
 # --- Stage 1: proxy + thumb (refactor of existing process_video) ---------
 
 def _stage1_proxy(file_id: str, raw_path: str, tmpdir: str) -> tuple[float, int, int]:
@@ -507,6 +536,9 @@ def l1_orchestrate(file_id: str, r2_key: str) -> None:
             logger.info("L1 analysis written to %s", log_path)
         except Exception:
             logger.exception("L1 succeeded but writing the audit log failed for %s", file_id)
+
+        # Every video flows L1 -> L2 automatically, in the background.
+        _enqueue_l2_if_needed(file_id)
     except Exception:
         logger.exception("L1 failed for %s", file_id)
         _set_l1_status(file_id, "failed")

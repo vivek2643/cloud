@@ -50,11 +50,16 @@ def list_l1_analyses(user_id: str, limit: int = 200) -> List[Dict[str, Any]]:
             f.duration_seconds as duration_seconds,
             f.created_at    as created_at,
             (select count(*) from shots s where s.file_id = f.id) as shot_count,
-            (select extract(epoch from (max(pj.finished_at) - min(pj.started_at)))
+            -- Sum of per-stage durations (not the start->end span) so a
+            -- failed-then-retried stage doesn't inflate the number with the
+            -- idle gap between attempts. The serial L1 pipeline runs stages
+            -- back-to-back, so this equals real compute time.
+            (select extract(epoch from sum(pj.finished_at - pj.started_at))
                from processing_jobs pj
               where pj.file_id = f.id
                 and pj.stage = any(%s)
-                and pj.started_at is not null) as l1_seconds,
+                and pj.started_at is not null
+                and pj.finished_at is not null) as l1_seconds,
             (select max(pj.finished_at)
                from processing_jobs pj
               where pj.file_id = f.id and pj.stage = any(%s)) as l1_finished_at
