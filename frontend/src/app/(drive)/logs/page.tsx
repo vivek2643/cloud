@@ -6,37 +6,44 @@ import { useAuthStore } from "@/stores/auth-store";
 import {
   listEditLogs,
   listL1Logs,
+  listL2Logs,
   type EditLogListItem,
   type L1LogListItem,
+  type L2LogListItem,
 } from "@/lib/api";
-import { ScrollText, FileVideo, Sparkles, RefreshCw } from "lucide-react";
+import { ScrollText, FileVideo, Layers, Sparkles, RefreshCw } from "lucide-react";
 
-type Tab = "edits" | "l1";
+type Tab = "edits" | "l1" | "l2";
 
-function formatBytes(b: number) {
-  if (b < 1024) return `${b} B`;
-  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
-  return `${(b / 1024 / 1024).toFixed(1)} MB`;
-}
-
-function statusColor(status: string) {
+function statusColor(status: string | null) {
   switch (status) {
     case "ok":
+    case "ready":
       return "var(--accent)";
     case "failed":
       return "#ef4444";
     case "started":
+    case "running":
       return "#f59e0b";
     default:
       return "var(--muted)";
   }
 }
 
+function formatSeconds(s: number | null) {
+  if (s == null) return "—";
+  if (s < 60) return `${s.toFixed(1)}s`;
+  const m = Math.floor(s / 60);
+  const rem = Math.round(s % 60);
+  return `${m}m ${rem}s`;
+}
+
 export default function LogsPage() {
   const session = useAuthStore((s) => s.session);
-  const [tab, setTab] = useState<Tab>("edits");
+  const [tab, setTab] = useState<Tab>("l1");
   const [edits, setEdits] = useState<EditLogListItem[]>([]);
   const [l1, setL1] = useState<L1LogListItem[]>([]);
+  const [l2, setL2] = useState<L2LogListItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -45,12 +52,14 @@ export default function LogsPage() {
     setLoading(true);
     setError(null);
     try {
-      const [e, l] = await Promise.all([
+      const [e, l, l2res] = await Promise.all([
         listEditLogs(session.access_token),
         listL1Logs(session.access_token),
+        listL2Logs(session.access_token),
       ]);
       setEdits(e.items);
       setL1(l.items);
+      setL2(l2res.items);
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -82,39 +91,31 @@ export default function LogsPage() {
       </div>
 
       <p className="mb-6 text-sm" style={{ color: "var(--muted)" }}>
-        Every L1 indexing run and every AI edit request is written to{" "}
-        <code className="rounded px-1.5 py-0.5 text-xs" style={{ background: "var(--border)" }}>
-          backend/logs/
-        </code>{" "}
-        as a JSON file. Files survive server restarts so you can always inspect what the
-        system thought of your video and how it built each timeline.
+        Per-video <strong>L1</strong> (fast index) and <strong>L2</strong> (deep enrichment)
+        analyses, sourced live from the database so they show up no matter which worker ran
+        them. Each row includes how long the analysis took, in seconds.
       </p>
 
       <div className="mb-4 flex gap-1 border-b" style={{ borderColor: "var(--border)" }}>
-        <button
-          onClick={() => setTab("edits")}
-          className="flex items-center gap-2 px-4 py-2 text-sm transition-colors"
-          style={{
-            borderBottom: tab === "edits" ? "2px solid var(--accent)" : "2px solid transparent",
-            color: tab === "edits" ? "var(--foreground)" : "var(--muted)",
-            fontWeight: tab === "edits" ? 600 : 400,
-          }}
-        >
-          <Sparkles size={14} />
-          Edit requests ({edits.length})
-        </button>
-        <button
-          onClick={() => setTab("l1")}
-          className="flex items-center gap-2 px-4 py-2 text-sm transition-colors"
-          style={{
-            borderBottom: tab === "l1" ? "2px solid var(--accent)" : "2px solid transparent",
-            color: tab === "l1" ? "var(--foreground)" : "var(--muted)",
-            fontWeight: tab === "l1" ? 600 : 400,
-          }}
-        >
-          <FileVideo size={14} />
-          L1 analyses ({l1.length})
-        </button>
+        {([
+          { id: "l1" as Tab, label: `L1 analyses (${l1.length})`, icon: FileVideo },
+          { id: "l2" as Tab, label: `L2 analyses (${l2.length})`, icon: Layers },
+          { id: "edits" as Tab, label: `Edit requests (${edits.length})`, icon: Sparkles },
+        ]).map(({ id, label, icon: Icon }) => (
+          <button
+            key={id}
+            onClick={() => setTab(id)}
+            className="flex items-center gap-2 px-4 py-2 text-sm transition-colors"
+            style={{
+              borderBottom: tab === id ? "2px solid var(--accent)" : "2px solid transparent",
+              color: tab === id ? "var(--foreground)" : "var(--muted)",
+              fontWeight: tab === id ? 600 : 400,
+            }}
+          >
+            <Icon size={14} />
+            {label}
+          </button>
+        ))}
       </div>
 
       {error && (
@@ -214,9 +215,11 @@ export default function LogsPage() {
             <table className="w-full text-sm">
               <thead style={{ background: "var(--sidebar)", color: "var(--muted)" }}>
                 <tr>
-                  <th className="px-4 py-2 text-left font-medium">File ID</th>
-                  <th className="px-4 py-2 text-right font-medium">Size</th>
-                  <th className="px-4 py-2 text-left font-medium">Last analyzed</th>
+                  <th className="px-4 py-2 text-left font-medium">File</th>
+                  <th className="px-4 py-2 text-left font-medium">Status</th>
+                  <th className="px-4 py-2 text-right font-medium">Shots</th>
+                  <th className="px-4 py-2 text-right font-medium">Time taken</th>
+                  <th className="px-4 py-2 text-left font-medium">Analyzed</th>
                 </tr>
               </thead>
               <tbody>
@@ -232,14 +235,89 @@ export default function LogsPage() {
                         className="hover:underline"
                         style={{ color: "var(--foreground)" }}
                       >
-                        <code className="text-xs">{item.file_id}</code>
+                        {item.name || item.file_id}
                       </Link>
                     </td>
+                    <td className="px-4 py-2">
+                      <span
+                        className="rounded-full px-2 py-0.5 text-xs"
+                        style={{ background: "var(--border)", color: statusColor(item.l1_status) }}
+                      >
+                        {item.l1_status}
+                      </span>
+                    </td>
                     <td className="px-4 py-2 text-right tabular-nums" style={{ color: "var(--muted)" }}>
-                      {formatBytes(item.size_bytes)}
+                      {item.shot_count}
+                    </td>
+                    <td
+                      className="px-4 py-2 text-right tabular-nums font-medium"
+                      style={{ color: item.l1_seconds != null ? "var(--foreground)" : "var(--muted)" }}
+                    >
+                      {formatSeconds(item.l1_seconds)}
                     </td>
                     <td className="px-4 py-2 text-xs" style={{ color: "var(--muted)" }}>
-                      {new Date(item.modified_at).toLocaleString()}
+                      {item.analyzed_at ? new Date(item.analyzed_at).toLocaleString() : "—"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      {tab === "l2" && (
+        <div className="overflow-hidden rounded-lg border" style={{ borderColor: "var(--border)" }}>
+          {l2.length === 0 ? (
+            <div className="px-4 py-8 text-center text-sm" style={{ color: "var(--muted)" }}>
+              No L2 analyses yet. Deep enrichment runs in the background after upload.
+            </div>
+          ) : (
+            <table className="w-full text-sm">
+              <thead style={{ background: "var(--sidebar)", color: "var(--muted)" }}>
+                <tr>
+                  <th className="px-4 py-2 text-left font-medium">File</th>
+                  <th className="px-4 py-2 text-left font-medium">Status</th>
+                  <th className="px-4 py-2 text-right font-medium">Enriched shots</th>
+                  <th className="px-4 py-2 text-right font-medium">Time taken</th>
+                  <th className="px-4 py-2 text-left font-medium">Analyzed</th>
+                </tr>
+              </thead>
+              <tbody>
+                {l2.map((item) => (
+                  <tr
+                    key={item.file_id}
+                    className="border-t hover:bg-[var(--sidebar)]"
+                    style={{ borderColor: "var(--border)" }}
+                  >
+                    <td className="px-4 py-2">
+                      <Link
+                        href={`/logs/l1/${item.file_id}`}
+                        className="hover:underline"
+                        style={{ color: "var(--foreground)" }}
+                      >
+                        {item.name || item.file_id}
+                      </Link>
+                    </td>
+                    <td className="px-4 py-2">
+                      <span
+                        className="rounded-full px-2 py-0.5 text-xs"
+                        style={{ background: "var(--border)", color: statusColor(item.l2_status) }}
+                      >
+                        {item.l2_status ?? "—"}
+                      </span>
+                    </td>
+                    <td className="px-4 py-2 text-right tabular-nums" style={{ color: "var(--muted)" }}>
+                      {item.enriched_shots} / {item.shot_count}
+                    </td>
+                    <td
+                      className="px-4 py-2 text-right tabular-nums font-medium"
+                      style={{ color: item.l2_seconds != null ? "var(--foreground)" : "var(--muted)" }}
+                    >
+                      {formatSeconds(item.l2_seconds)}
+                    </td>
+                    <td className="px-4 py-2 text-xs" style={{ color: "var(--muted)" }}>
+                      {item.analyzed_at ? new Date(item.analyzed_at).toLocaleString() : "—"}
                     </td>
                   </tr>
                 ))}

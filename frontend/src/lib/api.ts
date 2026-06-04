@@ -821,8 +821,23 @@ export interface EditLogListItem {
 
 export interface L1LogListItem {
   file_id: string;
-  size_bytes: number;
-  modified_at: string;
+  name: string;
+  l1_status: string;
+  l2_status: string | null;
+  duration_seconds: number | null;
+  shot_count: number;
+  l1_seconds: number | null;
+  analyzed_at: string | null;
+}
+
+export interface L2LogListItem {
+  file_id: string;
+  name: string;
+  l2_status: string | null;
+  shot_count: number;
+  enriched_shots: number;
+  l2_seconds: number | null;
+  analyzed_at: string | null;
 }
 
 export function listEditLogs(token: string, limit = 50) {
@@ -839,4 +854,12 @@ export function listL1Logs(token: string) {
 
 export function getL1Log(fileId: string, token: string) {
   return request<Record<string, unknown>>(`/api/logs/l1/${fileId}`, { token });
+}
+
+export function listL2Logs(token: string) {
+  return request<{ items: L2LogListItem[] }>(`/api/logs/l2`, { token });
+}
+
+export function getL2Log(fileId: string, token: string) {
+  return request<Record<string, unknown>>(`/api/logs/l2/${fileId}`, { token });
 }

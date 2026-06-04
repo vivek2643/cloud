@@ -6,7 +6,7 @@ import { useDriveStore } from "@/stores/drive-store";
 import { useAuthStore } from "@/stores/auth-store";
 import { FileIcon } from "./file-icon";
 import { formatBytes, formatDuration } from "@/lib/utils";
-import { getFilePlaybackUrl } from "@/lib/api";
+import { getFilePlaybackUrl, deleteFile } from "@/lib/api";
 import {
   MoreHorizontal,
   Loader2,
@@ -16,6 +16,8 @@ import {
   VolumeX,
   CheckCircle2,
   Circle,
+  ExternalLink,
+  Trash2,
 } from "lucide-react";
 import type { Folder, FileRecord } from "@/lib/api";
 
@@ -35,7 +37,37 @@ export function DriveContent({ onFileContextMenu, onFolderContextMenu }: DriveCo
     searchQuery,
     aiPanelOpen,
     toggleSelected,
+    removeFile,
   } = useDriveStore();
+  const session = useAuthStore((s) => s.session);
+
+  const [fileMenu, setFileMenu] = useState<{ file: FileRecord; x: number; y: number } | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  // Either a right-click or the row's "⋯" button opens our menu. If the parent
+  // passed its own handler we honour it too (none currently do).
+  function handleFileMenu(file: FileRecord, e: React.MouseEvent) {
+    onFileContextMenu?.(file, e);
+    setFileMenu({ file, x: e.clientX, y: e.clientY });
+  }
+
+  async function handleDelete(file: FileRecord) {
+    setFileMenu(null);
+    if (!session?.access_token) return;
+    const ok = window.confirm(
+      `Delete "${file.name}"?\n\nThis permanently removes the video and all of its L1/L2 analysis. This cannot be undone.`,
+    );
+    if (!ok) return;
+    setDeletingId(file.id);
+    try {
+      await deleteFile(file.id, session.access_token);
+      removeFile(file.id);
+    } catch (err) {
+      window.alert(`Could not delete the video: ${(err as Error).message}`);
+    } finally {
+      setDeletingId(null);
+    }
+  }
 
   // Client-side filter driven by the top search bar.
   const q = searchQuery.trim().toLowerCase();
@@ -77,10 +109,11 @@ export function DriveContent({ onFileContextMenu, onFolderContextMenu }: DriveCo
           folders={visibleFolders}
           files={visibleFiles}
           selectedIds={selectedIds}
+          deletingId={deletingId}
           onToggleSelect={toggleSelected}
           onNavigate={(id) => router.push(`/drive/folder/${id}`)}
           onOpenFile={(id) => router.push(`/file/${id}`)}
-          onFileContextMenu={onFileContextMenu}
+          onFileContextMenu={handleFileMenu}
           onFolderContextMenu={onFolderContextMenu}
         />
       ) : (
@@ -88,15 +121,83 @@ export function DriveContent({ onFileContextMenu, onFolderContextMenu }: DriveCo
           folders={visibleFolders}
           files={visibleFiles}
           selectedIds={selectedIds}
+          deletingId={deletingId}
           compact={aiPanelOpen}
           onToggleSelect={toggleSelected}
           onNavigate={(id) => router.push(`/drive/folder/${id}`)}
           onOpenFile={(id) => router.push(`/file/${id}`)}
-          onFileContextMenu={onFileContextMenu}
+          onFileContextMenu={handleFileMenu}
           onFolderContextMenu={onFolderContextMenu}
         />
       )}
+
+      {fileMenu && (
+        <FileMenu
+          file={fileMenu.file}
+          x={fileMenu.x}
+          y={fileMenu.y}
+          onClose={() => setFileMenu(null)}
+          onOpen={() => {
+            const id = fileMenu.file.id;
+            setFileMenu(null);
+            router.push(`/file/${id}`);
+          }}
+          onDelete={() => handleDelete(fileMenu.file)}
+        />
+      )}
     </div>
+  );
+}
+
+// --- Context menu ---
+
+function FileMenu({
+  file,
+  x,
+  y,
+  onClose,
+  onOpen,
+  onDelete,
+}: {
+  file: FileRecord;
+  x: number;
+  y: number;
+  onClose: () => void;
+  onOpen: () => void;
+  onDelete: () => void;
+}) {
+  // Clamp so the menu never spills off the right/bottom edge.
+  const MENU_W = 180;
+  const MENU_H = 92;
+  const left = Math.min(x, (typeof window !== "undefined" ? window.innerWidth : x) - MENU_W - 8);
+  const top = Math.min(y, (typeof window !== "undefined" ? window.innerHeight : y) - MENU_H - 8);
+  return (
+    <>
+      <div className="fixed inset-0 z-40" onClick={onClose} onContextMenu={(e) => { e.preventDefault(); onClose(); }} />
+      <div
+        className="fixed z-50 overflow-hidden rounded-lg border py-1 shadow-xl"
+        style={{ left, top, minWidth: MENU_W, background: "var(--background)", borderColor: "var(--border)" }}
+      >
+        <div className="truncate px-3 pb-1 pt-0.5 text-[11px]" style={{ color: "var(--muted)" }}>
+          {file.name}
+        </div>
+        <button
+          onClick={onOpen}
+          className="flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm transition-colors hover:bg-[var(--accent-soft)]"
+        >
+          <ExternalLink size={15} style={{ color: "var(--muted)" }} />
+          Open
+        </button>
+        <button
+          onClick={onDelete}
+          className="flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm transition-colors hover:bg-[var(--accent-soft)]"
+          style={{ color: "#ef4444" }}
+        >
+          <Trash2 size={15} />
+          Delete
+        </button>
+      </div>
+    </>
   );
 }
 
@@ -106,6 +207,7 @@ function GridView({
   folders,
   files,
   selectedIds,
+  deletingId,
   compact = false,
   onToggleSelect,
   onNavigate,
@@ -116,6 +218,7 @@ function GridView({
   folders: Folder[];
   files: FileRecord[];
   selectedIds: Set<string>;
+  deletingId?: string | null;
   compact?: boolean;
   onToggleSelect: (id: string) => void;
   onNavigate: (id: string) => void;
@@ -165,6 +268,7 @@ function GridView({
                 key={file.id}
                 file={file}
                 selected={selectedIds.has(file.id)}
+                deleting={deletingId === file.id}
                 onToggleSelect={() => onToggleSelect(file.id)}
                 onOpen={() => onOpenFile(file.id)}
                 onContextMenu={(e) => { e.preventDefault(); onFileContextMenu?.(file, e); }}
@@ -180,12 +284,14 @@ function GridView({
 function VideoCard({
   file,
   selected,
+  deleting = false,
   onToggleSelect,
   onOpen,
   onContextMenu,
 }: {
   file: FileRecord;
   selected: boolean;
+  deleting?: boolean;
   onToggleSelect: () => void;
   onOpen: () => void;
   onContextMenu: (e: React.MouseEvent) => void;
@@ -363,10 +469,17 @@ function VideoCard({
           </button>
         )}
 
-        {isProcessing && (
+        {isProcessing && !deleting && (
           <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-black/40">
             <Loader2 size={20} className="animate-spin text-white" />
             <span className="text-xs text-white/80">Processing…</span>
+          </div>
+        )}
+
+        {deleting && (
+          <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-2 bg-black/60">
+            <Loader2 size={20} className="animate-spin text-white" />
+            <span className="text-xs text-white/80">Deleting…</span>
           </div>
         )}
 
@@ -408,6 +521,7 @@ function ListView({
   folders,
   files,
   selectedIds,
+  deletingId,
   onToggleSelect,
   onNavigate,
   onOpenFile,
@@ -417,6 +531,7 @@ function ListView({
   folders: Folder[];
   files: FileRecord[];
   selectedIds: Set<string>;
+  deletingId?: string | null;
   onToggleSelect: (id: string) => void;
   onNavigate: (id: string) => void;
   onOpenFile: (id: string) => void;
@@ -458,6 +573,7 @@ function ListView({
           ))}
           {files.map((file) => {
             const sel = selectedIds.has(file.id);
+            const isDeleting = deletingId === file.id;
             return (
               <tr
                 key={file.id}
@@ -467,6 +583,8 @@ function ListView({
                 style={{
                   borderColor: "var(--border)",
                   background: sel ? "var(--accent-soft)" : undefined,
+                  opacity: isDeleting ? 0.5 : 1,
+                  pointerEvents: isDeleting ? "none" : undefined,
                 }}
               >
                 <td className="w-8 px-2 py-2.5">
@@ -482,7 +600,7 @@ function ListView({
                 <td className="flex items-center gap-2.5 px-4 py-2.5">
                   <FileIcon type={file.file_type as "video"} size={16} />
                   <span className="truncate">{file.name}</span>
-                  {file.status === "processing" && (
+                  {(file.status === "processing" || isDeleting) && (
                     <Loader2 size={14} className="animate-spin" style={{ color: "var(--accent)" }} />
                   )}
                 </td>

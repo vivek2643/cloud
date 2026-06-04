@@ -51,6 +51,49 @@ def _set_l2_status(file_id: str, status: Optional[str]) -> None:
     sb.table("files").update({"l2_status": status}).eq("id", file_id).execute()
 
 
+# --- L2 wall-clock timing -------------------------------------------------
+# We reuse the same processing_jobs ledger the L1 pipeline uses, under a
+# synthetic stage name 'l2', so the logs UI can show how long enrichment took
+# (finished_at - started_at). One row per file; re-running resets the clock.
+
+def _l2_timing_begin(conn: psycopg.Connection, file_id: str) -> None:
+    conn.execute(
+        """
+        insert into processing_jobs (file_id, stage, status, started_at, attempts)
+        values (%s, 'l2', 'running', now(), 1)
+        on conflict (file_id, stage) do update set
+            status = 'running',
+            started_at = now(),
+            finished_at = null,
+            attempts = processing_jobs.attempts + 1,
+            error = null
+        """,
+        (file_id,),
+    )
+
+
+def _l2_timing_done(conn: psycopg.Connection, file_id: str) -> None:
+    conn.execute(
+        """
+        update processing_jobs
+           set status = 'done', finished_at = now(), error = null
+         where file_id = %s and stage = 'l2'
+        """,
+        (file_id,),
+    )
+
+
+def _l2_timing_fail(conn: psycopg.Connection, file_id: str, err: str) -> None:
+    conn.execute(
+        """
+        update processing_jobs
+           set status = 'failed', finished_at = now(), error = %s
+         where file_id = %s and stage = 'l2'
+        """,
+        (err[:8000], file_id),
+    )
+
+
 def _fetch_target_shots(
     conn: psycopg.Connection,
     file_id: Optional[str],
@@ -281,6 +324,7 @@ def enrich(
             if not file_row:
                 continue
             _set_l2_status(fid, "running")
+            _l2_timing_begin(conn, fid)
             try:
                 with tempfile.TemporaryDirectory() as tmp:
                     raw_path = os.path.join(tmp, "raw")
@@ -336,6 +380,7 @@ def enrich(
                         except Exception:
                             logger.exception("Stage D writeback failed for shot %s", shot_id)
 
+                _l2_timing_done(conn, fid)
                 _set_l2_status(fid, "ready")
                 files_processed += 1
                 try:
@@ -343,8 +388,12 @@ def enrich(
                     audit_log.write_l1_analysis(fid, snap)
                 except Exception:
                     logger.exception("L2 succeeded but writing the audit log failed for %s", fid)
-            except Exception:
+            except Exception as exc:
                 logger.exception("L2 enrich failed for file %s", fid)
+                try:
+                    _l2_timing_fail(conn, fid, str(exc))
+                except Exception:
+                    logger.exception("Failed to record L2 timing failure for %s", fid)
                 _set_l2_status(fid, "failed")
 
     return {"shots_processed": shots_processed, "files_processed": files_processed}

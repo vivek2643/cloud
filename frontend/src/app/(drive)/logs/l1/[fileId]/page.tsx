@@ -28,7 +28,13 @@ interface L1Log {
     segments?: Array<Record<string, unknown>>;
   } | null;
   audio_features?: Record<string, unknown> | null;
-  processing_jobs?: Array<{ stage: string; status: string; attempts?: number }>;
+  processing_jobs?: Array<{
+    stage: string;
+    status: string;
+    attempts?: number;
+    started_at?: string | null;
+    finished_at?: string | null;
+  }>;
   [k: string]: unknown;
 }
 
@@ -211,10 +217,18 @@ export default function L1LogDetailPage() {
                     <th className="px-3 py-2 text-left font-medium">Stage</th>
                     <th className="px-3 py-2 text-left font-medium">Status</th>
                     <th className="px-3 py-2 text-right font-medium">Attempts</th>
+                    <th className="px-3 py-2 text-right font-medium">Duration</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {log.processing_jobs.map((j) => (
+                  {log.processing_jobs.map((j) => {
+                    const secs =
+                      j.started_at && j.finished_at
+                        ? (new Date(j.finished_at).getTime() -
+                            new Date(j.started_at).getTime()) /
+                          1000
+                        : null;
+                    return (
                     <tr
                       key={j.stage}
                       className="border-t"
@@ -235,8 +249,12 @@ export default function L1LogDetailPage() {
                         {j.status}
                       </td>
                       <td className="px-3 py-2 text-right tabular-nums">{j.attempts}</td>
+                      <td className="px-3 py-2 text-right tabular-nums" style={{ color: "var(--muted)" }}>
+                        {secs == null ? "—" : `${secs.toFixed(1)}s`}
+                      </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </section>

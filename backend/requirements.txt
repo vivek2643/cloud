@@ -13,6 +13,11 @@ procrastinate[psycopg]==3.7.0
 faster-whisper==1.1.1
 scenedetect[opencv]==0.6.5
 transformers==4.49.0
+# SigLIP's tokenizer (SiglipTokenizer) is SentencePiece-backed; transformers
+# does NOT pull these in automatically, so the embeddings stage crashes without
+# them. protobuf is required by the SentencePiece -> fast-tokenizer conversion.
+sentencepiece==0.2.0
+protobuf==5.29.3
 # CPU build of torch; on Apple Silicon this resolves to the universal wheel.
 torch==2.6.0
 torchvision==0.21.0

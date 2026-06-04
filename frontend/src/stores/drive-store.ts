@@ -59,6 +59,7 @@ interface DriveState {
   setCurrentFolder: (id: string | null) => void;
   setFolders: (folders: Folder[]) => void;
   setFiles: (files: FileRecord[]) => void;
+  removeFile: (id: string) => void;
   setLoading: (loading: boolean) => void;
   setViewMode: (mode: ViewMode) => void;
   setSearchQuery: (q: string) => void;
@@ -101,6 +102,12 @@ export const useDriveStore = create<DriveState>((set) => ({
   setCurrentFolder: (id) => set({ currentFolderId: id, selectedIds: new Set() }),
   setFolders: (folders) => set({ folders }),
   setFiles: (files) => set({ files }),
+  removeFile: (id) =>
+    set((state) => {
+      const next = new Set(state.selectedIds);
+      next.delete(id);
+      return { files: state.files.filter((f) => f.id !== id), selectedIds: next };
+    }),
   setLoading: (loading) => set({ loading }),
   setViewMode: (mode) => set({ viewMode: mode }),
   setSearchQuery: (q) => set({ searchQuery: q }),

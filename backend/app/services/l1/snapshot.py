@@ -26,6 +26,108 @@ def _row_to_dict(row) -> Optional[Dict[str, Any]]:
     return {k: v for k, v in row.items()}
 
 
+_L1_STAGES = ("proxy", "transcript", "shots", "embeddings", "audio_features")
+
+
+def _iso(v) -> Optional[str]:
+    return v.isoformat(timespec="seconds") if v is not None else None
+
+
+def list_l1_analyses(user_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+    """List every file that has at least one L1 stage recorded, with the
+    L1 wall-clock duration (span of all L1 processing_jobs) in seconds.
+
+    Sourced entirely from Postgres so it works no matter which machine
+    (local or a remote GPU worker) actually ran the analysis.
+    """
+    settings = get_settings()
+    sql = """
+        select
+            f.id            as file_id,
+            f.name          as name,
+            f.l1_status     as l1_status,
+            f.l2_status     as l2_status,
+            f.duration_seconds as duration_seconds,
+            f.created_at    as created_at,
+            (select count(*) from shots s where s.file_id = f.id) as shot_count,
+            (select extract(epoch from (max(pj.finished_at) - min(pj.started_at)))
+               from processing_jobs pj
+              where pj.file_id = f.id
+                and pj.stage = any(%s)
+                and pj.started_at is not null) as l1_seconds,
+            (select max(pj.finished_at)
+               from processing_jobs pj
+              where pj.file_id = f.id and pj.stage = any(%s)) as l1_finished_at
+        from files f
+        where f.user_id = %s
+          and exists (
+              select 1 from processing_jobs pj2
+               where pj2.file_id = f.id and pj2.stage = any(%s)
+          )
+        order by f.created_at desc
+        limit %s
+    """
+    stages = list(_L1_STAGES)
+    out: List[Dict[str, Any]] = []
+    with psycopg.connect(settings.database_url, autocommit=True, row_factory=dict_row) as conn:
+        cur = conn.execute(sql, (stages, stages, user_id, stages, limit))
+        for r in cur.fetchall():
+            secs = r["l1_seconds"]
+            out.append({
+                "file_id": str(r["file_id"]),
+                "name": r["name"],
+                "l1_status": r["l1_status"],
+                "l2_status": r["l2_status"],
+                "duration_seconds": r["duration_seconds"],
+                "shot_count": r["shot_count"],
+                "l1_seconds": round(float(secs), 1) if secs is not None else None,
+                "analyzed_at": _iso(r["l1_finished_at"]) or _iso(r["created_at"]),
+            })
+    return out
+
+
+def list_l2_analyses(user_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+    """List every file that has had L2 enrichment started/finished, with the
+    L2 wall-clock duration (stage='l2' processing_jobs row) in seconds."""
+    settings = get_settings()
+    sql = """
+        select
+            f.id            as file_id,
+            f.name          as name,
+            f.l2_status     as l2_status,
+            f.created_at    as created_at,
+            (select count(*) from shots s where s.file_id = f.id) as shot_count,
+            (select count(*) from shots s
+              where s.file_id = f.id and s.dinov2_embedding is not null) as enriched_shots,
+            (select extract(epoch from (pj.finished_at - pj.started_at))
+               from processing_jobs pj
+              where pj.file_id = f.id and pj.stage = 'l2'
+                and pj.started_at is not null and pj.finished_at is not null) as l2_seconds,
+            (select pj.finished_at
+               from processing_jobs pj
+              where pj.file_id = f.id and pj.stage = 'l2') as l2_finished_at
+        from files f
+        where f.user_id = %s and f.l2_status is not null
+        order by f.created_at desc
+        limit %s
+    """
+    out: List[Dict[str, Any]] = []
+    with psycopg.connect(settings.database_url, autocommit=True, row_factory=dict_row) as conn:
+        cur = conn.execute(sql, (user_id, limit))
+        for r in cur.fetchall():
+            secs = r["l2_seconds"]
+            out.append({
+                "file_id": str(r["file_id"]),
+                "name": r["name"],
+                "l2_status": r["l2_status"],
+                "shot_count": r["shot_count"],
+                "enriched_shots": r["enriched_shots"],
+                "l2_seconds": round(float(secs), 1) if secs is not None else None,
+                "analyzed_at": _iso(r["l2_finished_at"]) or _iso(r["created_at"]),
+            })
+    return out
+
+
 def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
     """Read every L1-relevant row for `file_id` and return a clean JSON-able dict.
 
