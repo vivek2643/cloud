@@ -77,11 +77,14 @@ class _WhisperEngine:
     def get(cls):
         if cls._model is None:
             from faster_whisper import WhisperModel
-            logger.info("Loading Whisper large-v3-turbo (int8, CPU)...")
+            from app.services.ml_device import whisper_device
+
+            device, compute_type = whisper_device()
+            logger.info("Loading Whisper large-v3-turbo (%s, %s)...", compute_type, device)
             cls._model = WhisperModel(
                 "large-v3-turbo",
-                device="cpu",
-                compute_type="int8",
+                device=device,
+                compute_type=compute_type,
             )
             logger.info("Whisper loaded.")
         return cls._model

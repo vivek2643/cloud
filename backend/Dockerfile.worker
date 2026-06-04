@@ -1,0 +1,36 @@
+# GPU worker image for the L1/L2 ingest pipeline.
+#
+# Base ships torch 2.6.0 + CUDA 12.4 + cuDNN 9 — matches requirements.txt's
+# torch pin and what faster-whisper's CTranslate2 4.x needs for fp16 on GPU.
+# The worker is stateless: it pulls jobs from Supabase Postgres (Procrastinate)
+# and reads/writes media on R2, so it needs no exposed ports — only env vars.
+FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HOME=/models \
+    # Pre-create a cache dir for model weights (mount a volume here to persist
+    # across pod restarts and skip re-downloading ~3-4 GB of weights).
+    TORCH_HOME=/models
+
+# System libs: ffmpeg (transcode/slice), libGL + glib (opencv-headless),
+# git (some pip deps fetch from VCS).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        libgl1 \
+        libglib2.0-0 \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app/backend
+
+# torch / torchvision (2.6.0 / 0.21.0) are already in the base image as CUDA
+# builds; the pins in requirements.txt resolve as already-satisfied, so pip
+# keeps the GPU build instead of pulling the CPU wheel.
+COPY backend/requirements.txt ./requirements.txt
+RUN pip install -r requirements.txt
+
+COPY backend/ /app/backend/
+
+# Stateless worker; no EXPOSE needed. Provide env at runtime (see docs).
+CMD ["python", "worker.py"]

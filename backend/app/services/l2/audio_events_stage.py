@@ -54,8 +54,11 @@ class _PannsEngine:
     def get(cls):
         if cls._tagger is None:
             from panns_inference import AudioTagging  # type: ignore
-            logger.info("Loading panns CNN14 audio tagger (CPU)...")
-            cls._tagger = AudioTagging(checkpoint_path=None, device="cpu")
+            from app.services.ml_device import torch_device
+
+            device = torch_device()
+            logger.info("Loading panns CNN14 audio tagger (%s)...", device)
+            cls._tagger = AudioTagging(checkpoint_path=None, device=device)
             logger.info("panns tagger ready.")
         return cls._tagger
 

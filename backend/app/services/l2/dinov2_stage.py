@@ -32,18 +32,23 @@ class _DinoEngine:
     _processor = None
     _torch = None
 
+    _device = "cpu"
+
     @classmethod
     def get(cls):
         if cls._model is None:
             from transformers import AutoImageProcessor, AutoModel
             import torch
 
-            logger.info("Loading DINOv2 base (CPU)...")
+            from app.services.ml_device import torch_device
+
+            cls._device = torch_device()
+            logger.info("Loading DINOv2 base (%s)...", cls._device)
             cls._processor = AutoImageProcessor.from_pretrained(MODEL_ID)
-            cls._model = AutoModel.from_pretrained(MODEL_ID).eval()
+            cls._model = AutoModel.from_pretrained(MODEL_ID).eval().to(cls._device)
             cls._torch = torch
             logger.info("DINOv2 loaded.")
-        return cls._model, cls._processor, cls._torch
+        return cls._model, cls._processor, cls._torch, cls._device
 
 
 def embed_images(image_paths: Sequence[str]) -> np.ndarray:
@@ -52,7 +57,7 @@ def embed_images(image_paths: Sequence[str]) -> np.ndarray:
         return np.zeros((0, EMBED_DIM), dtype=np.float32)
     from PIL import Image
 
-    model, processor, torch = _DinoEngine.get()
+    model, processor, torch, device = _DinoEngine.get()
     out: List[np.ndarray] = []
     with torch.no_grad():
         for i in range(0, len(image_paths), BATCH_SIZE):
@@ -64,12 +69,12 @@ def embed_images(image_paths: Sequence[str]) -> np.ndarray:
                 except Exception:
                     logger.warning("Could not open %s; using black placeholder", p)
                     images.append(Image.new("RGB", (224, 224)))
-            inputs = processor(images=images, return_tensors="pt")
+            inputs = processor(images=images, return_tensors="pt").to(device)
             outputs = model(**inputs)
             # CLS-token pooled output = [batch, hidden]
             cls = outputs.last_hidden_state[:, 0, :]
             cls = cls / cls.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            out.append(cls.cpu().numpy().astype(np.float32))
+            out.append(cls.float().cpu().numpy().astype(np.float32))
     return np.concatenate(out, axis=0) if out else np.zeros((0, EMBED_DIM), dtype=np.float32)
 
 

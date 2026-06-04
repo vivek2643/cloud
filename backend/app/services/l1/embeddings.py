@@ -26,6 +26,7 @@ class _SigLIPEngine:
     """Lazy-loaded singleton so model weights load once per worker process."""
     _model = None
     _processor = None
+    _device = "cpu"
 
     @classmethod
     def get(cls):
@@ -33,12 +34,15 @@ class _SigLIPEngine:
             from transformers import AutoModel, AutoProcessor
             import torch
 
-            logger.info("Loading %s (CPU)...", MODEL_ID)
+            from app.services.ml_device import torch_device
+
+            cls._device = torch_device()
+            logger.info("Loading %s (%s)...", MODEL_ID, cls._device)
             cls._processor = AutoProcessor.from_pretrained(MODEL_ID)
-            cls._model = AutoModel.from_pretrained(MODEL_ID).eval()
+            cls._model = AutoModel.from_pretrained(MODEL_ID).eval().to(cls._device)
             cls._torch = torch
             logger.info("SigLIP loaded.")
-        return cls._model, cls._processor, cls._torch
+        return cls._model, cls._processor, cls._torch, cls._device
 
 
 def embed_images(image_paths: Sequence[str]) -> np.ndarray:
@@ -48,7 +52,7 @@ def embed_images(image_paths: Sequence[str]) -> np.ndarray:
 
     from PIL import Image
 
-    model, processor, torch = _SigLIPEngine.get()
+    model, processor, torch, device = _SigLIPEngine.get()
     out: List[np.ndarray] = []
 
     with torch.no_grad():
@@ -61,17 +65,17 @@ def embed_images(image_paths: Sequence[str]) -> np.ndarray:
                 except Exception:
                     logger.warning("Could not open keyframe %s; using black placeholder", p)
                     images.append(Image.new("RGB", (256, 256)))
-            inputs = processor(images=images, return_tensors="pt")
+            inputs = processor(images=images, return_tensors="pt").to(device)
             features = model.get_image_features(**inputs)
             features = features / features.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            out.append(features.cpu().numpy().astype(np.float32))
+            out.append(features.float().cpu().numpy().astype(np.float32))
 
     return np.concatenate(out, axis=0) if out else np.zeros((0, EMBED_DIM), dtype=np.float32)
 
 
 def embed_text(query: str) -> np.ndarray:
     """Encode a text query for retrieval against shot_embeddings."""
-    model, processor, torch = _SigLIPEngine.get()
+    model, processor, torch, device = _SigLIPEngine.get()
     with torch.no_grad():
         inputs = processor(
             text=[query],
@@ -79,7 +83,7 @@ def embed_text(query: str) -> np.ndarray:
             padding="max_length",
             max_length=64,
             truncation=True,
-        )
+        ).to(device)
         features = model.get_text_features(**inputs)
         features = features / features.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        return features[0].cpu().numpy().astype(np.float32)
+        return features[0].float().cpu().numpy().astype(np.float32)

@@ -1,0 +1,24 @@
+# Keep the GPU worker build context small. Build from repo root:
+#   docker build -f backend/Dockerfile.worker -t <image> .
+.git
+.gitignore
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.mypy_cache/
+
+# Frontend is irrelevant to the worker image.
+frontend/
+
+# Local secrets & envs — never bake into the image (pass at runtime instead).
+.env
+.env.*
+backend/.env
+
+# Local artifacts / audit dumps / venvs.
+**/.venv/
+**/venv/
+backend/audit_logs/
+backend/data/
+docs/
+*.md

@@ -50,9 +50,26 @@ def _warmup() -> None:
 async def main() -> None:
     register_tasks()
     _warmup()
-    logger.info("Worker ready; entering main loop.")
+
+    # Concurrency defaults to 1 (Whisper + SigLIP saturate one CPU). On a GPU
+    # box you can raise it via WORKER_CONCURRENCY, but a single GPU usually
+    # still wants 1 to avoid VRAM contention. WORKER_QUEUES (comma-separated)
+    # restricts which queues this worker pulls; empty = all queues.
+    concurrency = int(os.getenv("WORKER_CONCURRENCY", "1"))
+    queues_env = os.getenv("WORKER_QUEUES", "").strip()
+    queues = [q.strip() for q in queues_env.split(",") if q.strip()] or None
+
+    logger.info(
+        "Worker ready; concurrency=%d queues=%s; entering main loop.",
+        concurrency,
+        queues or "ALL",
+    )
     async with app.open_async():
-        await app.run_worker_async(concurrency=1, install_signal_handlers=True)
+        await app.run_worker_async(
+            concurrency=concurrency,
+            queues=queues,
+            install_signal_handlers=True,
+        )
 
 
 if __name__ == "__main__":
