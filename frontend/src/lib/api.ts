@@ -674,6 +674,37 @@ export function ensureProject(sourceFileIds: string[], token: string, name = "Un
   });
 }
 
+export interface ProjectSummary {
+  id: string;
+  name: string;
+  source_file_ids: string[];
+  updated_at?: string | null;
+  clip_count: number;
+  duration_ms: number;
+  author_kind: "user" | "claude" | "system";
+  version_count: number;
+  thumbnail_url?: string | null;
+}
+
+export function listProjects(token: string) {
+  return request<ProjectSummary[]>(`/api/edl/projects`, { token });
+}
+
+export function renameProject(projectId: string, name: string, token: string) {
+  return request<ProjectMeta>(`/api/edl/projects/${projectId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ name }),
+    token,
+  });
+}
+
+export function deleteProject(projectId: string, token: string) {
+  return request<{ ok: boolean }>(`/api/edl/projects/${projectId}`, {
+    method: "DELETE",
+    token,
+  });
+}
+
 export function getLatestEdl(projectId: string, token: string) {
   return request<EnrichedEdl | null>(`/api/edl/projects/${projectId}/latest`, { token });
 }

@@ -262,6 +262,78 @@ def ensure_project(body: EnsureProjectBody, user_id: str = Depends(get_current_u
     )
 
 
+class ProjectSummary(BaseModel):
+    id: str
+    name: str
+    source_file_ids: List[str]
+    updated_at: Optional[str] = None
+    clip_count: int
+    duration_ms: int
+    author_kind: str
+    version_count: int
+    thumbnail_url: Optional[str] = None
+
+
+class RenameProjectBody(BaseModel):
+    name: str
+
+
+@router.get("/projects", response_model=List[ProjectSummary])
+def list_projects(user_id: str = Depends(get_current_user_id)):
+    """Saved edits for the Edits library: one card per project, newest first."""
+    rows = edl_store.list_project_summaries(user_id)
+    # Batch-resolve a thumbnail for each project's first clip.
+    shot_ids = [r["first_shot_id"] for r in rows if r.get("first_shot_id")]
+    thumb_by_shot: Dict[str, Optional[str]] = {}
+    if shot_ids:
+        try:
+            for cand in fetch_candidates_by_shot_ids(user_id, shot_ids):
+                thumb_by_shot[cand.shot_id] = _thumb_url(cand.keyframe_r2_key)
+        except Exception:
+            logger.exception("list_projects: thumbnail resolution failed")
+    out: List[ProjectSummary] = []
+    for r in rows:
+        out.append(
+            ProjectSummary(
+                id=r["id"],
+                name=r["name"],
+                source_file_ids=r["source_file_ids"],
+                updated_at=r["updated_at"],
+                clip_count=r["clip_count"],
+                duration_ms=r["duration_ms"],
+                author_kind=r["author_kind"],
+                version_count=r["version_count"],
+                thumbnail_url=thumb_by_shot.get(r.get("first_shot_id") or ""),
+            )
+        )
+    return out
+
+
+@router.patch("/projects/{project_id}", response_model=ProjectMeta)
+def rename_project(
+    project_id: str,
+    body: RenameProjectBody,
+    user_id: str = Depends(get_current_user_id),
+):
+    name = (body.name or "").strip() or "Untitled"
+    project = edl_store.rename_project(project_id, user_id, name)
+    if not project:
+        raise HTTPException(status_code=404, detail="project not found")
+    return ProjectMeta(
+        id=project["id"],
+        name=project.get("name") or "Untitled",
+        source_file_ids=project.get("source_file_ids") or [],
+    )
+
+
+@router.delete("/projects/{project_id}")
+def delete_project(project_id: str, user_id: str = Depends(get_current_user_id)):
+    ok = edl_store.delete_project(project_id, user_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="project not found")
+    return {"ok": True}
+
+
 @router.get("/projects/{project_id}/latest", response_model=Optional[EnrichedEdlResponse])
 def get_latest_edl(project_id: str, user_id: str = Depends(get_current_user_id)):
     _require_project(project_id, user_id)

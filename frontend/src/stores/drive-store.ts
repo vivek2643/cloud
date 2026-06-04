@@ -45,6 +45,10 @@ interface DriveState {
   aiScopeFileIds: string[];
   aiTimeline: AiTimelineData | null;
   aiTimelineVisible: boolean;
+  // Who owns the working timeline: a live chat cut, or a saved edit opened
+  // from the Edits library. Keeps the chat panel from clearing a loaded
+  // project just because its own session is empty.
+  aiTimelineSource: "chat" | "project";
   // True when the working timeline has clips (AI cut or manually dropped),
   // so the preview monitor can drop its empty-state placeholder.
   editorHasClips: boolean;
@@ -61,6 +65,11 @@ interface DriveState {
   openAiPanel: (fileIds: string[]) => void;
   closeAiPanel: () => void;
   setAiTimeline: (t: AiTimelineData | null) => void;
+  setAiTimelineSource: (src: "chat" | "project") => void;
+  // Open a saved edit into the docked editor (left media + bottom timeline,
+  // right render/chat). Hydrates the dock and opens the AI panel scoped to the
+  // edit's source files.
+  openSavedEdit: (args: { fileIds: string[]; timeline: AiTimelineData }) => void;
   showAiTimeline: () => void;
   hideAiTimeline: () => void;
   setEditorHasClips: (has: boolean) => void;
@@ -85,6 +94,7 @@ export const useDriveStore = create<DriveState>((set) => ({
   aiScopeFileIds: [],
   aiTimeline: null,
   aiTimelineVisible: true,
+  aiTimelineSource: "chat",
   editorHasClips: false,
   previewVideoEl: null,
 
@@ -97,6 +107,15 @@ export const useDriveStore = create<DriveState>((set) => ({
   openAiPanel: (fileIds) => set({ aiPanelOpen: true, aiScopeFileIds: fileIds }),
   closeAiPanel: () => set({ aiPanelOpen: false, editorHasClips: false }),
   setAiTimeline: (t) => set({ aiTimeline: t }),
+  setAiTimelineSource: (src) => set({ aiTimelineSource: src }),
+  openSavedEdit: ({ fileIds, timeline }) =>
+    set({
+      aiPanelOpen: true,
+      aiScopeFileIds: fileIds,
+      aiTimeline: timeline,
+      aiTimelineSource: "project",
+      aiTimelineVisible: true,
+    }),
   showAiTimeline: () => set({ aiTimelineVisible: true }),
   hideAiTimeline: () => set({ aiTimelineVisible: false }),
   setEditorHasClips: (has) => set({ editorHasClips: has }),

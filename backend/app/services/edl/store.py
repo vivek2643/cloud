@@ -131,6 +131,85 @@ def list_projects(user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
         return [_row_to_project(r) for r in cur.fetchall()]
 
 
+def list_project_summaries(user_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+    """
+    Projects that have at least one committed version, joined with their latest
+    version, for the "Edits" library. Each row carries enough to render a card
+    (clip count, duration, author, first shot id for a thumbnail) without
+    fetching the full enriched EDL.
+    """
+    with _pg() as conn:
+        cur = conn.execute(
+            """
+            select p.id, p.name, p.source_file_ids, p.updated_at,
+                   v.edl_json, v.author_kind, v.created_at as version_created_at,
+                   (select count(*) from public.edl_versions ev
+                      where ev.project_id = p.id) as version_count
+            from public.projects p
+            join lateral (
+                select edl_json, author_kind, created_at
+                from public.edl_versions
+                where project_id = p.id
+                order by created_at desc
+                limit 1
+            ) v on true
+            where p.user_id = %s
+            order by p.updated_at desc
+            limit %s
+            """,
+            (user_id, limit),
+        )
+        out: List[Dict[str, Any]] = []
+        for r in cur.fetchall():
+            edl = r["edl_json"] or {}
+            clips = edl.get("clips") or []
+            duration_ms = 0
+            first_shot_id: Optional[str] = None
+            for c in clips:
+                duration_ms = max(duration_ms, int(c.get("timeline_out_ms") or 0))
+                if first_shot_id is None and c.get("shot_id"):
+                    first_shot_id = str(c["shot_id"])
+            out.append(
+                {
+                    "id": str(r["id"]),
+                    "name": r["name"] or "Untitled",
+                    "source_file_ids": [str(x) for x in (r["source_file_ids"] or [])],
+                    "updated_at": r["updated_at"].isoformat() if r.get("updated_at") else None,
+                    "clip_count": len(clips),
+                    "duration_ms": duration_ms,
+                    "author_kind": r["author_kind"],
+                    "version_count": int(r["version_count"]),
+                    "first_shot_id": first_shot_id,
+                }
+            )
+        return out
+
+
+def rename_project(project_id: str, user_id: str, name: str) -> Optional[Dict[str, Any]]:
+    with _pg() as conn:
+        cur = conn.execute(
+            """
+            update public.projects
+               set name = %s, updated_at = now()
+             where id = %s and user_id = %s
+            returning id, user_id, name, source_file_ids, created_at, updated_at
+            """,
+            (name, project_id, user_id),
+        )
+        row = cur.fetchone()
+        return _row_to_project(row) if row else None
+
+
+def delete_project(project_id: str, user_id: str) -> bool:
+    """Delete a project; edl_versions and renders cascade via FK."""
+    with _pg() as conn:
+        cur = conn.execute(
+            "delete from public.projects where id = %s and user_id = %s returning id",
+            (project_id, user_id),
+        )
+        return cur.fetchone() is not None
+
+
 # ---------------------------------------------------------------------------
 # EDL versions
 # ---------------------------------------------------------------------------

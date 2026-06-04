@@ -217,6 +217,7 @@ export function AiEditPanel({
   const router = useRouter();
   const session = useAuthStore((s) => s.session);
   const setAiTimeline = useDriveStore((s) => s.setAiTimeline);
+  const setAiTimelineSource = useDriveStore((s) => s.setAiTimelineSource);
   const showAiTimeline = useDriveStore((s) => s.showAiTimeline);
   const [sessionState, setSessionState] = useState<Session>(() => newSession());
   const [scope, setScope] = useState<Scope>(() => ({ fileIds: [], files: [] }));
@@ -334,9 +335,13 @@ export function AiEditPanel({
   useEffect(() => {
     if (!hydrated) return;
     if (!lastAssistant || lastAssistant.timeline.length === 0) {
-      setAiTimeline(null);
+      // Don't stomp a saved edit that was opened into the dock from the Edits
+      // library; only clear when the chat itself owns the timeline.
+      if (useDriveStore.getState().aiTimelineSource === "chat") setAiTimeline(null);
       return;
     }
+    // A chat-produced cut takes ownership of the working timeline.
+    setAiTimelineSource("chat");
     setAiTimeline({
       clips: lastAssistant.timeline.map((c) => ({
         shot_id: c.shot_id ?? null,
@@ -353,7 +358,7 @@ export function AiEditPanel({
       projectId: lastAssistant.project_id ?? null,
       baseVersionId: lastAssistant.edl_version_id ?? null,
     });
-  }, [lastAssistant, hydrated, setAiTimeline]);
+  }, [lastAssistant, hydrated, setAiTimeline, setAiTimelineSource]);
 
   // Auto-open the timeline when a new edit lands and again once it renders.
   useEffect(() => {
