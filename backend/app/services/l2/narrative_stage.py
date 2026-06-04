@@ -1,28 +1,23 @@
 """
-L2 Stage D: Per-shot narrative analysis via a hosted Qwen2.5-VL endpoint.
+L2 Stage D: Per-shot narrative analysis via Qwen2.5-VL.
 
-For Phase 2 v1 we call a hosted multimodal endpoint (Replicate / Anyscale /
-Cloudflare AI Gateway) configured via QWEN_VL_ENDPOINT_URL + QWEN_VL_API_KEY.
-The endpoint is expected to accept a JSON payload of:
-  {
-    "images_b64": [<3 base64 strings, anchor/motion/variance>],
-    "transcript": "..."
-  }
-and return JSON of:
-  { "description": str, "role": str, "valence": float }
+VLM selection order (see `analyze_shot`):
+  1. Hosted Qwen endpoint  -- if QWEN_VL_ENDPOINT_URL is set (explicit override)
+  2. Self-hosted Qwen2.5-VL on the worker GPU -- default; see services/l2/qwen_vl.py
+  3. Claude vision (Anthropic) -- fallback when no GPU / Qwen fails to load
 
-If QWEN_VL_ENDPOINT_URL is empty, this stage is a no-op and the columns stay
-null. That keeps Phase 2 useful without forcing a paid VLM dependency from
-day one.
+The model returns JSON of: { "description": str, "role": str, "valence": float }.
 
-A future "Stage D v2" can self-host Qwen2.5-VL-3B quantized when traffic
-justifies it; only this file changes.
+Self-hosting Qwen on the GPU replaces ~N per-shot Claude API calls (network
+latency + per-call cost) with local inference, which is the dominant cost of
+L2. Claude remains a zero-config fallback for CPU-only environments.
 """
 from __future__ import annotations
 
 import base64
 import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -63,22 +58,57 @@ def analyze_shot(
     transcript_segment: Optional[str],
 ) -> Optional[NarrativeResult]:
     """
-    Run VLM analysis. Returns None when no endpoint is configured AND no
-    Anthropic fallback is available (so the caller can decide to skip).
+    Run VLM analysis. Tries self-hosted Qwen on the GPU first, then a hosted
+    Qwen endpoint, then Claude. Returns None when nothing is available.
     """
     settings = get_settings()
-    imgs_b64 = [b for b in (_encode_b64(p) for p in keyframe_paths) if b]
-    if not imgs_b64:
+    valid_paths = [p for p in keyframe_paths if p and os.path.exists(p)]
+    if not valid_paths:
         return None
 
+    # 1. Explicit hosted Qwen endpoint override.
     if settings.qwen_vl_endpoint_url:
-        return _call_qwen(settings.qwen_vl_endpoint_url, settings.qwen_vl_api_key, imgs_b64, transcript_segment)
+        imgs_b64 = [b for b in (_encode_b64(p) for p in valid_paths) if b]
+        if imgs_b64:
+            return _call_qwen(settings.qwen_vl_endpoint_url, settings.qwen_vl_api_key, imgs_b64, transcript_segment)
 
+    # 2. Self-hosted Qwen2.5-VL on the worker GPU (the default fast path).
+    if settings.qwen_vl_local:
+        res = _call_qwen_local(valid_paths, transcript_segment)
+        if res is not None:
+            return res
+        # else fall through to Claude (no GPU, or Qwen failed to load)
+
+    # 3. Claude vision fallback.
     if settings.anthropic_api_key:
-        return _call_claude_vision(imgs_b64, transcript_segment)
+        imgs_b64 = [b for b in (_encode_b64(p) for p in valid_paths) if b]
+        if imgs_b64:
+            return _call_claude_vision(imgs_b64, transcript_segment)
 
-    logger.info("Stage D skipped: no QWEN_VL_ENDPOINT_URL and no ANTHROPIC_API_KEY configured.")
+    logger.info("Stage D skipped: no Qwen GPU/endpoint and no ANTHROPIC_API_KEY.")
     return None
+
+
+def _call_qwen_local(
+    image_paths: List[str],
+    transcript: Optional[str],
+) -> Optional[NarrativeResult]:
+    """Self-hosted Qwen2.5-VL on the GPU. Returns None if unavailable/failed so
+    the caller can fall back to Claude."""
+    try:
+        from app.services.l2.qwen_vl import _QwenVLEngine
+
+        if not _QwenVLEngine.available():
+            return None
+        settings = get_settings()
+        prompt_text = prompts_mod.load(PROMPT_NAME, transcript=transcript or "(none)")
+        data = _QwenVLEngine.infer(image_paths, prompt_text, settings.qwen_vl_max_tokens)
+        if not data:
+            return None
+        return _coerce(data)
+    except Exception:
+        logger.exception("Local Qwen narrative call failed")
+        return None
 
 
 def _call_qwen(

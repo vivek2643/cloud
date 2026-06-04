@@ -46,6 +46,16 @@ def _warmup() -> None:
     except Exception:
         logger.exception("SigLIP warmup failed; will lazy-load on first job.")
 
+    # Self-hosted Qwen2.5-VL for L2 narratives — only on a GPU box (the model is
+    # too heavy for CPU). Downloads ~7 GB to HF_HOME the first time, then caches.
+    try:
+        from app.services.l2.qwen_vl import _QwenVLEngine
+        if _QwenVLEngine.available():
+            logger.info("Warming up Qwen2.5-VL...")
+            _QwenVLEngine.get()
+    except Exception:
+        logger.exception("Qwen2.5-VL warmup failed; will lazy-load on first L2 job.")
+
 
 async def main() -> None:
     register_tasks()

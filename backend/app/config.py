@@ -31,10 +31,17 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-4-5-20250929"
 
-    # Phase 2 Stage D: hosted Qwen2.5-VL endpoint (Replicate / Anyscale style)
-    # Leave empty until L2 Stage D is in use.
+    # Phase 2 Stage D: hosted Qwen2.5-VL endpoint (Replicate / Anyscale style).
+    # Leave empty to use the self-hosted GPU model below instead.
     qwen_vl_endpoint_url: str = ""
     qwen_vl_api_key: str = ""
+
+    # Self-hosted Qwen2.5-VL on the worker GPU. When enabled, narratives run
+    # locally on CUDA (falling back to Claude on CPU-only boxes or load failure).
+    # 3B fits a 16 GB GPU alongside the other models; bump to 7B on a bigger GPU.
+    qwen_vl_local: bool = True
+    qwen_vl_model: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    qwen_vl_max_tokens: int = 256
 
     @property
     def r2_endpoint(self) -> str:
