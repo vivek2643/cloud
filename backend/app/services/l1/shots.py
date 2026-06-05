@@ -141,27 +141,6 @@ def _brightness(image_path: str) -> Optional[float]:
     return float(gray.mean())
 
 
-def _motion_magnitude(video_path: str, start_ms: int, mid_ms: int) -> float:
-    """Optical-flow magnitude across start-of-shot vs midpoint frames."""
-    cap = cv2.VideoCapture(video_path)
-    try:
-        cap.set(cv2.CAP_PROP_POS_MSEC, max(start_ms, 0))
-        ok1, frame1 = cap.read()
-        if not ok1:
-            return 0.0
-        cap.set(cv2.CAP_PROP_POS_MSEC, mid_ms)
-        ok2, frame2 = cap.read()
-        if not ok2:
-            return 0.0
-        g1 = cv2.cvtColor(cv2.resize(frame1, (320, 180)), cv2.COLOR_BGR2GRAY)
-        g2 = cv2.cvtColor(cv2.resize(frame2, (320, 180)), cv2.COLOR_BGR2GRAY)
-        flow = cv2.calcOpticalFlowFarneback(g1, g2, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-        mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-        return float(mag.mean())
-    finally:
-        cap.release()
-
-
 # --- High-level entry point ----------------------------------------------
 
 def detect_shots(video_path: str, duration_s: float, output_dir: str) -> List[Shot]:
@@ -200,8 +179,10 @@ def detect_shots(video_path: str, duration_s: float, output_dir: str) -> List[Sh
         # brightness = mean luminance of anchor, motion_magnitude = start-vs-mid.
         focus = float(kf_mod.laplacian_blur_score(anchor)) if anchor else None
         brightness = _brightness(anchor) if anchor else None
-        mid_ms = (s_ms + e_ms) // 2
-        motion = _motion_magnitude(video_path, s_ms, mid_ms) if anchor else 0.0
+        # Reuse the optical-flow magnitude already computed while picking the
+        # motion keyframe -- avoids re-opening the video for a second flow pass
+        # (which previously dominated the shots stage).
+        motion = kfs.motion_mag if (anchor and kfs.motion_mag is not None) else 0.0
 
         shots.append(Shot(
             index=idx,

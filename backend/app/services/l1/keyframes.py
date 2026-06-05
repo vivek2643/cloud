@@ -46,6 +46,10 @@ class ThreeKeyframes:
     anchor_ts_ms: Optional[int]
     motion_ts_ms: Optional[int]
     variance_ts_ms: Optional[int]
+    # Peak optical-flow magnitude across the sampled frames. Computed here as a
+    # by-product of picking the motion keyframe, so the shots stage can reuse it
+    # instead of re-opening the video for a second flow pass.
+    motion_mag: Optional[float] = None
 
 
 def _hist(frame_bgr: np.ndarray) -> np.ndarray:
@@ -86,22 +90,42 @@ def extract_three(
 
     cap = cv2.VideoCapture(video_path)
     try:
+        span = end_ms - start_ms
         if SAMPLE_FRAMES > 1:
-            timestamps = [
-                start_ms + (end_ms - start_ms) * i / (SAMPLE_FRAMES - 1)
+            targets = [
+                start_ms + span * i / (SAMPLE_FRAMES - 1)
                 for i in range(SAMPLE_FRAMES)
             ]
         else:
-            timestamps = [(start_ms + end_ms) / 2]
+            targets = [(start_ms + end_ms) / 2.0]
 
+        # Seek ONCE to the shot start, then decode forward sequentially and grab
+        # the frame nearest each target timestamp. The old code did a backward
+        # CAP_PROP_POS_MSEC seek per sample (12 per shot); each such seek
+        # re-decodes from the prior keyframe, so on a long clip the video was
+        # effectively decoded dozens of times -- the L1 bottleneck. One seek +
+        # sequential reads decodes each shot span at most once.
+        cap.set(cv2.CAP_PROP_POS_MSEC, max(start_ms - 1.0, 0.0))
         samples: List[Tuple[float, np.ndarray]] = []
-        for ts in timestamps:
-            cap.set(cv2.CAP_PROP_POS_MSEC, ts)
+        ti = 0
+        reads = 0
+        max_reads = SAMPLE_FRAMES * 400  # safety bound vs. runaway decode
+        while ti < len(targets) and reads < max_reads:
             ok, frame = cap.read()
+            reads += 1
             if not ok or frame is None:
-                continue
-            small = cv2.resize(frame, (DOWNSCALE_WIDTH, DOWNSCALE_HEIGHT))
-            samples.append((ts, small))
+                break
+            cur = cap.get(cv2.CAP_PROP_POS_MSEC)
+            small = None
+            # A single decoded frame may satisfy one or more pending targets
+            # (very short shots); advance through all it has reached.
+            while ti < len(targets) and cur + 1e-3 >= targets[ti]:
+                if small is None:
+                    small = cv2.resize(frame, (DOWNSCALE_WIDTH, DOWNSCALE_HEIGHT))
+                samples.append((cur, small))
+                ti += 1
+            if cur >= end_ms:
+                break
 
         if not samples:
             return none
@@ -153,6 +177,7 @@ def extract_three(
             anchor_ts_ms=int(anchor_ts) if ok_a else None,
             motion_ts_ms=int(best_motion[0]) if ok_m else None,
             variance_ts_ms=int(best_var[0]) if ok_v else None,
+            motion_mag=float(best_motion[1]) if best_motion[1] >= 0 else 0.0,
         )
     finally:
         cap.release()
