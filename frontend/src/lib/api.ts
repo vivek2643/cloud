@@ -348,6 +348,17 @@ export interface ChatTimelineClipOut {
   why?: string | null;
 }
 
+export interface ChatSection {
+  index: number;
+  style: string;
+  intent: string;
+  start_ms: number;
+  end_ms: number;
+  duration_ms: number;
+  video_clips: number;
+  audio_clips: number;
+}
+
 export interface ChatResponse {
   timeline: ChatTimelineClipOut[];
   fcp7_xml: string;
@@ -355,6 +366,8 @@ export interface ChatResponse {
   reasoning: string;
   warnings: string[];
   catalog_size: number;
+  // Per-section styles when the editor mixed recipes (empty for single-style).
+  sections?: ChatSection[];
   // Phase 1: every chat turn persists a new EDL version and auto-enqueues a
   // render. The frontend polls /api/renders/:id to swap in the rendered MP4.
   project_id?: string | null;

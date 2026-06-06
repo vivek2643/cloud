@@ -80,6 +80,17 @@ def _file_ids_from_candidates(candidates) -> List[str]:
     return out
 
 
+def _file_ids_from_timeline(timeline: List[Dict[str, Any]]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for c in timeline:
+        fid = c.get("file_id")
+        if fid and fid not in seen:
+            seen.add(fid)
+            out.append(str(fid))
+    return out
+
+
 def _serialize_candidates(cands: list) -> list[dict]:
     return [
         {
@@ -168,109 +179,65 @@ def run_chat_turn(
     try:
         _check_cancel(should_cancel)
 
-        # 1. Retrieval --------------------------------------------------
-        emit("retrieving", 8, "Searching your footage")
-        primary = retrieve_for_chat(
+        # 1-3. Director: plan -> fill (recipes/composer) -> critique -> re-plan
+        emit("retrieving", 8, "Loading footage")
+        from app.services.l3 import director as director_mod
+
+        dres = director_mod.direct_edit(
             user_id=user_id,
-            prompt=latest,
-            folder_id=inp.folder_id,
+            messages=inp.messages,
             file_ids=file_ids or None,
-            cap=inp.catalog_size,
+            folder_id=inp.folder_id,
+            duration_target_s=inp.duration_target_s,
+            fps=inp.fps,
+            emit=emit,
         )
-        prior_shot_ids: List[str] = []
-        for m in inp.messages:
-            if m.get("role") != "assistant" or not m.get("timeline"):
-                continue
-            for c in m["timeline"]:
-                sid = c.get("shot_id") if isinstance(c, dict) else None
-                if sid:
-                    prior_shot_ids.append(str(sid))
-        prior_shot_ids = list(dict.fromkeys(prior_shot_ids))
-        pinned = (
-            fetch_candidates_by_shot_ids(
-                user_id=user_id, shot_ids=prior_shot_ids, file_ids=file_ids or None
-            )
-            if prior_shot_ids
-            else []
-        )
+        audit.stage("director_plan", dres.plan)
+        audit.stage("director_critiques", dres.critiques)
+        audit.stage("director_sections", dres.sections)
+        audit.stage("editor_reasoning", dres.reasoning)
+        audit.stage("editor_warnings", dres.warnings)
 
-        seen: set[str] = set()
-        candidates = []
-        for c in list(pinned) + list(primary):
-            if c.shot_id in seen:
-                continue
-            seen.add(c.shot_id)
-            candidates.append(c)
-        audit.set("catalog_size", len(candidates))
-        audit.stage("candidates_l1_only", _serialize_candidates(candidates))
-        emit("retrieving", 28, f"{len(candidates)} candidate shots")
-
-        if not candidates:
+        timeline = dres.timeline
+        has_av = bool(dres.edl and (dres.edl.get("video_track") or dres.edl.get("audio_track")))
+        if not has_av:
             audit.succeed()
             empty = {
                 "timeline": [],
-                "fcp7_xml": build_fcp7_xml(inp.sequence_name, [], _pathurl_for, inp.fps),
+                "fcp7_xml": "",
                 "total_duration_ms": 0,
-                "reasoning": "No indexed shots are available yet -- upload and index footage first.",
-                "warnings": ["Empty catalog."],
+                "reasoning": dres.reasoning or "No timeline could be built from the available footage.",
+                "warnings": dres.warnings or ["Empty timeline."],
                 "catalog_size": 0,
+                "sections": [],
                 "project_id": None,
                 "edl_version_id": None,
                 "render_id": None,
             }
-            emit("done", 100, "No footage available")
+            emit("done", 100, "No usable footage")
             return empty
 
-        _check_cancel(should_cancel)
-
-        # 2. Claude reasoning ------------------------------------------
-        emit("reasoning", 35, "Editor is thinking")
-        result = claude_editor.compile_timeline_chat(
-            history=inp.messages,
-            candidates=candidates,
-            duration_target_s=inp.duration_target_s,
-            emit=emit,
-        )
-        audit.stage("editor_user_message", result.user_text)
-        audit.stage("editor_raw_response", result.raw_response)
-        audit.stage("editor_reasoning", result.reasoning)
-        audit.stage("editor_warnings", result.warnings)
-        audit.stage("editor_post_processing", result.post_processing)
-
-        timeline = result.timeline
-        actual_ms = timeline[-1].timeline_end_ms if timeline else 0
-        audit.stage("timeline", [_serialize_clip(t) for t in timeline])
-        audit.stage(
-            "timeline_summary",
-            {
-                "clip_count": len(timeline),
-                "actual_duration_ms": actual_ms,
-                "actual_duration_s": round(actual_ms / 1000.0, 2),
-            },
-        )
-        emit("reasoning", 68, f"{len(timeline)} clips selected")
-
-        fcp7 = build_fcp7_xml(inp.sequence_name, timeline, _pathurl_for, inp.fps)
-        audit.set("fcp7_xml_chars", len(fcp7))
+        actual_ms = dres.total_ms
+        audit.stage("timeline", timeline)
+        audit.stage("timeline_summary", {"clip_count": len(timeline), "actual_duration_ms": actual_ms})
+        emit("persisting", 80, f"{len(timeline)} clips")
 
         _check_cancel(should_cancel)
 
-        # 3. Persist EDL version + 4. enqueue render -------------------
+        # Persist EDL v2 + enqueue render ------------------------------
         project_id: Optional[str] = None
         edl_version_id: Optional[str] = None
         render_id: Optional[str] = None
         try:
-            emit("persisting", 78, "Saving timeline")
             project = edl_store.find_or_create_default_project(
                 user_id=user_id,
-                source_file_ids=file_ids if file_ids else _file_ids_from_candidates(candidates),
+                source_file_ids=file_ids if file_ids else _file_ids_from_timeline(timeline),
             )
             project_id = project["id"]
             parent = edl_store.get_latest_edl_version(project_id)
-            edl_json = edl_store.edl_from_timeline_clips(timeline, fps=30)
             new_version = edl_store.write_edl_version(
                 project_id=project_id,
-                edl_json=edl_json,
+                edl_json=dres.edl,
                 author_kind="claude",
                 parent_id=parent["id"] if parent else None,
                 commit_msg=latest[:200],
@@ -280,8 +247,9 @@ def run_chat_turn(
             audit.set("edl_version_id", edl_version_id)
 
             if timeline:
-                emit("rendering", 88, "Starting render")
-                render_row = renders_store.create_render(edl_version_id, preset="preview")
+                emit("rendering", 90, "Starting render")
+                preset = "preview_vertical" if dres.vertical else "preview"
+                render_row = renders_store.create_render(edl_version_id, preset=preset)
                 render_id = render_row["id"]
                 _enqueue_render(render_id)
                 audit.set("render_id", render_id)
@@ -294,26 +262,13 @@ def run_chat_turn(
         audit.succeed()
 
         payload = {
-            "timeline": [
-                {
-                    "file_id": t.file_id,
-                    "file_name": t.file_name,
-                    "source_in_ms": t.source_in_ms,
-                    "source_out_ms": t.source_out_ms,
-                    "timeline_start_ms": t.timeline_start_ms,
-                    "timeline_end_ms": t.timeline_end_ms,
-                    "score": t.score,
-                    "shot_id": getattr(t, "shot_id", None),
-                    "role_in_edit": getattr(t, "role_in_edit", None),
-                    "why": getattr(t, "why", None),
-                }
-                for t in timeline
-            ],
-            "fcp7_xml": fcp7,
+            "timeline": timeline,
+            "fcp7_xml": "",
             "total_duration_ms": actual_ms,
-            "reasoning": result.reasoning,
-            "warnings": result.warnings,
-            "catalog_size": len(candidates),
+            "reasoning": dres.reasoning,
+            "warnings": dres.warnings,
+            "catalog_size": len(timeline),
+            "sections": dres.sections,
             "project_id": project_id,
             "edl_version_id": edl_version_id,
             "render_id": render_id,

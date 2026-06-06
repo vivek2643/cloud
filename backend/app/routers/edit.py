@@ -420,6 +420,18 @@ class ChatTimelineClipOut(BaseModel):
     why: Optional[str] = None
 
 
+class ChatSectionOut(BaseModel):
+    """One section of a (possibly multi-style) edit, for UI labelling."""
+    index: int
+    style: str
+    intent: str = ""
+    start_ms: int = 0
+    end_ms: int = 0
+    duration_ms: int = 0
+    video_clips: int = 0
+    audio_clips: int = 0
+
+
 class ChatResponse(BaseModel):
     timeline: list[ChatTimelineClipOut]
     fcp7_xml: str
@@ -427,6 +439,8 @@ class ChatResponse(BaseModel):
     reasoning: str
     warnings: list[str] = []
     catalog_size: int
+    # Per-section styles when the editor mixed recipes (empty for single-style).
+    sections: list[ChatSectionOut] = []
     # Phase 1: every chat turn writes a new EDL version and auto-enqueues a
     # render. The frontend polls /api/renders/:id to swap in the rendered MP4.
     project_id: Optional[str] = None
@@ -454,6 +468,7 @@ def _payload_to_chat_response(payload: dict) -> ChatResponse:
         reasoning=payload.get("reasoning", ""),
         warnings=payload.get("warnings", []),
         catalog_size=payload.get("catalog_size", 0),
+        sections=[ChatSectionOut(**s) for s in payload.get("sections", []) if isinstance(s, dict)],
         project_id=payload.get("project_id"),
         edl_version_id=payload.get("edl_version_id"),
         render_id=payload.get("render_id"),

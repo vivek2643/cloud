@@ -32,45 +32,60 @@ def _pg():
     return psycopg.connect(get_settings().database_url, autocommit=True, row_factory=dict_row)
 
 
+def _iter_edl_clips(edl: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """All clip dicts across v1 (clips) and v2 (video_track + audio_track)."""
+    if edl.get("version") == 2:
+        return list(edl.get("video_track") or []) + list(edl.get("audio_track") or [])
+    return list(edl.get("clips") or [])
+
+
 def _resolve_file_lookup_for_edl(edl: Dict[str, Any]) -> tuple[Dict[str, cuts_renderer.FileEntry], Dict[str, str]]:
     """
-    Given an EDL, return (file_lookup_by_file_id, shot_to_file).
+    Given an EDL (v1 or v2), return (file_lookup_by_file_id, shot_to_file).
 
-    We look up:
-      - shot_id -> file_id (via the shots table)
-      - file_id -> r2_key, r2_proxy_key (via the files table)
-
-    Clips that reference a shot_id we can't resolve cause a hard error --
-    the EDL is malformed if it points at shots we don't own.
+    v2 clips usually carry file_id directly; v1 clips carry shot_id. We resolve
+    shot_id -> file_id via the shots table and fetch r2 keys for every file_id
+    referenced (directly or via a shot).
     """
-    shot_ids = list({c.get("shot_id") for c in edl.get("clips") or [] if c.get("shot_id")})
-    if not shot_ids:
+    clips = _iter_edl_clips(edl)
+    shot_ids = list({str(c["shot_id"]) for c in clips if c.get("shot_id")})
+    direct_file_ids = list({str(c["file_id"]) for c in clips if c.get("file_id")})
+    if not shot_ids and not direct_file_ids:
         return {}, {}
-
-    with _pg() as conn:
-        cur = conn.execute(
-            """
-            select s.id as shot_id, f.id as file_id, f.r2_key, f.r2_proxy_key
-            from shots s
-            join files f on f.id = s.file_id
-            where s.id = any(%s::uuid[])
-            """,
-            (shot_ids,),
-        )
-        rows = cur.fetchall()
 
     shot_to_file: Dict[str, str] = {}
     file_lookup: Dict[str, cuts_renderer.FileEntry] = {}
-    for r in rows:
-        sid = str(r["shot_id"])
-        fid = str(r["file_id"])
-        shot_to_file[sid] = fid
-        if fid not in file_lookup:
-            file_lookup[fid] = cuts_renderer.FileEntry(
-                file_id=fid,
-                r2_key=r["r2_key"],
-                r2_proxy_key=r.get("r2_proxy_key"),
-            )
+
+    with _pg() as conn:
+        if shot_ids:
+            rows = conn.execute(
+                """
+                select s.id as shot_id, f.id as file_id, f.r2_key, f.r2_proxy_key
+                from shots s
+                join files f on f.id = s.file_id
+                where s.id = any(%s::uuid[])
+                """,
+                (shot_ids,),
+            ).fetchall()
+            for r in rows:
+                sid = str(r["shot_id"])
+                fid = str(r["file_id"])
+                shot_to_file[sid] = fid
+                file_lookup.setdefault(fid, cuts_renderer.FileEntry(
+                    file_id=fid, r2_key=r["r2_key"], r2_proxy_key=r.get("r2_proxy_key"),
+                ))
+
+        missing_files = [fid for fid in direct_file_ids if fid not in file_lookup]
+        if missing_files:
+            rows = conn.execute(
+                "select id as file_id, r2_key, r2_proxy_key from files where id = any(%s::uuid[])",
+                (missing_files,),
+            ).fetchall()
+            for r in rows:
+                fid = str(r["file_id"])
+                file_lookup.setdefault(fid, cuts_renderer.FileEntry(
+                    file_id=fid, r2_key=r["r2_key"], r2_proxy_key=r.get("r2_proxy_key"),
+                ))
 
     missing = [sid for sid in shot_ids if sid not in shot_to_file]
     if missing:
@@ -82,12 +97,20 @@ def _resolve_file_lookup_for_edl(edl: Dict[str, Any]) -> tuple[Dict[str, cuts_re
 
 
 def _stamp_file_ids(edl: Dict[str, Any], shot_to_file: Dict[str, str]) -> Dict[str, Any]:
-    """Return a shallow copy of the EDL with file_id stamped on each clip."""
-    new_clips: List[Dict[str, Any]] = []
-    for c in edl.get("clips") or []:
-        sid = c.get("shot_id")
-        new_clips.append({**c, "file_id": shot_to_file.get(sid)})
-    return {**edl, "clips": new_clips}
+    """Return a shallow copy of the EDL with file_id stamped on each clip
+    (from shot_to_file when only a shot_id is present). Handles v1 + v2."""
+    def stamp(c: Dict[str, Any]) -> Dict[str, Any]:
+        if c.get("file_id"):
+            return dict(c)
+        return {**c, "file_id": shot_to_file.get(c.get("shot_id"))}
+
+    if edl.get("version") == 2:
+        return {
+            **edl,
+            "video_track": [stamp(c) for c in (edl.get("video_track") or [])],
+            "audio_track": [stamp(c) for c in (edl.get("audio_track") or [])],
+        }
+    return {**edl, "clips": [stamp(c) for c in (edl.get("clips") or [])]}
 
 
 def run_render(render_id: str) -> None:
@@ -112,7 +135,7 @@ def run_render(render_id: str) -> None:
         return
 
     edl = version["edl_json"]
-    if not (edl and isinstance(edl, dict) and edl.get("clips")):
+    if not (edl and isinstance(edl, dict) and _iter_edl_clips(edl)):
         renders_store.update_status(
             render_id, status="failed",
             error="EDL has no clips to render",

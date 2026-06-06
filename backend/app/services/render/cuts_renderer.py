@@ -69,6 +69,29 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "audio_bitrate": "192k",
         "use_proxy": False,
     },
+    # Vertical 9:16 preview for SocialShort recipe output.
+    "preview_vertical": {
+        "width": 720,
+        "height": 1280,
+        "fps": 30,
+        "video_codec": "libx264",
+        "video_preset": "veryfast",
+        "video_crf": 24,
+        "audio_codec": "aac",
+        "audio_bitrate": "128k",
+        "use_proxy": True,
+    },
+    "export_vertical": {
+        "width": 1080,
+        "height": 1920,
+        "fps": 30,
+        "video_codec": "libx264",
+        "video_preset": "medium",
+        "video_crf": 20,
+        "audio_codec": "aac",
+        "audio_bitrate": "192k",
+        "use_proxy": False,
+    },
 }
 
 
@@ -104,8 +127,6 @@ def render_edl(
     Returns:
         (output_r2_key, duration_ms)
     """
-    if not edl.get("clips"):
-        raise ValueError("EDL has no clips to render.")
     if preset not in PRESETS:
         raise ValueError(f"Unknown preset: {preset!r}")
     cfg = PRESETS[preset]
@@ -119,6 +140,13 @@ def render_edl(
                 progress_cb(pct, label)
             except Exception:
                 logger.exception("progress_cb raised; ignoring")
+
+    # v2 = A/V split track. Dispatch to the two-track renderer.
+    if edl.get("version") == 2:
+        return _render_av_edl(edl, file_lookup, cfg, report)
+
+    if not edl.get("clips"):
+        raise ValueError("EDL has no clips to render.")
 
     report(2, "starting")
 
@@ -216,10 +244,11 @@ def _resolve_file_id_for_clip(clip: Dict[str, Any], file_lookup: Dict[str, FileE
 
 
 def _segment_cache_path(*, file_id: str, in_ms: int, out_ms: int,
-                        width: int, height: int, fps: int) -> str:
-    key = f"{file_id}|{in_ms}|{out_ms}|{width}x{height}|{fps}"
+                        width: int, height: int, fps: int, kind: str = "av") -> str:
+    key = f"{kind}|{file_id}|{in_ms}|{out_ms}|{width}x{height}|{fps}"
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
-    return os.path.join(CACHE_ROOT, f"{digest}.mp4")
+    ext = "m4a" if kind == "a" else "mp4"
+    return os.path.join(CACHE_ROOT, f"{digest}.{ext}")
 
 
 def _produce_segment(*, src: str, dst: str, in_ms: int, out_ms: int, cfg: Dict[str, Any]) -> None:
@@ -329,3 +358,266 @@ def _pct(i: int, n: int, lo: int, hi: int) -> int:
     if n <= 0:
         return lo
     return int(lo + (hi - lo) * (i / n))
+
+
+# ---------------------------------------------------------------------------
+# v2: A/V split-track renderer
+# ---------------------------------------------------------------------------
+
+def _render_av_edl(
+    edl: Dict[str, Any],
+    file_lookup: Dict[str, FileEntry],
+    cfg: Dict[str, Any],
+    report: Callable[[int, str], None],
+) -> Tuple[str, int]:
+    """
+    Render a v2 EDL: build the video track and audio track independently
+    (each a gapless sequence of normalized segments + black/silence fillers
+    covering the full timeline) then mux them into one MP4.
+    """
+    video_clips = sorted(edl.get("video_track") or [], key=lambda c: int(c["timeline_in_ms"]))
+    audio_clips = sorted(edl.get("audio_track") or [], key=lambda c: int(c["timeline_in_ms"]))
+    if not video_clips and not audio_clips:
+        raise ValueError("EDL v2 has no clips to render.")
+
+    total_ms = 0
+    for c in list(video_clips) + list(audio_clips):
+        total_ms = max(total_ms, int(c["timeline_out_ms"]))
+    if total_ms <= 0:
+        raise ValueError("EDL v2 total duration is zero.")
+
+    report(2, "starting A/V render")
+    with tempfile.TemporaryDirectory(prefix="edso_av_") as tmp:
+        src_cache: Dict[str, str] = {}
+
+        report(8, "building video track")
+        v_segments = _build_track(
+            video_clips, "v", total_ms, cfg, file_lookup, tmp, src_cache, report, 8, 48,
+        )
+        video_track_file = os.path.join(tmp, "video_track.mp4")
+        _concat_track(v_segments, video_track_file, cfg, kind="v")
+
+        report(52, "building audio track")
+        a_segments = _build_track(
+            audio_clips, "a", total_ms, cfg, file_lookup, tmp, src_cache, report, 52, 84,
+        )
+        audio_track_file = os.path.join(tmp, "audio_track.m4a")
+        _concat_track(a_segments, audio_track_file, cfg, kind="a")
+
+        report(88, "muxing A/V")
+        out_local = os.path.join(tmp, "out.mp4")
+        _mux_av(video_track_file, audio_track_file, out_local)
+
+        report(92, "uploading")
+        out_key = f"{RENDER_PREFIX}/{uuid.uuid4().hex}.mp4"
+        _upload_to_r2(out_local, out_key, "video/mp4")
+
+    report(100, "done")
+    return out_key, total_ms
+
+
+def _resolve_av_file_id(clip: Dict[str, Any], file_lookup: Dict[str, FileEntry]) -> str:
+    fid = clip.get("file_id")
+    if fid and str(fid) in file_lookup:
+        return str(fid)
+    sid = clip.get("shot_id")
+    if sid and str(sid) in file_lookup:
+        return str(sid)
+    raise RuntimeError(f"v2 clip {clip.get('id')!r} has no resolvable file reference")
+
+
+def _build_track(
+    clips: List[Dict[str, Any]],
+    kind: str,                       # "v" | "a"
+    total_ms: int,
+    cfg: Dict[str, Any],
+    file_lookup: Dict[str, FileEntry],
+    tmp: str,
+    src_cache: Dict[str, str],
+    report: Callable[[int, str], None],
+    lo: int,
+    hi: int,
+) -> List[str]:
+    """
+    Produce an ordered, gapless list of segment files covering [0, total_ms].
+    Gaps between clips (and before the first / after the last) are filled with
+    black video or silence so the two tracks stay length-aligned for muxing.
+    """
+    segments: List[str] = []
+    cursor = 0
+    n = max(1, len(clips))
+    filler_idx = 0
+
+    for i, clip in enumerate(clips):
+        t_in = int(clip["timeline_in_ms"])
+        t_out = int(clip["timeline_out_ms"])
+        if t_in > cursor:
+            seg = os.path.join(tmp, f"fill_{kind}_{filler_idx:04d}.{'m4a' if kind == 'a' else 'mp4'}")
+            _make_filler(seg, t_in - cursor, cfg, kind)
+            segments.append(seg)
+            filler_idx += 1
+
+        file_id = _resolve_av_file_id(clip, file_lookup)
+        entry = file_lookup[file_id]
+        in_ms = int(clip["source_in_ms"])
+        out_ms = int(clip["source_out_ms"])
+
+        cache_path = _segment_cache_path(
+            file_id=file_id, in_ms=in_ms, out_ms=out_ms,
+            width=cfg["width"], height=cfg["height"], fps=cfg["fps"], kind=kind,
+        )
+        if not os.path.exists(cache_path) or os.path.getsize(cache_path) == 0:
+            src_key = (entry.r2_proxy_key if cfg["use_proxy"] and entry.r2_proxy_key else entry.r2_key)
+            if src_key not in src_cache:
+                src_local = os.path.join(tmp, f"src_{len(src_cache):04d}.mp4")
+                _download_from_r2(src_key, src_local)
+                src_cache[src_key] = src_local
+            src_local = src_cache[src_key]
+            if kind == "v":
+                _produce_video_segment(src=src_local, dst=cache_path, in_ms=in_ms, out_ms=out_ms, cfg=cfg)
+            else:
+                _produce_audio_segment(src=src_local, dst=cache_path, in_ms=in_ms, out_ms=out_ms, cfg=cfg)
+        segments.append(cache_path)
+        cursor = max(cursor, t_out)
+        report(_pct(i, n, lo, hi), f"{'video' if kind == 'v' else 'audio'} {i + 1}/{len(clips)}")
+
+    if cursor < total_ms:
+        seg = os.path.join(tmp, f"fill_{kind}_{filler_idx:04d}.{'m4a' if kind == 'a' else 'mp4'}")
+        _make_filler(seg, total_ms - cursor, cfg, kind)
+        segments.append(seg)
+
+    return segments
+
+
+def _make_filler(dst: str, dur_ms: int, cfg: Dict[str, Any], kind: str) -> None:
+    dur_s = max(dur_ms / 1000.0, 0.05)
+    if kind == "v":
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi",
+            "-i", f"color=c=black:s={cfg['width']}x{cfg['height']}:r={cfg['fps']}",
+            "-t", str(dur_s),
+            "-c:v", cfg["video_codec"], "-preset", cfg["video_preset"],
+            "-crf", str(cfg["video_crf"]), "-pix_fmt", "yuv420p",
+            "-an", "-movflags", "+faststart", dst,
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi",
+            "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+            "-t", str(dur_s),
+            "-c:a", cfg["audio_codec"], "-b:a", cfg["audio_bitrate"],
+            "-ar", "48000", "-ac", "2", dst,
+        ]
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst) == 0:
+        tail = proc.stderr.decode("utf-8", errors="ignore")[-600:]
+        raise RuntimeError(f"ffmpeg filler ({kind}) failed:\n{tail}")
+
+
+def _produce_video_segment(*, src: str, dst: str, in_ms: int, out_ms: int, cfg: Dict[str, Any]) -> None:
+    in_s = max(in_ms / 1000.0, 0.0)
+    dur_s = max((out_ms - in_ms) / 1000.0, 0.05)
+    tmp_path = dst.replace(".mp4", ".part.mp4")
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(in_s), "-i", src, "-t", str(dur_s),
+        "-vf",
+        f"scale=w={cfg['width']}:h={cfg['height']}:force_original_aspect_ratio=decrease,"
+        f"pad={cfg['width']}:{cfg['height']}:(ow-iw)/2:(oh-ih)/2:color=black,"
+        f"setsar=1,fps={cfg['fps']}",
+        "-c:v", cfg["video_codec"], "-preset", cfg["video_preset"],
+        "-crf", str(cfg["video_crf"]), "-pix_fmt", "yuv420p",
+        "-an",
+        "-movflags", "+faststart", "-avoid_negative_ts", "make_zero", "-fflags", "+genpts",
+        tmp_path,
+    ]
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0 or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        tail = proc.stderr.decode("utf-8", errors="ignore")[-800:]
+        raise RuntimeError(f"ffmpeg video cut failed {in_ms}-{out_ms}ms:\n{tail}")
+    shutil.move(tmp_path, dst)
+
+
+def _produce_audio_segment(*, src: str, dst: str, in_ms: int, out_ms: int, cfg: Dict[str, Any]) -> None:
+    in_s = max(in_ms / 1000.0, 0.0)
+    dur_s = max((out_ms - in_ms) / 1000.0, 0.05)
+    tmp_path = dst.replace(".m4a", ".part.m4a")
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(in_s), "-i", src, "-t", str(dur_s),
+        "-vn",
+        "-c:a", cfg["audio_codec"], "-b:a", cfg["audio_bitrate"], "-ar", "48000", "-ac", "2",
+        "-avoid_negative_ts", "make_zero", "-fflags", "+genpts",
+        tmp_path,
+    ]
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0 or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        tail = proc.stderr.decode("utf-8", errors="ignore")[-800:]
+        raise RuntimeError(f"ffmpeg audio cut failed {in_ms}-{out_ms}ms:\n{tail}")
+    shutil.move(tmp_path, dst)
+
+
+def _concat_track(segments: List[str], dst: str, cfg: Dict[str, Any], kind: str) -> None:
+    """Concat one track's segments. Segments are uniformly normalized so
+    -c copy works; fall back to a re-encode if the demuxer rejects them."""
+    if not segments:
+        raise RuntimeError("no segments to concat")
+    list_path = dst + ".list"
+    with open(list_path, "w") as f:
+        for s in segments:
+            f.write(f"file '{s}'\n")
+    try:
+        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy"]
+        if kind == "v":
+            cmd += ["-movflags", "+faststart"]
+        cmd += [dst]
+        proc = subprocess.run(cmd, capture_output=True)
+        if proc.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst) == 0:
+            tail = proc.stderr.decode("utf-8", errors="ignore")[-600:]
+            logger.warning("concat -c copy (%s) failed; re-encoding.\n%s", kind, tail)
+            if kind == "v":
+                cmd = [
+                    "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+                    "-c:v", cfg["video_codec"], "-preset", cfg["video_preset"],
+                    "-crf", str(cfg["video_crf"]), "-pix_fmt", "yuv420p",
+                    "-an", "-movflags", "+faststart", dst,
+                ]
+            else:
+                cmd = [
+                    "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+                    "-c:a", cfg["audio_codec"], "-b:a", cfg["audio_bitrate"],
+                    "-ar", "48000", "-ac", "2", dst,
+                ]
+            proc = subprocess.run(cmd, capture_output=True)
+            if proc.returncode != 0:
+                tail = proc.stderr.decode("utf-8", errors="ignore")[-800:]
+                raise RuntimeError(f"ffmpeg concat ({kind}) re-encode failed:\n{tail}")
+    finally:
+        try:
+            os.remove(list_path)
+        except OSError:
+            pass
+
+
+def _mux_av(video_file: str, audio_file: str, dst: str) -> None:
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_file, "-i", audio_file,
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c", "copy", "-movflags", "+faststart",
+        dst,
+    ]
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst) == 0:
+        tail = proc.stderr.decode("utf-8", errors="ignore")[-800:]
+        raise RuntimeError(f"ffmpeg A/V mux failed:\n{tail}")

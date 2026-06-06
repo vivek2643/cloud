@@ -12,6 +12,7 @@ import {
   getChatTurn,
   type ChatMessage,
   type ChatResponse,
+  type ChatSection,
   type ChatTimelineClip,
   type RenderRow,
 } from "@/lib/api";
@@ -36,6 +37,7 @@ type AssistantMessage = {
   role: "assistant";
   reasoning: string;
   warnings: string[];
+  sections?: ChatSection[];
   timeline: ChatTimelineClip[];
   total_duration_ms: number;
   fcp7_xml: string;
@@ -129,6 +131,21 @@ function turnsToMessages(turns: Turn[]): ChatMessage[] {
   );
 }
 
+const STYLE_LABELS: Record<string, string> = {
+  highlight: "Highlight",
+  talking_head: "Talking-head",
+  trailer: "Trailer",
+  beat_sync: "Beat-sync",
+  vlog: "Vlog",
+  social_short: "Social short",
+  tutorial: "Tutorial",
+  cinematic_broll: "Cinematic b-roll",
+};
+
+function prettyStyle(key: string): string {
+  return STYLE_LABELS[key] || key.replace(/_/g, " ");
+}
+
 function responseToAssistant(res: ChatResponse): AssistantMessage {
   const merged: ChatTimelineClip[] = res.timeline.map((t) => ({
     shot_id: t.shot_id || "",
@@ -145,6 +162,7 @@ function responseToAssistant(res: ChatResponse): AssistantMessage {
     role: "assistant",
     reasoning: res.reasoning,
     warnings: res.warnings || [],
+    sections: res.sections || [],
     timeline: merged,
     total_duration_ms: res.total_duration_ms,
     fcp7_xml: res.fcp7_xml,
@@ -223,6 +241,7 @@ export function AiEditPanel({
   const [scope, setScope] = useState<Scope>(() => ({ fileIds: [], files: [] }));
   const [hydrated, setHydrated] = useState(false);
   const [input, setInput] = useState("");
+  const [style, setStyle] = useState("auto");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState<{ phase: string; pct: number; label: string } | null>(null);
@@ -369,8 +388,11 @@ export function AiEditPanel({
   }, [lastAssistant?.render_url, showAiTimeline]);
 
   async function handleSend(prompt?: string) {
-    const text = (prompt ?? input).trim();
-    if (!text || !session?.access_token || sending) return;
+    const base = (prompt ?? input).trim();
+    // When the user forces a style, append a directive the planner respects.
+    const text =
+      style !== "auto" ? `${base} (Use the ${prettyStyle(style)} style.)` : base;
+    if (!base || !session?.access_token || sending) return;
     const token = session.access_token;
     setError(null);
     setInput("");
@@ -552,7 +574,22 @@ export function AiEditPanel({
 
           {/* Composer */}
           <div className={`border-t ${padX} py-3`} style={{ borderColor: "var(--border)" }}>
-            <div className={`mx-auto flex ${bodyMax} items-end gap-2`}>
+            <div className={`mx-auto ${bodyMax} space-y-2`}>
+            <div className="flex items-center gap-2 text-xs" style={{ color: "var(--muted)" }}>
+              <span>Style</span>
+              <select
+                value={style}
+                onChange={(e) => setStyle(e.target.value)}
+                className="rounded-md border px-2 py-1 text-xs focus:outline-none"
+                style={{ background: "var(--background)", borderColor: "var(--border)", color: "var(--foreground)" }}
+              >
+                <option value="auto">Auto (let the editor decide)</option>
+                {Object.entries(STYLE_LABELS).map(([key, label]) => (
+                  <option key={key} value={key}>{label}</option>
+                ))}
+              </select>
+            </div>
+            <div className="flex items-end gap-2">
               <textarea
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
@@ -575,6 +612,7 @@ export function AiEditPanel({
                 {sending ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
                 {sending ? "..." : "Send"}
               </button>
+            </div>
             </div>
           </div>
         </div>
@@ -757,6 +795,22 @@ function AssistantBubble({ message }: { message: AssistantMessage }) {
         {message.reasoning && (
           <div className="w-full rounded-2xl rounded-tl-sm border px-4 py-3 text-sm" style={{ borderColor: "var(--border)", background: "var(--background)" }}>
             <p className="whitespace-pre-wrap break-words leading-relaxed">{message.reasoning}</p>
+          </div>
+        )}
+
+        {message.sections && message.sections.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            {message.sections.map((s) => (
+              <span
+                key={s.index}
+                title={s.intent || undefined}
+                className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium"
+                style={{ borderColor: "var(--border)", background: "var(--sidebar)", color: "var(--foreground)" }}
+              >
+                <span style={{ color: "var(--accent)" }}>{prettyStyle(s.style)}</span>
+                <span style={{ color: "var(--muted)" }}>{(s.duration_ms / 1000).toFixed(1)}s</span>
+              </span>
+            ))}
           </div>
         )}
 

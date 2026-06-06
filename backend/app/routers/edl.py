@@ -156,9 +156,24 @@ def _source_url(m: Any) -> Optional[str]:
         return None
 
 
+def _v2_video_as_clips(edl: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Flatten a v2 EDL's video track into the v1 clip shape for enrichment/UI."""
+    out: List[Dict[str, Any]] = []
+    for c in sorted(edl.get("video_track") or [], key=lambda x: x["timeline_in_ms"]):
+        out.append({
+            "id": c["id"],
+            "shot_id": c.get("shot_id"),
+            "source_in_ms": int(c["source_in_ms"]),
+            "source_out_ms": int(c["source_out_ms"]),
+            "timeline_in_ms": int(c["timeline_in_ms"]),
+            "timeline_out_ms": int(c["timeline_out_ms"]),
+        })
+    return out
+
+
 def _enrich(version: Dict[str, Any], user_id: str) -> EnrichedEdlResponse:
-    edl = version["edl_json"]
-    clips = edl.get("clips") or []
+    edl = version["edl_json"] or {}
+    clips = _v2_video_as_clips(edl) if edl.get("version") == 2 else (edl.get("clips") or [])
     shot_ids = list({c.get("shot_id") for c in clips if c.get("shot_id")})
     meta_by_shot: Dict[str, Any] = {}
     if shot_ids:
@@ -348,7 +363,8 @@ def list_versions(project_id: str, user_id: str = Depends(get_current_user_id)):
     _require_project(project_id, user_id)
     out: List[VersionMeta] = []
     for v in edl_store.list_edl_versions(project_id):
-        clips = (v["edl_json"] or {}).get("clips") or []
+        ej = v["edl_json"] or {}
+        clips = (ej.get("video_track") or []) if ej.get("version") == 2 else (ej.get("clips") or [])
         out.append(VersionMeta(
             id=v["id"],
             parent_id=v.get("parent_id"),

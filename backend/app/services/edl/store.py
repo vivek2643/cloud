@@ -298,36 +298,68 @@ def validate_edl(edl: Dict[str, Any]) -> None:
     """
     Lightweight schema check. Raises ValueError on malformed EDL.
 
-    We intentionally only enforce the cut-only invariants here. Future
-    polish phases extend with optional fields whose absence is fine.
+    Supports two versions:
+      v1 (cut-only): a single ``clips`` list, video+audio coupled per clip.
+      v2 (A/V split): independent ``video_track`` and ``audio_track`` lists so
+          we can lay a music bed under b-roll, do J/L cuts, or cut away from a
+          speaker while keeping their audio.
+
+    Both are accepted forever -- old edits and the existing chat flow keep
+    working. New work emits v2.
     """
     if not isinstance(edl, dict):
         raise ValueError("EDL must be a JSON object")
-    if edl.get("version") != 1:
-        raise ValueError(f"Unsupported EDL version: {edl.get('version')!r}")
+    version = edl.get("version")
+    if version == 1:
+        _validate_common(edl)
+        clips = edl.get("clips")
+        if not isinstance(clips, list):
+            raise ValueError("EDL.clips must be a list")
+        _validate_clip_list(clips, label="clips", require_shot_id=True)
+        return
+    if version == 2:
+        _validate_common(edl)
+        vt = edl.get("video_track")
+        at = edl.get("audio_track")
+        if not isinstance(vt, list) or not isinstance(at, list):
+            raise ValueError("EDL v2 requires list 'video_track' and 'audio_track'")
+        if not vt and not at:
+            raise ValueError("EDL v2 has no clips on either track")
+        _validate_clip_list(vt, label="video_track", require_shot_id=False)
+        _validate_clip_list(at, label="audio_track", require_shot_id=False)
+        return
+    raise ValueError(f"Unsupported EDL version: {version!r}")
+
+
+def _validate_common(edl: Dict[str, Any]) -> None:
     fps = edl.get("fps")
     if not isinstance(fps, (int, float)) or fps <= 0:
         raise ValueError(f"EDL.fps must be a positive number, got {fps!r}")
     res = edl.get("resolution")
     if not (isinstance(res, list) and len(res) == 2 and all(isinstance(x, int) and x > 0 for x in res)):
         raise ValueError(f"EDL.resolution must be [w, h] of positive ints, got {res!r}")
-    clips = edl.get("clips")
-    if not isinstance(clips, list):
-        raise ValueError("EDL.clips must be a list")
-    seen_ids = set()
+
+
+def _validate_clip_list(clips: List[Dict[str, Any]], label: str, require_shot_id: bool) -> None:
+    seen_ids: set = set()
     for i, c in enumerate(clips):
         if not isinstance(c, dict):
-            raise ValueError(f"clips[{i}] must be an object")
-        for k in ("id", "shot_id", "source_in_ms", "source_out_ms",
-                  "timeline_in_ms", "timeline_out_ms"):
+            raise ValueError(f"{label}[{i}] must be an object")
+        required = ["id", "source_in_ms", "source_out_ms", "timeline_in_ms", "timeline_out_ms"]
+        if require_shot_id:
+            required.append("shot_id")
+        for k in required:
             if k not in c:
-                raise ValueError(f"clips[{i}] missing field {k!r}")
+                raise ValueError(f"{label}[{i}] missing field {k!r}")
+        # v2 clips must carry a file reference so the renderer can resolve media.
+        if not require_shot_id and not (c.get("file_id") or c.get("shot_id")):
+            raise ValueError(f"{label}[{i}] needs a file_id or shot_id")
         if not isinstance(c["source_in_ms"], int) or not isinstance(c["source_out_ms"], int):
-            raise ValueError(f"clips[{i}] source_in/out_ms must be ints")
+            raise ValueError(f"{label}[{i}] source_in/out_ms must be ints")
         if c["source_out_ms"] - c["source_in_ms"] < 1:
-            raise ValueError(f"clips[{i}] has zero or negative duration")
+            raise ValueError(f"{label}[{i}] has zero or negative duration")
         if c["id"] in seen_ids:
-            raise ValueError(f"duplicate clip id {c['id']!r} at index {i}")
+            raise ValueError(f"duplicate clip id {c['id']!r} at {label}[{i}]")
         seen_ids.add(c["id"])
 
 
@@ -342,6 +374,67 @@ def empty_edl(fps: int = 30, resolution: tuple[int, int] = (1920, 1080)) -> Dict
         "resolution": [resolution[0], resolution[1]],
         "clips": [],
     }
+
+
+def empty_av_edl(fps: int = 30, resolution: tuple[int, int] = (1920, 1080)) -> Dict[str, Any]:
+    return {
+        "version": 2,
+        "fps": fps,
+        "resolution": [resolution[0], resolution[1]],
+        "video_track": [],
+        "audio_track": [],
+        "sections": [],
+    }
+
+
+def _normalize_track_clips(clips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Coerce a track's clips into the validated v2 shape (fill id, ints)."""
+    out: List[Dict[str, Any]] = []
+    for i, c in enumerate(clips):
+        in_ms = int(c["source_in_ms"])
+        out_ms = int(c["source_out_ms"])
+        if out_ms - in_ms < 1:
+            raise ValueError(f"track clip[{i}] has zero or negative duration")
+        clip: Dict[str, Any] = {
+            "id": str(c.get("id") or uuid.uuid4()),
+            "file_id": str(c["file_id"]) if c.get("file_id") else None,
+            "shot_id": str(c["shot_id"]) if c.get("shot_id") else None,
+            "source_in_ms": in_ms,
+            "source_out_ms": out_ms,
+            "timeline_in_ms": int(c["timeline_in_ms"]),
+            "timeline_out_ms": int(c["timeline_out_ms"]),
+        }
+        # Optional editorial metadata kept for UI/audit (never required).
+        for k in ("role_in_edit", "section", "why", "gain_db", "transition"):
+            if c.get(k) is not None:
+                clip[k] = c[k]
+        out.append(clip)
+    return out
+
+
+def build_av_edl(
+    video_track: List[Dict[str, Any]],
+    audio_track: List[Dict[str, Any]],
+    fps: int = 30,
+    resolution: tuple[int, int] = (1920, 1080),
+    sections: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """
+    Build a validated v2 (A/V split) EDL from independent video + audio clip
+    lists produced by the composer/recipes. Each clip dict needs at least:
+    file_id, source_in_ms, source_out_ms, timeline_in_ms, timeline_out_ms.
+    ``sections`` is optional metadata describing the per-section styles.
+    """
+    edl = {
+        "version": 2,
+        "fps": fps,
+        "resolution": [resolution[0], resolution[1]],
+        "video_track": _normalize_track_clips(video_track),
+        "audio_track": _normalize_track_clips(audio_track),
+        "sections": list(sections or []),
+    }
+    validate_edl(edl)
+    return edl
 
 
 def build_edl_from_user_clips(
