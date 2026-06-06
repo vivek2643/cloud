@@ -1,7 +1,8 @@
 name: Build GPU worker image
 
 # Builds backend/Dockerfile.worker and pushes it to GitHub Container Registry
-# (GHCR) so RunPod / Lambda / any GPU host can pull it. No local Docker needed.
+# (GHCR) so the AWS GPU box (or any GPU host) can pull it. No local Docker needed.
+# See docs/gpu_worker.md + deploy/aws/ for the single-box fleet deployment.
 on:
   workflow_dispatch: {}
   push:

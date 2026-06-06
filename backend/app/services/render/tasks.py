@@ -14,7 +14,7 @@ from app.services.render.edl_runner import run_render
 logger = logging.getLogger(__name__)
 
 
-@app.task(name="render_edl", retry={"max_attempts": 2, "wait": "exponential"})
+@app.task(name="render_edl", queue="cpu", retry={"max_attempts": 2, "wait": "exponential"})
 def render_edl_task(render_id: str) -> None:
     """Top-level render job. The runner does all the heavy lifting."""
     logger.info("render_edl task picked up: render_id=%s", render_id)

@@ -124,7 +124,8 @@ def _enqueue_l2_if_needed(file_id: str) -> None:
 
         enqueue_app = App(connector=PsycopgConnector(conninfo=get_settings().database_url))
         with enqueue_app.open():
-            enqueue_app.configure_task("l2_enrich_file").defer(file_id=file_id)
+            # queue="gpu" so the GPU fleet (not CPU render workers) picks it up.
+            enqueue_app.configure_task("l2_enrich_file", queue="gpu").defer(file_id=file_id)
         logger.info("Auto-enqueued L2 enrichment for %s.", file_id)
     except Exception:
         logger.exception("L1 done but auto-enqueue of L2 failed for %s.", file_id)
@@ -479,7 +480,7 @@ def _run_stage(
 
 # --- Top-level procrastinate task ----------------------------------------
 
-@app.task(name="l1_orchestrate", retry={"max_attempts": 3, "wait": "exponential"})
+@app.task(name="l1_orchestrate", queue="gpu", retry={"max_attempts": 3, "wait": "exponential"})
 def l1_orchestrate(file_id: str, r2_key: str) -> None:
     """
     Single procrastinate task that downloads the raw video once and runs all

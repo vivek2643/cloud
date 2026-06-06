@@ -401,7 +401,7 @@ def enrich(
 
 # --- Procrastinate task wrappers -----------------------------------------
 
-@proc_app.task(name="l2_enrich_file", retry={"max_attempts": 2, "wait": "exponential"})
+@proc_app.task(name="l2_enrich_file", queue="gpu", retry={"max_attempts": 2, "wait": "exponential"})
 def l2_enrich_file_task(file_id: str) -> None:
     enrich(file_id=file_id)
 

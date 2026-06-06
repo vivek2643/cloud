@@ -79,7 +79,8 @@ def _enqueue_l1(file_id: str, r2_key: str) -> bool:
 
         enqueue_app = App(connector=PsycopgConnector(conninfo=get_settings().database_url))
         with enqueue_app.open():
-            enqueue_app.configure_task("l1_orchestrate").defer(file_id=file_id, r2_key=r2_key)
+            # queue="gpu": GPU fleet runs ingest; CPU render workers ignore it.
+            enqueue_app.configure_task("l1_orchestrate", queue="gpu").defer(file_id=file_id, r2_key=r2_key)
         return True
     except Exception:
         logger.exception("Could not enqueue L1 job for %s; file is still uploaded.", file_id)
