@@ -71,11 +71,14 @@ resource "aws_iam_instance_profile" "fleet" {
   role        = aws_iam_role.fleet.name
 }
 
-# --- the box -----------------------------------------------------------------
+# --- the boxes ---------------------------------------------------------------
+# One spot request per box; spread across AZs (subnet round-robin) to improve
+# spot fulfillment. 2x g5.2xlarge = 16 vCPU = the Spot G quota ceiling.
 resource "aws_instance" "fleet" {
+  count                       = var.worker_count
   ami                         = data.aws_ssm_parameter.gpu_ami.value
   instance_type               = var.instance_type
-  subnet_id                   = element(data.aws_subnets.default.ids, 0)
+  subnet_id                   = element(data.aws_subnets.default.ids, count.index)
   vpc_security_group_ids      = [aws_security_group.fleet.id]
   iam_instance_profile        = aws_iam_instance_profile.fleet.name
   associate_public_ip_address = true
@@ -107,5 +110,5 @@ resource "aws_instance" "fleet" {
     ghcr_pat           = var.ghcr_pat
   })
 
-  tags = { Name = var.name }
+  tags = { Name = "${var.name}-${count.index}" }
 }

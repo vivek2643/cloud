@@ -1,7 +1,13 @@
 variable "region" {
-  description = "AWS region. Keep close to Supabase (their DB is us-west-2) to cut latency."
+  description = "AWS region. Must match where your G-instance quota lives (us-east-1 here)."
   type        = string
-  default     = "us-west-2"
+  default     = "us-east-1"
+}
+
+variable "aws_profile" {
+  description = "Named AWS CLI profile to use. Empty = default credential chain."
+  type        = string
+  default     = "edso"
 }
 
 variable "name" {
@@ -12,19 +18,25 @@ variable "name" {
 
 variable "instance_type" {
   description = <<-EOT
-    GPU instance. One large box:
-      g5.2xlarge   = 1x A10G 24GB  (cheapest, first parallel test)
-      g5.12xlarge  = 4x A10G 24GB  (GPU_WORKERS=4, 4 videos at once)
-      g6.12xlarge  = 4x L4  24GB   (newer/cheaper alt)
+    GPU instance (per box). Under the 16-vCPU Spot G quota:
+      g5.2xlarge  = 8 vCPU, 1x A10G 24GB  -> 2 boxes = 16 vCPU = 2 GPUs (chosen)
+      g5.4xlarge  = 16 vCPU, 1x A10G      -> 1 box only
+      g4dn.xlarge = 4 vCPU, 1x T4 16GB    -> 4 boxes (slower, OOM risk)
   EOT
   type        = string
-  default     = "g5.12xlarge"
+  default     = "g5.2xlarge"
+}
+
+variable "worker_count" {
+  description = "Number of GPU boxes. 2x g5.2xlarge = 16 vCPU = the Spot G quota ceiling."
+  type        = number
+  default     = 2
 }
 
 variable "use_spot" {
-  description = "Use a spot instance (~60-70% cheaper, can be interrupted). On-demand is safer mid-demo."
+  description = "Use spot. On-Demand G quota is 0 in us-east-1, so this must stay true."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "root_volume_gb" {
@@ -46,9 +58,9 @@ variable "gpu_workers" {
 }
 
 variable "cpu_workers" {
-  description = "CPU-queue (render) worker processes."
+  description = "CPU-queue (render) worker processes per box. 1 is plenty on an 8-vCPU box."
   type        = number
-  default     = 2
+  default     = 1
 }
 
 variable "worker_concurrency" {

@@ -1,21 +1,24 @@
-# Copy to terraform.tfvars and adjust. Most defaults are fine for a demo.
+# Copy to terraform.tfvars and adjust. Defaults match the approved setup:
+# us-east-1, Spot-only (On-Demand G quota = 0), 2x g5.2xlarge = 2 GPUs.
 
-region        = "us-west-2"
-instance_type = "g5.12xlarge" # 4x A10G -> 4 videos ingest in parallel
-use_spot      = false         # true = ~60-70% cheaper, can be interrupted
+region        = "us-east-1"
+aws_profile   = "edso"
+instance_type = "g5.2xlarge" # 1x A10G per box
+worker_count  = 2            # 2 boxes = 16 vCPU = Spot G quota ceiling
+use_spot      = true         # On-Demand G is quota-blocked here
 
 # Worker fleet sizing (optional; gpu_workers empty = 1 per GPU).
-# gpu_workers        = "4"
-# cpu_workers        = 2
+# gpu_workers        = ""    # auto: 1 per detected GPU
+# cpu_workers        = 1
 # worker_concurrency = 1
 
-# Secrets: by default Terraform bakes in the repo-root .env. Override if needed:
+# Secrets: Terraform bakes in the repo-root .env by default. Override if needed:
 # env_file_path = "/absolute/path/to/.env"
 
-# Only if the GHCR image package is PRIVATE:
+# GHCR package is public, so no login needed. If you make it private later:
 # ghcr_user = "vivek2643"
 # ghcr_pat  = "ghp_xxx"   # read:packages scope
 
-# Only if you want SSH (otherwise use SSM Session Manager, no inbound port):
+# Optional SSH (otherwise use SSM Session Manager, no inbound port):
 # ssh_key_name     = "my-keypair"
 # allowed_ssh_cidr = "1.2.3.4/32"
