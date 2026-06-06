@@ -10,6 +10,10 @@ Target deployment: **one large GPU instance** running a *fleet* of worker
 processes for cross-file parallelism. Many videos process at once — each worker
 process pulls a different file.
 
+> **Fully automated:** `deploy/aws/terraform/` provisions the box and boots the
+> fleet in one `terraform apply` (it bakes in your `.env`). See its README. The
+> steps below are the manual equivalent.
+
 ---
 
 ## Queues (parallelism model)

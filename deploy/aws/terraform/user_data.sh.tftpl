@@ -1,0 +1,39 @@
+#!/bin/bash
+# Bootstraps the EDSO worker fleet on a Deep Learning GPU AMI (Docker +
+# nvidia-container-toolkit already installed). Runs once at first boot.
+set -euxo pipefail
+
+mkdir -p /opt/edso/models
+cd /opt/edso
+
+# --- secrets: write the baked .env -----------------------------------------
+%{ if env_b64 != "" ~}
+echo "${env_b64}" | base64 -d > /opt/edso/.env
+chmod 600 /opt/edso/.env
+%{ else ~}
+echo "WARNING: no .env was baked in; create /opt/edso/.env then restart the container." >&2
+touch /opt/edso/.env
+%{ endif ~}
+
+# --- private image? log in to GHCR -----------------------------------------
+%{ if ghcr_pat != "" ~}
+echo "${ghcr_pat}" | docker login ghcr.io -u "${ghcr_user}" --password-stdin
+%{ endif ~}
+
+docker pull "${image}"
+
+docker rm -f edso-fleet 2>/dev/null || true
+docker run -d --name edso-fleet --restart unless-stopped \
+  --gpus all \
+  --env-file /opt/edso/.env \
+  %{ if gpu_workers != "" ~}-e GPU_WORKERS=${gpu_workers} %{ endif ~}-e CPU_WORKERS=${cpu_workers} \
+  -e WORKER_CONCURRENCY=${worker_concurrency} \
+  -v /opt/edso/models:/models \
+  "${image}" bash run_workers.sh
+
+# Convenience: helper to tail fleet logs (`edso-logs`).
+cat >/usr/local/bin/edso-logs <<'EOF'
+#!/bin/bash
+exec docker logs -f edso-fleet
+EOF
+chmod +x /usr/local/bin/edso-logs
