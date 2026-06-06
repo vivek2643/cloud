@@ -168,6 +168,59 @@ export function completeUpload(fileId: string, token: string) {
   });
 }
 
+// --- Multipart upload (files larger than R2's 5 GiB single-PUT limit) ---
+
+export interface MultipartCreateResponse {
+  file_id: string;
+  r2_key: string;
+  upload_id: string;
+  part_size: number;
+  part_urls: string[];
+}
+
+export function createMultipartUpload(
+  filename: string,
+  contentType: string,
+  fileSize: number,
+  folderId: string | null,
+  token: string
+) {
+  return request<MultipartCreateResponse>("/api/upload/multipart/create", {
+    method: "POST",
+    body: JSON.stringify({
+      filename,
+      content_type: contentType,
+      file_size: fileSize,
+      folder_id: folderId,
+    }),
+    token,
+  });
+}
+
+export function completeMultipartUpload(
+  fileId: string,
+  uploadId: string,
+  token: string
+) {
+  return request<FileRecord>("/api/upload/multipart/complete", {
+    method: "POST",
+    body: JSON.stringify({ file_id: fileId, upload_id: uploadId }),
+    token,
+  });
+}
+
+export function abortMultipartUpload(
+  fileId: string,
+  uploadId: string,
+  token: string
+) {
+  return request<{ ok: boolean }>("/api/upload/multipart/abort", {
+    method: "POST",
+    body: JSON.stringify({ file_id: fileId, upload_id: uploadId }),
+    token,
+  });
+}
+
 // --- L3 Edit requests ---
 
 export interface EditRequestBody {

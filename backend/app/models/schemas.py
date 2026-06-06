@@ -73,3 +73,30 @@ class PresignRequest(BaseModel):
 class PresignResponse(BaseModel):
     file_id: str
     upload_url: str
+
+
+# --- Multipart upload (large files > 5 GiB) ---
+
+class MultipartCreateRequest(BaseModel):
+    filename: str
+    content_type: str
+    file_size: int
+    folder_id: Optional[str] = None
+
+
+class MultipartCreateResponse(BaseModel):
+    file_id: str
+    r2_key: str
+    upload_id: str
+    part_size: int
+    part_urls: list[str]
+
+
+class MultipartCompleteRequest(BaseModel):
+    file_id: str
+    upload_id: str
+
+
+class MultipartAbortRequest(BaseModel):
+    file_id: str
+    upload_id: str

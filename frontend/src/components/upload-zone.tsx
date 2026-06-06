@@ -5,11 +5,46 @@ import { useDropzone } from "react-dropzone";
 import { Upload } from "lucide-react";
 import { useDriveStore } from "@/stores/drive-store";
 import { useAuthStore } from "@/stores/auth-store";
-import { presignUpload, completeUpload } from "@/lib/api";
+import {
+  presignUpload,
+  completeUpload,
+  createMultipartUpload,
+  completeMultipartUpload,
+  abortMultipartUpload,
+} from "@/lib/api";
 
 const VIDEO_ACCEPT = {
   "video/*": [".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv", ".mxf", ".mts"],
 };
+
+// R2's single presigned PUT caps at 5 GiB; route anything large through
+// multipart. The threshold is well under 5 GiB so we never hit EntityTooLarge.
+const MULTIPART_THRESHOLD = 100 * 1024 * 1024; // 100 MiB
+
+/** PUT a blob with upload progress. Pass contentType only when it was signed
+ * (single-PUT); multipart part URLs are signed without a content-type. */
+function putBlob(
+  url: string,
+  body: Blob,
+  contentType: string | null,
+  onProgress: (loadedBytes: number) => void
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", url, true);
+    if (contentType) xhr.setRequestHeader("Content-Type", contentType);
+    xhr.upload.addEventListener("progress", (e) => {
+      if (e.lengthComputable) onProgress(e.loaded);
+    });
+    xhr.addEventListener("load", () => {
+      if (xhr.status >= 200 && xhr.status < 300) resolve();
+      else reject(new Error(`Upload failed: ${xhr.status}`));
+    });
+    xhr.addEventListener("error", () => reject(new Error("Network error during upload")));
+    xhr.addEventListener("abort", () => reject(new Error("Upload cancelled")));
+    xhr.send(body);
+  });
+}
 
 export function useUploadFiles() {
   const currentFolderId = useDriveStore((s) => s.currentFolderId);
@@ -30,43 +65,62 @@ export function useUploadFiles() {
       try {
         const token = session?.access_token;
         if (!token) throw new Error("Not authenticated");
+        const contentType = file.type || "video/mp4";
 
-        const presign = await presignUpload(
-          file.name,
-          file.type || "video/mp4",
-          file.size,
-          currentFolderId,
-          token
-        );
-
-        await new Promise<void>((resolve, reject) => {
-          const xhr = new XMLHttpRequest();
-          xhr.open("PUT", presign.upload_url, true);
-          xhr.setRequestHeader("Content-Type", file.type || "video/mp4");
-
-          xhr.upload.addEventListener("progress", (e) => {
-            if (e.lengthComputable) {
-              updateUpload(uploadId, {
-                progress: Math.round((e.loaded / e.total) * 100),
+        if (file.size > MULTIPART_THRESHOLD) {
+          // Large file: chunked multipart upload (handles > 5 GiB).
+          const mp = await createMultipartUpload(
+            file.name,
+            contentType,
+            file.size,
+            currentFolderId,
+            token
+          );
+          try {
+            let uploadedBytes = 0;
+            for (let i = 0; i < mp.part_urls.length; i++) {
+              const start = i * mp.part_size;
+              const end = Math.min(start + mp.part_size, file.size);
+              const blob = file.slice(start, end);
+              await putBlob(mp.part_urls[i], blob, null, (loaded) => {
+                updateUpload(uploadId, {
+                  progress: Math.round(((uploadedBytes + loaded) / file.size) * 100),
+                });
               });
+              uploadedBytes += end - start;
             }
+            await completeMultipartUpload(mp.file_id, mp.upload_id, token);
+            updateUpload(uploadId, {
+              status: "complete",
+              progress: 100,
+              fileId: mp.file_id,
+            });
+          } catch (err) {
+            // Best-effort cleanup so no orphaned 'uploading' row / R2 parts linger.
+            abortMultipartUpload(mp.file_id, mp.upload_id, token).catch(() => {});
+            throw err;
+          }
+        } else {
+          // Small file: single presigned PUT.
+          const presign = await presignUpload(
+            file.name,
+            contentType,
+            file.size,
+            currentFolderId,
+            token
+          );
+          await putBlob(presign.upload_url, file, contentType, (loaded) => {
+            updateUpload(uploadId, {
+              progress: Math.round((loaded / file.size) * 100),
+            });
           });
-
-          xhr.addEventListener("load", () => {
-            if (xhr.status >= 200 && xhr.status < 300) resolve();
-            else reject(new Error(`Upload failed: ${xhr.status}`));
+          await completeUpload(presign.file_id, token);
+          updateUpload(uploadId, {
+            status: "complete",
+            progress: 100,
+            fileId: presign.file_id,
           });
-          xhr.addEventListener("error", () => reject(new Error("Network error during upload")));
-          xhr.addEventListener("abort", () => reject(new Error("Upload cancelled")));
-          xhr.send(file);
-        });
-
-        await completeUpload(presign.file_id, token);
-        updateUpload(uploadId, {
-          status: "complete",
-          progress: 100,
-          fileId: presign.file_id,
-        });
+        }
       } catch (err) {
         updateUpload(uploadId, {
           status: "error",

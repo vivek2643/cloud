@@ -1,13 +1,29 @@
 import logging
+import math
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.auth import get_current_user_id
 from app.config import get_settings
-from app.services.r2 import generate_presigned_put
+from app.services.r2 import (
+    abort_multipart_upload,
+    complete_multipart_upload,
+    create_multipart_upload,
+    generate_presigned_put,
+    generate_presigned_upload_parts,
+    part_size_for,
+)
 from app.services.supabase_client import get_supabase
-from app.models.schemas import PresignRequest, PresignResponse, FileResponse
+from app.models.schemas import (
+    FileResponse,
+    MultipartAbortRequest,
+    MultipartCompleteRequest,
+    MultipartCreateRequest,
+    MultipartCreateResponse,
+    PresignRequest,
+    PresignResponse,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/upload", tags=["upload"])
@@ -118,3 +134,98 @@ def complete_upload(
         _enqueue_l1(file_id, file_record["r2_key"])
 
     return result.data[0]
+
+
+def _finalize_upload(sb, file_record: dict) -> dict:
+    """Flip an uploaded file to processing/ready and enqueue L1 for videos.
+    Shared by the single-PUT and multipart completion paths."""
+    new_status = "processing" if file_record["file_type"] == "video" else "ready"
+    result = (
+        sb.table("files").update({"status": new_status}).eq("id", file_record["id"]).execute()
+    )
+    if new_status == "processing":
+        _enqueue_l1(file_record["id"], file_record["r2_key"])
+    return result.data[0]
+
+
+# --- Multipart upload (files > 5 GiB, and any large upload) -------------------
+
+@router.post("/multipart/create", response_model=MultipartCreateResponse)
+def multipart_create(
+    body: MultipartCreateRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    sb = get_supabase()
+
+    if body.folder_id:
+        folder = sb.table("folders").select("id").eq("id", body.folder_id).eq("user_id", user_id).execute()
+        if not folder.data:
+            raise HTTPException(status_code=404, detail="Folder not found")
+
+    file_id = str(uuid.uuid4())
+    r2_key = f"raw/{user_id}/{file_id}/{body.filename}"
+
+    upload_id = create_multipart_upload(r2_key, body.content_type)
+    psize = part_size_for(body.file_size)
+    part_count = max(1, math.ceil(body.file_size / psize))
+    part_urls = generate_presigned_upload_parts(r2_key, upload_id, part_count)
+
+    sb.table("files").insert({
+        "id": file_id,
+        "user_id": user_id,
+        "folder_id": body.folder_id,
+        "name": body.filename,
+        "filename": body.filename,
+        "mime_type": body.content_type,
+        "file_size": body.file_size,
+        "file_type": _detect_file_type(body.content_type),
+        "r2_key": r2_key,
+        "status": "uploading",
+    }).execute()
+
+    return MultipartCreateResponse(
+        file_id=file_id,
+        r2_key=r2_key,
+        upload_id=upload_id,
+        part_size=psize,
+        part_urls=part_urls,
+    )
+
+
+@router.post("/multipart/complete", response_model=FileResponse)
+def multipart_complete(
+    body: MultipartCompleteRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    sb = get_supabase()
+    file_result = sb.table("files").select("*").eq("id", body.file_id).eq("user_id", user_id).execute()
+    if not file_result.data:
+        raise HTTPException(status_code=404, detail="File not found")
+    file_record = file_result.data[0]
+    if file_record["status"] != "uploading":
+        raise HTTPException(status_code=400, detail="File is not in uploading state")
+
+    try:
+        complete_multipart_upload(file_record["r2_key"], body.upload_id)
+    except Exception as e:
+        logger.exception("Multipart complete failed for %s", body.file_id)
+        raise HTTPException(status_code=400, detail=f"Could not complete upload: {e}")
+
+    return _finalize_upload(sb, file_record)
+
+
+@router.post("/multipart/abort")
+def multipart_abort(
+    body: MultipartAbortRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    sb = get_supabase()
+    file_result = sb.table("files").select("*").eq("id", body.file_id).eq("user_id", user_id).execute()
+    if not file_result.data:
+        raise HTTPException(status_code=404, detail="File not found")
+    file_record = file_result.data[0]
+
+    abort_multipart_upload(file_record["r2_key"], body.upload_id)
+    # Drop the placeholder row so it doesn't linger as a stuck 'uploading' file.
+    sb.table("files").delete().eq("id", body.file_id).eq("user_id", user_id).execute()
+    return {"ok": True}
