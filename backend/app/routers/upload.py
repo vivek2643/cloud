@@ -77,7 +77,10 @@ def _enqueue_l1(file_id: str, r2_key: str) -> bool:
     try:
         from procrastinate import App, PsycopgConnector
 
-        enqueue_app = App(connector=PsycopgConnector(conninfo=get_settings().database_url))
+        # Tiny pool: Supabase's session pooler caps total clients, and this API
+        # only needs a brief connection to defer the job (see jobs.DB_POOL_MAX).
+        enqueue_app = App(connector=PsycopgConnector(
+            conninfo=get_settings().database_url, min_size=1, max_size=2))
         with enqueue_app.open():
             # queue="gpu": GPU fleet runs ingest; CPU render workers ignore it.
             enqueue_app.configure_task("l1_orchestrate", queue="gpu").defer(file_id=file_id, r2_key=r2_key)

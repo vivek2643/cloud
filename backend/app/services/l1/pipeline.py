@@ -122,7 +122,10 @@ def _enqueue_l2_if_needed(file_id: str) -> None:
 
         from procrastinate import App, PsycopgConnector
 
-        enqueue_app = App(connector=PsycopgConnector(conninfo=get_settings().database_url))
+        # Tiny pool: this runs inside an L1 worker that already holds a pool, and
+        # Supabase's session pooler caps total clients (see jobs.DB_POOL_MAX).
+        enqueue_app = App(connector=PsycopgConnector(
+            conninfo=get_settings().database_url, min_size=1, max_size=2))
         with enqueue_app.open():
             # queue="gpu" so the GPU fleet (not CPU render workers) picks it up.
             enqueue_app.configure_task("l2_enrich_file", queue="gpu").defer(file_id=file_id)

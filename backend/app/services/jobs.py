@@ -14,9 +14,19 @@ Setup (one-time):
 """
 from __future__ import annotations
 
+import os
+
 from procrastinate import App, PsycopgConnector
 
 from app.config import get_settings
+
+
+# Supabase's session pooler caps total client connections (15 on smaller tiers).
+# A fleet of N worker processes each opening psycopg_pool's default 4 connections
+# blows past that and starves later boxes (EMAXCONNSESSION). Keep each worker's
+# pool tiny: a running worker needs ~2 (one held for LISTEN/NOTIFY, one for
+# fetch/ack). Tune via DB_POOL_MAX if you raise the pooler limit.
+DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "2"))
 
 
 def _make_connector() -> PsycopgConnector:
@@ -27,7 +37,11 @@ def _make_connector() -> PsycopgConnector:
             "(Project Settings -> Database -> Connection string -> URI) before "
             "starting the worker or enqueuing jobs."
         )
-    return PsycopgConnector(conninfo=settings.database_url)
+    return PsycopgConnector(
+        conninfo=settings.database_url,
+        min_size=1,
+        max_size=DB_POOL_MAX,
+    )
 
 
 # Single global app instance. Tasks are registered in modules imported below.
