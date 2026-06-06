@@ -48,6 +48,52 @@ def _pg():
     return psycopg.connect(get_settings().database_url, autocommit=True, row_factory=dict_row)
 
 
+# Columns selected by the chat retrieval queries, in CandidateShot order.
+# Kept as a constant so the "<= cap" and "bucketed" branches stay in sync.
+_CHAT_SELECT_COLS = """
+            s.id              as shot_id,
+            s.shot_index      as shot_index,
+            s.start_ms        as start_ms,
+            s.end_ms          as end_ms,
+            s.keyframe_r2_key as keyframe_r2_key,
+            s.intra_shot_variance as intra_shot_variance,
+            s.peak_motion_ms      as peak_motion_ms,
+            s.blur_min            as blur_min,
+            f.id              as file_id,
+            f.name            as file_name,
+            f.r2_key          as file_r2_key,
+            f.r2_proxy_key    as file_r2_proxy_key,
+            f.duration_seconds as duration_seconds,
+            t.text            as transcript_text,
+            af.is_musical     as is_musical
+"""
+
+
+def _hydrate(rows) -> List["CandidateShot"]:
+    """Map raw dict rows (selecting _CHAT_SELECT_COLS) into CandidateShot."""
+    return [
+        CandidateShot(
+            shot_id=str(r["shot_id"]),
+            file_id=str(r["file_id"]),
+            file_name=r["file_name"],
+            file_r2_key=r["file_r2_key"],
+            file_r2_proxy_key=r.get("file_r2_proxy_key"),
+            duration_seconds=r.get("duration_seconds"),
+            shot_index=r["shot_index"],
+            start_ms=r["start_ms"],
+            end_ms=r["end_ms"],
+            score=float(r.get("score") or 0.0),
+            keyframe_r2_key=r.get("keyframe_r2_key"),
+            transcript_text=r.get("transcript_text"),
+            is_musical=r.get("is_musical"),
+            intra_shot_variance=r.get("intra_shot_variance"),
+            peak_motion_ms=r.get("peak_motion_ms"),
+            blur_min=r.get("blur_min"),
+        )
+        for r in rows
+    ]
+
+
 def fetch_candidates_by_shot_ids(
     user_id: str,
     shot_ids: List[str],
@@ -206,6 +252,134 @@ def retrieve_top_k(
         )
         for r in rows
     ]
+
+
+def retrieve_for_chat(
+    user_id: str,
+    prompt: str,
+    folder_id: Optional[str] = None,
+    file_ids: Optional[List[str]] = None,
+    cap: int = 120,
+) -> List[CandidateShot]:
+    """
+    Retrieval tuned for the conversational editor.
+
+    Unlike `retrieve_top_k` (pure SigLIP top-K, which biases the catalog toward
+    whatever the prompt embeds near and shuffles footage out of order), this
+    returns shots in CHRONOLOGICAL order so Claude can read the footage like a
+    story instead of a bag of best-matching frames:
+
+      * If the in-scope footage has <= cap shots, return ALL of them in
+        chronological order (file creation order, then shot index). The editor
+        sees the complete story; nothing is dropped.
+
+      * If there are more than cap shots, stay chronological but DOWNSAMPLE:
+        split each file into temporal buckets and keep the top `per_bucket`
+        shots per bucket by a BALANCED blended score, then re-emit the kept
+        shots in chronological order. This preserves coverage across the whole
+        timeline instead of clustering on the prompt.
+
+    The blended score spreads weight across modalities so the catalog is
+    neither transcript-biased nor visual-biased:
+        0.5 * visual (SigLIP cosine to the prompt)
+      + 0.3 * transcript (full-text rank vs the prompt)
+      + 0.2 * emotional_valence (L2)
+      + 0.2 * motion_magnitude (clamped)
+      + 0.1 * (not blurry)
+    """
+    prompt = (prompt or "").strip()
+
+    # Scope filter shared by the count, file-count, and both retrieval branches.
+    scope_sql = "where f.user_id = %s and f.l1_status = 'ready'"
+    scope_params: List[Any] = [user_id]
+    if file_ids:
+        scope_sql += " and f.id = any(%s::uuid[])"
+        scope_params.append(file_ids)
+    elif folder_id:
+        scope_sql += " and f.folder_id = %s"
+        scope_params.append(folder_id)
+
+    with _pg() as conn:
+        cnt_row = conn.execute(
+            "select count(*) as n from shots s join files f on f.id = s.file_id " + scope_sql,
+            scope_params,
+        ).fetchone()
+        total = int((cnt_row or {}).get("n") or 0)
+        if total == 0:
+            return []
+
+        # ---- Branch A: everything fits -> chronological, nothing dropped ----
+        if total <= cap:
+            sql = (
+                "select" + _CHAT_SELECT_COLS +
+                "from shots s\n"
+                "join files f on f.id = s.file_id\n"
+                "left join transcripts t on t.file_id = f.id\n"
+                "left join audio_features af on af.file_id = f.id\n"
+                + scope_sql + "\n"
+                "order by f.created_at asc, f.id asc, s.shot_index asc"
+            )
+            rows = conn.execute(sql, scope_params).fetchall()
+            return _hydrate(rows)
+
+        # ---- Branch B: too many shots -> chronological bucketed downsample ----
+        files_row = conn.execute(
+            "select count(distinct f.id) as n from shots s join files f on f.id = s.file_id " + scope_sql,
+            scope_params,
+        ).fetchone()
+        num_files = max(1, int((files_row or {}).get("n") or 1))
+
+        BUCKETS = 10
+        per_bucket = max(1, round(cap / (BUCKETS * num_files)))
+
+        if not prompt:
+            # No text to embed: fall back to a chronological, blur-aware sample.
+            score_expr = (
+                "0.2 * coalesce(s.emotional_valence, 0)\n"
+                "      + 0.2 * least(coalesce(s.motion_magnitude, 0) / 10.0, 1.0)\n"
+                "      + 0.1 * case when s.blur_min is null or s.blur_min >= 50 then 1 else 0 end"
+            )
+            score_params: List[Any] = []
+        else:
+            text_vec = emb_mod.embed_text(prompt)
+            vec_pg = _vec_to_pg(text_vec)
+            score_expr = (
+                "0.5 * (1 - (se.embedding <=> %s::halfvec))\n"
+                "      + 0.3 * coalesce(ts_rank(t.tsv, plainto_tsquery('simple', %s)), 0)\n"
+                "      + 0.2 * coalesce(s.emotional_valence, 0)\n"
+                "      + 0.2 * least(coalesce(s.motion_magnitude, 0) / 10.0, 1.0)\n"
+                "      + 0.1 * case when s.blur_min is null or s.blur_min >= 50 then 1 else 0 end"
+            )
+            score_params = [vec_pg, prompt]
+
+        # Two nested subqueries: inner q1 computes the score + temporal bucket,
+        # outer q2 ranks within (file, bucket). Postgres can't nest a window
+        # function (ntile) inside another window's PARTITION BY, hence the split.
+        sql = (
+            "select * from (\n"
+            "  select q1.*,\n"
+            "         row_number() over (partition by file_id, bucket order by score desc) as rn\n"
+            "  from (\n"
+            "    select" + _CHAT_SELECT_COLS + ",\n"
+            "      f.created_at as created_at,\n"
+            "      (" + score_expr + ") as score,\n"
+            "      ntile(" + str(BUCKETS) + ") over (partition by s.file_id order by s.start_ms) as bucket\n"
+            "    from shots s\n"
+            "    join files f on f.id = s.file_id\n"
+            "    join shot_embeddings se on se.shot_id = s.id\n"
+            "    left join transcripts t on t.file_id = f.id\n"
+            "    left join audio_features af on af.file_id = f.id\n"
+            "    " + scope_sql + "\n"
+            "  ) q1\n"
+            ") q2\n"
+            "where rn <= %s\n"
+            "order by created_at asc, file_id asc, shot_index asc"
+        )
+        params: List[Any] = list(score_params) + list(scope_params) + [per_bucket]
+        if prompt:
+            conn.execute("SET LOCAL hnsw.ef_search = 100")
+        rows = conn.execute(sql, params).fetchall()
+        return _hydrate(rows)
 
 
 def run_query(

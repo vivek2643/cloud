@@ -25,7 +25,7 @@ from app.services.edl import store as edl_store
 from app.services.l3 import claude_editor
 from app.services.l3.query_executor import (
     fetch_candidates_by_shot_ids,
-    retrieve_top_k,
+    retrieve_for_chat,
 )
 from app.services.l3.xml_builder import build_fcp7_xml
 from app.services.r2 import generate_presigned_get
@@ -44,7 +44,9 @@ class ChatTurnInput:
     folder_id: Optional[str] = None
     sequence_name: str = "AI Rough Cut"
     fps: int = 24
-    catalog_size: int = 50
+    # Chronological catalog budget. Larger than the old top-K default so the
+    # editor can read the whole story when footage fits; downsampled above this.
+    catalog_size: int = 120
     duration_target_s: Optional[int] = None
 
 
@@ -168,12 +170,12 @@ def run_chat_turn(
 
         # 1. Retrieval --------------------------------------------------
         emit("retrieving", 8, "Searching your footage")
-        primary = retrieve_top_k(
+        primary = retrieve_for_chat(
             user_id=user_id,
             prompt=latest,
             folder_id=inp.folder_id,
-            k=inp.catalog_size,
             file_ids=file_ids or None,
+            cap=inp.catalog_size,
         )
         prior_shot_ids: List[str] = []
         for m in inp.messages:
@@ -227,6 +229,7 @@ def run_chat_turn(
             history=inp.messages,
             candidates=candidates,
             duration_target_s=inp.duration_target_s,
+            emit=emit,
         )
         audit.stage("editor_user_message", result.user_text)
         audit.stage("editor_raw_response", result.raw_response)

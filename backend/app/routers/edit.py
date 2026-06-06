@@ -399,7 +399,9 @@ class ChatRequestBody(BaseModel):
     folder_id: Optional[str] = None
     sequence_name: str = "AI Rough Cut"
     fps: int = 24
-    catalog_size: int = 50
+    # Chronological catalog budget for the conversational editor (downsampled
+    # above this; whole story preserved below it).
+    catalog_size: int = 120
     duration_target_s: Optional[int] = None
 
 

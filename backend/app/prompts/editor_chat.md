@@ -48,11 +48,25 @@ Strict rules (same as single-shot):
 
 Editorial heuristics still apply (trailer/teaser -> hook->build->reveal, walkthrough -> chronological, pitch -> hook->problem->solution->close, etc.). The brief always overrides defaults.
 
+HOW TO BUILD A COHERENT, STORY-DRIVEN CUT:
+- The CATALOG is presented in CHRONOLOGICAL order (by file, then by source time). Read it top-to-bottom first to understand what actually happens in the footage before you cut anything.
+- If an EDITORIAL PLAN (beat sheet) is provided, follow it -- it is your own plan for the shape of this cut. Refine it against the exact shots available, but don't ignore it.
+- Balance ALL the signals, not just the transcript: the visual description, the spoken words, the narrative role, the valence, and the technical quality (prefer sharper shots -- higher blur_min is sharper; avoid blur_min < 50 unless nothing better exists). A great cut is not "the shots that mention the keyword".
+- DEFAULT TO CHRONOLOGICAL order within a story. Only reorder when the brief or a clear editorial reason (cold-open hook, intercut, callback) justifies it.
+- Keep beats from the same file together unless you have a reason to intercut; jumping between files every clip feels random.
+- Don't include weak or redundant shots just to hit a duration. A shorter tight cut beats a longer flabby one.
+
+TRIMMING (cut points matter):
+- Prefer cutting on natural boundaries: the start/end of a sentence (use the transcript), a silence, or a peak-motion moment for action.
+- NEVER cut in the middle of a spoken word. If a shot's transcript ends mid-sentence, either include enough to finish the thought or start the clip after the prior sentence ends.
+- Keep clips tight: trim dead air, false starts, and filler at the head and tail. A talking clip should usually start a beat before the first useful word and end just after the last.
+- Use source_in_ms / source_out_ms to express these trims; stay inside the shot's [start_ms, end_ms] bounds.
+
 Catalog format (one block per shot):
-SHOT <i>  id=<shot_id>  start=<ms>  end=<ms>  duration=<s>
+SHOT <i>  id=<shot_id>  file=<filename>  t=<m:ss>  start=<ms>  end=<ms>  duration=<s>
   visual:    <one-line scene description>
   framing:   <CU|MS|WS|null>          camera: <Static|Pan|...|null>
   role:      <setup|payoff|aside|reaction|transition|null>   valence: <-1..+1>
-  blur_min:  <float>                   intra_var: <float>
+  blur_min:  <float, higher = sharper>  intra_var: <float>
   audio:     <comma-sep tags or null>  (e.g. speech, applause, music)
   transcript: "<exact spoken text in this shot, may be empty>"

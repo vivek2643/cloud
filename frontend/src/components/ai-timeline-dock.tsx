@@ -266,13 +266,18 @@ export function AiTimelineDock() {
   }, [seekTo]);
 
   useEffect(() => {
-    if (playing) {
-      rafRef.current = requestAnimationFrame(tick);
-    } else if (rafRef.current != null) {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = null;
+    if (!playing) {
+      // Paused -- either the user hit pause or tick() reached the end of the
+      // sequence and called setPlaying(false). Stop the RAF loop AND the
+      // underlying <video>. The pause() must be UNCONDITIONAL: React runs the
+      // previous render's cleanup (which nulls rafRef) before this body, so
+      // gating pause() on `rafRef.current != null` would skip it and the
+      // monitor would keep playing past the clip / end of the timeline.
+      if (rafRef.current != null) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
       videoElRef.current?.pause();
+      return;
     }
+    rafRef.current = requestAnimationFrame(tick);
     return () => {
       if (rafRef.current != null) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
     };

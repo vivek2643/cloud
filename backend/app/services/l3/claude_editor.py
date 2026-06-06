@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import psycopg
 from psycopg.rows import dict_row
@@ -46,9 +46,9 @@ logger = logging.getLogger(__name__)
 # Per-clip minimum length below which we drop a clip post-validation.
 MIN_CLIP_MS = 500
 # How many catalog shots to send to Claude. The retriever already narrows
-# down via SigLIP; we cap again here so we never blow the context window
-# even on extreme cases.
-MAX_CATALOG_SHOTS = 80
+# down (chronologically, bucketed when over budget); we cap again here so we
+# never blow the context window even on extreme cases.
+MAX_CATALOG_SHOTS = 140
 
 
 # ---------------------------------------------------------------------------
@@ -137,14 +137,25 @@ def _fmt_optional(v, prec: int = 2) -> str:
     return str(v)
 
 
+def _fmt_tc(ms: int) -> str:
+    """Source timecode as m:ss so Claude can reason about where in each file a
+    shot sits without doing millisecond math."""
+    total_s = max(0, int(ms)) // 1000
+    return f"{total_s // 60}:{total_s % 60:02d}"
+
+
 def _build_catalog(
     candidates: List[CandidateShot],
 ) -> tuple[str, Dict[str, CandidateShot]]:
     """
     Render the catalog Claude will read, and return a {shot_id -> candidate}
     map for downstream validation. Truncated to MAX_CATALOG_SHOTS.
+
+    Shots are presented in CHRONOLOGICAL order (by file, then in-file time) so
+    the editor reads the footage as a story rather than a similarity-ranked
+    bag. Each block is labelled with its source file and source timecode.
     """
-    cands = candidates[:MAX_CATALOG_SHOTS]
+    cands = sorted(candidates, key=lambda c: (c.file_name or "", c.start_ms))[:MAX_CATALOG_SHOTS]
     cand_by_id: Dict[str, CandidateShot] = {c.shot_id: c for c in cands}
 
     meta = _fetch_shot_metadata([c.shot_id for c in cands])
@@ -166,7 +177,8 @@ def _build_catalog(
         spoken_repr = json.dumps(spoken) if spoken else '""'
         audio_repr = ", ".join(audio_tags) if audio_tags else "null"
         block = (
-            f"SHOT {i}  id={c.shot_id}  start={c.start_ms}ms  end={c.end_ms}ms  "
+            f"SHOT {i}  id={c.shot_id}  file={c.file_name!r}  "
+            f"t={_fmt_tc(c.start_ms)}  start={c.start_ms}ms  end={c.end_ms}ms  "
             f"duration={(c.end_ms - c.start_ms) / 1000:.1f}s\n"
             f"  visual:    {visual or '(no description)'}\n"
             f"  framing:   {_fmt_optional(m.get('framing_scale'))}          "
@@ -223,6 +235,67 @@ def _build_user_message(
         "Respond with the JSON object specified in your instructions. JSON only, no other text."
     )
     return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Pass A: planning (beat sheet) -- decide the SHAPE before picking clips
+# ---------------------------------------------------------------------------
+
+_PLAN_SYSTEM = (
+    "You are the lead editor planning a cut BEFORE touching the timeline. "
+    "You are given the user's brief and a chronological catalog of available "
+    "shots (with file, source timecode, visual description, and spoken text). "
+    "Do NOT pick exact clips yet. Instead write a short BEAT SHEET: the shape "
+    "of the edit as 3-7 beats. For each beat give:\n"
+    "  - a one-line intent (what this beat accomplishes for the viewer),\n"
+    "  - which footage region(s) it should draw from (reference files / rough "
+    "timecodes, e.g. \"clip2 around 0:30-0:50\"),\n"
+    "  - the emotional or narrative function (hook / build / reveal / payoff / "
+    "breather / outro).\n"
+    "Respect the brief literally first, then add editorial taste. Keep the "
+    "footage in a coherent order (usually chronological within a file) unless "
+    "the brief calls for a non-linear structure. Be concise: plain text, no "
+    "JSON, no clip ids. This plan will guide the clip-selection pass."
+)
+
+
+def _plan_beats(
+    history: List[Dict[str, Any]],
+    catalog_text: str,
+    duration_target_s: Optional[int],
+) -> str:
+    """Pass A: ask Claude for a short beat sheet. Returns plain text (best
+    effort) -- never raises; on failure we return "" and the fill pass runs
+    without an explicit plan."""
+    latest = ""
+    for m in reversed(history):
+        if m.get("role") == "user":
+            latest = str(m.get("content") or "").strip()
+            break
+    if not latest:
+        return ""
+    dur = (
+        f"DURATION TARGET: {duration_target_s} seconds"
+        if duration_target_s is not None
+        else "DURATION TARGET: (none -- choose a tight, defensible length)"
+    )
+    user_message = "\n\n".join([f"BRIEF:\n{latest}", dur, catalog_text,
+                                "Write the beat sheet now."])
+    try:
+        settings = get_settings()
+        client = _anthropic_client()
+        msg = client.messages.create(
+            model=settings.anthropic_model,
+            max_tokens=900,
+            system=_PLAN_SYSTEM,
+            messages=[{"role": "user", "content": user_message}],
+        )
+        return "".join(
+            b.text for b in msg.content if getattr(b, "type", None) == "text"
+        ).strip()
+    except Exception:
+        logger.exception("Plan pass failed; continuing without a beat sheet")
+        return ""
 
 
 def _call_claude(system_prompt: str, user_message: str, max_tokens: int = 4096) -> Dict[str, Any]:
@@ -346,6 +419,7 @@ def compile_timeline_chat(
     history: List[Dict[str, Any]],
     candidates: List[CandidateShot],
     duration_target_s: Optional[int] = None,
+    emit: Optional[Callable[[str, int, str], None]] = None,
 ) -> EditorResult:
     """
     Multi-turn variant. `history` is the entire conversation so far, ordered
@@ -381,12 +455,20 @@ def compile_timeline_chat(
         )
 
     catalog_text, cand_by_id = _build_catalog(candidates)
+
+    # Pass A: plan the shape (beat sheet) before selecting clips. Streamed to
+    # the UI so the user sees the editorial intent as it forms.
+    plan_text = _plan_beats(history, catalog_text, duration_target_s)
+    if plan_text and emit:
+        emit("planning", 55, plan_text[:280])
+
     history_text = _render_history(history[:-1])  # everything BEFORE the latest user msg
     user_message = _build_chat_user_message(
         history_text=history_text,
         latest_brief=latest_brief,
         duration_target_s=duration_target_s,
         catalog_text=catalog_text,
+        plan_text=plan_text,
     )
     system_prompt = prompts_mod.load("editor_chat")
 
@@ -468,6 +550,7 @@ def _build_chat_user_message(
     latest_brief: str,
     duration_target_s: Optional[int],
     catalog_text: str,
+    plan_text: str = "",
 ) -> str:
     parts: List[str] = [
         "CONVERSATION HISTORY (oldest first):",
@@ -476,6 +559,12 @@ def _build_chat_user_message(
         "LATEST USER MESSAGE:",
         latest_brief,
     ]
+    if plan_text:
+        parts.append(
+            "\nEDITORIAL PLAN (your own beat sheet from the planning pass -- "
+            "follow it, refining as needed against the exact catalog):\n"
+            + plan_text
+        )
     if duration_target_s is not None:
         parts.append(f"\nDURATION TARGET (this turn): {duration_target_s} seconds")
     else:
