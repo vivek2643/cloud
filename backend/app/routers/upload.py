@@ -106,36 +106,6 @@ def _enqueue_l1(file_id: str, r2_key: str) -> bool:
         return False
 
 
-@router.post("/{file_id}/complete", response_model=FileResponse)
-def complete_upload(
-    file_id: str,
-    user_id: str = Depends(get_current_user_id),
-):
-    sb = get_supabase()
-
-    file_result = sb.table("files").select("*").eq("id", file_id).eq("user_id", user_id).execute()
-    if not file_result.data:
-        raise HTTPException(status_code=404, detail="File not found")
-
-    file_record = file_result.data[0]
-    if file_record["status"] != "uploading":
-        raise HTTPException(status_code=400, detail="File is not in uploading state")
-
-    new_status = "processing" if file_record["file_type"] == "video" else "ready"
-
-    result = (
-        sb.table("files")
-        .update({"status": new_status})
-        .eq("id", file_id)
-        .execute()
-    )
-
-    if new_status == "processing":
-        _enqueue_l1(file_id, file_record["r2_key"])
-
-    return result.data[0]
-
-
 def _finalize_upload(sb, file_record: dict) -> dict:
     """Flip an uploaded file to processing/ready and enqueue L1 for videos.
     Shared by the single-PUT and multipart completion paths."""
@@ -229,3 +199,20 @@ def multipart_abort(
     # Drop the placeholder row so it doesn't linger as a stuck 'uploading' file.
     sb.table("files").delete().eq("id", body.file_id).eq("user_id", user_id).execute()
     return {"ok": True}
+
+
+# NOTE: This dynamic route must be registered AFTER the static /multipart/* routes,
+# otherwise "/multipart/complete" gets captured here with file_id="multipart".
+@router.post("/{file_id}/complete", response_model=FileResponse)
+def complete_upload(
+    file_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    sb = get_supabase()
+    file_result = sb.table("files").select("*").eq("id", file_id).eq("user_id", user_id).execute()
+    if not file_result.data:
+        raise HTTPException(status_code=404, detail="File not found")
+    file_record = file_result.data[0]
+    if file_record["status"] != "uploading":
+        raise HTTPException(status_code=400, detail="File is not in uploading state")
+    return _finalize_upload(sb, file_record)
