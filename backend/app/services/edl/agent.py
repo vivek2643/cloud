@@ -33,6 +33,7 @@ from psycopg.rows import dict_row
 
 from app.config import get_settings
 from app.services import prompts
+from app.services.edl import patch as edl_patch
 from app.services.edl import store as edl_store
 from app.services.l3.anthropic_client import _client as _anthropic_client
 from app.services.l3.query_executor import retrieve_top_k
@@ -179,11 +180,13 @@ class _Timeline:
     """In-memory ordered list of minimal clips the tools mutate."""
 
     def __init__(self, clips: List[Dict[str, Any]]):
-        # Keep only the cut-only fields; preserve order.
+        # Keep only the cut-only fields; preserve order. file_id is carried so
+        # v2 (A/V split) timelines round-trip through the patch engine.
         self.clips: List[Dict[str, Any]] = [
             {
                 "id": str(c["id"]),
-                "shot_id": str(c["shot_id"]),
+                "file_id": str(c["file_id"]) if c.get("file_id") else None,
+                "shot_id": str(c["shot_id"]) if c.get("shot_id") else None,
                 "source_in_ms": int(c["source_in_ms"]),
                 "source_out_ms": int(c["source_out_ms"]),
             }
@@ -396,6 +399,7 @@ def _exec_tool(
                 return {"error": f"clip would be shorter than {MIN_CLIP_MS}ms"}, False, None
             new_clip = {
                 "id": str(uuid.uuid4()),
+                "file_id": str(row["file_id"]) if row.get("file_id") else None,
                 "shot_id": shot_id,
                 "source_in_ms": in_ms,
                 "source_out_ms": out_ms,
@@ -502,8 +506,15 @@ def run_agent(
         version = edl_store.get_edl_version(base_version_id)
     else:
         version = edl_store.get_latest_edl_version(project_id)
-    base_clips = (version["edl_json"].get("clips") if version else []) or []
+    base_edl: Dict[str, Any] = (version["edl_json"] if version else {}) or {}
     base_version_id = version["id"] if version else None
+
+    # v2 (A/V split) edits expose the video_track as the editable spine; v1 uses
+    # the coupled clips list. Either way the agent mutates a minimal clip list.
+    if base_edl.get("version") == 2:
+        base_clips = list(base_edl.get("video_track") or [])
+    else:
+        base_clips = list(base_edl.get("clips") or [])
 
     tl = _Timeline(base_clips)
     emit("planning", 5, "Reading the timeline")
@@ -583,16 +594,27 @@ def run_agent(
         summary = " ".join(final_text_bits).strip()[:300] or "Proposed timeline edits."
 
     work_clips = tl.clips
-    diff = _compute_diff(base_clips, work_clips)
+    # Materialize the full proposed EDL through the version-aware patch engine
+    # (recomputes timeline + rebuilds the audio track for v2). Fall back to the
+    # legacy clip-diff if rebuild fails, so a bad edit never breaks the proposal.
+    proposed_edl: Optional[Dict[str, Any]] = None
+    diff: Dict[str, Any]
+    try:
+        proposed_edl, diff = edl_patch.rebuild_from_clips(base_edl, work_clips)
+    except Exception:
+        logger.exception("patch rebuild failed; returning clip-level diff only")
+        diff = _compute_diff(_Timeline(base_clips).clips, work_clips)
     emit("done", 100, "Proposal ready")
 
     return {
         "project_id": project_id,
         "base_version_id": base_version_id,
+        "edl_version": base_edl.get("version", 1),
         "instruction": instruction,
         "summary": summary,
         "reasoning": " ".join(final_text_bits).strip()[:2000],
         "proposed_clips": work_clips,
+        "proposed_edl": proposed_edl,
         "diff": diff,
         "tool_log": tool_log,
     }
