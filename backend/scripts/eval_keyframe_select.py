@@ -143,7 +143,45 @@ def list_files(user_id: str) -> None:
         print(f"{str(r['id']):38}  {r['n_shots']:>5}  {dur:>7}  {str(r['l1_status']):9}  {r['name']}")
 
 
+def _load_from_shot_keyframes(file_id: str) -> List[ShotRow]:
+    """Layer A path: variable-count adaptive frames from shot_keyframes."""
+    sql = """
+        select s.shot_index, s.start_ms, s.end_ms,
+               sk.frame_index, sk.kind, sk.ts_ms, sk.r2_key,
+               sk.embedding::text as emb
+          from shots s
+          join shot_keyframes sk on sk.shot_id = s.id
+         where s.file_id = %s and sk.embedding is not null
+         order by s.shot_index, sk.frame_index
+    """
+    with _pg() as conn:
+        rows = conn.execute(sql, (file_id,)).fetchall()
+
+    by_shot: dict = {}
+    for r in rows:
+        vec = _parse_halfvec(r["emb"])
+        if vec is None:
+            continue
+        sr = by_shot.get(r["shot_index"])
+        if sr is None:
+            sr = ShotRow(
+                shot_index=r["shot_index"], start_ms=r["start_ms"], end_ms=r["end_ms"],
+                anchor_key=None, motion_key=None, variance_key=None,
+                peak_motion_ms=None, peak_variance_ms=None,
+                emb_anchor=None, emb_motion=None, emb_variance=None,
+            )
+            by_shot[r["shot_index"]] = sr
+        sr.frames.append(Frame(r["shot_index"], r["kind"], int(r["ts_ms"]), r["r2_key"], vec))
+    return [by_shot[k] for k in sorted(by_shot)]
+
+
 def load_shots(file_id: str) -> List[ShotRow]:
+    adaptive = _load_from_shot_keyframes(file_id)
+    if adaptive:
+        print("(source: shot_keyframes / Layer A adaptive coverage)")
+        return adaptive
+    print("(source: legacy anchor/motion/variance triple)")
+
     sql = """
         select s.shot_index, s.start_ms, s.end_ms,
                s.keyframe_r2_key            as anchor_key,

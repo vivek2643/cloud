@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import cv2  # type: ignore
@@ -44,6 +44,18 @@ def pick_form_factor(duration_s: float) -> dict:
 
 
 @dataclass
+class Keyframe:
+    """One adaptive keyframe (Layer A). The unified `Shot.keyframes` list drives
+    the shot_keyframes table; the legacy anchor/motion/variance fields below feed
+    the shots + shot_embeddings tables unchanged."""
+    kind: str                              # anchor | motion | variance | coverage
+    ts_ms: int
+    local_path: Optional[str] = None       # full-res JPEG during indexing
+    r2_key: Optional[str] = None           # 224x224 in R2 after upload
+    blur: Optional[float] = None
+
+
+@dataclass
 class Shot:
     index: int
     start_ms: int
@@ -65,6 +77,8 @@ class Shot:
     brightness: Optional[float] = None
     motion_magnitude: Optional[float] = None
     blur_min: Optional[float] = None                # min Laplacian variance across 3 keyframes
+    # Layer A: unified, time-ordered adaptive keyframe set (>= the base 3).
+    keyframes: List["Keyframe"] = field(default_factory=list)
 
 
 # --- PySceneDetect wrapper -----------------------------------------------
@@ -164,7 +178,7 @@ def detect_shots(video_path: str, duration_s: float, output_dir: str) -> List[Sh
     shots: List[Shot] = []
     for idx, (s_ms, e_ms) in enumerate(bounded):
         prefix = f"shot_{idx:05d}"
-        kfs = kf_mod.extract_three(video_path, s_ms, e_ms, output_dir, prefix)
+        kfs = kf_mod.extract_adaptive(video_path, s_ms, e_ms, output_dir, prefix)
 
         anchor = kfs.anchor_path
         # Per-keyframe blur
@@ -184,6 +198,22 @@ def detect_shots(video_path: str, duration_s: float, output_dir: str) -> List[Sh
         # (which previously dominated the shots stage).
         motion = kfs.motion_mag if (anchor and kfs.motion_mag is not None) else 0.0
 
+        # Unified adaptive keyframe set (Layer A): base 3 + coverage, time-ordered.
+        unified: List[Keyframe] = []
+        for kind, path, ts in (
+            ("anchor", kfs.anchor_path, kfs.anchor_ts_ms),
+            ("motion", kfs.motion_path, kfs.motion_ts_ms),
+            ("variance", kfs.variance_path, kfs.variance_ts_ms),
+        ):
+            if path and ts is not None:
+                unified.append(Keyframe(kind=kind, ts_ms=int(ts), local_path=path,
+                                        blur=kf_mod.laplacian_blur_score(path)))
+        for cov in kfs.coverage:
+            unified.append(Keyframe(kind="coverage", ts_ms=int(cov.ts_ms),
+                                    local_path=cov.path,
+                                    blur=kf_mod.laplacian_blur_score(cov.path)))
+        unified.sort(key=lambda kf: kf.ts_ms)
+
         shots.append(Shot(
             index=idx,
             start_ms=s_ms,
@@ -198,5 +228,6 @@ def detect_shots(video_path: str, duration_s: float, output_dir: str) -> List[Sh
             brightness=brightness,
             motion_magnitude=motion,
             blur_min=blur_min,
+            keyframes=unified,
         ))
     return shots

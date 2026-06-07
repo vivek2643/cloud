@@ -43,6 +43,27 @@ def _pg_conn() -> psycopg.Connection:
     return psycopg.connect(settings.database_url, autocommit=True)
 
 
+# Cached per-process: whether the Layer A shot_keyframes table exists. Lets L1
+# run cleanly before migration 008 is applied (writes just no-op).
+_SHOT_KEYFRAMES_OK: Optional[bool] = None
+
+
+def _shot_keyframes_available(conn: psycopg.Connection) -> bool:
+    global _SHOT_KEYFRAMES_OK
+    if _SHOT_KEYFRAMES_OK is None:
+        try:
+            row = conn.execute("select to_regclass('public.shot_keyframes')").fetchone()
+            _SHOT_KEYFRAMES_OK = bool(row and row[0] is not None)
+        except Exception:
+            _SHOT_KEYFRAMES_OK = False
+        if not _SHOT_KEYFRAMES_OK:
+            logger.warning(
+                "shot_keyframes table missing; Layer A adaptive keyframes disabled "
+                "(apply migration 008_adaptive_keyframes.sql)."
+            )
+    return _SHOT_KEYFRAMES_OK
+
+
 def _vec_to_pg(v: np.ndarray) -> str:
     """Format a numpy vector as pgvector text literal `[v1,v2,...]`.
     Works for both `vector` and `halfvec` via SQL `::halfvec` cast.
@@ -399,9 +420,11 @@ def _stage3_shots(
     shots = shots_mod.detect_shots(video_path, duration_s, shots_dir)
 
     conn.execute("delete from shots where file_id = %s", (file_id,))
+    sk_ok = _shot_keyframes_available(conn)
 
     for shot in shots:
-        # Upload all 3 keyframes (anchor / motion / variance) at 224x224.
+        # Upload the base triple (anchor / motion / variance) at 224x224.
+        base_keys: dict[str, str] = {}
         for kind, src in (
             ("anchor", shot.anchor_local_path),
             ("motion", shot.motion_local_path),
@@ -414,14 +437,12 @@ def _stage3_shots(
                 continue
             key = f"keyframes/{file_id}/{shot.index:05d}_{kind}.jpg"
             _upload_to_r2(small, key, "image/jpeg")
-            if kind == "anchor":
-                shot.keyframe_r2_key = key
-            elif kind == "motion":
-                shot.r2_keyframe_motion_key = key
-            else:
-                shot.r2_keyframe_variance_key = key
+            base_keys[kind] = key
+        shot.keyframe_r2_key = base_keys.get("anchor")
+        shot.r2_keyframe_motion_key = base_keys.get("motion")
+        shot.r2_keyframe_variance_key = base_keys.get("variance")
 
-        conn.execute(
+        row = conn.execute(
             """
             insert into shots (
                 file_id, shot_index, start_ms, end_ms,
@@ -429,6 +450,7 @@ def _stage3_shots(
                 focus_score, brightness, motion_magnitude,
                 blur_min, peak_motion_ms, peak_variance_ms
             ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            returning id
             """,
             (
                 file_id, shot.index, shot.start_ms, shot.end_ms,
@@ -438,7 +460,38 @@ def _stage3_shots(
                 shot.focus_score, shot.brightness, shot.motion_magnitude,
                 shot.blur_min, shot.motion_ts_ms, shot.variance_ts_ms,
             ),
-        )
+        ).fetchone()
+        shot_id = row[0]
+
+        if not sk_ok:
+            continue
+
+        # Layer A: persist the full adaptive keyframe set. Base frames reuse the
+        # JPEGs uploaded above; coverage frames are uploaded under their own keys.
+        for frame_index, kf in enumerate(shot.keyframes):
+            if kf.kind in base_keys:
+                kf.r2_key = base_keys[kf.kind]
+            else:
+                if not kf.local_path or not os.path.exists(kf.local_path):
+                    continue
+                small = os.path.join(r2_dir, f"shot_{shot.index:05d}_{frame_index:02d}_cov.jpg")
+                if not kf_mod.downscale_for_storage(kf.local_path, small, target_size=224, quality=85):
+                    continue
+                key = f"keyframes/{file_id}/{shot.index:05d}_{frame_index:02d}_cov.jpg"
+                _upload_to_r2(small, key, "image/jpeg")
+                kf.r2_key = key
+            if not kf.r2_key:
+                continue
+            conn.execute(
+                """
+                insert into shot_keyframes (shot_id, frame_index, kind, ts_ms, r2_key, blur)
+                values (%s, %s, %s, %s, %s, %s)
+                on conflict (shot_id, frame_index) do update set
+                    kind = excluded.kind, ts_ms = excluded.ts_ms,
+                    r2_key = excluded.r2_key, blur = excluded.blur
+                """,
+                (shot_id, frame_index, kf.kind, kf.ts_ms, kf.r2_key, kf.blur),
+            )
     return shots
 
 
@@ -533,6 +586,63 @@ def _stage4_embeddings(
             conn.execute(
                 "update shots set intra_shot_variance = %s where id = %s",
                 (intra_var, sid),
+            )
+
+    _embed_shot_keyframes(file_id, shots, conn)
+
+
+def _embed_shot_keyframes(
+    file_id: str,
+    shots: List[shots_mod.Shot],
+    conn: psycopg.Connection,
+) -> None:
+    """Layer A: SigLIP-embed every shot_keyframes row that lacks an embedding.
+
+    Robust to retries: prefers the in-memory full-res frame, but falls back to
+    downloading the 224px JPEG from R2 by its stored key, so coverage frames get
+    embedded even when the indexing tmpdir is gone."""
+    if not _shot_keyframes_available(conn):
+        return
+    rows = conn.execute(
+        """
+        select sk.id, sk.r2_key
+          from shot_keyframes sk
+          join shots s on s.id = sk.shot_id
+         where s.file_id = %s and sk.embedding is null
+        """,
+        (file_id,),
+    ).fetchall()
+    if not rows:
+        return
+
+    local_by_key: dict[str, str] = {}
+    for s in shots:
+        for kf in s.keyframes:
+            if kf.r2_key and kf.local_path and os.path.exists(kf.local_path):
+                local_by_key[kf.r2_key] = kf.local_path
+
+    with tempfile.TemporaryDirectory() as dl_dir:
+        plan: List[tuple] = []  # (sk_id, path)
+        for sk_id, r2_key in rows:
+            path = local_by_key.get(r2_key)
+            if not path or not os.path.exists(path):
+                path = os.path.join(dl_dir, f"{sk_id}.jpg")
+                try:
+                    _download_from_r2(r2_key, path)
+                except Exception:
+                    logger.warning("Could not fetch keyframe %s for embedding", r2_key)
+                    continue
+            plan.append((sk_id, path))
+
+        if not plan:
+            return
+        vecs = emb_mod.embed_images([p for _, p in plan])
+        if vecs.shape[0] == 0:
+            return
+        for (sk_id, _path), vec in zip(plan, vecs):
+            conn.execute(
+                "update shot_keyframes set embedding = %s::halfvec where id = %s",
+                (_vec_to_pg(vec), sk_id),
             )
 
 
