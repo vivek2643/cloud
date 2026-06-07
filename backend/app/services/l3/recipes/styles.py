@@ -21,6 +21,7 @@ from app.services.l3.recipes.base import (
     snap_unit_bounds,
     trim_to_length,
 )
+from app.services.l3.recipes.params import RecipeParams
 
 
 def _target_ms(section: SectionPlan, default_s: Optional[float] = None) -> Optional[int]:
@@ -65,19 +66,21 @@ class HighlightMontage(Recipe):
     label = "Highlight / montage"
 
     def assemble(self, section: SectionPlan, ctx: RecipeContext) -> AVTimeline:
+        p = RecipeParams.from_section(section)
         units = ctx.units_for_section(section, modality="visual")
         units = dedup_visual_units(units)
         # Rank by combined quality + energy, keep the strongest, then restore
         # chronological order so the montage still reads coherently.
-        ranked = sorted(units, key=lambda u: (u.quality + 0.4 * u.motion), reverse=True)
+        ew = p.energy_weight(0.4)
+        ranked = sorted(units, key=lambda u: (u.quality + ew * u.motion), reverse=True)
         target = _target_ms(section, default_s=20)
         # Pick enough strong units (assume ~2s each) to fill target.
         keep_n = max(3, (target // 1800)) if target else len(ranked)
         chosen = sorted(ranked[:keep_n], key=lambda u: (u.file_id, u.in_ms))
-        src = _units_to_src(chosen, ctx, max_clip_ms=2200)
+        src = _units_to_src(chosen, ctx, max_clip_ms=p.max_clip_ms(2200))
         music = ctx.pick_music_file(exclude_file_ids=_file_ids(chosen))
         if music:
-            return _styled(place_split(src, music, ctx), self.key)
+            return _styled(place_split(src, music, ctx, music_gain_db=p.music_gain_db(-6.0)), self.key)
         return _styled(place_coupled(src), self.key)
 
 
@@ -106,24 +109,27 @@ class Trailer(Recipe):
     _ROLE_ORDER = {"hook": 0, "setup": 1, "build": 2, "reveal": 3, "payoff": 4, "outro": 5}
 
     def assemble(self, section: SectionPlan, ctx: RecipeContext) -> AVTimeline:
+        p = RecipeParams.from_section(section)
         units = ctx.units_for_section(section)
         units = dedup_speech_units(units) + dedup_visual_units(units)
         target = _target_ms(section, default_s=25)
         # Hook = highest energy/valence unit; then rising build; payoff last.
         def role_key(u: EditUnit):
             return self._ROLE_ORDER.get((u.narrative_role or "build").lower(), 2)
-        ranked = sorted(units, key=lambda u: (u.quality + 0.3 * u.motion), reverse=True)
+        ew = p.energy_weight(0.3)
+        ranked = sorted(units, key=lambda u: (u.quality + ew * u.motion), reverse=True)
         chosen = select_for_target(sorted(ranked, key=role_key), target)
-        # Accelerate: earlier clips longer, later clips snappier.
+        # Accelerate: earlier clips longer, later clips snappier (pace-scaled).
         src: List[tuple] = []
         n = max(1, len(chosen))
+        hi, lo = p.max_clip_ms(2600), p.max_clip_ms(1200)
         for i, u in enumerate(chosen):
-            clip_cap = int(2600 - 1400 * (i / n))  # 2.6s -> ~1.2s
+            clip_cap = int(hi - (hi - lo) * (i / n))
             for s in _units_to_src([u], ctx, max_clip_ms=clip_cap):
                 src.append(s)
         music = ctx.pick_music_file(exclude_file_ids=_file_ids(chosen))
         if music:
-            return _styled(place_split(src, music, ctx, music_gain_db=-4.0), self.key)
+            return _styled(place_split(src, music, ctx, music_gain_db=p.music_gain_db(-4.0)), self.key)
         return _styled(place_coupled(src), self.key)
 
 
@@ -191,7 +197,8 @@ class VlogWalkthrough(Recipe):
             keep = {u.id for u in select_for_target(ranked, target)}
             spine = [u for u in spine if u.id in keep]
         units = spine if spine else sorted(visual, key=lambda u: (u.file_id, u.in_ms))
-        src = _units_to_src(units, ctx, max_clip_ms=6000)
+        p = RecipeParams.from_section(section)
+        src = _units_to_src(units, ctx, max_clip_ms=p.max_clip_ms(6000))
         return _styled(place_coupled(src), self.key)
 
 
@@ -200,12 +207,14 @@ class SocialShort(Recipe):
     label = "Social short (vertical, hook-first)"
 
     def assemble(self, section: SectionPlan, ctx: RecipeContext) -> AVTimeline:
+        p = RecipeParams.from_section(section)
         units = ctx.units_for_section(section)
         units = dedup_speech_units(units) + dedup_visual_units(units)
         target = _target_ms(section, default_s=20)
         # Hard cap at 30s for a social short.
         target = min(target or 20000, 30000)
-        ranked = sorted(units, key=lambda u: (u.quality + 0.3 * u.motion), reverse=True)
+        ew = p.energy_weight(0.3)
+        ranked = sorted(units, key=lambda u: (u.quality + ew * u.motion), reverse=True)
         chosen = select_for_target(ranked, target)
         if not chosen:
             return _styled(AVTimeline(style=self.key), self.key)
@@ -213,7 +222,7 @@ class SocialShort(Recipe):
         hook = chosen[0]
         rest = sorted(chosen[1:], key=lambda u: (u.file_id, u.in_ms))
         ordered = [hook] + rest
-        src = _units_to_src(ordered, ctx, max_clip_ms=2500)
+        src = _units_to_src(ordered, ctx, max_clip_ms=p.max_clip_ms(2500))
         tl = place_coupled(src)
         tl.style = self.key
         # Flag vertical so the orchestrator picks a vertical render preset.
@@ -242,17 +251,19 @@ class CinematicBRoll(Recipe):
     label = "Cinematic b-roll mood"
 
     def assemble(self, section: SectionPlan, ctx: RecipeContext) -> AVTimeline:
+        p = RecipeParams.from_section(section)
         visual = dedup_visual_units(ctx.units_for_section(section, modality="visual"))
         # Prefer stable, scenic shots (lower motion, high visual quality);
-        # longer holds + a music bed for mood.
-        ranked = sorted(visual, key=lambda u: (u.quality - 0.2 * u.motion), reverse=True)
+        # longer holds + a music bed for mood. energy_weight defaults negative.
+        ew = p.energy_weight(-0.2)
+        ranked = sorted(visual, key=lambda u: (u.quality + ew * u.motion), reverse=True)
         target = _target_ms(section, default_s=25)
         keep_n = max(3, (target // 3500)) if target else len(ranked)
         chosen = sorted(ranked[:keep_n], key=lambda u: (u.file_id, u.in_ms))
-        src = _units_to_src(chosen, ctx, max_clip_ms=4000)
+        src = _units_to_src(chosen, ctx, max_clip_ms=p.max_clip_ms(4000))
         music = ctx.pick_music_file(exclude_file_ids=_file_ids(chosen))
         if music:
-            return _styled(place_split(src, music, ctx, music_gain_db=-5.0), self.key)
+            return _styled(place_split(src, music, ctx, music_gain_db=p.music_gain_db(-5.0)), self.key)
         return _styled(place_coupled(src), self.key)
 
 

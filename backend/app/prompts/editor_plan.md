@@ -33,6 +33,17 @@ target_duration_s, and SELECT the unit labels that belong in it (in the order
 you want them). Pick units on merit -- balance spoken content, visuals,
 narrative role, and quality. Don't pad with weak units to hit a duration.
 
+TUNING (optional "params" per section): you can shape a style without switching
+recipes. All keys are optional; omit them to use the style's defaults.
+- "pace": "slow" | "medium" | "fast"   -- how long clips are held. Use "slow"
+  if a previous attempt felt frantic; "fast" for punchy montages.
+- "max_clip_s": <number>               -- hard cap on any single clip's length.
+- "energy_weight": <number>            -- bias toward motion/action when picking
+  visuals (higher = punchier; negative = calmer/scenic).
+- "music_gain_db": <number>            -- music bed loudness (e.g. -6 quieter).
+If the prior turn's CRITIC FEEDBACK flagged frantic pacing, set pace "slow" or a
+larger max_clip_s; if it flagged the cut too long, lower target_duration_s.
+
 Return STRICT JSON ONLY:
 {{
   "reasoning": "<2-4 sentences on the editorial logic and why these styles/sections>",
@@ -41,6 +52,7 @@ Return STRICT JSON ONLY:
       "style": "<one of the style keys above>",
       "intent": "<what this section accomplishes>",
       "target_duration_s": <number or null>,
+      "params": {{ "pace": "medium" }},
       "units": ["U3", "U7", "U8", ...]
     }}
   ]

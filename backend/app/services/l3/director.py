@@ -349,11 +349,14 @@ def _sections_from_plan(plan, label_to_id, duration_target_s) -> List[SectionPla
         labels = s.get("units") or []
         unit_ids = [label_to_id[str(l)] for l in labels if str(l) in label_to_id]
         tgt = s.get("target_duration_s")
+        raw_params = s.get("params")
+        params = dict(raw_params) if isinstance(raw_params, dict) else {}
         out.append(SectionPlan(
             style=style,
             intent=str(s.get("intent") or "")[:200],
             target_duration_s=float(tgt) if isinstance(tgt, (int, float)) else None,
             file_ids=None,          # sections scope by their selected unit_ids
             unit_ids=unit_ids,
+            params=params,
         ))
     return out
