@@ -24,6 +24,7 @@ from app.config import get_settings
 from app.services import prompts as prompts_mod
 from app.services.l3 import claude_editor
 from app.services.l3.composer import ComposeResult, compose, summarize_for_critique
+from app.services.l3.critic import critique_edl
 from app.services.l3.primitives.loader import load_file_analyses
 from app.services.l3.primitives.units import EditUnit, build_units
 from app.services.l3.recipes import RecipeContext, SectionPlan
@@ -129,13 +130,40 @@ def direct_edit(
         if attempt >= MAX_CRITIQUE_PASSES:
             break
         emit("critiquing", 70 + attempt * 8, "Reviewing the cut")
+
+        # Mechanical critic FIRST: deterministic defects (flicker cuts, blurry/
+        # black frames, shot reuse, duration miss, missing music bed). This is
+        # the authoritative gate -- repeatable and pixel-grounded.
+        styles = [str(s.get("style") or "") for s in result.sections]
+        mech = critique_edl(
+            result.edl, ctx.analyses,
+            target_s=int(duration_target_s) if duration_target_s else None,
+            section_styles=styles,
+        )
+        critiques.append(mech.to_dict())
+
+        # LLM critic SECOND: editorial taste over a text summary of the cut.
         summary = summarize_for_critique(result, ctx)
-        critique = _critique(brief, summary)
-        critiques.append(critique)
-        if critique.get("ok", True):
+        llm = _critique(brief, summary)
+        critiques.append(llm)
+
+        warn_count = sum(1 for i in mech.issues if i.severity == "warn")
+        # Revise on any hard defect, an unhappy taste critic, or a pile-up of
+        # softer warnings. The loop is bounded by MAX_CRITIQUE_PASSES regardless.
+        should_revise = (not mech.ok) or (warn_count >= 2) or (not llm.get("ok", True))
+        if not should_revise:
             break
+
+        guidance = mech.guidance if (not mech.ok or warn_count) else ""
+        if not llm.get("ok", True):
+            extra = str(llm.get("guidance") or "").strip()
+            if extra:
+                guidance = (guidance + "\n\nEditorial notes:\n" + extra).strip()
+        combined = {"ok": False, "guidance": guidance,
+                    "mechanical": mech.to_dict(), "taste": llm}
+
         emit("revising", 78, "Revising the cut")
-        plan = _replan(messages, brief, profile_text, catalog_text, duration_target_s, plan, critique)
+        plan = _replan(messages, brief, profile_text, catalog_text, duration_target_s, plan, combined)
         if not plan.get("sections"):
             break
         sections = _sections_from_plan(plan, label_to_id, duration_target_s)
