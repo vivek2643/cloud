@@ -346,6 +346,7 @@ export function AiTimelineDock() {
       const payload: CommitClip[] = merged.map((c) => ({
         id: c.id,
         shot_id: c.shot_id as string,
+        file_id: c.file_id ?? null,
         source_in_ms: Math.round(c.source_in_ms),
         source_out_ms: Math.round(c.source_out_ms),
       }));

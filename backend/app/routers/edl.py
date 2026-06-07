@@ -30,6 +30,7 @@ from app.auth import get_current_user_id
 from app.services.chat import turns_store
 from app.services.chat.broker import broker
 from app.services.edl import agent as edl_agent
+from app.services.edl import patch as edl_patch
 from app.services.edl import renders_store
 from app.services.edl import store as edl_store
 from app.services.l3.query_executor import fetch_candidates_by_shot_ids, retrieve_top_k
@@ -87,10 +88,19 @@ class CommitClipIn(BaseModel):
     shot_id: str
     source_in_ms: int
     source_out_ms: int
+    # Carried so a v2 (A/V-split) lineage can rebuild video clips that retain
+    # their source file. Optional for backward-compat with v1-only callers.
+    file_id: Optional[str] = None
 
 
 class CommitBody(BaseModel):
-    clips: List[CommitClipIn]
+    # Cut-only clip list. The server rebuilds the timeline from these. For a v2
+    # lineage the music bed / audio track is preserved from the parent version.
+    clips: List[CommitClipIn] = []
+    # Full EDL passthrough (v1 or v2). When provided it takes precedence over
+    # `clips`: used to apply an AI agent's `proposed_edl` verbatim so a v2
+    # A/V-split edit round-trips without being flattened to v1.
+    edl: Optional[Dict[str, Any]] = None
     commit_msg: Optional[str] = None
     # Base the new version on this one (for optimistic-concurrency / branching).
     # When omitted, we branch off the current latest version.
@@ -394,19 +404,46 @@ def commit_edl(
     _require_project(project_id, user_id)
 
     # Default parent = current latest (so the version chain stays linear unless
-    # the client explicitly branches via parent_id).
+    # the client explicitly branches via parent_id). We also need the parent's
+    # EDL json to decide whether to preserve a v2 (A/V-split) structure.
     parent_id = body.parent_id
-    if parent_id is None:
+    parent_edl: Optional[Dict[str, Any]] = None
+    if parent_id is not None:
+        pv = edl_store.get_edl_version(parent_id)
+        parent_edl = (pv or {}).get("edl_json") if pv else None
+    else:
         latest = edl_store.get_latest_edl_version(project_id)
-        parent_id = latest["id"] if latest else None
+        if latest:
+            parent_id = latest["id"]
+            parent_edl = latest.get("edl_json")
 
+    # Build the EDL to persist. Three cases, in priority order:
+    #   1. Full EDL passthrough (`body.edl`) -- e.g. applying an AI agent's
+    #      `proposed_edl`. Re-materialized via the patch engine to recompute the
+    #      timeline + audio and validate; preserves v2 verbatim.
+    #   2. clips + a v2 parent -> rebuild a v2 EDL from the submitted video
+    #      clips, carrying the parent's music bed / audio track forward so a
+    #      manual tweak doesn't flatten the edit to v1.
+    #   3. clips + a v1 (or no) parent -> classic v1 build.
     try:
-        edl_json = edl_store.build_edl_from_user_clips(
-            [c.model_dump() for c in body.clips],
-            fps=body.fps,
-        )
-    except ValueError as e:
+        if body.edl is not None:
+            src = body.edl
+            work = src.get("video_track") if src.get("version") == 2 else src.get("clips")
+            edl_json, _ = edl_patch.rebuild_from_clips(src, list(work or []))
+        elif parent_edl and parent_edl.get("version") == 2:
+            work = [c.model_dump() for c in body.clips]
+            edl_json, _ = edl_patch.rebuild_from_clips(parent_edl, work)
+        else:
+            edl_json = edl_store.build_edl_from_user_clips(
+                [c.model_dump() for c in body.clips],
+                fps=body.fps,
+            )
+    except (ValueError, edl_patch.PatchError) as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    # Resolve the timeline track regardless of version for counts + render gating.
+    track = edl_json["video_track"] if edl_json.get("version") == 2 else edl_json.get("clips", [])
+    total = track[-1]["timeline_out_ms"] if track else 0
 
     author_kind = body.author_kind if body.author_kind in ("user", "claude", "system") else "user"
     new_version = edl_store.write_edl_version(
@@ -417,12 +454,11 @@ def commit_edl(
         commit_msg=body.commit_msg or ("AI edit" if author_kind == "claude" else "Manual edit"),
     )
 
-    clips = edl_json["clips"]
-    total = clips[-1]["timeline_out_ms"] if clips else 0
-
     render_id: Optional[str] = None
-    if clips:
-        render_row = renders_store.create_render(new_version["id"], preset="preview")
+    if track:
+        res = list(edl_json.get("resolution") or [1920, 1080])
+        preset = "preview_vertical" if len(res) == 2 and res[1] > res[0] else "preview"
+        render_row = renders_store.create_render(new_version["id"], preset=preset)
         render_id = render_row["id"]
         _enqueue_render(render_id)
 
@@ -430,7 +466,7 @@ def commit_edl(
         project_id=project_id,
         edl_version_id=new_version["id"],
         render_id=render_id,
-        clip_count=len(clips),
+        clip_count=len(track),
         total_duration_ms=total,
     )
 

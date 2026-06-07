@@ -704,6 +704,9 @@ export interface CommitClip {
   shot_id: string;
   source_in_ms: number;
   source_out_ms: number;
+  // Carried so a v2 (A/V-split) lineage keeps each video clip's source file
+  // when the server rebuilds the timeline. Optional for v1-only callers.
+  file_id?: string | null;
 }
 
 export interface CommitEdlResponse {
@@ -792,12 +795,17 @@ export function commitEdl(
     parentId?: string | null;
     fps?: number;
     authorKind?: "user" | "claude" | "system";
+    // Full EDL passthrough (v1 or v2). When set, takes precedence over `clips`
+    // and is persisted verbatim -- used to apply an AI agent's `proposed_edl`
+    // so a v2 A/V-split edit round-trips without flattening to v1.
+    edl?: Record<string, unknown> | null;
   } = {},
 ) {
   return request<CommitEdlResponse>(`/api/edl/projects/${projectId}/commit`, {
     method: "POST",
     body: JSON.stringify({
       clips,
+      edl: opts.edl ?? null,
       commit_msg: opts.commitMsg,
       parent_id: opts.parentId ?? null,
       fps: opts.fps ?? 30,
@@ -836,6 +844,11 @@ export interface AgentResult {
   reasoning: string;
   proposed_clips: AgentProposedClip[];
   proposed_enriched: EnrichedClip[];
+  // The full proposed EDL (v1 or v2). Apply this verbatim via
+  // `commitEdl(..., { edl: proposed_edl, authorKind: "claude" })` so a v2
+  // A/V-split refinement keeps its music bed instead of flattening to v1.
+  proposed_edl?: Record<string, unknown> | null;
+  edl_version?: number;
   diff: AgentDiff;
   tool_log: { tool: string; input: Record<string, unknown>; result_keys: string[] }[];
 }
