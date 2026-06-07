@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-4-5-20250929"
 
+    # Layer C: how many keyframe images to attach to the multimodal editor call
+    # (0 disables vision -> text-only editor). ~1.3k tokens/image on Sonnet.
+    editor_vision_max_images: int = 16
+    editor_vision_per_shot_max: int = 1
+
     # Phase 2 Stage D: hosted Qwen2.5-VL endpoint (Replicate / Anyscale style).
     # Leave empty to use the self-hosted GPU model below instead.
     qwen_vl_endpoint_url: str = ""

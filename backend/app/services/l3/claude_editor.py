@@ -37,6 +37,8 @@ from psycopg.rows import dict_row
 
 from app.config import get_settings
 from app.services import prompts as prompts_mod
+from app.services.l3 import keyframe_select as kf_select
+from app.services.l3 import vision as vision_mod
 from app.services.l3.anthropic_client import _client as _anthropic_client
 from app.services.l3.edit_logic_basic import TimelineClip
 from app.services.l3.query_executor import CandidateShot
@@ -218,6 +220,34 @@ def _build_catalog(
 # Claude call + validation
 # ---------------------------------------------------------------------------
 
+def _build_vision(
+    candidates: List[CandidateShot],
+    brief: str,
+) -> tuple[List[Dict[str, Any]], str]:
+    """Layer C: pick keyframes for this brief and turn them into Anthropic image
+    blocks + a preamble. Never raises -- returns ([], "") to fall back to a
+    text-only edit. Honors editor_vision_max_images (0 disables)."""
+    settings = get_settings()
+    budget = int(getattr(settings, "editor_vision_max_images", 0) or 0)
+    if budget <= 0 or not candidates:
+        return [], ""
+    try:
+        frames = kf_select.select_frames_for_edit(
+            shot_ids=[c.shot_id for c in candidates],
+            brief=brief,
+            budget=budget,
+            per_shot_max=int(getattr(settings, "editor_vision_per_shot_max", 1) or 1),
+        )
+        blocks = vision_mod.build_image_blocks(frames)
+        n = len([b for b in blocks if b.get("type") == "image"])
+        if n == 0:
+            return [], ""
+        return blocks, vision_mod.vision_preamble(n)
+    except Exception:
+        logger.exception("Vision attach failed; editor will run text-only")
+        return [], ""
+
+
 def _build_user_message(
     brief: str,
     duration_target_s: Optional[int],
@@ -298,14 +328,25 @@ def _plan_beats(
         return ""
 
 
-def _call_claude(system_prompt: str, user_message: str, max_tokens: int = 4096) -> Dict[str, Any]:
+def _call_claude(
+    system_prompt: str,
+    user_message: str,
+    max_tokens: int = 4096,
+    image_blocks: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     settings = get_settings()
     client = _anthropic_client()
+    if image_blocks:
+        # Text first (the catalog/brief), then the labeled keyframe images.
+        content: List[Dict[str, Any]] = [{"type": "text", "text": user_message}]
+        content.extend(image_blocks)
+    else:
+        content = user_message  # type: ignore[assignment]
     msg = client.messages.create(
         model=settings.anthropic_model,
         max_tokens=max_tokens,
         system=system_prompt,
-        messages=[{"role": "user", "content": user_message}],
+        messages=[{"role": "user", "content": content}],
     )
     text = "".join(b.text for b in msg.content if getattr(b, "type", None) == "text").strip()
     if not text:
@@ -462,12 +503,13 @@ def compile_timeline_chat(
     if plan_text and emit:
         emit("planning", 55, plan_text[:280])
 
+    image_blocks, vision_note = _build_vision(candidates, latest_brief)
     history_text = _render_history(history[:-1])  # everything BEFORE the latest user msg
     user_message = _build_chat_user_message(
         history_text=history_text,
         latest_brief=latest_brief,
         duration_target_s=duration_target_s,
-        catalog_text=catalog_text,
+        catalog_text=catalog_text + vision_note,
         plan_text=plan_text,
     )
     system_prompt = prompts_mod.load("editor_chat")
@@ -475,7 +517,7 @@ def compile_timeline_chat(
     warnings: List[str] = []
     raw: Dict[str, Any] = {}
     try:
-        raw = _call_claude(system_prompt, user_message)
+        raw = _call_claude(system_prompt, user_message, image_blocks=image_blocks)
     except Exception as e:
         logger.exception("Claude chat editor call failed")
         warnings.append(f"Claude editor call failed: {type(e).__name__}: {e}")
@@ -594,13 +636,14 @@ def compile_timeline(
         )
 
     catalog_text, cand_by_id = _build_catalog(candidates)
-    user_message = _build_user_message(brief, duration_target_s, catalog_text)
+    image_blocks, vision_note = _build_vision(candidates, brief)
+    user_message = _build_user_message(brief, duration_target_s, catalog_text + vision_note)
     system_prompt = prompts_mod.load("editor")
 
     warnings: List[str] = []
     raw: Dict[str, Any] = {}
     try:
-        raw = _call_claude(system_prompt, user_message)
+        raw = _call_claude(system_prompt, user_message, image_blocks=image_blocks)
     except Exception as e:
         logger.exception("Claude editor call failed")
         warnings.append(f"Claude editor call failed: {type(e).__name__}: {e}")
