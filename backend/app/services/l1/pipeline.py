@@ -13,11 +13,13 @@ import logging
 import os
 import subprocess
 import tempfile
+import threading
 import traceback
 from typing import List, Optional
 
 import numpy as np
 import psycopg
+from procrastinate import RetryStrategy
 
 from app.config import get_settings
 from app.services import audit_log
@@ -101,6 +103,21 @@ def _set_l1_status(file_id: str, status: str) -> None:
     sb.table("files").update({"l1_status": status}).eq("id", file_id).execute()
 
 
+def _file_exists(file_id: str) -> bool:
+    """True if the files row still exists. A user can delete a file (or abort a
+    multipart upload) mid-processing; without this guard the shots/embeddings
+    inserts hit a foreign-key violation and retry forever."""
+    try:
+        with _pg_conn() as conn:
+            row = conn.execute(
+                "select 1 from files where id = %s", (file_id,)
+            ).fetchone()
+        return row is not None
+    except Exception:
+        # If we can't tell, assume it exists and let normal error handling run.
+        return True
+
+
 def _enqueue_l2_if_needed(file_id: str) -> None:
     """Chain deep L2 enrichment after a successful L1 run so every video gets
     enriched in the background without any manual trigger.
@@ -110,6 +127,10 @@ def _enqueue_l2_if_needed(file_id: str) -> None:
     L2 is already running/ready (L2 itself is idempotent, but this avoids
     redundant queue churn on an L1 re-run).
     """
+    if not get_settings().enable_l2_vlm:
+        # Deep L2 (Qwen VLM / faces / dinov2) is disabled by default -- edit-time
+        # managed multimodal vision replaces per-shot pre-captioning.
+        return
     try:
         with _pg_conn() as conn:
             row = conn.execute(
@@ -144,41 +165,116 @@ def _gpu_available() -> bool:
         return False
 
 
-def _encode_proxy(raw_path: str, proxy_path: str) -> None:
-    """1080p H.264 proxy. Uses the GPU's NVENC encoder when present (an order
-    of magnitude faster than CPU libx264), falling back to libx264 if NVENC
-    isn't available or fails."""
-    base_in = ["ffmpeg", "-y"]
+def _has_audio_stream(raw_path: str) -> bool:
+    """True if the file carries at least one audio stream. Silent footage
+    (screen recordings, some drone/action clips) skips demux + transcript +
+    audio-features instead of crashing."""
+    try:
+        probe = _probe_video(raw_path)
+        return any(s.get("codec_type") == "audio" for s in probe.get("streams", []))
+    except Exception:
+        return False
+
+
+# Bound the proxy to fit inside this box, preserving aspect (any orientation),
+# never upscaling small sources, and forcing even dimensions.
+_PROXY_SCALE = (
+    "scale='min(1920,iw)':'min(1080,ih)':"
+    "force_original_aspect_ratio=decrease:force_divisible_by=2"
+)
+# HDR (PQ/HLG, bt2020) -> SDR bt709. Needs an ffmpeg built with zscale (libzimg);
+# if absent the attempt fails and we retry without it.
+_TONEMAP = (
+    "zscale=transfer=linear:npl=100,tonemap=hable:desat=0,"
+    "zscale=primaries=bt709:transfer=bt709:matrix=bt709"
+)
+
+
+def _normalize_vf(is_hdr: bool, tonemap: bool) -> str:
+    """Build the normalization filter chain. Always lands on 8-bit yuv420p at
+    <=1080p; optionally tonemaps HDR first."""
+    parts = []
+    if is_hdr and tonemap:
+        parts.append(_TONEMAP)
+    parts.append(_PROXY_SCALE)
+    parts.append("format=yuv420p")
+    return ",".join(parts)
+
+
+# Upper bound on any single ffmpeg invocation so a wedged encode kills the job
+# (procrastinate then retries) instead of hanging a worker indefinitely.
+FFMPEG_TIMEOUT_S = 2 * 60 * 60
+
+
+def _run_ffmpeg(cmd: list) -> tuple[bool, bytes]:
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=FFMPEG_TIMEOUT_S)
+        return True, b""
+    except subprocess.TimeoutExpired:
+        return False, b"ffmpeg timed out"
+    except subprocess.CalledProcessError as e:
+        return False, (e.stderr or b"")[-400:]
+
+
+def _encode_proxy(raw_path: str, proxy_path: str, is_hdr: bool = False) -> None:
+    """Normalize ANY input into a uniform, edit-safe 1080p H.264 proxy:
+    8-bit yuv420p, constant frame rate, bounded resolution (any orientation),
+    rotation auto-applied, HDR tonemapped to SDR. Tries NVENC then libx264, and
+    drops HDR tonemapping if this ffmpeg build can't do it -- so exotic uploads
+    (10-bit, HDR, VFR, rotated) still produce a working proxy instead of failing."""
     common_out = [
+        "-vsync", "cfr",  # normalize VFR (phone footage) to constant frame rate
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
         proxy_path,
     ]
+
+    # (use_nvenc, tonemap) attempts, most-preferred first. We degrade encoder
+    # (NVENC -> CPU) and, for HDR, degrade the filter (tonemap -> plain) so a
+    # missing zimg build never blocks the proxy.
+    attempts: list[tuple[bool, bool]] = []
     if _gpu_available():
-        # NVDEC decode + scale_npp + NVENC encode keeps frames on the GPU.
-        nvenc = base_in + [
-            "-hwaccel", "cuda",
-            "-i", raw_path,
-            "-vf", "scale=-2:1080",
-            "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "25",
-        ] + common_out
-        try:
-            subprocess.run(nvenc, check=True, capture_output=True)
+        attempts.append((True, True))
+        attempts.append((True, False))
+    attempts.append((False, True))
+    attempts.append((False, False))
+
+    last_err = b""
+    seen: set[tuple[bool, bool]] = set()
+    for use_nvenc, tonemap in attempts:
+        key = (use_nvenc, tonemap and is_hdr)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        vf = _normalize_vf(is_hdr, tonemap)
+        cmd = ["ffmpeg", "-y"]
+        if use_nvenc:
+            cmd += ["-hwaccel", "auto"]
+        cmd += ["-i", raw_path, "-vf", vf]
+        if use_nvenc:
+            cmd += ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "25"]
+        else:
+            cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
+        cmd += common_out
+
+        ok, err = _run_ffmpeg(cmd)
+        if ok:
             return
-        except subprocess.CalledProcessError as e:
-            logger.warning(
-                "NVENC proxy encode failed (%s); falling back to libx264.",
-                (e.stderr or b"")[-300:],
-            )
-    # CPU fallback (veryfast is ~2x quicker than fast at similar size).
-    subprocess.run(
-        base_in + [
-            "-i", raw_path,
-            "-vf", "scale=-2:1080",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-        ] + common_out,
-        check=True, capture_output=True,
-    )
+        last_err = err
+        logger.warning(
+            "Proxy encode attempt failed (nvenc=%s tonemap=%s): %s",
+            use_nvenc, tonemap and is_hdr, err,
+        )
+
+    raise RuntimeError(f"All proxy encode attempts failed: {last_err!r}")
+
+
+def _is_hdr_stream(stream: dict) -> bool:
+    """Detect HDR/wide-gamut transfer so we know to tonemap."""
+    transfer = (stream.get("color_transfer") or "").lower()
+    primaries = (stream.get("color_primaries") or "").lower()
+    return transfer in {"smpte2084", "arib-std-b67"} or primaries == "bt2020"
 
 
 def _stage1_proxy(file_id: str, raw_path: str, tmpdir: str) -> tuple[float, int, int]:
@@ -190,27 +286,38 @@ def _stage1_proxy(file_id: str, raw_path: str, tmpdir: str) -> tuple[float, int,
     probe = _probe_video(raw_path)
     duration = float(probe.get("format", {}).get("duration", 0))
     width, height = 0, 0
+    is_hdr = False
+    has_video = False
     for stream in probe.get("streams", []):
         if stream.get("codec_type") == "video":
+            has_video = True
             width = int(stream.get("width", 0))
             height = int(stream.get("height", 0))
+            is_hdr = _is_hdr_stream(stream)
             break
 
-    _encode_proxy(raw_path, proxy_path)
+    if not has_video:
+        # Audio-only file or a corrupt/non-video upload -- fail fast and clearly
+        # rather than letting ffmpeg die deep in the encode with a cryptic error.
+        raise ValueError("Uploaded file contains no decodable video stream")
+
+    _encode_proxy(raw_path, proxy_path, is_hdr=is_hdr)
     proxy_key = f"proxies/{file_id}/proxy.mp4"
     _upload_to_r2(proxy_path, proxy_key, "video/mp4")
 
+    # Thumbnail straight off the proxy: it's already normalized (8-bit, SDR,
+    # rotation baked), so mjpeg never trips over exotic source pixel formats.
     thumb_time = max(duration * 0.25, 1.0)
     subprocess.run(
         [
             "ffmpeg", "-y", "-ss", str(thumb_time),
-            "-i", raw_path,
+            "-i", proxy_path,
             "-vframes", "1",
-            "-vf", "scale=640:-2",
+            "-vf", "scale=640:-2,format=yuv420p",
             "-q:v", "3",
             thumb_path,
         ],
-        check=True, capture_output=True,
+        check=True, capture_output=True, timeout=FFMPEG_TIMEOUT_S,
     )
     thumb_key = f"thumbnails/{file_id}/thumb.jpg"
     _upload_to_r2(thumb_path, thumb_key, "image/jpeg")
@@ -237,7 +344,7 @@ def _demux_wav(raw_path: str, out_path: str) -> None:
             "-c:a", "pcm_s16le",
             out_path,
         ],
-        check=True, capture_output=True,
+        check=True, capture_output=True, timeout=FFMPEG_TIMEOUT_S,
     )
 
 
@@ -483,13 +590,18 @@ def _run_stage(
 
 # --- Top-level procrastinate task ----------------------------------------
 
-@app.task(name="l1_orchestrate", queue="gpu", retry={"max_attempts": 3, "wait": "exponential"})
+@app.task(name="l1_orchestrate", queue="gpu", retry=RetryStrategy(max_attempts=3, exponential_wait=4))
 def l1_orchestrate(file_id: str, r2_key: str) -> None:
     """
     Single procrastinate task that downloads the raw video once and runs all
     five L1 stages. Idempotent: each stage checks processing_jobs first.
     """
     settings = get_settings()
+
+    if not _file_exists(file_id):
+        logger.info("File %s no longer exists; skipping L1 (likely deleted/aborted).", file_id)
+        return
+
     _set_l1_status(file_id, "running")
 
     try:
@@ -498,6 +610,26 @@ def l1_orchestrate(file_id: str, r2_key: str) -> None:
             wav_path = os.path.join(tmpdir, "audio.wav")
             logger.info("L1: downloading %s for file %s", r2_key, file_id)
             _download_from_r2(r2_key, raw_path)
+
+            has_audio = _has_audio_stream(raw_path)
+            if not has_audio:
+                logger.info("File %s has no audio stream; skipping transcript/audio.", file_id)
+
+            # Audio demux is a pure subprocess->file step with no DB access, so
+            # we overlap it with the (CPU/NVENC-heavy) proxy encode to take it
+            # off the critical path. Transcript/audio stages join on it later.
+            demux_err: dict = {}
+
+            def _demux_bg() -> None:
+                try:
+                    _demux_wav(raw_path, wav_path)
+                except Exception as e:  # noqa: BLE001 - surfaced after join
+                    demux_err["e"] = e
+
+            demux_thread: Optional[threading.Thread] = None
+            if has_audio:
+                demux_thread = threading.Thread(target=_demux_bg, daemon=True)
+                demux_thread.start()
 
             with _pg_conn() as conn:
                 duration, _w, _h = _run_stage(
@@ -517,10 +649,17 @@ def l1_orchestrate(file_id: str, r2_key: str) -> None:
                         "Duration %.1fs > guardrail %ds; skipping deep L1 stages",
                         duration_s, settings.max_l1_duration_seconds,
                     )
+                    if demux_thread is not None:
+                        demux_thread.join()
                     _set_l1_status(file_id, "skipped")
                     return
 
-                _demux_wav(raw_path, wav_path)
+                # Ensure the demux finished (it almost always has, in parallel
+                # with the proxy) before the transcript/audio stages need it.
+                if demux_thread is not None:
+                    demux_thread.join()
+                    if "e" in demux_err:
+                        raise demux_err["e"]
 
                 # Prefer the 1080p proxy for shot detection / keyframes /
                 # telemetry (much cheaper to decode than a 4K raw). It exists
@@ -573,11 +712,12 @@ def l1_orchestrate(file_id: str, r2_key: str) -> None:
                 _run_stage(conn, file_id, "embeddings",
                            _stage4_embeddings, file_id, shots_for_emb, conn)
 
-                _run_stage(conn, file_id, "transcript",
-                           _stage2_transcript, file_id, wav_path, conn)
+                if has_audio:
+                    _run_stage(conn, file_id, "transcript",
+                               _stage2_transcript, file_id, wav_path, conn)
 
-                _run_stage(conn, file_id, "audio_features",
-                           _stage5_audio, file_id, wav_path, conn)
+                    _run_stage(conn, file_id, "audio_features",
+                               _stage5_audio, file_id, wav_path, conn)
 
         _set_l1_status(file_id, "ready")
         logger.info("L1 complete for %s", file_id)
@@ -590,7 +730,15 @@ def l1_orchestrate(file_id: str, r2_key: str) -> None:
 
         # Every video flows L1 -> L2 automatically, in the background.
         _enqueue_l2_if_needed(file_id)
+    except psycopg.errors.ForeignKeyViolation:
+        # The files row was deleted while we were processing it -- the inserts
+        # have nowhere to land. Stop cleanly instead of failing + retrying.
+        logger.info("File %s deleted mid-L1; abandoning cleanly.", file_id)
+        return
     except Exception:
+        if not _file_exists(file_id):
+            logger.info("File %s deleted mid-L1; abandoning cleanly.", file_id)
+            return
         logger.exception("L1 failed for %s", file_id)
         _set_l1_status(file_id, "failed")
         raise

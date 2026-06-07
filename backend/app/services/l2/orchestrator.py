@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Iterable, List, Optional
 
 import psycopg
+from procrastinate import RetryStrategy
 from psycopg.rows import dict_row
 
 from app.config import get_settings
@@ -401,11 +402,11 @@ def enrich(
 
 # --- Procrastinate task wrappers -----------------------------------------
 
-@proc_app.task(name="l2_enrich_file", queue="gpu", retry={"max_attempts": 2, "wait": "exponential"})
+@proc_app.task(name="l2_enrich_file", queue="gpu", retry=RetryStrategy(max_attempts=2, exponential_wait=4))
 def l2_enrich_file_task(file_id: str) -> None:
     enrich(file_id=file_id)
 
 
-@proc_app.task(name="l2_enrich_shots", retry={"max_attempts": 2, "wait": "exponential"})
+@proc_app.task(name="l2_enrich_shots", retry=RetryStrategy(max_attempts=2, exponential_wait=4))
 def l2_enrich_shots_task(shot_ids: list[str]) -> None:
     enrich(shot_ids=shot_ids)
