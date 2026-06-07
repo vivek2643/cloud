@@ -80,8 +80,14 @@ def critique_edl(
 ) -> CritiqueResult:
     """Run all checks. `section_styles` (per the composer's sections meta) lets us
     skip pacing checks for intentionally fast styles."""
-    vt = list(edl.get("video_track") or [])
-    at = list(edl.get("audio_track") or [])
+    # v1 EDLs carry a single coupled `clips` list; v2 splits video/audio. Treat
+    # the v1 clips as the video track so the critic scores both shapes.
+    if edl.get("version") == 1:
+        vt = list(edl.get("clips") or [])
+        at: List[Dict[str, Any]] = []
+    else:
+        vt = list(edl.get("video_track") or [])
+        at = list(edl.get("audio_track") or [])
     shots = _shot_index(analyses)
     issues: List[CriticIssue] = []
 
