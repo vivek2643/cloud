@@ -1,9 +1,10 @@
 """
-Turn selected keyframes into Anthropic multimodal content blocks.
+Turn selected keyframes into neutral multimodal content blocks (see
+app.services.llm.base) that the provider adapter translates per-vendor.
 
 The editor is otherwise blind: with local L2 VLM captioning deprecated, the
 text catalog has no visual description. This module fetches the Layer-B-selected
-224x224 keyframe JPEGs from R2 and interleaves them with labels so Claude can
+224x224 keyframe JPEGs from R2 and interleaves them with labels so the model can
 actually SEE each shot and map the image back to its shot_id.
 """
 from __future__ import annotations
@@ -54,10 +55,8 @@ def build_image_blocks(frames: List[SelectedFrame]) -> List[Dict[str, Any]]:
             "type": "text",
             "text": f"[FRAME {idx} | shot_id={fr.shot_id} | t={_fmt_tc(fr.ts_ms)} | {fr.kind}]",
         })
-        blocks.append({
-            "type": "image",
-            "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
-        })
+        # Neutral image block; the LLM adapter translates per-provider.
+        blocks.append({"type": "image", "data": b64, "media_type": "image/jpeg"})
     return blocks
 
 

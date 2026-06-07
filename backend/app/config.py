@@ -31,10 +31,28 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-4-5-20250929"
 
+    # Provider-agnostic LLM backbone. "anthropic" (default) or "gemini". All L3
+    # model calls route through app.services.llm.get_llm() keyed on this value.
+    llm_provider: str = "anthropic"
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.5-pro"
+
     # Layer C: how many keyframe images to attach to the multimodal editor call
     # (0 disables vision -> text-only editor). ~1.3k tokens/image on Sonnet.
     editor_vision_max_images: int = 16
     editor_vision_per_shot_max: int = 1
+
+    # Agentic perception (director view_frames loop). The director is a "blind
+    # editor" that pulls keyframes on demand; these bound its appetite so cost
+    # and latency stay sane.
+    editor_perception_max_rounds: int = 12
+    editor_perception_max_images: int = 300
+    view_frames_per_shot_max: int = 8
+    # Keep images from only the most recent N view_frames turns in context; older
+    # frames are pruned to their captions to bound multimodal token growth.
+    editor_perception_keep_image_turns: int = 3
+    # Prompt caching on the stable system/catalog prefix (Anthropic only).
+    llm_prompt_caching: bool = True
 
     # Phase 2 Stage D: hosted Qwen2.5-VL endpoint (Replicate / Anyscale style).
     # Leave empty to use the self-hosted GPU model below instead.

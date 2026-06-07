@@ -39,9 +39,10 @@ from app.config import get_settings
 from app.services import prompts as prompts_mod
 from app.services.l3 import keyframe_select as kf_select
 from app.services.l3 import vision as vision_mod
-from app.services.l3.anthropic_client import _client as _anthropic_client
 from app.services.l3.edit_logic_basic import TimelineClip
 from app.services.l3.query_executor import CandidateShot
+from app.services.llm import base as llm
+from app.services.llm import get_llm
 
 logger = logging.getLogger(__name__)
 
@@ -309,20 +310,15 @@ def _plan_beats(
         if duration_target_s is not None
         else "DURATION TARGET: (none -- choose a tight, defensible length)"
     )
-    user_message = "\n\n".join([f"BRIEF:\n{latest}", dur, catalog_text,
-                                "Write the beat sheet now."])
+    user_text = "\n\n".join([f"BRIEF:\n{latest}", dur, catalog_text,
+                             "Write the beat sheet now."])
     try:
-        settings = get_settings()
-        client = _anthropic_client()
-        msg = client.messages.create(
-            model=settings.anthropic_model,
-            max_tokens=900,
+        resp = get_llm().run(
             system=_PLAN_SYSTEM,
-            messages=[{"role": "user", "content": user_message}],
+            messages=[llm.user_message([llm.text_block(user_text)])],
+            max_tokens=900,
         )
-        return "".join(
-            b.text for b in msg.content if getattr(b, "type", None) == "text"
-        ).strip()
+        return resp.text.strip()
     except Exception:
         logger.exception("Plan pass failed; continuing without a beat sheet")
         return ""
@@ -334,23 +330,20 @@ def _call_claude(
     max_tokens: int = 4096,
     image_blocks: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    settings = get_settings()
-    client = _anthropic_client()
+    # Text first (the catalog/brief), then any labeled keyframe images. The
+    # image blocks are neutral ({"type":"image","data","media_type"}); the
+    # adapter translates them per-provider.
+    content: List[Dict[str, Any]] = [llm.text_block(user_message)]
     if image_blocks:
-        # Text first (the catalog/brief), then the labeled keyframe images.
-        content: List[Dict[str, Any]] = [{"type": "text", "text": user_message}]
         content.extend(image_blocks)
-    else:
-        content = user_message  # type: ignore[assignment]
-    msg = client.messages.create(
-        model=settings.anthropic_model,
-        max_tokens=max_tokens,
+    resp = get_llm().run(
         system=system_prompt,
-        messages=[{"role": "user", "content": content}],
+        messages=[llm.user_message(content)],
+        max_tokens=max_tokens,
     )
-    text = "".join(b.text for b in msg.content if getattr(b, "type", None) == "text").strip()
+    text = resp.text.strip()
     if not text:
-        raise ValueError("Empty response from Claude editor")
+        raise ValueError("Empty response from LLM editor")
     if text.startswith("```"):
         lines = text.splitlines()
         # drop the first fence and the last fence if present

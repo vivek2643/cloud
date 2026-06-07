@@ -35,8 +35,8 @@ from app.config import get_settings
 from app.services import prompts
 from app.services.edl import patch as edl_patch
 from app.services.edl import store as edl_store
-from app.services.l3.anthropic_client import _client as _anthropic_client
 from app.services.l3.query_executor import retrieve_top_k
+from app.services.llm import get_llm, tool_result_block, user_message
 
 logger = logging.getLogger(__name__)
 
@@ -528,8 +528,7 @@ def run_agent(
     )
     messages: List[Dict[str, Any]] = [{"role": "user", "content": initial_user}]
 
-    client = _anthropic_client()
-    settings = get_settings()
+    llm = get_llm()
     tool_log: List[Dict[str, Any]] = []
     summary = ""
     final_text_bits: List[str] = []
@@ -539,54 +538,36 @@ def run_agent(
             raise AgentCancelled()
 
         emit("reasoning", min(10 + it * 4, 80), f"Thinking (step {it + 1})")
-        msg = client.messages.create(
-            model=settings.anthropic_model,
-            max_tokens=1536,
+        resp = llm.run(
             system=system_prompt,
-            tools=TOOLS,
             messages=messages,
+            tools=TOOLS,
+            max_tokens=1536,
+            cache_system=True,
         )
 
-        # Collect any assistant text + tool_use blocks.
-        assistant_content: List[Dict[str, Any]] = []
-        tool_uses = []
-        for block in msg.content:
-            btype = getattr(block, "type", None)
-            if btype == "text":
-                final_text_bits.append(block.text)
-                assistant_content.append({"type": "text", "text": block.text})
-            elif btype == "tool_use":
-                tool_uses.append(block)
-                assistant_content.append({
-                    "type": "tool_use",
-                    "id": block.id,
-                    "name": block.name,
-                    "input": block.input,
-                })
-        messages.append({"role": "assistant", "content": assistant_content})
+        if resp.text:
+            final_text_bits.append(resp.text)
+        messages.append(resp.assistant_message)
 
-        if msg.stop_reason != "tool_use" or not tool_uses:
+        if resp.stop_reason != "tool_use" or not resp.tool_calls:
             # Model stopped without (more) tools -> treat as finished.
             break
 
-        tool_results = []
+        tool_results: List[Dict[str, Any]] = []
         is_done = False
-        for tu in tool_uses:
-            args = tu.input if isinstance(tu.input, dict) else {}
-            label = _tool_label(tu.name, args)
+        for tc in resp.tool_calls:
+            args = tc.input if isinstance(tc.input, dict) else {}
+            label = _tool_label(tc.name, args)
             emit("editing", min(15 + it * 4, 85), label)
-            result, done, done_summary = _exec_tool(tu.name, args, tl, user_id)
-            tool_log.append({"tool": tu.name, "input": args, "result_keys": list(result.keys())})
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": tu.id,
-                "content": json.dumps(result)[:6000],
-            })
+            result, done, done_summary = _exec_tool(tc.name, args, tl, user_id)
+            tool_log.append({"tool": tc.name, "input": args, "result_keys": list(result.keys())})
+            tool_results.append(tool_result_block(tc.id, json.dumps(result)[:6000]))
             if done:
                 is_done = True
                 summary = done_summary or "Done"
 
-        messages.append({"role": "user", "content": tool_results})
+        messages.append(user_message(tool_results))
         if is_done:
             break
 

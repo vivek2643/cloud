@@ -195,6 +195,7 @@ def run_chat_turn(
         audit.stage("director_plan", dres.plan)
         audit.stage("director_critiques", dres.critiques)
         audit.stage("director_sections", dres.sections)
+        audit.stage("director_perception", dres.raw.get("perception"))
         audit.stage("editor_reasoning", dres.reasoning)
         audit.stage("editor_warnings", dres.warnings)
 

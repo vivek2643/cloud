@@ -1,9 +1,11 @@
 """
-Thin wrapper around the Anthropic SDK with one helper: get a JSON response
-constrained to a schema using Claude's strict JSON output mode.
+JSON helper on top of the provider-agnostic LLM adapter: get a JSON dict back
+from a single system+user call. Provider selection lives in
+`app.services.llm` (keyed on `llm_provider`), so this file no longer talks to
+any vendor SDK directly.
 
-Keeping this in its own file so swapping providers (Bedrock, Vertex, etc.)
-is a one-file change.
+`_client()` is retained as a thin shim for any legacy import; new code should
+use `app.services.llm.get_llm()`.
 """
 from __future__ import annotations
 
@@ -11,13 +13,16 @@ import json
 import logging
 from typing import Any
 
-from app.config import get_settings
+from app.services.llm import get_llm, text_block, user_message
 
 logger = logging.getLogger(__name__)
 
 
 def _client():
+    """Deprecated: returns the raw Anthropic SDK client. Prefer get_llm()."""
     from anthropic import Anthropic
+
+    from app.config import get_settings
 
     settings = get_settings()
     if not settings.anthropic_api_key:
@@ -29,28 +34,23 @@ def _client():
 
 def call_json(system_prompt: str, user_prompt: str, max_tokens: int = 2048) -> dict[str, Any]:
     """
-    Call Claude and return a parsed JSON dict.
+    Call the configured LLM and return a parsed JSON dict.
 
-    Claude is instructed via the system prompt to emit JSON only. We then
+    The model is instructed via the system prompt to emit JSON only. We then
     strip code fences if present and parse. Raises ValueError if the result
     can't be parsed.
     """
-    settings = get_settings()
-    client = _client()
-    msg = client.messages.create(
-        model=settings.anthropic_model,
-        max_tokens=max_tokens,
+    llm = get_llm()
+    resp = llm.run(
         system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
+        messages=[user_message([text_block(user_prompt)])],
+        max_tokens=max_tokens,
     )
-
-    text = "".join(
-        block.text for block in msg.content if getattr(block, "type", None) == "text"
-    ).strip()
+    text = resp.text.strip()
     if not text:
-        raise ValueError("Empty response from Claude")
+        raise ValueError("Empty response from LLM")
 
-    # Strip markdown fences if Claude wrapped JSON in them
+    # Strip markdown fences if the model wrapped JSON in them
     if text.startswith("```"):
         lines = text.splitlines()
         text = "\n".join(lines[1:-1] if lines[-1].startswith("```") else lines[1:])
