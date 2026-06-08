@@ -42,6 +42,7 @@ class PlacedClip:
     role_in_edit: Optional[str] = None
     why: Optional[str] = None
     gain_db: Optional[float] = None
+    speaker_id: Optional[str] = None
 
     @property
     def source_dur_ms(self) -> int:
@@ -289,3 +290,156 @@ def place_split(
                 shot_id=vc.shot_id,
             ))
     return AVTimeline(video=video, audio=audio, duration_ms=total)
+
+
+# ---------------------------------------------------------------------------
+# Spine + coverage substrate (general editor)
+# ---------------------------------------------------------------------------
+
+def place_spine_coverage(
+    spine_units: List[EditUnit],
+    ctx: RecipeContext,
+    *,
+    coverage_ratio: float = 0.35,
+    max_cutaway_ms: int = 3500,
+    min_hold_ms: int = 1200,
+) -> AVTimeline:
+    """The general substrate: a continuous spine (audio bed) with coverage cut
+    in on the VIDEO track only.
+
+    The spine's audio plays uninterrupted (one speaker's line stays whole) while
+    the video alternates between the spine's own footage and coverage -- an
+    alternate camera angle of the SAME moment (multicam) or topical b-roll. Both
+    are the same operation here; only the coverage SOURCE differs.
+
+    Coverage is inserted as a flat substitution on the video track (no overlap /
+    z-order), so it renders today: audio_track = spine, video_track = spine with
+    cutaway spans swapped to coverage footage.
+    """
+    from app.services.l3.primitives import coverage as cov_mod
+
+    sim = cov_mod.simultaneity_map(ctx.analyses)
+    all_units = list(ctx.units)
+
+    video: List[PlacedClip] = []
+    audio: List[PlacedClip] = []
+    cursor = 0
+    total_spine_ms = 0
+    covered_ms = 0
+
+    for u in spine_units:
+        in_ms, out_ms = snap_unit_bounds(u, ctx)
+        dur = out_ms - in_ms
+        if dur < MIN_CLIP_MS:
+            continue
+        t0 = cursor
+        t1 = cursor + dur
+        # Audio: the spine's own continuous line.
+        audio.append(PlacedClip(
+            file_id=u.file_id, source_in_ms=in_ms, source_out_ms=out_ms,
+            timeline_in_ms=t0, timeline_out_ms=t1,
+            shot_id=u.shot_id, role_in_edit="spine", speaker_id=u.speaker_id,
+            why=(u.text or "")[:140],
+        ))
+        total_spine_ms += dur
+
+        # Decide whether to cut away on the video for the MIDDLE of this line.
+        want_more_coverage = (covered_ms < coverage_ratio * max(total_spine_ms, dur))
+        cov_clip = None
+        if want_more_coverage and dur >= (2 * min_hold_ms + MIN_CLIP_MS):
+            candidates = cov_mod.coverage_candidates(u, all_units, sim, max_candidates=4)
+            cov_clip = _pick_coverage_source(
+                u, in_ms, candidates, sim, ctx,
+                hold_ms=min_hold_ms, max_cutaway_ms=max_cutaway_ms,
+            )
+
+        if cov_clip is None:
+            # Plain spine video for the whole line.
+            video.append(PlacedClip(
+                file_id=u.file_id, source_in_ms=in_ms, source_out_ms=out_ms,
+                timeline_in_ms=t0, timeline_out_ms=t1,
+                shot_id=u.shot_id, role_in_edit="spine", speaker_id=u.speaker_id,
+                why=(u.text or "")[:140],
+            ))
+        else:
+            cov_len, cov_src_in, cov_src_out, cov_file, cov_shot, cov_role = cov_clip
+            hold = min_hold_ms
+            # 1) spine head
+            video.append(PlacedClip(
+                file_id=u.file_id, source_in_ms=in_ms, source_out_ms=in_ms + hold,
+                timeline_in_ms=t0, timeline_out_ms=t0 + hold,
+                shot_id=u.shot_id, role_in_edit="spine", speaker_id=u.speaker_id,
+            ))
+            # 2) coverage (cutaway)
+            video.append(PlacedClip(
+                file_id=cov_file, source_in_ms=cov_src_in, source_out_ms=cov_src_out,
+                timeline_in_ms=t0 + hold, timeline_out_ms=t0 + hold + cov_len,
+                shot_id=cov_shot, role_in_edit=cov_role, why="coverage",
+            ))
+            # 3) spine tail
+            tail_in = in_ms + hold + cov_len
+            video.append(PlacedClip(
+                file_id=u.file_id, source_in_ms=tail_in, source_out_ms=out_ms,
+                timeline_in_ms=t0 + hold + cov_len, timeline_out_ms=t1,
+                shot_id=u.shot_id, role_in_edit="spine", speaker_id=u.speaker_id,
+            ))
+            covered_ms += cov_len
+
+        cursor = t1
+
+    return AVTimeline(video=video, audio=audio, duration_ms=cursor)
+
+
+def _pick_coverage_source(
+    spine_unit: EditUnit,
+    spine_in_ms: int,
+    candidates: List[EditUnit],
+    sim,
+    ctx: RecipeContext,
+    *,
+    hold_ms: int,
+    max_cutaway_ms: int,
+):
+    """Resolve a coverage candidate into a concrete source window for the cutaway.
+
+    Simultaneous angles are sampled at the SAME wall-clock moment (via the
+    cluster offsets) so the cut reveals another camera of the same instant;
+    b-roll just uses the candidate's own footage. Returns a tuple
+    (cov_len, src_in, src_out, file_id, shot_id, role) or None.
+    """
+    spine_dur = spine_unit.out_ms - spine_in_ms
+    cov_len = min(max_cutaway_ms, spine_dur - 2 * hold_ms)
+    if cov_len < MIN_CLIP_MS:
+        return None
+
+    spine_cluster = sim.get(spine_unit.file_id)
+    spine_off = spine_cluster.offsets.get(spine_unit.file_id, 0) if spine_cluster else 0
+    # The cutaway covers spine source [spine_in+hold, +cov_len] -> wall clock.
+    cut_src_in = spine_in_ms + hold_ms
+    wall_in = cut_src_in + spine_off
+
+    for c in candidates:
+        c_cluster = sim.get(c.file_id)
+        simultaneous = bool(
+            spine_cluster and c_cluster
+            and c_cluster.ref_file_id == spine_cluster.ref_file_id
+            and c.file_id != spine_unit.file_id
+        )
+        if simultaneous:
+            c_off = c_cluster.offsets.get(c.file_id, 0)
+            src_in = wall_in - c_off
+            src_out = src_in + cov_len
+            fa = ctx.analyses.get(c.file_id)
+            max_ms = int((fa.duration_seconds or 0) * 1000) if fa else src_out
+            if src_in < 0 or (max_ms and src_out > max_ms):
+                continue
+            return (cov_len, src_in, src_out, c.file_id, c.shot_id, "angle")
+        # b-roll cutaway: use the candidate's own window, trimmed to cov_len.
+        c_in, c_out = snap_unit_bounds(c, ctx)
+        if c_out - c_in < MIN_CLIP_MS:
+            continue
+        src_out = min(c_out, c_in + cov_len)
+        if src_out - c_in < MIN_CLIP_MS:
+            continue
+        return (src_out - c_in, c_in, src_out, c.file_id, c.shot_id, "broll")
+    return None

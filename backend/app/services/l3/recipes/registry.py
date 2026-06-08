@@ -9,6 +9,7 @@ from app.services.l3.recipes.styles import (
     CinematicBRoll,
     HighlightMontage,
     SocialShort,
+    SpineCoverage,
     TalkingHead,
     Trailer,
     TutorialExplainer,
@@ -24,6 +25,7 @@ _INSTANCES: List[Recipe] = [
     SocialShort(),
     TutorialExplainer(),
     CinematicBRoll(),
+    SpineCoverage(),
 ]
 
 RECIPES: Dict[str, Recipe] = {r.key: r for r in _INSTANCES}

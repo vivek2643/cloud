@@ -116,6 +116,7 @@ def _append_track(
             "role_in_edit": c.role_in_edit,
             "why": c.why,
             "gain_db": c.gain_db,
+            "speaker_id": c.speaker_id,
             "section": section_idx,
         })
 

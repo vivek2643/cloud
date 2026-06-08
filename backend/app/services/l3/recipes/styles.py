@@ -16,6 +16,7 @@ from app.services.l3.recipes.base import (
     SectionPlan,
     MIN_CLIP_MS,
     place_coupled,
+    place_spine_coverage,
     place_split,
     select_for_target,
     snap_unit_bounds,
@@ -265,6 +266,41 @@ class CinematicBRoll(Recipe):
         if music:
             return _styled(place_split(src, music, ctx, music_gain_db=p.music_gain_db(-5.0)), self.key)
         return _styled(place_coupled(src), self.key)
+
+
+class SpineCoverage(Recipe):
+    """General spine + coverage editor.
+
+    The substrate that makes multicam camera-switching and b-roll cutaways the
+    same operation: keep one speaker's line whole on the audio bed (the spine),
+    and cut the VIDEO to alternate angles of the same moment (multicam) or
+    topical b-roll (coverage). Driven entirely by policy params -- this one
+    recipe spans clean talking heads (coverage_ratio=0) through dynamic,
+    multi-angle interview cuts."""
+    key = "spine_coverage"
+    label = "Spine + coverage (general)"
+
+    def assemble(self, section: SectionPlan, ctx: RecipeContext) -> AVTimeline:
+        p = RecipeParams.from_section(section)
+        speech = dedup_speech_units(ctx.units_for_section(section, modality="speech"))
+        spine = sorted(speech, key=lambda u: (u.file_id, u.in_ms))
+        if not spine:
+            # No speech -> behave like a highlight montage of visuals.
+            return HighlightMontage().assemble(section, ctx)
+
+        target = _target_ms(section)
+        if target:
+            ranked = sorted(spine, key=lambda u: u.quality, reverse=True)
+            keep = {u.id for u in select_for_target(ranked, target)}
+            spine = [u for u in spine if u.id in keep]
+
+        tl = place_spine_coverage(
+            spine, ctx,
+            coverage_ratio=p.coverage_ratio(0.35),
+            max_cutaway_ms=p.max_cutaway_ms(3500),
+            min_hold_ms=p.min_hold_ms(1200),
+        )
+        return _styled(tl, self.key)
 
 
 def _styled(tl: AVTimeline, style: str) -> AVTimeline:

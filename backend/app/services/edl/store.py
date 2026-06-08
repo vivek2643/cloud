@@ -405,7 +405,7 @@ def _normalize_track_clips(clips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "timeline_out_ms": int(c["timeline_out_ms"]),
         }
         # Optional editorial metadata kept for UI/audit (never required).
-        for k in ("role_in_edit", "section", "why", "gain_db", "transition"):
+        for k in ("role_in_edit", "section", "why", "gain_db", "transition", "speaker_id"):
             if c.get(k) is not None:
                 clip[k] = c[k]
         out.append(clip)

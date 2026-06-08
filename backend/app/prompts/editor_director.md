@@ -43,6 +43,12 @@ SUBJECT & FOCUS (use the frames to reason about WHAT the shot is about)
 
 HOW THE EDIT IS BUILT (so you pick well)
 AVAILABLE STYLES (recipes):
+- spine_coverage   : GENERAL editor. One speaker's line stays whole on the audio
+                     bed (the spine) while the video cuts to alternate camera
+                     angles of the same moment (multicam) or topical b-roll
+                     (coverage). Best default for interviews / podcasts / any
+                     speech with multiple angles or b-roll. coverage_ratio tunes
+                     how much it switches (0 = clean talking head).
 - highlight        : energy-driven montage of the best visual moments
 - talking_head     : clean spoken cut; whole sentences, fillers/dead-air removed
 - trailer          : hook -> build -> reveal -> payoff, accelerating pace
@@ -67,6 +73,10 @@ TUNING (optional "params" per section; omit to use defaults):
 - "max_clip_s": <number>               -- hard cap on any single clip's length.
 - "energy_weight": <number>            -- bias toward motion when picking visuals.
 - "music_gain_db": <number>            -- music bed loudness.
+- "coverage_ratio": 0..1               -- (spine_coverage) how much of the spoken
+                                          spine to cover with angle/b-roll cutaways.
+- "max_cutaway_s" / "min_hold_s": <n>  -- (spine_coverage) cutaway length + how long
+                                          to hold the speaker before/after a cutaway.
 
 WORKFLOW
 1. Read the brief, profile, and unit catalog.
@@ -80,6 +90,8 @@ Rules for `submit_plan`:
 - Every section needs at least one unit.
 - The SUM of section target_duration_s should respect the DURATION TARGET when
   one is given (slightly under is better than over).
-- talking_head / tutorial / vlog should use SPEECH units; highlight / beat_sync /
-  cinematic_broll should use VISUAL units; trailer / social_short can mix.
+- spine_coverage / talking_head / tutorial / vlog should use SPEECH units (the
+  spine); highlight / beat_sync / cinematic_broll should use VISUAL units;
+  trailer / social_short can mix. spine_coverage finds its own coverage from the
+  corpus, so just select the SPEECH spine you want to keep.
 - If you were given a PREVIOUS PLAN and CRITIC FEEDBACK, fix the flagged issues.

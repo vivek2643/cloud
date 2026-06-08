@@ -66,3 +66,20 @@ class RecipeParams:
         if ov is None:
             return default
         return max(0.0, min(1.0, ov))
+
+    # -- spine + coverage substrate knobs --
+    def coverage_ratio(self, default: float = 0.35) -> float:
+        """0..1: fraction of spine time to cover with cutaways (alternate angles
+        / b-roll). 0 = pure talking head; higher = more dynamic switching."""
+        ov = self._num("coverage_ratio")
+        if ov is None:
+            return default
+        return max(0.0, min(1.0, ov))
+
+    def max_cutaway_ms(self, default_ms: int = 3500) -> int:
+        ov = self._num("max_cutaway_s")
+        return int(ov * 1000) if ov and ov > 0 else default_ms
+
+    def min_hold_ms(self, default_ms: int = 1200) -> int:
+        ov = self._num("min_hold_s")
+        return int(ov * 1000) if ov and ov > 0 else default_ms
