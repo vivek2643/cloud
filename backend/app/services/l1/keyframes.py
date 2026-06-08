@@ -59,6 +59,10 @@ class ThreeKeyframes:
     # by-product of picking the motion keyframe, so the shots stage can reuse it
     # instead of re-opening the video for a second flow pass.
     motion_mag: Optional[float] = None
+    # Dominant (magnitude-weighted mean) screen-space motion direction of the
+    # shot, in px/frame at the 320x180 sampling resolution.
+    motion_dx: Optional[float] = None
+    motion_dy: Optional[float] = None
 
 
 @dataclass
@@ -86,12 +90,21 @@ def _hist(frame_bgr: np.ndarray) -> np.ndarray:
     return h.flatten()
 
 
-def _flow_mag(prev_gray: np.ndarray, cur_gray: np.ndarray) -> float:
+def _flow_vec(prev_gray: np.ndarray, cur_gray: np.ndarray) -> Tuple[float, float, float]:
+    """Dense optical flow between two frames -> (mean magnitude, mean dx, mean dy).
+
+    The mean (dx, dy) is the dominant screen-space motion direction of this
+    transition (px/frame at the 320x180 sampling resolution). We used to throw
+    it away and keep only magnitude; the direction is what lets the editor make
+    motion-continuous match cuts and avoid jarring direction reversals.
+    """
     flow = cv2.calcOpticalFlowFarneback(
         prev_gray, cur_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0,
     )
-    mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-    return float(mag.mean())
+    fx = flow[..., 0]
+    fy = flow[..., 1]
+    mag, _ = cv2.cartToPolar(fx, fy)
+    return float(mag.mean()), float(fx.mean()), float(fy.mean())
 
 
 def _sample_shot(
@@ -150,12 +163,20 @@ def _pick_base(samples: List[Tuple[float, np.ndarray]]) -> dict:
     best_motion = (anchor_ts, -1.0)
     best_var = (anchor_ts, -1.0)
     best_var_idx = anchor_idx
+    # Accumulate a magnitude-weighted mean flow vector over the shot -> its
+    # dominant motion direction (used for match-cut continuity).
+    sum_dx = 0.0
+    sum_dy = 0.0
+    sum_w = 0.0
     prev_gray = anchor_gray
     for j, (ts, frame) in enumerate(samples):
         if j == anchor_idx:
             continue
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        mag = _flow_mag(prev_gray, gray)
+        mag, dx, dy = _flow_vec(prev_gray, gray)
+        sum_dx += dx * mag
+        sum_dy += dy * mag
+        sum_w += mag
         if mag > best_motion[1]:
             best_motion = (ts, mag)
         hist = _hist(frame)
@@ -171,12 +192,17 @@ def _pick_base(samples: List[Tuple[float, np.ndarray]]) -> dict:
     if best_var[1] < 0:
         best_var = (anchor_ts, 0.0)
 
+    motion_dx = (sum_dx / sum_w) if sum_w > 0 else 0.0
+    motion_dy = (sum_dy / sum_w) if sum_w > 0 else 0.0
+
     return {
         "anchor_idx": anchor_idx,
         "anchor_ts": anchor_ts,
         "best_motion": best_motion,
         "best_var": best_var,
         "best_var_idx": best_var_idx,
+        "motion_dx": motion_dx,
+        "motion_dy": motion_dy,
         "hists": hists,
     }
 
@@ -270,6 +296,8 @@ def extract_three(
         motion_ts_ms=int(best_motion[0]) if ok_m else None,
         variance_ts_ms=int(best_var[0]) if ok_v else None,
         motion_mag=float(best_motion[1]) if best_motion[1] >= 0 else 0.0,
+        motion_dx=float(base.get("motion_dx", 0.0)),
+        motion_dy=float(base.get("motion_dy", 0.0)),
     )
 
 
@@ -349,6 +377,8 @@ def extract_adaptive(
         motion_ts_ms=int(best_motion[0]) if ok_m else None,
         variance_ts_ms=int(best_var[0]) if ok_v else None,
         motion_mag=float(best_motion[1]) if best_motion[1] >= 0 else 0.0,
+        motion_dx=float(base.get("motion_dx", 0.0)),
+        motion_dy=float(base.get("motion_dy", 0.0)),
         coverage=coverage,
     )
 

@@ -25,6 +25,7 @@ from app.config import get_settings
 from app.services import audit_log
 from app.services.jobs import app
 from app.services.l1 import audio_features as af_mod
+from app.services.l1 import diarization as diar_mod
 from app.services.l1 import embeddings as emb_mod
 from app.services.l1 import keyframes as kf_mod
 from app.services.l1 import shots as shots_mod
@@ -35,7 +36,7 @@ from app.services.supabase_client import get_supabase
 
 logger = logging.getLogger(__name__)
 
-STAGES = ("proxy", "transcript", "shots", "embeddings", "audio_features")
+STAGES = ("proxy", "transcript", "shots", "embeddings", "audio_features", "diarization")
 
 
 def _pg_conn() -> psycopg.Connection:
@@ -448,8 +449,9 @@ def _stage3_shots(
                 file_id, shot_index, start_ms, end_ms,
                 keyframe_r2_key, r2_keyframe_motion_key, r2_keyframe_variance_key,
                 focus_score, brightness, motion_magnitude,
-                blur_min, peak_motion_ms, peak_variance_ms
-            ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                blur_min, peak_motion_ms, peak_variance_ms,
+                motion_dx, motion_dy
+            ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             returning id
             """,
             (
@@ -459,6 +461,7 @@ def _stage3_shots(
                 shot.r2_keyframe_variance_key,
                 shot.focus_score, shot.brightness, shot.motion_magnitude,
                 shot.blur_min, shot.motion_ts_ms, shot.variance_ts_ms,
+                shot.motion_dx, shot.motion_dy,
             ),
         ).fetchone()
         shot_id = row[0]
@@ -654,15 +657,22 @@ def _stage5_audio(file_id: str, wav_path: str, conn: psycopg.Connection) -> None
         """
         insert into audio_features (
             file_id, integrated_lufs, true_peak_db,
-            is_musical, bpm, onsets_ms, silence_intervals
-        ) values (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
+            is_musical, bpm, onsets_ms, silence_intervals,
+            energy_peaks_ms, pause_map, rms_db, pitch_hz, prosody_hop_ms
+        ) values (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb,
+                  %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s)
         on conflict (file_id) do update set
             integrated_lufs = excluded.integrated_lufs,
             true_peak_db = excluded.true_peak_db,
             is_musical = excluded.is_musical,
             bpm = excluded.bpm,
             onsets_ms = excluded.onsets_ms,
-            silence_intervals = excluded.silence_intervals
+            silence_intervals = excluded.silence_intervals,
+            energy_peaks_ms = excluded.energy_peaks_ms,
+            pause_map = excluded.pause_map,
+            rms_db = excluded.rms_db,
+            pitch_hz = excluded.pitch_hz,
+            prosody_hop_ms = excluded.prosody_hop_ms
         """,
         (
             file_id,
@@ -670,8 +680,66 @@ def _stage5_audio(file_id: str, wav_path: str, conn: psycopg.Connection) -> None
             af.is_musical, af.bpm,
             json.dumps(af.onsets_ms),
             json.dumps(af.silence_intervals),
+            json.dumps(af.energy_peaks_ms),
+            json.dumps(af.pause_map),
+            json.dumps(af.rms_db),
+            json.dumps(af.pitch_hz),
+            af.prosody_hop_ms,
         ),
     )
+
+
+# --- Stage 6: diarization (who-says-what) --------------------------------
+
+def _stage6_diarization(file_id: str, wav_path: str, conn: psycopg.Connection) -> None:
+    """Label every transcript word with a per-file speaker id.
+
+    Best-effort: reuses Whisper's word timings (read back from the transcript
+    row), runs CPU diarization, and writes a `speaker` key into each word in
+    `transcripts.segments`. Any failure leaves speakers unset without breaking
+    the pipeline -- diarization is a soft signal, not a gate.
+    """
+    settings = get_settings()
+    if not settings.enable_diarization:
+        return
+
+    row = conn.execute(
+        "select segments from transcripts where file_id = %s",
+        (file_id,),
+    ).fetchone()
+    if not row or not row[0]:
+        return
+    segments = row[0]
+
+    # Flatten words with a back-reference so we can write speakers in place.
+    flat: List[dict] = []
+    refs: List[tuple] = []  # (segment, word_dict)
+    for seg in segments:
+        for w in seg.get("words") or []:
+            flat.append(w)
+            refs.append((seg, w))
+    if not flat:
+        return
+
+    result = diar_mod.diarize(
+        wav_path,
+        flat,
+        backend=settings.diarization_backend,
+        max_speakers=settings.diarization_max_speakers,
+    )
+    speakers = result.speaker_by_word
+    if not speakers or len(speakers) != len(refs):
+        return
+
+    for (_seg, w), spk in zip(refs, speakers):
+        if spk is not None:
+            w["speaker"] = spk
+
+    conn.execute(
+        "update transcripts set segments = %s::jsonb where file_id = %s",
+        (json.dumps(segments), file_id),
+    )
+    logger.info("Diarization: %s -> %d speaker(s)", file_id, result.num_speakers)
 
 
 # --- Helpers -------------------------------------------------------------
@@ -828,6 +896,10 @@ def l1_orchestrate(file_id: str, r2_key: str) -> None:
 
                     _run_stage(conn, file_id, "audio_features",
                                _stage5_audio, file_id, wav_path, conn)
+
+                    # Diarization depends on the transcript words written above.
+                    _run_stage(conn, file_id, "diarization",
+                               _stage6_diarization, file_id, wav_path, conn)
 
         _set_l1_status(file_id, "ready")
         logger.info("L1 complete for %s", file_id)

@@ -364,6 +364,18 @@ def _fmt_tc(ms: int) -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
+def _motion_dir_label(mag: float, dx: float, dy: float) -> str:
+    """Compact screen-direction token for the catalog, e.g. ' dir=pan-right'.
+
+    Helps the editor keep motion continuous across cuts. Returns '' for shots
+    with negligible motion so the catalog stays terse."""
+    if mag < 0.6 or (abs(dx) < 0.15 and abs(dy) < 0.15):
+        return ""
+    if abs(dx) >= abs(dy):
+        return " dir=pan-right" if dx > 0 else " dir=pan-left"
+    return " dir=down" if dy > 0 else " dir=up"
+
+
 def _build_unit_catalog(
     units: List[EditUnit],
     analyses,
@@ -391,11 +403,13 @@ def _build_unit_catalog(
         if len(text) > 160:
             text = text[:157] + "..."
         nframes = sum(len(frames_by_shot.get(sid, [])) for sid in u.shot_ids)
+        spk = f" speaker={u.speaker_id}" if u.speaker_id else ""
+        mdir = _motion_dir_label(u.motion, u.motion_dx, u.motion_dy)
         blocks.append(
             f"{label} [{u.modality}] file={u.file_name!r} t={_fmt_tc(u.in_ms)} "
             f"dur={u.duration_ms / 1000:.1f}s q={u.quality:.2f} "
             f"role={u.narrative_role or '-'} framing={u.framing_scale or '-'} "
-            f"motion={u.motion:.1f} frames={nframes}"
+            f"motion={u.motion:.1f}{mdir}{spk} frames={nframes}"
             + (f"\n   text: {text!r}" if text else "")
         )
     return "\n".join(blocks), label_to_id

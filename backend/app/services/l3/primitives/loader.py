@@ -33,6 +33,7 @@ class WordTok:
     end_ms: int
     text: str
     is_filler: bool = False
+    speaker_id: Optional[str] = None   # per-file diarization label ("S0", ...)
 
 
 @dataclass
@@ -51,6 +52,9 @@ class AudioData:
     silence_intervals: List[dict] = field(default_factory=list)  # {start_ms,end_ms}
     acoustic_tags: List[str] = field(default_factory=list)
     integrated_lufs: Optional[float] = None
+    # Prosody / rhythm (cut-timing): emphasis peaks + natural pauses.
+    energy_peaks_ms: List[int] = field(default_factory=list)
+    pause_map: List[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -61,6 +65,8 @@ class ShotRow:
     start_ms: int
     end_ms: int
     motion_magnitude: Optional[float] = None
+    motion_dx: Optional[float] = None
+    motion_dy: Optional[float] = None
     peak_motion_ms: Optional[int] = None
     blur_min: Optional[float] = None
     focus_score: Optional[float] = None
@@ -147,7 +153,8 @@ def load_file_analyses(
         shot_rows = conn.execute(
             """
             select id, file_id, shot_index, start_ms, end_ms,
-                   motion_magnitude, peak_motion_ms, blur_min, focus_score,
+                   motion_magnitude, motion_dx, motion_dy, peak_motion_ms,
+                   blur_min, focus_score,
                    brightness, intra_shot_variance, framing_scale,
                    camera_dynamics, narrative_role, emotional_valence,
                    narrative_description, tracked_character_ids, keyframe_r2_key
@@ -170,6 +177,8 @@ def load_file_analyses(
                     start_ms=int(r["start_ms"]),
                     end_ms=int(r["end_ms"]),
                     motion_magnitude=_f(r.get("motion_magnitude")),
+                    motion_dx=_f(r.get("motion_dx")),
+                    motion_dy=_f(r.get("motion_dy")),
                     peak_motion_ms=_i(r.get("peak_motion_ms")),
                     blur_min=_f(r.get("blur_min")),
                     focus_score=_f(r.get("focus_score")),
@@ -207,7 +216,7 @@ def load_file_analyses(
         af_rows = conn.execute(
             """
             select file_id, is_musical, bpm, onsets_ms, silence_intervals,
-                   acoustic_tags, integrated_lufs
+                   acoustic_tags, integrated_lufs, energy_peaks_ms, pause_map
             from audio_features where file_id = any(%s::uuid[])
             """,
             (owned_ids,),
@@ -224,6 +233,8 @@ def load_file_analyses(
                 silence_intervals=list(r.get("silence_intervals") or []),
                 acoustic_tags=[str(x) for x in (r.get("acoustic_tags") or [])],
                 integrated_lufs=_f(r.get("integrated_lufs")),
+                energy_peaks_ms=[int(x) for x in (r.get("energy_peaks_ms") or [])],
+                pause_map=list(r.get("pause_map") or []),
             )
 
     return out
@@ -234,12 +245,14 @@ def _flatten_words(segments: List[dict]) -> List[WordTok]:
     for seg in segments or []:
         for w in seg.get("words") or []:
             try:
+                spk = w.get("speaker")
                 words.append(
                     WordTok(
                         start_ms=int(w.get("start_ms", 0)),
                         end_ms=int(w.get("end_ms", 0)),
                         text=str(w.get("text", "")).strip(),
                         is_filler=bool(w.get("is_filler", False)),
+                        speaker_id=str(spk) if spk else None,
                     )
                 )
             except (TypeError, ValueError):

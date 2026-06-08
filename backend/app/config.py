@@ -27,6 +27,14 @@ class Settings(BaseSettings):
     # L1 guardrail: anything longer than this just gets S1 (proxy + thumb).
     max_l1_duration_seconds: int = 3600
 
+    # L1 Stage 6: CPU speaker diarization (who-says-what). Labels each word with
+    # a per-file speaker id ("S0", "S1", ...). "mfcc" is the dependency-free
+    # default (librosa + sklearn, no GPU, no model download); a stronger
+    # backend (ecapa / pyannote) can be slotted in later behind this flag.
+    enable_diarization: bool = True
+    diarization_backend: str = "mfcc"
+    diarization_max_speakers: int = 8
+
     # Phase 3a: L3 query parsing via Anthropic Claude
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-4-5-20250929"

@@ -49,6 +49,8 @@ class EditUnit:
     shot_id: Optional[str] = None
     shot_ids: List[str] = field(default_factory=list)
     motion: float = 0.0
+    motion_dx: float = 0.0   # dominant screen-space motion direction (px/frame)
+    motion_dy: float = 0.0
     valence: Optional[float] = None
     narrative_role: Optional[str] = None
     framing_scale: Optional[str] = None
@@ -110,6 +112,7 @@ def _build_speech_units(fa: FileAnalysis) -> List[EditUnit]:
             continue
         text = " ".join(w.text for w in real).strip()
         q = speech_quality(group)
+        speaker_id = _majority_speaker(real)
         shot = _shot_covering(fa.shots, (in_ms + out_ms) // 2)
         out.append(
             EditUnit(
@@ -124,14 +127,29 @@ def _build_speech_units(fa: FileAnalysis) -> List[EditUnit]:
                 shot_id=shot.shot_id if shot else None,
                 shot_ids=[shot.shot_id] if shot else [],
                 motion=shot.motion_magnitude or 0.0 if shot else 0.0,
+                motion_dx=(shot.motion_dx or 0.0) if shot else 0.0,
+                motion_dy=(shot.motion_dy or 0.0) if shot else 0.0,
                 valence=shot.emotional_valence if shot else None,
                 narrative_role=shot.narrative_role if shot else None,
                 framing_scale=shot.framing_scale if shot else None,
                 characters=list(shot.tracked_character_ids) if shot else [],
+                speaker_id=speaker_id,
                 keyframe_r2_key=shot.keyframe_r2_key if shot else None,
             )
         )
     return out
+
+
+def _majority_speaker(words: List[WordTok]) -> Optional[str]:
+    """The speaker label covering the most words in an utterance (diarization
+    is per-word; an utterance is almost always one speaker)."""
+    counts: dict = {}
+    for w in words:
+        if w.speaker_id:
+            counts[w.speaker_id] = counts.get(w.speaker_id, 0) + 1
+    if not counts:
+        return None
+    return max(counts.items(), key=lambda kv: kv[1])[0]
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +178,8 @@ def _build_visual_units(fa: FileAnalysis) -> List[EditUnit]:
                 shot_id=s.shot_id,
                 shot_ids=[s.shot_id],
                 motion=s.motion_magnitude or 0.0,
+                motion_dx=s.motion_dx or 0.0,
+                motion_dy=s.motion_dy or 0.0,
                 valence=s.emotional_valence,
                 narrative_role=s.narrative_role,
                 framing_scale=s.framing_scale,

@@ -26,6 +26,12 @@ class AudioFeatures:
     bpm: float = 0.0
     onsets_ms: List[int] = field(default_factory=list)
     silence_intervals: List[dict] = field(default_factory=list)
+    # Prosody / rhythm signals for cut-timing (snap cuts to emphasis + pauses).
+    energy_peaks_ms: List[int] = field(default_factory=list)   # RMS emphasis peaks
+    pause_map: List[dict] = field(default_factory=list)        # {start_ms,end_ms}
+    rms_db: List[float] = field(default_factory=list)          # coarse energy envelope
+    pitch_hz: List[float] = field(default_factory=list)        # coarse f0 contour (0=unvoiced)
+    prosody_hop_ms: int = 0                                    # hop for rms_db / pitch_hz
 
 
 def _ffmpeg_loudnorm_pass1(wav_path: str) -> tuple[float, float]:
@@ -95,10 +101,117 @@ def _detect_musicality(wav_path: str) -> tuple[bool, float, List[int]]:
     return True, tempo, onsets_ms
 
 
+# Storage bound: downsample the continuous envelope/contour to at most this many
+# points regardless of clip length, so a long video can't bloat the JSONB.
+PROSODY_MAX_POINTS = 600
+# A pause is a contiguous low-energy run at least this long.
+PAUSE_MIN_MS = 250
+
+
+def _compute_prosody(wav_path: str) -> dict:
+    """Energy envelope, pitch contour, emphasis peaks and a pause map.
+
+    All librosa, CPU, single load of the 16k WAV. Pitch uses YIN (fast) rather
+    than PYIN (accurate but minutes-slow) so this stays a few seconds even on
+    long clips. Returns plain lists ready for JSONB storage.
+    """
+    import librosa
+    import numpy as np
+
+    out = {
+        "energy_peaks_ms": [], "pause_map": [],
+        "rms_db": [], "pitch_hz": [], "prosody_hop_ms": 0,
+    }
+    try:
+        y, sr = librosa.load(wav_path, sr=16000, mono=True)
+    except Exception:
+        logger.exception("Prosody: failed to load %s", wav_path)
+        return out
+    if y.size == 0:
+        return out
+
+    # --- RMS energy envelope at 50ms frames ---
+    hop = int(sr * 0.05)
+    rms = librosa.feature.rms(y=y, frame_length=hop * 2, hop_length=hop)[0]
+    if rms.size == 0:
+        return out
+    times_ms = (librosa.frames_to_time(np.arange(rms.size), sr=sr, hop_length=hop) * 1000)
+    rms_db = 20.0 * np.log10(rms + 1e-6)
+
+    # Reference loudness = the loud (speech) part of the clip, robust to how much
+    # silence the clip contains. Used to scale peak + pause thresholds in dB.
+    speech_ref = float(np.percentile(rms_db, 90))
+
+    # --- emphasis peaks (local dB maxima well above neighbours) ---
+    try:
+        delta = max(3.0, float(np.std(rms_db)) * 0.4)
+        peaks = librosa.util.peak_pick(
+            rms_db, pre_max=3, post_max=3, pre_avg=5, post_avg=5, delta=delta, wait=8
+        )
+        # Keep only genuinely loud peaks (ignore bumps in the noise floor).
+        out["energy_peaks_ms"] = [
+            int(times_ms[p]) for p in peaks if rms_db[p] >= speech_ref - 12.0
+        ]
+    except Exception:
+        out["energy_peaks_ms"] = []
+
+    # --- pause map (contiguous quiet runs relative to speech level) ---
+    floor = speech_ref - 25.0
+    out["pause_map"] = _runs_below(rms_db, times_ms, floor, PAUSE_MIN_MS, hop_ms=50)
+
+    # --- coarse pitch contour via YIN at 100ms hop ---
+    phop = int(sr * 0.1)
+    try:
+        f0 = librosa.yin(y, fmin=65, fmax=400, sr=sr, frame_length=2048, hop_length=phop)
+        f0 = np.where(np.isfinite(f0), f0, 0.0)
+    except Exception:
+        f0 = np.zeros(0)
+
+    # --- downsample both series to a bounded length, on a common hop ---
+    dur_ms = float(times_ms[-1]) if times_ms.size else 0.0
+    hop_ms = max(100, int(np.ceil((dur_ms / PROSODY_MAX_POINTS))) if dur_ms else 100)
+    out["prosody_hop_ms"] = hop_ms
+    out["rms_db"] = _resample_series(rms_db, times_ms, hop_ms, dur_ms)
+    if f0.size:
+        f0_times = librosa.frames_to_time(np.arange(f0.size), sr=sr, hop_length=phop) * 1000
+        out["pitch_hz"] = _resample_series(f0, f0_times, hop_ms, dur_ms)
+    return out
+
+
+def _runs_below(values, times_ms, thresh: float, min_ms: int, hop_ms: int) -> List[dict]:
+    runs: List[dict] = []
+    start = None
+    for i, v in enumerate(values):
+        if v < thresh:
+            if start is None:
+                start = i
+        else:
+            if start is not None:
+                s_ms = int(times_ms[start]); e_ms = int(times_ms[i])
+                if e_ms - s_ms >= min_ms:
+                    runs.append({"start_ms": s_ms, "end_ms": e_ms})
+                start = None
+    if start is not None:
+        s_ms = int(times_ms[start]); e_ms = int(times_ms[-1]) + hop_ms
+        if e_ms - s_ms >= min_ms:
+            runs.append({"start_ms": s_ms, "end_ms": e_ms})
+    return runs
+
+
+def _resample_series(values, times_ms, hop_ms: int, dur_ms: float) -> List[float]:
+    import numpy as np
+    if values is None or len(values) == 0 or dur_ms <= 0:
+        return []
+    grid = np.arange(0.0, dur_ms + hop_ms, hop_ms)
+    sampled = np.interp(grid, times_ms, values)
+    return [round(float(x), 1) for x in sampled]
+
+
 def compute_audio_features(wav_path: str) -> AudioFeatures:
     lufs, tp = _ffmpeg_loudnorm_pass1(wav_path)
     silences = _detect_silence(wav_path)
     is_musical, bpm, onsets = _detect_musicality(wav_path)
+    prosody = _compute_prosody(wav_path)
     return AudioFeatures(
         integrated_lufs=lufs,
         true_peak_db=tp,
@@ -106,4 +219,9 @@ def compute_audio_features(wav_path: str) -> AudioFeatures:
         bpm=bpm,
         onsets_ms=onsets,
         silence_intervals=silences,
+        energy_peaks_ms=prosody["energy_peaks_ms"],
+        pause_map=prosody["pause_map"],
+        rms_db=prosody["rms_db"],
+        pitch_hz=prosody["pitch_hz"],
+        prosody_hop_ms=prosody["prosody_hop_ms"],
     )

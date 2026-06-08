@@ -76,6 +76,8 @@ class Shot:
     focus_score: Optional[float] = None             # Laplacian variance of anchor (legacy)
     brightness: Optional[float] = None
     motion_magnitude: Optional[float] = None
+    motion_dx: Optional[float] = None               # dominant screen-space motion direction
+    motion_dy: Optional[float] = None
     blur_min: Optional[float] = None                # min Laplacian variance across 3 keyframes
     # Layer A: unified, time-ordered adaptive keyframe set (>= the base 3).
     keyframes: List["Keyframe"] = field(default_factory=list)
@@ -227,6 +229,8 @@ def detect_shots(video_path: str, duration_s: float, output_dir: str) -> List[Sh
             focus_score=focus,
             brightness=brightness,
             motion_magnitude=motion,
+            motion_dx=kfs.motion_dx,
+            motion_dy=kfs.motion_dy,
             blur_min=blur_min,
             keyframes=unified,
         ))
