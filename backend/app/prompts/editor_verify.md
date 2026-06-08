@@ -11,6 +11,11 @@ Check for real defects you can only catch by looking:
   subject, axis break) when a smoother option existed.
 - A clip that does not show what its role/text implies (e.g. the speaker is not
   on screen during their line and no cutaway justifies it).
+- SUBJECT continuity broken across a cut: the focus of the shot (the speaking
+  person, a ball/vehicle in motion, the hands demonstrating) jumps to something
+  unrelated mid-action, or a match cut joins clearly opposing motion directions.
+- During dialogue, the WRONG person is on screen for the line (e.g. a `speaker`
+  change in the source was ignored, or a reaction shot would have been stronger).
 
 Be frugal with frames but look at the clips that actually matter to your call.
 A clean, obviously-correct cut needs little or no looking.

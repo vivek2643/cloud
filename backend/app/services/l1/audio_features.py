@@ -32,6 +32,10 @@ class AudioFeatures:
     rms_db: List[float] = field(default_factory=list)          # coarse energy envelope
     pitch_hz: List[float] = field(default_factory=list)        # coarse f0 contour (0=unvoiced)
     prosody_hop_ms: int = 0                                    # hop for rms_db / pitch_hz
+    # Fixed-hop, normalized energy envelope for cross-file simultaneity (multicam)
+    # detection. Same recording from two cameras -> near-identical sync_env.
+    sync_env: List[float] = field(default_factory=list)
+    sync_hop_ms: int = 0
 
 
 def _ffmpeg_loudnorm_pass1(wav_path: str) -> tuple[float, float]:
@@ -107,6 +111,11 @@ PROSODY_MAX_POINTS = 600
 # A pause is a contiguous low-energy run at least this long.
 PAUSE_MIN_MS = 250
 
+# Cross-file sync fingerprint: fixed hop (so two files share a time grid) and a
+# hard cap on length so correlating a corpus stays cheap.
+SYNC_HOP_MS = 500
+SYNC_MAX_POINTS = 2400  # ~20 min at 500ms
+
 
 def _compute_prosody(wav_path: str) -> dict:
     """Energy envelope, pitch contour, emphasis peaks and a pause map.
@@ -121,6 +130,7 @@ def _compute_prosody(wav_path: str) -> dict:
     out = {
         "energy_peaks_ms": [], "pause_map": [],
         "rms_db": [], "pitch_hz": [], "prosody_hop_ms": 0,
+        "sync_env": [], "sync_hop_ms": 0,
     }
     try:
         y, sr = librosa.load(wav_path, sr=16000, mono=True)
@@ -175,6 +185,18 @@ def _compute_prosody(wav_path: str) -> dict:
     if f0.size:
         f0_times = librosa.frames_to_time(np.arange(f0.size), sr=sr, hop_length=phop) * 1000
         out["pitch_hz"] = _resample_series(f0, f0_times, hop_ms, dur_ms)
+
+    # --- fixed-hop normalized sync envelope (cross-file simultaneity) ---
+    if dur_ms > 0 and times_ms.size > 1:
+        grid = np.arange(0.0, min(dur_ms, SYNC_MAX_POINTS * SYNC_HOP_MS), SYNC_HOP_MS)
+        env = np.interp(grid, times_ms, rms_db)
+        lo, hi = float(env.min()), float(env.max())
+        if hi > lo:
+            env = (env - lo) / (hi - lo)
+        else:
+            env = np.zeros_like(env)
+        out["sync_env"] = [round(float(x), 3) for x in env]
+        out["sync_hop_ms"] = SYNC_HOP_MS
     return out
 
 
@@ -224,4 +246,6 @@ def compute_audio_features(wav_path: str) -> AudioFeatures:
         rms_db=prosody["rms_db"],
         pitch_hz=prosody["pitch_hz"],
         prosody_hop_ms=prosody["prosody_hop_ms"],
+        sync_env=prosody["sync_env"],
+        sync_hop_ms=prosody["sync_hop_ms"],
     )

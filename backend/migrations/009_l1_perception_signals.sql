@@ -27,7 +27,9 @@ alter table public.audio_features
     add column if not exists pause_map       jsonb not null default '[]'::jsonb,
     add column if not exists rms_db          jsonb not null default '[]'::jsonb,
     add column if not exists pitch_hz        jsonb not null default '[]'::jsonb,
-    add column if not exists prosody_hop_ms  int  not null default 0;
+    add column if not exists prosody_hop_ms  int  not null default 0,
+    add column if not exists sync_env        jsonb not null default '[]'::jsonb,
+    add column if not exists sync_hop_ms     int  not null default 0;
 
 comment on column public.audio_features.energy_peaks_ms is
     'Timestamps (ms) of RMS-energy emphasis peaks. Cut-sync points for non-musical audio.';
@@ -39,3 +41,7 @@ comment on column public.audio_features.pitch_hz is
     'Coarse f0 contour (Hz, 0=unvoiced) sampled every prosody_hop_ms. Prosody / emphasis.';
 comment on column public.audio_features.prosody_hop_ms is
     'Sample hop (ms) for rms_db and pitch_hz series.';
+comment on column public.audio_features.sync_env is
+    'Fixed-hop normalized energy envelope (0..1) for cross-file simultaneity (multicam) alignment.';
+comment on column public.audio_features.sync_hop_ms is
+    'Sample hop (ms) for sync_env (shared time grid across files).';

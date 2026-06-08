@@ -27,7 +27,7 @@ from app.services.l3 import frame_service
 from app.services.l3.composer import ComposeResult, compose, summarize_for_critique
 from app.services.l3.critic import critique_edl
 from app.services.l3.primitives.loader import load_file_analyses
-from app.services.l3.primitives.units import EditUnit, build_units
+from app.services.l3.primitives.units import EditUnit, assign_lanes, build_units
 from app.services.l3.recipes import RecipeContext, SectionPlan
 from app.services.l3.recipes.registry import RECIPES
 from app.services.l3.router import profile_footage
@@ -178,6 +178,9 @@ def direct_edit(
     if not all_units:
         return DirectorResult(edl={}, warnings=["Footage has no usable editorial units yet."])
 
+    # Corpus-level spine/coverage lane assignment (montage -> visuals are spine).
+    assign_lanes(all_units)
+
     profile = profile_footage(analyses, units_by_file)
     ctx = RecipeContext(analyses=analyses, units=all_units, profile=profile)
 
@@ -196,6 +199,21 @@ def direct_edit(
 
     catalog_text, label_to_id = _build_unit_catalog(all_units, analyses, frames_by_shot)
     profile_text = _profile_text(profile, analyses)
+
+    # Corpus budget: derive output length from how much usable SPINE content
+    # exists, instead of letting the planner guess an arbitrary number. If the
+    # brief gave no explicit target, anchor to the spine.
+    spine_units = [u for u in all_units if u.lane == "spine"]
+    spine_seconds = sum(u.duration_ms for u in spine_units) / 1000.0
+    if duration_target_s is None and spine_seconds > 0:
+        duration_target_s = int(max(15, min(900, round(spine_seconds * 0.7))))
+    if spine_seconds > 0:
+        profile_text += (
+            f"\nUSABLE SPINE CONTENT: ~{spine_seconds:.0f}s across {len(spine_units)} "
+            f"spine units (the primary narrative material). Choose an output length "
+            f"that reflects how much GOOD material exists -- not an arbitrary number. "
+            f"Coverage/b-roll overlays the spine and does not add length."
+        )
 
     # ---- Pass A: agentic plan (blind editor pulls frames on demand) ----
     emit("planning", 30, f"Planning ({profile.suggested_style})")
@@ -840,4 +858,21 @@ def _sections_from_plan(plan, label_to_id, duration_target_s) -> List[SectionPla
             unit_ids=unit_ids,
             params=params,
         ))
+
+    # Honor the (content-derived or explicit) global target: sections that left
+    # target_duration_s unset get the remaining budget, split by their share of
+    # selected units. Without this the engine fell back to each recipe's literal
+    # default, ignoring the corpus entirely.
+    if duration_target_s and out:
+        missing = [sp for sp in out if sp.target_duration_s is None]
+        if missing:
+            explicit_total = sum(sp.target_duration_s or 0.0 for sp in out)
+            remaining = max(0.0, float(duration_target_s) - explicit_total)
+            total_units = sum(len(sp.unit_ids) for sp in missing)
+            for sp in missing:
+                if total_units > 0:
+                    share = len(sp.unit_ids) / total_units
+                else:
+                    share = 1.0 / len(missing)
+                sp.target_duration_s = round(remaining * share, 1) if remaining > 0 else None
     return out

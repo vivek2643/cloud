@@ -55,6 +55,9 @@ class AudioData:
     # Prosody / rhythm (cut-timing): emphasis peaks + natural pauses.
     energy_peaks_ms: List[int] = field(default_factory=list)
     pause_map: List[dict] = field(default_factory=list)
+    # Cross-file simultaneity (multicam): fixed-hop normalized energy envelope.
+    sync_env: List[float] = field(default_factory=list)
+    sync_hop_ms: int = 0
 
 
 @dataclass
@@ -216,7 +219,8 @@ def load_file_analyses(
         af_rows = conn.execute(
             """
             select file_id, is_musical, bpm, onsets_ms, silence_intervals,
-                   acoustic_tags, integrated_lufs, energy_peaks_ms, pause_map
+                   acoustic_tags, integrated_lufs, energy_peaks_ms, pause_map,
+                   sync_env, sync_hop_ms
             from audio_features where file_id = any(%s::uuid[])
             """,
             (owned_ids,),
@@ -235,6 +239,8 @@ def load_file_analyses(
                 integrated_lufs=_f(r.get("integrated_lufs")),
                 energy_peaks_ms=[int(x) for x in (r.get("energy_peaks_ms") or [])],
                 pause_map=list(r.get("pause_map") or []),
+                sync_env=[float(x) for x in (r.get("sync_env") or [])],
+                sync_hop_ms=int(r.get("sync_hop_ms") or 0),
             )
 
     return out

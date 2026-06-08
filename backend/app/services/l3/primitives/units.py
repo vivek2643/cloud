@@ -45,6 +45,7 @@ class EditUnit:
     in_ms: int
     out_ms: int
     quality: float
+    lane: str = "spine"      # "spine" (primary narrative) | "coverage" (overlay/b-roll)
     text: str = ""           # spoken text (speech units)
     shot_id: Optional[str] = None
     shot_ids: List[str] = field(default_factory=list)
@@ -70,6 +71,21 @@ def build_units(fa: FileAnalysis) -> List[EditUnit]:
     units.extend(_build_visual_units(fa))
     units.sort(key=lambda u: (u.in_ms, u.out_ms))
     return units
+
+
+def assign_lanes(units: List[EditUnit]) -> None:
+    """Corpus-level spine/coverage assignment (in place).
+
+    Speech is the spine and visual units are coverage (b-roll/cutaways) whenever
+    the corpus has any speech. For a purely visual corpus (montage, no speech),
+    the visual units ARE the timeline, so they become the spine.
+    """
+    has_speech = any(u.modality == "speech" for u in units)
+    if has_speech:
+        return
+    for u in units:
+        if u.modality == "visual":
+            u.lane = "spine"
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +139,7 @@ def _build_speech_units(fa: FileAnalysis) -> List[EditUnit]:
                 in_ms=in_ms,
                 out_ms=out_ms,
                 quality=q,
+                lane="spine",
                 text=text,
                 shot_id=shot.shot_id if shot else None,
                 shot_ids=[shot.shot_id] if shot else [],
@@ -174,6 +191,7 @@ def _build_visual_units(fa: FileAnalysis) -> List[EditUnit]:
                 in_ms=s.start_ms,
                 out_ms=s.end_ms,
                 quality=q,
+                lane="coverage",
                 text=(s.narrative_description or "").strip(),
                 shot_id=s.shot_id,
                 shot_ids=[s.shot_id],

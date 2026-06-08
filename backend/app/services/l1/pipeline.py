@@ -658,9 +658,10 @@ def _stage5_audio(file_id: str, wav_path: str, conn: psycopg.Connection) -> None
         insert into audio_features (
             file_id, integrated_lufs, true_peak_db,
             is_musical, bpm, onsets_ms, silence_intervals,
-            energy_peaks_ms, pause_map, rms_db, pitch_hz, prosody_hop_ms
+            energy_peaks_ms, pause_map, rms_db, pitch_hz, prosody_hop_ms,
+            sync_env, sync_hop_ms
         ) values (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb,
-                  %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s)
+                  %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s::jsonb, %s)
         on conflict (file_id) do update set
             integrated_lufs = excluded.integrated_lufs,
             true_peak_db = excluded.true_peak_db,
@@ -672,7 +673,9 @@ def _stage5_audio(file_id: str, wav_path: str, conn: psycopg.Connection) -> None
             pause_map = excluded.pause_map,
             rms_db = excluded.rms_db,
             pitch_hz = excluded.pitch_hz,
-            prosody_hop_ms = excluded.prosody_hop_ms
+            prosody_hop_ms = excluded.prosody_hop_ms,
+            sync_env = excluded.sync_env,
+            sync_hop_ms = excluded.sync_hop_ms
         """,
         (
             file_id,
@@ -685,6 +688,8 @@ def _stage5_audio(file_id: str, wav_path: str, conn: psycopg.Connection) -> None
             json.dumps(af.rms_db),
             json.dumps(af.pitch_hz),
             af.prosody_hop_ms,
+            json.dumps(af.sync_env),
+            af.sync_hop_ms,
         ),
     )
 
