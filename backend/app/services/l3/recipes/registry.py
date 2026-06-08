@@ -1,32 +1,16 @@
-"""Recipe registry: style key -> Recipe instance."""
+"""Recipe registry: style key -> Recipe instance.
+
+Every style is a declarative StylePolicy (see policy.py) interpreted by the one
+general PolicyRecipe. Adding a style = adding a policy, not a class.
+"""
 from __future__ import annotations
 
 from typing import Dict, List
 
 from app.services.l3.recipes.base import Recipe
-from app.services.l3.recipes.styles import (
-    BeatSyncMusicMontage,
-    CinematicBRoll,
-    HighlightMontage,
-    SocialShort,
-    SpineCoverage,
-    TalkingHead,
-    Trailer,
-    TutorialExplainer,
-    VlogWalkthrough,
-)
+from app.services.l3.recipes.policy import STYLE_POLICIES, PolicyRecipe
 
-_INSTANCES: List[Recipe] = [
-    HighlightMontage(),
-    TalkingHead(),
-    Trailer(),
-    BeatSyncMusicMontage(),
-    VlogWalkthrough(),
-    SocialShort(),
-    TutorialExplainer(),
-    CinematicBRoll(),
-    SpineCoverage(),
-]
+_INSTANCES: List[Recipe] = [PolicyRecipe(p) for p in STYLE_POLICIES.values()]
 
 RECIPES: Dict[str, Recipe] = {r.key: r for r in _INSTANCES}
 
