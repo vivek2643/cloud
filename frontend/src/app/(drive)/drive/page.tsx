@@ -7,7 +7,8 @@ import { getFolders, getFiles, createFolder } from "@/lib/api";
 import { UploadZone, useUploadFiles } from "@/components/upload-zone";
 import { DriveContent } from "@/components/drive-content";
 import { CreateFolderDialog } from "@/components/create-folder-dialog";
-import { FolderPlus, Upload, Search, Sparkles, Layers, Crosshair, Star, X } from "lucide-react";
+import { SearchEditBar } from "@/components/search-edit-bar";
+import { FolderPlus, Upload, Layers, Crosshair, Star, X } from "lucide-react";
 
 const VIDEO_EXTENSIONS = ".mp4,.mov,.avi,.mkv,.webm,.m4v,.wmv,.flv,.mxf,.mts";
 
@@ -27,12 +28,7 @@ export default function DrivePage() {
     setLoading,
     setCurrentFolder,
     uploads,
-    searchQuery,
-    setSearchQuery,
     selectedIds,
-    files,
-    openAiPanel,
-    aiPanelOpen,
     clearSelection,
   } = useDriveStore();
   const [showNewFolder, setShowNewFolder] = useState(false);
@@ -81,62 +77,13 @@ export default function DrivePage() {
     }
   }
 
-  // The AI Edit button docks the conversational editor on the right. If videos
-  // are selected, scope the session to them; otherwise it draws from all videos.
-  function handleAiEdit() {
-    const ids = Array.from(selectedIds);
-    // Stash names so the panel's scope chip can render them without a refetch.
-    const idToFile = new Map(files.map((f) => [f.id, f]));
-    const payload = ids
-      .map((id) => idToFile.get(id))
-      .filter((f): f is NonNullable<typeof f> => !!f)
-      .map((f) => ({ id: f.id, name: f.name, file_type: f.file_type }));
-    try {
-      window.sessionStorage.setItem(
-        "edso_edit_scope_v1",
-        JSON.stringify({ files: payload, ts: Date.now() }),
-      );
-    } catch {
-      // non-fatal
-    }
-    openAiPanel(ids);
-  }
-
   const selectedCount = selectedIds.size;
 
   return (
     <UploadZone>
       <div className="flex-1 p-6">
         {/* Row 1: search + AI Edit */}
-        <div className="mb-4 flex items-center gap-3">
-          <div className="relative flex-1">
-            <Search
-              size={18}
-              className="absolute left-3.5 top-1/2 -translate-y-1/2"
-              style={{ color: "var(--muted)" }}
-            />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search your videos…"
-              className="w-full rounded-xl border py-2.5 pl-11 pr-4 text-sm outline-none transition-colors focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent-soft)]"
-              style={{ borderColor: "var(--border)", background: "var(--sidebar)" }}
-            />
-          </div>
-          <button
-            onClick={handleAiEdit}
-            className="flex shrink-0 items-center gap-2 rounded-xl px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition-transform hover:scale-[1.02] active:scale-95"
-            style={{
-              background: "var(--accent)",
-              boxShadow: aiPanelOpen ? "0 0 0 2px var(--accent-soft)" : undefined,
-            }}
-            title={selectedCount > 0 ? "Edit selected videos with AI" : "Open the AI editor"}
-          >
-            <Sparkles size={16} />
-            AI Edit{selectedCount > 0 ? ` (${selectedCount})` : ""}
-          </button>
-        </div>
+        <SearchEditBar />
 
         {/* Row 2: tabs + library actions */}
         <div className="mb-6 flex flex-wrap items-center justify-between gap-3 border-b pb-3" style={{ borderColor: "var(--border)" }}>
