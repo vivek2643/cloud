@@ -25,6 +25,7 @@ from app.config import get_settings
 from app.services import audit_log
 from app.services.jobs import app
 from app.services.l1 import audio_features as af_mod
+from app.services.l1 import cut_cost as cutcost_mod
 from app.services.l1 import diarization as diar_mod
 from app.services.l1 import embeddings as emb_mod
 from app.services.l1 import keyframes as kf_mod
@@ -36,7 +37,7 @@ from app.services.supabase_client import get_supabase
 
 logger = logging.getLogger(__name__)
 
-STAGES = ("proxy", "transcript", "shots", "embeddings", "audio_features", "diarization")
+STAGES = ("proxy", "transcript", "shots", "embeddings", "audio_features", "diarization", "dialogue_cut")
 
 
 def _pg_conn() -> psycopg.Connection:
@@ -710,6 +711,76 @@ def _stage6_diarization(file_id: str, wav_path: str, conn: psycopg.Connection) -
     logger.info("Diarization: %s -> %d speaker(s)", file_id, result.num_speakers)
 
 
+# --- Stage 7: dialogue cut-cost grid (derived; cheap, CPU-only) -----------
+
+def _flatten_words(segments: list) -> List[dict]:
+    """Chronological word list with the diarization speaker carried through."""
+    words: List[dict] = []
+    for seg in segments or []:
+        for w in seg.get("words") or []:
+            words.append({
+                "start_ms": w.get("start_ms", 0),
+                "end_ms": w.get("end_ms", 0),
+                "text": w.get("text", ""),
+                "is_filler": w.get("is_filler", False),
+                "speaker": w.get("speaker"),
+            })
+    return words
+
+
+def _stage7_dialogue_cut(file_id: str, duration_s: float, conn: psycopg.Connection) -> None:
+    """Derive the dialogue cut-cost grid from the transcript words + audio
+    pause/energy signals written by the earlier stages, and persist it onto the
+    file's audio_features row. Pure arithmetic -- no model, no GPU.
+
+    Soft signal: a missing transcript / audio_features row just no-ops.
+    """
+    row = conn.execute(
+        "select segments from transcripts where file_id = %s", (file_id,)
+    ).fetchone()
+    if not row or not row[0]:
+        return
+    words = _flatten_words(row[0])
+    if not words:
+        return
+
+    af = conn.execute(
+        "select rms_db, prosody_hop_ms from audio_features where file_id = %s",
+        (file_id,),
+    ).fetchone()
+    rms_db = (af[0] if af else None) or []
+    prosody_hop_ms = (af[1] if af else 0) or 0
+
+    grid = cutcost_mod.compute_dialogue_cut_grid(
+        words=words,
+        rms_db=rms_db,
+        prosody_hop_ms=prosody_hop_ms,
+        duration_ms=int((duration_s or 0) * 1000),
+    )
+    if not grid.has_dialogue:
+        return
+
+    conn.execute(
+        """
+        update audio_features
+           set dialogue_cut_cost   = %s::jsonb,
+               dialogue_cut_hop_ms = %s,
+               dialogue_cut_points = %s::jsonb
+         where file_id = %s
+        """,
+        (
+            json.dumps(grid.cost_payload()),
+            grid.hop_ms,
+            json.dumps(grid.points_payload()),
+            file_id,
+        ),
+    )
+    logger.info(
+        "Dialogue cut grid: %s -> %d hops, %d cut points",
+        file_id, len(grid.cut_cost), len(grid.cut_points),
+    )
+
+
 # --- Helpers -------------------------------------------------------------
 
 def _run_stage(
@@ -868,6 +939,11 @@ def l1_orchestrate(file_id: str, r2_key: str) -> None:
                     # Diarization depends on the transcript words written above.
                     _run_stage(conn, file_id, "diarization",
                                _stage6_diarization, file_id, wav_path, conn)
+
+                    # Dialogue cut-cost grid: pure derivation over the transcript
+                    # words + speakers (post-diarization) + audio pause/energy.
+                    _run_stage(conn, file_id, "dialogue_cut",
+                               _stage7_dialogue_cut, file_id, duration_s, conn)
 
         _set_l1_status(file_id, "ready")
         logger.info("L1 complete for %s", file_id)

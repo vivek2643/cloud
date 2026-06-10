@@ -58,6 +58,11 @@ class AudioData:
     # Cross-file simultaneity (multicam): fixed-hop normalized energy envelope.
     sync_env: List[float] = field(default_factory=list)
     sync_hop_ms: int = 0
+    # Dialogue cut-cost grid (0=ideal seam .. 1=forbidden/mid-word) + discrete
+    # exact-timestamp seam candidates. "Safe to cut" = 1 - cost.
+    dialogue_cut_cost: List[float] = field(default_factory=list)
+    dialogue_cut_hop_ms: int = 0
+    dialogue_cut_points: List[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -220,7 +225,8 @@ def load_file_analyses(
             """
             select file_id, is_musical, bpm, onsets_ms, silence_intervals,
                    acoustic_tags, integrated_lufs, energy_peaks_ms, pause_map,
-                   sync_env, sync_hop_ms
+                   sync_env, sync_hop_ms,
+                   dialogue_cut_cost, dialogue_cut_hop_ms, dialogue_cut_points
             from audio_features where file_id = any(%s::uuid[])
             """,
             (owned_ids,),
@@ -241,6 +247,9 @@ def load_file_analyses(
                 pause_map=list(r.get("pause_map") or []),
                 sync_env=[float(x) for x in (r.get("sync_env") or [])],
                 sync_hop_ms=int(r.get("sync_hop_ms") or 0),
+                dialogue_cut_cost=[float(x) for x in (r.get("dialogue_cut_cost") or [])],
+                dialogue_cut_hop_ms=int(r.get("dialogue_cut_hop_ms") or 0),
+                dialogue_cut_points=list(r.get("dialogue_cut_points") or []),
             )
 
     return out

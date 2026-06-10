@@ -208,13 +208,16 @@ def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
             select integrated_lufs, true_peak_db,
                    is_musical, bpm,
                    onsets_ms, silence_intervals,
-                   acoustic_tags, event_segments
+                   acoustic_tags, event_segments,
+                   dialogue_cut_cost, dialogue_cut_hop_ms, dialogue_cut_points
               from audio_features where file_id = %s
             """,
             (file_id,),
         )
         af = cur.fetchone()
         if af:
+            cut_cost = af["dialogue_cut_cost"] or []
+            cut_points = af["dialogue_cut_points"] or []
             out["audio_features"] = {
                 "integrated_lufs": af["integrated_lufs"],
                 "true_peak_db": af["true_peak_db"],
@@ -225,6 +228,12 @@ def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
                 "silence_intervals": af["silence_intervals"],
                 "acoustic_tags": af["acoustic_tags"],
                 "event_segments": af["event_segments"],
+                # Dialogue cut-cost grid (0=ideal seam .. 1=forbidden). The full
+                # curve is included for visualization; "safe to cut" = 1 - cost.
+                "dialogue_cut_hop_ms": af["dialogue_cut_hop_ms"],
+                "dialogue_cut_cost": cut_cost,
+                "dialogue_cut_points": cut_points,
+                "dialogue_cut_point_count": len(cut_points),
             }
 
         # Per-stage processing job rows
