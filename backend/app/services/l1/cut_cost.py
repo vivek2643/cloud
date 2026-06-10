@@ -39,22 +39,20 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 
-# --- Tunables -------------------------------------------------------------
-
-HOP_MS = 100              # grid resolution = minimum expected cut granularity
-HANDLE_MS = 80            # protected breathing room next to each word edge
-SILENCE_FULL_MS = 700     # gap >= this bottoms the seam cost out to ~0
-SENTENCE_GAP_MS = 600     # a gap this long reads as a structural/sentence break
-MIN_SEAM_MS = 120         # don't emit discrete points for sub-this micro-gaps
-WORD_COST = 1.0           # cost inside a word (forbidden)
-
-# Boundary-type multipliers applied to the length-based seam cost floor.
-# Lower = cheaper / more attractive cut. They stack multiplicatively.
-SPEAKER_CHANGE_MULT = 0.35   # cutting on a speaker handoff is a strong seam
-SENTENCE_END_MULT = 0.5      # cutting at a sentence boundary is clean
-FILLER_EDGE_MULT = 0.3       # we WANT to cut around "um"/"uh"
-
-_TERMINAL_PUNCT = ".?!…"
+# Tunables live in one place so we can re-tune at the end of the project
+# against real clips. See cut_grid_params.py.
+from app.services.l1.cut_grid_params import (  # noqa: E402
+    FILLER_EDGE_MULT,
+    HANDLE_MS,
+    HOP_MS,
+    MIN_SEAM_MS,
+    SENTENCE_END_MULT,
+    SENTENCE_GAP_MS,
+    SILENCE_FULL_MS,
+    SPEAKER_CHANGE_MULT,
+    TERMINAL_PUNCT,
+    WORD_COST,
+)
 
 
 # --- Data structures ------------------------------------------------------
@@ -148,7 +146,7 @@ def _min_energy_ts(
 
 def _is_sentence_end(text: str, gap_ms: int) -> bool:
     t = (text or "").rstrip()
-    return (bool(t) and t[-1] in _TERMINAL_PUNCT) or gap_ms >= SENTENCE_GAP_MS
+    return (bool(t) and t[-1] in TERMINAL_PUNCT) or gap_ms >= SENTENCE_GAP_MS
 
 
 def _seam_floor_and_kind(prev: dict, nxt: dict, gap_ms: int) -> tuple[float, str]:

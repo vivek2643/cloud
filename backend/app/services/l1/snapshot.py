@@ -209,7 +209,8 @@ def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
                    is_musical, bpm,
                    onsets_ms, silence_intervals,
                    acoustic_tags, event_segments,
-                   dialogue_cut_cost, dialogue_cut_hop_ms, dialogue_cut_points
+                   dialogue_cut_cost, dialogue_cut_hop_ms, dialogue_cut_points,
+                   beat_cut_cost, beat_cut_hop_ms, beat_cut_points
               from audio_features where file_id = %s
             """,
             (file_id,),
@@ -234,6 +235,40 @@ def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
                 "dialogue_cut_cost": cut_cost,
                 "dialogue_cut_points": cut_points,
                 "dialogue_cut_point_count": len(cut_points),
+                # Beat/music cut grid (0=on a beat/ideal .. 1=off-beat). Empty
+                # for non-musical files. "Safe to cut" = 1 - cost.
+                "beat_cut_hop_ms": af["beat_cut_hop_ms"],
+                "beat_cut_cost": af["beat_cut_cost"] or [],
+                "beat_cut_points": af["beat_cut_points"] or [],
+                "beat_cut_point_count": len(af["beat_cut_points"] or []),
+            }
+
+        # Motion dynamics (action + camera/distortion) -- video-derived, own table.
+        cur = conn.execute(
+            """
+            select hop_ms, action_energy, camera_motion, camera_coherence,
+                   camera_stability, blur, action_cut_cost, camera_cut_cost,
+                   action_points
+              from motion_dynamics where file_id = %s
+            """,
+            (file_id,),
+        )
+        md = cur.fetchone()
+        if md:
+            out["motion_dynamics"] = {
+                "hop_ms": md["hop_ms"],
+                "action_energy": md["action_energy"] or [],
+                "camera_motion": md["camera_motion"] or [],
+                # Camera-motion QUALITY: coherence (rigid global move) + stability
+                # (sustained vs jerky). High+high => a deliberate move (cuttable).
+                "camera_coherence": md["camera_coherence"] or [],
+                "camera_stability": md["camera_stability"] or [],
+                "blur": md["blur"] or [],
+                # Derived cut-cost channels (0=ideal seam .. 1=avoid).
+                "action_cut_cost": md["action_cut_cost"] or [],
+                "camera_cut_cost": md["camera_cut_cost"] or [],
+                "action_points": md["action_points"] or [],
+                "action_point_count": len(md["action_points"] or []),
             }
 
         # Per-stage processing job rows

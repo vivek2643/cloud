@@ -25,8 +25,10 @@ from app.config import get_settings
 from app.services import audit_log
 from app.services.jobs import app
 from app.services.l1 import audio_features as af_mod
+from app.services.l1 import beat_cost as beat_mod
 from app.services.l1 import cut_cost as cutcost_mod
 from app.services.l1 import diarization as diar_mod
+from app.services.l1 import motion_dynamics as motion_mod
 from app.services.l1 import embeddings as emb_mod
 from app.services.l1 import keyframes as kf_mod
 from app.services.l1 import shots as shots_mod
@@ -37,7 +39,7 @@ from app.services.supabase_client import get_supabase
 
 logger = logging.getLogger(__name__)
 
-STAGES = ("proxy", "transcript", "shots", "embeddings", "audio_features", "diarization", "dialogue_cut")
+STAGES = ("proxy", "transcript", "shots", "embeddings", "audio_features", "diarization", "dialogue_cut", "beat_cut", "motion_dynamics")
 
 
 def _pg_conn() -> psycopg.Connection:
@@ -781,6 +783,88 @@ def _stage7_dialogue_cut(file_id: str, duration_s: float, conn: psycopg.Connecti
     )
 
 
+def _stage8_beat_cut(file_id: str, duration_s: float, conn: psycopg.Connection) -> None:
+    """Derive the beat/music cut grid from the librosa onsets/bpm already on the
+    file's audio_features row. Free -- pure arithmetic, no new decode.
+
+    Non-musical files leave the columns empty.
+    """
+    af = conn.execute(
+        "select is_musical, bpm, onsets_ms from audio_features where file_id = %s",
+        (file_id,),
+    ).fetchone()
+    if not af:
+        return
+
+    grid = beat_mod.compute_beat_grid(
+        is_musical=bool(af[0]),
+        bpm=float(af[1] or 0.0),
+        onsets_ms=af[2] or [],
+        duration_ms=int((duration_s or 0) * 1000),
+    )
+    if not grid.has_beat:
+        return
+
+    conn.execute(
+        """
+        update audio_features
+           set beat_cut_cost   = %s::jsonb,
+               beat_cut_hop_ms = %s,
+               beat_cut_points = %s::jsonb
+         where file_id = %s
+        """,
+        (json.dumps(grid.cost), grid.hop_ms, json.dumps(grid.points), file_id),
+    )
+    logger.info(
+        "Beat cut grid: %s -> %d hops, %d beats (bpm=%.1f)",
+        file_id, len(grid.cost), len(grid.points), grid.bpm,
+    )
+
+
+def _stage9_motion_dynamics(
+    file_id: str, video_path: str, duration_s: float, conn: psycopg.Connection
+) -> None:
+    """One optical-flow pass over the proxy -> action + camera/distortion cut
+    grids. Best-effort: a flow/decode failure no-ops without failing L1.
+    """
+    md = motion_mod.compute_motion_dynamics(
+        video_path, duration_ms=int((duration_s or 0) * 1000)
+    )
+    if not md.has_motion:
+        return
+
+    conn.execute(
+        """
+        insert into motion_dynamics
+            (file_id, hop_ms, action_energy, camera_motion, camera_coherence,
+             camera_stability, blur, action_cut_cost, camera_cut_cost, action_points)
+        values (%s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb,
+                %s::jsonb, %s::jsonb, %s::jsonb)
+        on conflict (file_id) do update set
+            hop_ms           = excluded.hop_ms,
+            action_energy    = excluded.action_energy,
+            camera_motion    = excluded.camera_motion,
+            camera_coherence = excluded.camera_coherence,
+            camera_stability = excluded.camera_stability,
+            blur             = excluded.blur,
+            action_cut_cost  = excluded.action_cut_cost,
+            camera_cut_cost  = excluded.camera_cut_cost,
+            action_points    = excluded.action_points
+        """,
+        (
+            file_id, md.hop_ms,
+            json.dumps(md.action_energy), json.dumps(md.camera_motion),
+            json.dumps(md.camera_coherence), json.dumps(md.camera_stability),
+            json.dumps(md.blur), json.dumps(md.action_cut_cost),
+            json.dumps(md.camera_cut_cost), json.dumps(md.action_points),
+        ),
+    )
+    logger.info(
+        "Motion dynamics: %s -> %d hops, %d action impacts",
+        file_id, len(md.action_cut_cost), len(md.action_points),
+    )
+
+
 # --- Helpers -------------------------------------------------------------
 
 def _run_stage(
@@ -944,6 +1028,16 @@ def l1_orchestrate(file_id: str, r2_key: str) -> None:
                     # words + speakers (post-diarization) + audio pause/energy.
                     _run_stage(conn, file_id, "dialogue_cut",
                                _stage7_dialogue_cut, file_id, duration_s, conn)
+
+                    # Beat/music cut grid: free derivation over the librosa
+                    # onsets/bpm written by the audio_features stage.
+                    _run_stage(conn, file_id, "beat_cut",
+                               _stage8_beat_cut, file_id, duration_s, conn)
+
+                # Motion dynamics (action + camera/distortion): one optical-flow
+                # pass over the proxy. Video-only -- runs even on silent files.
+                _run_stage(conn, file_id, "motion_dynamics",
+                           _stage9_motion_dynamics, file_id, shot_source, duration_s, conn)
 
         _set_l1_status(file_id, "ready")
         logger.info("L1 complete for %s", file_id)

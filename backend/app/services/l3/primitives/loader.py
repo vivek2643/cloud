@@ -63,6 +63,28 @@ class AudioData:
     dialogue_cut_cost: List[float] = field(default_factory=list)
     dialogue_cut_hop_ms: int = 0
     dialogue_cut_points: List[dict] = field(default_factory=list)
+    # Beat/music cut grid (0=on a beat/ideal .. 1=off-beat). Empty if not musical.
+    beat_cut_cost: List[float] = field(default_factory=list)
+    beat_cut_hop_ms: int = 0
+    beat_cut_points: List[dict] = field(default_factory=list)
+
+
+@dataclass
+class MotionData:
+    """Video-derived motion cut grids (action + camera/distortion)."""
+    hop_ms: int = 0
+    action_energy: List[float] = field(default_factory=list)
+    camera_motion: List[float] = field(default_factory=list)
+    # Camera-motion quality: coherence (rigid global move) + stability (sustained
+    # vs jerky). High coherence + high stability + sustained magnitude = a
+    # deliberate camera move (cuttable), not the kind of motion to avoid.
+    camera_coherence: List[float] = field(default_factory=list)
+    camera_stability: List[float] = field(default_factory=list)
+    blur: List[float] = field(default_factory=list)
+    # Cut-cost channels (0=ideal seam .. 1=avoid).
+    action_cut_cost: List[float] = field(default_factory=list)
+    camera_cut_cost: List[float] = field(default_factory=list)
+    action_points: List[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -103,6 +125,7 @@ class FileAnalysis:
     shots: List[ShotRow] = field(default_factory=list)
     transcript: Optional[TranscriptData] = None
     audio: Optional[AudioData] = None
+    motion: Optional["MotionData"] = None
 
     @property
     def has_speech(self) -> bool:
@@ -226,7 +249,8 @@ def load_file_analyses(
             select file_id, is_musical, bpm, onsets_ms, silence_intervals,
                    acoustic_tags, integrated_lufs, energy_peaks_ms, pause_map,
                    sync_env, sync_hop_ms,
-                   dialogue_cut_cost, dialogue_cut_hop_ms, dialogue_cut_points
+                   dialogue_cut_cost, dialogue_cut_hop_ms, dialogue_cut_points,
+                   beat_cut_cost, beat_cut_hop_ms, beat_cut_points
             from audio_features where file_id = any(%s::uuid[])
             """,
             (owned_ids,),
@@ -250,6 +274,36 @@ def load_file_analyses(
                 dialogue_cut_cost=[float(x) for x in (r.get("dialogue_cut_cost") or [])],
                 dialogue_cut_hop_ms=int(r.get("dialogue_cut_hop_ms") or 0),
                 dialogue_cut_points=list(r.get("dialogue_cut_points") or []),
+                beat_cut_cost=[float(x) for x in (r.get("beat_cut_cost") or [])],
+                beat_cut_hop_ms=int(r.get("beat_cut_hop_ms") or 0),
+                beat_cut_points=list(r.get("beat_cut_points") or []),
+            )
+
+        # --- motion dynamics (action + camera/distortion) ---
+        md_rows = conn.execute(
+            """
+            select file_id, hop_ms, action_energy, camera_motion, camera_coherence,
+                   camera_stability, blur, action_cut_cost, camera_cut_cost,
+                   action_points
+            from motion_dynamics where file_id = any(%s::uuid[])
+            """,
+            (owned_ids,),
+        ).fetchall()
+        for r in md_rows:
+            fid = str(r["file_id"])
+            fa = out.get(fid)
+            if fa is None:
+                continue
+            fa.motion = MotionData(
+                hop_ms=int(r.get("hop_ms") or 0),
+                action_energy=[float(x) for x in (r.get("action_energy") or [])],
+                camera_motion=[float(x) for x in (r.get("camera_motion") or [])],
+                camera_coherence=[float(x) for x in (r.get("camera_coherence") or [])],
+                camera_stability=[float(x) for x in (r.get("camera_stability") or [])],
+                blur=[float(x) for x in (r.get("blur") or [])],
+                action_cut_cost=[float(x) for x in (r.get("action_cut_cost") or [])],
+                camera_cut_cost=[float(x) for x in (r.get("camera_cut_cost") or [])],
+                action_points=list(r.get("action_points") or []),
             )
 
     return out
