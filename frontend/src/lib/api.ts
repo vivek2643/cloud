@@ -328,15 +328,6 @@ export function semanticSearch(q: string, token: string, folderId?: string | nul
   return request<SearchResponse>(`/api/search?${params.toString()}`, { token });
 }
 
-// --- L2 enrichment trigger ---
-
-export function enqueueFileL2(fileId: string, token: string) {
-  return request<{ ok: boolean; l2_status: string }>(
-    `/api/files/${fileId}/l2`,
-    { method: "POST", token },
-  );
-}
-
 // --- Edit preview render ---
 
 export function renderEditPreview(body: EditRequestBody, token: string) {

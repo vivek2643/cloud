@@ -62,24 +62,6 @@ class Settings(BaseSettings):
     # Prompt caching on the stable system/catalog prefix (Anthropic only).
     llm_prompt_caching: bool = True
 
-    # Phase 2 Stage D: hosted Qwen2.5-VL endpoint (Replicate / Anyscale style).
-    # Leave empty to use the self-hosted GPU model below instead.
-    qwen_vl_endpoint_url: str = ""
-    qwen_vl_api_key: str = ""
-
-    # Self-hosted Qwen2.5-VL on the worker GPU. When enabled, narratives run
-    # locally on CUDA (falling back to Claude on CPU-only boxes or load failure).
-    # 3B fits a 16 GB GPU alongside the other models; bump to 7B on a bigger GPU.
-    qwen_vl_local: bool = True
-    qwen_vl_model: str = "Qwen/Qwen2.5-VL-3B-Instruct"
-    qwen_vl_max_tokens: int = 256
-
-    # L2 deep enrichment (Qwen VLM narrative, faces, dinov2). Off by default:
-    # edit-time managed multimodal vision replaces per-shot pre-captioning, and
-    # this was the heavy, OOM-prone GPU stage. Set true to re-enable the local
-    # L2 pipeline.
-    enable_l2_vlm: bool = False
-
     @property
     def r2_endpoint(self) -> str:
         return f"https://{self.r2_account_id}.r2.cloudflarestorage.com"

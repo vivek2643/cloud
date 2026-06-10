@@ -30,7 +30,6 @@ from pydantic import BaseModel
 
 from app.auth import get_current_user_id
 from app.services import audit_log
-from app.services.l2 import orchestrator as l2_orch
 from app.services.edl import renders_store
 from app.services.edl import store as edl_store
 from app.services.chat import turns_store
@@ -59,9 +58,9 @@ class EditRequestBody(BaseModel):
     candidate_limit: int = 200
     fps: int = 24
     sequence_name: str = "AI Rough Cut"
-    # When true (default), the parser's needs_l2 hint triggers synchronous L2
-    # enrichment of the candidate set before edit logic runs. Set to false for
-    # a fast L1-only preview.
+    # Retained for API compatibility. When true (default) and the parser sets
+    # the needs_l2 hint, the richer timeline builder is used (it reads optional
+    # shot metadata columns, gracefully tolerating nulls).
     enrich_l2: bool = True
     # "smart" (default) -> Claude reasons over the catalog and returns a timeline.
     # "fast"            -> deterministic SQL filter + score sort + duration fill.
@@ -271,21 +270,6 @@ def _run_fast_path(body: EditRequestBody, user_id: str, audit) -> EditRequestRes
 
     needs_l2 = bool(query.get("needs_l2")) and body.enrich_l2
     audit.set("needs_l2_resolved", needs_l2)
-    if needs_l2 and candidates:
-        try:
-            l2_orch.enrich(shot_ids=[c.shot_id for c in candidates[:50]])
-            candidates = run_query(
-                user_id=user_id,
-                query=query,
-                folder_id=body.folder_id,
-                limit=body.candidate_limit,
-                raw_prompt=body.prompt,
-            )
-            audit.stage("candidates_after_l2", _serialize_candidates(candidates))
-        except Exception as e:
-            logger.exception("Inline L2 enrichment failed; continuing with L1 data only.")
-            audit.set("l2_enrichment_error", str(e))
-
     if needs_l2:
         timeline = build_timeline_full(candidates, query)
     else:
@@ -852,12 +836,6 @@ def render_edit_preview(
     query = parse_prompt(body.prompt)
     candidates = run_query(user_id, query, body.folder_id, body.candidate_limit, raw_prompt=body.prompt)
     needs_l2 = bool(query.get("needs_l2")) and body.enrich_l2
-    if needs_l2 and candidates:
-        try:
-            l2_orch.enrich(shot_ids=[c.shot_id for c in candidates[:50]])
-            candidates = run_query(user_id, query, body.folder_id, body.candidate_limit, raw_prompt=body.prompt)
-        except Exception:
-            logger.exception("Inline L2 enrichment failed during preview render.")
     timeline = build_timeline_full(candidates, query) if needs_l2 else build_timeline(candidates, query)
     if not timeline:
         raise HTTPException(status_code=404, detail="No matching shots to render.")
@@ -880,12 +858,6 @@ def download_edit_xml(
     query = parse_prompt(body.prompt)
     candidates = run_query(user_id, query, body.folder_id, body.candidate_limit, raw_prompt=body.prompt)
     needs_l2 = bool(query.get("needs_l2")) and body.enrich_l2
-    if needs_l2 and candidates:
-        try:
-            l2_orch.enrich(shot_ids=[c.shot_id for c in candidates[:50]])
-            candidates = run_query(user_id, query, body.folder_id, body.candidate_limit, raw_prompt=body.prompt)
-        except Exception:
-            logger.exception("Inline L2 enrichment failed; continuing with L1 data only.")
     timeline = build_timeline_full(candidates, query) if needs_l2 else build_timeline(candidates, query)
     xml = build_fcp7_xml(body.sequence_name, timeline, _pathurl_for, body.fps)
     safe_name = "".join(c if c.isalnum() else "_" for c in body.sequence_name)[:60]

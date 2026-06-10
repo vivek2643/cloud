@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.routers import folders, files, upload, edit, l2, search, logs as logs_router, renders, edl
+from app.routers import folders, files, upload, edit, search, logs as logs_router, renders, edl
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +63,6 @@ app.include_router(folders.router)
 app.include_router(files.router)
 app.include_router(upload.router)
 app.include_router(edit.router)
-app.include_router(l2.router)
 app.include_router(search.router)
 app.include_router(logs_router.router)
 app.include_router(renders.router)

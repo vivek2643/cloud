@@ -8,12 +8,11 @@ import {
   getFile,
   getFilePlaybackUrl,
   getFileDownloadUrl,
-  enqueueFileL2,
   type FileRecord,
 } from "@/lib/api";
 import { FileIcon } from "@/components/file-icon";
 import { formatBytes, formatDuration } from "@/lib/utils";
-import { ArrowLeft, Download, Loader2, ScrollText, Sparkles } from "lucide-react";
+import { ArrowLeft, Download, Loader2, ScrollText } from "lucide-react";
 
 export default function FilePage({ params }: { params: Promise<{ fileId: string }> }) {
   const { fileId } = use(params);
@@ -46,23 +45,6 @@ export default function FilePage({ params }: { params: Promise<{ fileId: string 
     if (!session?.access_token || !file) return;
     const { url } = await getFileDownloadUrl(file.id, session.access_token);
     window.open(url, "_blank");
-  }
-
-  const [l2Loading, setL2Loading] = useState(false);
-  const [l2Msg, setL2Msg] = useState<string | null>(null);
-  async function handleRunL2() {
-    if (!session?.access_token || !file) return;
-    setL2Loading(true);
-    setL2Msg(null);
-    try {
-      const r = await enqueueFileL2(file.id, session.access_token);
-      setL2Msg(`Queued. l2_status=${r.l2_status}. Check the worker console; finished output appears in the Logs tab and below.`);
-      setFile({ ...file, l2_status: "running" });
-    } catch (err) {
-      setL2Msg(`Failed: ${(err as Error).message}`);
-    } finally {
-      setL2Loading(false);
-    }
   }
 
   if (loading) {
@@ -174,42 +156,6 @@ export default function FilePage({ params }: { params: Promise<{ fileId: string 
                   <ScrollText size={14} />
                   View L1 analysis
                 </Link>
-              )}
-
-              <button
-                onClick={handleRunL2}
-                disabled={
-                  l2Loading ||
-                  file.l1_status !== "ready" ||
-                  file.l2_status === "running"
-                }
-                className="mt-2 flex w-full items-center justify-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors disabled:opacity-50"
-                style={{ background: "var(--accent)", color: "var(--background)" }}
-              >
-                {l2Loading || file.l2_status === "running" ? (
-                  <Loader2 size={14} className="animate-spin" />
-                ) : (
-                  <Sparkles size={14} />
-                )}
-                {file.l2_status === "running"
-                  ? "Running deeper analysis…"
-                  : file.l2_status === "ready"
-                  ? "Re-run deeper analysis"
-                  : "Run deeper analysis"}
-              </button>
-              {file.l1_status !== "ready" && (
-                <p className="mt-2 text-xs" style={{ color: "var(--muted)" }}>
-                  Wait for L1 indexing to finish before running L2.
-                </p>
-              )}
-              {file.l2_status === "running" && (
-                <p className="mt-2 text-xs" style={{ color: "var(--muted)" }}>
-                  L2 takes several minutes the first time (model downloads + per-shot inference).
-                  Refresh this page periodically; updated results land in the Logs tab automatically.
-                </p>
-              )}
-              {l2Msg && (
-                <p className="mt-2 text-xs" style={{ color: "var(--muted)" }}>{l2Msg}</p>
               )}
             </section>
           )}

@@ -1,6 +1,6 @@
 # Running the ingest fleet on one AWS GPU box
 
-The L1/L2 pipeline worker is **stateless**. It pulls jobs from Supabase Postgres
+The L1 pipeline worker is **stateless**. It pulls jobs from Supabase Postgres
 (via Procrastinate) and reads/writes media on Cloudflare R2 using presigned URLs.
 That means it runs on *any* GPU box with internet access — no ports to expose.
 Models auto-select CUDA when a GPU is present (`app/services/ml_device.py`); on a
@@ -22,7 +22,7 @@ Tasks are routed to two queues so compute specializes:
 
 | Queue | Tasks | Runs on |
 |---|---|---|
-| `gpu` | `l1_orchestrate`, `l2_enrich_file` | GPU worker processes |
+| `gpu` | `l1_orchestrate` (proxy, transcript, shots, SigLIP embeddings, audio features, diarization) | GPU worker processes |
 | `cpu` | `render_edl` (ffmpeg) | CPU worker processes |
 
 `backend/run_workers.sh` launches both pools on one box:
@@ -43,7 +43,7 @@ A worker with no `WORKER_QUEUES` set pulls **all** queues (handy for local dev:
 | `SUPABASE_URL` / `SUPABASE_SERVICE_KEY` | ✅ | |
 | `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | ✅ | |
 | `R2_BUCKET_NAME` | – | defaults to `aerodrive` |
-| `ANTHROPIC_API_KEY` | – | L2 narrative fallback (used when Qwen isn't on GPU) |
+| `ANTHROPIC_API_KEY` | – | L3 edit-time reasoning + vision (the editor/director) |
 | `GPU_WORKERS` | – | # of GPU-queue processes (default = detected GPU count) |
 | `CPU_WORKERS` | – | # of render processes (default `2`) |
 | `WORKER_CONCURRENCY` | – | per-process concurrency (default `1`; keep low for VRAM) |
@@ -105,7 +105,7 @@ docker run -d --gpus all --restart unless-stopped \
   --name edso-fleet ghcr.io/<you>/cloud-worker:latest bash run_workers.sh
 ```
 
-Mounting `/models` persists the ~7 GB of weights (Whisper/SigLIP/Qwen) across
+Mounting `/models` persists the weights (Whisper/SigLIP) across
 restarts so reboots don't re-download them.
 
 ---
@@ -113,11 +113,9 @@ restarts so reboots don't re-download them.
 ## 4. Notes & limits
 
 - **Throughput = `GPU_WORKERS`.** With N GPUs, run N GPU workers (1 per GPU) so
-  each loads its own model set without VRAM contention. Going above N (sharing a
-  GPU) risks OOM with Qwen2.5-VL resident.
+  each loads its own model set (Whisper + SigLIP) without VRAM contention.
 - **`DATABASE_URL` must be the direct/session connection** (5432), not the
   pooler — Procrastinate needs `LISTEN/NOTIFY`. Each worker holds a couple of
   connections; mind Supabase's connection ceiling as you scale `GPU_WORKERS`.
-- **Faces (insightface)** run on CPU via onnxruntime — small part of L2.
 - **Local dev** is unchanged: `python backend/worker.py` (no queue filter) pulls
   everything and auto-selects CPU.

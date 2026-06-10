@@ -140,43 +140,6 @@ def _file_exists(file_id: str) -> bool:
         return True
 
 
-def _enqueue_l2_if_needed(file_id: str) -> None:
-    """Chain deep L2 enrichment after a successful L1 run so every video gets
-    enriched in the background without any manual trigger.
-
-    Best-effort: uses a short-lived App/connector so it never collides with the
-    worker's own (already-open, async) procrastinate app, and is skipped when
-    L2 is already running/ready (L2 itself is idempotent, but this avoids
-    redundant queue churn on an L1 re-run).
-    """
-    if not get_settings().enable_l2_vlm:
-        # Deep L2 (Qwen VLM / faces / dinov2) is disabled by default -- edit-time
-        # managed multimodal vision replaces per-shot pre-captioning.
-        return
-    try:
-        with _pg_conn() as conn:
-            row = conn.execute(
-                "select l2_status from files where id = %s", (file_id,)
-            ).fetchone()
-        l2 = row[0] if row else None
-        if l2 in ("running", "ready"):
-            logger.info("L2 already %s for %s; not re-enqueuing.", l2, file_id)
-            return
-
-        from procrastinate import App, PsycopgConnector
-
-        # Tiny pool: this runs inside an L1 worker that already holds a pool, and
-        # Supabase's session pooler caps total clients (see jobs.DB_POOL_MAX).
-        enqueue_app = App(connector=PsycopgConnector(
-            conninfo=get_settings().database_url, min_size=1, max_size=2))
-        with enqueue_app.open():
-            # queue="gpu" so the GPU fleet (not CPU render workers) picks it up.
-            enqueue_app.configure_task("l2_enrich_file", queue="gpu").defer(file_id=file_id)
-        logger.info("Auto-enqueued L2 enrichment for %s.", file_id)
-    except Exception:
-        logger.exception("L1 done but auto-enqueue of L2 failed for %s.", file_id)
-
-
 # --- Stage 1: proxy + thumb (refactor of existing process_video) ---------
 
 def _gpu_available() -> bool:
@@ -914,9 +877,6 @@ def l1_orchestrate(file_id: str, r2_key: str) -> None:
             logger.info("L1 analysis written to %s", log_path)
         except Exception:
             logger.exception("L1 succeeded but writing the audit log failed for %s", file_id)
-
-        # Every video flows L1 -> L2 automatically, in the background.
-        _enqueue_l2_if_needed(file_id)
     except psycopg.errors.ForeignKeyViolation:
         # The files row was deleted while we were processing it -- the inserts
         # have nowhere to land. Stop cleanly instead of failing + retrying.

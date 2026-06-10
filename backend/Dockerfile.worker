@@ -1,4 +1,4 @@
-# GPU worker image for the L1/L2 ingest pipeline.
+# GPU worker image for the L1 ingest pipeline.
 #
 # Base ships torch 2.6.0 + CUDA 12.4 + cuDNN 9 — matches requirements.txt's
 # torch pin and what faster-whisper's CTranslate2 4.x needs for fp16 on GPU.
@@ -14,14 +14,12 @@ ENV PYTHONUNBUFFERED=1 \
     TORCH_HOME=/models
 
 # System libs: ffmpeg (transcode/slice), libGL + glib (opencv-headless),
-# git (some pip deps fetch from VCS), build-essential (insightface builds a
-# C++/Cython extension from source — the base image ships no compiler).
+# git (some pip deps fetch from VCS).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         libgl1 \
         libglib2.0-0 \
         git \
-        build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app/backend
