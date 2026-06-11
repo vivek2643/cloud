@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     diarization_backend: str = "mfcc"
     diarization_max_speakers: int = 8
 
-    # Phase 3a: L3 query parsing via Anthropic Claude
+    # Anthropic credentials (used by the L3 edit orchestrator).
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-4-5-20250929"
 
@@ -69,21 +69,18 @@ class Settings(BaseSettings):
     # uploaded video before giving up.
     l2_file_active_timeout_seconds: int = 300
 
-    # Layer C: how many keyframe images to attach to the multimodal editor call
-    # (0 disables vision -> text-only editor). ~1.3k tokens/image on Sonnet.
-    editor_vision_max_images: int = 16
-    editor_vision_per_shot_max: int = 1
-
-    # Agentic perception (director view_frames loop). The director is a "blind
-    # editor" that pulls keyframes on demand; these bound its appetite so cost
-    # and latency stay sane.
-    editor_perception_max_rounds: int = 12
-    editor_perception_max_images: int = 300
-    view_frames_per_shot_max: int = 8
-    # Keep images from only the most recent N view_frames turns in context; older
-    # frames are pruned to their captions to bound multimodal token growth.
-    editor_perception_keep_image_turns: int = 3
-    # Prompt caching on the stable system/catalog prefix (Anthropic only).
+    # --- L3: edit orchestrator (Claude Opus agentic tool-loop) ------------
+    # The creative brain: picks material/order/rough timing over the L1+L2 text
+    # analysis and drives the deterministic cut-engine tools; never places
+    # exact frames itself (the cost grids do).
+    l3_model: str = "claude-opus-4-8"
+    # Guardrails so the inner reason->tool loop is always bounded.
+    l3_max_iterations: int = 40
+    l3_max_output_tokens: int = 16384
+    # Extended-thinking budget per call (0 disables thinking).
+    l3_thinking_budget_tokens: int = 8192
+    # Prompt caching on the stable system/tools/catalog prefix (Anthropic only);
+    # this is what makes a many-iteration Opus loop affordable.
     llm_prompt_caching: bool = True
 
     @property

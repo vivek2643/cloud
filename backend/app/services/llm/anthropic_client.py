@@ -93,7 +93,12 @@ class AnthropicClient:
         tools: Optional[List[Dict[str, Any]]] = None,
         max_tokens: int = 2048,
         cache_system: bool = False,
+        thinking_budget: int = 0,
     ) -> LLMResponse:
+        """`thinking_budget` > 0 enables extended thinking with that token
+        budget. Thinking blocks are carried through the neutral assistant
+        message verbatim (Anthropic requires them to be replayed unmodified on
+        the next request of a tool-use loop)."""
         client = _sdk_client()
 
         kwargs: Dict[str, Any] = {
@@ -101,6 +106,8 @@ class AnthropicClient:
             "max_tokens": max_tokens,
             "messages": _messages_to_anthropic(messages),
         }
+        if thinking_budget > 0:
+            kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
 
         # System prompt, optionally cached as a stable prefix.
         if system:
@@ -130,7 +137,14 @@ class AnthropicClient:
         assistant_content: List[Dict[str, Any]] = []
         for block in msg.content:
             btype = getattr(block, "type", None)
-            if btype == "text":
+            if btype == "thinking":
+                # Preserve verbatim (incl. signature) for replay in tool loops.
+                assistant_content.append(
+                    {"type": "thinking", "thinking": block.thinking, "signature": block.signature}
+                )
+            elif btype == "redacted_thinking":
+                assistant_content.append({"type": "redacted_thinking", "data": block.data})
+            elif btype == "text":
                 text_bits.append(block.text)
                 assistant_content.append({"type": "text", "text": block.text})
             elif btype == "tool_use":
