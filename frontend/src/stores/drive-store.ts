@@ -22,6 +22,12 @@ interface DriveState {
   searchQuery: string;
   uploads: UploadItem[];
 
+  // AI Edit (L3) panel
+  aiPanelOpen: boolean;
+  aiScopeFileIds: string[];
+  openAiPanel: (fileIds: string[]) => void;
+  closeAiPanel: () => void;
+
   setCurrentFolder: (id: string | null) => void;
   setFolders: (folders: Folder[]) => void;
   setFiles: (files: FileRecord[]) => void;
@@ -45,6 +51,11 @@ export const useDriveStore = create<DriveState>((set) => ({
   selectedIds: new Set(),
   searchQuery: "",
   uploads: [],
+
+  aiPanelOpen: false,
+  aiScopeFileIds: [],
+  openAiPanel: (fileIds) => set({ aiPanelOpen: true, aiScopeFileIds: fileIds }),
+  closeAiPanel: () => set({ aiPanelOpen: false }),
 
   setCurrentFolder: (id) => set({ currentFolderId: id, selectedIds: new Set() }),
   setFolders: (folders) => set({ folders }),

@@ -250,3 +250,137 @@ export function listL1Logs(token: string) {
 export function getL1Log(fileId: string, token: string) {
   return request<Record<string, unknown>>(`/api/logs/l1/${fileId}`, { token });
 }
+
+// --- L3: AI edit orchestrator ---
+
+export type EditThreadStatus = "drafting" | "awaiting_user" | "ready" | "failed";
+
+export interface EditBrief {
+  goal?: string;
+  target_duration_s?: number;
+  tone?: string;
+  platform?: string;
+  constraints?: string[];
+  assumptions?: string[];
+}
+
+export interface EditBeat {
+  beat_id: string;
+  purpose: string;
+  intent: string;
+  target_s?: number;
+}
+
+export interface EditSegment {
+  seg_id: string;
+  file_id: string;
+  in_ms: number;
+  out_ms: number;
+  axis?: string;
+  beat_id?: string | null;
+  content?: string | null;
+  rationale?: string | null;
+  priority?: number;
+  cut_in_cost?: number;
+  cut_out_cost?: number;
+  warnings?: string[];
+}
+
+export interface EditQuestion {
+  q_id: string;
+  question: string;
+  options?: string[];
+  default: string;
+  why?: string;
+}
+
+export interface EditDiagnostics {
+  segment_count?: number;
+  total_ms?: number;
+  total_s?: number;
+  mean_seam_cost?: number;
+  max_seam_cost?: number;
+  warnings?: string[];
+  guardrail?: string;
+  [k: string]: unknown;
+}
+
+export interface EditDocument {
+  brief?: EditBrief;
+  outline?: EditBeat[];
+  timeline?: EditSegment[];
+  open_questions?: EditQuestion[];
+  summary?: string;
+  notes?: string[];
+  diagnostics?: EditDiagnostics;
+}
+
+export interface EditThread {
+  id: string;
+  user_id: string;
+  title: string | null;
+  file_ids: string[];
+  brief: string;
+  status: EditThreadStatus;
+  created_at: string;
+  updated_at: string;
+  document: EditDocument | null;
+  document_version: number | null;
+  open_questions: EditQuestion[];
+  usage: { input_tokens?: number; output_tokens?: number };
+}
+
+export interface EditThreadListItem {
+  id: string;
+  title: string | null;
+  status: EditThreadStatus;
+  created_at: string;
+  clip_count: number;
+  latest_version: number | null;
+}
+
+export interface EditVersionListItem {
+  version: number;
+  created_at: string;
+}
+
+export function createEditThread(fileIds: string[], brief: string, token: string) {
+  return request<{ thread_id: string; status: EditThreadStatus }>("/api/edit/threads", {
+    method: "POST",
+    body: JSON.stringify({ file_ids: fileIds, brief }),
+    token,
+  });
+}
+
+export function listEditThreads(token: string) {
+  return request<{ threads: EditThreadListItem[] }>("/api/edit/threads", { token });
+}
+
+export function getEditThread(id: string, token: string) {
+  return request<EditThread>(`/api/edit/threads/${id}`, { token });
+}
+
+export function sendEditMessage(
+  id: string,
+  payload: { text?: string; answers?: Record<string, string> },
+  token: string
+) {
+  return request<{ ok: boolean; status: EditThreadStatus }>(
+    `/api/edit/threads/${id}/message`,
+    { method: "POST", body: JSON.stringify(payload), token }
+  );
+}
+
+export function listEditVersions(id: string, token: string) {
+  return request<{ versions: EditVersionListItem[] }>(
+    `/api/edit/threads/${id}/versions`,
+    { token }
+  );
+}
+
+export function getEditVersion(id: string, version: number, token: string) {
+  return request<{ version: number; document: EditDocument }>(
+    `/api/edit/threads/${id}/versions/${version}`,
+    { token }
+  );
+}

@@ -8,6 +8,7 @@ import { UploadZone, useUploadFiles } from "@/components/upload-zone";
 import { DriveContent } from "@/components/drive-content";
 import { Breadcrumb } from "@/components/breadcrumb";
 import { CreateFolderDialog } from "@/components/create-folder-dialog";
+import { SearchEditBar } from "@/components/search-edit-bar";
 import { FolderPlus, Upload } from "lucide-react";
 
 const VIDEO_EXTENSIONS = ".mp4,.mov,.avi,.mkv,.webm,.m4v,.wmv,.flv,.mxf,.mts";
@@ -101,6 +102,8 @@ export default function FolderPage({ params }: { params: Promise<{ folderId: str
             />
           </div>
         </div>
+
+        <SearchEditBar />
 
         <DriveContent />
       </div>

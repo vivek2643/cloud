@@ -7,6 +7,7 @@ import { getFolders, getFiles, createFolder } from "@/lib/api";
 import { UploadZone, useUploadFiles } from "@/components/upload-zone";
 import { DriveContent } from "@/components/drive-content";
 import { CreateFolderDialog } from "@/components/create-folder-dialog";
+import { SearchEditBar } from "@/components/search-edit-bar";
 import { FolderPlus, Upload, Layers, Crosshair, Star, X } from "lucide-react";
 
 const VIDEO_EXTENSIONS = ".mp4,.mov,.avi,.mkv,.webm,.m4v,.wmv,.flv,.mxf,.mts";
@@ -81,6 +82,8 @@ export default function DrivePage() {
   return (
     <UploadZone>
       <div className="flex-1 p-6">
+        <SearchEditBar />
+
         {/* Tabs + library actions */}
         <div className="mb-6 flex flex-wrap items-center justify-between gap-3 border-b pb-3" style={{ borderColor: "var(--border)" }}>
           <div className="flex items-center gap-1.5">

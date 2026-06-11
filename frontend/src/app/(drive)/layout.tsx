@@ -6,6 +6,7 @@ import { AuthProvider } from "@/components/auth-provider";
 import { Navbar } from "@/components/navbar";
 import { Sidebar } from "@/components/sidebar";
 import { UploadProgress } from "@/components/upload-progress";
+import { AiEditPanel } from "@/components/ai-edit-panel";
 import { useAuthStore } from "@/stores/auth-store";
 import { isSupabaseConfigured } from "@/lib/supabase";
 
@@ -70,6 +71,7 @@ function DriveShell({ children }: { children: React.ReactNode }) {
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
           <div className="flex flex-1 flex-col overflow-y-auto">{children}</div>
         </main>
+        <AiEditPanel />
       </div>
     </div>
   );
