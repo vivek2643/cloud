@@ -141,10 +141,6 @@ export default function FilePage({ params }: { params: Promise<{ fileId: string 
                   label="L1 (auto)"
                   value={file.l1_status ?? "pending"}
                 />
-                <DetailRow
-                  label="L2 (deeper)"
-                  value={file.l2_status ?? "not run"}
-                />
               </dl>
 
               {file.l1_status === "ready" && (

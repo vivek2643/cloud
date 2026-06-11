@@ -39,13 +39,6 @@ def _warmup() -> None:
     except Exception:
         logger.exception("Whisper warmup failed; will lazy-load on first job.")
 
-    try:
-        logger.info("Warming up SigLIP 2...")
-        from app.services.l1.embeddings import _SigLIPEngine
-        _SigLIPEngine.get()
-    except Exception:
-        logger.exception("SigLIP warmup failed; will lazy-load on first job.")
-
 
 async def main() -> None:
     register_tasks()

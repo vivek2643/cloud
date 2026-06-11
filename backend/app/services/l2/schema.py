@@ -1,0 +1,367 @@
+"""
+L2 perception artifact schema.
+
+This is the contract for what Gemini returns for one short, single-take clip.
+It is passed directly to the SDK as a `response_schema` (so Gemini emits typed
+JSON) and re-validated on the way back, so the same definition documents the
+prompt, constrains the model, and parses the result.
+
+Design rules baked into the shape (see the perception spec discussion):
+  * Universal spine + optional modules. Every clip gets clip-level fields; the
+    `persons`/`events`/`reactions`/... tracks are lists that are simply empty
+    when they don't apply (a sunset clip has no persons, no speech, no events).
+  * Single take. There are no shots/scenes -- the whole clip is one continuous
+    camera take, so "structure" is a *timeline of events*, never a cut list.
+  * Sparse, timestamped events. Tracks emit events at the moments they happen
+    (ms, video-relative); downstream code rasterizes them into the dense 100 ms
+    cut-cost grid. The model never emits dense per-frame arrays.
+  * Stable local ids. People are `p1`, `p2`, ... within this clip; events and
+    interactions reference those ids so actors link to actions. The ids are
+    clip-local; cross-video identity is resolved later from the durable traits.
+  * Controlled vocabularies (enums) wherever comparability matters, free text
+    where nuance matters.
+
+All timestamps are integer milliseconds from the start of the clip.
+"""
+from __future__ import annotations
+
+from enum import Enum
+from typing import List, Optional
+
+from pydantic import BaseModel, Field
+
+SCHEMA_VERSION = 1
+
+
+# --------------------------------------------------------------------------
+# Controlled vocabularies
+# --------------------------------------------------------------------------
+
+class ContentType(str, Enum):
+    talking_head = "talking_head"
+    interview = "interview"
+    vlog = "vlog"
+    tutorial = "tutorial"
+    demo = "demo"
+    product = "product"
+    performance = "performance"
+    action = "action"
+    scenic = "scenic"
+    broll = "broll"
+    screen_recording = "screen_recording"
+    event = "event"
+    other = "other"
+
+
+class PrimaryAxis(str, Enum):
+    """What carries the clip -- i.e. which cut-cost channel should dominate."""
+    speech = "speech"
+    action = "action"
+    visual = "visual"
+    performance = "performance"
+
+
+class CutSensitivity(str, Enum):
+    """How forgiving the clip is of cuts overall."""
+    high = "high"      # delicate: dialogue / continuous action, few safe seams
+    medium = "medium"
+    low = "low"        # forgiving: static b-roll, scenery
+
+
+class TimeOfDay(str, Enum):
+    day = "day"
+    night = "night"
+    golden_hour = "golden_hour"
+    dawn_dusk = "dawn_dusk"
+    indoor_artificial = "indoor_artificial"
+    unsure = "unsure"
+
+
+class InteriorExterior(str, Enum):
+    interior = "interior"
+    exterior = "exterior"
+    unsure = "unsure"
+
+
+class ShotSize(str, Enum):
+    extreme_close_up = "extreme_close_up"
+    close_up = "close_up"
+    medium_close_up = "medium_close_up"
+    medium = "medium"
+    medium_wide = "medium_wide"
+    wide = "wide"
+    extreme_wide = "extreme_wide"
+    unsure = "unsure"
+
+
+class CameraAngle(str, Enum):
+    eye_level = "eye_level"
+    low = "low"
+    high = "high"
+    overhead = "overhead"
+    dutch = "dutch"
+    unsure = "unsure"
+
+
+class CameraMovement(str, Enum):
+    static = "static"
+    pan = "pan"
+    tilt = "tilt"
+    push_in = "push_in"
+    pull_out = "pull_out"
+    zoom = "zoom"
+    handheld = "handheld"
+    follow = "follow"
+    whip = "whip"
+    orbit = "orbit"
+    unsure = "unsure"
+
+
+class EventChange(str, Enum):
+    """The editorial moment an event marks -- these are the points a cut wants
+    to respect (don't cut mid-reveal) or land on (cut on an exit)."""
+    enters_frame = "enters_frame"
+    exits_frame = "exits_frame"
+    action_starts = "action_starts"
+    action_peak = "action_peak"
+    action_ends = "action_ends"
+    holds = "holds"
+    reveal = "reveal"
+    setup = "setup"
+
+
+class ReactionType(str, Enum):
+    smile = "smile"
+    laugh = "laugh"
+    surprise = "surprise"
+    frown = "frown"
+    cry = "cry"
+    nod = "nod"
+    shake_head = "shake_head"
+    eye_widen = "eye_widen"
+    eyebrow_raise = "eyebrow_raise"
+    look_away = "look_away"
+    other = "other"
+
+
+class GazeDirection(str, Enum):
+    to_camera = "to_camera"
+    off_camera = "off_camera"
+    at_person = "at_person"
+    at_object = "at_object"
+    down = "down"
+    around = "around"
+    unsure = "unsure"
+
+
+class GraphicKind(str, Enum):
+    on_screen_text = "on_screen_text"
+    caption = "caption"
+    lower_third = "lower_third"
+    sign = "sign"
+    ui_element = "ui_element"
+    logo = "logo"
+    other = "other"
+
+
+# --------------------------------------------------------------------------
+# Clip-level (the universal spine -- present for every clip)
+# --------------------------------------------------------------------------
+
+class Look(BaseModel):
+    time_of_day: Optional[TimeOfDay] = None
+    interior_exterior: Optional[InteriorExterior] = None
+    light_quality: Optional[str] = Field(
+        None, description="e.g. 'soft diffused', 'hard direct sun', 'mixed/practical', 'low-key'"
+    )
+    light_direction: Optional[str] = Field(None, description="e.g. 'frontal', 'back-lit', 'side/left'")
+    color_palette: Optional[str] = Field(None, description="dominant colors / grade, e.g. 'warm teal-orange'")
+    mood: Optional[str] = None
+
+
+class SettingObject(BaseModel):
+    name: str
+    detail: Optional[str] = Field(None, description="make/model/state -- only when it matters editorially")
+    is_subject: bool = Field(
+        False, description="True only when the clip is ABOUT this object (e.g. a product/car review)"
+    )
+
+
+class Setting(BaseModel):
+    location: Optional[str] = Field(None, description="where this is, e.g. 'home kitchen', 'city street', 'forest trail'")
+    background: List[str] = Field(default_factory=list, description="notable background elements")
+    objects: List[SettingObject] = Field(default_factory=list, description="foreground objects worth indexing")
+
+
+class Editability(BaseModel):
+    primary_axis: Optional[PrimaryAxis] = None
+    cut_sensitivity: Optional[CutSensitivity] = None
+    best_use: List[str] = Field(
+        default_factory=list,
+        description="how an editor would reach for this clip, e.g. ['establishing', 'reaction insert', 'soundbite']",
+    )
+
+
+# --------------------------------------------------------------------------
+# Camera craft (timeline -- a single take can still pan, push, reframe)
+# --------------------------------------------------------------------------
+
+class CameraSpan(BaseModel):
+    start_ms: int
+    end_ms: int
+    shot_size: Optional[ShotSize] = None
+    angle: Optional[CameraAngle] = None
+    movement: Optional[CameraMovement] = None
+    subject_focus: Optional[str] = Field(None, description="what the framing favors, e.g. 'p1 face', 'the car', 'horizon'")
+    is_deliberate: Optional[bool] = Field(
+        None, description="True for an intentional move (push-in, planned pan); False for incidental wobble"
+    )
+
+
+# --------------------------------------------------------------------------
+# Persons (optional module -- empty when no people)
+# --------------------------------------------------------------------------
+
+class PersonDurable(BaseModel):
+    """Traits that survive across clips -- the cross-video matching key. Describe
+    what you can SEE; omit (leave null) what you genuinely can't tell."""
+    gender_presentation: Optional[str] = None
+    age_band: Optional[str] = Field(None, description="e.g. 'child', 'teen', '20s', '30s', '40s', '50s+'")
+    skin_tone: Optional[str] = None
+    build: Optional[str] = Field(None, description="e.g. 'slim', 'average', 'broad', 'tall'")
+    face_shape: Optional[str] = None
+    hair_color: Optional[str] = None
+    eye_color: Optional[str] = None
+    distinctive_marks: List[str] = Field(
+        default_factory=list,
+        description="the strongest re-id signal: moles, scars, tattoos, freckles, dimples, gap teeth, etc.",
+    )
+
+
+class PersonMutable(BaseModel):
+    """Session-specific appearance -- useful for this edit, useless for re-id."""
+    hair_style: Optional[str] = None
+    facial_hair: Optional[str] = None
+    glasses: Optional[str] = None
+    headwear: Optional[str] = None
+    wardrobe: List[str] = Field(default_factory=list, description="visible clothing, top to bottom")
+    accessories: List[str] = Field(default_factory=list)
+
+
+class Person(BaseModel):
+    local_id: str = Field(description="clip-local id: 'p1', 'p2', ... referenced by events/interactions")
+    canonical_description: Optional[str] = Field(
+        None, description="one-line natural-language identikit a human could use to pick this person out"
+    )
+    role: Optional[str] = Field(None, description="e.g. 'main subject', 'interviewer', 'passerby'")
+    durable: Optional[PersonDurable] = None
+    mutable: Optional[PersonMutable] = None
+    enters_ms: Optional[int] = None
+    exits_ms: Optional[int] = None
+    best_face_ms: Optional[int] = Field(None, description="timestamp of the clearest, most front-on look at the face")
+    screen_time_note: Optional[str] = None
+    # NOTE: filled in post-hoc by audio/visual fusion against L1 diarization.
+    # The model should leave this null.
+    voice_speaker_id: Optional[str] = None
+    av_link_confidence: Optional[float] = None
+
+
+# --------------------------------------------------------------------------
+# Temporal tracks (sparse, timestamped events)
+# --------------------------------------------------------------------------
+
+class Event(BaseModel):
+    """One beat on the timeline. `actor` is optional so the timeline generalizes
+    beyond people (a door opening, a car passing). Multi-actor moments are split
+    into one event per actor and tied together by a shared `interaction_id`."""
+    id: str
+    start_ms: int
+    end_ms: int
+    description: str = Field(description="what happens, concretely: 'p1 opens the car door and steps out'")
+    actor: Optional[str] = Field(None, description="person local_id, or null for non-person events")
+    target: Optional[str] = Field(None, description="person local_id or object name the action is directed at")
+    change: Optional[EventChange] = None
+    interaction_id: Optional[str] = Field(None, description="links the per-actor events of one shared moment")
+
+
+class Interaction(BaseModel):
+    id: str
+    start_ms: int
+    end_ms: int
+    kind: Optional[str] = Field(None, description="e.g. 'conversation', 'handshake', 'hug', 'hand-off'")
+    participants: List[str] = Field(default_factory=list, description="person local_ids involved")
+    description: Optional[str] = None
+
+
+class Reaction(BaseModel):
+    start_ms: int
+    end_ms: int
+    subject: str = Field(description="person local_id reacting")
+    type: Optional[ReactionType] = None
+    intensity: Optional[float] = Field(None, ge=0.0, le=1.0)
+    trigger: Optional[str] = Field(None, description="what prompted it, e.g. 'p2's joke', 'the reveal'")
+
+
+class GazeSpan(BaseModel):
+    start_ms: int
+    end_ms: int
+    subject: str = Field(description="person local_id")
+    direction: Optional[GazeDirection] = None
+    target: Optional[str] = Field(None, description="person local_id or object the gaze lands on")
+
+
+class SpeakingSpan(BaseModel):
+    """When a visible person is clearly speaking on camera (mouth moving in
+    speech). This is the VLM's *independent* observation -- it is never told the
+    diarization answer. Code later intersects these spans with L1 voice activity
+    to derive the audio<->visual identity link, so the worst case is 'no link',
+    never a hallucinated one."""
+    start_ms: int
+    end_ms: int
+    subject: str = Field(description="person local_id who is visibly speaking")
+
+
+class EnvironmentEvent(BaseModel):
+    """Non-person world changes worth a cut point: light shifts, weather,
+    something entering/leaving frame, a vehicle passing."""
+    start_ms: int
+    end_ms: int
+    description: str
+    change: Optional[EventChange] = None
+
+
+class GraphicTextEvent(BaseModel):
+    start_ms: int
+    end_ms: int
+    kind: Optional[GraphicKind] = None
+    text: Optional[str] = Field(None, description="verbatim text if legible")
+
+
+# --------------------------------------------------------------------------
+# Root artifact
+# --------------------------------------------------------------------------
+
+class ClipPerception(BaseModel):
+    schema_version: int = SCHEMA_VERSION
+    content_type: Optional[ContentType] = None
+    logline: Optional[str] = Field(None, description="one sentence: what this clip is and what happens in it")
+    synopsis: Optional[str] = Field(None, description="a short chronological paragraph describing the take start to finish")
+    topics: List[str] = Field(default_factory=list)
+    keywords: List[str] = Field(default_factory=list)
+
+    look: Optional[Look] = None
+    setting: Optional[Setting] = None
+    editability: Optional[Editability] = None
+
+    camera_craft: List[CameraSpan] = Field(default_factory=list)
+    persons: List[Person] = Field(default_factory=list)
+
+    events: List[Event] = Field(default_factory=list)
+    interactions: List[Interaction] = Field(default_factory=list)
+    reactions: List[Reaction] = Field(default_factory=list)
+    gaze: List[GazeSpan] = Field(default_factory=list)
+    speaking: List[SpeakingSpan] = Field(default_factory=list)
+    environment_events: List[EnvironmentEvent] = Field(default_factory=list)
+    graphic_text_events: List[GraphicTextEvent] = Field(default_factory=list)
+
+    notes: Optional[str] = Field(None, description="caveats, low-confidence calls, anything ambiguous")

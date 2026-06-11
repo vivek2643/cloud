@@ -6,10 +6,7 @@ import { AuthProvider } from "@/components/auth-provider";
 import { Navbar } from "@/components/navbar";
 import { Sidebar } from "@/components/sidebar";
 import { UploadProgress } from "@/components/upload-progress";
-import { AiEditPanel } from "@/components/ai-edit-panel";
-import { AiTimelineDock } from "@/components/ai-timeline-dock";
 import { useAuthStore } from "@/stores/auth-store";
-import { useDriveStore } from "@/stores/drive-store";
 import { isSupabaseConfigured } from "@/lib/supabase";
 
 function SetupMessage() {
@@ -65,27 +62,14 @@ function DriveGuard({ children }: { children: React.ReactNode }) {
 }
 
 function DriveShell({ children }: { children: React.ReactNode }) {
-  const aiPanelOpen = useDriveStore((s) => s.aiPanelOpen);
-  const aiScopeFileIds = useDriveStore((s) => s.aiScopeFileIds);
-  const closeAiPanel = useDriveStore((s) => s.closeAiPanel);
-
   return (
     <div className="flex h-screen flex-col">
       <Navbar />
       <div className="flex flex-1 overflow-hidden">
-        <Sidebar collapsed={aiPanelOpen} />
+        <Sidebar />
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
           <div className="flex flex-1 flex-col overflow-y-auto">{children}</div>
-          <AiTimelineDock />
         </main>
-        {aiPanelOpen && (
-          <aside
-            className="flex w-[600px] max-w-[55vw] shrink-0 flex-col overflow-hidden border-l"
-            style={{ borderColor: "var(--border)", background: "var(--background)" }}
-          >
-            <AiEditPanel fileIds={aiScopeFileIds} embedded onClose={closeAiPanel} />
-          </aside>
-        )}
       </div>
     </div>
   );

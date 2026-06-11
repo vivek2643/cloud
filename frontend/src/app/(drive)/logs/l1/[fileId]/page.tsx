@@ -15,10 +15,8 @@ interface L1Log {
     width?: number;
     height?: number;
     l1_status?: string;
-    l2_status?: string | null;
   };
   summary?: Record<string, unknown>;
-  shots?: Array<Record<string, unknown>>;
   transcript?: {
     language?: string;
     text?: string;
@@ -78,7 +76,7 @@ export default function L1LogDetailPage() {
             <h1 className="text-lg font-semibold">{log.file?.name ?? "L1 analysis"}</h1>
             <div className="mt-1 text-xs" style={{ color: "var(--muted)" }}>
               {log.file?.width}x{log.file?.height} · {log.file?.duration_seconds?.toFixed(1)}s
-              · L1: {log.file?.l1_status} · L2: {log.file?.l2_status ?? "not run"}
+              · L1: {log.file?.l1_status}
             </div>
           </header>
 
@@ -132,63 +130,6 @@ export default function L1LogDetailPage() {
                   </pre>
                 </details>
               )}
-            </section>
-          )}
-
-          {log.shots && log.shots.length > 0 && (
-            <section>
-              <h2 className="mb-2 text-sm font-medium" style={{ color: "var(--muted)" }}>
-                Shots ({log.shots.length})
-              </h2>
-              <div
-                className="overflow-hidden rounded-md border"
-                style={{ borderColor: "var(--border)" }}
-              >
-                <table className="w-full text-xs">
-                  <thead style={{ background: "var(--sidebar)", color: "var(--muted)" }}>
-                    <tr>
-                      <th className="px-3 py-2 text-left font-medium">#</th>
-                      <th className="px-3 py-2 text-right font-medium">Start</th>
-                      <th className="px-3 py-2 text-right font-medium">End</th>
-                      <th className="px-3 py-2 text-right font-medium">Length</th>
-                      <th className="px-3 py-2 text-right font-medium">Focus</th>
-                      <th className="px-3 py-2 text-right font-medium">Brightness</th>
-                      <th className="px-3 py-2 text-right font-medium">Motion</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {log.shots.map((s) => (
-                      <tr
-                        key={Number(s.shot_index)}
-                        className="border-t"
-                        style={{ borderColor: "var(--border)" }}
-                      >
-                        <td className="px-3 py-2 tabular-nums">{Number(s.shot_index)}</td>
-                        <td className="px-3 py-2 text-right tabular-nums">
-                          {Number(s.start_ms)} ms
-                        </td>
-                        <td className="px-3 py-2 text-right tabular-nums">
-                          {Number(s.end_ms)} ms
-                        </td>
-                        <td className="px-3 py-2 text-right tabular-nums">
-                          {Number(s.duration_ms)} ms
-                        </td>
-                        <td className="px-3 py-2 text-right tabular-nums">
-                          {s.focus_score != null ? Number(s.focus_score).toFixed(1) : "—"}
-                        </td>
-                        <td className="px-3 py-2 text-right tabular-nums">
-                          {s.brightness != null ? Number(s.brightness).toFixed(1) : "—"}
-                        </td>
-                        <td className="px-3 py-2 text-right tabular-nums">
-                          {s.motion_magnitude != null
-                            ? Number(s.motion_magnitude).toFixed(2)
-                            : "—"}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
             </section>
           )}
 

@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.routers import folders, files, upload, edit, search, logs as logs_router, renders, edl
+from app.routers import folders, files, upload, logs as logs_router
 
 logger = logging.getLogger(__name__)
 
@@ -62,11 +62,7 @@ async def cors_aware_exception_handler(request: Request, exc: Exception) -> JSON
 app.include_router(folders.router)
 app.include_router(files.router)
 app.include_router(upload.router)
-app.include_router(edit.router)
-app.include_router(search.router)
 app.include_router(logs_router.router)
-app.include_router(renders.router)
-app.include_router(edl.router)
 
 
 @app.get("/health")

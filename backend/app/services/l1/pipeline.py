@@ -17,7 +17,6 @@ import threading
 import traceback
 from typing import List, Optional
 
-import numpy as np
 import psycopg
 from procrastinate import RetryStrategy
 
@@ -29,9 +28,6 @@ from app.services.l1 import beat_cost as beat_mod
 from app.services.l1 import cut_cost as cutcost_mod
 from app.services.l1 import diarization as diar_mod
 from app.services.l1 import motion_dynamics as motion_mod
-from app.services.l1 import embeddings as emb_mod
-from app.services.l1 import keyframes as kf_mod
-from app.services.l1 import shots as shots_mod
 from app.services.l1 import transcript as tr_mod
 from app.services.l1.snapshot import build_l1_snapshot
 from app.services.processing import _download_from_r2, _probe_video, _upload_to_r2
@@ -39,40 +35,12 @@ from app.services.supabase_client import get_supabase
 
 logger = logging.getLogger(__name__)
 
-STAGES = ("proxy", "transcript", "shots", "embeddings", "audio_features", "diarization", "dialogue_cut", "beat_cut", "motion_dynamics")
+STAGES = ("proxy", "transcript", "audio_features", "diarization", "dialogue_cut", "beat_cut", "motion_dynamics")
 
 
 def _pg_conn() -> psycopg.Connection:
     settings = get_settings()
     return psycopg.connect(settings.database_url, autocommit=True)
-
-
-# Cached per-process: whether the Layer A shot_keyframes table exists. Lets L1
-# run cleanly before migration 008 is applied (writes just no-op).
-_SHOT_KEYFRAMES_OK: Optional[bool] = None
-
-
-def _shot_keyframes_available(conn: psycopg.Connection) -> bool:
-    global _SHOT_KEYFRAMES_OK
-    if _SHOT_KEYFRAMES_OK is None:
-        try:
-            row = conn.execute("select to_regclass('public.shot_keyframes')").fetchone()
-            _SHOT_KEYFRAMES_OK = bool(row and row[0] is not None)
-        except Exception:
-            _SHOT_KEYFRAMES_OK = False
-        if not _SHOT_KEYFRAMES_OK:
-            logger.warning(
-                "shot_keyframes table missing; Layer A adaptive keyframes disabled "
-                "(apply migration 008_adaptive_keyframes.sql)."
-            )
-    return _SHOT_KEYFRAMES_OK
-
-
-def _vec_to_pg(v: np.ndarray) -> str:
-    """Format a numpy vector as pgvector text literal `[v1,v2,...]`.
-    Works for both `vector` and `halfvec` via SQL `::halfvec` cast.
-    """
-    return "[" + ",".join(f"{float(x):.6f}" for x in v) + "]"
 
 
 # --- Per-stage job tracking ----------------------------------------------
@@ -130,8 +98,8 @@ def _set_l1_status(file_id: str, status: str) -> None:
 
 def _file_exists(file_id: str) -> bool:
     """True if the files row still exists. A user can delete a file (or abort a
-    multipart upload) mid-processing; without this guard the shots/embeddings
-    inserts hit a foreign-key violation and retry forever."""
+    multipart upload) mid-processing; without this guard the L1 inserts hit a
+    foreign-key violation and retry forever."""
     try:
         with _pg_conn() as conn:
             row = conn.execute(
@@ -358,261 +326,6 @@ def _stage2_transcript(file_id: str, wav_path: str, conn: psycopg.Connection) ->
             json.dumps(tr_mod.serialize_fillers(result.fillers)),
         ),
     )
-
-
-# --- Stage 3: shots ------------------------------------------------------
-
-def _stage3_shots(
-    file_id: str,
-    video_path: str,
-    duration_s: float,
-    tmpdir: str,
-    conn: psycopg.Connection,
-) -> List[shots_mod.Shot]:
-    """
-    Detect shots + extract 3 keyframes per shot. For each keyframe:
-      - keep the JPEG locally (used by SigLIP embedding stage)
-      - downscale to 224x224 and upload that compact copy to R2
-
-    `video_path` is the 1080p proxy when available (set by the orchestrator),
-    which makes detection/keyframe/telemetry decode a small file instead of a
-    full-res raw. Shot boundaries are in milliseconds, so they map cleanly back
-    onto the raw video for later L2 keyframe extraction.
-    """
-    shots_dir = os.path.join(tmpdir, "keyframes")
-    r2_dir = os.path.join(tmpdir, "keyframes_r2")
-    os.makedirs(shots_dir, exist_ok=True)
-    os.makedirs(r2_dir, exist_ok=True)
-
-    shots = shots_mod.detect_shots(video_path, duration_s, shots_dir)
-
-    conn.execute("delete from shots where file_id = %s", (file_id,))
-    sk_ok = _shot_keyframes_available(conn)
-
-    for shot in shots:
-        # Upload the base triple (anchor / motion / variance) at 224x224.
-        base_keys: dict[str, str] = {}
-        for kind, src in (
-            ("anchor", shot.anchor_local_path),
-            ("motion", shot.motion_local_path),
-            ("variance", shot.variance_local_path),
-        ):
-            if not src or not os.path.exists(src):
-                continue
-            small = os.path.join(r2_dir, f"shot_{shot.index:05d}_{kind}.jpg")
-            if not kf_mod.downscale_for_storage(src, small, target_size=224, quality=85):
-                continue
-            key = f"keyframes/{file_id}/{shot.index:05d}_{kind}.jpg"
-            _upload_to_r2(small, key, "image/jpeg")
-            base_keys[kind] = key
-        shot.keyframe_r2_key = base_keys.get("anchor")
-        shot.r2_keyframe_motion_key = base_keys.get("motion")
-        shot.r2_keyframe_variance_key = base_keys.get("variance")
-
-        row = conn.execute(
-            """
-            insert into shots (
-                file_id, shot_index, start_ms, end_ms,
-                keyframe_r2_key, r2_keyframe_motion_key, r2_keyframe_variance_key,
-                focus_score, brightness, motion_magnitude,
-                blur_min, peak_motion_ms, peak_variance_ms,
-                motion_dx, motion_dy
-            ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            returning id
-            """,
-            (
-                file_id, shot.index, shot.start_ms, shot.end_ms,
-                shot.keyframe_r2_key,
-                shot.r2_keyframe_motion_key,
-                shot.r2_keyframe_variance_key,
-                shot.focus_score, shot.brightness, shot.motion_magnitude,
-                shot.blur_min, shot.motion_ts_ms, shot.variance_ts_ms,
-                shot.motion_dx, shot.motion_dy,
-            ),
-        ).fetchone()
-        shot_id = row[0]
-
-        if not sk_ok:
-            continue
-
-        # Layer A: persist the full adaptive keyframe set. Base frames reuse the
-        # JPEGs uploaded above; coverage frames are uploaded under their own keys.
-        for frame_index, kf in enumerate(shot.keyframes):
-            if kf.kind in base_keys:
-                kf.r2_key = base_keys[kf.kind]
-            else:
-                if not kf.local_path or not os.path.exists(kf.local_path):
-                    continue
-                small = os.path.join(r2_dir, f"shot_{shot.index:05d}_{frame_index:02d}_cov.jpg")
-                if not kf_mod.downscale_for_storage(kf.local_path, small, target_size=224, quality=85):
-                    continue
-                key = f"keyframes/{file_id}/{shot.index:05d}_{frame_index:02d}_cov.jpg"
-                _upload_to_r2(small, key, "image/jpeg")
-                kf.r2_key = key
-            if not kf.r2_key:
-                continue
-            conn.execute(
-                """
-                insert into shot_keyframes (shot_id, frame_index, kind, ts_ms, r2_key, blur)
-                values (%s, %s, %s, %s, %s, %s)
-                on conflict (shot_id, frame_index) do update set
-                    kind = excluded.kind, ts_ms = excluded.ts_ms,
-                    r2_key = excluded.r2_key, blur = excluded.blur
-                """,
-                (shot_id, frame_index, kf.kind, kf.ts_ms, kf.r2_key, kf.blur),
-            )
-    return shots
-
-
-# --- Stage 4: SigLIP 2 embeddings ----------------------------------------
-
-def _stage4_embeddings(
-    file_id: str,
-    shots: List[shots_mod.Shot],
-    conn: psycopg.Connection,
-) -> None:
-    """
-    Compute SigLIP embeddings on all 3 keyframes per shot (anchor, motion,
-    variance) and store them. Also computes:
-      - intra_shot_variance = 1 - cosine(anchor, motion)  -> shots.intra_shot_variance
-    Inserts/upserts shot_embeddings; idempotent.
-
-    Reads keyframes from the in-memory shot list (full-res local paths
-    written during _stage3_shots). If those paths are gone (rare retry
-    case), falls back to skipping the shot.
-    """
-    cur = conn.execute(
-        """
-        select s.id, s.shot_index
-          from shots s
-          left join shot_embeddings se on se.shot_id = s.id
-         where s.file_id = %s and (se.shot_id is null or se.embedding_motion is null)
-         order by s.shot_index
-        """,
-        (file_id,),
-    )
-    pending_rows = cur.fetchall()
-    if not pending_rows:
-        return
-
-    by_idx = {s.index: s for s in shots}
-    # Build a flat list of (shot_id, kind, path) so we batch-encode all 3 frames
-    # of all pending shots in one SigLIP forward pass.
-    plan: List[tuple[str, int, str, str]] = []  # (shot_id, shot_index, kind, path)
-    for sid, sidx in pending_rows:
-        s = by_idx.get(sidx)
-        if not s:
-            continue
-        for kind, path in (
-            ("anchor", s.anchor_local_path),
-            ("motion", s.motion_local_path),
-            ("variance", s.variance_local_path),
-        ):
-            if path and os.path.exists(path):
-                plan.append((str(sid), sidx, kind, path))
-
-    if not plan:
-        return
-
-    vecs = emb_mod.embed_images([p for _, _, _, p in plan])
-    if vecs.shape[0] == 0:
-        return
-
-    # Index vectors back by (shot_id, kind)
-    by_shot: dict[str, dict[str, np.ndarray]] = {}
-    for (sid, _sidx, kind, _path), vec in zip(plan, vecs):
-        by_shot.setdefault(sid, {})[kind] = vec
-
-    for sid, vmap in by_shot.items():
-        anchor = vmap.get("anchor")
-        motion = vmap.get("motion")
-        variance = vmap.get("variance")
-        if anchor is None:
-            continue
-
-        conn.execute(
-            """
-            insert into shot_embeddings (shot_id, embedding, embedding_motion, embedding_variance)
-            values (%s, %s::halfvec, %s::halfvec, %s::halfvec)
-            on conflict (shot_id) do update set
-                embedding = excluded.embedding,
-                embedding_motion = excluded.embedding_motion,
-                embedding_variance = excluded.embedding_variance
-            """,
-            (
-                sid,
-                _vec_to_pg(anchor),
-                _vec_to_pg(motion) if motion is not None else None,
-                _vec_to_pg(variance) if variance is not None else None,
-            ),
-        )
-
-        # intra_shot_variance = 1 - cosine(anchor, motion). SigLIP outputs are
-        # already L2-normalized so we can compute cosine via a single dot product.
-        if motion is not None:
-            cos = float(np.clip(np.dot(anchor, motion), -1.0, 1.0))
-            intra_var = 1.0 - cos
-            conn.execute(
-                "update shots set intra_shot_variance = %s where id = %s",
-                (intra_var, sid),
-            )
-
-    _embed_shot_keyframes(file_id, shots, conn)
-
-
-def _embed_shot_keyframes(
-    file_id: str,
-    shots: List[shots_mod.Shot],
-    conn: psycopg.Connection,
-) -> None:
-    """Layer A: SigLIP-embed every shot_keyframes row that lacks an embedding.
-
-    Robust to retries: prefers the in-memory full-res frame, but falls back to
-    downloading the 224px JPEG from R2 by its stored key, so coverage frames get
-    embedded even when the indexing tmpdir is gone."""
-    if not _shot_keyframes_available(conn):
-        return
-    rows = conn.execute(
-        """
-        select sk.id, sk.r2_key
-          from shot_keyframes sk
-          join shots s on s.id = sk.shot_id
-         where s.file_id = %s and sk.embedding is null
-        """,
-        (file_id,),
-    ).fetchall()
-    if not rows:
-        return
-
-    local_by_key: dict[str, str] = {}
-    for s in shots:
-        for kf in s.keyframes:
-            if kf.r2_key and kf.local_path and os.path.exists(kf.local_path):
-                local_by_key[kf.r2_key] = kf.local_path
-
-    with tempfile.TemporaryDirectory() as dl_dir:
-        plan: List[tuple] = []  # (sk_id, path)
-        for sk_id, r2_key in rows:
-            path = local_by_key.get(r2_key)
-            if not path or not os.path.exists(path):
-                path = os.path.join(dl_dir, f"{sk_id}.jpg")
-                try:
-                    _download_from_r2(r2_key, path)
-                except Exception:
-                    logger.warning("Could not fetch keyframe %s for embedding", r2_key)
-                    continue
-            plan.append((sk_id, path))
-
-        if not plan:
-            return
-        vecs = emb_mod.embed_images([p for _, p in plan])
-        if vecs.shape[0] == 0:
-            return
-        for (sk_id, _path), vec in zip(plan, vecs):
-            conn.execute(
-                "update shot_keyframes set embedding = %s::halfvec where id = %s",
-                (_vec_to_pg(vec), sk_id),
-            )
 
 
 # --- Stage 5: audio features ---------------------------------------------
@@ -962,56 +675,12 @@ def l1_orchestrate(file_id: str, r2_key: str) -> None:
                     if "e" in demux_err:
                         raise demux_err["e"]
 
-                # Prefer the 1080p proxy for shot detection / keyframes /
-                # telemetry (much cheaper to decode than a 4K raw). It exists
-                # locally whenever the proxy stage ran in this invocation; on a
-                # rare retry where it doesn't, fall back to the raw file.
+                # Prefer the 1080p proxy for the motion pass (much cheaper to
+                # decode than a 4K raw). It exists locally whenever the proxy
+                # stage ran in this invocation; on a rare retry where it
+                # doesn't, fall back to the raw file.
                 proxy_local = os.path.join(tmpdir, "proxy.mp4")
-                shot_source = proxy_local if os.path.exists(proxy_local) else raw_path
-
-                shots_result = _run_stage(
-                    conn, file_id, "shots",
-                    _stage3_shots, file_id, shot_source, duration_s, tmpdir, conn,
-                )
-
-                # Re-hydrate shot list from disk so the embeddings stage can
-                # read keyframe paths even on retry. If the shots stage just
-                # ran in this invocation, prefer its in-memory list (paths
-                # are guaranteed valid); otherwise reconstruct from disk.
-                if shots_result is not None:
-                    shots_for_emb = shots_result
-                else:
-                    shots_for_emb = []
-                    kf_dir = os.path.join(tmpdir, "keyframes")
-                    cur = conn.execute(
-                        """
-                        select shot_index, start_ms, end_ms,
-                               keyframe_r2_key, r2_keyframe_motion_key, r2_keyframe_variance_key,
-                               peak_motion_ms, peak_variance_ms
-                          from shots where file_id = %s order by shot_index
-                        """,
-                        (file_id,),
-                    )
-                    for sidx, sms, ems, kkey_a, kkey_m, kkey_v, m_ts, v_ts in cur.fetchall():
-                        s = shots_mod.Shot(index=sidx, start_ms=sms, end_ms=ems)
-                        s.keyframe_r2_key = kkey_a
-                        s.r2_keyframe_motion_key = kkey_m
-                        s.r2_keyframe_variance_key = kkey_v
-                        s.motion_ts_ms = m_ts
-                        s.variance_ts_ms = v_ts
-                        s.anchor_ts_ms = (sms + ems) // 2  # best-effort fallback
-                        for kind, attr in (
-                            ("anchor", "anchor_local_path"),
-                            ("motion", "motion_local_path"),
-                            ("variance", "variance_local_path"),
-                        ):
-                            p = os.path.join(kf_dir, f"shot_{sidx:05d}_{kind}.jpg")
-                            if os.path.exists(p):
-                                setattr(s, attr, p)
-                        shots_for_emb.append(s)
-
-                _run_stage(conn, file_id, "embeddings",
-                           _stage4_embeddings, file_id, shots_for_emb, conn)
+                video_source = proxy_local if os.path.exists(proxy_local) else raw_path
 
                 if has_audio:
                     _run_stage(conn, file_id, "transcript",
@@ -1037,7 +706,7 @@ def l1_orchestrate(file_id: str, r2_key: str) -> None:
                 # Motion dynamics (action + camera/distortion): one optical-flow
                 # pass over the proxy. Video-only -- runs even on silent files.
                 _run_stage(conn, file_id, "motion_dynamics",
-                           _stage9_motion_dynamics, file_id, shot_source, duration_s, conn)
+                           _stage9_motion_dynamics, file_id, video_source, duration_s, conn)
 
         _set_l1_status(file_id, "ready")
         logger.info("L1 complete for %s", file_id)
@@ -1047,6 +716,14 @@ def l1_orchestrate(file_id: str, r2_key: str) -> None:
             logger.info("L1 analysis written to %s", log_path)
         except Exception:
             logger.exception("L1 succeeded but writing the audit log failed for %s", file_id)
+
+        # L2 (Gemini perception) runs as its own task so a VLM hiccup retries
+        # independently of the L1 index. Gated by duration inside the enqueue.
+        try:
+            from app.services.l2.perception import enqueue_l2_if_eligible
+            enqueue_l2_if_eligible(file_id, duration_s)
+        except Exception:
+            logger.exception("L1 done but enqueuing L2 failed for %s", file_id)
     except psycopg.errors.ForeignKeyViolation:
         # The files row was deleted while we were processing it -- the inserts
         # have nowhere to land. Stop cleanly instead of failing + retrying.

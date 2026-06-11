@@ -35,7 +35,6 @@ export function DriveContent({ onFileContextMenu, onFolderContextMenu }: DriveCo
     loading,
     selectedIds,
     searchQuery,
-    aiPanelOpen,
     toggleSelected,
     removeFile,
   } = useDriveStore();
@@ -122,7 +121,6 @@ export function DriveContent({ onFileContextMenu, onFolderContextMenu }: DriveCo
           files={visibleFiles}
           selectedIds={selectedIds}
           deletingId={deletingId}
-          compact={aiPanelOpen}
           onToggleSelect={toggleSelected}
           onNavigate={(id) => router.push(`/drive/folder/${id}`)}
           onOpenFile={(id) => router.push(`/file/${id}`)}

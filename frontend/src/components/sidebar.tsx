@@ -2,13 +2,11 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { FolderClosed, Clock, Trash2, Star, Sparkles, ScrollText, Clapperboard } from "lucide-react";
+import { FolderClosed, Clock, Trash2, Star, ScrollText } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const NAV_ITEMS = [
   { label: "My Drive", href: "/drive", icon: FolderClosed },
-  { label: "AI Rough Cut", href: "/edit", icon: Sparkles },
-  { label: "Edits", href: "/edits", icon: Clapperboard },
   { label: "Logs", href: "/logs", icon: ScrollText },
   { label: "Recent", href: "/drive/recent", icon: Clock },
   { label: "Starred", href: "/drive/starred", icon: Star },

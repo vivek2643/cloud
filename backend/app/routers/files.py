@@ -139,57 +139,6 @@ def get_download_url(
     return {"url": url}
 
 
-@router.get("/{file_id}/shots")
-def get_file_shots(
-    file_id: str,
-    user_id: str = Depends(get_current_user_id),
-):
-    """
-    Return the ordered shot list for a file plus its total duration in ms.
-
-    Used by the editor when a whole raw file is dropped onto the timeline: the
-    client expands the file into its constituent shots (each carrying a real
-    shot_id) and coalesces the contiguous span back into a single clip, so the
-    dropped file is committable to the EDL and renders as one continuous segment.
-    """
-    sb = get_supabase()
-    f = (
-        sb.table("files")
-        .select("id, duration_seconds")
-        .eq("id", file_id)
-        .eq("user_id", user_id)
-        .execute()
-    )
-    if not f.data:
-        raise HTTPException(status_code=404, detail="File not found")
-
-    rows = (
-        sb.table("shots")
-        .select("id, shot_index, start_ms, end_ms")
-        .eq("file_id", file_id)
-        .order("shot_index")
-        .execute()
-    )
-    shots = [
-        {
-            "shot_id": str(r["id"]),
-            "shot_index": r.get("shot_index"),
-            "start_ms": r.get("start_ms"),
-            "end_ms": r.get("end_ms"),
-        }
-        for r in (rows.data or [])
-    ]
-
-    duration_ms: Optional[int] = None
-    dur_s = f.data[0].get("duration_seconds")
-    if dur_s is not None:
-        duration_ms = int(round(float(dur_s) * 1000))
-    elif shots:
-        duration_ms = max((s["end_ms"] or 0) for s in shots)
-
-    return {"file_id": file_id, "duration_ms": duration_ms, "shots": shots}
-
-
 @router.get("/{file_id}/l1")
 def get_l1_index(
     file_id: str,
@@ -197,7 +146,7 @@ def get_l1_index(
 ):
     """
     Return the full L1 analysis for a file as one JSON document
-    (file row + transcript + shots + audio_features + processing_jobs + summary).
+    (file row + transcript + audio_features + cut grids + processing_jobs + summary).
 
     The same payload also lives on disk at backend/logs/l1/<file_id>.json.
     """
