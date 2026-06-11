@@ -94,11 +94,17 @@ class AnthropicClient:
         max_tokens: int = 2048,
         cache_system: bool = False,
         thinking_budget: int = 0,
+        effort: Optional[str] = None,
     ) -> LLMResponse:
-        """`thinking_budget` > 0 enables extended thinking with that token
-        budget. Thinking blocks are carried through the neutral assistant
-        message verbatim (Anthropic requires them to be replayed unmodified on
-        the next request of a tool-use loop)."""
+        """`thinking_budget` > 0 enables extended thinking. Modern Opus models
+        (4.7/4.8+) only accept *adaptive* thinking -- the model decides how much
+        to think -- with reasoning depth steered by `effort`
+        (low|medium|high|xhigh|max) instead of a manual token budget. We map any
+        positive `thinking_budget` to adaptive thinking for forward-compat.
+
+        Thinking blocks are carried through the neutral assistant message
+        verbatim (Anthropic requires them to be replayed unmodified on the next
+        request of a tool-use loop)."""
         client = _sdk_client()
 
         kwargs: Dict[str, Any] = {
@@ -107,7 +113,11 @@ class AnthropicClient:
             "messages": _messages_to_anthropic(messages),
         }
         if thinking_budget > 0:
-            kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
+            kwargs["thinking"] = {"type": "adaptive"}
+        if effort:
+            # `output_config` is a top-level field not yet typed by this SDK
+            # version; inject it into the request body directly.
+            kwargs["extra_body"] = {"output_config": {"effort": effort}}
 
         # System prompt, optionally cached as a stable prefix.
         if system:

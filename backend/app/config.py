@@ -77,8 +77,12 @@ class Settings(BaseSettings):
     # Guardrails so the inner reason->tool loop is always bounded.
     l3_max_iterations: int = 40
     l3_max_output_tokens: int = 16384
-    # Extended-thinking budget per call (0 disables thinking).
+    # Extended-thinking toggle: > 0 enables adaptive thinking on the model
+    # (modern Opus ignores the exact number; depth is steered by effort below).
     l3_thinking_budget_tokens: int = 8192
+    # Reasoning depth for adaptive thinking: low|medium|high|xhigh|max.
+    # "high" is the default; "xhigh" is recommended for heavy agentic loops.
+    l3_effort: str = "high"
     # Prompt caching on the stable system/tools/catalog prefix (Anthropic only);
     # this is what makes a many-iteration Opus loop affordable.
     llm_prompt_caching: bool = True

@@ -121,7 +121,17 @@ def load_messages(thread_id: str) -> List[Dict[str, Any]]:
         ).fetchall()
     out: List[Dict[str, Any]] = []
     for role, content in rows:
-        c = content if not isinstance(content, str) else json.loads(content)
+        # psycopg returns jsonb already parsed: a plain user brief comes back as
+        # a str (the literal message text), assistant/tool turns as a list of
+        # blocks. Only re-parse if a driver handed us serialized JSON text for a
+        # container; never json.loads a bare string (it's the message itself).
+        if isinstance(content, str) and content[:1] in ("[", "{"):
+            try:
+                c: Any = json.loads(content)
+            except json.JSONDecodeError:
+                c = content
+        else:
+            c = content
         out.append({"role": role, "content": c})
     return out
 

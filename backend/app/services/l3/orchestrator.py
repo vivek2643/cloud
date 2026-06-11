@@ -132,6 +132,7 @@ def run_thread(thread_id: str) -> None:
             max_tokens=settings.l3_max_output_tokens,
             cache_system=True,
             thinking_budget=settings.l3_thinking_budget_tokens,
+            effort=settings.l3_effort,
         )
         messages.append(resp.assistant_message)
         store.append_turn(thread_id, "assistant", resp.assistant_message["content"], resp.usage)
