@@ -28,6 +28,7 @@ from app.services.l1 import beat_cost as beat_mod
 from app.services.l1 import cut_cost as cutcost_mod
 from app.services.l1 import diarization as diar_mod
 from app.services.l1 import motion_dynamics as motion_mod
+from app.services.l1 import music_structure as music_mod
 from app.services.l1 import transcript as tr_mod
 from app.services.l1.snapshot import build_l1_snapshot
 from app.services.processing import _download_from_r2, _probe_video, _upload_to_r2
@@ -36,6 +37,8 @@ from app.services.supabase_client import get_supabase
 logger = logging.getLogger(__name__)
 
 STAGES = ("proxy", "transcript", "audio_features", "diarization", "dialogue_cut", "beat_cut", "motion_dynamics")
+# Audio-only uploads (music) run a different, video-free set of stages.
+AUDIO_STAGES = ("audio_proxy", "audio_features", "beat_cut", "music_structure")
 
 
 def _pg_conn() -> psycopg.Connection:
@@ -94,6 +97,19 @@ def _stage_fail(conn: psycopg.Connection, file_id: str, stage: str, err: str) ->
 def _set_l1_status(file_id: str, status: str) -> None:
     sb = get_supabase()
     sb.table("files").update({"l1_status": status}).eq("id", file_id).execute()
+
+
+def _file_type(file_id: str) -> Optional[str]:
+    """Read the file's classified type ('video' | 'audio' | ...) so the
+    orchestrator can pick the right (video vs audio-only) pipeline."""
+    try:
+        with _pg_conn() as conn:
+            row = conn.execute(
+                "select file_type from files where id = %s", (file_id,)
+            ).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
 
 
 def _file_exists(file_id: str) -> bool:
@@ -301,6 +317,124 @@ def _demux_wav(raw_path: str, out_path: str) -> None:
             out_path,
         ],
         check=True, capture_output=True, timeout=FFMPEG_TIMEOUT_S,
+    )
+
+
+def _demux_music_wav(raw_path: str, out_path: str) -> None:
+    """22.05 kHz mono wav for the musical-structure pass (chroma/segmentation
+    want more bandwidth than the 16k speech wav)."""
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", raw_path,
+            "-ac", "1", "-ar", str(music_mod.MUSIC_SR),
+            "-c:a", "pcm_s16le",
+            out_path,
+        ],
+        check=True, capture_output=True, timeout=FFMPEG_TIMEOUT_S,
+    )
+
+
+# --- Audio-only (music) stages -------------------------------------------
+
+# Waveform thumbnail dimensions (also stored as the file's width/height so the
+# grid has something to lay out).
+_WAVEFORM_W = 1280
+_WAVEFORM_H = 320
+
+
+def _stage_audio_proxy(file_id: str, raw_path: str, tmpdir: str) -> float:
+    """Music upload: normalized AAC proxy for browser playback + a waveform PNG
+    thumbnail. Flips the file to 'ready'. Returns duration (s)."""
+    sb = get_supabase()
+    proxy_path = os.path.join(tmpdir, "proxy.m4a")
+    thumb_path = os.path.join(tmpdir, "waveform.png")
+
+    probe = _probe_video(raw_path)
+    duration = float(probe.get("format", {}).get("duration", 0) or 0)
+    has_audio = any(s.get("codec_type") == "audio" for s in probe.get("streams", []))
+    if not has_audio:
+        raise ValueError("Uploaded audio file contains no decodable audio stream")
+
+    ok, err = _run_ffmpeg([
+        "ffmpeg", "-y", "-i", raw_path,
+        "-vn", "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart",
+        proxy_path,
+    ])
+    if not ok:
+        raise RuntimeError(f"Audio proxy encode failed: {err!r}")
+    proxy_key = f"proxies/{file_id}/proxy.m4a"
+    _upload_to_r2(proxy_path, proxy_key, "audio/mp4")
+
+    # Waveform image as the thumbnail (best-effort -- a missing thumb shouldn't
+    # fail ingest).
+    thumb_key = None
+    wf_ok, _ = _run_ffmpeg([
+        "ffmpeg", "-y", "-i", raw_path,
+        "-filter_complex",
+        f"aformat=channel_layouts=mono,showwavespic=s={_WAVEFORM_W}x{_WAVEFORM_H}:colors=#7c5cff",
+        "-frames:v", "1", thumb_path,
+    ])
+    if wf_ok and os.path.exists(thumb_path):
+        thumb_key = f"thumbnails/{file_id}/waveform.png"
+        _upload_to_r2(thumb_path, thumb_key, "image/png")
+
+    update = {
+        "r2_proxy_key": proxy_key,
+        "duration_seconds": duration,
+        "width": _WAVEFORM_W,
+        "height": _WAVEFORM_H,
+        "status": "ready",
+    }
+    if thumb_key:
+        update["r2_thumbnail_key"] = thumb_key
+    sb.table("files").update(update).eq("id", file_id).execute()
+    return duration
+
+
+def _stage_music_structure(
+    file_id: str, music_wav: str, duration_s: float, conn: psycopg.Connection
+) -> None:
+    """Persist the deep musical-structure analysis (bar/downbeat grid, sections,
+    energy envelope, key, phrase cut grid). Best-effort columns: a failed
+    sub-feature is stored empty by the analyzer."""
+    ms = music_mod.compute_music_structure(
+        music_wav, duration_ms=int((duration_s or 0) * 1000)
+    )
+    if not ms.has_music:
+        return
+    conn.execute(
+        """
+        insert into music_structure (
+            file_id, bpm, music_key, beat_times_ms, downbeat_times_ms,
+            sections, energy_hop_ms, energy,
+            phrase_cut_hop_ms, phrase_cut_cost, phrase_cut_points
+        ) values (%s, %s, %s, %s::jsonb, %s::jsonb,
+                  %s::jsonb, %s, %s::jsonb,
+                  %s, %s::jsonb, %s::jsonb)
+        on conflict (file_id) do update set
+            bpm               = excluded.bpm,
+            music_key         = excluded.music_key,
+            beat_times_ms     = excluded.beat_times_ms,
+            downbeat_times_ms = excluded.downbeat_times_ms,
+            sections          = excluded.sections,
+            energy_hop_ms     = excluded.energy_hop_ms,
+            energy            = excluded.energy,
+            phrase_cut_hop_ms = excluded.phrase_cut_hop_ms,
+            phrase_cut_cost   = excluded.phrase_cut_cost,
+            phrase_cut_points = excluded.phrase_cut_points
+        """,
+        (
+            file_id, ms.bpm, ms.key,
+            json.dumps(ms.beat_times_ms), json.dumps(ms.downbeat_times_ms),
+            json.dumps(ms.sections), ms.energy_hop_ms, json.dumps(ms.energy),
+            ms.phrase_cut_hop_ms, json.dumps(ms.phrase_cut_cost),
+            json.dumps(ms.phrase_cut_points),
+        ),
+    )
+    logger.info(
+        "Music structure: %s -> bpm=%.1f key=%s sections=%d downbeats=%d",
+        file_id, ms.bpm, ms.key, len(ms.sections), len(ms.downbeat_times_ms),
     )
 
 
@@ -602,18 +736,88 @@ def _run_stage(
         raise
 
 
+# --- Audio-only (music) orchestrator -------------------------------------
+
+def _orchestrate_audio(file_id: str, r2_key: str, settings) -> None:
+    """L1 for a standalone music/audio upload. No video proxy, no motion, no
+    speech tools, no L2 (Gemini video perception). Runs: playable proxy +
+    waveform thumb, audio_features (loudness/BPM/onsets), beat cut grid, and the
+    deep musical-structure pass. Stages are idempotent via processing_jobs."""
+    _set_l1_status(file_id, "running")
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_path = os.path.join(tmpdir, "raw")
+            wav_path = os.path.join(tmpdir, "audio.wav")        # 16k for features
+            music_wav = os.path.join(tmpdir, "music.wav")        # 22.05k for structure
+            logger.info("L1(audio): downloading %s for file %s", r2_key, file_id)
+            _download_from_r2(r2_key, raw_path)
+
+            with _pg_conn() as conn:
+                duration = _run_stage(
+                    conn, file_id, "audio_proxy",
+                    _stage_audio_proxy, file_id, raw_path, tmpdir,
+                )
+                cur = conn.execute(
+                    "select duration_seconds from files where id = %s", (file_id,)
+                )
+                row = cur.fetchone()
+                duration_s = float(row[0]) if row and row[0] else float(duration or 0.0)
+
+                if duration_s > settings.max_l1_duration_seconds:
+                    logger.info(
+                        "Audio %.1fs > guardrail %ds; proxy kept, deep stages skipped",
+                        duration_s, settings.max_l1_duration_seconds,
+                    )
+                    _set_l1_status(file_id, "skipped")
+                    return
+
+                _demux_wav(raw_path, wav_path)
+                _demux_music_wav(raw_path, music_wav)
+
+                _run_stage(conn, file_id, "audio_features",
+                           _stage5_audio, file_id, wav_path, conn)
+                _run_stage(conn, file_id, "beat_cut",
+                           _stage8_beat_cut, file_id, duration_s, conn)
+                _run_stage(conn, file_id, "music_structure",
+                           _stage_music_structure, file_id, music_wav, duration_s, conn)
+
+        _set_l1_status(file_id, "ready")
+        logger.info("L1(audio) complete for %s", file_id)
+        try:
+            snapshot = build_l1_snapshot(file_id)
+            log_path = audit_log.write_l1_analysis(file_id, snapshot)
+            logger.info("L1(audio) analysis written to %s", log_path)
+        except Exception:
+            logger.exception("L1(audio) done but writing the audit log failed for %s", file_id)
+    except psycopg.errors.ForeignKeyViolation:
+        logger.info("File %s deleted mid-L1(audio); abandoning cleanly.", file_id)
+        return
+    except Exception:
+        if not _file_exists(file_id):
+            logger.info("File %s deleted mid-L1(audio); abandoning cleanly.", file_id)
+            return
+        logger.exception("L1(audio) failed for %s", file_id)
+        _set_l1_status(file_id, "failed")
+        raise
+
+
 # --- Top-level procrastinate task ----------------------------------------
 
 @app.task(name="l1_orchestrate", queue="gpu", retry=RetryStrategy(max_attempts=3, exponential_wait=4))
 def l1_orchestrate(file_id: str, r2_key: str) -> None:
     """
-    Single procrastinate task that downloads the raw video once and runs all
-    five L1 stages. Idempotent: each stage checks processing_jobs first.
+    Single procrastinate task that downloads the raw media once and runs the L1
+    stages. Branches by file_type: audio uploads run the video-free music path.
+    Idempotent: each stage checks processing_jobs first.
     """
     settings = get_settings()
 
     if not _file_exists(file_id):
         logger.info("File %s no longer exists; skipping L1 (likely deleted/aborted).", file_id)
+        return
+
+    if _file_type(file_id) == "audio":
+        _orchestrate_audio(file_id, r2_key, settings)
         return
 
     _set_l1_status(file_id, "running")

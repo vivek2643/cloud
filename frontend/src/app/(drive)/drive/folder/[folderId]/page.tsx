@@ -11,7 +11,9 @@ import { CreateFolderDialog } from "@/components/create-folder-dialog";
 import { SearchEditBar } from "@/components/search-edit-bar";
 import { FolderPlus, Upload } from "lucide-react";
 
-const VIDEO_EXTENSIONS = ".mp4,.mov,.avi,.mkv,.webm,.m4v,.wmv,.flv,.mxf,.mts";
+const VIDEO_EXTENSIONS =
+  ".mp4,.mov,.avi,.mkv,.webm,.m4v,.wmv,.flv,.mxf,.mts," +
+  ".mp3,.wav,.m4a,.aac,.flac,.ogg,.oga,.opus,.wma,.aiff";
 
 export default function FolderPage({ params }: { params: Promise<{ folderId: string }> }) {
   const { folderId } = use(params);

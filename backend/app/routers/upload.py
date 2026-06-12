@@ -107,13 +107,16 @@ def _enqueue_l1(file_id: str, r2_key: str) -> bool:
 
 
 def _finalize_upload(sb, file_record: dict) -> dict:
-    """Flip an uploaded file to processing/ready and enqueue L1 for videos.
-    Shared by the single-PUT and multipart completion paths."""
-    new_status = "processing" if file_record["file_type"] == "video" else "ready"
+    """Flip an uploaded file to processing/ready and enqueue L1.
+    Shared by the single-PUT and multipart completion paths. Both video and
+    audio get analyzed (audio runs the video-free music path); everything else
+    is immediately ready with no analysis."""
+    analyzable = file_record["file_type"] in ("video", "audio")
+    new_status = "processing" if analyzable else "ready"
     result = (
         sb.table("files").update({"status": new_status}).eq("id", file_record["id"]).execute()
     )
-    if new_status == "processing":
+    if analyzable:
         _enqueue_l1(file_record["id"], file_record["r2_key"])
     return result.data[0]
 

@@ -15,6 +15,7 @@ import {
 
 const VIDEO_ACCEPT = {
   "video/*": [".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv", ".mxf", ".mts"],
+  "audio/*": [".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".oga", ".opus", ".wma", ".aiff"],
 };
 
 // R2's single presigned PUT caps at 5 GiB; route anything large through

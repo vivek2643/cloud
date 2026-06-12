@@ -10,7 +10,9 @@ import { CreateFolderDialog } from "@/components/create-folder-dialog";
 import { SearchEditBar } from "@/components/search-edit-bar";
 import { FolderPlus, Upload, Layers, Crosshair, Star, X } from "lucide-react";
 
-const VIDEO_EXTENSIONS = ".mp4,.mov,.avi,.mkv,.webm,.m4v,.wmv,.flv,.mxf,.mts";
+const VIDEO_EXTENSIONS =
+  ".mp4,.mov,.avi,.mkv,.webm,.m4v,.wmv,.flv,.mxf,.mts," +
+  ".mp3,.wav,.m4a,.aac,.flac,.ogg,.oga,.opus,.wma,.aiff";
 
 type Tab = "versioned" | "crux" | "highlights";
 

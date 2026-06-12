@@ -27,7 +27,8 @@ def _row_to_dict(row) -> Optional[Dict[str, Any]]:
 
 
 _L1_STAGES = ("proxy", "transcript", "audio_features", "diarization",
-              "dialogue_cut", "beat_cut", "motion_dynamics")
+              "dialogue_cut", "beat_cut", "motion_dynamics",
+              "audio_proxy", "music_structure")
 
 
 def _iso(v) -> Optional[str]:
@@ -204,6 +205,35 @@ def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
                 "camera_cut_cost": md["camera_cut_cost"] or [],
                 "action_points": md["action_points"] or [],
                 "action_point_count": len(md["action_points"] or []),
+            }
+
+        # Music structure (audio-only uploads) -- own table, music-derived.
+        cur = conn.execute(
+            """
+            select bpm, music_key, beat_times_ms, downbeat_times_ms,
+                   sections, energy_hop_ms, energy,
+                   phrase_cut_hop_ms, phrase_cut_cost, phrase_cut_points
+              from music_structure where file_id = %s
+            """,
+            (file_id,),
+        )
+        mus = cur.fetchone()
+        if mus:
+            out["music_structure"] = {
+                "bpm": mus["bpm"],
+                "key": mus["music_key"],
+                "beat_count": len(mus["beat_times_ms"] or []),
+                "downbeat_times_ms": mus["downbeat_times_ms"] or [],
+                "downbeat_count": len(mus["downbeat_times_ms"] or []),
+                "sections": mus["sections"] or [],
+                "section_count": len(mus["sections"] or []),
+                "energy_hop_ms": mus["energy_hop_ms"],
+                "energy": mus["energy"] or [],
+                # Phrase cut grid (0=on a downbeat/section boundary .. 1=avoid).
+                "phrase_cut_hop_ms": mus["phrase_cut_hop_ms"],
+                "phrase_cut_cost": mus["phrase_cut_cost"] or [],
+                "phrase_cut_points": mus["phrase_cut_points"] or [],
+                "phrase_cut_point_count": len(mus["phrase_cut_points"] or []),
             }
 
         # Per-stage processing job rows
