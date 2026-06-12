@@ -17,9 +17,10 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from app.services.l3 import engine
+from app.services.l3 import engine, score_span
 from app.services.l3.catalog import ClipSummary
 from app.services.l3.engine import ClipGrids
+from app.services.l3.takes import TakeGroup
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ class EditSession:
     file_ids: List[str]
     catalog: List[ClipSummary]
     document: Dict[str, Any] = field(default_factory=dict)
+    take_groups: List[TakeGroup] = field(default_factory=list)
     _grids: Dict[str, ClipGrids] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -205,6 +207,18 @@ TOOL_SPECS: List[dict] = [
             "tolerance_ms": {"type": "integer", "description": "default 500"},
         },
         ["target_s"],
+    ),
+    _spec(
+        "compare_takes",
+        "When the same content was delivered more than once (see TAKE GROUPS in "
+        "the catalog), get an objective, span-level scorecard for every competing "
+        "take so you can choose the best one. Returns per-take metrics (word pace, "
+        "fillers, pauses, gaze-to-camera, loudness) plus the perception's localized "
+        "quality notes (energy/fluency/naturalness/technical). The choice is YOURS: "
+        "weight the metrics by the brief (polished ad -> fluency; raw/authentic -> "
+        "energy, stop penalizing imperfection), then add_segment the winner's span.",
+        {"group_id": {"type": "string", "description": "a take-group id from the catalog, e.g. 'tg1'"}},
+        ["group_id"],
     ),
     _spec(
         "ask_user",
@@ -378,6 +392,30 @@ def _execute(session: EditSession, name: str, args: Dict[str, Any]) -> str:
         idx = max(0, min(int(args["new_index"]), len(doc["timeline"])))
         doc["timeline"].insert(idx, seg)
         return _j({"ok": True, "order": [s["seg_id"] for s in doc["timeline"]]})
+
+    if name == "compare_takes":
+        gid = args.get("group_id")
+        group = next((g for g in session.take_groups if g.group_id == gid), None)
+        if group is None:
+            return _j({
+                "error": "unknown group_id",
+                "available": [g.group_id for g in session.take_groups],
+            })
+        sources = score_span.load_sources(list({a.file_id for a in group.attempts}))
+        takes_out = []
+        for a in group.attempts:
+            src = sources.get(a.file_id)
+            takes_out.append({
+                "attempt_id": a.attempt_id,
+                "file_id": a.file_id,
+                "in_ms": a.start_ms,
+                "out_ms": a.end_ms,
+                "is_retry": a.is_restart,
+                "text": a.text,
+                "metrics": score_span.score_span(src, a.start_ms, a.end_ms) if src else {},
+                "quality_notes": score_span.quality_events_in(src, a.start_ms, a.end_ms) if src else [],
+            })
+        return _j({"group_id": gid, "content_key": group.content_key, "takes": takes_out})
 
     if name == "timeline_status":
         return _j(engine.timeline_status(doc["timeline"]))

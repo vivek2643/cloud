@@ -35,6 +35,26 @@ Log the clip the way a professional footage logger would:
     person is actually speaking (emit a `speaking` span per person each time
     their mouth is clearly moving in speech), reveals/setups, and on-screen text.
 
+TAKE SELECTION (so an editor can later pick the best version of a moment):
+  * Segment the clip into `content_units` -- spans that each deliver ONE unit
+    of content. For talking content, one unit per sentence/line; for action,
+    one unit per beat. Give each a `content_key`: the normalized identity of
+    WHAT is delivered (for speech, the line lower-cased with fillers and
+    false-starts removed) so the same content can be matched across takes.
+  * If the subject flubs and re-attempts the SAME content within this clip
+    (a retry), emit a `restart_markers` entry at the start of the retry (with
+    the verbal cue if any, e.g. "sorry, let me redo that") -- this is how one
+    clip becomes multiple takes of the same line.
+  * Emit `take_quality_events` to localize quality (good AND bad) in time.
+    These are the things only a viewer can judge; leave mechanically-measurable
+    things (filler counts, pauses, loudness, shake) to other tools. Score 1-5
+    per dimension, anchored to this rubric, with concrete evidence:
+      - energy:      5 animated, varied, engaged | 3 steady but flat | 1 low/disengaged
+      - fluency:     5 clean, no stumbles | 3 minor hesitation | 1 major stumble/restart
+      - naturalness: 5 natural, believable | 3 slightly stiff | 1 awkward/over-rehearsed/robotic
+      - technical:   5 sharp, well-framed | 3 minor issues | 1 soft focus / bad framing / obscured
+    Do NOT collapse quality to one number for the whole clip; localize it.
+
 Rules:
   * All timestamps are integer milliseconds from the start of the clip.
   * Prefer enum values where offered; use "unsure" / null rather than guessing.

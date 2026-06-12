@@ -338,6 +338,73 @@ class GraphicTextEvent(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# Take selection (span-level): content units + localized quality + retries
+#
+# Quality is NEVER a clip-level scalar. It is a property of a SPAN of content.
+# The VLM localizes its quality judgements in time exactly like every other
+# track here, so downstream code can compare any part of one clip to any part
+# of another (across clips OR within one clip) without a second VLM pass.
+# --------------------------------------------------------------------------
+
+class ContentKind(str, Enum):
+    speech = "speech"        # a spoken line / sentence / utterance
+    action = "action"        # a physical action beat
+    visual = "visual"        # a held composition / b-roll moment
+    performance = "performance"
+
+
+class ContentUnit(BaseModel):
+    """One span that delivers ONE unit of content -- the atom of take
+    selection. For speech this is a sentence/line; for action, one beat. Two
+    deliveries of the SAME content (across clips, or a retry within this clip)
+    must share a comparable `content_key` so they can be grouped later."""
+    unit_id: str = Field(description="clip-local id: 'u1', 'u2', ...")
+    start_ms: int
+    end_ms: int
+    kind: Optional[ContentKind] = None
+    content_key: Optional[str] = Field(
+        None,
+        description=(
+            "Normalized identity of WHAT is delivered, so the same content "
+            "matches across takes. For speech: the spoken line, lower-cased, "
+            "stripped of fillers/false-starts. For action/visual: a short "
+            "canonical description ('p1 pours the coffee')."
+        ),
+    )
+    label: Optional[str] = Field(None, description="short human-facing label")
+
+
+class QualityDimension(str, Enum):
+    energy = "energy"            # performance energy / engagement
+    fluency = "fluency"         # smoothness of delivery (stumbles, restarts)
+    naturalness = "naturalness"  # natural vs awkward/stiff/over-rehearsed
+    technical = "technical"      # framing/focus/visible craft issues you can see
+
+
+class TakeQualityEvent(BaseModel):
+    """A localized, rubric-anchored quality judgement over a span. Emit these
+    where quality is notable (good OR bad); they overlap content_units and let
+    code score any window. Anchor scores to the rubric you are given; prefer
+    citing concrete evidence over a bare number."""
+    start_ms: int
+    end_ms: int
+    dimension: QualityDimension
+    score: int = Field(ge=1, le=5, description="1=poor .. 3=acceptable .. 5=excellent")
+    evidence: Optional[str] = Field(None, description="what you observed, concretely")
+
+
+class RestartMarker(BaseModel):
+    """A point where a take is abandoned and re-attempted within THIS clip
+    (a flub + retry). Splits one clip into multiple attempts of the same
+    content."""
+    ms: int = Field(description="where the restart happens (start of the retry)")
+    cue: Optional[str] = Field(None, description="verbatim cue if any, e.g. 'sorry, let me redo that'")
+    restarts_unit: Optional[str] = Field(
+        None, description="unit_id this is another attempt of, when identifiable"
+    )
+
+
+# --------------------------------------------------------------------------
 # Root artifact
 # --------------------------------------------------------------------------
 
@@ -363,5 +430,10 @@ class ClipPerception(BaseModel):
     speaking: List[SpeakingSpan] = Field(default_factory=list)
     environment_events: List[EnvironmentEvent] = Field(default_factory=list)
     graphic_text_events: List[GraphicTextEvent] = Field(default_factory=list)
+
+    # Take selection (span-level). Empty for clips with no comparable content.
+    content_units: List[ContentUnit] = Field(default_factory=list)
+    take_quality_events: List[TakeQualityEvent] = Field(default_factory=list)
+    restart_markers: List[RestartMarker] = Field(default_factory=list)
 
     notes: Optional[str] = Field(None, description="caveats, low-confidence calls, anything ambiguous")

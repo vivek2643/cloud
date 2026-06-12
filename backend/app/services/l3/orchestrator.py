@@ -24,6 +24,7 @@ from app.config import get_settings
 from app.services.jobs import app
 from app.services.l3 import store
 from app.services.l3.catalog import build_catalog, render_catalog_text
+from app.services.l3.takes import build_take_groups, render_take_groups_text
 from app.services.l3.tools import TERMINAL_TOOLS, TOOL_SPECS, EditSession, execute_tool
 from app.services.llm.anthropic_client import AnthropicClient
 from app.services.llm.base import tool_result_block, user_message
@@ -76,17 +77,26 @@ segments, then finalize again.
 STYLE OF THE CUT:
 - Respect the grain of the footage: cut dialogue at sentence/turn seams, action on impacts, \
 music on beats. Enter scenes as late as possible, leave as early as possible. Vary segment \
-lengths; monotony reads as machine-made. If two takes cover one beat, choose the one whose log \
-shows the cleaner reaction/face/camera -- and say so in the rationale.
+lengths; monotony reads as machine-made.
+- TAKES: when the same content was delivered more than once (a retake, or a flub-then-retry \
+inside one clip), they appear as TAKE GROUPS below. Call compare_takes to get an objective \
+scorecard for each alternative, weight it by the brief (polished -> fluency/clean; raw -> \
+energy/authenticity), pick the strongest span, and say why in the rationale. Don't eyeball it \
+from the logline.
 
 CLIP CATALOG (scope for this thread):
 {catalog}
+
+{take_groups}
 """
 
 
-def _build_system_prompt(file_ids: List[str]) -> str:
-    catalog = build_catalog(file_ids)
-    return SYSTEM_PROMPT_TEMPLATE.format(catalog=render_catalog_text(catalog))
+def _render_system_prompt(catalog, take_groups) -> str:
+    tg_text = render_take_groups_text(take_groups)
+    return SYSTEM_PROMPT_TEMPLATE.format(
+        catalog=render_catalog_text(catalog),
+        take_groups=tg_text or "(no repeated-content take groups detected)",
+    )
 
 
 # --------------------------------------------------------------------------
@@ -104,7 +114,12 @@ def run_thread(thread_id: str) -> None:
 
     store.set_thread_status(thread_id, "drafting")
 
-    system = _build_system_prompt(thread["file_ids"])
+    # Built once from the DB; shared by the (cacheable) system prompt and the
+    # tool session so the catalog/take-groups are computed a single time.
+    catalog = build_catalog(thread["file_ids"])
+    take_groups = build_take_groups(thread["file_ids"])
+
+    system = _render_system_prompt(catalog, take_groups)
     messages = store.load_messages(thread_id)
     if not messages:
         logger.error("L3: thread %s has no messages; nothing to do.", thread_id)
@@ -113,11 +128,11 @@ def run_thread(thread_id: str) -> None:
 
     # Resume the working document from the latest snapshot (empty on first run).
     doc, _version = store.latest_document(thread_id)
-    catalog = build_catalog(thread["file_ids"])
     session = EditSession(
         thread_id=thread_id,
         file_ids=thread["file_ids"],
         catalog=catalog,
+        take_groups=take_groups,
         document=doc or {},
     )
 
