@@ -42,6 +42,7 @@ class EditSession:
 
     def __post_init__(self) -> None:
         self.document.setdefault("brief", {})
+        self.document.setdefault("spine", None)
         self.document.setdefault("outline", [])
         self.document.setdefault("timeline", [])
         self.document.setdefault("open_questions", [])
@@ -122,6 +123,73 @@ TOOL_SPECS: List[dict] = [
             "assumptions": {"type": "array", "items": {"type": "string"}},
         },
         ["goal"],
+    ),
+    _spec(
+        "set_spine",
+        "Declare the EDIT SPINE before building the timeline: the load-bearing "
+        "through-line every other choice serves. It names, per time-ordered "
+        "region, which channel is LOCKED (irreplaceable) vs FREE (coverable / "
+        "scoreable). Decoupling A/V is the privileged move -- default to "
+        "kind='sync' (both locked, atomic) unless the brief or footage justifies "
+        "freeing a channel. kinds: dialogue (audio locked, video free -> B-roll "
+        "covers picture, cut on dialogue seams); music (music bed locked, video "
+        "free -> coverage cut to beats/sections); visual (VIDEO locked -- "
+        "on-screen text / demo / reveal / performance -- audio free to score, cut "
+        "on action/visual); sync (BOTH locked -- punchline+face, sync-sound; do "
+        "not split); other (escape hatch -- set label + locked_channels). Mark "
+        "do-not-cover spans (on-screen text, key reveals) as protected_windows. "
+        "One region for most edits; multiple only when the edit shifts mode "
+        "(e.g. montage hook -> testimonial).",
+        {
+            "regions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["dialogue", "music", "visual", "sync", "other"],
+                        },
+                        "label": {
+                            "type": "string",
+                            "description": "human label; REQUIRED when kind='other'",
+                        },
+                        "locked_channels": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": ["video", "audio"]},
+                            "description": "irreplaceable channels. dialogue/music=[audio]; "
+                                           "visual=[video]; sync=[video,audio]",
+                        },
+                        "source_file_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "clip(s)/track forming this region's spine "
+                                           "(the VO/interview clip, or the music file)",
+                        },
+                        "protected_windows": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "file_id": {"type": "string"},
+                                    "start_ms": {"type": "integer"},
+                                    "end_ms": {"type": "integer"},
+                                    "reason": {"type": "string"},
+                                },
+                                "required": ["file_id", "start_ms", "end_ms"],
+                            },
+                            "description": "do-not-cover spans inside an otherwise-free region",
+                        },
+                        "rationale": {
+                            "type": "string",
+                            "description": "why this spine, citing the brief + footage evidence",
+                        },
+                    },
+                    "required": ["kind", "locked_channels", "rationale"],
+                },
+            }
+        },
+        ["regions"],
     ),
     _spec(
         "set_outline",
@@ -337,6 +405,18 @@ def _execute(session: EditSession, name: str, args: Dict[str, Any]) -> str:
     if name == "set_brief":
         doc["brief"] = {k: v for k, v in args.items() if v is not None}
         return _j({"ok": True, "brief": doc["brief"]})
+
+    if name == "set_spine":
+        regions = args.get("regions") or []
+        doc["spine"] = {"regions": regions}
+        return _j({
+            "ok": True,
+            "region_count": len(regions),
+            "spine": [
+                {"kind": r.get("kind"), "locked": r.get("locked_channels", [])}
+                for r in regions
+            ],
+        })
 
     if name == "set_outline":
         doc["outline"] = args["beats"]

@@ -419,6 +419,27 @@ function DocumentView({
         <p style={{ color: "var(--muted)" }}>{doc.brief.goal}</p>
       )}
 
+      {doc.spine?.regions && doc.spine.regions.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="text-xs" style={{ color: "var(--muted)" }}>
+            Spine
+          </span>
+          {doc.spine.regions.map((r, i) => (
+            <span
+              key={i}
+              title={r.rationale ?? undefined}
+              className="rounded-full border px-2 py-0.5 text-xs"
+              style={{ borderColor: "var(--border)", color: "var(--accent)" }}
+            >
+              {r.kind === "other" && r.label ? r.label : r.kind}
+              {r.locked_channels && r.locked_channels.length > 0
+                ? ` · 🔒${r.locked_channels.map((c) => c[0].toUpperCase()).join("")}`
+                : ""}
+            </span>
+          ))}
+        </div>
+      )}
+
       {doc.summary && <p className="whitespace-pre-wrap">{doc.summary}</p>}
 
       {timeline.length > 0 && (

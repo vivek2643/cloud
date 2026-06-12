@@ -271,6 +271,21 @@ export interface EditBeat {
   target_s?: number;
 }
 
+export type SpineKind = "dialogue" | "music" | "visual" | "sync" | "other";
+
+export interface EditSpineRegion {
+  kind: SpineKind;
+  label?: string;
+  locked_channels?: ("video" | "audio")[];
+  source_file_ids?: string[];
+  protected_windows?: { file_id: string; start_ms: number; end_ms: number; reason?: string }[];
+  rationale?: string;
+}
+
+export interface EditSpine {
+  regions?: EditSpineRegion[];
+}
+
 export interface EditSegment {
   seg_id: string;
   file_id: string;
@@ -307,6 +322,7 @@ export interface EditDiagnostics {
 
 export interface EditDocument {
   brief?: EditBrief;
+  spine?: EditSpine | null;
   outline?: EditBeat[];
   timeline?: EditSegment[];
   open_questions?: EditQuestion[];
