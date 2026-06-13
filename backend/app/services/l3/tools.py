@@ -378,11 +378,15 @@ TOOL_SPECS: List[dict] = [
         "compare_takes",
         "When the same content was delivered more than once (see TAKE GROUPS in "
         "the catalog), get an objective, span-level scorecard for every competing "
-        "take so you can choose the best one. Returns per-take metrics (word pace, "
-        "fillers, pauses, gaze-to-camera, loudness) plus the perception's localized "
-        "quality notes (energy/fluency/naturalness/technical). The choice is YOURS: "
-        "weight the metrics by the brief (polished ad -> fluency; raw/authentic -> "
-        "energy, stop penalizing imperfection), then add_segment the winner's span.",
+        "take so you can choose the best one. Returns, per take: the actual spoken "
+        "TRANSCRIPT ('text'), metrics (word pace, fillers, pauses, gaze-to-camera, "
+        "loudness), and the perception's localized quality notes "
+        "(energy/fluency/naturalness/technical). You MUST keep exactly one take per "
+        "group. Decide on the TEXT FIRST: read each take's transcript and prefer the "
+        "most complete, correct delivery -- full intended line, no false starts, no "
+        "cut-off/missing words, fewest fillers, no stumbles -- before weighting the "
+        "remaining metrics by the brief. Then add_segment the winner's span and name "
+        "the take + textual reason in the rationale.",
         {"group_id": {"type": "string", "description": "a take-group id from the catalog, e.g. 'tg1'"}},
         ["group_id"],
     ),

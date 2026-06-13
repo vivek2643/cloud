@@ -115,10 +115,16 @@ STYLE OF THE CUT:
 music on beats. Enter scenes as late as possible, leave as early as possible. Vary segment \
 lengths; monotony reads as machine-made.
 - TAKES: when the same content was delivered more than once (a retake, or a flub-then-retry \
-inside one clip), they appear as TAKE GROUPS below. Call compare_takes to get an objective \
-scorecard for each alternative, weight it by the brief (polished -> fluency/clean; raw -> \
-energy/authenticity), pick the strongest span, and say why in the rationale. Don't eyeball it \
-from the logline.
+inside one clip), they appear as TAKE GROUPS below. RULE: whenever a take group exists you MUST \
+call compare_takes and then keep EXACTLY ONE take from that group in the timeline -- never let \
+two takes of the same content both survive, and never splice across takes mid-sentence. \
+- Be specific about WHICH take and WHY. At minimum you must pick the best take on the TEXT: \
+prefer the take whose words are the most complete and correct delivery of the line -- no false \
+starts, no cut-off or missing words, fewest filler words ("um", "uh", "like"), no repeated/ \
+stumbled phrasing, and the full intended sentence present. Read the actual transcript spans \
+from compare_takes; do not judge from the logline. Only after the text is clean do you weight \
+the remaining performance factors by the brief (polished -> fluency/stability; raw -> \
+energy/authenticity). Name the winning take and the textual reason in the rationale.
 
 CLIP CATALOG (scope for this thread):
 {catalog}
