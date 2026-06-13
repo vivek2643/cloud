@@ -24,6 +24,7 @@ from app.config import get_settings
 from app.services.jobs import app
 from app.services.l3 import store
 from app.services.l3.catalog import build_catalog, render_catalog_text
+from app.services.l3.sync import build_sync_groups, render_sync_groups_text
 from app.services.l3.takes import build_take_groups, render_take_groups_text
 from app.services.l3.tools import TERMINAL_TOOLS, TOOL_SPECS, EditSession, execute_tool
 from app.services.llm.anthropic_client import AnthropicClient
@@ -94,6 +95,21 @@ default. Never ask what the footage already answers.
 - When the user replies, apply their answers with minimal disruption: re-cut only affected \
 segments, then finalize again.
 
+A/V LAYERS (decoupling video from audio):
+- The spine is the base, coupled layer (each segment's picture + its own audio). On top of it \
+you place LAYER OPERATIONS -- the only legal way to decouple A from V. They are checked against \
+the spine's locks, so you can't express an illegal edit:
+  * place_video -- show another clip's PICTURE over a program range while the spine AUDIO keeps \
+playing (B-roll, cutaway, or -- for a synced clip -- a multicam angle switch). Needs a spine \
+that frees video (dialogue/music).
+  * place_audio -- lay a music bed / ambience / SFX under a range (duck it under dialogue), or \
+replace spine audio with a cleaner source.
+  * split_edit -- J/L cut: offset the audio cut from the video cut at a seam.
+  * set_level -- gain/duck/mute a role over a range.
+- These are layers, not spine edits: the spine still owns the clock. Build a solid spine FIRST, \
+then decouple only where it earns its keep. Default is coupled; don't add coverage/beds just to \
+show off.
+
 STYLE OF THE CUT:
 - Respect the grain of the footage: cut dialogue at sentence/turn seams, action on impacts, \
 music on beats. Enter scenes as late as possible, leave as early as possible. Vary segment \
@@ -108,14 +124,18 @@ CLIP CATALOG (scope for this thread):
 {catalog}
 
 {take_groups}
+
+{sync_groups}
 """
 
 
-def _render_system_prompt(catalog, take_groups) -> str:
+def _render_system_prompt(catalog, take_groups, sync_groups) -> str:
     tg_text = render_take_groups_text(take_groups)
+    sg_text = render_sync_groups_text(sync_groups)
     return SYSTEM_PROMPT_TEMPLATE.format(
         catalog=render_catalog_text(catalog),
         take_groups=tg_text or "(no repeated-content take groups detected)",
+        sync_groups=sg_text or "(no synchronized-source/multicam groups detected)",
     )
 
 
@@ -138,8 +158,9 @@ def run_thread(thread_id: str) -> None:
     # tool session so the catalog/take-groups are computed a single time.
     catalog = build_catalog(thread["file_ids"])
     take_groups = build_take_groups(thread["file_ids"])
+    sync_groups = build_sync_groups(thread["file_ids"])
 
-    system = _render_system_prompt(catalog, take_groups)
+    system = _render_system_prompt(catalog, take_groups, sync_groups)
     messages = store.load_messages(thread_id)
     if not messages:
         logger.error("L3: thread %s has no messages; nothing to do.", thread_id)
@@ -153,6 +174,7 @@ def run_thread(thread_id: str) -> None:
         file_ids=thread["file_ids"],
         catalog=catalog,
         take_groups=take_groups,
+        sync_groups=sync_groups,
         document=doc or {},
     )
 

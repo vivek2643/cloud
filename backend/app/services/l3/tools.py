@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from app.services.l3 import engine, score_span
+from app.services.l3 import engine, layers, score_span
+from app.services.l3 import sync as sync_mod
 from app.services.l3.catalog import ClipSummary
 from app.services.l3.engine import ClipGrids
+from app.services.l3.sync import SyncGroup
 from app.services.l3.takes import TakeGroup
 
 logger = logging.getLogger(__name__)
@@ -38,6 +41,7 @@ class EditSession:
     catalog: List[ClipSummary]
     document: Dict[str, Any] = field(default_factory=dict)
     take_groups: List[TakeGroup] = field(default_factory=list)
+    sync_groups: List[SyncGroup] = field(default_factory=list)
     _grids: Dict[str, ClipGrids] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -45,6 +49,7 @@ class EditSession:
         self.document.setdefault("spine", None)
         self.document.setdefault("outline", [])
         self.document.setdefault("timeline", [])
+        self.document.setdefault("operations", [])
         self.document.setdefault("open_questions", [])
         self.document.setdefault("diagnostics", {})
 
@@ -57,6 +62,20 @@ class EditSession:
         for fid in {s["file_id"] for s in self.document["timeline"]}:
             self.grids(fid)
         return self._grids
+
+    def durations(self) -> Dict[str, int]:
+        """file_id -> source duration (ms), used to clamp split-edit audio
+        extensions to real footage."""
+        out: Dict[str, int] = {}
+        for fid in self.file_ids:
+            try:
+                out[fid] = self.grids(fid).duration_ms
+            except Exception:
+                pass
+        return out
+
+    def resolved(self) -> layers.ResolvedTimeline:
+        return layers.resolve(self.document, self.durations())
 
     def find_segment(self, seg_id: str) -> Optional[dict]:
         for s in self.document["timeline"]:
@@ -258,9 +277,88 @@ TOOL_SPECS: List[dict] = [
         ["seg_id", "new_index"],
     ),
     _spec(
+        "place_video",
+        "Lay another clip's PICTURE over a program-time range while the spine "
+        "AUDIO keeps playing underneath (coverage / cutaway / a multicam angle "
+        "switch). You give the covering clip + a rough source point and the "
+        "rough program range to cover; the engine snaps the clip's entry to its "
+        "own visual grid, snaps the range edges to the spine's audio seams, and "
+        "refuses if the spine locks the video there or it hits a protected "
+        "window. Requires a spine that frees the video channel (dialogue/music). "
+        "Picture is full-frame (split-screen/PiP is a later layout). MULTICAM: if "
+        "the covering clip is in the same SYNC GROUP as the spine clip under "
+        "from_ms, omit src_in_ms -- the engine derives the angle's source time "
+        "from the sync offset so the cut is frame-aligned.",
+        {
+            "file_id": {"type": "string", "description": "the covering clip"},
+            "src_in_ms": {"type": "integer", "description": "rough entry in the covering clip; OMIT for a synced angle switch"},
+            "from_ms": {"type": "integer", "description": "program time the coverage starts"},
+            "to_ms": {"type": "integer", "description": "program time the coverage ends"},
+            "rationale": {"type": "string", "description": "why cut away here, to this"},
+        },
+        ["file_id", "from_ms", "to_ms"],
+    ),
+    _spec(
+        "place_audio",
+        "Lay an audio layer over a program-time range: a music bed, ambience, or "
+        "an SFX (role='music'|'sfx'), or REPLACE the spine dialogue with cleaner "
+        "audio (role='dialogue', kind='replace'). Beds duck under live dialogue "
+        "automatically when you pass a negative duck_db. The engine snaps a "
+        "musical source's entry to its beat/phrase grid and the range edges to "
+        "the spine seams. Replacing locked spine audio is refused.",
+        {
+            "file_id": {"type": "string", "description": "the audio source (e.g. a music clip)"},
+            "role": {"type": "string", "enum": ["music", "sfx", "dialogue"]},
+            "from_ms": {"type": "integer"},
+            "to_ms": {"type": "integer"},
+            "src_in_ms": {"type": "integer", "description": "rough entry in the source; default 0"},
+            "gain_db": {"type": "number", "description": "layer gain in dB (default 0)"},
+            "duck_db": {"type": "number", "description": "how much to duck this bed under dialogue, e.g. -12"},
+            "kind": {"type": "string", "enum": ["bed", "replace"], "description": "default bed"},
+            "rationale": {"type": "string"},
+        },
+        ["file_id", "role", "from_ms", "to_ms"],
+    ),
+    _spec(
+        "split_edit",
+        "Make a J- or L-cut at a spine seam: offset the AUDIO cut from the VIDEO "
+        "cut. Positive audio_offset_ms = L-cut (the previous clip's audio lingers "
+        "over the next clip's picture); negative = J-cut (the next clip's audio "
+        "leads in under the current picture). The audio boundary snaps to a "
+        "dialogue seam. Refused on a sync-locked spine.",
+        {
+            "seam_seg_id": {"type": "string", "description": "the LATER segment at the seam (cut is at its start)"},
+            "audio_offset_ms": {"type": "integer", "description": "+L-cut / -J-cut, in ms"},
+            "rationale": {"type": "string"},
+        },
+        ["seam_seg_id", "audio_offset_ms"],
+    ),
+    _spec(
+        "set_level",
+        "Mix automation: set a gain (dB) or mute on an audio role over a program "
+        "range. Use to balance a bed against dialogue beyond the auto-duck, or "
+        "silence a channel.",
+        {
+            "role": {"type": "string", "enum": ["dialogue", "music", "sfx"]},
+            "from_ms": {"type": "integer"},
+            "to_ms": {"type": "integer"},
+            "gain_db": {"type": "number"},
+            "mute": {"type": "boolean"},
+        },
+        ["role", "from_ms", "to_ms"],
+    ),
+    _spec(
+        "remove_operation",
+        "Delete a previously added layer operation (coverage / audio / split / "
+        "level) by its op_id.",
+        {"op_id": {"type": "string"}},
+        ["op_id"],
+    ),
+    _spec(
         "timeline_status",
         "Objective health report of the current timeline: total duration, "
-        "per-segment durations and seam costs, jump-cut/short-segment warnings. "
+        "per-segment durations and seam costs, jump-cut/short-segment warnings, "
+        "plus the resolved A/V layers (coverage %, audio roles, split edits). "
         "Call after edits and before finalize.",
         {},
         [],
@@ -377,6 +475,52 @@ def _read_clip(session: EditSession, file_id: str) -> str:
     })
 
 
+def _op_id() -> str:
+    return f"op{uuid.uuid4().hex[:6]}"
+
+
+def _snap_prog_to_spine(
+    session: EditSession,
+    spans: List["layers.SpineSpan"],
+    prog_ms: int,
+    axis_override: Optional[str] = None,
+) -> tuple[int, Optional[float]]:
+    """Snap a program-time instant to the nearest clean seam on the spine clip
+    underneath it (its dialogue/beat grid). Returns (program_ms, seam_cost)."""
+    m = layers.prog_to_source(spans, prog_ms)
+    if not m:
+        return prog_ms, None
+    seg, src, span = m
+    grids = session.grids(seg["file_id"])
+    axis = axis_override or seg.get("axis", "any")
+    snapped = engine.snap_cut(grids, src, axis)
+    new_prog = span.prog_start_ms + (snapped["ts_ms"] - int(seg["in_ms"]))
+    new_prog = max(span.prog_start_ms, min(span.prog_end_ms, new_prog))
+    return new_prog, snapped.get("cost")
+
+
+def _full_status(session: EditSession) -> Dict[str, Any]:
+    """Spine health report (engine) + the resolved A/V layer summary."""
+    status = engine.timeline_status(session.document["timeline"])
+    r = session.resolved()
+    cover_ms = sum(
+        v.prog_end_ms - v.prog_start_ms for v in r.video_layers if v.kind == "coverage"
+    )
+    beds = [a for a in r.audio_layers if a.kind in ("bed", "sfx")]
+    ops = session.document.get("operations", [])
+    status["layers"] = {
+        "program_ms": r.duration_ms,
+        "coverage_ms": cover_ms,
+        "coverage_pct": round(100.0 * cover_ms / r.duration_ms, 1) if r.duration_ms else 0.0,
+        "video_layer_count": len(r.video_layers),
+        "audio_roles": sorted({a.role for a in r.audio_layers}),
+        "audio_bed_count": len(beds),
+        "split_edits": sum(1 for o in ops if o.get("type") == "split_edit"),
+        "operations": len(ops),
+    }
+    return status
+
+
 def execute_tool(session: EditSession, name: str, args: Dict[str, Any]) -> str:
     """Run one tool against the session; returns the JSON string fed back to
     the model. Raises nothing: errors return as structured results so the
@@ -473,6 +617,138 @@ def _execute(session: EditSession, name: str, args: Dict[str, Any]) -> str:
         doc["timeline"].insert(idx, seg)
         return _j({"ok": True, "order": [s["seg_id"] for s in doc["timeline"]]})
 
+    if name == "place_video":
+        fid = args["file_id"]
+        if fid not in session.file_ids:
+            return _j({"error": "file_id not in this thread's scope"})
+        spans, total = layers.spine_spans(doc["timeline"])
+        if not spans:
+            return _j({"error": "no spine yet; add_segment the base timeline before covering it"})
+        from_ms = max(0, min(int(args["from_ms"]), total))
+        to_ms = max(0, min(int(args["to_ms"]), total))
+        if to_ms <= from_ms:
+            return _j({"error": "to_ms must be after from_ms"})
+        reason = layers.coverage_conflicts(doc, spans, from_ms, to_ms)
+        if reason:
+            return _j({"error": reason})
+        from_s, _ = _snap_prog_to_spine(session, spans, from_ms)
+        to_s, _ = _snap_prog_to_spine(session, spans, to_ms)
+        if to_s <= from_s:
+            to_s = min(total, from_s + engine.MIN_SEGMENT_MS)
+        prog_dur = to_s - from_s
+        cg = session.grids(fid)
+        # Source entry: explicit, or derived from a sync group (multicam angle).
+        warnings = []
+        rough_src = args.get("src_in_ms")
+        if rough_src is None:
+            m = layers.prog_to_source(spans, from_s)
+            g = sync_mod.find_group_for(session.sync_groups, fid) if m else None
+            if g and m and g.offset_of(m[0]["file_id"]) is not None:
+                spine_seg, src_spine, _span = m
+                rough_src = src_spine + (g.offset_of(spine_seg["file_id"]) - g.offset_of(fid))
+            else:
+                return _j({"error": "src_in_ms required (no sync group links this clip to the spine here)"})
+        snap_in = engine.snap_cut(cg, int(rough_src), "visual")
+        src_in = snap_in["ts_ms"]
+        src_out = src_in + prog_dur
+        if snap_in.get("warning"):
+            warnings.append(snap_in["warning"])
+        if cg.duration_ms and src_out > cg.duration_ms:
+            avail = cg.duration_ms - src_in
+            src_out = cg.duration_ms
+            to_s = from_s + max(0, avail)
+            warnings.append("covering clip too short for the range; coverage shortened")
+        if to_s - from_s < engine.MIN_SEGMENT_MS:
+            warnings.append(f"coverage is only {to_s - from_s}ms after snapping")
+        op = {
+            "op_id": _op_id(), "type": "place_video",
+            "source_file_id": fid, "src_in_ms": src_in, "src_out_ms": src_out,
+            "from_ms": from_s, "to_ms": to_s,
+            "layout": layers.DEFAULT_LAYOUT, "z": layers.Z_COVERAGE, "opacity": 1.0,
+            "rationale": args.get("rationale"),
+            "cut_in_cost": snap_in["cost"], "warnings": warnings,
+        }
+        doc["operations"].append(op)
+        return _j({"operation": op, "covers_pct": round(100.0 * (to_s - from_s) / total, 1) if total else 0.0})
+
+    if name == "place_audio":
+        fid = args["file_id"]
+        if fid not in session.file_ids:
+            return _j({"error": "file_id not in this thread's scope"})
+        role = args.get("role", "music")
+        kind = args.get("kind", "bed")
+        if kind == "replace" and not layers.audio_is_free(doc):
+            return _j({"error": "spine locks the audio channel; cannot replace it (a bed is fine)"})
+        spans, total = layers.spine_spans(doc["timeline"])
+        if not spans:
+            return _j({"error": "no spine yet; build the base timeline first"})
+        from_ms = max(0, min(int(args["from_ms"]), total))
+        to_ms = max(0, min(int(args["to_ms"]), total))
+        if to_ms <= from_ms:
+            return _j({"error": "to_ms must be after from_ms"})
+        from_s, _ = _snap_prog_to_spine(session, spans, from_ms)
+        to_s, _ = _snap_prog_to_spine(session, spans, to_ms)
+        cg = session.grids(fid)
+        # A musical source snaps its entry to the beat grid; otherwise as-is.
+        snap = engine.snap_cut(cg, int(args.get("src_in_ms", 0)), "music")
+        src_in = snap["ts_ms"]
+        src_out = src_in + (to_s - from_s)
+        warnings = []
+        if cg.duration_ms and src_out > cg.duration_ms:
+            src_out = cg.duration_ms
+            warnings.append("audio source shorter than the range; not looped (loop is a later feature)")
+        op = {
+            "op_id": _op_id(), "type": "place_audio",
+            "source_file_id": fid, "role": role, "audio_kind": kind,
+            "from_ms": from_s, "to_ms": to_s,
+            "src_in_ms": src_in, "src_out_ms": src_out,
+            "gain_db": float(args.get("gain_db", 0.0)),
+            "duck_db": float(args.get("duck_db", 0.0)),
+            "rationale": args.get("rationale"), "warnings": warnings,
+        }
+        doc["operations"].append(op)
+        return _j({"operation": op})
+
+    if name == "split_edit":
+        if layers.av_is_coupled(doc):
+            return _j({"error": "spine keeps A/V coupled (sync / no spine); no split edits"})
+        spans, _ = layers.spine_spans(doc["timeline"])
+        idx = next((i for i, s in enumerate(spans) if s.seg["seg_id"] == args["seam_seg_id"]), None)
+        if idx is None:
+            return _j({"error": "unknown seam_seg_id"})
+        if idx == 0:
+            return _j({"error": "no seam before the first segment"})
+        video_boundary = spans[idx].prog_start_ms
+        audio_boundary, cost = _snap_prog_to_spine(
+            session, spans, video_boundary + int(args["audio_offset_ms"]), axis_override="speech"
+        )
+        offset = audio_boundary - video_boundary
+        op = {
+            "op_id": _op_id(), "type": "split_edit",
+            "seam_seg_id": args["seam_seg_id"], "audio_offset_ms": offset,
+            "kind": "L-cut" if offset > 0 else "J-cut",
+            "rationale": args.get("rationale"), "cut_cost": cost,
+        }
+        doc["operations"].append(op)
+        return _j({"operation": op})
+
+    if name == "set_level":
+        op = {
+            "op_id": _op_id(), "type": "level",
+            "role": args["role"],
+            "from_ms": int(args["from_ms"]), "to_ms": int(args["to_ms"]),
+            "gain_db": args.get("gain_db"), "mute": bool(args.get("mute", False)),
+        }
+        doc["operations"].append(op)
+        return _j({"operation": op})
+
+    if name == "remove_operation":
+        before = len(doc["operations"])
+        doc["operations"] = [o for o in doc["operations"] if o.get("op_id") != args["op_id"]]
+        if len(doc["operations"]) == before:
+            return _j({"error": "unknown op_id"})
+        return _j({"ok": True, "remaining": len(doc["operations"])})
+
     if name == "compare_takes":
         gid = args.get("group_id")
         group = next((g for g in session.take_groups if g.group_id == gid), None)
@@ -498,7 +774,7 @@ def _execute(session: EditSession, name: str, args: Dict[str, Any]) -> str:
         return _j({"group_id": gid, "content_key": group.content_key, "takes": takes_out})
 
     if name == "timeline_status":
-        return _j(engine.timeline_status(doc["timeline"]))
+        return _j(_full_status(session))
 
     if name == "fit_duration":
         fitted, report = engine.fit_duration(
@@ -517,7 +793,10 @@ def _execute(session: EditSession, name: str, args: Dict[str, Any]) -> str:
         doc["summary"] = args["summary"]
         doc["notes"] = args.get("notes", [])
         doc["open_questions"] = doc.get("open_questions", [])
-        doc["diagnostics"] = engine.timeline_status(doc["timeline"])
+        doc["diagnostics"] = _full_status(session)
+        # Persist the resolved A/V layers alongside the authoritative spine +
+        # operations, so consumers (export/preview) don't re-resolve.
+        doc["resolved"] = session.resolved().to_dict()
         return _j({"ok": True, "finalized": True})
 
     return _j({"error": f"unknown tool {name!r}"})
