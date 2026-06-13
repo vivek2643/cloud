@@ -15,6 +15,10 @@ import {
   Loader2,
   AlertCircle,
   Film,
+  Layers,
+  Music,
+  Scissors,
+  SlidersHorizontal,
 } from "lucide-react";
 import { useDriveStore } from "@/stores/drive-store";
 import { useAuthStore } from "@/stores/auth-store";
@@ -26,6 +30,7 @@ import {
   type EditThread,
   type EditThreadStatus,
   type EditSegment,
+  type EditOperation,
 } from "@/lib/api";
 
 const POLL_MS = 2000;
@@ -269,7 +274,11 @@ export function AiEditPanel() {
       </div>
 
       {/* Program monitor */}
-      <EditPreview timeline={doc?.timeline ?? []} token={token} />
+      <EditPreview
+        timeline={doc?.timeline ?? []}
+        token={token}
+        layered={(doc?.operations?.length ?? 0) > 0}
+      />
 
       {/* Conversation */}
       <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto px-4 py-4">
@@ -395,6 +404,18 @@ function DocumentView({
   const timeline = doc.timeline ?? [];
   const totalMs = timeline.reduce((a, s) => a + (s.out_ms - s.in_ms), 0);
 
+  const resolved = doc.resolved;
+  const coveragePct =
+    resolved && resolved.duration_ms
+      ? Math.round(
+          (1000 *
+            resolved.video_layers
+              .filter((v) => v.kind === "coverage")
+              .reduce((a, v) => a + (v.prog_end_ms - v.prog_start_ms), 0)) /
+            resolved.duration_ms
+        ) / 10
+      : 0;
+
   return (
     <div
       className="space-y-3 rounded-2xl border p-3 text-sm"
@@ -464,6 +485,10 @@ function DocumentView({
         </ol>
       )}
 
+      {doc.operations && doc.operations.length > 0 && (
+        <OperationsView operations={doc.operations} coveragePct={coveragePct} />
+      )}
+
       {doc.notes && doc.notes.length > 0 && (
         <ul className="space-y-1 border-t pt-2 text-xs" style={{ borderColor: "var(--border)", color: "var(--muted)" }}>
           {doc.notes.map((n, i) => (
@@ -471,6 +496,107 @@ function DocumentView({
           ))}
         </ul>
       )}
+    </div>
+  );
+}
+
+function opVisual(op: EditOperation): {
+  icon: React.ReactNode;
+  label: string;
+  detail: string;
+} {
+  const span =
+    op.from_ms != null && op.to_ms != null
+      ? `${fmtClock(op.from_ms)}–${fmtClock(op.to_ms)}`
+      : "";
+  const src = op.source_file_id ? op.source_file_id.slice(0, 6) : "";
+  switch (op.type) {
+    case "place_video":
+      return {
+        icon: <Layers size={13} />,
+        label: "Coverage",
+        detail: [span, src && `clip ${src}`].filter(Boolean).join(" · "),
+      };
+    case "place_audio": {
+      const role =
+        op.audio_kind === "replace"
+          ? "Audio replace"
+          : op.role === "music"
+          ? "Music bed"
+          : op.role === "sfx"
+          ? "SFX"
+          : "Audio";
+      const mix = [
+        op.gain_db ? `${op.gain_db > 0 ? "+" : ""}${op.gain_db}dB` : "",
+        op.duck_db ? `duck ${op.duck_db}dB` : "",
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      return {
+        icon: <Music size={13} />,
+        label: role,
+        detail: [span, mix].filter(Boolean).join(" · "),
+      };
+    }
+    case "split_edit":
+      return {
+        icon: <Scissors size={13} />,
+        label: op.kind || "Split edit",
+        detail: `audio ${(op.audio_offset_ms ?? 0) > 0 ? "+" : ""}${op.audio_offset_ms ?? 0}ms`,
+      };
+    case "level":
+      return {
+        icon: <SlidersHorizontal size={13} />,
+        label: "Level",
+        detail: [span, op.mute ? "mute" : op.gain_db != null ? `${op.gain_db}dB` : "", op.role]
+          .filter(Boolean)
+          .join(" · "),
+      };
+    default:
+      return { icon: <Layers size={13} />, label: op.type, detail: span };
+  }
+}
+
+function OperationsView({
+  operations,
+  coveragePct,
+}: {
+  operations: EditOperation[];
+  coveragePct: number;
+}) {
+  return (
+    <div className="border-t pt-2" style={{ borderColor: "var(--border)" }}>
+      <div className="mb-1.5 flex items-center justify-between">
+        <span className="text-xs font-semibold" style={{ color: "var(--muted)" }}>
+          A/V layers · {operations.length}
+        </span>
+        {coveragePct > 0 && (
+          <span className="text-xs" style={{ color: "var(--muted)" }}>
+            {coveragePct}% covered
+          </span>
+        )}
+      </div>
+      <ul className="space-y-1">
+        {operations.map((op) => {
+          const v = opVisual(op);
+          return (
+            <li
+              key={op.op_id}
+              title={op.rationale ?? undefined}
+              className="flex items-center gap-2 text-xs"
+            >
+              <span style={{ color: "var(--accent)" }}>{v.icon}</span>
+              <span className="font-medium">{v.label}</span>
+              {v.detail && (
+                <span style={{ color: "var(--muted)" }}>{v.detail}</span>
+              )}
+              {op.warnings && op.warnings.length > 0 && (
+                <AlertCircle size={11} style={{ color: "var(--danger)" }} />
+              )}
+            </li>
+          );
+        })}
+      </ul>
     </div>
   );
 }
@@ -549,9 +675,11 @@ function QuestionForm({
 function EditPreview({
   timeline,
   token,
+  layered = false,
 }: {
   timeline: EditSegment[];
   token: string | undefined;
+  layered?: boolean;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [urls, setUrls] = useState<Record<string, string>>({});
@@ -711,6 +839,12 @@ function EditPreview({
             Cut {index + 1}/{timeline.length}
           </span>
         </div>
+      )}
+
+      {hasTimeline && layered && (
+        <p className="mt-1.5 text-[11px]" style={{ color: "var(--muted)" }}>
+          Spine preview — coverage, beds &amp; split edits aren&apos;t composited here yet.
+        </p>
       )}
     </div>
   );

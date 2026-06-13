@@ -320,9 +320,75 @@ export interface EditDiagnostics {
   [k: string]: unknown;
 }
 
+export type EditOperationType = "place_video" | "place_audio" | "split_edit" | "level";
+
+export interface EditOperation {
+  op_id: string;
+  type: EditOperationType;
+  rationale?: string | null;
+  warnings?: string[];
+  // place_video / place_audio
+  source_file_id?: string;
+  src_in_ms?: number;
+  src_out_ms?: number;
+  from_ms?: number;
+  to_ms?: number;
+  // place_video
+  layout?: string;
+  z?: number;
+  opacity?: number;
+  // place_audio
+  role?: string;
+  audio_kind?: string;
+  gain_db?: number | null;
+  duck_db?: number;
+  // split_edit
+  seam_seg_id?: string;
+  audio_offset_ms?: number;
+  kind?: string;
+  // level
+  mute?: boolean;
+}
+
+export interface ResolvedVideoLayer {
+  layer_id: string;
+  source_file_id: string;
+  src_in_ms: number;
+  src_out_ms: number;
+  prog_start_ms: number;
+  prog_end_ms: number;
+  z: number;
+  layout: string;
+  opacity: number;
+  kind: string;
+  op_id?: string | null;
+}
+
+export interface ResolvedAudioLayer {
+  layer_id: string;
+  role: string;
+  source_file_id: string;
+  src_in_ms: number;
+  src_out_ms: number;
+  prog_start_ms: number;
+  prog_end_ms: number;
+  gain_db: number;
+  duck_db: number;
+  kind: string;
+  op_id?: string | null;
+}
+
+export interface ResolvedTimeline {
+  duration_ms: number;
+  video_layers: ResolvedVideoLayer[];
+  audio_layers: ResolvedAudioLayer[];
+}
+
 export interface EditDocument {
   brief?: EditBrief;
   spine?: EditSpine | null;
+  operations?: EditOperation[];
+  resolved?: ResolvedTimeline | null;
   outline?: EditBeat[];
   timeline?: EditSegment[];
   open_questions?: EditQuestion[];
