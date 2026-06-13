@@ -423,6 +423,7 @@ export interface EditThreadListItem {
 
 export interface EditVersionListItem {
   version: number;
+  created_by?: string;
   created_at: string;
 }
 
@@ -463,6 +464,68 @@ export function listEditVersions(id: string, token: string) {
 export function getEditVersion(id: string, version: number, token: string) {
   return request<{ version: number; document: EditDocument }>(
     `/api/edit/threads/${id}/versions/${version}`,
+    { token }
+  );
+}
+
+// --- Editable timeline (human edits -> new user version) ---
+
+export interface SaveEditBody {
+  base_version: number;
+  timeline: EditSegment[];
+  operations?: EditOperation[];
+  summary?: string;
+  notes?: string[];
+}
+
+export function saveEditDocument(id: string, body: SaveEditBody, token: string) {
+  return request<{ version: number; document: EditDocument }>(
+    `/api/edit/threads/${id}/document`,
+    { method: "PUT", body: JSON.stringify(body), token }
+  );
+}
+
+// --- Render / export ---
+
+export type RenderStatus = "queued" | "running" | "done" | "failed" | "cancelled";
+export type RenderPreset = "preview" | "export";
+
+export interface RenderJob {
+  id: string;
+  thread_id: string;
+  document_version: number;
+  preset: RenderPreset | string;
+  status: RenderStatus;
+  progress_pct: number;
+  resolved_hash?: string | null;
+  output_r2_key?: string | null;
+  output_url?: string | null;
+  duration_ms?: number | null;
+  error?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export function createRender(
+  threadId: string,
+  preset: RenderPreset,
+  token: string,
+  version?: number
+) {
+  return request<RenderJob>(`/api/edit/threads/${threadId}/render`, {
+    method: "POST",
+    body: JSON.stringify({ preset, version }),
+    token,
+  });
+}
+
+export function getRender(renderId: string, token: string) {
+  return request<RenderJob>(`/api/renders/${renderId}`, { token });
+}
+
+export function listRenders(threadId: string, token: string) {
+  return request<{ renders: RenderJob[] }>(
+    `/api/edit/threads/${threadId}/renders`,
     { token }
   );
 }

@@ -19,8 +19,11 @@ import {
   Music,
   Scissors,
   SlidersHorizontal,
+  Pencil,
 } from "lucide-react";
 import { useDriveStore } from "@/stores/drive-store";
+import { RenderBar } from "@/components/render-bar";
+import { TimelineEditor } from "@/components/timeline-editor";
 import { useAuthStore } from "@/stores/auth-store";
 import {
   createEditThread,
@@ -103,6 +106,7 @@ export function AiEditPanel() {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [editing, setEditing] = useState(false);
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -225,6 +229,13 @@ export function AiEditPanel() {
     setInput("");
     setError(null);
     setBusy(false);
+    setEditing(false);
+  }
+
+  function handleSavedEdit(newVersion: number, newDoc: NonNullable<EditThread["document"]>) {
+    setThread((prev) =>
+      prev ? { ...prev, document: newDoc, document_version: newVersion } : prev
+    );
   }
 
   if (!aiPanelOpen) return null;
@@ -257,6 +268,16 @@ export function AiEditPanel() {
           >
             {aiScopeFileIds.length} clip{aiScopeFileIds.length === 1 ? "" : "s"}
           </span>
+          {doc?.timeline && doc.timeline.length > 0 && (
+            <button
+              onClick={() => setEditing((v) => !v)}
+              className="rounded-lg p-1.5 transition-colors hover:bg-[var(--accent-soft)]"
+              style={editing ? { color: "var(--accent)" } : undefined}
+              title={editing ? "Back to plan" : "Edit timeline"}
+            >
+              <Pencil size={16} />
+            </button>
+          )}
           <button
             onClick={handleNewThread}
             className="rounded-lg p-1.5 transition-colors hover:bg-[var(--accent-soft)]"
@@ -284,6 +305,16 @@ export function AiEditPanel() {
         layered={(doc?.operations?.length ?? 0) > 0}
       />
 
+      {/* Export / render */}
+      {threadId && (
+        <RenderBar
+          threadId={threadId}
+          version={thread?.document_version ?? null}
+          token={token}
+          disabled={!doc?.timeline?.length}
+        />
+      )}
+
       {/* Conversation */}
       <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto px-4 py-4">
         {!threadId && (
@@ -296,7 +327,17 @@ export function AiEditPanel() {
           </Bubble>
         ))}
 
-        {doc && <DocumentView doc={doc} version={thread?.document_version ?? null} />}
+        {doc && editing && threadId ? (
+          <TimelineEditor
+            threadId={threadId}
+            doc={doc}
+            version={thread?.document_version ?? 0}
+            token={token}
+            onSaved={handleSavedEdit}
+          />
+        ) : (
+          doc && <DocumentView doc={doc} version={thread?.document_version ?? null} />
+        )}
 
         {busy && status === "drafting" && (
           <div

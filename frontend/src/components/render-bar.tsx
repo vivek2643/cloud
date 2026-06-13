@@ -1,0 +1,168 @@
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Download, Loader2, Clapperboard, AlertCircle } from "lucide-react";
+import {
+  createRender,
+  getRender,
+  type RenderJob,
+  type RenderPreset,
+} from "@/lib/api";
+
+const POLL_MS = 1500;
+
+const PRESETS: { id: RenderPreset; label: string }[] = [
+  { id: "preview", label: "Preview · 720p" },
+  { id: "export", label: "Export · 1080p" },
+];
+
+export function RenderBar({
+  threadId,
+  version,
+  token,
+  disabled,
+}: {
+  threadId: string;
+  version: number | null;
+  token: string | undefined;
+  disabled: boolean;
+}) {
+  const [preset, setPreset] = useState<RenderPreset>("preview");
+  const [job, setJob] = useState<RenderJob | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const stop = useCallback(() => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }, []);
+
+  // Reset render state when the underlying plan version changes.
+  useEffect(() => {
+    stop();
+    setJob(null);
+    setError(null);
+    setBusy(false);
+  }, [version, threadId, stop]);
+
+  useEffect(() => stop, [stop]);
+
+  const poll = useCallback(
+    (id: string) => {
+      stop();
+      pollRef.current = setInterval(async () => {
+        if (!token) return;
+        try {
+          const r = await getRender(id, token);
+          setJob(r);
+          if (r.status === "done" || r.status === "failed" || r.status === "cancelled") {
+            stop();
+            setBusy(false);
+            if (r.status === "failed") setError(r.error || "Render failed.");
+          }
+        } catch (e) {
+          stop();
+          setBusy(false);
+          setError(e instanceof Error ? e.message : "Render polling failed.");
+        }
+      }, POLL_MS);
+    },
+    [token, stop]
+  );
+
+  async function start() {
+    if (!token || busy || disabled) return;
+    setError(null);
+    setBusy(true);
+    try {
+      const r = await createRender(threadId, preset, token, version ?? undefined);
+      setJob(r);
+      if (r.status === "done" || r.status === "failed") {
+        setBusy(false);
+        if (r.status === "failed") setError(r.error || "Render failed.");
+      } else {
+        poll(r.id);
+      }
+    } catch (e) {
+      setBusy(false);
+      setError(e instanceof Error ? e.message : "Could not start render.");
+    }
+  }
+
+  const running = job && (job.status === "queued" || job.status === "running");
+  const done = job && job.status === "done" && job.output_url;
+
+  return (
+    <div className="border-b px-4 py-3" style={{ borderColor: "var(--border)" }}>
+      <div className="flex items-center gap-2">
+        <select
+          value={preset}
+          onChange={(e) => setPreset(e.target.value as RenderPreset)}
+          disabled={busy || disabled}
+          className="rounded-lg border bg-transparent px-2 py-1.5 text-xs outline-none"
+          style={{ borderColor: "var(--border)" }}
+        >
+          {PRESETS.map((p) => (
+            <option key={p.id} value={p.id} style={{ background: "var(--background)" }}>
+              {p.label}
+            </option>
+          ))}
+        </select>
+        <button
+          onClick={start}
+          disabled={busy || disabled}
+          className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium text-white transition-opacity disabled:opacity-40"
+          style={{ background: "var(--accent)" }}
+          title={disabled ? "No timeline to render yet" : "Render this edit to a file"}
+        >
+          {busy ? <Loader2 size={13} className="animate-spin" /> : <Clapperboard size={13} />}
+          {busy ? "Rendering…" : "Render"}
+        </button>
+        {done && (
+          <a
+            href={job!.output_url!}
+            download
+            className="ml-auto flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors hover:bg-[var(--accent-soft)]"
+            style={{ borderColor: "var(--border)" }}
+          >
+            <Download size={13} /> Download
+          </a>
+        )}
+      </div>
+
+      {running && (
+        <div className="mt-2">
+          <div className="h-1.5 w-full overflow-hidden rounded-full" style={{ background: "var(--accent-soft)" }}>
+            <div
+              className="h-full rounded-full transition-[width]"
+              style={{ width: `${job!.progress_pct}%`, background: "var(--accent)" }}
+            />
+          </div>
+          <p className="mt-1 text-[11px]" style={{ color: "var(--muted)" }}>
+            {job!.status === "queued" ? "Queued…" : `Rendering ${job!.progress_pct}%`}
+          </p>
+        </div>
+      )}
+
+      {done && (
+        <video
+          src={job!.output_url!}
+          controls
+          playsInline
+          className="mt-2 w-full rounded-lg"
+          style={{ background: "#000" }}
+        />
+      )}
+
+      {error && (
+        <div className="mt-2 flex items-start gap-1.5 text-[11px]" style={{ color: "var(--danger)" }}>
+          <AlertCircle size={12} className="mt-0.5 shrink-0" />
+          <span>{error}</span>
+        </div>
+      )}
+    </div>
+  );
+}

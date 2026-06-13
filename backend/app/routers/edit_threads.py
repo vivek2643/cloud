@@ -40,6 +40,52 @@ class MessageBody(BaseModel):
     answers: Optional[dict] = None
 
 
+class EditDocumentBody(BaseModel):
+    # The version the edit is based on; rejected (409) if the head has moved
+    # (the agent or another tab wrote a newer version meanwhile).
+    base_version: int
+    timeline: List[dict]
+    operations: List[dict] = []
+    summary: Optional[str] = None
+    notes: Optional[List[str]] = None
+
+
+_ALLOWED_OP_TYPES = {"place_video", "place_audio", "split_edit", "level"}
+
+
+def _sanitize_timeline(timeline: List[dict], durations: dict) -> List[dict]:
+    out: List[dict] = []
+    for i, seg in enumerate(timeline):
+        try:
+            seg_id = str(seg["seg_id"])
+            file_id = str(seg["file_id"])
+            in_ms = max(0, int(seg["in_ms"]))
+            out_ms = int(seg["out_ms"])
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(status_code=422, detail=f"timeline[{i}] missing seg_id/file_id/in_ms/out_ms")
+        dur = durations.get(file_id)
+        if dur:
+            out_ms = min(out_ms, dur)
+            in_ms = min(in_ms, max(0, dur - 1))
+        if out_ms <= in_ms:
+            raise HTTPException(status_code=422, detail=f"timeline[{i}] out_ms must exceed in_ms")
+        clean = {**seg, "seg_id": seg_id, "file_id": file_id, "in_ms": in_ms, "out_ms": out_ms}
+        out.append(clean)
+    return out
+
+
+def _sanitize_operations(operations: List[dict]) -> List[dict]:
+    out: List[dict] = []
+    for i, op in enumerate(operations):
+        t = op.get("type")
+        if t not in _ALLOWED_OP_TYPES:
+            raise HTTPException(status_code=422, detail=f"operations[{i}] invalid type {t!r}")
+        if not op.get("op_id"):
+            raise HTTPException(status_code=422, detail=f"operations[{i}] missing op_id")
+        out.append(op)
+    return out
+
+
 @router.post("")
 def create_thread(body: CreateThreadBody, user_id: str = Depends(get_current_user_id)):
     thread_id = start_thread(user_id, body.file_ids, body.brief)
@@ -85,6 +131,44 @@ def post_message(
         raise HTTPException(status_code=422, detail="Provide text and/or answers")
     send_user_message(thread_id, "\n\n".join(parts))
     return {"ok": True, "status": "drafting"}
+
+
+@router.put("/{thread_id}/document")
+def put_document(
+    thread_id: str, body: EditDocumentBody, user_id: str = Depends(get_current_user_id)
+):
+    """Save a human edit of the timeline as a new (created_by='user') version.
+
+    The whole edited timeline + operations come from the client; we re-resolve
+    the layer set server-side so `resolved` stays authoritative and the render
+    matches the preview. Optimistic concurrency on `base_version`."""
+    _owned_thread(thread_id, user_id)
+    from app.services.render.tasks import _durations, resolve_document
+
+    doc, head = store.latest_document(thread_id)
+    if doc is None:
+        raise HTTPException(status_code=409, detail="No edit document to edit yet")
+    if body.base_version != head:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "stale_base_version", "latest_version": head},
+        )
+
+    fids = list({str(s.get("file_id")) for s in body.timeline if s.get("file_id")})
+    durations = _durations(fids)
+    timeline = _sanitize_timeline(body.timeline, durations)
+    operations = _sanitize_operations(body.operations)
+
+    new_doc = {**doc, "timeline": timeline, "operations": operations}
+    if body.summary is not None:
+        new_doc["summary"] = body.summary
+    if body.notes is not None:
+        new_doc["notes"] = body.notes
+    new_doc.pop("resolved", None)  # force a fresh recompute below
+    new_doc["resolved"] = resolve_document(new_doc)
+
+    version = store.save_document(thread_id, new_doc, created_by="user")
+    return {"version": version, "document": new_doc}
 
 
 @router.get("/{thread_id}/versions")
