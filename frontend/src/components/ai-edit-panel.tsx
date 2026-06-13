@@ -748,6 +748,7 @@ function CompositePreview({
   const playingRef = useRef(false);
   const mutedRef = useRef(false);
   const lastTsRef = useRef(0);
+  const lastDisplayRef = useRef(0);
   const rafRef = useRef<number | null>(null);
   const curVideoSrcRef = useRef<string>("");
 
@@ -801,6 +802,9 @@ function CompositePreview({
       // VIDEO — top z layer covering t.
       const v = videoRef.current;
       if (v) {
+        // React's `muted` JSX prop is unreliable; enforce it on the node so the
+        // picture's own audio track never doubles the audio bus (comb-filtering).
+        if (!v.muted) v.muted = true;
         let top: ResolvedTimeline["video_layers"][number] | null = null;
         for (const layer of resolved.video_layers) {
           if (layer.prog_start_ms <= t && t < layer.prog_end_ms) {
@@ -875,16 +879,21 @@ function CompositePreview({
         if (t >= duration) {
           t = duration;
           progRef.current = t;
-          setProgMs(t);
           syncTo(t);
           pauseAll();
           progRef.current = 0;
+          lastDisplayRef.current = 0;
           setProgMs(0);
           return;
         }
         progRef.current = t;
-        setProgMs(t);
         syncTo(t);
+        // Throttle the React re-render (~10fps) so 60fps state churn doesn't
+        // starve audio/video decoding and cause stutter.
+        if (Math.abs(t - lastDisplayRef.current) >= 100) {
+          lastDisplayRef.current = t;
+          setProgMs(t);
+        }
       }
       lastTsRef.current = ts;
       rafRef.current = requestAnimationFrame(loop);
@@ -909,6 +918,7 @@ function CompositePreview({
 
   function scrub(t: number) {
     progRef.current = t;
+    lastDisplayRef.current = t;
     setProgMs(t);
     lastTsRef.current = 0;
     syncTo(t, { hardSeek: true });
@@ -929,6 +939,7 @@ function CompositePreview({
   useEffect(() => {
     pauseAll();
     progRef.current = 0;
+    lastDisplayRef.current = 0;
     setProgMs(0);
     curVideoSrcRef.current = "";
     // eslint-disable-next-line react-hooks/exhaustive-deps
