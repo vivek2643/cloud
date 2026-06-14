@@ -25,16 +25,11 @@ import {
   type EditOperation,
   type EditVersionListItem,
 } from "@/lib/api";
-
-const MIN_SEG_MS = 200;
+import { useEditDocStore } from "@/stores/edit-doc-store";
 
 function fmt(ms: number) {
   const s = Math.max(0, Math.round(ms / 1000));
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
-}
-
-function rid(prefix: string) {
-  return prefix + Math.random().toString(16).slice(2, 8);
 }
 
 type Span = { seg: EditSegment; start: number; end: number };
@@ -52,21 +47,39 @@ function layout(timeline: EditSegment[]): { spans: Span[]; total: number } {
 
 export function TimelineEditor({
   threadId,
-  doc,
-  version,
   token,
   onSaved,
 }: {
   threadId: string;
-  doc: EditDocument;
-  version: number;
   token: string | undefined;
   onSaved: (version: number, document: EditDocument) => void;
 }) {
-  const [timeline, setTimeline] = useState<EditSegment[]>(doc.timeline ?? []);
-  const [operations, setOperations] = useState<EditOperation[]>(doc.operations ?? []);
-  const [selected, setSelected] = useState<string | null>(null);
-  const [dirty, setDirty] = useState(false);
+  // Live working state lives in the shared store; the preview reads the same
+  // state, so every mutation here updates the program monitor instantly.
+  const timeline = useEditDocStore((s) => s.timeline);
+  const operations = useEditDocStore((s) => s.operations);
+  const selected = useEditDocStore((s) => s.selected);
+  const baseVersion = useEditDocStore((s) => s.baseVersion);
+  const select = useEditDocStore((s) => s.select);
+  const trimSeg = useEditDocStore((s) => s.trim);
+  const nudgeSeg = useEditDocStore((s) => s.nudge);
+  const moveSeg = useEditDocStore((s) => s.move);
+  const splitSeg = useEditDocStore((s) => s.split);
+  const removeSeg = useEditDocStore((s) => s.remove);
+  const setGain = useEditDocStore((s) => s.setGain);
+  const removeOpStore = useEditDocStore((s) => s.removeOp);
+  const revertStore = useEditDocStore((s) => s.revert);
+  const setWorking = useEditDocStore((s) => s.setWorking);
+  const commit = useEditDocStore((s) => s.commit);
+  const isDirty = useEditDocStore((s) => s.isDirty);
+
+  const dirty = useMemo(
+    () => isDirty(),
+    // recompute whenever the working data changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [timeline, operations, baseVersion]
+  );
+
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showHistory, setShowHistory] = useState(false);
@@ -75,16 +88,6 @@ export function TimelineEditor({
 
   const trackRef = useRef<HTMLDivElement>(null);
   const muteCache = useRef<Record<string, number>>({});
-
-  // Reset editor when the upstream document/version changes (agent wrote a
-  // new version, or we reset). Discards unsaved edits intentionally.
-  useEffect(() => {
-    setTimeline(doc.timeline ?? []);
-    setOperations(doc.operations ?? []);
-    setSelected(null);
-    setDirty(false);
-    setError(null);
-  }, [doc, version]);
 
   useEffect(() => {
     const el = trackRef.current;
@@ -98,15 +101,6 @@ export function TimelineEditor({
   const { spans, total } = useMemo(() => layout(timeline), [timeline]);
   const pxPerMs = total > 0 ? trackW / total : 0;
 
-  const mutate = useCallback((next: EditSegment[]) => {
-    setTimeline(next);
-    setDirty(true);
-  }, []);
-  const mutateOps = useCallback((next: EditOperation[]) => {
-    setOperations(next);
-    setDirty(true);
-  }, []);
-
   // --- trim via drag handles ---
   function startTrim(segId: string, edge: "in" | "out", e: React.PointerEvent) {
     e.preventDefault();
@@ -118,18 +112,7 @@ export function TimelineEditor({
     const startOut = seg.out_ms;
     const onMove = (ev: PointerEvent) => {
       const dMs = Math.round((ev.clientX - startX) / pxPerMs);
-      setTimeline((prev) =>
-        prev.map((s) => {
-          if (s.seg_id !== segId) return s;
-          if (edge === "in") {
-            const ni = Math.max(0, Math.min(startIn + dMs, s.out_ms - MIN_SEG_MS));
-            return { ...s, in_ms: ni };
-          }
-          const no = Math.max(s.in_ms + MIN_SEG_MS, startOut + dMs);
-          return { ...s, out_ms: no };
-        })
-      );
-      setDirty(true);
+      trimSeg(segId, edge, edge === "in" ? startIn + dMs : startOut + dMs);
     };
     const onUp = () => {
       window.removeEventListener("pointermove", onMove);
@@ -139,78 +122,29 @@ export function TimelineEditor({
     window.addEventListener("pointerup", onUp);
   }
 
-  function move(segId: string, dir: -1 | 1) {
-    const i = timeline.findIndex((s) => s.seg_id === segId);
-    const j = i + dir;
-    if (i < 0 || j < 0 || j >= timeline.length) return;
-    const next = [...timeline];
-    [next[i], next[j]] = [next[j], next[i]];
-    mutate(next);
-  }
-
-  function split(segId: string) {
-    const i = timeline.findIndex((s) => s.seg_id === segId);
-    if (i < 0) return;
-    const s = timeline[i];
-    const mid = Math.round((s.in_ms + s.out_ms) / 2);
-    if (mid - s.in_ms < MIN_SEG_MS || s.out_ms - mid < MIN_SEG_MS) return;
-    const a = { ...s, out_ms: mid };
-    const b = { ...s, seg_id: rid("se"), in_ms: mid };
-    const next = [...timeline];
-    next.splice(i, 1, a, b);
-    mutate(next);
-  }
-
-  function removeSeg(segId: string) {
-    if (timeline.length <= 1) return;
-    mutate(timeline.filter((s) => s.seg_id !== segId));
-    if (selected === segId) setSelected(null);
-  }
-
-  function nudge(segId: string, edge: "in" | "out", delta: number) {
-    mutate(
-      timeline.map((s) => {
-        if (s.seg_id !== segId) return s;
-        if (edge === "in") return { ...s, in_ms: Math.max(0, Math.min(s.in_ms + delta, s.out_ms - MIN_SEG_MS)) };
-        return { ...s, out_ms: Math.max(s.in_ms + MIN_SEG_MS, s.out_ms + delta) };
-      })
-    );
-  }
-
   // --- operations ---
-  function setGain(opId: string, gain: number) {
-    mutateOps(
-      operations.map((o) =>
-        o.op_id === opId ? { ...o, gain_db: gain, ...(o.type === "level" ? { mute: false } : {}) } : o
-      )
-    );
-  }
   function toggleMute(op: EditOperation) {
     const muted = (op.gain_db ?? 0) <= -119;
     if (muted) {
-      const restore = muteCache.current[op.op_id] ?? 0;
-      setGain(op.op_id, restore);
+      setGain(op.op_id, muteCache.current[op.op_id] ?? 0);
     } else {
       muteCache.current[op.op_id] = op.gain_db ?? 0;
       setGain(op.op_id, -120);
     }
   }
-  function removeOp(opId: string) {
-    mutateOps(operations.filter((o) => o.op_id !== opId));
-  }
 
   // --- save / revert / history ---
-  async function save() {
+  const save = useCallback(async () => {
     if (!token || saving) return;
     setSaving(true);
     setError(null);
     try {
       const res = await saveEditDocument(
         threadId,
-        { base_version: version, timeline, operations },
+        { base_version: baseVersion, timeline, operations },
         token
       );
-      setDirty(false);
+      commit(res.version, res.document);
       onSaved(res.version, res.document);
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Save failed.";
@@ -222,14 +156,11 @@ export function TimelineEditor({
     } finally {
       setSaving(false);
     }
-  }
+  }, [token, saving, threadId, baseVersion, timeline, operations, commit, onSaved]);
 
   function revert() {
-    setTimeline(doc.timeline ?? []);
-    setOperations(doc.operations ?? []);
-    setDirty(false);
+    revertStore();
     setError(null);
-    setSelected(null);
   }
 
   async function openHistory() {
@@ -248,9 +179,9 @@ export function TimelineEditor({
     if (!token) return;
     try {
       const { document } = await getEditVersion(threadId, v, token);
-      setTimeline(document.timeline ?? []);
-      setOperations(document.operations ?? []);
-      setDirty(true); // saving will create a new version on top of head
+      // Load onto the working state; baseline (head) stays put so saving makes
+      // a new version on top of the latest.
+      setWorking(document.timeline ?? [], document.operations ?? []);
       setShowHistory(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not load version.");
@@ -336,7 +267,7 @@ export function TimelineEditor({
             return (
               <div
                 key={seg.seg_id}
-                onClick={() => setSelected(seg.seg_id)}
+                onClick={() => select(seg.seg_id)}
                 className="absolute top-0 flex h-full cursor-pointer items-center overflow-hidden border-l text-[10px]"
                 style={{
                   left,
@@ -369,11 +300,11 @@ export function TimelineEditor({
               {selSeg.file_id.slice(0, 6)} · {fmt(selSeg.in_ms)}–{fmt(selSeg.out_ms)}
             </span>
             <div className="ml-auto flex items-center gap-1">
-              <Stepper label="in" onMinus={() => nudge(selSeg.seg_id, "in", -250)} onPlus={() => nudge(selSeg.seg_id, "in", 250)} />
-              <Stepper label="out" onMinus={() => nudge(selSeg.seg_id, "out", -250)} onPlus={() => nudge(selSeg.seg_id, "out", 250)} />
-              <IconBtn title="Move left" onClick={() => move(selSeg.seg_id, -1)}><ChevronLeft size={14} /></IconBtn>
-              <IconBtn title="Move right" onClick={() => move(selSeg.seg_id, 1)}><ChevronRight size={14} /></IconBtn>
-              <IconBtn title="Split at middle" onClick={() => split(selSeg.seg_id)}><Scissors size={13} /></IconBtn>
+              <Stepper label="in" onMinus={() => nudgeSeg(selSeg.seg_id, "in", -250)} onPlus={() => nudgeSeg(selSeg.seg_id, "in", 250)} />
+              <Stepper label="out" onMinus={() => nudgeSeg(selSeg.seg_id, "out", -250)} onPlus={() => nudgeSeg(selSeg.seg_id, "out", 250)} />
+              <IconBtn title="Move left" onClick={() => moveSeg(selSeg.seg_id, -1)}><ChevronLeft size={14} /></IconBtn>
+              <IconBtn title="Move right" onClick={() => moveSeg(selSeg.seg_id, 1)}><ChevronRight size={14} /></IconBtn>
+              <IconBtn title="Split at middle" onClick={() => splitSeg(selSeg.seg_id)}><Scissors size={13} /></IconBtn>
               <IconBtn title="Delete cut" onClick={() => removeSeg(selSeg.seg_id)} danger><Trash2 size={13} /></IconBtn>
             </div>
           </div>
@@ -419,7 +350,7 @@ export function TimelineEditor({
                     </>
                   )}
                   <button
-                    onClick={() => removeOp(op.op_id)}
+                    onClick={() => removeOpStore(op.op_id)}
                     title="Delete layer"
                     className={`rounded p-1 hover:bg-[var(--accent-soft)] ${isAudio ? "" : "ml-auto"}`}
                   >

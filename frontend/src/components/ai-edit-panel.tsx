@@ -6,12 +6,6 @@ import {
   X,
   Send,
   Plus,
-  Play,
-  Pause,
-  Volume2,
-  VolumeX,
-  SkipBack,
-  SkipForward,
   Loader2,
   AlertCircle,
   Film,
@@ -24,17 +18,16 @@ import {
 import { useDriveStore } from "@/stores/drive-store";
 import { RenderBar } from "@/components/render-bar";
 import { TimelineEditor } from "@/components/timeline-editor";
+import { CompositePreview } from "@/components/preview/composite-preview";
+import { useEditDocStore } from "@/stores/edit-doc-store";
 import { useAuthStore } from "@/stores/auth-store";
 import {
   createEditThread,
   getEditThread,
   sendEditMessage,
-  getFilePlaybackUrl,
   type EditThread,
   type EditThreadStatus,
-  type EditSegment,
   type EditOperation,
-  type ResolvedTimeline,
 } from "@/lib/api";
 
 const POLL_MS = 2000;
@@ -171,6 +164,19 @@ export function AiEditPanel() {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [thread, userTurns, busy]);
 
+  // Seed the live working-document store whenever the authoritative version
+  // changes (agent wrote a new version, or we loaded a thread). Keyed on
+  // version so 2s polls don't wipe in-progress manual edits.
+  const seedDoc = useEditDocStore((s) => s.seed);
+  const seededRef = useRef<string>("");
+  useEffect(() => {
+    if (!thread?.id) return;
+    const key = `${thread.id}:${thread.document_version ?? 0}`;
+    if (seededRef.current === key) return;
+    seededRef.current = key;
+    seedDoc(thread.id, thread.document_version ?? 0, thread.document);
+  }, [thread?.id, thread?.document_version, thread?.document, seedDoc]);
+
   async function handleSend() {
     const text = input.trim();
     if (!text || !token || busy) return;
@@ -295,15 +301,8 @@ export function AiEditPanel() {
         </div>
       </div>
 
-      {/* Program monitor */}
-      <CompositePreview
-        resolved={
-          doc?.resolved ??
-          (doc?.timeline?.length ? spineResolved(doc.timeline) : null)
-        }
-        token={token}
-        layered={(doc?.operations?.length ?? 0) > 0}
-      />
+      {/* Program monitor — reads the live working doc from the edit store */}
+      <CompositePreview token={token} />
 
       {/* Export / render */}
       {threadId && (
@@ -330,8 +329,6 @@ export function AiEditPanel() {
         {doc && editing && threadId ? (
           <TimelineEditor
             threadId={threadId}
-            doc={doc}
-            version={thread?.document_version ?? 0}
             token={token}
             onSaved={handleSavedEdit}
           />
@@ -711,405 +708,6 @@ function QuestionForm({
       >
         Submit answers
       </button>
-    </div>
-  );
-}
-
-// --- Program monitor: a real compositor over the resolved layer set ---
-//
-// One muted <video> shows the top video layer at the program instant; one
-// <audio> per audio layer is mixed by gain+duck. Everything is slaved to a
-// performance.now() master clock, with drift-correcting seeks so picture and
-// the (possibly decoupled) audio beds stay aligned.
-
-const SYNC_DRIFT_S = 0.18; // re-seek a media element if it drifts past this
-
-function spineResolved(timeline: EditSegment[]): ResolvedTimeline {
-  let t = 0;
-  const video: ResolvedTimeline["video_layers"] = [];
-  const audio: ResolvedTimeline["audio_layers"] = [];
-  for (const seg of timeline) {
-    const dur = Math.max(0, seg.out_ms - seg.in_ms);
-    video.push({
-      layer_id: `v_${seg.seg_id}`,
-      source_file_id: seg.file_id,
-      src_in_ms: seg.in_ms,
-      src_out_ms: seg.out_ms,
-      prog_start_ms: t,
-      prog_end_ms: t + dur,
-      z: 0,
-      layout: "full_frame",
-      opacity: 1,
-      kind: "spine",
-    });
-    audio.push({
-      layer_id: `a_${seg.seg_id}`,
-      role: "dialogue",
-      source_file_id: seg.file_id,
-      src_in_ms: seg.in_ms,
-      src_out_ms: seg.out_ms,
-      prog_start_ms: t,
-      prog_end_ms: t + dur,
-      gain_db: 0,
-      duck_db: 0,
-      kind: "spine",
-    });
-    t += dur;
-  }
-  return { duration_ms: t, video_layers: video, audio_layers: audio };
-}
-
-function dbToGain(db: number): number {
-  if (db <= -119) return 0;
-  return Math.min(1, Math.pow(10, db / 20));
-}
-
-function srcMatches(el: HTMLMediaElement, url: string): boolean {
-  if (!el.src || !url) return false;
-  return el.src === url || el.src.split("?")[0] === url.split("?")[0];
-}
-
-function CompositePreview({
-  resolved,
-  token,
-  layered = false,
-}: {
-  resolved: ResolvedTimeline | null;
-  token: string | undefined;
-  layered?: boolean;
-}) {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const audioEls = useRef<Map<string, HTMLAudioElement>>(new Map());
-  const [urls, setUrls] = useState<Record<string, string>>({});
-  const [playing, setPlaying] = useState(false);
-  const [muted, setMuted] = useState(false);
-  const [progMs, setProgMs] = useState(0);
-
-  const progRef = useRef(0);
-  const playingRef = useRef(false);
-  const mutedRef = useRef(false);
-  const lastTsRef = useRef(0);
-  const lastDisplayRef = useRef(0);
-  const rafRef = useRef<number | null>(null);
-  const curVideoSrcRef = useRef<string>("");
-
-  const duration = resolved?.duration_ms ?? 0;
-  const hasTimeline = !!resolved && resolved.video_layers.length > 0;
-
-  const fileIds = useMemo(() => {
-    if (!resolved) return [];
-    const s = new Set<string>();
-    resolved.video_layers.forEach((v) => s.add(v.source_file_id));
-    resolved.audio_layers.forEach((a) => s.add(a.source_file_id));
-    return Array.from(s);
-  }, [resolved]);
-
-  // Resolve playback URLs for every source clip referenced by any layer.
-  useEffect(() => {
-    if (!token) return;
-    let cancelled = false;
-    (async () => {
-      const entries = await Promise.all(
-        fileIds.map(async (id) => {
-          if (urls[id]) return [id, urls[id]] as const;
-          try {
-            const { url } = await getFilePlaybackUrl(id, token);
-            return [id, url] as const;
-          } catch {
-            return [id, ""] as const;
-          }
-        })
-      );
-      if (!cancelled) {
-        setUrls((prev) => {
-          const next = { ...prev };
-          for (const [id, url] of entries) if (url) next[id] = url;
-          return next;
-        });
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fileIds.join(","), token]);
-
-  // Place every media element at the right source position for program time t.
-  const syncTo = useCallback(
-    (t: number, opts: { hardSeek?: boolean } = {}) => {
-      if (!resolved) return;
-      const hard = opts.hardSeek ?? false;
-
-      // VIDEO — top z layer covering t.
-      const v = videoRef.current;
-      if (v) {
-        // React's `muted` JSX prop is unreliable; enforce it on the node so the
-        // picture's own audio track never doubles the audio bus (comb-filtering).
-        if (!v.muted) v.muted = true;
-        let top: ResolvedTimeline["video_layers"][number] | null = null;
-        for (const layer of resolved.video_layers) {
-          if (layer.prog_start_ms <= t && t < layer.prog_end_ms) {
-            if (!top || layer.z > top.z) top = layer;
-          }
-        }
-        if (top) {
-          const url = urls[top.source_file_id];
-          if (url) {
-            const want = (top.src_in_ms + (t - top.prog_start_ms)) / 1000;
-            if (curVideoSrcRef.current !== top.source_file_id || !srcMatches(v, url)) {
-              curVideoSrcRef.current = top.source_file_id;
-              v.src = url;
-              const onMeta = () => {
-                v.currentTime = want;
-                if (playingRef.current) v.play().catch(() => {});
-              };
-              if (v.readyState >= 1) onMeta();
-              else v.addEventListener("loadedmetadata", onMeta, { once: true });
-            } else if (hard || Math.abs(v.currentTime - want) > SYNC_DRIFT_S) {
-              v.currentTime = want;
-            }
-          }
-        }
-      }
-
-      // AUDIO — every layer sounding at t plays; the rest pause.
-      for (const a of resolved.audio_layers) {
-        const el = audioEls.current.get(a.layer_id);
-        if (!el) continue;
-        const active = a.prog_start_ms <= t && t < a.prog_end_ms;
-        if (active) {
-          el.volume = mutedRef.current ? 0 : dbToGain(a.gain_db + a.duck_db);
-          const want = (a.src_in_ms + (t - a.prog_start_ms)) / 1000;
-          if (hard || Math.abs(el.currentTime - want) > SYNC_DRIFT_S) {
-            try {
-              el.currentTime = want;
-            } catch {
-              /* not seekable yet */
-            }
-          }
-          if (playingRef.current && el.paused) el.play().catch(() => {});
-        } else if (!el.paused) {
-          el.pause();
-        }
-      }
-    },
-    [resolved, urls]
-  );
-
-  const stopRaf = useCallback(() => {
-    if (rafRef.current != null) {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = null;
-    }
-  }, []);
-
-  const pauseAll = useCallback(() => {
-    playingRef.current = false;
-    setPlaying(false);
-    videoRef.current?.pause();
-    audioEls.current.forEach((el) => el.pause());
-    stopRaf();
-  }, [stopRaf]);
-
-  // Master clock: advance program time in real time, nudging media into sync.
-  const loop = useCallback(
-    (ts: number) => {
-      if (lastTsRef.current) {
-        const dt = ts - lastTsRef.current;
-        let t = progRef.current + dt;
-        if (t >= duration) {
-          t = duration;
-          progRef.current = t;
-          syncTo(t);
-          pauseAll();
-          progRef.current = 0;
-          lastDisplayRef.current = 0;
-          setProgMs(0);
-          return;
-        }
-        progRef.current = t;
-        syncTo(t);
-        // Throttle the React re-render (~10fps) so 60fps state churn doesn't
-        // starve audio/video decoding and cause stutter.
-        if (Math.abs(t - lastDisplayRef.current) >= 100) {
-          lastDisplayRef.current = t;
-          setProgMs(t);
-        }
-      }
-      lastTsRef.current = ts;
-      rafRef.current = requestAnimationFrame(loop);
-    },
-    [duration, syncTo, pauseAll]
-  );
-
-  function togglePlay() {
-    if (!hasTimeline) return;
-    if (playingRef.current) {
-      pauseAll();
-      return;
-    }
-    playingRef.current = true;
-    setPlaying(true);
-    lastTsRef.current = 0;
-    syncTo(progRef.current, { hardSeek: true });
-    videoRef.current?.play().catch(() => {});
-    stopRaf();
-    rafRef.current = requestAnimationFrame(loop);
-  }
-
-  function scrub(t: number) {
-    progRef.current = t;
-    lastDisplayRef.current = t;
-    setProgMs(t);
-    lastTsRef.current = 0;
-    syncTo(t, { hardSeek: true });
-  }
-
-  // Keep mute reactive without restarting the clock.
-  useEffect(() => {
-    mutedRef.current = muted;
-    if (resolved) {
-      resolved.audio_layers.forEach((a) => {
-        const el = audioEls.current.get(a.layer_id);
-        if (el) el.volume = muted ? 0 : dbToGain(a.gain_db + a.duck_db);
-      });
-    }
-  }, [muted, resolved]);
-
-  // Reset to the start whenever the resolved plan changes shape.
-  useEffect(() => {
-    pauseAll();
-    progRef.current = 0;
-    lastDisplayRef.current = 0;
-    setProgMs(0);
-    curVideoSrcRef.current = "";
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [resolved]);
-
-  useEffect(() => stopRaf, [stopRaf]);
-
-  const activeVideo = useMemo(() => {
-    if (!resolved) return null;
-    let top: ResolvedTimeline["video_layers"][number] | null = null;
-    for (const layer of resolved.video_layers) {
-      if (layer.prog_start_ms <= progMs && progMs < layer.prog_end_ms) {
-        if (!top || layer.z > top.z) top = layer;
-      }
-    }
-    return top;
-  }, [resolved, progMs]);
-
-  const activeBeds = resolved
-    ? resolved.audio_layers.filter(
-        (a) =>
-          a.kind !== "spine" &&
-          a.prog_start_ms <= progMs &&
-          progMs < a.prog_end_ms
-      ).length
-    : 0;
-
-  return (
-    <div className="border-b px-4 py-3" style={{ borderColor: "var(--border)" }}>
-      <div
-        className="relative aspect-video w-full overflow-hidden rounded-lg"
-        style={{ background: "#000" }}
-      >
-        {hasTimeline ? (
-          <video ref={videoRef} className="h-full w-full" muted playsInline />
-        ) : (
-          <div
-            className="flex h-full w-full items-center justify-center text-xs"
-            style={{ color: "#666" }}
-          >
-            <Film size={28} />
-          </div>
-        )}
-
-        {/* hidden audio bus — one element per audio layer, mixed live */}
-        {resolved?.audio_layers.map((a) => (
-          <audio
-            key={a.layer_id}
-            ref={(el) => {
-              if (el) audioEls.current.set(a.layer_id, el);
-              else audioEls.current.delete(a.layer_id);
-            }}
-            src={urls[a.source_file_id] || undefined}
-            preload="auto"
-          />
-        ))}
-
-        {/* live badges for what's overriding the spine right now */}
-        {hasTimeline && (activeVideo?.kind === "coverage" || activeBeds > 0) && (
-          <div className="absolute left-2 top-2 flex gap-1">
-            {activeVideo?.kind === "coverage" && (
-              <span className="flex items-center gap-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] text-white">
-                <Layers size={10} /> coverage
-              </span>
-            )}
-            {activeBeds > 0 && (
-              <span className="flex items-center gap-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] text-white">
-                <Music size={10} /> {activeBeds} bed{activeBeds === 1 ? "" : "s"}
-              </span>
-            )}
-          </div>
-        )}
-      </div>
-
-      {hasTimeline && (
-        <>
-          <input
-            type="range"
-            min={0}
-            max={Math.max(1, duration)}
-            value={Math.min(progMs, duration)}
-            onChange={(e) => scrub(Number(e.target.value))}
-            className="mt-2 w-full accent-[var(--accent)]"
-          />
-          <div className="mt-1 flex items-center gap-2">
-            <button
-              onClick={() => scrub(Math.max(0, progMs - 5000))}
-              className="rounded p-1 transition-colors hover:bg-[var(--accent-soft)]"
-              title="Back 5s"
-            >
-              <SkipBack size={15} />
-            </button>
-            <button
-              onClick={togglePlay}
-              className="rounded-full p-1.5 text-white"
-              style={{ background: "var(--accent)" }}
-              title={playing ? "Pause" : "Play"}
-            >
-              {playing ? <Pause size={15} /> : <Play size={15} />}
-            </button>
-            <button
-              onClick={() => scrub(Math.min(duration, progMs + 5000))}
-              className="rounded p-1 transition-colors hover:bg-[var(--accent-soft)]"
-              title="Forward 5s"
-            >
-              <SkipForward size={15} />
-            </button>
-            <button
-              onClick={() => setMuted((m) => !m)}
-              className="rounded p-1 transition-colors hover:bg-[var(--accent-soft)]"
-              title={muted ? "Unmute" : "Mute"}
-            >
-              {muted ? <VolumeX size={15} /> : <Volume2 size={15} />}
-            </button>
-            <span
-              className="ml-auto text-xs tabular-nums"
-              style={{ color: "var(--muted)" }}
-            >
-              {fmtClock(progMs)} / {fmtClock(duration)}
-            </span>
-          </div>
-          {layered && (
-            <p className="mt-1 text-[11px]" style={{ color: "var(--muted)" }}>
-              Composited preview — beds &amp; coverage mixed live; split-edit drift
-              within ~0.2s.
-            </p>
-          )}
-        </>
-      )}
     </div>
   );
 }

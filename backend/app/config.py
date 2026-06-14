@@ -64,7 +64,9 @@ class Settings(BaseSettings):
     # Per-frame token budget: "low" (~64 tok/frame), "default", or "high".
     l2_media_resolution: str = "default"
     # Rich logs for a few minutes of footage can be large; give the model room.
-    l2_max_output_tokens: int = 32768
+    # gemini-2.5-flash supports up to 65536 output tokens; long/dense clips
+    # (>10 min) overflow 32768 and return truncated, unparseable JSON.
+    l2_max_output_tokens: int = 65536
     # Files API upload poll: how long to wait for Gemini to finish ingesting the
     # uploaded video before giving up.
     l2_file_active_timeout_seconds: int = 300
