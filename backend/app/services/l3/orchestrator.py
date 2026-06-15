@@ -24,10 +24,13 @@ from app.config import get_settings
 from app.services.jobs import app
 from app.services.l3 import store
 from app.services.l3.catalog import build_catalog, render_catalog_text
-from app.services.l3.sync import build_sync_groups, render_sync_groups_text
-from app.services.l3.roster import render_roster_text
+from app.services.l3.content import (
+    build_content_map,
+    build_overlap_index,
+    render_content_map_text,
+    render_overlap_text,
+)
 from app.services.l3.principles import render_principles_text
-from app.services.l3.takes import build_take_groups, render_take_groups_text
 from app.services.l3.tools import TERMINAL_TOOLS, TOOL_SPECS, EditSession, execute_tool
 from app.services.llm.anthropic_client import AnthropicClient
 from app.services.llm.base import tool_result_block, user_message
@@ -85,11 +88,16 @@ WORKFLOW (each run):
 engine honors (favor_speaker, reward_reaction, shot_variety, pace, anti_metronome, \
 hook_first, tighten_dead_air, ...). Set only the knobs you want to push; the rest run \
 at sensible defaults.
-3. Skim the catalog; read_clip the promising clips.
+3. Survey the CONTENT MAP -- it shows what EVERY clip contains. The CONTENT OVERLAP \
+block marks which clips are duplicate takes/angles (same content) vs. distinct material. \
+read_clip the promising clips for exact timestamps. Distinct-content clips are not \
+interchangeable: don't build the whole edit from one and silently drop the rest.
 4. set_outline: 2-6 beats with purpose + intent (hook first when the brief implies an audience).
 5. Build the timeline beat by beat: query_seams to scout, add_segment with rough times, \
 content + rationale on every segment. Set priority (1=core, 5=expendable filler).
-6. timeline_status; fix warnings that matter (jump cuts, dirty seams, micro-segments).
+6. timeline_status; fix warnings that matter (jump cuts, dirty seams, micro-segments). \
+Check its content_coverage: any clip listed there has UNIQUE content used nowhere -- \
+confirm each omission is intentional (off-topic / redundant / weaker take) or add it.
 7. fit_duration to the target. If it can't fit by trimming, drop a whole segment yourself.
 8. finalize with an honest summary (what you chose, what's weak, what you'd tweak next).
 
@@ -113,59 +121,36 @@ replace spine audio with a cleaner source.
 - These are layers, not spine edits: the spine still owns the clock. Build a solid spine FIRST. \
 For decorative B-roll / beds the default is coupled -- don't add them just to show off.
 
-MULTICAM / ANGLES (only when clips are a SYNC GROUP -- same moment, several cameras):
-- Switching which angle is on screen is a NORMAL picture cut, NOT B-roll. Use pick_angle to cut \
-the spine PICTURE to another synced angle over a range; the spine AUDIO keeps playing and the \
-engine frame-aligns the angle from the sync offset. It is legal on ANY spine kind (a synced \
-angle is the same moment, so A/V stay coherent) -- the one place decoupling the picture is the \
-expected move, not showing off.
-- Don't hand-place every switch: call auto_multicam to SEED a speaker/reaction-aware cut (it \
-follows whoever holds the floor and cuts to a strong reaction when one beats the talker, \
-weighted by your principles), then review timeline_status and adjust with pick_angle / \
-remove_operation. read_angles shows the per-window menu (floor speaker + what each angle offers). \
-Generally follow the speaker, but cut to a genuine reaction when it's stronger; vary shot sizes; \
-don't cut metronomically.
-- Match the same person across angles yourself using the ROSTER below (durable appearance traits \
-+ time alignment -- never the clip-local voice/p-id label).
-
 STYLE OF THE CUT:
 - Respect the grain of the footage: cut dialogue at sentence/turn seams, action on impacts, \
 music on beats. Enter scenes as late as possible, leave as early as possible. Vary segment \
 lengths; monotony reads as machine-made.
 - TAKES: when the same content was delivered more than once (a retake, or a flub-then-retry \
-inside one clip), they appear as TAKE GROUPS below. RULE: whenever a take group exists you MUST \
-call compare_takes and then keep EXACTLY ONE take from that group in the timeline -- never let \
-two takes of the same content both survive, and never splice across takes mid-sentence. \
-- Be specific about WHICH take and WHY. At minimum you must pick the best take on the TEXT: \
-prefer the take whose words are the most complete and correct delivery of the line -- no false \
-starts, no cut-off or missing words, fewest filler words ("um", "uh", "like"), no repeated/ \
-stumbled phrasing, and the full intended sentence present. Read the actual transcript spans \
-from compare_takes; do not judge from the logline. Only after the text is clean do you weight \
-the remaining performance factors by the brief (polished -> fluency/stability; raw -> \
+inside one clip), keep EXACTLY ONE take in the timeline -- never let two takes of the same \
+content both survive, and never splice across takes mid-sentence. Pick the best take on the \
+TEXT first: prefer the words that are the most complete and correct delivery of the line -- no \
+false starts, no cut-off or missing words, fewest filler words ("um", "uh", "like"), no \
+repeated/stumbled phrasing, the full intended sentence present. Use score_span to get objective \
+metrics + quality notes for each candidate span; only after the text is clean do you weight the \
+remaining performance factors by the brief (polished -> fluency/stability; raw -> \
 energy/authenticity). Name the winning take and the textual reason in the rationale.
 
 CLIP CATALOG (scope for this thread):
 {catalog}
 
-{take_groups}
+{content_map}
 
-{sync_groups}
-
-{sync_roster}
+{content_overlap}
 
 {principles}
 """
 
 
-def _render_system_prompt(catalog, take_groups, sync_groups, document=None) -> str:
-    tg_text = render_take_groups_text(take_groups)
-    sg_text = render_sync_groups_text(sync_groups)
-    roster_text = render_roster_text(sync_groups)
+def _render_system_prompt(catalog, content_map=None, overlap=None, document=None) -> str:
     return SYSTEM_PROMPT_TEMPLATE.format(
         catalog=render_catalog_text(catalog),
-        take_groups=tg_text or "(no repeated-content take groups detected)",
-        sync_groups=sg_text or "(no synchronized-source/multicam groups detected)",
-        sync_roster=roster_text or "(no sync-group people roster -- single-source or unsynced footage)",
+        content_map=render_content_map_text(content_map or []),
+        content_overlap=render_overlap_text(overlap or []),
         principles=render_principles_text(document or {}),
     )
 
@@ -186,17 +171,19 @@ def run_thread(thread_id: str) -> None:
     store.set_thread_status(thread_id, "drafting")
 
     # Built once from the DB; shared by the (cacheable) system prompt and the
-    # tool session so the catalog/take-groups are computed a single time.
+    # tool session so the catalog is computed a single time. The content map
+    # surveys every clip's actual material so the model can't build from a
+    # subset and silently drop unique footage.
     catalog = build_catalog(thread["file_ids"])
-    take_groups = build_take_groups(thread["file_ids"])
-    sync_groups = build_sync_groups(thread["file_ids"])
+    content = build_content_map(thread["file_ids"])
+    overlap = build_overlap_index(content)
 
     # Resume the working document from the latest snapshot (empty on first run).
     # Loaded before the prompt so a resumed run reflects any principles set
     # earlier (the rest of the prefix stays stable for caching within a run).
     doc, _version = store.latest_document(thread_id)
 
-    system = _render_system_prompt(catalog, take_groups, sync_groups, doc or {})
+    system = _render_system_prompt(catalog, content, overlap, doc or {})
     messages = store.load_messages(thread_id)
     if not messages:
         logger.error("L3: thread %s has no messages; nothing to do.", thread_id)
@@ -207,8 +194,8 @@ def run_thread(thread_id: str) -> None:
         thread_id=thread_id,
         file_ids=thread["file_ids"],
         catalog=catalog,
-        take_groups=take_groups,
-        sync_groups=sync_groups,
+        content=content,
+        overlap=overlap,
         document=doc or {},
     )
 

@@ -1,66 +1,63 @@
 """
-L3 synchronized-source detection (multicam, single frame).
+On-demand audio alignment for synchronized sources (multicam / a separate
+recorder / a screen-rec + webcam).
 
-Multiple recordings of the SAME moment (camera angles, a screen-rec + a webcam,
-a separate audio recorder) can be aligned in time by the fact that they captured
-the same sound. We align them by cross-correlating the per-file `sync_env` that
-L1 already stores on audio_features -- a fixed-hop (500 ms), normalized energy
-envelope built for exactly this ("same recording from two cameras -> near
-identical sync_env").
+Two recordings of the SAME moment captured the same sound, so we can recover
+their time offset by cross-correlating the per-file `sync_env` that L1 stores on
+audio_features -- a fixed-hop (500 ms), normalized energy envelope built for
+exactly this.
 
-Pipeline:
-  S1 coarse  -- pairwise normalized cross-correlation of sync_env -> best lag
-                (multiple of the 500 ms hop) + a confidence (the peak Pearson
-                correlation). Files whose confidence clears a threshold are the
-                same moment.
-  S2 refine  -- parabolic interpolation around the correlation peak gives a
-                sub-hop offset (well under 500 ms) with no extra data. A broad/
-                low peak is flagged low-confidence (possible clock drift); true
-                sample-accuracy is a later pass.
-  S3 group   -- union-find clusters synced files into a group sharing one master
-                time, with each member's offset relative to an anchor and a
-                suggested hero (cleanest) audio source.
+This is deliberately NOT a global precompute that partitions the library into
+"sync groups" (that mislabeled distinct-content clips as duplicate angles and
+made the model drop unique footage). It is an AIRTIGHT, UNIVERSAL, on-demand
+query: `align_clips(a, b, span)` answers "are these two simultaneous, and if so
+by what offset?" for the one pair a cut is actually considering, and returns an
+honest `None` when they are not simultaneous (or one is silent).
 
-Source switching itself needs NO new machinery: an angle switch is just a
-`place_video` of another group member, and the engine derives its source time
-from the group offset.
+Airtight = three gates a coincidental match cannot pass:
+  1. SUBSTANTIAL OVERLAP -- the compared region must be long (>= ~25 s and a
+     quarter of the shorter clip); a lucky 3-second tail is ineligible.
+  2. PEAK PROMINENCE -- the best lag must beat the best lag far from it by a
+     margin; a flat/ambiguous correlation surface is rejected.
+  3. CONFIDENCE FLOOR -- the peak Pearson correlation must clear a threshold.
+A sub-hop offset is refined by parabolic interpolation around the peak.
 """
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Min peak correlation (0..1) to call two clips the same moment.
-SYNC_CONF_THRESHOLD = 0.6
-# A clip must overlap the other by at least this many hops to be comparable.
-MIN_OVERLAP_HOPS = 6  # ~3 s at the 500 ms sync hop
+# Min peak Pearson correlation (0..1) to accept a match.
+SYNC_CONF_THRESHOLD = 0.45
+# Overlap must be at least this many hops AND this fraction of the shorter clip.
+MIN_OVERLAP_HOPS_FLOOR = 50      # ~25 s at the 500 ms sync hop
+MIN_OVERLAP_FRACTION = 0.25      # of the shorter envelope
+# The best lag must beat the best lag outside +/- NEIGHBOR hops by this margin.
+PEAK_PROMINENCE_MARGIN = 0.10
+PROMINENCE_NEIGHBOR_HOPS = 6
+
+Env = Tuple[int, List[float], Optional[float]]  # (hop_ms, sync_env, integrated_lufs)
 
 
 @dataclass
-class SyncMember:
-    file_id: str
-    offset_ms: int           # this clip's start in the group's master time
-    confidence: float        # correlation to the anchor
+class AlignResult:
+    offset_ms: int        # b's start in a's clock; positive => b starts after a
+    confidence: float     # peak correlation, 0..1
+    overlap_ms: int       # length of the compared overlap at the peak
+    prominence: float     # how far the peak stands above the far-field
 
-
-@dataclass
-class SyncGroup:
-    group_id: str
-    members: List[SyncMember] = field(default_factory=list)
-    anchor_file_id: str = ""
-    hero_file_id: str = ""   # suggested cleanest-audio source (overridable)
-    drift_warning: bool = False
-
-    def offset_of(self, file_id: str) -> Optional[int]:
-        for m in self.members:
-            if m.file_id == file_id:
-                return m.offset_ms
-        return None
+    def to_dict(self) -> dict:
+        return {
+            "offset_ms": self.offset_ms,
+            "confidence": round(self.confidence, 3),
+            "overlap_ms": self.overlap_ms,
+            "prominence": round(self.prominence, 3),
+        }
 
 
 def _pg_conn():
@@ -68,11 +65,11 @@ def _pg_conn():
     return psycopg.connect(get_settings().database_url, autocommit=True)
 
 
-def load_sync_envs(file_ids: List[str]) -> Dict[str, Tuple[int, List[float], Optional[float]]]:
+def load_sync_envs(file_ids: List[str]) -> Dict[str, Env]:
     """file_id -> (sync_hop_ms, sync_env, integrated_lufs). Missing/empty skipped."""
     if not file_ids:
         return {}
-    out: Dict[str, Tuple[int, List[float], Optional[float]]] = {}
+    out: Dict[str, Env] = {}
     with _pg_conn() as conn:
         rows = conn.execute(
             """
@@ -89,152 +86,127 @@ def load_sync_envs(file_ids: List[str]) -> Dict[str, Tuple[int, List[float], Opt
     return out
 
 
-def _best_lag(a: List[float], b: List[float]) -> Tuple[int, float, float]:
-    """Normalized cross-correlation of two envelopes.
+def _overlap_floor_hops(na: int, nb: int) -> int:
+    """How many overlapping hops we demand before a lag is even eligible."""
+    return max(MIN_OVERLAP_HOPS_FLOOR, int(MIN_OVERLAP_FRACTION * min(na, nb)))
 
-    Returns (best_lag_hops, peak_corr, sub_hop_frac). A positive lag means `b`
-    starts `lag` hops AFTER `a`. sub_hop_frac in (-0.5,0.5) refines the peak via
-    parabolic interpolation.
+
+def _best_lag(a: List[float], b: List[float]) -> Optional[dict]:
+    """Hardened normalized cross-correlation of two envelopes.
+
+    Only lags whose overlap clears the floor are eligible (so a tiny coincidental
+    tail can't win). Returns the winning lag with its correlation, sub-hop
+    refinement, overlap length, and prominence over the far-field -- or None if
+    nothing is eligible (clips too short to be sure).
     """
     import numpy as np
 
     va, vb = np.asarray(a, float), np.asarray(b, float)
     na, nb = va.size, vb.size
     if na == 0 or nb == 0:
-        return 0, 0.0, 0.0
+        return None
 
-    best_lag, best_corr = 0, -2.0
+    floor = _overlap_floor_hops(na, nb)
+    if floor > min(na, nb):
+        return None  # the clips can't possibly overlap enough to be certain
+
+    best_lag, best_corr, best_n = 0, -2.0, 0
     corr_at: Dict[int, float] = {}
-    # Slide b across a; require a real overlap so a tiny tail can't score high.
     for lag in range(-(nb - 1), na):
         a0 = max(0, lag)
         b0 = max(0, -lag)
         n = min(na - a0, nb - b0)
-        if n < MIN_OVERLAP_HOPS:
+        if n < floor:
             continue
         sa = va[a0:a0 + n]
         sb = vb[b0:b0 + n]
         sa = sa - sa.mean()
         sb = sb - sb.mean()
-        denom = (np.linalg.norm(sa) * np.linalg.norm(sb))
+        denom = np.linalg.norm(sa) * np.linalg.norm(sb)
         c = float(np.dot(sa, sb) / denom) if denom > 0 else 0.0
         corr_at[lag] = c
         if c > best_corr:
-            best_corr, best_lag = c, lag
+            best_corr, best_lag, best_n = c, lag, n
 
-    # Parabolic interpolation around the peak for a sub-hop estimate.
+    if not corr_at:
+        return None
+
+    # Prominence: the best correlation OUTSIDE a small neighborhood of the peak.
+    far = [c for lg, c in corr_at.items() if abs(lg - best_lag) > PROMINENCE_NEIGHBOR_HOPS]
+    far_best = max(far) if far else -1.0
+    prominence = best_corr - far_best
+
+    # Parabolic interpolation around the peak -> sub-hop fraction.
     frac = 0.0
     cm = corr_at.get(best_lag - 1)
     cp = corr_at.get(best_lag + 1)
     if cm is not None and cp is not None:
-        denom = (cm - 2 * best_corr + cp)
+        denom = cm - 2 * best_corr + cp
         if denom != 0:
-            frac = 0.5 * (cm - cp) / denom
-            frac = max(-0.5, min(0.5, frac))
-    return best_lag, best_corr, frac
+            frac = max(-0.5, min(0.5, 0.5 * (cm - cp) / denom))
+
+    return {
+        "lag": best_lag,
+        "corr": best_corr,
+        "frac": frac,
+        "overlap_hops": best_n,
+        "prominence": prominence,
+    }
 
 
-def align_pair(
-    env_a: Tuple[int, List[float], Optional[float]],
-    env_b: Tuple[int, List[float], Optional[float]],
-) -> Tuple[int, float]:
-    """Returns (offset_ms of b relative to a, confidence). Positive => b starts
-    after a."""
+def align_envs(env_a: Env, env_b: Env) -> Optional[AlignResult]:
+    """Align two loaded envelopes. None unless all three airtight gates pass."""
     hop_a, a, _ = env_a
     hop_b, b, _ = env_b
-    # Envelopes share the fixed SYNC_HOP_MS grid by construction; guard anyway.
-    if hop_a != hop_b:
-        return 0, 0.0
-    lag, corr, frac = _best_lag(a, b)
-    offset_ms = int(round((lag + frac) * hop_a))
-    return offset_ms, max(0.0, corr)
-
-
-def build_sync_groups(file_ids: List[str], threshold: float = SYNC_CONF_THRESHOLD) -> List[SyncGroup]:
-    """Cluster the in-scope clips into synchronized-source groups."""
-    envs = load_sync_envs(file_ids)
-    fids = list(envs.keys())
-    if len(fids) < 2:
-        return []
-
-    # Pairwise alignment -> edges above threshold (union-find clusters).
-    parent = {f: f for f in fids}
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(x, y):
-        parent[find(x)] = find(y)
-
-    pair_offset: Dict[Tuple[str, str], Tuple[int, float]] = {}
-    for i in range(len(fids)):
-        for j in range(i + 1, len(fids)):
-            off, conf = align_pair(envs[fids[i]], envs[fids[j]])
-            if conf >= threshold:
-                pair_offset[(fids[i], fids[j])] = (off, conf)
-                union(fids[i], fids[j])
-
-    clusters: Dict[str, List[str]] = {}
-    for f in fids:
-        clusters.setdefault(find(f), []).append(f)
-
-    groups: List[SyncGroup] = []
-    gi = 0
-    for members in clusters.values():
-        if len(members) < 2:
-            continue
-        gi += 1
-        # Anchor = the member with the most/strongest links (first is fine here).
-        anchor = members[0]
-        sm: List[SyncMember] = []
-        drift = False
-        for f in members:
-            if f == anchor:
-                sm.append(SyncMember(file_id=f, offset_ms=0, confidence=1.0))
-                continue
-            key = (anchor, f) if (anchor, f) in pair_offset else (f, anchor)
-            if key in pair_offset:
-                off, conf = pair_offset[key]
-                if key[0] != anchor:  # stored as (f, anchor) -> invert sign
-                    off = -off
-            else:
-                off, conf = align_pair(envs[anchor], envs[f])
-            if conf < threshold:
-                drift = True
-            sm.append(SyncMember(file_id=f, offset_ms=off, confidence=round(conf, 3)))
-        # Hero = loudest integrated audio (rough proxy for "cleanest"; overridable).
-        hero = max(members, key=lambda f: (envs[f][2] if envs[f][2] is not None else -120.0))
-        groups.append(SyncGroup(
-            group_id=f"sg{gi}", members=sm,
-            anchor_file_id=anchor, hero_file_id=hero, drift_warning=drift,
-        ))
-    return groups
-
-
-def find_group_for(groups: List[SyncGroup], file_id: str) -> Optional[SyncGroup]:
-    for g in groups:
-        if g.offset_of(file_id) is not None:
-            return g
-    return None
-
-
-def render_sync_groups_text(groups: List[SyncGroup]) -> str:
-    """Compact catalog block so Opus knows which clips are the same moment."""
-    if not groups:
-        return ""
-    lines = ["SYNCHRONIZED-SOURCE GROUPS (same moment, multiple angles/sources):"]
-    for g in groups:
-        mem = ", ".join(
-            f"{m.file_id}(+{m.offset_ms}ms)" + (" [hero]" if m.file_id == g.hero_file_id else "")
-            for m in g.members
-        )
-        warn = "  ! low-confidence/drift" if g.drift_warning else ""
-        lines.append(f"  {g.group_id}: {mem}{warn}")
-    lines.append(
-        "  -> switch angles with place_video of another member (its source time "
-        "is derived from the offset automatically); keep audio on the [hero] source."
+    if hop_a != hop_b or not a or not b:
+        return None
+    r = _best_lag(a, b)
+    if r is None:
+        return None
+    corr = r["corr"]
+    if corr < SYNC_CONF_THRESHOLD or r["prominence"] < PEAK_PROMINENCE_MARGIN:
+        return None  # ambiguous or weak -> honest "not simultaneous"
+    offset_ms = int(round((r["lag"] + r["frac"]) * hop_a))
+    return AlignResult(
+        offset_ms=offset_ms,
+        confidence=max(0.0, min(1.0, corr)),
+        overlap_ms=int(r["overlap_hops"] * hop_a),
+        prominence=r["prominence"],
     )
-    return "\n".join(lines)
+
+
+def align_clips(
+    file_a: str,
+    file_b: str,
+    span: Optional[Tuple[int, int]] = None,
+) -> Optional[AlignResult]:
+    """On-demand: are `file_a` and `file_b` the same moment, and by what offset?
+
+    Returns b's offset in a's clock (positive => b starts after a), a confidence,
+    and the overlap length -- or None when they are not simultaneous, one has no
+    audio envelope, or the comparable overlap is too short to be sure. `span`
+    (ms in file_a) restricts the comparison to a region of a (e.g. where a cut is
+    considered); the returned offset stays in file_a's absolute clock.
+    """
+    envs = load_sync_envs([file_a, file_b])
+    ea, eb = envs.get(file_a), envs.get(file_b)
+    if not ea or not eb:
+        return None  # no audio envelope on one side (e.g. a silent clip)
+
+    if span:
+        hop, a_env, lufs = ea
+        s0 = max(0, int(span[0]) // hop)
+        s1 = min(len(a_env), max(s0 + 1, int(span[1]) // hop + 1))
+        sliced = (hop, a_env[s0:s1], lufs)
+        res = align_envs(sliced, eb)
+        if res is None:
+            return None
+        # The slice's index 0 sits at s0 hops into file_a, so re-base the offset.
+        return AlignResult(
+            offset_ms=res.offset_ms + s0 * hop,
+            confidence=res.confidence,
+            overlap_ms=res.overlap_ms,
+            prominence=res.prominence,
+        )
+
+    return align_envs(ea, eb)

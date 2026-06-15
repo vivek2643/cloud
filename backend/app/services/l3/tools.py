@@ -21,9 +21,8 @@ from typing import Any, Dict, List, Optional
 from app.services.l3 import engine, layers, principles, score_span
 from app.services.l3 import sync as sync_mod
 from app.services.l3.catalog import ClipSummary
+from app.services.l3.content import ClipContent, OverlapPair, content_coverage
 from app.services.l3.engine import ClipGrids
-from app.services.l3.sync import SyncGroup
-from app.services.l3.takes import TakeGroup
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +39,8 @@ class EditSession:
     file_ids: List[str]
     catalog: List[ClipSummary]
     document: Dict[str, Any] = field(default_factory=dict)
-    take_groups: List[TakeGroup] = field(default_factory=list)
-    sync_groups: List[SyncGroup] = field(default_factory=list)
+    content: List[ClipContent] = field(default_factory=list)
+    overlap: List[OverlapPair] = field(default_factory=list)
     _grids: Dict[str, ClipGrids] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -304,66 +303,21 @@ TOOL_SPECS: List[dict] = [
     _spec(
         "place_video",
         "Lay another clip's PICTURE over a program-time range while the spine "
-        "AUDIO keeps playing underneath (coverage / cutaway / a multicam angle "
-        "switch). You give the covering clip + a rough source point and the "
-        "rough program range to cover; the engine snaps the clip's entry to its "
-        "own visual grid, snaps the range edges to the spine's audio seams, and "
-        "refuses if the spine locks the video there or it hits a protected "
-        "window. Requires a spine that frees the video channel (dialogue/music). "
-        "Picture is full-frame (split-screen/PiP is a later layout). MULTICAM: if "
-        "the covering clip is in the same SYNC GROUP as the spine clip under "
-        "from_ms, omit src_in_ms -- the engine derives the angle's source time "
-        "from the sync offset so the cut is frame-aligned.",
+        "AUDIO keeps playing underneath (B-roll / cutaway over an UNSYNCED clip). "
+        "You give the covering clip + a rough source point and the rough program "
+        "range to cover; the engine snaps the clip's entry to its own visual "
+        "grid, snaps the range edges to the spine's audio seams, and refuses if "
+        "the spine locks the video there or it hits a protected window. Requires "
+        "a spine that frees the video channel (dialogue/music). Picture is "
+        "full-frame (split-screen/PiP is a later layout).",
         {
             "file_id": {"type": "string", "description": "the covering clip"},
-            "src_in_ms": {"type": "integer", "description": "rough entry in the covering clip; OMIT for a synced angle switch"},
+            "src_in_ms": {"type": "integer", "description": "rough entry point in the covering clip"},
             "from_ms": {"type": "integer", "description": "program time the coverage starts"},
             "to_ms": {"type": "integer", "description": "program time the coverage ends"},
             "rationale": {"type": "string", "description": "why cut away here, to this"},
         },
-        ["file_id", "from_ms", "to_ms"],
-    ),
-    _spec(
-        "pick_angle",
-        "Switch which SYNCED ANGLE is on screen over a program range -- a normal "
-        "picture cut, NOT B-roll. The chosen clip MUST be in the same SYNC GROUP "
-        "as the spine clip under from_ms; the engine derives the angle's source "
-        "time from the sync offset (frame-aligned) and snaps the range edges to "
-        "the spine's seams. The spine AUDIO keeps playing underneath. Legal on "
-        "ANY spine kind (a synced angle is the same moment, so A/V stay "
-        "coherent). For UNSYNCED coverage / B-roll / cutaways use place_video.",
-        {
-            "file_id": {"type": "string", "description": "the angle to cut to (a sync-group member)"},
-            "from_ms": {"type": "integer", "description": "program time the angle starts"},
-            "to_ms": {"type": "integer", "description": "program time the angle ends"},
-            "rationale": {"type": "string", "description": "why this angle here (speaker / reaction / variety)"},
-        },
-        ["file_id", "from_ms", "to_ms"],
-    ),
-    _spec(
-        "auto_multicam",
-        "Seed a speaker/reaction-aware ANGLE cut across a detected sync group: "
-        "the engine follows whoever holds the floor and cuts to a strong "
-        "reaction when one beats the talker, weighted by your principles. Adds "
-        "pick_angle ops you can then keep, tweak, or remove. ADVISORY -- a "
-        "competent starting point, not the final say. Requires a sync group and "
-        "an existing spine. Call read_angles first if you want to inspect the "
-        "menu, or just call this and review timeline_status.",
-        {"group_id": {"type": "string", "description": "sync-group id (e.g. 'sg1'); omit to use the first"}},
-        [],
-    ),
-    _spec(
-        "read_angles",
-        "Inspect the per-window ANGLE MENU for a sync group over a program "
-        "range: who holds the floor and, per angle, whether the speaker is on "
-        "camera, the shot size, any active reaction, and gaze. Use to decide "
-        "manual pick_angle switches or to sanity-check auto_multicam.",
-        {
-            "group_id": {"type": "string", "description": "sync-group id; omit to use the first"},
-            "from_ms": {"type": "integer", "description": "program start (default 0)"},
-            "to_ms": {"type": "integer", "description": "program end (default: end of spine)"},
-        },
-        [],
+        ["file_id", "src_in_ms", "from_ms", "to_ms"],
     ),
     _spec(
         "place_audio",
@@ -442,20 +396,40 @@ TOOL_SPECS: List[dict] = [
         ["target_s"],
     ),
     _spec(
-        "compare_takes",
-        "When the same content was delivered more than once (see TAKE GROUPS in "
-        "the catalog), get an objective, span-level scorecard for every competing "
-        "take so you can choose the best one. Returns, per take: the actual spoken "
-        "TRANSCRIPT ('text'), metrics (word pace, fillers, pauses, gaze-to-camera, "
-        "loudness), and the perception's localized quality notes "
-        "(energy/fluency/naturalness/technical). You MUST keep exactly one take per "
-        "group. Decide on the TEXT FIRST: read each take's transcript and prefer the "
-        "most complete, correct delivery -- full intended line, no false starts, no "
-        "cut-off/missing words, fewest fillers, no stumbles -- before weighting the "
-        "remaining metrics by the brief. Then add_segment the winner's span and name "
-        "the take + textual reason in the rationale.",
-        {"group_id": {"type": "string", "description": "a take-group id from the catalog, e.g. 'tg1'"}},
-        ["group_id"],
+        "score_span",
+        "Get an objective quality scorecard for a specific span of one clip: "
+        "metrics (word pace, fillers, pauses, gaze-to-camera, loudness) and the "
+        "perception's localized quality notes (energy/fluency/naturalness/"
+        "technical). Use when the CONTENT OVERLAP map shows two clips cover the "
+        "same content (competing takes) and you want to choose the better "
+        "delivery: score each candidate span, decide on the transcript FIRST "
+        "(most complete, correct, fewest fillers/stumbles), then weigh the "
+        "metrics by the brief before add_segment-ing the winner.",
+        {
+            "file_id": {"type": "string", "description": "the clip to score"},
+            "in_ms": {"type": "integer", "description": "span start in the clip"},
+            "out_ms": {"type": "integer", "description": "span end in the clip"},
+        },
+        ["file_id", "in_ms", "out_ms"],
+    ),
+    _spec(
+        "align_clips",
+        "Check whether two clips are the SAME MOMENT recorded simultaneously "
+        "(multicam / a separate recorder) by comparing their audio, and if so "
+        "return their exact time offset. Use to verify before treating two clips "
+        "as interchangeable angles, or before cutting between them as one "
+        "continuous moment. Returns matched=true with offset_ms (file_b's start "
+        "in file_a's clock), a confidence (0..1), and the overlap length; returns "
+        "matched=false when they are NOT simultaneous, one clip is silent, or the "
+        "shared audio is too short to be sure -- in which case they are distinct "
+        "takes/material, not synced angles.",
+        {
+            "file_a": {"type": "string"},
+            "file_b": {"type": "string"},
+            "from_ms": {"type": "integer", "description": "optional: restrict the check to a region of file_a"},
+            "to_ms": {"type": "integer", "description": "optional: end of that file_a region"},
+        },
+        ["file_a", "file_b"],
     ),
     _spec(
         "ask_user",
@@ -596,6 +570,10 @@ def _full_status(session: EditSession) -> Dict[str, Any]:
         "split_edits": sum(1 for o in ops if o.get("type") == "split_edit"),
         "operations": len(ops),
     }
+    if session.content:
+        status["content_coverage"] = content_coverage(
+            session.content, session.overlap, session.document
+        )
     return status
 
 
@@ -724,17 +702,10 @@ def _execute(session: EditSession, name: str, args: Dict[str, Any]) -> str:
             to_s = min(total, from_s + engine.MIN_SEGMENT_MS)
         prog_dur = to_s - from_s
         cg = session.grids(fid)
-        # Source entry: explicit, or derived from a sync group (multicam angle).
         warnings = []
         rough_src = args.get("src_in_ms")
         if rough_src is None:
-            m = layers.prog_to_source(spans, from_s)
-            g = sync_mod.find_group_for(session.sync_groups, fid) if m else None
-            if g and m and g.offset_of(m[0]["file_id"]) is not None:
-                spine_seg, src_spine, _span = m
-                rough_src = src_spine + (g.offset_of(spine_seg["file_id"]) - g.offset_of(fid))
-            else:
-                return _j({"error": "src_in_ms required (no sync group links this clip to the spine here)"})
+            return _j({"error": "src_in_ms required (the rough entry point in the covering clip)"})
         snap_in = engine.snap_cut(cg, int(rough_src), "visual")
         src_in = snap_in["ts_ms"]
         src_out = src_in + prog_dur
@@ -757,109 +728,6 @@ def _execute(session: EditSession, name: str, args: Dict[str, Any]) -> str:
         }
         doc["operations"].append(op)
         return _j({"operation": op, "covers_pct": round(100.0 * (to_s - from_s) / total, 1) if total else 0.0})
-
-    if name == "pick_angle":
-        fid = args["file_id"]
-        if fid not in session.file_ids:
-            return _j({"error": "file_id not in this thread's scope"})
-        spans, total = layers.spine_spans(doc["timeline"])
-        if not spans:
-            return _j({"error": "no spine yet; add_segment the base timeline before picking angles"})
-        from_ms = max(0, min(int(args["from_ms"]), total))
-        to_ms = max(0, min(int(args["to_ms"]), total))
-        if to_ms <= from_ms:
-            return _j({"error": "to_ms must be after from_ms"})
-        # Must be a synced angle of the spine clip beneath the range.
-        m = layers.prog_to_source(spans, from_ms)
-        g = sync_mod.find_group_for(session.sync_groups, fid) if m else None
-        if not (g and m and g.offset_of(m[0]["file_id"]) is not None):
-            return _j({"error": "pick_angle needs a sync group linking this clip to the spine here; "
-                                "use place_video for unsynced coverage"})
-        reason = layers.angle_conflicts(doc, spans, from_ms, to_ms)
-        if reason:
-            return _j({"error": reason})
-        from_s, _ = _snap_prog_to_spine(session, spans, from_ms)
-        to_s, _ = _snap_prog_to_spine(session, spans, to_ms)
-        if to_s <= from_s:
-            to_s = min(total, from_s + engine.MIN_SEGMENT_MS)
-        prog_dur = to_s - from_s
-        # Derive the angle's source entry from the sync offset (frame-aligned).
-        m2 = layers.prog_to_source(spans, from_s)
-        if not m2:
-            return _j({"error": "could not map program time to the spine here"})
-        spine_seg, src_spine, _span = m2
-        spine_off, angle_off = g.offset_of(spine_seg["file_id"]), g.offset_of(fid)
-        if spine_off is None or angle_off is None:
-            return _j({"error": "the spine clip here is not in this angle's sync group"})
-        rough_src = src_spine + (spine_off - angle_off)
-        cg = session.grids(fid)
-        snap_in = engine.snap_cut(cg, int(rough_src), "visual")
-        src_in = snap_in["ts_ms"]
-        src_out = src_in + prog_dur
-        warnings = []
-        if snap_in.get("warning"):
-            warnings.append(snap_in["warning"])
-        if cg.duration_ms and src_out > cg.duration_ms:
-            avail = cg.duration_ms - src_in
-            src_out = cg.duration_ms
-            to_s = from_s + max(0, avail)
-            warnings.append("angle clip too short for the range; shortened")
-        if to_s - from_s < engine.MIN_SEGMENT_MS:
-            warnings.append(f"angle is only {to_s - from_s}ms after snapping")
-        if g.drift_warning:
-            warnings.append("sync group is low-confidence/drift; angle may be slightly misaligned")
-        op = {
-            "op_id": _op_id(), "type": "pick_angle",
-            "source_file_id": fid, "src_in_ms": src_in, "src_out_ms": src_out,
-            "from_ms": from_s, "to_ms": to_s,
-            "layout": layers.DEFAULT_LAYOUT, "z": layers.Z_ANGLE,
-            "group_id": g.group_id,
-            "rationale": args.get("rationale"),
-            "cut_in_cost": snap_in["cost"], "warnings": warnings,
-        }
-        doc["operations"].append(op)
-        return _j({"operation": op, "angle_pct": round(100.0 * (to_s - from_s) / total, 1) if total else 0.0})
-
-    if name in ("auto_multicam", "read_angles"):
-        from app.services.l3 import angles, baseline
-        spans, total = layers.spine_spans(doc["timeline"])
-        if not spans:
-            return _j({"error": "no spine yet; build the base timeline first"})
-        if not session.sync_groups:
-            return _j({"error": "no sync groups detected; this is not synced multicam (use place_video for unsynced coverage)"})
-        gid = args.get("group_id")
-        group = (
-            next((g for g in session.sync_groups if g.group_id == gid), None)
-            if gid else session.sync_groups[0]
-        )
-        if group is None:
-            return _j({"error": "unknown group_id", "available": [g.group_id for g in session.sync_groups]})
-
-        if name == "read_angles":
-            from_ms = max(0, int(args.get("from_ms", 0)))
-            to_ms = min(total, int(args.get("to_ms", total)))
-            menu = angles.build_menu(group, spans, from_ms, to_ms)
-            return _j({"group_id": group.group_id, "menu": angles.render_angle_menu_text(menu)})
-
-        # auto_multicam: seed picks and apply them through the pick_angle path.
-        menu = angles.build_menu(group, spans, 0, total)
-        picks = baseline.seed_multicam(spans, group, menu, doc)
-        applied, errors = 0, []
-        for p in picks:
-            res = json.loads(_execute(session, "pick_angle", p))
-            if res.get("operation"):
-                applied += 1
-            elif res.get("error"):
-                errors.append(res["error"])
-        out = {
-            "group_id": group.group_id,
-            "picks_proposed": len(picks),
-            "picks_applied": applied,
-            "note": "advisory baseline; review with timeline_status and adjust via pick_angle / remove_operation",
-        }
-        if errors:
-            out["skipped"] = errors[:5]
-        return _j(out)
 
     if name == "place_audio":
         fid = args["file_id"]
@@ -939,29 +807,43 @@ def _execute(session: EditSession, name: str, args: Dict[str, Any]) -> str:
             return _j({"error": "unknown op_id"})
         return _j({"ok": True, "remaining": len(doc["operations"])})
 
-    if name == "compare_takes":
-        gid = args.get("group_id")
-        group = next((g for g in session.take_groups if g.group_id == gid), None)
-        if group is None:
+    if name == "score_span":
+        fid = args["file_id"]
+        if fid not in session.file_ids:
+            return _j({"error": "file_id not in this thread's scope"})
+        in_ms = int(args["in_ms"])
+        out_ms = int(args["out_ms"])
+        if out_ms <= in_ms:
+            return _j({"error": "out_ms must be after in_ms"})
+        src = score_span.load_sources([fid]).get(fid)
+        if not src:
+            return _j({"error": "no analysis available for this clip"})
+        return _j({
+            "file_id": fid,
+            "in_ms": in_ms,
+            "out_ms": out_ms,
+            "metrics": score_span.score_span(src, in_ms, out_ms),
+            "quality_notes": score_span.quality_events_in(src, in_ms, out_ms),
+        })
+
+    if name == "align_clips":
+        fa, fb = args["file_a"], args["file_b"]
+        if fa not in session.file_ids or fb not in session.file_ids:
+            return _j({"error": "file_a and file_b must both be in this thread's scope"})
+        if fa == fb:
+            return _j({"error": "file_a and file_b must be different clips"})
+        span = None
+        if args.get("from_ms") is not None and args.get("to_ms") is not None:
+            span = (int(args["from_ms"]), int(args["to_ms"]))
+        res = sync_mod.align_clips(fa, fb, span)
+        if res is None:
             return _j({
-                "error": "unknown group_id",
-                "available": [g.group_id for g in session.take_groups],
+                "file_a": fa, "file_b": fb, "matched": False,
+                "note": "not simultaneous (or one clip is silent / shared audio too "
+                        "short to be sure); treat as distinct takes/material, not synced angles",
             })
-        sources = score_span.load_sources(list({a.file_id for a in group.attempts}))
-        takes_out = []
-        for a in group.attempts:
-            src = sources.get(a.file_id)
-            takes_out.append({
-                "attempt_id": a.attempt_id,
-                "file_id": a.file_id,
-                "in_ms": a.start_ms,
-                "out_ms": a.end_ms,
-                "is_retry": a.is_restart,
-                "text": a.text,
-                "metrics": score_span.score_span(src, a.start_ms, a.end_ms) if src else {},
-                "quality_notes": score_span.quality_events_in(src, a.start_ms, a.end_ms) if src else [],
-            })
-        return _j({"group_id": gid, "content_key": group.content_key, "takes": takes_out})
+        out = {"file_a": fa, "file_b": fb, "matched": True, **res.to_dict()}
+        return _j(out)
 
     if name == "timeline_status":
         return _j(_full_status(session))
