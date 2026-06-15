@@ -175,6 +175,106 @@ def align_envs(env_a: Env, env_b: Env) -> Optional[AlignResult]:
     )
 
 
+# --------------------------------------------------------------------------
+# Candidate surfacing: a CHEAP, genre-general pre-screen.
+#
+# Text overlap (content.py) only nominates synced pairs that share DIALOGUE, so
+# action / music / mostly-silent multicam is invisible to it. This pre-screen
+# nominates pairs by their AUDIO ENERGY alone (a decimated, gate-free coarse
+# cross-correlation), so anything that recorded the same sound is surfaced. It
+# is deliberately permissive -- it only says "these MIGHT be the same moment";
+# align_clips remains the airtight confirm. Bounded for large projects by a
+# top-K cap on the pairs handed to full verification.
+# --------------------------------------------------------------------------
+
+# Loose floor for nomination (well below SYNC_CONF_THRESHOLD; this only narrows
+# the field for the airtight check, it does not accept anything).
+CANDIDATE_CORR_FLOOR = 0.30
+# Cap the samples the coarse pass correlates per envelope. Decimation only kicks
+# in for pathologically long clips; striding destroys the sub-hop phase that
+# carries a real offset, so normal-length clips run at full resolution.
+CANDIDATE_MAX_SAMPLES = 2000
+CANDIDATE_MIN_OVERLAP_HOPS = 20  # at the (possibly decimated) hop
+
+
+@dataclass
+class SyncCandidate:
+    file_a: str
+    file_b: str
+    coarse: float
+
+
+@dataclass
+class VerifiedAngle:
+    file_a: str          # the spine-side clip
+    file_b: str          # the angle
+    result: AlignResult
+
+
+def _decim_for(*lengths: int) -> int:
+    """Stride that keeps each envelope under CANDIDATE_MAX_SAMPLES (1 = none)."""
+    n = max(lengths) if lengths else 0
+    return max(1, -(-n // CANDIDATE_MAX_SAMPLES))  # ceil division
+
+
+def _coarse_corr(a: List[float], b: List[float], decim: int = 1) -> float:
+    """Best gate-free normalized correlation -- a fast screen, not a measurement.
+    `decim` strides both envelopes (only for very long clips); returns 0 when the
+    overlap is too small to mean anything."""
+    import numpy as np
+
+    va = np.asarray(a[::decim], float)
+    vb = np.asarray(b[::decim], float)
+    na, nb = va.size, vb.size
+    if na < CANDIDATE_MIN_OVERLAP_HOPS or nb < CANDIDATE_MIN_OVERLAP_HOPS:
+        return 0.0
+    best = 0.0
+    for lag in range(-(nb - 1), na):
+        a0, b0 = max(0, lag), max(0, -lag)
+        n = min(na - a0, nb - b0)
+        if n < CANDIDATE_MIN_OVERLAP_HOPS:
+            continue
+        sa = va[a0:a0 + n] - va[a0:a0 + n].mean()
+        sb = vb[b0:b0 + n] - vb[b0:b0 + n].mean()
+        denom = np.linalg.norm(sa) * np.linalg.norm(sb)
+        if denom > 0:
+            best = max(best, float(np.dot(sa, sb) / denom))
+    return best
+
+
+def sync_candidates(file_ids: List[str], max_pairs: int = 24) -> List[SyncCandidate]:
+    """Nominate pairs that MIGHT be the same moment, by audio energy alone.
+    Cheap (decimated, gate-free); the result is the short list align_clips then
+    confirms. Capped to `max_pairs` strongest so an n^2 scan stays bounded."""
+    envs = load_sync_envs(file_ids)
+    fids = [f for f in file_ids if f in envs]
+    out: List[SyncCandidate] = []
+    for i in range(len(fids)):
+        hop_i, ei, _ = envs[fids[i]]
+        for j in range(i + 1, len(fids)):
+            hop_j, ej, _ = envs[fids[j]]
+            if hop_i != hop_j or not ei or not ej:
+                continue
+            c = _coarse_corr(ei, ej, _decim_for(len(ei), len(ej)))
+            if c >= CANDIDATE_CORR_FLOOR:
+                out.append(SyncCandidate(fids[i], fids[j], round(c, 3)))
+    out.sort(key=lambda p: p.coarse, reverse=True)
+    return out[:max_pairs]
+
+
+def discover_synced_angles(file_ids: List[str], max_pairs: int = 24) -> List[VerifiedAngle]:
+    """Full pipeline: pre-screen candidates -> airtight-verify each with
+    align_clips -> keep only confirmed synced pairs. This is what the
+    orchestrator surfaces so Opus knows which clips are real second angles."""
+    verified: List[VerifiedAngle] = []
+    for cand in sync_candidates(file_ids, max_pairs):
+        res = align_clips(cand.file_a, cand.file_b)
+        if res is not None:
+            verified.append(VerifiedAngle(cand.file_a, cand.file_b, res))
+    verified.sort(key=lambda v: v.result.confidence, reverse=True)
+    return verified
+
+
 def align_clips(
     file_a: str,
     file_b: str,

@@ -23,6 +23,8 @@ from procrastinate import RetryStrategy
 from app.config import get_settings
 from app.services.jobs import app
 from app.services.l3 import store
+from app.services.l3 import sync as sync_mod
+from app.services.l3.angle_menu import render_synced_angles_text
 from app.services.l3.catalog import build_catalog, render_catalog_text
 from app.services.l3.content import (
     build_content_map,
@@ -94,7 +96,10 @@ read_clip the promising clips for exact timestamps. Distinct-content clips are n
 interchangeable: don't build the whole edit from one and silently drop the rest.
 4. set_outline: 2-6 beats with purpose + intent (hook first when the brief implies an audience).
 5. Build the timeline beat by beat: query_seams to scout, add_segment with rough times, \
-content + rationale on every segment. Set priority (1=core, 5=expendable filler).
+content + rationale on every segment. Set priority (1=core, 5=expendable filler). If the \
+SYNCED ANGLES block lists a second camera for this material, call read_angles over the beat \
+to see who is speaking vs. listening per moment, then pick_angle to follow the focus -- don't \
+ride one camera through a whole conversation.
 6. timeline_status; fix warnings that matter (jump cuts, dirty seams, micro-segments). \
 Check its content_coverage: any clip listed there has UNIQUE content used nowhere -- \
 confirm each omission is intentional (off-topic / redundant / weaker take) or add it.
@@ -114,12 +119,30 @@ A/V LAYERS (decoupling video from audio):
 you place LAYER OPERATIONS, checked against the spine's locks so you can't express an illegal edit:
   * place_video -- lay another clip's PICTURE over a range while the spine AUDIO keeps playing: \
 B-roll / cutaway over an UNSYNCED clip. Needs a spine that frees video (dialogue/music).
+  * pick_angle -- cut the picture to a VERIFIED synced SECOND ANGLE of the spine clip (see \
+MULTICAM below). A normal picture cut, not B-roll.
   * place_audio -- lay a music bed / ambience / SFX under a range (duck it under dialogue), or \
 replace spine audio with a cleaner source.
   * split_edit -- J/L cut: offset the audio cut from the video cut at a seam.
   * set_level -- gain/duck/mute a role over a range.
 - These are layers, not spine edits: the spine still owns the clock. Build a solid spine FIRST. \
 For decorative B-roll / beds the default is coupled -- don't add them just to show off.
+
+MULTICAM / ANGLES (two cameras of the SAME moment -- e.g. an interview shot from two angles):
+- The SYNCED ANGLES block (below, when present) lists pairs already VERIFIED as the same moment \
+from two cameras, with their exact offset -- these are real second angles, not B-roll. (If a pair \
+you suspect isn't listed, align_clips checks any two clips on demand.)
+- DRIVE the cut from the facts, not from a quota. For a synced beat, call read_angles over the \
+range: it returns, per moment, which camera shows the SPEAKER vs. a LISTENER, the shot size, and \
+any reaction. Then pick_angle to FOLLOW THE FOCUS: stay on the speaker by default; cut to the \
+listener when an answer runs long (a breathing/listening beat) or when there's a genuine reaction \
+(a real laugh/nod/surprise the menu flags). That is the difference from B-roll -- you are tracking \
+who/what matters, not filling time. Riding one camera through a whole conversation is the #1 \
+failure; cutting metronomically for blind variety is the #2. Cut on dialogue seams; let your \
+principles (favor_speaker, reward_reaction, shot_variety) bias the balance.
+- pick_angle is for VERIFIED synced angles only; for unsynced coverage / B-roll use place_video. \
+The same read_angles logic generalizes to action (cut to the camera framing the action beat) and \
+music (cut on sections) when those are the spine.
 
 STYLE OF THE CUT:
 - Respect the grain of the footage: cut dialogue at sentence/turn seams, action on impacts, \
@@ -142,15 +165,21 @@ CLIP CATALOG (scope for this thread):
 
 {content_overlap}
 
+{synced_angles}
+
 {principles}
 """
 
 
-def _render_system_prompt(catalog, content_map=None, overlap=None, document=None) -> str:
+def _render_system_prompt(catalog, content_map=None, overlap=None,
+                          synced=None, document=None) -> str:
+    synced_block = render_synced_angles_text(synced or [])
     return SYSTEM_PROMPT_TEMPLATE.format(
         catalog=render_catalog_text(catalog),
         content_map=render_content_map_text(content_map or []),
         content_overlap=render_overlap_text(overlap or []),
+        synced_angles=synced_block or "SYNCED ANGLES: none detected (single-camera / "
+                                      "no simultaneously-recorded clips in scope).",
         principles=render_principles_text(document or {}),
     )
 
@@ -177,13 +206,17 @@ def run_thread(thread_id: str) -> None:
     catalog = build_catalog(thread["file_ids"])
     content = build_content_map(thread["file_ids"])
     overlap = build_overlap_index(content)
+    # Audio-energy pre-screen + airtight verification surfaces REAL second
+    # angles (genre-general: works for action/music multicam that share no
+    # dialogue), so the model follows the focus instead of riding one camera.
+    synced = sync_mod.discover_synced_angles(thread["file_ids"])
 
     # Resume the working document from the latest snapshot (empty on first run).
     # Loaded before the prompt so a resumed run reflects any principles set
     # earlier (the rest of the prefix stays stable for caching within a run).
     doc, _version = store.latest_document(thread_id)
 
-    system = _render_system_prompt(catalog, content, overlap, doc or {})
+    system = _render_system_prompt(catalog, content, overlap, synced, doc or {})
     messages = store.load_messages(thread_id)
     if not messages:
         logger.error("L3: thread %s has no messages; nothing to do.", thread_id)
@@ -196,6 +229,7 @@ def run_thread(thread_id: str) -> None:
         catalog=catalog,
         content=content,
         overlap=overlap,
+        synced=synced,
         document=doc or {},
     )
 

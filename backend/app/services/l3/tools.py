@@ -18,7 +18,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from app.services.l3 import engine, layers, principles, score_span
+from app.services.l3 import angle_menu, engine, focus, layers, principles, score_span
 from app.services.l3 import sync as sync_mod
 from app.services.l3.catalog import ClipSummary
 from app.services.l3.content import ClipContent, OverlapPair, content_coverage
@@ -41,7 +41,10 @@ class EditSession:
     document: Dict[str, Any] = field(default_factory=dict)
     content: List[ClipContent] = field(default_factory=list)
     overlap: List[OverlapPair] = field(default_factory=list)
+    synced: List[Any] = field(default_factory=list)   # sync.VerifiedAngle[]
     _grids: Dict[str, ClipGrids] = field(default_factory=dict)
+    _align_cache: Dict[tuple, Any] = field(default_factory=dict)
+    _perceptions: Optional[Dict[str, dict]] = None
 
     def __post_init__(self) -> None:
         self.document.setdefault("brief", {})
@@ -57,6 +60,45 @@ class EditSession:
         if file_id not in self._grids:
             self._grids[file_id] = engine.load_grids(file_id)
         return self._grids[file_id]
+
+    def aligned(self, spine_fid: str, angle_fid: str):
+        """Verified full-clip alignment of an angle to a spine clip (memoized).
+        Returns an AlignResult (offset = the angle's start in the spine's clock)
+        or None when they are not a reliable synced pair. The offset is global
+        for the pair, so one verification serves every pick_angle on it."""
+        key = (spine_fid, angle_fid)
+        if key not in self._align_cache:
+            self._align_cache[key] = sync_mod.align_clips(spine_fid, angle_fid)
+        return self._align_cache[key]
+
+    def perceptions_map(self) -> Dict[str, dict]:
+        """L2 perception per clip in scope (loaded once, shared by the angle menu)."""
+        if self._perceptions is None:
+            from app.services.l3.catalog import load_perceptions
+            self._perceptions = load_perceptions(self.file_ids)
+        return self._perceptions
+
+    def angle_offsets(self, spine_fid: str, angle_fids: List[str]) -> Dict[str, int]:
+        """For each candidate angle, its verified offset in the spine's clock
+        (angle start in spine time), dropping any pair that doesn't lock."""
+        out: Dict[str, int] = {}
+        for fid in angle_fids:
+            if fid == spine_fid:
+                continue
+            al = self.aligned(spine_fid, fid)
+            if al is not None:
+                out[fid] = al.offset_ms
+        return out
+
+    def synced_with(self, spine_fid: str) -> List[str]:
+        """The other member of every verified synced pair that includes this clip."""
+        out: List[str] = []
+        for v in self.synced:
+            if v.file_a == spine_fid:
+                out.append(v.file_b)
+            elif v.file_b == spine_fid:
+                out.append(v.file_a)
+        return out
 
     def grids_by_file(self) -> Dict[str, ClipGrids]:
         for fid in {s["file_id"] for s in self.document["timeline"]}:
@@ -320,6 +362,24 @@ TOOL_SPECS: List[dict] = [
         ["file_id", "src_in_ms", "from_ms", "to_ms"],
     ),
     _spec(
+        "pick_angle",
+        "Cut the spine PICTURE to a SYNCED SECOND ANGLE over a program range -- a "
+        "NORMAL picture cut (e.g. cut to the other camera in a 2-camera interview: "
+        "the speaker, or the listener reacting / asking). NOT B-roll. The chosen "
+        "clip must be a VERIFIED synced angle of the spine clip under from_ms -- "
+        "the engine calls align_clips itself, derives the angle's source time from "
+        "the exact offset (frame-aligned), keeps the spine AUDIO playing "
+        "underneath, and snaps the range to spine seams. Refused (use place_video) "
+        "if the pair isn't a reliable sync. Legal on ANY spine kind.",
+        {
+            "file_id": {"type": "string", "description": "the synced angle to cut to"},
+            "from_ms": {"type": "integer", "description": "program time the angle starts"},
+            "to_ms": {"type": "integer", "description": "program time the angle ends"},
+            "rationale": {"type": "string", "description": "why this angle here (speaker / reaction / variety)"},
+        },
+        ["file_id", "from_ms", "to_ms"],
+    ),
+    _spec(
         "place_audio",
         "Lay an audio layer over a program-time range: a music bed, ambience, or "
         "an SFX (role='music'|'sfx'), or REPLACE the spine dialogue with cleaner "
@@ -432,6 +492,29 @@ TOOL_SPECS: List[dict] = [
         ["file_a", "file_b"],
     ),
     _spec(
+        "read_angles",
+        "The per-moment ANGLE MENU for a synced multicam region: for each focus "
+        "interval (speaker turn / action beat / music section of the spine clip) "
+        "it reports what EACH verified angle shows -- whether the visible person "
+        "is the SPEAKER or a LISTENER, the shot size, the strongest reaction, and "
+        "gaze. Use this BEFORE pick_angle so your cuts follow the focus (cut to "
+        "whoever is speaking; cut to the listener on a genuine reaction or a long "
+        "hold) instead of riding one camera or cutting for blind variety. Times "
+        "are in the spine clip's own clock. Pass the spine clip + the region; "
+        "angle_file_ids is optional (defaults to every verified angle of the "
+        "spine clip). Only verified synced angles appear.",
+        {
+            "file_id": {"type": "string", "description": "the spine clip (the one whose audio plays)"},
+            "from_ms": {"type": "integer", "description": "region start in the spine clip's clock"},
+            "to_ms": {"type": "integer", "description": "region end in the spine clip's clock"},
+            "angle_file_ids": {
+                "type": "array", "items": {"type": "string"},
+                "description": "optional: which angles to compare; default = all verified angles",
+            },
+        },
+        ["file_id", "from_ms", "to_ms"],
+    ),
+    _spec(
         "ask_user",
         "Pause and ask the user. Use for genuine forks (length, ending, tone, "
         "include/exclude) -- not for things the footage answers. ALWAYS have a "
@@ -522,6 +605,20 @@ def _read_clip(session: EditSession, file_id: str) -> str:
 
 def _op_id() -> str:
     return f"op{uuid.uuid4().hex[:6]}"
+
+
+def _spine_kind_for(doc: Dict[str, Any], file_id: str) -> Optional[str]:
+    """The set_spine kind of the region this clip anchors (so the angle menu's
+    focus matches the declared spine). None when no spine names this clip."""
+    spine = doc.get("spine") or {}
+    for region in spine.get("regions") or []:
+        if file_id in (region.get("source_file_ids") or []):
+            return region.get("kind")
+    # A single-region spine governs everything even if it didn't list the file.
+    regions = spine.get("regions") or []
+    if len(regions) == 1:
+        return regions[0].get("kind")
+    return None
 
 
 def _snap_prog_to_spine(
@@ -729,6 +826,83 @@ def _execute(session: EditSession, name: str, args: Dict[str, Any]) -> str:
         doc["operations"].append(op)
         return _j({"operation": op, "covers_pct": round(100.0 * (to_s - from_s) / total, 1) if total else 0.0})
 
+    if name == "pick_angle":
+        fid = args["file_id"]
+        if fid not in session.file_ids:
+            return _j({"error": "file_id not in this thread's scope"})
+        spans, total = layers.spine_spans(doc["timeline"])
+        if not spans:
+            return _j({"error": "no spine yet; add_segment the base timeline before picking angles"})
+        from_ms = max(0, min(int(args["from_ms"]), total))
+        to_ms = max(0, min(int(args["to_ms"]), total))
+        if to_ms <= from_ms:
+            return _j({"error": "to_ms must be after from_ms"})
+        m = layers.prog_to_source(spans, from_ms)
+        if not m:
+            return _j({"error": "could not map program time to the spine here"})
+        spine_fid = m[0]["file_id"]
+        if spine_fid == fid:
+            return _j({"error": "that clip is already the spine picture here"})
+        # Verify the pair is a synced angle (airtight, on-demand, per-pair).
+        al = session.aligned(spine_fid, fid)
+        if al is None:
+            return _j({"error": (
+                f"{fid} is not a verified synced angle of the spine clip here -- "
+                "align_clips found no reliable sync (different content, not "
+                "simultaneous, or one clip is silent; lip-sync fallback is not "
+                "available yet). Use place_video for unsynced coverage."
+            )})
+        reason = layers.angle_conflicts(doc, spans, from_ms, to_ms)
+        if reason:
+            return _j({"error": reason})
+        from_s, _ = _snap_prog_to_spine(session, spans, from_ms)
+        to_s, _ = _snap_prog_to_spine(session, spans, to_ms)
+        if to_s <= from_s:
+            to_s = min(total, from_s + engine.MIN_SEGMENT_MS)
+        prog_dur = to_s - from_s
+        m2 = layers.prog_to_source(spans, from_s)
+        if not m2:
+            return _j({"error": "could not map program time to the spine here"})
+        _seg, src_spine, _span = m2
+        # align_clips offset = the angle's start in the spine's clock, so the
+        # same instant in the angle is (spine source - offset). Frame-aligned.
+        rough_src = src_spine - al.offset_ms
+        cg = session.grids(fid)
+        if rough_src < 0 or (cg.duration_ms and rough_src > cg.duration_ms):
+            return _j({"error": "the angle clip doesn't cover this moment (the sync "
+                                "offset puts it outside the angle's footage)"})
+        snap_in = engine.snap_cut(cg, int(rough_src), "visual")
+        src_in = snap_in["ts_ms"]
+        src_out = src_in + prog_dur
+        warnings = []
+        if snap_in.get("warning"):
+            warnings.append(snap_in["warning"])
+        if cg.duration_ms and src_out > cg.duration_ms:
+            avail = cg.duration_ms - src_in
+            src_out = cg.duration_ms
+            to_s = from_s + max(0, avail)
+            warnings.append("angle clip too short for the range; shortened")
+        if to_s - from_s < engine.MIN_SEGMENT_MS:
+            warnings.append(f"angle is only {to_s - from_s}ms after snapping")
+        if al.confidence < 0.6:
+            warnings.append(f"sync confidence {al.confidence:.2f}; angle may drift slightly")
+        op = {
+            "op_id": _op_id(), "type": "pick_angle",
+            "source_file_id": fid, "src_in_ms": src_in, "src_out_ms": src_out,
+            "from_ms": from_s, "to_ms": to_s,
+            "layout": layers.DEFAULT_LAYOUT, "z": layers.Z_ANGLE,
+            "sync_offset_ms": al.offset_ms, "sync_confidence": round(al.confidence, 3),
+            "rationale": args.get("rationale"),
+            "cut_in_cost": snap_in["cost"], "warnings": warnings,
+        }
+        doc["operations"].append(op)
+        return _j({
+            "operation": op,
+            "angle_pct": round(100.0 * (to_s - from_s) / total, 1) if total else 0.0,
+            "verified_offset_ms": al.offset_ms,
+            "sync_confidence": round(al.confidence, 3),
+        })
+
     if name == "place_audio":
         fid = args["file_id"]
         if fid not in session.file_ids:
@@ -844,6 +1018,39 @@ def _execute(session: EditSession, name: str, args: Dict[str, Any]) -> str:
             })
         out = {"file_a": fa, "file_b": fb, "matched": True, **res.to_dict()}
         return _j(out)
+
+    if name == "read_angles":
+        spine = args["file_id"]
+        if spine not in session.file_ids:
+            return _j({"error": "file_id not in this thread's scope"})
+        from_ms = max(0, int(args["from_ms"]))
+        to_ms = int(args["to_ms"])
+        if to_ms <= from_ms:
+            return _j({"error": "to_ms must be after from_ms"})
+        requested = args.get("angle_file_ids") or session.synced_with(spine)
+        if not requested:
+            return _j({
+                "spine": spine, "matched_angles": [],
+                "note": "no verified synced angle for this clip; this is single-camera "
+                        "here. Use place_video for unsynced coverage, not pick_angle.",
+            })
+        offsets = session.angle_offsets(spine, list(dict.fromkeys(requested)))
+        if not offsets:
+            return _j({
+                "spine": spine, "matched_angles": [],
+                "note": "the requested clips did not verify as synced angles of this "
+                        "clip (align_clips found no reliable sync).",
+            })
+        sig = focus.load_focus_signals(spine)
+        kind = focus.focus_for_spine_kind(_spine_kind_for(doc, spine), sig)
+        intervals = focus.focus_timeline(kind, sig, from_ms, to_ms)
+        rows = angle_menu.build_angle_menu(spine, offsets, intervals, session.perceptions_map())
+        return _j({
+            "spine": spine,
+            "focus_kind": kind,
+            "matched_angles": {fid: off for fid, off in offsets.items()},
+            "menu": angle_menu.render_angle_menu_text(spine, rows),
+        })
 
     if name == "timeline_status":
         return _j(_full_status(session))
