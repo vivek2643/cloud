@@ -320,14 +320,19 @@ export interface EditDiagnostics {
   [k: string]: unknown;
 }
 
-export type EditOperationType = "place_video" | "place_audio" | "split_edit" | "level";
+export type EditOperationType =
+  | "place_video"
+  | "pick_angle"
+  | "place_audio"
+  | "split_edit"
+  | "level";
 
 export interface EditOperation {
   op_id: string;
   type: EditOperationType;
   rationale?: string | null;
   warnings?: string[];
-  // place_video / place_audio
+  // place_video / pick_angle / place_audio
   source_file_id?: string;
   src_in_ms?: number;
   src_out_ms?: number;

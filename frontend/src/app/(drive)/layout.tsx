@@ -70,6 +70,9 @@ function DriveShell({ children }: { children: React.ReactNode }) {
         <Sidebar />
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
           <div className="flex flex-1 flex-col overflow-y-auto">{children}</div>
+          {/* Bottom editor dock slot — AiEditPanel portals the program monitor
+              + editable timeline here (pro-editor layout). Empty otherwise. */}
+          <div id="ai-editor-dock" className="shrink-0" />
         </main>
         <AiEditPanel />
       </div>

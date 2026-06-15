@@ -15,7 +15,7 @@ import {
 import { getFile, getFilePlaybackUrl, type ResolvedTimeline } from "@/lib/api";
 import { resolveTimeline } from "@/lib/resolve-timeline";
 import { useEditDocStore } from "@/stores/edit-doc-store";
-import { useWebAudioMixer } from "./use-web-audio-mixer";
+import { useAudioMixer } from "./use-audio-mixer";
 import { useVideoPicture } from "./use-video-picture";
 
 function fmtClock(ms: number): string {
@@ -62,7 +62,7 @@ export function CompositePreview({ token }: { token: string | undefined }) {
     return Array.from(s).filter(Boolean);
   }, [resolved]);
 
-  const mixer = useWebAudioMixer(resolved, urls);
+  const mixer = useAudioMixer(resolved, urls);
   const picture = useVideoPicture(resolved, urls);
 
   // Resolve playback URLs + source durations for every referenced clip.

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   Sparkles,
   X,
@@ -13,7 +14,6 @@ import {
   Music,
   Scissors,
   SlidersHorizontal,
-  Pencil,
 } from "lucide-react";
 import { useDriveStore } from "@/stores/drive-store";
 import { RenderBar } from "@/components/render-bar";
@@ -99,7 +99,9 @@ export function AiEditPanel() {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [editing, setEditing] = useState(false);
+  // Portal target for the bottom editor dock (program monitor + timeline) that
+  // lives in the main area, pro-editor style.
+  const [dockEl, setDockEl] = useState<HTMLElement | null>(null);
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -177,6 +179,12 @@ export function AiEditPanel() {
     seedDoc(thread.id, thread.document_version ?? 0, thread.document);
   }, [thread?.id, thread?.document_version, thread?.document, seedDoc]);
 
+  // Find the bottom dock slot rendered by the drive layout so we can portal the
+  // program monitor + timeline into the main area.
+  useEffect(() => {
+    setDockEl(document.getElementById("ai-editor-dock"));
+  }, [aiPanelOpen]);
+
   async function handleSend() {
     const text = input.trim();
     if (!text || !token || busy) return;
@@ -235,7 +243,6 @@ export function AiEditPanel() {
     setInput("");
     setError(null);
     setBusy(false);
-    setEditing(false);
   }
 
   function handleSavedEdit(newVersion: number, newDoc: NonNullable<EditThread["document"]>) {
@@ -252,6 +259,7 @@ export function AiEditPanel() {
     status === "awaiting_user" ? thread?.open_questions ?? [] : [];
 
   return (
+    <>
     <aside
       className="flex h-full w-[460px] shrink-0 flex-col border-l"
       style={{ borderColor: "var(--border)", background: "var(--sidebar)" }}
@@ -274,16 +282,6 @@ export function AiEditPanel() {
           >
             {aiScopeFileIds.length} clip{aiScopeFileIds.length === 1 ? "" : "s"}
           </span>
-          {doc?.timeline && doc.timeline.length > 0 && (
-            <button
-              onClick={() => setEditing((v) => !v)}
-              className="rounded-lg p-1.5 transition-colors hover:bg-[var(--accent-soft)]"
-              style={editing ? { color: "var(--accent)" } : undefined}
-              title={editing ? "Back to plan" : "Edit timeline"}
-            >
-              <Pencil size={16} />
-            </button>
-          )}
           <button
             onClick={handleNewThread}
             className="rounded-lg p-1.5 transition-colors hover:bg-[var(--accent-soft)]"
@@ -326,15 +324,7 @@ export function AiEditPanel() {
           </Bubble>
         ))}
 
-        {doc && editing && threadId ? (
-          <TimelineEditor
-            threadId={threadId}
-            token={token}
-            onSaved={handleSavedEdit}
-          />
-        ) : (
-          doc && <DocumentView doc={doc} version={thread?.document_version ?? null} />
-        )}
+        {doc && <DocumentView doc={doc} version={thread?.document_version ?? null} />}
 
         {busy && status === "drafting" && (
           <div
@@ -396,6 +386,24 @@ export function AiEditPanel() {
         </div>
       </div>
     </aside>
+
+    {/* Editable timeline dock, pinned full-width to the bottom of the main
+        area (left of the chat), pro-editor style. The program monitor stays in
+        the panel; this is the timeline track. */}
+    {dockEl &&
+      doc?.timeline &&
+      doc.timeline.length > 0 &&
+      threadId &&
+      createPortal(
+        <div
+          className="max-h-[40vh] min-h-[200px] w-full overflow-y-auto border-t p-3"
+          style={{ borderColor: "var(--border)", background: "var(--sidebar)" }}
+        >
+          <TimelineEditor threadId={threadId} token={token} onSaved={handleSavedEdit} />
+        </div>,
+        dockEl
+      )}
+    </>
   );
 }
 

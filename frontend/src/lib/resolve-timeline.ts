@@ -20,6 +20,7 @@ import type {
 
 // Z bands so layer kinds stack predictably regardless of insertion order.
 export const Z_SPINE_VIDEO = 0;
+export const Z_ANGLE = 5; // a synced multicam angle re-pointing the spine picture
 export const Z_COVERAGE = 10;
 export const DEFAULT_LAYOUT = "full_frame";
 
@@ -189,6 +190,22 @@ export function resolveTimeline(
         layout: op.layout ?? DEFAULT_LAYOUT,
         opacity: Number(op.opacity ?? 1),
         kind: "coverage",
+        op_id: op.op_id,
+      });
+    } else if (op.type === "pick_angle") {
+      // Synced multicam angle: re-points the spine PICTURE (a normal cut) just
+      // above the base spine; audio stays the spine. Mirrors layers.resolve.
+      video.push({
+        layer_id: op.op_id,
+        source_file_id: op.source_file_id ?? "",
+        src_in_ms: Math.round(op.src_in_ms ?? 0),
+        src_out_ms: Math.round(op.src_out_ms ?? 0),
+        prog_start_ms: Math.round(op.from_ms ?? 0),
+        prog_end_ms: Math.round(op.to_ms ?? 0),
+        z: Math.round(op.z ?? Z_ANGLE),
+        layout: op.layout ?? DEFAULT_LAYOUT,
+        opacity: 1,
+        kind: "angle",
         op_id: op.op_id,
       });
     } else if (op.type === "place_audio") {

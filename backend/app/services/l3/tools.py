@@ -18,7 +18,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from app.services.l3 import engine, layers, score_span
+from app.services.l3 import engine, layers, principles, score_span
 from app.services.l3 import sync as sync_mod
 from app.services.l3.catalog import ClipSummary
 from app.services.l3.engine import ClipGrids
@@ -47,6 +47,7 @@ class EditSession:
     def __post_init__(self) -> None:
         self.document.setdefault("brief", {})
         self.document.setdefault("spine", None)
+        self.document.setdefault("principles", [])
         self.document.setdefault("outline", [])
         self.document.setdefault("timeline", [])
         self.document.setdefault("operations", [])
@@ -211,6 +212,30 @@ TOOL_SPECS: List[dict] = [
         ["regions"],
     ),
     _spec(
+        "set_principles",
+        "Declare the editorial PRINCIPLES -- weighted style tendencies (NOT "
+        "rules) that bias how the cut is made within the spine's freedom. Each "
+        "is {id, weight 0..1, scope}. scope='global' (default) or a spine-region "
+        "label to override there. Set only the knobs you want to push; the rest "
+        "run at sensible defaults. Common: favor_speaker, reward_reaction, "
+        "shot_variety, pace, anti_metronome, hook_first, tighten_dead_air.",
+        {
+            "principles": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "a known principle id"},
+                        "weight": {"type": "number", "description": "tendency strength, 0..1"},
+                        "scope": {"type": "string", "description": "'global' or a spine-region label"},
+                    },
+                    "required": ["id", "weight"],
+                },
+            }
+        },
+        ["principles"],
+    ),
+    _spec(
         "set_outline",
         "Replace the beat outline (the narrative skeleton). Keep 2-6 beats; "
         "each maps to >=1 timeline segments later.",
@@ -297,6 +322,48 @@ TOOL_SPECS: List[dict] = [
             "rationale": {"type": "string", "description": "why cut away here, to this"},
         },
         ["file_id", "from_ms", "to_ms"],
+    ),
+    _spec(
+        "pick_angle",
+        "Switch which SYNCED ANGLE is on screen over a program range -- a normal "
+        "picture cut, NOT B-roll. The chosen clip MUST be in the same SYNC GROUP "
+        "as the spine clip under from_ms; the engine derives the angle's source "
+        "time from the sync offset (frame-aligned) and snaps the range edges to "
+        "the spine's seams. The spine AUDIO keeps playing underneath. Legal on "
+        "ANY spine kind (a synced angle is the same moment, so A/V stay "
+        "coherent). For UNSYNCED coverage / B-roll / cutaways use place_video.",
+        {
+            "file_id": {"type": "string", "description": "the angle to cut to (a sync-group member)"},
+            "from_ms": {"type": "integer", "description": "program time the angle starts"},
+            "to_ms": {"type": "integer", "description": "program time the angle ends"},
+            "rationale": {"type": "string", "description": "why this angle here (speaker / reaction / variety)"},
+        },
+        ["file_id", "from_ms", "to_ms"],
+    ),
+    _spec(
+        "auto_multicam",
+        "Seed a speaker/reaction-aware ANGLE cut across a detected sync group: "
+        "the engine follows whoever holds the floor and cuts to a strong "
+        "reaction when one beats the talker, weighted by your principles. Adds "
+        "pick_angle ops you can then keep, tweak, or remove. ADVISORY -- a "
+        "competent starting point, not the final say. Requires a sync group and "
+        "an existing spine. Call read_angles first if you want to inspect the "
+        "menu, or just call this and review timeline_status.",
+        {"group_id": {"type": "string", "description": "sync-group id (e.g. 'sg1'); omit to use the first"}},
+        [],
+    ),
+    _spec(
+        "read_angles",
+        "Inspect the per-window ANGLE MENU for a sync group over a program "
+        "range: who holds the floor and, per angle, whether the speaker is on "
+        "camera, the shot size, any active reaction, and gaze. Use to decide "
+        "manual pick_angle switches or to sanity-check auto_multicam.",
+        {
+            "group_id": {"type": "string", "description": "sync-group id; omit to use the first"},
+            "from_ms": {"type": "integer", "description": "program start (default 0)"},
+            "to_ms": {"type": "integer", "description": "program end (default: end of spine)"},
+        },
+        [],
     ),
     _spec(
         "place_audio",
@@ -510,12 +577,19 @@ def _full_status(session: EditSession) -> Dict[str, Any]:
     cover_ms = sum(
         v.prog_end_ms - v.prog_start_ms for v in r.video_layers if v.kind == "coverage"
     )
+    angle_ms = sum(
+        v.prog_end_ms - v.prog_start_ms for v in r.video_layers if v.kind == "angle"
+    )
     beds = [a for a in r.audio_layers if a.kind in ("bed", "sfx")]
     ops = session.document.get("operations", [])
     status["layers"] = {
         "program_ms": r.duration_ms,
         "coverage_ms": cover_ms,
         "coverage_pct": round(100.0 * cover_ms / r.duration_ms, 1) if r.duration_ms else 0.0,
+        # Angle switches re-point the spine picture; tracked apart from coverage.
+        "angle_switches": sum(1 for o in ops if o.get("type") == "pick_angle"),
+        "angle_ms": angle_ms,
+        "angle_pct": round(100.0 * angle_ms / r.duration_ms, 1) if r.duration_ms else 0.0,
         "video_layer_count": len(r.video_layers),
         "audio_roles": sorted({a.role for a in r.audio_layers}),
         "audio_bed_count": len(beds),
@@ -565,6 +639,15 @@ def _execute(session: EditSession, name: str, args: Dict[str, Any]) -> str:
                 for r in regions
             ],
         })
+
+    if name == "set_principles":
+        clean, errors = principles.normalize(args.get("principles") or [])
+        doc["principles"] = clean
+        result: Dict[str, Any] = {"ok": True, "principles": clean}
+        if errors:
+            result["ignored"] = errors
+            result["known"] = sorted(principles.KNOWN)
+        return _j(result)
 
     if name == "set_outline":
         doc["outline"] = args["beats"]
@@ -674,6 +757,109 @@ def _execute(session: EditSession, name: str, args: Dict[str, Any]) -> str:
         }
         doc["operations"].append(op)
         return _j({"operation": op, "covers_pct": round(100.0 * (to_s - from_s) / total, 1) if total else 0.0})
+
+    if name == "pick_angle":
+        fid = args["file_id"]
+        if fid not in session.file_ids:
+            return _j({"error": "file_id not in this thread's scope"})
+        spans, total = layers.spine_spans(doc["timeline"])
+        if not spans:
+            return _j({"error": "no spine yet; add_segment the base timeline before picking angles"})
+        from_ms = max(0, min(int(args["from_ms"]), total))
+        to_ms = max(0, min(int(args["to_ms"]), total))
+        if to_ms <= from_ms:
+            return _j({"error": "to_ms must be after from_ms"})
+        # Must be a synced angle of the spine clip beneath the range.
+        m = layers.prog_to_source(spans, from_ms)
+        g = sync_mod.find_group_for(session.sync_groups, fid) if m else None
+        if not (g and m and g.offset_of(m[0]["file_id"]) is not None):
+            return _j({"error": "pick_angle needs a sync group linking this clip to the spine here; "
+                                "use place_video for unsynced coverage"})
+        reason = layers.angle_conflicts(doc, spans, from_ms, to_ms)
+        if reason:
+            return _j({"error": reason})
+        from_s, _ = _snap_prog_to_spine(session, spans, from_ms)
+        to_s, _ = _snap_prog_to_spine(session, spans, to_ms)
+        if to_s <= from_s:
+            to_s = min(total, from_s + engine.MIN_SEGMENT_MS)
+        prog_dur = to_s - from_s
+        # Derive the angle's source entry from the sync offset (frame-aligned).
+        m2 = layers.prog_to_source(spans, from_s)
+        if not m2:
+            return _j({"error": "could not map program time to the spine here"})
+        spine_seg, src_spine, _span = m2
+        spine_off, angle_off = g.offset_of(spine_seg["file_id"]), g.offset_of(fid)
+        if spine_off is None or angle_off is None:
+            return _j({"error": "the spine clip here is not in this angle's sync group"})
+        rough_src = src_spine + (spine_off - angle_off)
+        cg = session.grids(fid)
+        snap_in = engine.snap_cut(cg, int(rough_src), "visual")
+        src_in = snap_in["ts_ms"]
+        src_out = src_in + prog_dur
+        warnings = []
+        if snap_in.get("warning"):
+            warnings.append(snap_in["warning"])
+        if cg.duration_ms and src_out > cg.duration_ms:
+            avail = cg.duration_ms - src_in
+            src_out = cg.duration_ms
+            to_s = from_s + max(0, avail)
+            warnings.append("angle clip too short for the range; shortened")
+        if to_s - from_s < engine.MIN_SEGMENT_MS:
+            warnings.append(f"angle is only {to_s - from_s}ms after snapping")
+        if g.drift_warning:
+            warnings.append("sync group is low-confidence/drift; angle may be slightly misaligned")
+        op = {
+            "op_id": _op_id(), "type": "pick_angle",
+            "source_file_id": fid, "src_in_ms": src_in, "src_out_ms": src_out,
+            "from_ms": from_s, "to_ms": to_s,
+            "layout": layers.DEFAULT_LAYOUT, "z": layers.Z_ANGLE,
+            "group_id": g.group_id,
+            "rationale": args.get("rationale"),
+            "cut_in_cost": snap_in["cost"], "warnings": warnings,
+        }
+        doc["operations"].append(op)
+        return _j({"operation": op, "angle_pct": round(100.0 * (to_s - from_s) / total, 1) if total else 0.0})
+
+    if name in ("auto_multicam", "read_angles"):
+        from app.services.l3 import angles, baseline
+        spans, total = layers.spine_spans(doc["timeline"])
+        if not spans:
+            return _j({"error": "no spine yet; build the base timeline first"})
+        if not session.sync_groups:
+            return _j({"error": "no sync groups detected; this is not synced multicam (use place_video for unsynced coverage)"})
+        gid = args.get("group_id")
+        group = (
+            next((g for g in session.sync_groups if g.group_id == gid), None)
+            if gid else session.sync_groups[0]
+        )
+        if group is None:
+            return _j({"error": "unknown group_id", "available": [g.group_id for g in session.sync_groups]})
+
+        if name == "read_angles":
+            from_ms = max(0, int(args.get("from_ms", 0)))
+            to_ms = min(total, int(args.get("to_ms", total)))
+            menu = angles.build_menu(group, spans, from_ms, to_ms)
+            return _j({"group_id": group.group_id, "menu": angles.render_angle_menu_text(menu)})
+
+        # auto_multicam: seed picks and apply them through the pick_angle path.
+        menu = angles.build_menu(group, spans, 0, total)
+        picks = baseline.seed_multicam(spans, group, menu, doc)
+        applied, errors = 0, []
+        for p in picks:
+            res = json.loads(_execute(session, "pick_angle", p))
+            if res.get("operation"):
+                applied += 1
+            elif res.get("error"):
+                errors.append(res["error"])
+        out = {
+            "group_id": group.group_id,
+            "picks_proposed": len(picks),
+            "picks_applied": applied,
+            "note": "advisory baseline; review with timeline_status and adjust via pick_angle / remove_operation",
+        }
+        if errors:
+            out["skipped"] = errors[:5]
+        return _j(out)
 
     if name == "place_audio":
         fid = args["file_id"]

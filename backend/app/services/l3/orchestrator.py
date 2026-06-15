@@ -25,6 +25,8 @@ from app.services.jobs import app
 from app.services.l3 import store
 from app.services.l3.catalog import build_catalog, render_catalog_text
 from app.services.l3.sync import build_sync_groups, render_sync_groups_text
+from app.services.l3.roster import render_roster_text
+from app.services.l3.principles import render_principles_text
 from app.services.l3.takes import build_take_groups, render_take_groups_text
 from app.services.l3.tools import TERMINAL_TOOLS, TOOL_SPECS, EditSession, execute_tool
 from app.services.llm.anthropic_client import AnthropicClient
@@ -79,6 +81,10 @@ multicam, and B-roll are ways material ATTACHES to the spine, not spine kinds.
 WORKFLOW (each run):
 1. Interpret the brief -> set_brief. Record every default you assumed in `assumptions`.
 2. Decide the SPINE -> set_spine (see THE SPINE above). This frames every later choice.
+2b. (optional) set_principles to bias the cut's STYLE -- weighted tendencies the \
+engine honors (favor_speaker, reward_reaction, shot_variety, pace, anti_metronome, \
+hook_first, tighten_dead_air, ...). Set only the knobs you want to push; the rest run \
+at sensible defaults.
 3. Skim the catalog; read_clip the promising clips.
 4. set_outline: 2-6 beats with purpose + intent (hook first when the brief implies an audience).
 5. Build the timeline beat by beat: query_seams to scout, add_segment with rough times, \
@@ -97,18 +103,30 @@ segments, then finalize again.
 
 A/V LAYERS (decoupling video from audio):
 - The spine is the base, coupled layer (each segment's picture + its own audio). On top of it \
-you place LAYER OPERATIONS -- the only legal way to decouple A from V. They are checked against \
-the spine's locks, so you can't express an illegal edit:
-  * place_video -- show another clip's PICTURE over a program range while the spine AUDIO keeps \
-playing (B-roll, cutaway, or -- for a synced clip -- a multicam angle switch). Needs a spine \
-that frees video (dialogue/music).
+you place LAYER OPERATIONS, checked against the spine's locks so you can't express an illegal edit:
+  * place_video -- lay another clip's PICTURE over a range while the spine AUDIO keeps playing: \
+B-roll / cutaway over an UNSYNCED clip. Needs a spine that frees video (dialogue/music).
   * place_audio -- lay a music bed / ambience / SFX under a range (duck it under dialogue), or \
 replace spine audio with a cleaner source.
   * split_edit -- J/L cut: offset the audio cut from the video cut at a seam.
   * set_level -- gain/duck/mute a role over a range.
-- These are layers, not spine edits: the spine still owns the clock. Build a solid spine FIRST, \
-then decouple only where it earns its keep. Default is coupled; don't add coverage/beds just to \
-show off.
+- These are layers, not spine edits: the spine still owns the clock. Build a solid spine FIRST. \
+For decorative B-roll / beds the default is coupled -- don't add them just to show off.
+
+MULTICAM / ANGLES (only when clips are a SYNC GROUP -- same moment, several cameras):
+- Switching which angle is on screen is a NORMAL picture cut, NOT B-roll. Use pick_angle to cut \
+the spine PICTURE to another synced angle over a range; the spine AUDIO keeps playing and the \
+engine frame-aligns the angle from the sync offset. It is legal on ANY spine kind (a synced \
+angle is the same moment, so A/V stay coherent) -- the one place decoupling the picture is the \
+expected move, not showing off.
+- Don't hand-place every switch: call auto_multicam to SEED a speaker/reaction-aware cut (it \
+follows whoever holds the floor and cuts to a strong reaction when one beats the talker, \
+weighted by your principles), then review timeline_status and adjust with pick_angle / \
+remove_operation. read_angles shows the per-window menu (floor speaker + what each angle offers). \
+Generally follow the speaker, but cut to a genuine reaction when it's stronger; vary shot sizes; \
+don't cut metronomically.
+- Match the same person across angles yourself using the ROSTER below (durable appearance traits \
++ time alignment -- never the clip-local voice/p-id label).
 
 STYLE OF THE CUT:
 - Respect the grain of the footage: cut dialogue at sentence/turn seams, action on impacts, \
@@ -132,16 +150,23 @@ CLIP CATALOG (scope for this thread):
 {take_groups}
 
 {sync_groups}
+
+{sync_roster}
+
+{principles}
 """
 
 
-def _render_system_prompt(catalog, take_groups, sync_groups) -> str:
+def _render_system_prompt(catalog, take_groups, sync_groups, document=None) -> str:
     tg_text = render_take_groups_text(take_groups)
     sg_text = render_sync_groups_text(sync_groups)
+    roster_text = render_roster_text(sync_groups)
     return SYSTEM_PROMPT_TEMPLATE.format(
         catalog=render_catalog_text(catalog),
         take_groups=tg_text or "(no repeated-content take groups detected)",
         sync_groups=sg_text or "(no synchronized-source/multicam groups detected)",
+        sync_roster=roster_text or "(no sync-group people roster -- single-source or unsynced footage)",
+        principles=render_principles_text(document or {}),
     )
 
 
@@ -166,15 +191,18 @@ def run_thread(thread_id: str) -> None:
     take_groups = build_take_groups(thread["file_ids"])
     sync_groups = build_sync_groups(thread["file_ids"])
 
-    system = _render_system_prompt(catalog, take_groups, sync_groups)
+    # Resume the working document from the latest snapshot (empty on first run).
+    # Loaded before the prompt so a resumed run reflects any principles set
+    # earlier (the rest of the prefix stays stable for caching within a run).
+    doc, _version = store.latest_document(thread_id)
+
+    system = _render_system_prompt(catalog, take_groups, sync_groups, doc or {})
     messages = store.load_messages(thread_id)
     if not messages:
         logger.error("L3: thread %s has no messages; nothing to do.", thread_id)
         store.set_thread_status(thread_id, "failed")
         return
 
-    # Resume the working document from the latest snapshot (empty on first run).
-    doc, _version = store.latest_document(thread_id)
     session = EditSession(
         thread_id=thread_id,
         file_ids=thread["file_ids"],

@@ -28,7 +28,8 @@ from typing import Dict, List, Optional, Tuple
 
 # Z bands so layer kinds stack predictably regardless of insertion order.
 Z_SPINE_VIDEO = 0
-Z_COVERAGE = 10        # video laid over the spine (coverage / angle / overlay)
+Z_ANGLE = 5            # a synced multicam angle re-pointing the spine picture
+Z_COVERAGE = 10        # video laid over the spine (coverage / cutaway / overlay)
 DEFAULT_LAYOUT = "full_frame"
 
 # Audio roles (the mixer knows how to duck dialogue under music, etc.).
@@ -271,6 +272,19 @@ def resolve(document: dict, durations: Optional[Dict[str, int]] = None) -> Resol
                 opacity=float(op.get("opacity", 1.0)),
                 kind="coverage", op_id=op["op_id"],
             ))
+        elif t == "pick_angle":
+            # A synced multicam angle re-points the SPINE picture (a normal cut),
+            # so it resolves as a spine-band video layer just above the base
+            # spine -- not as coverage. Audio is untouched (stays the spine).
+            video.append(VideoLayer(
+                layer_id=op["op_id"],
+                source_file_id=op["source_file_id"],
+                src_in_ms=int(op["src_in_ms"]), src_out_ms=int(op["src_out_ms"]),
+                prog_start_ms=int(op["from_ms"]), prog_end_ms=int(op["to_ms"]),
+                z=int(op.get("z", Z_ANGLE)),
+                layout=op.get("layout", DEFAULT_LAYOUT),
+                opacity=1.0, kind="angle", op_id=op["op_id"],
+            ))
         elif t == "place_audio":
             audio.append(AudioLayer(
                 layer_id=op["op_id"],
@@ -394,6 +408,30 @@ def coverage_conflicts(
         return "spine keeps A/V coupled (sync / no spine); cannot cover the picture"
     if not video_is_free(document):
         return "spine locks the video channel; the picture is the content and must show"
+    for s in covering_segments(spans, from_ms, to_ms):
+        seg = s.seg
+        ov_start = max(from_ms, s.prog_start_ms)
+        ov_end = min(to_ms, s.prog_end_ms)
+        src_a = int(seg["in_ms"]) + (ov_start - s.prog_start_ms)
+        src_b = int(seg["in_ms"]) + (ov_end - s.prog_start_ms)
+        for (ws, we, reason) in protected_windows_for(document, seg["file_id"]):
+            if _overlaps(src_a, src_b, ws, we):
+                return (f"covers a protected window in {seg['file_id']} "
+                        f"[{ws}-{we}ms]{f': {reason}' if reason else ''}")
+    return None
+
+
+def angle_conflicts(
+    document: dict, spans: List[SpineSpan], from_ms: int, to_ms: int
+) -> Optional[str]:
+    """Reason a multicam ANGLE switch over [from_ms,to_ms] would be illegal, else
+    None.
+
+    Unlike coverage, an angle switch is legal on ANY spine kind (a synced angle
+    is the same moment, so A/V stay coherent) -- the sync-group membership
+    requirement is enforced by the executor. The only document-level block is a
+    protected window of the spine clip underneath (switching away would hide
+    the very thing the window protects)."""
     for s in covering_segments(spans, from_ms, to_ms):
         seg = s.seg
         ov_start = max(from_ms, s.prog_start_ms)

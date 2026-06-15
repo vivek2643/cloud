@@ -122,64 +122,14 @@ def _load_transcript_context(
     """Return (transcript_text, speaker_ids, speaker_turns).
 
     speaker_turns are (start_ms, end_ms, speaker) merged from diarized words and
-    are reused both for the prompt and for audio/visual fusion.
+    are reused both for the prompt and for audio/visual fusion. The merge lives
+    in the shared `l3.diarize` leaf so L3 angle routing uses the identical turns.
     """
-    with _pg_conn() as conn:
-        row = conn.execute(
-            "select segments from transcripts where file_id = %s", (file_id,)
-        ).fetchone()
-    if not row or not row[0]:
-        return None, [], []
+    from app.services.l3.diarize import load_turns
 
-    segments = row[0] if isinstance(row[0], list) else json.loads(row[0])
-
-    words: List[dict] = []
-    for seg in segments:
-        for w in seg.get("words") or []:
-            if w.get("is_filler"):
-                continue
-            words.append(w)
-    words.sort(key=lambda w: w.get("start_ms", 0))
-    if not words:
-        return None, [], []
-
-    # Merge words into speaker turns.
-    turns: List[Tuple[int, int, str]] = []
-    cur_start = cur_end = None
-    cur_spk = None
-    cur_text: List[str] = []
-    lines: List[str] = []
-
-    def _flush() -> None:
-        if cur_start is None:
-            return
-        spk = cur_spk or "S?"
-        turns.append((cur_start, cur_end, spk))
-        lines.append(f"[{cur_start}-{cur_end}] {spk}: {' '.join(cur_text).strip()}")
-
-    for w in words:
-        spk = w.get("speaker") or "S?"
-        start = int(w.get("start_ms", 0))
-        end = int(w.get("end_ms", start))
-        text = (w.get("text") or "").strip()
-        if (
-            cur_spk == spk
-            and cur_end is not None
-            and start - cur_end <= _TURN_GAP_MS
-        ):
-            cur_end = end
-            cur_text.append(text)
-        else:
-            _flush()
-            cur_start, cur_end, cur_spk, cur_text = start, end, spk, [text]
-    _flush()
-
-    transcript_text = "\n".join(lines)
-    if len(transcript_text) > _MAX_TRANSCRIPT_CHARS:
-        transcript_text = transcript_text[:_MAX_TRANSCRIPT_CHARS] + "\n... [truncated]"
-
-    speaker_ids = sorted({spk for _, _, spk in turns if spk != "S?"})
-    return transcript_text, speaker_ids, turns
+    return load_turns(
+        file_id, turn_gap_ms=_TURN_GAP_MS, max_chars=_MAX_TRANSCRIPT_CHARS
+    )
 
 
 # --------------------------------------------------------------------------

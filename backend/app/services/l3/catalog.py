@@ -134,6 +134,26 @@ def build_catalog(file_ids: List[str]) -> List[ClipSummary]:
     return [out[fid] for fid in file_ids if fid in out]
 
 
+def load_perceptions(file_ids: List[str]) -> Dict[str, dict]:
+    """file_id -> parsed L2 perception dict (skips missing/unparseable). Shared
+    by the people roster and the angle menu so they read one source."""
+    if not file_ids:
+        return {}
+    out: Dict[str, dict] = {}
+    with _pg_conn() as conn:
+        rows = conn.execute(
+            "select file_id::text, perception from clip_perception where file_id = any(%s::uuid[])",
+            (file_ids,),
+        ).fetchall()
+    for fid, perception in rows:
+        doc = perception if isinstance(perception, dict) else (
+            json.loads(perception) if perception else None
+        )
+        if doc and not doc.get("_parse_error"):
+            out[fid] = doc
+    return out
+
+
 def render_catalog_text(clips: List[ClipSummary]) -> str:
     """The prompt-facing rendering: one compact block per clip."""
     if not clips:
