@@ -113,7 +113,7 @@ def _refuse(file_id: str, min_conf_clear: bool = True) -> str:
     return f"refused -> links {links}" if links else "refused -> no confident links"
 
 
-def rediarize_one(file_id: str, min_speakers: int) -> None:
+def rediarize_one(file_id: str, min_speakers: int, max_speakers: int) -> None:
     with _pg_conn() as c:
         frow = c.execute("select name, r2_proxy_key, r2_key from files where id=%s",
                          (file_id,)).fetchone()
@@ -134,7 +134,8 @@ def rediarize_one(file_id: str, min_speakers: int) -> None:
         src = os.path.join(td, "src"); wav = os.path.join(td, "a.wav")
         _download_from_r2(src_key, src)
         _demux_wav(src, wav)
-        res = diar_mod.diarize(wav, flat, backend="neural", min_speakers=min_speakers)
+        res = diar_mod.diarize(wav, flat, backend="neural",
+                               min_speakers=min_speakers, max_speakers=max_speakers)
 
     spk = res.speaker_by_word
     if not spk or len(spk) != len(refs):
@@ -159,16 +160,19 @@ def main() -> None:
     ap.add_argument("file_ids", nargs="*")
     ap.add_argument("--thread")
     ap.add_argument("--min-speakers", type=int, default=1)
+    ap.add_argument("--max-speakers", type=int, default=8,
+                    help="upper bound on clusters (cap to the real cast size to "
+                         "stop one voice splitting into spurious extras)")
     args = ap.parse_args()
 
     ids = _resolve_file_ids(args)
     if not ids:
         print("no files to process"); return
     print(f"re-diarizing {len(ids)} clip(s) with the neural backend "
-          f"(min_speakers={args.min_speakers}):")
+          f"(min_speakers={args.min_speakers}, max_speakers={args.max_speakers}):")
     for fid in ids:
         try:
-            rediarize_one(fid, args.min_speakers)
+            rediarize_one(fid, args.min_speakers, args.max_speakers)
         except Exception as e:  # noqa: BLE001
             print(f"  {fid[:8]}  FAILED: {type(e).__name__}: {e}")
     print("done.")
