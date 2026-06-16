@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     # default (librosa + sklearn, no GPU, no model download); a stronger
     # backend (ecapa / pyannote) can be slotted in later behind this flag.
     enable_diarization: bool = True
-    diarization_backend: str = "mfcc"
+    diarization_backend: str = "neural"
     diarization_max_speakers: int = 8
 
     # Anthropic credentials (used by the L3 edit orchestrator).

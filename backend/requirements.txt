@@ -22,6 +22,11 @@ protobuf==5.29.3
 torch==2.6.0
 torchvision==0.21.0
 librosa==0.10.2.post1
+# Neural speaker-embedding (GE2E d-vector) for diarization; ships its own
+# weights, CPU-only, runs on the torch above. Separates same-gender speakers
+# the classical MFCC backend cannot. webrtcvad is its VAD dependency.
+resemblyzer==0.1.4
+webrtcvad==2.0.10
 opencv-python-headless==4.11.0.86
 pydub==0.25.1
 pgvector==0.3.6

@@ -14,10 +14,22 @@ Design goals (per the universal-editor plan):
   - Pluggable backend so a stronger embedding (ECAPA / pyannote) can be dropped
     in later via `DIARIZATION_BACKEND` without touching callers.
 
-Default backend = "mfcc": build short windows over the word stream, embed each
-with MFCC + pitch statistics (librosa only), pick the speaker count via
-silhouette, and cluster (agglomerative). It is approximate but fast and
-dependency-free, which is exactly what we want for a *soft* signal.
+Backends (set via DIARIZATION_BACKEND):
+  * "neural" (default): a pretrained neural speaker embedding (Resemblyzer's
+    GE2E d-vector -- same family as ECAPA x-vectors). This is what actually
+    separates SAME-GENDER speakers, which the cheap classical features cannot;
+    the model ships with the package (no download), runs on CPU in seconds, and
+    needs no GPU. We embed each window, then cluster as before.
+  * "mfcc": the original classical fallback -- MFCC + pitch statistics (librosa
+    only), no model. Approximate but fully dependency-free; used automatically
+    if the neural backend can't be imported, so diarization never hard-fails.
+
+Either way the window embeddings are clustered (agglomerative, K chosen by
+silhouette). With strong neural embeddings the silhouette is meaningful again,
+so the "collapse to one speaker" gate stops firing on real two-person audio. A
+`min_speakers` hint (e.g. from the VLM seeing two people, or from a verified
+synced second camera) can additionally force K>=2 when the caller already knows
+the clip is multi-speaker.
 """
 from __future__ import annotations
 
@@ -41,6 +53,14 @@ DEFAULT_MAX_SPEAKERS = 8
 # Below this silhouette score we treat the file as a single speaker rather than
 # inventing a spurious second cluster out of noise.
 SILHOUETTE_MIN = 0.12
+# Parsimony: adding a speaker must improve silhouette by at least this margin,
+# else prefer the smaller count (Occam -- avoid splitting one voice into many).
+SILHOUETTE_MARGIN = 0.03
+# A cluster smaller than this fraction of windows (and below the absolute floor)
+# is treated as noise and merged into its nearest neighbour -- kills the spurious
+# 2-3 window "speakers" the embedding sometimes spawns.
+MIN_CLUSTER_FRACTION = 0.10
+MIN_CLUSTER_WINDOWS = 3
 
 # A window's audio must be at least this long to yield a stable MFCC vector.
 MIN_WINDOW_AUDIO_MS = 200
@@ -62,14 +82,17 @@ def diarize(
     wav_path: str,
     words: Sequence[dict],
     *,
-    backend: str = "mfcc",
+    backend: str = "neural",
     max_speakers: int = DEFAULT_MAX_SPEAKERS,
+    min_speakers: int = 1,
     window_ms: int = DEFAULT_WINDOW_MS,
     min_gap_ms: int = DEFAULT_MIN_GAP_MS,
 ) -> DiarizationResult:
     """Label each word with a per-file speaker id ("S0", "S1", ...).
 
     `words` is the flat, chronological word list (dicts with start_ms/end_ms).
+    `min_speakers` forces at least that many clusters when the caller already
+    knows the clip is multi-speaker (skips the single-speaker collapse gate).
     Never raises: on any failure it returns an empty result so the caller can
     treat diarization as best-effort.
     """
@@ -83,12 +106,13 @@ def diarize(
         if not windows:
             return DiarizationResult(speaker_by_word=[None] * n)
 
-        feats, valid_window_idx = _embed_windows(wav_path, windows, backend)
+        feats, valid_window_idx, neural = _embed_windows(wav_path, windows, backend)
         if feats is None or feats.shape[0] == 0:
             # Couldn't embed anything -> single speaker fallback.
             return _single_speaker(word_list, windows)
 
-        labels = _cluster(feats, max_speakers)
+        labels = _cluster(feats, max_speakers, min_speakers=min_speakers,
+                          normalized=neural)
         return _assign(word_list, windows, valid_window_idx, labels)
     except Exception:
         logger.exception("Diarization failed for %s; leaving speakers unset.", wav_path)
@@ -138,40 +162,71 @@ def _build_windows(
 # Embedding (default: MFCC + pitch statistics, librosa-only)
 # ---------------------------------------------------------------------------
 
+_VOICE_ENCODER = None  # lazily-created, process-wide Resemblyzer encoder
+
+
+def _get_voice_encoder():
+    """Load the neural speaker-embedding model once per process. Returns None
+    if Resemblyzer/torch isn't available, so the caller can fall back to MFCC."""
+    global _VOICE_ENCODER
+    if _VOICE_ENCODER is None:
+        try:
+            from resemblyzer import VoiceEncoder
+            _VOICE_ENCODER = VoiceEncoder("cpu", verbose=False)
+        except Exception:
+            logger.warning("Neural diarization backend unavailable; falling back to mfcc.")
+            _VOICE_ENCODER = False  # sentinel: tried and failed
+    return _VOICE_ENCODER or None
+
+
 def _embed_windows(
     wav_path: str,
     windows: List[Tuple[int, int, List[int]]],
     backend: str,
-) -> Tuple[Optional[np.ndarray], List[int]]:
-    """Return (feature_matrix, valid_window_indices) for embeddable windows."""
-    if backend != "mfcc":
-        # Future backends (ecapa / pyannote / resemblyzer) plug in here. We fall
-        # back to MFCC so an unknown setting never silently disables diarization.
-        logger.warning("Unknown diarization backend %r; using mfcc.", backend)
+) -> Tuple[Optional[np.ndarray], List[int], bool]:
+    """Return (feature_matrix, valid_window_indices, is_neural).
 
+    `is_neural` tells the clusterer the vectors are L2-normalized d-vectors (so
+    it normalizes instead of z-scoring). Falls back to MFCC when the neural
+    backend is requested but can't load, so diarization never hard-fails."""
     import librosa
 
     y, _sr = librosa.load(wav_path, sr=SR, mono=True)
     if y.size == 0:
-        return None, []
+        return None, [], False
+
+    encoder = None
+    if backend not in ("mfcc",):
+        encoder = _get_voice_encoder()
+        if encoder is None and backend != "neural":
+            logger.warning("Unknown diarization backend %r; using mfcc.", backend)
 
     vecs: List[np.ndarray] = []
     valid: List[int] = []
+    floor = int(MIN_WINDOW_AUDIO_MS * SR / 1000)
     for wi, (s_ms, e_ms, _idxs) in enumerate(windows):
         a = max(0, int(s_ms * SR / 1000))
         b = min(y.size, int(e_ms * SR / 1000))
-        if b - a < int(MIN_WINDOW_AUDIO_MS * SR / 1000):
+        if b - a < floor:
             continue
         seg = y[a:b]
-        vec = _mfcc_pitch_vector(seg, librosa)
+        vec = _neural_vector(seg, encoder) if encoder is not None else _mfcc_pitch_vector(seg, librosa)
         if vec is None:
             continue
         vecs.append(vec)
         valid.append(wi)
 
     if not vecs:
-        return None, []
-    return np.vstack(vecs).astype(np.float32), valid
+        return None, [], False
+    return np.vstack(vecs).astype(np.float32), valid, encoder is not None
+
+
+def _neural_vector(seg: np.ndarray, encoder) -> Optional[np.ndarray]:
+    """One L2-normalized d-vector for a window via the neural encoder."""
+    try:
+        return encoder.embed_utterance(seg.astype(np.float32)).astype(np.float32)
+    except Exception:
+        return None
 
 
 def _mfcc_pitch_vector(seg: np.ndarray, librosa) -> Optional[np.ndarray]:
@@ -216,38 +271,87 @@ def _mfcc_pitch_vector(seg: np.ndarray, librosa) -> Optional[np.ndarray]:
 # Clustering
 # ---------------------------------------------------------------------------
 
-def _cluster(feats: np.ndarray, max_speakers: int) -> np.ndarray:
+def _cluster(
+    feats: np.ndarray,
+    max_speakers: int,
+    *,
+    min_speakers: int = 1,
+    normalized: bool = False,
+) -> np.ndarray:
     """Cluster window embeddings, choosing K by silhouette. Returns a label per
-    row of `feats`."""
+    row of `feats`.
+
+    `normalized=True` (neural d-vectors) -> L2-normalize so ward clustering acts
+    on cosine geometry; otherwise z-score the classical MFCC features.
+    `min_speakers>=2` forces at least that many clusters and skips the
+    single-speaker collapse gate (use when the clip is known multi-speaker)."""
     n = feats.shape[0]
-    if n < 2:
+    min_k = max(1, int(min_speakers))
+    if n < 2 or n <= min_k:
+        # Can't form the requested clusters; honor the floor if it's >1.
         return np.zeros(n, dtype=int)
 
-    # Standardize so MFCC and pitch scales are comparable.
-    mu = feats.mean(axis=0)
-    sd = feats.std(axis=0)
-    sd[sd == 0] = 1.0
-    x = (feats - mu) / sd
+    if normalized:
+        norms = np.linalg.norm(feats, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        x = feats / norms
+    else:
+        mu = feats.mean(axis=0)
+        sd = feats.std(axis=0)
+        sd[sd == 0] = 1.0
+        x = (feats - mu) / sd
 
     from sklearn.cluster import AgglomerativeClustering
     from sklearn.metrics import silhouette_score
 
-    k_max = max(1, min(max_speakers, n - 1))
-    best_k = 1
-    best_score = -1.0
-    best_labels = np.zeros(n, dtype=int)
-    for k in range(2, k_max + 1):
+    k_lo = max(2, min_k)
+    k_max = max(k_lo, min(max_speakers, n - 1))
+    scored: Dict[int, Tuple[float, np.ndarray]] = {}
+    for k in range(k_lo, k_max + 1):
         try:
             labels = AgglomerativeClustering(n_clusters=k, linkage="ward").fit_predict(x)
-            score = float(silhouette_score(x, labels))
+            scored[k] = (float(silhouette_score(x, labels)), labels)
         except Exception:
             continue
-        if score > best_score:
-            best_score, best_k, best_labels = score, k, labels
+    if not scored:
+        return np.zeros(n, dtype=int)
 
+    best_score = max(s for s, _ in scored.values())
+    # Parsimony: take the SMALLEST k whose silhouette is within a margin of the
+    # best, so one voice isn't split into several near-equivalent clusters.
+    best_k = min(k for k, (s, _) in scored.items() if s >= best_score - SILHOUETTE_MARGIN)
+    best_labels = scored[best_k][1]
+
+    # A known multi-speaker clip keeps K>=min_k regardless of the collapse gate.
+    if min_k >= 2:
+        return _merge_tiny(x, best_labels) if best_k >= 2 else np.zeros(n, dtype=int)
     if best_k == 1 or best_score < SILHOUETTE_MIN:
         return np.zeros(n, dtype=int)
-    return best_labels
+    return _merge_tiny(x, best_labels)
+
+
+def _merge_tiny(x: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    """Fold clusters too small to be a real speaker into their nearest surviving
+    cluster (by centroid). Prevents spurious 2-3 window 'speakers'."""
+    n = len(labels)
+    floor = max(MIN_CLUSTER_WINDOWS, int(MIN_CLUSTER_FRACTION * n))
+    counts = {lbl: int((labels == lbl).sum()) for lbl in set(labels.tolist())}
+    big = [lbl for lbl, c in counts.items() if c >= floor]
+    if len(big) <= 1:
+        # Everything is "tiny" relative to the floor; keep the largest cluster
+        # only when it dominates, else fall back to the original labels.
+        return labels
+    centroids = {lbl: x[labels == lbl].mean(axis=0) for lbl in big}
+    out = labels.copy()
+    for lbl, c in counts.items():
+        if c >= floor:
+            continue
+        idx = np.where(labels == lbl)[0]
+        for i in idx:
+            nearest = min(big, key=lambda b: float(np.linalg.norm(x[i] - centroids[b])))
+            out[i] = nearest
+    # Re-pack labels to 0..k-1 in first-appearance order is handled in _assign.
+    return out
 
 
 # ---------------------------------------------------------------------------
