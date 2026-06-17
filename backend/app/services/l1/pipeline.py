@@ -28,6 +28,7 @@ from app.services.l1 import audio_features as af_mod
 from app.services.l1 import beat_cost as beat_mod
 from app.services.l1 import cut_cost as cutcost_mod
 from app.services.l1 import diarization as diar_mod
+from app.services.l1 import dialogue_segments as dlg_mod
 from app.services.l1 import motion_dynamics as motion_mod
 from app.services.l1 import music_structure as music_mod
 from app.services.l1 import transcript as tr_mod
@@ -37,7 +38,7 @@ from app.services.supabase_client import get_supabase
 
 logger = logging.getLogger(__name__)
 
-STAGES = ("proxy", "transcript", "audio_features", "diarization", "dialogue_cut", "beat_cut", "motion_dynamics")
+STAGES = ("proxy", "transcript", "audio_features", "diarization", "dialogue_cut", "beat_cut", "motion_dynamics", "dialogue_segments")
 # Audio-only uploads (music) run a different, video-free set of stages.
 AUDIO_STAGES = ("audio_proxy", "audio_features", "beat_cut", "music_structure")
 
@@ -578,6 +579,36 @@ def _flatten_words(segments: list) -> List[dict]:
     return words
 
 
+def _stage_dialogue_segments(file_id: str, wav_path: str, conn: psycopg.Connection) -> None:
+    """Build the Dialogues-lens selects (sentence + topic) from the diarized
+    transcript, with audio-snapped cut points, and upsert them. Best-effort: a
+    missing transcript just no-ops; any failure leaves the lens uncomputed."""
+    row = conn.execute(
+        "select segments from transcripts where file_id = %s", (file_id,)
+    ).fetchone()
+    if not row or not row[0]:
+        return
+    words = _flatten_words(row[0])
+    if not words:
+        return
+    result = dlg_mod.build_dialogue_segments(words, wav_path)
+    conn.execute(
+        """
+        insert into dialogue_segments (file_id, schema_version, segments)
+        values (%s, %s, %s::jsonb)
+        on conflict (file_id) do update set
+            schema_version = excluded.schema_version,
+            segments = excluded.segments,
+            created_at = now()
+        """,
+        (file_id, dlg_mod.SCHEMA_VERSION, json.dumps(result)),
+    )
+    logger.info(
+        "Dialogue segments: %s -> %d sentence, %d topic",
+        file_id, len(result.get("sentence", [])), len(result.get("topic", [])),
+    )
+
+
 def _stage7_dialogue_cut(file_id: str, duration_s: float, conn: psycopg.Connection) -> None:
     """Derive the dialogue cut-cost grid from the transcript words + audio
     pause/energy signals written by the earlier stages, and persist it onto the
@@ -752,6 +783,9 @@ def _track_speech(file_id: str, wav_path: str) -> None:
     with _pg_conn() as conn:
         _run_stage(conn, file_id, "transcript", _stage2_transcript, file_id, wav_path, conn)
         _run_stage(conn, file_id, "diarization", _stage6_diarization, file_id, wav_path, conn)
+        # Dialogues lens: needs the diarized words + the WAV (for silence-snapped
+        # cuts), both in hand here, so it rides the speech track after diarization.
+        _run_stage(conn, file_id, "dialogue_segments", _stage_dialogue_segments, file_id, wav_path, conn)
 
 
 def _track_audio(file_id: str, wav_path: str, duration_s: float) -> None:

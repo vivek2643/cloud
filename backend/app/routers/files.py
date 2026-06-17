@@ -139,6 +139,38 @@ def get_download_url(
     return {"url": url}
 
 
+@router.get("/{file_id}/dialogues")
+def get_dialogues(
+    file_id: str,
+    level: Optional[str] = Query(None, description="sentence | topic (omit for both)"),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Return the precomputed Dialogues-lens selects for a file.
+
+    Zero recompute: this just reads the `dialogue_segments` document the L1
+    `dialogue_segments` stage wrote. `ready` is false when the stage hasn't run
+    yet (or the clip has no speech)."""
+    sb = get_supabase()
+    owns = sb.table("files").select("id").eq("id", file_id).eq("user_id", user_id).execute()
+    if not owns.data:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    row = (
+        sb.table("dialogue_segments")
+        .select("segments")
+        .eq("file_id", file_id)
+        .execute()
+    )
+    segs = (row.data[0]["segments"] if row.data else {}) or {}
+    sentence = segs.get("sentence", []) or []
+    topic = segs.get("topic", []) or []
+    if level == "sentence":
+        return {"sentence": sentence, "ready": bool(row.data)}
+    if level == "topic":
+        return {"topic": topic, "ready": bool(row.data)}
+    return {"sentence": sentence, "topic": topic, "ready": bool(row.data)}
+
+
 @router.get("/{file_id}/l1")
 def get_l1_index(
     file_id: str,

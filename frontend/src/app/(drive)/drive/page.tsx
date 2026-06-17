@@ -6,18 +6,20 @@ import { useAuthStore } from "@/stores/auth-store";
 import { getFolders, getFiles, createFolder } from "@/lib/api";
 import { UploadZone, useUploadFiles } from "@/components/upload-zone";
 import { DriveContent } from "@/components/drive-content";
+import { DialoguesView } from "@/components/dialogues-view";
 import { CreateFolderDialog } from "@/components/create-folder-dialog";
 import { SearchEditBar } from "@/components/search-edit-bar";
-import { FolderPlus, Upload, Layers, Crosshair, Star, X } from "lucide-react";
+import { FolderPlus, Upload, Layers, Crosshair, Star, MessageSquare, X } from "lucide-react";
 
 const VIDEO_EXTENSIONS =
   ".mp4,.mov,.avi,.mkv,.webm,.m4v,.wmv,.flv,.mxf,.mts," +
   ".mp3,.wav,.m4a,.aac,.flac,.ogg,.oga,.opus,.wma,.aiff";
 
-type Tab = "versioned" | "crux" | "highlights";
+type Tab = "versioned" | "dialogues" | "crux" | "highlights";
 
 const TABS: { id: Tab; label: string; icon: typeof Layers }[] = [
   { id: "versioned", label: "Versioned", icon: Layers },
+  { id: "dialogues", label: "Dialogues", icon: MessageSquare },
   { id: "crux", label: "Crux", icon: Crosshair },
   { id: "highlights", label: "Highlights", icon: Star },
 ];
@@ -152,6 +154,8 @@ export default function DrivePage() {
         {/* Content */}
         {activeTab === "versioned" ? (
           <DriveContent />
+        ) : activeTab === "dialogues" ? (
+          <DialoguesView />
         ) : (
           <ComingSoon tab={activeTab} />
         )}

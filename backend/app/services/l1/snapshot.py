@@ -27,7 +27,7 @@ def _row_to_dict(row) -> Optional[Dict[str, Any]]:
 
 
 _L1_STAGES = ("proxy", "transcript", "audio_features", "diarization",
-              "dialogue_cut", "beat_cut", "motion_dynamics",
+              "dialogue_cut", "beat_cut", "motion_dynamics", "dialogue_segments",
               "audio_proxy", "music_structure")
 
 

@@ -115,6 +115,36 @@ export function getFileDownloadUrl(id: string, token: string) {
   return request<{ url: string }>(`/api/files/${id}/download`, { token });
 }
 
+// --- Dialogues lens ---
+
+export interface DialogueSegment {
+  seg_id: string;
+  level: "sentence" | "topic";
+  order: number;
+  speaker: string | null;
+  text: string;
+  src_in_ms: number;
+  src_out_ms: number;
+  raw_in_ms: number;
+  raw_out_ms: number;
+  fade_in_ms: number;
+  fade_out_ms: number;
+  topic_id: number | null;
+  child_seg_ids: string[];
+  flags: string[];
+  confidence: number;
+}
+
+export interface DialoguesResponse {
+  sentence?: DialogueSegment[];
+  topic?: DialogueSegment[];
+  ready: boolean;
+}
+
+export function getDialogues(fileId: string, token: string) {
+  return request<DialoguesResponse>(`/api/files/${fileId}/dialogues`, { token });
+}
+
 // --- Upload ---
 
 export interface PresignResponse {
