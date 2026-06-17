@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor, wait
 from typing import List, Optional
 
 import psycopg
@@ -736,6 +737,67 @@ def _run_stage(
         raise
 
 
+# --- Parallel deep-stage tracks (video pipeline) -------------------------
+#
+# The deep L1 stages split into three INDEPENDENT tracks that run concurrently,
+# each on its OWN psycopg connection (psycopg connections are not safe to share
+# across threads). The heavy CPU work -- Whisper (CTranslate2), optical flow
+# (OpenCV) and librosa -- all release the GIL, so threads give real parallelism.
+# No two tracks write the same row, so their autocommit writes don't collide.
+# `dialogue_cut` is NOT in a track: it needs transcript + diarization + audio
+# features, so it runs after the tracks join.
+
+def _track_speech(file_id: str, wav_path: str) -> None:
+    """transcript (Whisper) -> diarization. The heaviest track."""
+    with _pg_conn() as conn:
+        _run_stage(conn, file_id, "transcript", _stage2_transcript, file_id, wav_path, conn)
+        _run_stage(conn, file_id, "diarization", _stage6_diarization, file_id, wav_path, conn)
+
+
+def _track_audio(file_id: str, wav_path: str, duration_s: float) -> None:
+    """audio_features (librosa) -> beat_cut (arithmetic)."""
+    with _pg_conn() as conn:
+        _run_stage(conn, file_id, "audio_features", _stage5_audio, file_id, wav_path, conn)
+        _run_stage(conn, file_id, "beat_cut", _stage8_beat_cut, file_id, duration_s, conn)
+
+
+def _track_motion(file_id: str, video_source: str, duration_s: float) -> None:
+    """motion_dynamics (optical flow). Independent of all audio stages."""
+    with _pg_conn() as conn:
+        _run_stage(conn, file_id, "motion_dynamics",
+                   _stage9_motion_dynamics, file_id, video_source, duration_s, conn)
+
+
+def _run_deep_stages_parallel(
+    file_id: str, wav_path: str, video_source: str, duration_s: float, has_audio: bool
+) -> None:
+    """Run the speech / audio / video tracks concurrently, then dialogue_cut.
+
+    Waits for ALL tracks before returning (so no orphan thread keeps writing
+    after the task ends), then re-raises the first track error. Idempotency and
+    best-effort semantics are unchanged -- each stage still records
+    processing_jobs and a retry skips finished stages.
+    """
+    tracks = [(_track_motion, (file_id, video_source, duration_s))]
+    if has_audio:
+        tracks.append((_track_speech, (file_id, wav_path)))
+        tracks.append((_track_audio, (file_id, wav_path, duration_s)))
+
+    with ThreadPoolExecutor(max_workers=len(tracks)) as ex:
+        futs = [ex.submit(fn, *args) for fn, args in tracks]
+        wait(futs)
+    for f in futs:
+        exc = f.exception()
+        if exc is not None:
+            raise exc
+
+    # Joins the speech (transcript+diarization) and audio (audio_features) tracks.
+    if has_audio:
+        with _pg_conn() as conn:
+            _run_stage(conn, file_id, "dialogue_cut",
+                       _stage7_dialogue_cut, file_id, duration_s, conn)
+
+
 # --- Audio-only (music) orchestrator -------------------------------------
 
 def _orchestrate_audio(file_id: str, r2_key: str, settings) -> None:
@@ -862,55 +924,35 @@ def l1_orchestrate(file_id: str, r2_key: str) -> None:
                 row = cur.fetchone()
                 duration_s = float(row[0]) if row and row[0] else (duration or 0.0)
 
-                if duration_s > settings.max_l1_duration_seconds:
-                    logger.info(
-                        "Duration %.1fs > guardrail %ds; skipping deep L1 stages",
-                        duration_s, settings.max_l1_duration_seconds,
-                    )
-                    if demux_thread is not None:
-                        demux_thread.join()
-                    _set_l1_status(file_id, "skipped")
-                    return
-
-                # Ensure the demux finished (it almost always has, in parallel
-                # with the proxy) before the transcript/audio stages need it.
+            if duration_s > settings.max_l1_duration_seconds:
+                logger.info(
+                    "Duration %.1fs > guardrail %ds; skipping deep L1 stages",
+                    duration_s, settings.max_l1_duration_seconds,
+                )
                 if demux_thread is not None:
                     demux_thread.join()
-                    if "e" in demux_err:
-                        raise demux_err["e"]
+                _set_l1_status(file_id, "skipped")
+                return
 
-                # Prefer the 1080p proxy for the motion pass (much cheaper to
-                # decode than a 4K raw). It exists locally whenever the proxy
-                # stage ran in this invocation; on a rare retry where it
-                # doesn't, fall back to the raw file.
-                proxy_local = os.path.join(tmpdir, "proxy.mp4")
-                video_source = proxy_local if os.path.exists(proxy_local) else raw_path
+            # Ensure the demux finished (it almost always has, in parallel
+            # with the proxy) before the transcript/audio stages need it.
+            if demux_thread is not None:
+                demux_thread.join()
+                if "e" in demux_err:
+                    raise demux_err["e"]
 
-                if has_audio:
-                    _run_stage(conn, file_id, "transcript",
-                               _stage2_transcript, file_id, wav_path, conn)
+            # Prefer the 1080p proxy for the motion pass (much cheaper to
+            # decode than a 4K raw). It exists locally whenever the proxy
+            # stage ran in this invocation; on a rare retry where it
+            # doesn't, fall back to the raw file.
+            proxy_local = os.path.join(tmpdir, "proxy.mp4")
+            video_source = proxy_local if os.path.exists(proxy_local) else raw_path
 
-                    _run_stage(conn, file_id, "audio_features",
-                               _stage5_audio, file_id, wav_path, conn)
-
-                    # Diarization depends on the transcript words written above.
-                    _run_stage(conn, file_id, "diarization",
-                               _stage6_diarization, file_id, wav_path, conn)
-
-                    # Dialogue cut-cost grid: pure derivation over the transcript
-                    # words + speakers (post-diarization) + audio pause/energy.
-                    _run_stage(conn, file_id, "dialogue_cut",
-                               _stage7_dialogue_cut, file_id, duration_s, conn)
-
-                    # Beat/music cut grid: free derivation over the librosa
-                    # onsets/bpm written by the audio_features stage.
-                    _run_stage(conn, file_id, "beat_cut",
-                               _stage8_beat_cut, file_id, duration_s, conn)
-
-                # Motion dynamics (action + camera/distortion): one optical-flow
-                # pass over the proxy. Video-only -- runs even on silent files.
-                _run_stage(conn, file_id, "motion_dynamics",
-                           _stage9_motion_dynamics, file_id, video_source, duration_s, conn)
+            # Deep stages run as three concurrent tracks (speech / audio / video),
+            # overlapping the two heaviest stages (Whisper + optical flow).
+            _run_deep_stages_parallel(
+                file_id, wav_path, video_source, duration_s, has_audio,
+            )
 
         _set_l1_status(file_id, "ready")
         logger.info("L1 complete for %s", file_id)
