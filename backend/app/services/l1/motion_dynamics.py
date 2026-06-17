@@ -200,6 +200,11 @@ def compute_motion_dynamics(
     coherence: List[float] = []
     sharp_raw: List[float] = []
     params: List[Tuple[float, float, float, float]] = []
+    # Per-hop normalized centroid (cx, cy in 0..1) of SUBJECT motion = where the
+    # action is, so a reframe can follow it. Camera motion is removed first by
+    # subtracting the global median flow, then we take the residual-weighted mean
+    # grid position. (0.5, 0.5) when there is no subject motion to point at.
+    centroids: List[Tuple[float, float]] = []
 
     prev = None
     try:
@@ -210,21 +215,34 @@ def compute_motion_dynamics(
                 camera_raw.append(0.0)
                 coherence.append(1.0)
                 params.append((0.0, 0.0, 0.0, 0.0))
+                centroids.append((0.5, 0.5))
             else:
                 # Deep pyramid (5 levels) + wide window so a fast pan/whip (large
                 # per-hop displacement) is still tracked instead of read as noise.
                 flow = cv2.calcOpticalFlowFarneback(
                     prev, frame, None, 0.5, 5, 21, 3, 7, 1.5, 0
                 )
+                fx = flow[gi_y, gi_x, 0]
+                fy = flow[gi_y, gi_x, 1]
                 # dst = where each sampled source pixel moved to.
-                dst = grid + np.column_stack([
-                    flow[gi_y, gi_x, 0], flow[gi_y, gi_x, 1]
-                ]).astype(np.float32)
+                dst = grid + np.column_stack([fx, fy]).astype(np.float32)
                 cam, coh, resid, pvec = _fit_camera_model(grid, dst, MOTION_RANSAC_PX)
                 camera_raw.append(cam)
                 coherence.append(coh)
                 action_raw.append(resid)
                 params.append(pvec)
+                # Subject-motion centroid: residual flow after removing the global
+                # (camera) median, weighted mean of grid positions.
+                rx = fx - float(np.median(fx))
+                ry = fy - float(np.median(fy))
+                mag = np.hypot(rx, ry)
+                msum = float(mag.sum())
+                if msum > 1e-3:
+                    cx = float((gi_x * mag).sum() / msum) / max(1, w)
+                    cy = float((gi_y * mag).sum() / msum) / max(1, h)
+                    centroids.append((round(clamp01(cx), 3), round(clamp01(cy), 3)))
+                else:
+                    centroids.append((0.5, 0.5))
             prev = frame
     except Exception:
         logger.exception("Motion-dynamics flow pass failed for %s.", video_path)
@@ -268,7 +286,18 @@ def compute_motion_dynamics(
     impacts = local_maxima(action_n, hop_ms, floor, ACTION_MIN_PEAK_GAP_MS)
     action_cut_cost = hit_cost_curve(impacts, duration_ms, hop_ms, ACTION_TOL_MS)
     n = len(action_cut_cost) if action_cut_cost else len(action_n)
-    action_points = [{"ts_ms": t, "kind": "action_impact", "score": 1.0} for t in impacts]
+
+    def _centroid_at(ts_ms: int) -> Tuple[float, float]:
+        if not centroids:
+            return (0.5, 0.5)
+        i = int(round(ts_ms / hop_ms)) if hop_ms else 0
+        return centroids[max(0, min(len(centroids) - 1, i))]
+
+    action_points = [
+        {"ts_ms": t, "kind": "action_impact", "score": 1.0,
+         "centroid": list(_centroid_at(t))}
+        for t in impacts
+    ]
 
     # CAMERA/DISTORTION (avoid channel), gated by motion quality: a smooth,
     # coherent, sustained move stays cheap; only chaos / transients / blur cost.

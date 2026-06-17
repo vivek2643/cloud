@@ -10,9 +10,15 @@
  * both sides and diff) protects against drift — see the backend parity fixture.
  */
 import type {
+  EditAspect,
   EditDocument,
   EditOperation,
   EditSegment,
+  LayerAnchor,
+  LayerFit,
+  LayerMotion,
+  LayerTransform,
+  MotionPoint,
   ResolvedAudioLayer,
   ResolvedTimeline,
   ResolvedVideoLayer,
@@ -133,12 +139,106 @@ function applyLevels(audio: ResolvedAudioLayer[], operations: EditOperation[]): 
  * Mirrors `layers.resolve`. `durations` is optional (file_id -> ms); missing
  * entries skip the split-edit clamp, exactly like the backend.
  */
+const ASPECTS: readonly EditAspect[] = ["landscape", "portrait", "square"];
+const FITS: readonly LayerFit[] = ["cover", "contain"];
+const ANCHORS: readonly LayerAnchor[] = ["center", "left", "right", "top", "bottom"];
+const ROTATIONS = [0, 90, 180, 270] as const;
+
+/** Automatic fit for a delivery aspect — vertical/square FILL, landscape fits.
+ * Mirrors backend `layers.default_fit`. */
+function defaultFit(aspect: EditAspect): LayerFit {
+  return aspect === "portrait" || aspect === "square" ? "cover" : "contain";
+}
+
+const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
+
+function normMotionPoint(p: unknown): MotionPoint | null {
+  if (!p || typeof p !== "object") return null;
+  const o = p as Record<string, unknown>;
+  const scale = Number(o.scale);
+  const cx = Number(o.cx);
+  const cy = Number(o.cy);
+  if (![scale, cx, cy].every(Number.isFinite)) return null;
+  return { scale: Math.max(1, scale), cx: clamp01(cx), cy: clamp01(cy) };
+}
+
+/** Validate + clamp a motion path (drop degenerate/no-move); mirrors
+ * backend `layers.normalize_motion`. */
+function normalizeMotion(motion: LayerMotion | undefined): LayerMotion | null {
+  if (!motion) return null;
+  const from = normMotionPoint(motion.from);
+  const to = normMotionPoint(motion.to);
+  if (!from || !to) return null;
+  const durMs = Math.max(1, Math.trunc(Number(motion.dur_ms) || 0));
+  const ease: "linear" | "smooth" = motion.ease === "smooth" ? "smooth" : "linear";
+  const moves =
+    Math.abs(from.scale - to.scale) > 1e-4 ||
+    Math.abs(from.cx - to.cx) > 1e-4 ||
+    Math.abs(from.cy - to.cy) > 1e-4;
+  if (!moves) return null;
+  return { from, to, ease, dur_ms: durMs };
+}
+
+/** {scale,cx,cy} of a motion path at relMs into the layer; mirrors backend
+ * `layers.sample_motion`. The single shared closed form preview + render use. */
+export function sampleMotion(motion: LayerMotion, relMs: number): MotionPoint {
+  const dur = Math.max(1, Math.trunc(motion.dur_ms || 1));
+  let p = clamp01(relMs / dur);
+  if (motion.ease === "smooth") p = 3 * p * p - 2 * p * p * p;
+  const { from, to } = motion;
+  return {
+    scale: from.scale + (to.scale - from.scale) * p,
+    cx: from.cx + (to.cx - from.cx) * p,
+    cy: from.cy + (to.cy - from.cy) * p,
+  };
+}
+
+/** Deterministic framing solver — faithful port of `layers.solve_transform`. */
+function solveTransform(
+  aspect: EditAspect,
+  formatFit: LayerFit | undefined,
+  override?: LayerTransform
+): LayerTransform {
+  const fit: LayerFit = formatFit && FITS.includes(formatFit) ? formatFit : defaultFit(aspect);
+  const t: LayerTransform = {
+    rotate: 0,
+    fit,
+    anchor: "center",
+    zoom: 1,
+    dest: "full",
+  };
+  if (override) {
+    if (override.rotate != null) {
+      const rot = (((Number(override.rotate) % 360) + 360) % 360) as 0 | 90 | 180 | 270;
+      if (ROTATIONS.includes(rot)) t.rotate = rot;
+    }
+    if (override.fit && FITS.includes(override.fit)) t.fit = override.fit;
+    if (override.anchor && ANCHORS.includes(override.anchor)) t.anchor = override.anchor;
+    if (override.zoom != null && Number.isFinite(Number(override.zoom))) {
+      t.zoom = Math.max(1, Number(override.zoom));
+    }
+    const f = override.focus;
+    if (f && Number.isFinite(Number(f.cx)) && Number.isFinite(Number(f.cy))) {
+      t.focus = {
+        cx: Math.min(1, Math.max(0, Number(f.cx))),
+        cy: Math.min(1, Math.max(0, Number(f.cy))),
+      };
+    }
+    const m = normalizeMotion(override.motion);
+    if (m) t.motion = m;
+  }
+  return t;
+}
+
 export function resolveTimeline(
-  document: Pick<EditDocument, "timeline" | "operations">,
+  document: Pick<EditDocument, "timeline" | "operations" | "format">,
   durations: Durations = {}
 ): ResolvedTimeline {
   const timeline = document.timeline ?? [];
   const operations = document.operations ?? [];
+  const a = document.format?.aspect;
+  const aspect: EditAspect = a && ASPECTS.includes(a) ? a : "landscape";
+  const formatFit = document.format?.fit;
   const { spans, total } = spineSpans(timeline);
 
   const video: ResolvedVideoLayer[] = [];
@@ -159,6 +259,7 @@ export function resolveTimeline(
       opacity: 1,
       kind: "spine",
       op_id: null,
+      transform: solveTransform(aspect, formatFit, seg.transform),
     });
     audio.push({
       layer_id: `a_${seg.seg_id}`,
@@ -191,6 +292,7 @@ export function resolveTimeline(
         opacity: Number(op.opacity ?? 1),
         kind: "coverage",
         op_id: op.op_id,
+        transform: solveTransform(aspect, formatFit, op.transform),
       });
     } else if (op.type === "pick_angle") {
       // Synced multicam angle: re-points the spine PICTURE (a normal cut) just
@@ -207,6 +309,7 @@ export function resolveTimeline(
         opacity: 1,
         kind: "angle",
         op_id: op.op_id,
+        transform: solveTransform(aspect, formatFit, op.transform),
       });
     } else if (op.type === "place_audio") {
       audio.push({
@@ -227,5 +330,5 @@ export function resolveTimeline(
 
   applyLevels(audio, operations);
 
-  return { duration_ms: total, video_layers: video, audio_layers: audio };
+  return { duration_ms: total, video_layers: video, audio_layers: audio, aspect };
 }

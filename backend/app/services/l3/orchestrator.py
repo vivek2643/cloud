@@ -33,6 +33,7 @@ from app.services.l3.content import (
     render_overlap_text,
 )
 from app.services.l3.principles import render_principles_text
+from app.services.l3 import framing
 from app.services.l3.tools import TERMINAL_TOOLS, TOOL_SPECS, EditSession, execute_tool
 from app.services.llm.anthropic_client import AnthropicClient
 from app.services.llm.base import tool_result_block, user_message
@@ -84,7 +85,12 @@ multiple time-ordered regions if it shifts mode (montage hook -> testimonial). B
 multicam, and B-roll are ways material ATTACHES to the spine, not spine kinds.
 
 WORKFLOW (each run):
-1. Interpret the brief -> set_brief. Record every default you assumed in `assumptions`.
+1. Interpret the brief -> set_brief. Record every default you assumed in `assumptions`. \
+Set the delivery ASPECT here: 'portrait' (9:16) for any reel / short / tiktok / story / \
+"vertical" brief, 'square' (1:1) when asked, else 'landscape' (16:9, the default). Infer it \
+from the words in the brief; if the user never said and the platform is ambiguous, this is a \
+genuine fork -- carry landscape as the default but ask_user to confirm. The aspect only changes \
+the output frame shape (the cut itself is the same); the preview + render follow it.
 2. Decide the SPINE -> set_spine (see THE SPINE above). This frames every later choice.
 2b. (optional) set_principles to bias the cut's STYLE -- weighted tendencies the \
 engine honors (favor_speaker, reward_reaction, shot_variety, pace, anti_metronome, \
@@ -113,6 +119,15 @@ Apply your best default, then ask only the genuine forks where the answer would 
 default. Never ask what the footage already answers.
 - When the user replies, apply their answers with minimal disruption: re-cut only affected \
 segments, then finalize again.
+
+FRAMING & ZOOM (reframe is automatic; the zoom MOVE is the user's call):
+- Reframing to the delivery aspect is AUTOMATIC: a vertical/square edit fills the frame and keeps \
+the subject in shot on its own (read_framing shows what it will do). You do not place crops by hand.
+- The one framing choice that is the USER's: how the frame ZOOMS. Once a draft exists, ask_user \
+ONE question -- static (no zoom), punch_in (held tighter), push_in (slow zoom in), or follow (stay \
+tight, track the subject) -- with a feel (snappy / glide). Record the answer via set_brief \
+(motion_style + motion_feel); the framing pass then applies it to every shot. Default to 'static' \
+if the user doesn't care. Do NOT invent zooms without asking.
 
 A/V LAYERS (decoupling video from audio):
 - The spine is the base, coupled layer (each segment's picture + its own audio). On top of it \
@@ -271,6 +286,13 @@ def run_thread(thread_id: str) -> None:
 
         if terminal:
             break
+
+    # Bake the automatic spatial framing focus onto the segments before persisting
+    # so the client preview and the server render read the SAME transform.
+    try:
+        framing.annotate_document(session.document)
+    except Exception:
+        logger.exception("L3: framing annotation failed for %s (continuing)", thread_id)
 
     version = store.save_document(thread_id, session.document)
 

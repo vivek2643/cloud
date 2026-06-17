@@ -255,13 +255,61 @@ export function getL1Log(fileId: string, token: string) {
 
 export type EditThreadStatus = "drafting" | "awaiting_user" | "ready" | "failed";
 
+export type EditAspect = "landscape" | "portrait" | "square";
+
 export interface EditBrief {
   goal?: string;
   target_duration_s?: number;
   tone?: string;
   platform?: string;
+  aspect?: EditAspect;
   constraints?: string[];
   assumptions?: string[];
+}
+
+export type LayerFit = "cover" | "contain";
+export type LayerAnchor = "center" | "left" | "right" | "top" | "bottom";
+
+/** Normalized point (0..1, origin top-left) to keep centered when reframing. */
+export interface LayerFocus {
+  cx: number;
+  cy: number;
+}
+
+export type MotionStyle = "static" | "punch_in" | "push_in" | "follow";
+export type MotionFeel = "snappy" | "glide";
+export type MotionEase = "linear" | "smooth";
+
+export interface MotionPoint {
+  scale: number;
+  cx: number;
+  cy: number;
+}
+
+/** Animated scale+focus over a layer span (from->to, eased); mirrors backend. */
+export interface LayerMotion {
+  from: MotionPoint;
+  to: MotionPoint;
+  ease?: MotionEase;
+  dur_ms: number;
+}
+
+/** Per-layer geometric framing; mirrors backend `layers.solve_transform`. */
+export interface LayerTransform {
+  rotate?: 0 | 90 | 180 | 270;
+  fit?: LayerFit;
+  anchor?: LayerAnchor;
+  zoom?: number;
+  focus?: LayerFocus;
+  motion?: LayerMotion;
+  dest?: "full";
+}
+
+export interface EditFormat {
+  aspect?: EditAspect;
+  fit?: LayerFit;
+  motion_style?: MotionStyle;
+  motion_feel?: MotionFeel;
 }
 
 export interface EditBeat {
@@ -299,6 +347,7 @@ export interface EditSegment {
   cut_in_cost?: number;
   cut_out_cost?: number;
   warnings?: string[];
+  transform?: LayerTransform;
 }
 
 export interface EditQuestion {
@@ -342,6 +391,7 @@ export interface EditOperation {
   layout?: string;
   z?: number;
   opacity?: number;
+  transform?: LayerTransform;
   // place_audio
   role?: string;
   audio_kind?: string;
@@ -367,6 +417,7 @@ export interface ResolvedVideoLayer {
   opacity: number;
   kind: string;
   op_id?: string | null;
+  transform?: LayerTransform;
 }
 
 export interface ResolvedAudioLayer {
@@ -387,10 +438,12 @@ export interface ResolvedTimeline {
   duration_ms: number;
   video_layers: ResolvedVideoLayer[];
   audio_layers: ResolvedAudioLayer[];
+  aspect?: EditAspect;
 }
 
 export interface EditDocument {
   brief?: EditBrief;
+  format?: EditFormat;
   spine?: EditSpine | null;
   operations?: EditOperation[];
   resolved?: ResolvedTimeline | null;

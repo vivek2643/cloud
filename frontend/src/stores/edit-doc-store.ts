@@ -8,8 +8,13 @@
  * version re-seeds the baseline.
  */
 import { create } from "zustand";
-import type { EditDocument, EditOperation, EditSegment } from "@/lib/api";
+import type { EditAspect, EditDocument, EditOperation, EditSegment } from "@/lib/api";
 import type { Durations } from "@/lib/resolve-timeline";
+
+function docAspect(doc: EditDocument | null): EditAspect {
+  const a = doc?.format?.aspect ?? doc?.brief?.aspect;
+  return a === "portrait" || a === "square" ? a : "landscape";
+}
 
 const MIN_SEG_MS = 200;
 
@@ -41,6 +46,8 @@ interface EditDocState {
   timeline: EditSegment[];
   operations: EditOperation[];
   durations: Durations;
+  /** Delivery frame shape for the preview/render (from the document format). */
+  aspect: EditAspect;
   selected: string | null;
 
   /** Seed/replace baseline + working state from an authoritative document. */
@@ -74,6 +81,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
   timeline: [],
   operations: [],
   durations: {},
+  aspect: "landscape",
   selected: null,
 
   seed: (threadId, version, doc) => {
@@ -86,6 +94,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       baselineOperations: operations,
       timeline: timeline.map((s) => ({ ...s })),
       operations: operations.map((o) => ({ ...o })),
+      aspect: docAspect(doc),
       selected: null,
     });
   },
@@ -99,6 +108,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       baselineOperations: operations,
       timeline: timeline.map((s) => ({ ...s })),
       operations: operations.map((o) => ({ ...o })),
+      aspect: docAspect(doc),
     });
   },
 

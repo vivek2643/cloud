@@ -30,7 +30,10 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
-SCHEMA_VERSION = 1
+# v2 adds coarse spatial framing signals (subject `region`s + clip
+# `frame_orientation`) used by the editor's auto-reframe/crop. Older v1 rows
+# simply lack them and fall back to centered framing.
+SCHEMA_VERSION = 2
 
 
 # --------------------------------------------------------------------------
@@ -154,6 +157,27 @@ class GazeDirection(str, Enum):
     unsure = "unsure"
 
 
+class FrameOrientation(str, Enum):
+    """How the footage must be ROTATED to sit upright. `upright` is the norm;
+    the others flag footage shot sideways/upside-down whose rotation metadata is
+    missing or wrong, so the editor can correct it (orthogonal only)."""
+    upright = "upright"
+    rotate_cw90 = "rotate_cw90"     # rotate 90 clockwise to make upright
+    rotate_ccw90 = "rotate_ccw90"   # rotate 90 counter-clockwise
+    rotate_180 = "rotate_180"
+
+
+class Region(BaseModel):
+    """Coarse normalized location of a subject in the frame (origin top-left,
+    0..1 of width/height). Approximate is fine -- a loose box around the
+    head/subject, NOT a tight detection. The editor uses the box CENTER to keep
+    the subject in frame when reframing to another aspect (e.g. a 9:16 reel)."""
+    x: float = Field(ge=0.0, le=1.0, description="left edge, fraction of width")
+    y: float = Field(ge=0.0, le=1.0, description="top edge, fraction of height")
+    w: float = Field(ge=0.0, le=1.0, description="width, fraction of frame width")
+    h: float = Field(ge=0.0, le=1.0, description="height, fraction of frame height")
+
+
 class GraphicKind(str, Enum):
     on_screen_text = "on_screen_text"
     caption = "caption"
@@ -259,6 +283,9 @@ class Person(BaseModel):
     enters_ms: Optional[int] = None
     exits_ms: Optional[int] = None
     best_face_ms: Optional[int] = Field(None, description="timestamp of the clearest, most front-on look at the face")
+    frame_region: Optional[Region] = Field(
+        None, description="where this person typically sits in the frame (coarse box around their head/torso); used to keep them in frame when reframing"
+    )
     screen_time_note: Optional[str] = None
     # NOTE: filled in post-hoc by audio/visual fusion against L1 diarization.
     # The model should leave this null.
@@ -282,6 +309,9 @@ class Event(BaseModel):
     target: Optional[str] = Field(None, description="person local_id or object name the action is directed at")
     change: Optional[EventChange] = None
     interaction_id: Optional[str] = Field(None, description="links the per-actor events of one shared moment")
+    region: Optional[Region] = Field(
+        None, description="where in the frame this beat happens (coarse box); used to reframe onto the action"
+    )
 
 
 class Interaction(BaseModel):
@@ -319,6 +349,9 @@ class SpeakingSpan(BaseModel):
     start_ms: int
     end_ms: int
     subject: str = Field(description="person local_id who is visibly speaking")
+    region: Optional[Region] = Field(
+        None, description="where the speaker is in the frame while speaking (coarse box around their head); used to keep them in frame when reframing"
+    )
 
 
 class EnvironmentEvent(BaseModel):
@@ -411,6 +444,9 @@ class RestartMarker(BaseModel):
 class ClipPerception(BaseModel):
     schema_version: int = SCHEMA_VERSION
     content_type: Optional[ContentType] = None
+    frame_orientation: Optional[FrameOrientation] = Field(
+        None, description="how the footage must be rotated to sit upright (almost always 'upright'); flag sideways/flipped footage so the editor can correct it"
+    )
     logline: Optional[str] = Field(None, description="one sentence: what this clip is and what happens in it")
     synopsis: Optional[str] = Field(None, description="a short chronological paragraph describing the take start to finish")
     topics: List[str] = Field(default_factory=list)

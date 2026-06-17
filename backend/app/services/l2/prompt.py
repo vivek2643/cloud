@@ -34,6 +34,18 @@ Log the clip the way a professional footage logger would:
     reactions (and what triggered them), gaze/eyeline direction, when a visible
     person is actually speaking (emit a `speaking` span per person each time
     their mouth is clearly moving in speech), reveals/setups, and on-screen text.
+  * Locate subjects in the frame so the editor can REFRAME (e.g. crop a wide
+    landscape take to a 9:16 reel) without cutting the subject off. Give a COARSE
+    normalized `region` (origin top-left, 0..1 of width/height) -- a loose box
+    around the head/torso, not a tight detection:
+      - on each `speaking` span, where the speaker is while speaking;
+      - on `events`, where that beat happens;
+      - on each person, a representative `frame_region` for where they sit.
+    A person who fills the frame is roughly {x:0,y:0,w:1,h:1}; someone on the
+    right third is around {x:0.6,y:0.2,w:0.35,h:0.7}. Approximate is fine.
+  * Set `frame_orientation`: almost always "upright". Only flag rotate_cw90 /
+    rotate_ccw90 / rotate_180 if the footage was genuinely shot sideways or
+    upside-down (it reads rotated and would need turning to sit level).
 
 TAKE SELECTION (so an editor can later pick the best version of a moment):
   * Segment the clip into `content_units` -- spans that each deliver ONE unit

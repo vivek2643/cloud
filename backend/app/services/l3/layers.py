@@ -38,6 +38,185 @@ ROLE_MUSIC = "music"
 ROLE_SFX = "sfx"
 AUDIO_ROLES = (ROLE_DIALOGUE, ROLE_MUSIC, ROLE_SFX)
 
+# Output FRAME shape (delivery format). The spine/operations are shape-agnostic;
+# aspect only changes the canvas the resolved layers are painted onto, so the
+# same edit can deliver landscape, vertical (reel/short), or square.
+ASPECT_LANDSCAPE = "landscape"   # 16:9
+ASPECT_PORTRAIT = "portrait"     # 9:16 (reels / shorts / tiktok)
+ASPECT_SQUARE = "square"         # 1:1
+ASPECTS = (ASPECT_LANDSCAPE, ASPECT_PORTRAIT, ASPECT_SQUARE)
+DEFAULT_ASPECT = ASPECT_LANDSCAPE
+
+
+def aspect_of(document: dict) -> str:
+    """The delivery aspect declared on the document (default landscape)."""
+    fmt = document.get("format") or {}
+    a = (fmt.get("aspect") if isinstance(fmt, dict) else None) or DEFAULT_ASPECT
+    return a if a in ASPECTS else DEFAULT_ASPECT
+
+
+# --------------------------------------------------------------------------
+# Per-layer geometric transform (framing) -- Phase 1
+# --------------------------------------------------------------------------
+#
+# Every video layer carries a TRANSFORM that says how its source pixels are
+# framed onto the canvas, in one fixed order of operations (identical in ffmpeg
+# and the CSS preview, so what you preview is what you render):
+#
+#     rotate (orthogonal) -> fit into the canvas (cover/contain) -> zoom-crop
+#     -> place into `dest` (always the full canvas for now) -> composite by z.
+#
+# The numbers are produced by a deterministic SOLVER (`solve_transform`), never
+# by the model: the model/document declares INTENT (delivery aspect, an explicit
+# fit, or -- later -- a focus/zoom), and the solver turns that into the rectangle.
+# Phase 1 uses only the delivery aspect: vertical/square deliveries FILL the
+# frame (cover, centered) instead of letterboxing; landscape stays contain so
+# existing edits are byte-identical. The focus-anchored crop and animated zoom
+# arrive in Phases 2-3 and only enrich this same struct.
+
+ROTATIONS = (0, 90, 180, 270)
+FIT_COVER = "cover"        # fill the canvas, crop the overflow
+FIT_CONTAIN = "contain"    # fit inside the canvas, letterbox the remainder
+FITS = (FIT_COVER, FIT_CONTAIN)
+ANCHORS = ("center", "left", "right", "top", "bottom")
+DEST_FULL = "full"         # whole canvas; sub-rects (split/PiP) are deferred
+
+DEFAULT_ROTATE = 0
+DEFAULT_ANCHOR = "center"
+DEFAULT_ZOOM = 1.0
+
+# Phase 3 -- animated motion. A `motion` path makes scale + focus VARY over the
+# layer's program span (push-in, pull-out, follow). It is a from->to move (two
+# endpoints) eased over `dur_ms`; both renderers evaluate the SAME closed form
+# `sample_motion`, so the preview and the render animate identically. A static
+# zoom/focus (Phase 1-2) is the degenerate from==to case and needs no motion.
+EASE_LINEAR = "linear"
+EASE_SMOOTH = "smooth"     # smoothstep 3p^2-2p^3 ("glide")
+EASES = (EASE_LINEAR, EASE_SMOOTH)
+
+
+def _clamp01f(v: float) -> float:
+    return 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
+
+
+def _norm_motion_point(p: dict) -> Optional[dict]:
+    try:
+        return {
+            "scale": max(1.0, float(p["scale"])),
+            "cx": _clamp01f(float(p["cx"])),
+            "cy": _clamp01f(float(p["cy"])),
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def normalize_motion(motion: Optional[dict]) -> Optional[dict]:
+    """Validate + clamp a motion path, or None if malformed/degenerate.
+    A motion that doesn't actually move (from == to) is dropped -- it collapses
+    to the static zoom/focus the rest of the transform already carries."""
+    if not isinstance(motion, dict):
+        return None
+    fr = _norm_motion_point(motion.get("from") or {})
+    to = _norm_motion_point(motion.get("to") or {})
+    if fr is None or to is None:
+        return None
+    ease = motion.get("ease") if motion.get("ease") in EASES else EASE_LINEAR
+    try:
+        dur_ms = max(1, int(motion.get("dur_ms") or 0))
+    except (TypeError, ValueError):
+        return None
+    moves = (abs(fr["scale"] - to["scale"]) > 1e-4
+             or abs(fr["cx"] - to["cx"]) > 1e-4
+             or abs(fr["cy"] - to["cy"]) > 1e-4)
+    if not moves:
+        return None
+    return {"from": fr, "to": to, "ease": ease, "dur_ms": dur_ms}
+
+
+def sample_motion(motion: dict, rel_ms: float) -> dict:
+    """The {scale, cx, cy} of a motion path at `rel_ms` into the layer (the
+    single source of truth both renderers evaluate). Linear or smoothstep ease."""
+    dur = max(1, int(motion.get("dur_ms") or 1))
+    p = _clamp01f(rel_ms / dur)
+    if motion.get("ease") == EASE_SMOOTH:
+        p = 3.0 * p * p - 2.0 * p * p * p
+    fr, to = motion["from"], motion["to"]
+    return {
+        "scale": fr["scale"] + (to["scale"] - fr["scale"]) * p,
+        "cx": fr["cx"] + (to["cx"] - fr["cx"]) * p,
+        "cy": fr["cy"] + (to["cy"] - fr["cy"]) * p,
+    }
+
+
+def default_fit(aspect: str) -> str:
+    """The automatic fit for a delivery aspect: vertical/square FILL the frame,
+    landscape keeps the safe letterbox (no regression on existing edits)."""
+    return FIT_COVER if aspect in (ASPECT_PORTRAIT, ASPECT_SQUARE) else FIT_CONTAIN
+
+
+def identity_transform(aspect: str = DEFAULT_ASPECT) -> dict:
+    return {
+        "rotate": DEFAULT_ROTATE,
+        "fit": default_fit(aspect),
+        "anchor": DEFAULT_ANCHOR,
+        "zoom": DEFAULT_ZOOM,
+        "dest": DEST_FULL,
+    }
+
+
+def _clamp_rotate(v) -> int:
+    try:
+        r = int(v) % 360
+    except (TypeError, ValueError):
+        return DEFAULT_ROTATE
+    return r if r in ROTATIONS else DEFAULT_ROTATE
+
+
+def solve_transform(document: dict, override: Optional[dict] = None) -> dict:
+    """Deterministic framing solver (Phase 1).
+
+    Resolves the layer's transform from the delivery aspect plus an optional
+    explicit `override` (a partial transform an operation/segment may carry, e.g.
+    a creative rotate or a static zoom). No perception or model logic -- a pure
+    function so the frontend resolver can mirror it exactly.
+    """
+    aspect = aspect_of(document)
+    fmt = document.get("format") or {}
+    fit = fmt.get("fit") if isinstance(fmt, dict) else None
+    if fit not in FITS:
+        fit = default_fit(aspect)
+    t = {
+        "rotate": DEFAULT_ROTATE,
+        "fit": fit,
+        "anchor": DEFAULT_ANCHOR,
+        "zoom": DEFAULT_ZOOM,
+        "dest": DEST_FULL,
+    }
+    if override:
+        if "rotate" in override:
+            t["rotate"] = _clamp_rotate(override.get("rotate"))
+        if override.get("fit") in FITS:
+            t["fit"] = override["fit"]
+        if override.get("anchor") in ANCHORS:
+            t["anchor"] = override["anchor"]
+        if override.get("zoom") is not None:
+            try:
+                t["zoom"] = max(1.0, float(override["zoom"]))
+            except (TypeError, ValueError):
+                pass
+        focus = override.get("focus")
+        if isinstance(focus, dict):
+            try:
+                cx = min(1.0, max(0.0, float(focus["cx"])))
+                cy = min(1.0, max(0.0, float(focus["cy"])))
+                t["focus"] = {"cx": round(cx, 4), "cy": round(cy, 4)}
+            except (KeyError, TypeError, ValueError):
+                pass
+        motion = normalize_motion(override.get("motion"))
+        if motion is not None:
+            t["motion"] = motion
+    return t
+
 
 # --------------------------------------------------------------------------
 # Resolved layer records (the output of resolution)
@@ -56,6 +235,8 @@ class VideoLayer:
     opacity: float = 1.0
     kind: str = "spine"          # spine | coverage
     op_id: Optional[str] = None  # operation that produced it (None = spine)
+    # Geometric framing (rotate/fit/anchor/zoom/dest); see solve_transform.
+    transform: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -70,6 +251,7 @@ class VideoLayer:
             "opacity": self.opacity,
             "kind": self.kind,
             "op_id": self.op_id,
+            "transform": self.transform or {},
         }
 
 
@@ -110,6 +292,7 @@ class ResolvedTimeline:
     duration_ms: int
     video_layers: List[VideoLayer] = field(default_factory=list)
     audio_layers: List[AudioLayer] = field(default_factory=list)
+    aspect: str = DEFAULT_ASPECT   # delivery frame shape; render + preview read it
 
     def video_at(self, ms: int) -> Optional[VideoLayer]:
         """The picture shown at `ms`: the highest-z full-frame opaque layer
@@ -130,6 +313,7 @@ class ResolvedTimeline:
             "duration_ms": self.duration_ms,
             "video_layers": [v.to_dict() for v in self.video_layers],
             "audio_layers": [a.to_dict() for a in self.audio_layers],
+            "aspect": self.aspect,
         }
 
 
@@ -245,6 +429,7 @@ def resolve(document: dict, durations: Optional[Dict[str, int]] = None) -> Resol
             src_in_ms=int(seg["in_ms"]), src_out_ms=int(seg["out_ms"]),
             prog_start_ms=s.prog_start_ms, prog_end_ms=s.prog_end_ms,
             z=Z_SPINE_VIDEO, kind="spine",
+            transform=solve_transform(document, seg.get("transform")),
         ))
         audio.append(AudioLayer(
             layer_id=f"a_{seg['seg_id']}",
@@ -271,6 +456,7 @@ def resolve(document: dict, durations: Optional[Dict[str, int]] = None) -> Resol
                 layout=op.get("layout", DEFAULT_LAYOUT),
                 opacity=float(op.get("opacity", 1.0)),
                 kind="coverage", op_id=op["op_id"],
+                transform=solve_transform(document, op.get("transform")),
             ))
         elif t == "pick_angle":
             # A synced multicam angle re-points the SPINE picture (a normal cut),
@@ -284,6 +470,7 @@ def resolve(document: dict, durations: Optional[Dict[str, int]] = None) -> Resol
                 z=int(op.get("z", Z_ANGLE)),
                 layout=op.get("layout", DEFAULT_LAYOUT),
                 opacity=1.0, kind="angle", op_id=op["op_id"],
+                transform=solve_transform(document, op.get("transform")),
             ))
         elif t == "place_audio":
             audio.append(AudioLayer(
@@ -299,7 +486,10 @@ def resolve(document: dict, durations: Optional[Dict[str, int]] = None) -> Resol
     # --- ducking + level automation: dialogue presence ducks beds ---
     _apply_levels(audio, operations)
 
-    return ResolvedTimeline(duration_ms=total, video_layers=video, audio_layers=audio)
+    return ResolvedTimeline(
+        duration_ms=total, video_layers=video, audio_layers=audio,
+        aspect=aspect_of(document),
+    )
 
 
 def _overlaps(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:

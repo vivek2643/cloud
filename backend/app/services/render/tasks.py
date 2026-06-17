@@ -48,6 +48,9 @@ def resolve_document(document: Dict[str, Any]) -> Dict[str, Any]:
     persisted; otherwise recompute deterministically from spine + operations."""
     res = document.get("resolved")
     if isinstance(res, dict) and (res.get("video_layers") or res.get("audio_layers")):
+        # Snapshots predating the format field carry no aspect; backfill it from
+        # the document so the render uses the declared delivery shape.
+        res.setdefault("aspect", layers.aspect_of(document))
         return res
     fids = list({s["file_id"] for s in (document.get("timeline") or [])})
     return layers.resolve(document, _durations(fids)).to_dict()

@@ -39,18 +39,49 @@ logger = logging.getLogger(__name__)
 CACHE_ROOT = os.environ.get("EDSO_RENDER_CACHE", "/tmp/edso_render_cache")
 RENDER_PREFIX = "renders"
 
+# `long_edge` is the quality tier; the actual W x H is derived from the edit's
+# delivery aspect so the SAME preset renders landscape, portrait, or square.
 PRESETS: Dict[str, Dict[str, Any]] = {
     "preview": {
-        "width": 1280, "height": 720, "fps": 30,
+        "long_edge": 1280, "fps": 30,
         "video_codec": "libx264", "video_preset": "veryfast", "video_crf": 24,
         "audio_codec": "aac", "audio_bitrate": "128k", "use_proxy": True,
     },
     "export": {
-        "width": 1920, "height": 1080, "fps": 30,
+        "long_edge": 1920, "fps": 30,
         "video_codec": "libx264", "video_preset": "medium", "video_crf": 20,
         "audio_codec": "aac", "audio_bitrate": "192k", "use_proxy": False,
     },
 }
+
+# Delivery aspect -> (w_ratio, h_ratio). The long edge maps to the larger ratio
+# component, so the frame is exactly the requested shape at the preset quality.
+ASPECT_RATIOS: Dict[str, Tuple[int, int]] = {
+    "landscape": (16, 9),
+    "portrait": (9, 16),
+    "square": (1, 1),
+}
+
+
+def _even(n: int) -> int:
+    """yuv420p needs even dimensions."""
+    n = int(round(n))
+    return n - (n % 2)
+
+
+def canvas_dims(long_edge: int, aspect: str) -> Tuple[int, int]:
+    """(width, height) for `aspect` at the given long edge (default landscape)."""
+    rw, rh = ASPECT_RATIOS.get(aspect, ASPECT_RATIOS["landscape"])
+    if rw >= rh:  # landscape / square: width is the long edge
+        return _even(long_edge), _even(long_edge * rh / rw)
+    return _even(long_edge * rw / rh), _even(long_edge)  # portrait: height is long
+
+
+def _cfg_for(preset: str, aspect: str) -> Dict[str, Any]:
+    """Concrete render config: the preset's quality tier sized to `aspect`."""
+    base = PRESETS[preset]
+    w, h = canvas_dims(int(base["long_edge"]), aspect)
+    return {**base, "width": w, "height": h}
 
 ProgressCb = Optional[Callable[[int, str], None]]
 
@@ -82,7 +113,8 @@ def render_resolved(
     """Render `resolved` to MP4, upload to R2, return (output_r2_key, duration_ms)."""
     if preset not in PRESETS:
         raise ValueError(f"Unknown preset {preset!r}; known: {list(PRESETS)}")
-    cfg = PRESETS[preset]
+    aspect = str(resolved.get("aspect") or "landscape")
+    cfg = _cfg_for(preset, aspect)
     os.makedirs(CACHE_ROOT, exist_ok=True)
 
     video = sorted(resolved.get("video_layers") or [], key=lambda v: (v["prog_start_ms"], v["z"]))
@@ -158,11 +190,13 @@ def _render_spine_concat(
         if entry is None:
             raise RuntimeError(f"no FileEntry for {v['source_file_id']}")
         in_ms, out_ms = int(v["src_in_ms"]), int(v["src_out_ms"])
-        cache_path = _segment_cache_path(v["source_file_id"], in_ms, out_ms, cfg)
+        transform = v.get("transform") or {}
+        cache_path = _segment_cache_path(v["source_file_id"], in_ms, out_ms, cfg, transform)
         if not (os.path.exists(cache_path) and os.path.getsize(cache_path) > 0):
             src = _source_path(entry, cfg, tmp, src_cache)
             report(_pct(i, n, 8, 78), f"cut {i + 1}/{n}")
-            _produce_segment(src=src, dst=cache_path, in_ms=in_ms, out_ms=out_ms, cfg=cfg)
+            _produce_segment(src=src, dst=cache_path, in_ms=in_ms, out_ms=out_ms,
+                             cfg=cfg, transform=transform)
         else:
             report(_pct(i, n, 8, 78), f"cut {i + 1}/{n} (cache)")
         segments.append(cache_path)
@@ -176,28 +210,171 @@ def _render_spine_concat(
     return out_key
 
 
-def _segment_cache_path(file_id: str, in_ms: int, out_ms: int, cfg: Dict[str, Any]) -> str:
+def _transform_key(transform: Optional[Dict[str, Any]]) -> str:
+    """Stable cache token for a layer transform; identity collapses to '' so
+    untouched (letterbox) segments keep their existing cache entries."""
+    t = transform or {}
+    rotate = int(t.get("rotate") or 0)
+    fit = t.get("fit") or "contain"
+    anchor = t.get("anchor") or "center"
+    try:
+        zoom = round(max(1.0, float(t.get("zoom") or 1.0)), 4)
+    except (TypeError, ValueError):
+        zoom = 1.0
+    focus = t.get("focus") if isinstance(t.get("focus"), dict) else None
+    motion = t.get("motion") if isinstance(t.get("motion"), dict) else None
+    if (rotate == 0 and fit == "contain" and anchor == "center"
+            and zoom == 1.0 and not focus and not motion):
+        return ""
+    fkey = ""
+    if focus:
+        try:
+            fkey = f"|f{float(focus['cx']):.4f},{float(focus['cy']):.4f}"
+        except (KeyError, TypeError, ValueError):
+            fkey = ""
+    mkey = ""
+    if motion:
+        try:
+            fr, to = motion["from"], motion["to"]
+            mkey = (f"|m{fr['scale']:.3f},{fr['cx']:.3f},{fr['cy']:.3f}"
+                    f">{to['scale']:.3f},{to['cx']:.3f},{to['cy']:.3f}"
+                    f":{motion.get('ease', 'linear')}:{int(motion.get('dur_ms') or 0)}")
+        except (KeyError, TypeError, ValueError):
+            mkey = ""
+    return f"r{rotate}|{fit}|{anchor}|z{zoom}{fkey}{mkey}"
+
+
+def _segment_cache_path(
+    file_id: str, in_ms: int, out_ms: int, cfg: Dict[str, Any],
+    transform: Optional[Dict[str, Any]] = None,
+) -> str:
     key = f"{file_id}|{in_ms}|{out_ms}|{cfg['width']}x{cfg['height']}|{cfg['fps']}|{cfg['video_crf']}"
+    tk = _transform_key(transform)
+    if tk:
+        key += f"|{tk}"
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
     return os.path.join(CACHE_ROOT, f"{digest}.mp4")
 
 
+def _transpose_chain(rotate: int) -> List[str]:
+    """Orthogonal rotation via ffmpeg `transpose` (1 = 90 CW, 2 = 90 CCW)."""
+    if rotate == 90:
+        return ["transpose=1"]
+    if rotate == 270:
+        return ["transpose=2"]
+    if rotate == 180:
+        return ["transpose=1", "transpose=1"]
+    return []
+
+
+def _crop_to(w: int, h: int, anchor: str, focus: Optional[Dict[str, Any]] = None) -> str:
+    """Crop a (>= w x h) frame down to w x h. When `focus` (normalized cx,cy) is
+    given, center the crop window on it (clamped into the frame); otherwise bias
+    to `anchor` (else center). The focus offset is an ffmpeg expression over the
+    post-scale dims (iw/ih), with commas escaped + single-quoted so the
+    filtergraph parser keeps it as one argument."""
+    if focus and "cx" in focus and "cy" in focus:
+        cx = max(0.0, min(1.0, float(focus["cx"])))
+        cy = max(0.0, min(1.0, float(focus["cy"])))
+        x = f"'min(max(0\\,{cx:.4f}*iw-{w // 2})\\,iw-{w})'"
+        y = f"'min(max(0\\,{cy:.4f}*ih-{h // 2})\\,ih-{h})'"
+        return f"crop={w}:{h}:{x}:{y}"
+    if anchor == "left":
+        x = "0"
+    elif anchor == "right":
+        x = f"iw-{w}"
+    else:
+        x = f"(iw-{w})/2"
+    if anchor == "top":
+        y = "0"
+    elif anchor == "bottom":
+        y = f"ih-{h}"
+    else:
+        y = f"(ih-{h})/2"
+    return f"crop={w}:{h}:{x}:{y}"
+
+
+def _ease_expr(motion: Dict[str, Any], fps: int) -> str:
+    """Eased progress 0..1 over the layer span, as an ffmpeg expr in `on`
+    (output frame index). Matches layers.sample_motion."""
+    dur_s = max(0.05, float(motion.get("dur_ms") or 50) / 1000.0)
+    p = f"min(1\\,on/({fps}*{dur_s:.3f}))"
+    if motion.get("ease") == "smooth":
+        return f"(3*({p})*({p})-2*({p})*({p})*({p}))"
+    return f"({p})"
+
+
+def _zoompan(motion: Dict[str, Any], w: int, h: int, fps: int) -> str:
+    """Animate scale + focus over a cover-filled w x h base via `zoompan`,
+    evaluating the SAME from->to eased path as layers.sample_motion. The zoom
+    window is centered on the (animated) focus and clamped into the frame."""
+    fr, to = motion["from"], motion["to"]
+    pe = _ease_expr(motion, fps)
+    z = f"({fr['scale']:.4f}+({to['scale'] - fr['scale']:.4f})*{pe})"
+    cx = f"({fr['cx']:.4f}+({to['cx'] - fr['cx']:.4f})*{pe})"
+    cy = f"({fr['cy']:.4f}+({to['cy'] - fr['cy']:.4f})*{pe})"
+    zmax = max(fr["scale"], to["scale"])
+    zexpr = f"max(1\\,min({zmax:.4f}\\,{z}))"
+    xexpr = f"max(0\\,min(iw-iw/zoom\\,({cx})*iw-(iw/zoom)/2))"
+    yexpr = f"max(0\\,min(ih-ih/zoom\\,({cy})*ih-(ih/zoom)/2))"
+    return f"zoompan=z='{zexpr}':x='{xexpr}':y='{yexpr}':d=1:s={w}x{h}:fps={fps}"
+
+
+def _transform_vf(cfg: Dict[str, Any], transform: Optional[Dict[str, Any]] = None) -> str:
+    """Filter chain that frames a source onto the canvas for ONE video layer,
+    in the canonical order rotate -> fit -> zoom-crop. An empty/None transform
+    is the identity (contain, no rotate, no zoom) -- byte-identical to the old
+    normalize so untouched edits keep their warm segment cache."""
+    W, H, FPS = cfg["width"], cfg["height"], cfg["fps"]
+    t = transform or {}
+    rotate = int(t.get("rotate") or 0)
+    fit = t.get("fit") or "contain"
+    anchor = t.get("anchor") or "center"
+    focus = t.get("focus") if isinstance(t.get("focus"), dict) else None
+    motion = t.get("motion") if isinstance(t.get("motion"), dict) else None
+    try:
+        zoom = max(1.0, float(t.get("zoom") or 1.0))
+    except (TypeError, ValueError):
+        zoom = 1.0
+
+    parts: List[str] = _transpose_chain(rotate)
+    if motion:
+        # Animated push-in / follow: fill a centered cover base (room to zoom +
+        # pan), then let zoompan drive scale + focus. The motion path subsumes
+        # any static zoom/focus, so they're not applied here.
+        parts.append(f"scale=w={W}:h={H}:force_original_aspect_ratio=increase")
+        parts.append(_crop_to(W, H, "center", None))
+        parts.append(_zoompan(motion, W, H, FPS))
+    else:
+        if fit == "cover":
+            parts.append(f"scale=w={W}:h={H}:force_original_aspect_ratio=increase")
+            parts.append(_crop_to(W, H, anchor, focus))
+        else:  # contain (letterbox) -- the historical default
+            parts.append(f"scale=w={W}:h={H}:force_original_aspect_ratio=decrease")
+            parts.append(f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black")
+        if zoom > 1.0001:
+            parts.append(f"scale=w={_even(W * zoom)}:h={_even(H * zoom)}")
+            parts.append(_crop_to(W, H, anchor, focus))
+    parts.append("setsar=1")
+    parts.append(f"fps={FPS}")
+    return ",".join(parts)
+
+
 def _vf_normalize(cfg: Dict[str, Any]) -> str:
-    return (
-        f"scale=w={cfg['width']}:h={cfg['height']}:force_original_aspect_ratio=decrease,"
-        f"pad={cfg['width']}:{cfg['height']}:(ow-iw)/2:(oh-ih)/2:color=black,"
-        f"setsar=1,fps={cfg['fps']}"
-    )
+    return _transform_vf(cfg, None)
 
 
-def _produce_segment(*, src: str, dst: str, in_ms: int, out_ms: int, cfg: Dict[str, Any]) -> None:
+def _produce_segment(
+    *, src: str, dst: str, in_ms: int, out_ms: int, cfg: Dict[str, Any],
+    transform: Optional[Dict[str, Any]] = None,
+) -> None:
     in_s = max(in_ms / 1000.0, 0.0)
     dur_s = max((out_ms - in_ms) / 1000.0, 0.05)
     tmp_path = dst.replace(".mp4", ".part.mp4")
     cmd = [
         "ffmpeg", "-y",
         "-ss", f"{in_s:.3f}", "-i", src, "-t", f"{dur_s:.3f}",
-        "-vf", _vf_normalize(cfg),
+        "-vf", _transform_vf(cfg, transform),
         "-c:v", cfg["video_codec"], "-preset", cfg["video_preset"], "-crf", str(cfg["video_crf"]),
         "-pix_fmt", "yuv420p",
         "-c:a", cfg["audio_codec"], "-b:a", cfg["audio_bitrate"], "-ar", "48000", "-ac", "2",
@@ -268,7 +445,7 @@ def _render_layers(
         opacity = float(v.get("opacity", 1.0))
         chain = (
             f"[{idx}:v]trim=start={in_s:.3f}:end={out_s:.3f},setpts=PTS-STARTPTS,"
-            f"{_vf_normalize(cfg)},format=yuva420p"
+            f"{_transform_vf(cfg, v.get('transform'))},format=yuva420p"
         )
         if opacity < 0.999:
             chain += f",colorchannelmixer=aa={max(0.0, min(1.0, opacity)):.3f}"

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   Play,
   Pause,
@@ -13,7 +13,7 @@ import {
   Music,
 } from "lucide-react";
 import { getFile, getFilePlaybackUrl, type ResolvedTimeline } from "@/lib/api";
-import { resolveTimeline } from "@/lib/resolve-timeline";
+import { resolveTimeline, sampleMotion } from "@/lib/resolve-timeline";
 import { useEditDocStore } from "@/stores/edit-doc-store";
 import { useAudioMixer } from "./use-audio-mixer";
 import { useVideoPicture } from "./use-video-picture";
@@ -33,12 +33,20 @@ export function CompositePreview({ token }: { token: string | undefined }) {
   const timeline = useEditDocStore((s) => s.timeline);
   const operations = useEditDocStore((s) => s.operations);
   const durations = useEditDocStore((s) => s.durations);
+  const aspect = useEditDocStore((s) => s.aspect);
   const mergeDurations = useEditDocStore((s) => s.mergeDurations);
 
   const resolved: ResolvedTimeline | null = useMemo(
-    () => (timeline.length ? resolveTimeline({ timeline, operations }, durations) : null),
-    [timeline, operations, durations]
+    () =>
+      timeline.length
+        ? resolveTimeline({ timeline, operations, format: { aspect } }, durations)
+        : null,
+    [timeline, operations, durations, aspect]
   );
+
+  // Frame box ratio for the program monitor, matching the delivery aspect.
+  const frameRatio =
+    aspect === "portrait" ? "9 / 16" : aspect === "square" ? "1 / 1" : "16 / 9";
 
   const [urls, setUrls] = useState<Record<string, string>>({});
   const [playing, setPlaying] = useState(false);
@@ -222,25 +230,76 @@ export function CompositePreview({ token }: { token: string | undefined }) {
       ).length
     : 0;
 
+  // CSS framing for the visible picture, mirroring the render's transform chain
+  // (rotate -> fit -> zoom). cover/contain + anchor are exact; rotate/zoom are
+  // best-effort (the automatic Phase-1 path emits neither).
+  const videoStyle: CSSProperties = useMemo(() => {
+    const t = activeVideo?.transform;
+    // Motion (push-in/follow) fills a cover base; show a stable REPRESENTATIVE
+    // frame (the path's midpoint) so the preview indicates the zoom/track. The
+    // render animates the full path frame-by-frame (it is authoritative).
+    const mid = t?.motion ? sampleMotion(t.motion, t.motion.dur_ms / 2) : null;
+    const fit = mid ? "cover" : t?.fit ?? (aspect === "landscape" ? "contain" : "cover");
+    const anchor = t?.anchor ?? "center";
+    const focusPoint = mid ? { cx: mid.cx, cy: mid.cy } : t?.focus ?? null;
+    // A focus point wins over the anchor enum: place it via object-position so
+    // cover-crop keeps the subject in frame. This is the CSS approximation of the
+    // render's focus-centered crop (the render is authoritative).
+    let objectPosition: string;
+    if (focusPoint) {
+      const px = Math.round(Math.min(1, Math.max(0, focusPoint.cx)) * 100);
+      const py = Math.round(Math.min(1, Math.max(0, focusPoint.cy)) * 100);
+      objectPosition = `${px}% ${py}%`;
+    } else {
+      objectPosition =
+        anchor === "left"
+          ? "left center"
+          : anchor === "right"
+            ? "right center"
+            : anchor === "top"
+              ? "center top"
+              : anchor === "bottom"
+                ? "center bottom"
+                : "center";
+    }
+    const tf: string[] = [];
+    if (t?.rotate) tf.push(`rotate(${t.rotate}deg)`);
+    const scale = mid ? mid.scale : t?.zoom && t.zoom > 1 ? t.zoom : 1;
+    if (scale > 1) tf.push(`scale(${scale})`);
+    return {
+      transition: "opacity 60ms linear",
+      objectFit: fit,
+      objectPosition,
+      ...(tf.length ? { transform: tf.join(" ") } : {}),
+    };
+  }, [activeVideo, aspect]);
+
   return (
     <div className="border-b px-4 py-3" style={{ borderColor: "var(--border)" }}>
+      <div className="flex w-full justify-center">
       <div
-        className="relative aspect-video w-full overflow-hidden rounded-lg"
-        style={{ background: "#000" }}
+        className="relative overflow-hidden rounded-lg"
+        style={{
+          background: "#000",
+          aspectRatio: frameRatio,
+          width: aspect === "landscape" ? "100%" : "auto",
+          height: aspect === "landscape" ? undefined : "min(70vh, 460px)",
+          maxWidth: "100%",
+        }}
       >
         {hasTimeline ? (
           <>
             <video
               ref={picture.attachA}
               className="absolute inset-0 h-full w-full"
-              style={{ transition: "opacity 60ms linear" }}
+              style={videoStyle}
               muted
               playsInline
             />
             <video
               ref={picture.attachB}
               className="absolute inset-0 h-full w-full"
-              style={{ transition: "opacity 60ms linear" }}
+              style={videoStyle}
               muted
               playsInline
             />
@@ -268,6 +327,7 @@ export function CompositePreview({ token }: { token: string | undefined }) {
             )}
           </div>
         )}
+      </div>
       </div>
 
       {hasTimeline && (

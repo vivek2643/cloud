@@ -18,7 +18,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from app.services.l3 import angle_menu, engine, focus, layers, principles, score_span
+from app.services.l3 import angle_menu, engine, focus, framing, layers, principles, score_span
 from app.services.l3 import sync as sync_mod
 from app.services.l3.catalog import ClipSummary
 from app.services.l3.content import ClipContent, OverlapPair, content_coverage
@@ -48,6 +48,7 @@ class EditSession:
 
     def __post_init__(self) -> None:
         self.document.setdefault("brief", {})
+        self.document.setdefault("format", {"aspect": layers.DEFAULT_ASPECT})
         self.document.setdefault("spine", None)
         self.document.setdefault("principles", [])
         self.document.setdefault("outline", [])
@@ -173,13 +174,37 @@ TOOL_SPECS: List[dict] = [
     _spec(
         "set_brief",
         "Record your interpretation of the user's brief (goal, target duration, "
-        "tone, platform, constraints). Defaults you assumed belong in "
-        "`assumptions` so they can become questions.",
+        "tone, platform, constraints, and delivery ASPECT). Defaults you assumed "
+        "belong in `assumptions` so they can become questions. Set `aspect` to "
+        "the DELIVERY frame shape: 'landscape' (16:9, default), 'portrait' (9:16 "
+        "-- reels / shorts / tiktok / vertical), or 'square' (1:1). Infer it from "
+        "the brief (words like reel/short/vertical/9:16 => portrait); if the user "
+        "didn't say and it materially changes the edit, ask_user instead of "
+        "guessing.",
         {
             "goal": {"type": "string"},
             "target_duration_s": {"type": "number"},
             "tone": {"type": "string"},
             "platform": {"type": "string"},
+            "aspect": {
+                "type": "string",
+                "enum": ["landscape", "portrait", "square"],
+                "description": "delivery frame shape (default landscape)",
+            },
+            "motion_style": {
+                "type": "string",
+                "enum": ["static", "punch_in", "push_in", "follow"],
+                "description": "how the frame ZOOMS/MOVES. Default 'static' (no "
+                "zoom). 'punch_in' = held slightly tighter; 'push_in' = slow zoom "
+                "in over each shot; 'follow' = stay tight and pan to keep the "
+                "subject in frame. This is a user CHOICE -- ask_user, don't assume.",
+            },
+            "motion_feel": {
+                "type": "string",
+                "enum": ["snappy", "glide"],
+                "description": "easing for motion_style: 'snappy' (linear) or "
+                "'glide' (smooth ease). Only matters when motion_style moves.",
+            },
             "constraints": {"type": "array", "items": {"type": "string"}},
             "assumptions": {"type": "array", "items": {"type": "string"}},
         },
@@ -515,6 +540,22 @@ TOOL_SPECS: List[dict] = [
         ["file_id", "from_ms", "to_ms"],
     ),
     _spec(
+        "read_framing",
+        "What the AUTOMATIC reframe will do for a clip (or a range of it) at the "
+        "current delivery aspect: whether it crops to fill (only non-landscape "
+        "aspects reframe), the orthogonal rotation to set it upright, and the "
+        "FOCUS point it will keep in frame (from who is speaking / where the "
+        "action is / the main subject). Read-only facts -- the framing is applied "
+        "automatically; call this only to see/sanity-check it. Clips logged "
+        "before spatial perception have no focus and stay centered.",
+        {
+            "file_id": {"type": "string"},
+            "from_ms": {"type": "integer", "description": "optional range start (clip clock); default 0"},
+            "to_ms": {"type": "integer", "description": "optional range end; default the clip end"},
+        },
+        ["file_id"],
+    ),
+    _spec(
         "ask_user",
         "Pause and ask the user. Use for genuine forks (length, ending, tone, "
         "include/exclude) -- not for things the footage answers. ALWAYS have a "
@@ -701,7 +742,22 @@ def _execute(session: EditSession, name: str, args: Dict[str, Any]) -> str:
 
     if name == "set_brief":
         doc["brief"] = {k: v for k, v in args.items() if v is not None}
-        return _j({"ok": True, "brief": doc["brief"]})
+        # The delivery aspect lives on the document `format` (where resolve +
+        # render + preview read it), mirrored from the brief.
+        aspect = args.get("aspect")
+        if aspect in layers.ASPECTS:
+            doc.setdefault("format", {})["aspect"] = aspect
+        # Motion style/feel (the one user-chosen zoom knob) also live on `format`,
+        # where the framing pass reads them to build per-segment motion.
+        style = args.get("motion_style")
+        if style in framing.MOTION_STYLES:
+            doc.setdefault("format", {})["motion_style"] = style
+        feel = args.get("motion_feel")
+        if feel in framing.MOTION_FEELS:
+            doc.setdefault("format", {})["motion_feel"] = feel
+        return _j({"ok": True, "brief": doc["brief"],
+                   "aspect": layers.aspect_of(doc),
+                   "motion_style": (doc.get("format") or {}).get("motion_style", "static")})
 
     if name == "set_spine":
         regions = args.get("regions") or []
@@ -1050,6 +1106,40 @@ def _execute(session: EditSession, name: str, args: Dict[str, Any]) -> str:
             "focus_kind": kind,
             "matched_angles": {fid: off for fid, off in offsets.items()},
             "menu": angle_menu.render_angle_menu_text(spine, rows),
+        })
+
+    if name == "read_framing":
+        from app.services.l3 import framing
+
+        fid = args["file_id"]
+        if fid not in session.file_ids:
+            return _j({"error": "file_id not in this thread's scope"})
+        from_ms = max(0, int(args.get("from_ms", 0)))
+        to_ms = int(args.get("to_ms") or 0)
+        if to_ms <= from_ms:
+            try:
+                to_ms = session.grids(fid).duration_ms
+            except Exception:
+                to_ms = from_ms + 1
+        perc = session.perceptions_map().get(fid)
+        focus = framing.focus_for_range(perc, framing._load_motion_centroids(fid), from_ms, to_ms)
+        rotate = framing.orientation_rotate(perc)
+        auto = layers.solve_transform(doc)
+        reframes = auto["fit"] == "cover"
+        return _j({
+            "file_id": fid,
+            "aspect": layers.aspect_of(doc),
+            "fit": auto["fit"],
+            "reframes": reframes,
+            "orientation_rotate_deg": rotate,
+            "focus": focus,
+            "note": (
+                ("centered (no spatial perception logged for this clip)"
+                 if focus is None else
+                 f"will keep {focus['source']} in frame ({focus['evidence']})")
+                if reframes else
+                "landscape delivery letterboxes; no crop, so focus is unused"
+            ),
         })
 
     if name == "timeline_status":
