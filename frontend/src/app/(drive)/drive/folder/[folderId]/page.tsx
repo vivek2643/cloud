@@ -5,7 +5,7 @@ import { useDriveStore } from "@/stores/drive-store";
 import { useAuthStore } from "@/stores/auth-store";
 import { getFolders, getFiles, createFolder, getBreadcrumb, type BreadcrumbItem } from "@/lib/api";
 import { UploadZone, useUploadFiles } from "@/components/upload-zone";
-import { DriveContent } from "@/components/drive-content";
+import { ProjectLenses } from "@/components/project-lenses";
 import { Breadcrumb } from "@/components/breadcrumb";
 import { CreateFolderDialog } from "@/components/create-folder-dialog";
 import { SearchEditBar } from "@/components/search-edit-bar";
@@ -107,7 +107,7 @@ export default function FolderPage({ params }: { params: Promise<{ folderId: str
 
         <SearchEditBar />
 
-        <DriveContent />
+        <ProjectLenses />
       </div>
 
       <CreateFolderDialog
