@@ -128,6 +128,44 @@ def test_end_to_end_silent_envelope():
     print("ok: end-to-end build returns linked sentence + topic selects")
 
 
+def test_production_cue_flagged_and_kept_out_of_topics():
+    # An isolated "Go" at the very start (crew cue) then a real line by S0.
+    words = [
+        _w(0, 250, "Go", "S0"),                   # isolated edge cue
+        _w(1500, 1900, "Today", "S0"),            # real speech, >600ms gap after cue
+        _w(1930, 2300, "we're", "S0"),
+        _w(2330, 2800, "cooking.", "S0"),
+    ]
+    out = d.build_dialogue_segments(words, wav_path=None)
+    cue = [s for s in out["sentence"] if s["text"].strip().lower() == "go"]
+    assert cue and "production_cue" in cue[0]["flags"], out["sentence"]
+    # The cue must not appear inside any topic (kept clean).
+    assert all("Go" not in t["text"].split()[:1] for t in out["topic"]), out["topic"]
+    # A mid-sentence "go" must NOT be flagged.
+    words2 = [
+        _w(0, 300, "Let's", "S0"), _w(330, 600, "go", "S0"),
+        _w(630, 1000, "there.", "S0"),
+    ]
+    out2 = d.build_dialogue_segments(words2, wav_path=None)
+    assert all("production_cue" not in s["flags"] for s in out2["sentence"]), out2["sentence"]
+    print("ok: isolated crew cue flagged + excluded from topics; mid-sentence 'go' kept")
+
+
+def test_offscreen_loudness_flag():
+    # speech_ref -5 dB; an isolated quiet word (-25 dB) at the start is off-mic.
+    rms = [-5.0] * 400
+    for f in range(0, 30):  # 0..300ms quiet
+        rms[f] = -25.0
+    env = d.Envelope(rms, hop_ms=10, speech_ref=-5.0)
+    units = [
+        d._Unit(speaker="S0", raw_in_ms=0, raw_out_ms=250, text="hey"),
+        d._Unit(speaker="S0", raw_in_ms=1500, raw_out_ms=2500, text="the real line"),
+    ]
+    d._mark_offscreen_units(units, env, clip_start=0, clip_end=2500)
+    assert "offscreen" in units[0].flags and "offscreen" not in units[1].flags, [u.flags for u in units]
+    print("ok: isolated off-mic (quiet) speech flagged offscreen")
+
+
 def main():
     test_phrases_split_on_speaker_and_gap()
     test_sentences_break_on_punctuation_and_speaker()
@@ -135,6 +173,8 @@ def main():
     test_snap_to_silence_trough_and_noisy_fallback()
     test_overlap_flag_on_crosstalk()
     test_end_to_end_silent_envelope()
+    test_production_cue_flagged_and_kept_out_of_topics()
+    test_offscreen_loudness_flag()
     print("\nALL DIALOGUE SEGMENT TESTS PASSED")
 
 

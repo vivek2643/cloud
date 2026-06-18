@@ -59,6 +59,22 @@ DISCOURSE_MARKERS = {
     "well", "basically", "another", "firstly", "secondly", "finally", "lastly",
 }
 
+# --- Off-camera / production-cue suppression (#1 lexicon, #2 loudness) ----
+# Words a crew member shouts that are NOT part of the on-camera dialogue. We
+# only suppress these when they're SHORT and ISOLATED (and, for the ambiguous
+# ones, near a clip edge) so we never eat a real line that happens to contain
+# "go" or "start". STRONG cues are almost never real dialogue; WEAK cues are
+# common words, so they need the edge gate too.
+STRONG_CUE_WORDS = {"action", "cut", "rolling", "slate", "marker", "speed"}
+WEAK_CUE_WORDS = {"go", "start", "stop", "ready", "set", "begin", "reset", "again", "take"}
+CUE_MAX_MS = 1_200          # a cue is a brief shout, not a sentence
+CUE_MAX_WORDS = 3
+CUE_EDGE_MS = 2_000         # "near a clip edge" window for the ambiguous cues
+CUE_ISOLATION_MS = 600      # silence to a neighbour that marks a unit as isolated
+# A unit whose speech sits this far below the clip's speech reference is likely
+# off-mic (someone behind the camera) rather than the on-camera subject.
+OFFSCREEN_LEVEL_DROP_DB = 12.0
+
 
 @dataclass
 class _Unit:
@@ -69,6 +85,7 @@ class _Unit:
     text: str
     is_backchannel: bool = False
     children: List[int] = field(default_factory=list)  # indices into the level below
+    flags: List[str] = field(default_factory=list)  # e.g. "production_cue", "offscreen"
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +146,17 @@ class Envelope:
                 best_i = i
         clean = best_v <= self.speech_ref - SILENCE_DROP_DB
         return best_i * self.hop_ms, float(best_v), clean
+
+    def level_db(self, lo_ms: int, hi_ms: int) -> Optional[float]:
+        """Median speech level (dB) over [lo_ms, hi_ms]; None if no audio.
+        Used to spot off-mic (quiet) speech relative to the clip's speech_ref."""
+        if self.n == 0 or hi_ms <= lo_ms:
+            return None
+        import numpy as np
+        a, b = self._idx(lo_ms), self._idx(hi_ms)
+        if b <= a:
+            return None
+        return float(np.median(self.rms_db[a:b + 1]))
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +303,65 @@ def _merge_short_forward(units: List[_Unit]) -> List[_Unit]:
 
 
 # ---------------------------------------------------------------------------
+# Off-camera / production-cue marking
+# ---------------------------------------------------------------------------
+
+def _is_production_cue(
+    u: _Unit, prev_out: Optional[int], next_in: Optional[int],
+    clip_start: int, clip_end: int,
+) -> bool:
+    """A short, isolated crew cue ('action', 'go', 'cut') rather than dialogue.
+    Strong cues fire when isolated anywhere; ambiguous (weak) cues additionally
+    require sitting near a clip edge, so a mid-sentence 'go' is never touched."""
+    toks = [t for t in (_norm(w) for w in u.text.split()) if t]
+    if not toks or len(toks) > CUE_MAX_WORDS:
+        return False
+    if (u.raw_out_ms - u.raw_in_ms) > CUE_MAX_MS:
+        return False
+    gap_before = (u.raw_in_ms - prev_out) if prev_out is not None else 10 ** 9
+    gap_after = (next_in - u.raw_out_ms) if next_in is not None else 10 ** 9
+    if max(gap_before, gap_after) < CUE_ISOLATION_MS:
+        return False  # nestled between other speech -> almost certainly real
+    near_edge = (
+        (u.raw_in_ms - clip_start) <= CUE_EDGE_MS
+        or (clip_end - u.raw_out_ms) <= CUE_EDGE_MS
+    )
+    if all(t in STRONG_CUE_WORDS for t in toks):
+        return True
+    if near_edge and all(t in (STRONG_CUE_WORDS | WEAK_CUE_WORDS) for t in toks):
+        return True
+    return False
+
+
+def _mark_offscreen_units(
+    units: List[_Unit], env: Envelope, clip_start: int, clip_end: int
+) -> None:
+    """In-place: tag units that look like off-camera speech. `production_cue`
+    (lexicon) and `offscreen` (well below the clip's speech level) -- both kept
+    out of topics and hidden by default in the UI, but never deleted."""
+    for i, u in enumerate(units):
+        prev_out = units[i - 1].raw_out_ms if i > 0 else None
+        next_in = units[i + 1].raw_in_ms if i + 1 < len(units) else None
+        if _is_production_cue(u, prev_out, next_in, clip_start, clip_end):
+            u.flags.append("production_cue")
+            continue
+        if env.speech_ref == 0.0:
+            continue  # silent fallback -> no usable level reference
+        gap_before = (u.raw_in_ms - prev_out) if prev_out is not None else 10 ** 9
+        gap_after = (next_in - u.raw_out_ms) if next_in is not None else 10 ** 9
+        isolated = max(gap_before, gap_after) >= CUE_ISOLATION_MS
+        near_edge = (
+            (u.raw_in_ms - clip_start) <= CUE_EDGE_MS
+            or (clip_end - u.raw_out_ms) <= CUE_EDGE_MS
+        )
+        if not (isolated or near_edge):
+            continue  # only judge loudness on isolated/edge bits, not mid-convo
+        lvl = env.level_db(u.raw_in_ms, u.raw_out_ms)
+        if lvl is not None and lvl <= env.speech_ref - OFFSCREEN_LEVEL_DROP_DB:
+            u.flags.append("offscreen")
+
+
+# ---------------------------------------------------------------------------
 # Topic units
 # ---------------------------------------------------------------------------
 
@@ -303,6 +390,9 @@ def build_topics(sentences: List[_Unit]) -> List[_Unit]:
         cur = []
 
     for idx, s in enumerate(sentences):
+        # Off-camera speech / crew cues never seed or join a topic.
+        if "production_cue" in s.flags or "offscreen" in s.flags:
+            continue
         # A short interjection by the OTHER speaker doesn't end the topic.
         if cur and s.is_backchannel and s.speaker != cur_spk:
             continue
@@ -371,7 +461,7 @@ def _snap_units(units: List[_Unit], env: Envelope, level: str) -> List[dict]:
         src_out, noisy_out = _snap_out(env, u.raw_out_ms, next_in)
         if src_out <= src_in:
             src_out = max(u.raw_out_ms, src_in + 1)
-        flags: List[str] = []
+        flags: List[str] = list(u.flags)
         if noisy_in or noisy_out:
             flags.append("noisy")
         if u.is_backchannel:
@@ -442,8 +532,14 @@ def build_dialogue_segments(words: Sequence[dict], wav_path: Optional[str]) -> D
         logger.exception("Dialogue envelope failed for %s; using silent fallback.", wav_path)
         env = Envelope.silent()
 
+    clip_start = min(int(w.get("start_ms", 0)) for w in flat)
+    clip_end = max(int(w.get("end_ms", 0)) for w in flat)
+    clip_end = max(clip_end, clip_start)
+
     sentence_units = merge_sentences(flat)
+    _mark_offscreen_units(sentence_units, env, clip_start, clip_end)
     topic_units = build_topics(sentence_units)
+    _mark_offscreen_units(topic_units, env, clip_start, clip_end)
 
     sentence_segs = _snap_units(sentence_units, env, "sentence")
     topic_segs = _snap_units(topic_units, env, "topic")

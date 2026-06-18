@@ -10,11 +10,17 @@ import {
   type DialogueSegment,
   type FileRecord,
 } from "@/lib/api";
-import { MessageSquare, Play, Pause, Volume2, VolumeX, AlertTriangle } from "lucide-react";
+import { MessageSquare, Play, Pause, Volume2, VolumeX, AlertTriangle, EyeOff } from "lucide-react";
 
 type Level = "sentence" | "topic";
 
 type FileDialogues = { sentence: DialogueSegment[]; topic: DialogueSegment[] };
+
+// Crew cues / off-mic speech: kept in the data but hidden from the lens by
+// default so the cameraman's "go / start / action" doesn't read as dialogue.
+function isOffCamera(seg: DialogueSegment): boolean {
+  return seg.flags.includes("offscreen") || seg.flags.includes("production_cue");
+}
 
 const SPEAKER_COLORS = ["#6366f1", "#10b981", "#f59e0b", "#ec4899", "#06b6d4", "#8b5cf6"];
 
@@ -37,6 +43,7 @@ export function DialoguesView() {
   const [level, setLevel] = useState<Level>("sentence");
   const [data, setData] = useState<Record<string, FileDialogues>>({});
   const [loading, setLoading] = useState(false);
+  const [showOffCamera, setShowOffCamera] = useState(false);
   const urlCache = useRef<Record<string, Promise<string | null>>>({});
 
   const candidates = useMemo(
@@ -87,11 +94,18 @@ export function DialoguesView() {
     [token]
   );
 
-  const sectionsWithClips = candidates
-    .map((f) => ({ file: f, segs: data[f.id]?.[level] ?? [] }))
-    .filter((s) => s.segs.length > 0);
+  const allSections = candidates.map((f) => {
+    const all = data[f.id]?.[level] ?? [];
+    const segs = showOffCamera ? all : all.filter((s) => !isOffCamera(s));
+    return { file: f, segs, hidden: all.length - segs.length };
+  });
+  const sectionsWithClips = allSections.filter((s) => s.segs.length > 0);
 
   const totalClips = sectionsWithClips.reduce((n, s) => n + s.segs.length, 0);
+  const hiddenCount = allSections.reduce(
+    (n, s) => n + (showOffCamera ? 0 : s.hidden),
+    0
+  );
 
   return (
     <div>
@@ -111,11 +125,30 @@ export function DialoguesView() {
             </button>
           ))}
         </div>
-        {totalClips > 0 && (
-          <span className="text-sm" style={{ color: "var(--muted)" }}>
-            {totalClips} {level} clip{totalClips === 1 ? "" : "s"}
-          </span>
-        )}
+        <div className="flex items-center gap-3">
+          {(hiddenCount > 0 || showOffCamera) && (
+            <button
+              onClick={() => setShowOffCamera((v) => !v)}
+              className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors"
+              style={{
+                borderColor: "var(--border)",
+                color: showOffCamera ? "var(--accent)" : "var(--muted)",
+                background: showOffCamera ? "var(--accent-soft)" : "transparent",
+              }}
+              title="Crew cues and off-mic speech (e.g. the camera operator's 'go'/'action') are hidden by default"
+            >
+              <EyeOff size={13} />
+              {showOffCamera
+                ? "Hide off-camera"
+                : `Show off-camera${hiddenCount ? ` (${hiddenCount})` : ""}`}
+            </button>
+          )}
+          {totalClips > 0 && (
+            <span className="text-sm" style={{ color: "var(--muted)" }}>
+              {totalClips} {level} clip{totalClips === 1 ? "" : "s"}
+            </span>
+          )}
+        </div>
       </div>
 
       {loading && (
@@ -175,6 +208,7 @@ function DialogueClipCard({
   const hasOverlap = seg.flags.includes("overlap");
   const isNoisy = seg.flags.includes("noisy");
   const isBackchannel = seg.flags.includes("backchannel");
+  const offCamera = isOffCamera(seg);
 
   async function ensureUrl() {
     if (playUrl) return;
@@ -276,7 +310,11 @@ function DialogueClipCard({
   return (
     <div
       className="group relative flex flex-col overflow-hidden rounded-xl border transition-colors hover:border-[var(--accent)]"
-      style={{ borderColor: "var(--border)", background: "var(--background)" }}
+      style={{
+        borderColor: "var(--border)",
+        background: "var(--background)",
+        opacity: offCamera ? 0.6 : 1,
+      }}
     >
       <div
         onMouseEnter={handleEnter}
@@ -364,8 +402,13 @@ function DialogueClipCard({
         <p className="line-clamp-2 text-sm leading-snug" style={{ minHeight: "2.5em" }}>
           {seg.text || <em style={{ color: "var(--muted)" }}>(no speech)</em>}
         </p>
-        {(isNoisy || isBackchannel) && (
+        {(isNoisy || isBackchannel || offCamera) && (
           <div className="mt-1.5 flex flex-wrap gap-1">
+            {offCamera && (
+              <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px]" style={{ background: "var(--accent-soft)", color: "var(--muted)" }} title="Crew cue or off-mic speech, not on-camera dialogue">
+                <EyeOff size={10} /> off-camera
+              </span>
+            )}
             {isNoisy && (
               <span className="rounded px-1.5 py-0.5 text-[10px]" style={{ background: "var(--accent-soft)", color: "var(--muted)" }} title="No clean silence at the cut; used a fixed handle">
                 noisy cut

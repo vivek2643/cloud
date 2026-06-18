@@ -181,6 +181,48 @@ def _fuse_speakers(
             person.av_link_confidence = confidence
 
 
+def _flag_offscreen_dialogue(file_id: str, perception: ClipPerception) -> None:
+    """Mark Dialogues-lens segments whose diarized speaker never links to a
+    VISIBLE on-camera person as `offscreen` (the off-screen crew/director).
+
+    Runs after `_fuse_speakers`, so we know which `S#` ids belong to people the
+    VLM actually saw speaking. We only act when there is at least one confident
+    on-camera link -- otherwise we have no basis to call anyone off-camera and
+    leave the lens untouched (fail to a missing flag, never a wrong one). The
+    flag is additive and non-destructive; the UI hides flagged clips by default.
+    """
+    oncam = {
+        p.voice_speaker_id
+        for p in perception.persons
+        if p.voice_speaker_id and (p.av_link_confidence or 0.0) >= _AV_LINK_MIN_CONFIDENCE
+    }
+    if not oncam:
+        return
+
+    with _pg_conn() as conn:
+        row = conn.execute(
+            "select segments from dialogue_segments where file_id = %s", (file_id,)
+        ).fetchone()
+        if not row or not row[0]:
+            return
+        doc = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+        changed = False
+        for level in ("sentence", "topic"):
+            for seg in doc.get(level) or []:
+                spk = seg.get("speaker")
+                if spk and spk not in oncam:
+                    flags = seg.setdefault("flags", [])
+                    if "offscreen" not in flags:
+                        flags.append("offscreen")
+                        changed = True
+        if changed:
+            conn.execute(
+                "update dialogue_segments set segments = %s::jsonb where file_id = %s",
+                (json.dumps(doc), file_id),
+            )
+            logger.info("L2: flagged off-camera dialogue for %s (on-camera=%s)", file_id, sorted(oncam))
+
+
 # --------------------------------------------------------------------------
 # Persistence
 # --------------------------------------------------------------------------
@@ -291,6 +333,14 @@ def l2_perception(file_id: str) -> None:
 
         _fuse_speakers(result.parsed, speaker_turns)
         _persist(file_id, result.parsed, result.usage, result.model)
+
+        # Refine the Dialogues lens now that we know who is actually on camera:
+        # any diarized voice with no visible speaker is off-screen crew. Best-
+        # effort -- a failure here must never fail the L2 perception task.
+        try:
+            _flag_offscreen_dialogue(file_id, result.parsed)
+        except Exception:
+            logger.exception("L2: off-camera dialogue flagging failed for %s", file_id)
 
         _set_l2_status(file_id, "ready")
         with _pg_conn() as conn:
