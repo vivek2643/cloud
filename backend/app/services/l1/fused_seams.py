@@ -61,6 +61,12 @@ SNAP_TIGHT_WIN_MS = 400
 # Two candidate seams closer than this collapse to one (keep the better Q).
 SEAM_MERGE_MS = 60
 
+# A candidate whose FUSED quality is below this is a vetoed point (e.g. a beat /
+# impact / speaker mark that lands mid-word), not a usable cut -- drop it from the
+# seam list. The dense grid still covers that region for snapping, so this only
+# affects which discrete seams we advertise, never where we can cut.
+SEAM_Q_FLOOR = 0.25
+
 GRID_HOP_MS = 100
 
 
@@ -152,6 +158,7 @@ def _build_seams(cost: List[float], hop_ms: int,
                 keep.q, keep.ts_ms, keep.kind = s.q, s.ts_ms, s.kind
         else:
             merged.append(s)
+    merged = [s for s in merged if s.q >= SEAM_Q_FLOOR]  # drop vetoed candidates
     merged.sort(key=lambda s: -s.q)
     return merged
 
