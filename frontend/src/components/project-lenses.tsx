@@ -3,15 +3,16 @@
 import { useState } from "react";
 import { DriveContent } from "@/components/drive-content";
 import { DialoguesView } from "@/components/dialogues-view";
+import { HeroCutsView } from "@/components/hero-cuts-view";
 import { Layers, Crosshair, Star, MessageSquare } from "lucide-react";
 
-type Tab = "versioned" | "dialogues" | "crux" | "highlights";
+type Tab = "versioned" | "hero" | "dialogues" | "crux";
 
 const TABS: { id: Tab; label: string; icon: typeof Layers }[] = [
   { id: "versioned", label: "Versioned", icon: Layers },
+  { id: "hero", label: "Hero Cuts", icon: Star },
   { id: "dialogues", label: "Dialogues", icon: MessageSquare },
   { id: "crux", label: "Crux", icon: Crosshair },
-  { id: "highlights", label: "Highlights", icon: Star },
 ];
 
 /**
@@ -48,6 +49,8 @@ export function ProjectLenses() {
 
       {activeTab === "versioned" ? (
         <DriveContent />
+      ) : activeTab === "hero" ? (
+        <HeroCutsView />
       ) : activeTab === "dialogues" ? (
         <DialoguesView />
       ) : (
@@ -58,10 +61,8 @@ export function ProjectLenses() {
 }
 
 function ComingSoon({ tab }: { tab: Tab }) {
-  const copy =
-    tab === "crux"
-      ? { icon: <Crosshair size={36} style={{ color: "var(--accent)" }} />, title: "Crux", body: "The key moments in this project's footage will surface here." }
-      : { icon: <Star size={36} style={{ color: "var(--accent)" }} />, title: "Highlights", body: "Auto-generated highlight reels for this project will appear here." };
+  const copy = { icon: <Crosshair size={36} style={{ color: "var(--accent)" }} />, title: "Crux", body: "The key moments in this project's footage will surface here." };
+  void tab;
   return (
     <div className="flex flex-col items-center justify-center py-24 text-center">
       {copy.icon}

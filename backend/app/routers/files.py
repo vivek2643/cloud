@@ -171,6 +171,28 @@ def get_dialogues(
     return {"sentence": sentence, "topic": topic, "ready": bool(row.data)}
 
 
+@router.get("/{file_id}/hero-cuts")
+def get_hero_cuts(
+    file_id: str,
+    energy: float = Query(0.5, ge=0.0, le=1.0, description="0=broad/calm .. 1=sharp/punchy"),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Return the ranked hero-cuts feed for a file (the V1 product surface).
+
+    Compute-on-read over already-persisted L1/L2/L3 artifacts (dialogue
+    segments + clip_perception + motion grids); deterministic given `energy`.
+    `ready` is false when none of the source artifacts exist yet."""
+    sb = get_supabase()
+    owns = sb.table("files").select("id").eq("id", file_id).eq("user_id", user_id).execute()
+    if not owns.data:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    from app.services.l3.hero_cuts import build_hero_cuts
+
+    heroes = build_hero_cuts([file_id], energy=energy)
+    return {"heroes": heroes, "energy": energy, "ready": bool(heroes)}
+
+
 @router.get("/{file_id}/l1")
 def get_l1_index(
     file_id: str,

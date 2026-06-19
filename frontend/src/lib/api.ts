@@ -145,6 +145,45 @@ export function getDialogues(fileId: string, token: string) {
   return request<DialoguesResponse>(`/api/files/${fileId}/dialogues`, { token });
 }
 
+// --- Hero Cuts lens ---
+
+export type HeroModality = "speech" | "action" | "visual";
+
+export interface HeroTake {
+  file_id: string;
+  src_in_ms: number;
+  src_out_ms: number;
+  score: number;
+}
+
+export interface HeroCut {
+  hero_id: string;
+  file_id: string;
+  modality: HeroModality;
+  label: string;
+  src_in_ms: number;
+  src_out_ms: number;
+  duration_ms: number;
+  score: number;
+  speaker: string | null;
+  flags: string[];
+  take_count: number;
+  alt_takes: HeroTake[];
+}
+
+export interface HeroCutsResponse {
+  heroes: HeroCut[];
+  energy: number;
+  ready: boolean;
+}
+
+export function getHeroCuts(fileId: string, energy: number, token: string) {
+  return request<HeroCutsResponse>(
+    `/api/files/${fileId}/hero-cuts?energy=${energy}`,
+    { token }
+  );
+}
+
 // --- Upload ---
 
 export interface PresignResponse {
