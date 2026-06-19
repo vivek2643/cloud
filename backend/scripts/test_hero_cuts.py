@@ -58,7 +58,8 @@ def test_speech_drops_offcamera_and_short():
         ], "sentence": []},
         perception=None, motion=None,
     )
-    heroes = hc._speech_candidates(clip, _src("aaaaaaaa-1", 8000, words), energy=0.0)
+    heroes = hc._speech_candidates(clip, _src("aaaaaaaa-1", 8000, words),
+                                   None, hc.energy_to_params(0.0))
     assert len(heroes) == 1, [h.label for h in heroes]
     assert heroes[0].label == "this is a real usable line"
     assert heroes[0].modality == "speech"
@@ -66,7 +67,8 @@ def test_speech_drops_offcamera_and_short():
 
 
 def test_energy_selects_granularity():
-    """Low energy -> topic spans; high energy -> sentence spans."""
+    """Low energy clusters adjacent sentences into one answer; high energy keeps
+    them as separate sentence heroes."""
     clip = hc._ClipInputs(
         file_id="bbbbbbbb-1", duration_ms=8000,
         dialogue={
@@ -81,11 +83,42 @@ def test_energy_selects_granularity():
     words = _words([("one", 0, 400), ("big", 400, 800), ("complete", 800, 1400),
                     ("thought", 2000, 2500), ("here", 2500, 2900), ("now", 2900, 3400)])
     src = _src("bbbbbbbb-1", 8000, words)
-    low = hc._speech_candidates(clip, src, energy=0.0)
-    high = hc._speech_candidates(clip, src, energy=1.0)
-    assert len(low) == 1, low
-    assert len(high) == 2, high
+    low = hc._speech_candidates(clip, src, None, hc.energy_to_params(0.0))
+    high = hc._speech_candidates(clip, src, None, hc.energy_to_params(1.0))
+    assert len(low) == 1, low                 # merged into one answer
+    assert len(high) == 2, high               # kept as two sentences
     print("ok  test_energy_selects_granularity")
+
+
+def test_clustering_gradient():
+    """Granularity is monotonic in energy: rising energy never yields FEWER
+    speech heroes (answers -> sentences -> clauses), and a long pause is never
+    merged across even at low energy."""
+    # Three sentences: s0,s1 close together (0.2s gap), s2 after a 3s pause.
+    clip = hc._ClipInputs(
+        file_id="gggggggg-1", duration_ms=12000,
+        dialogue={"topic": [], "sentence": [
+            _seg("s0", "sentence", "first part of the idea", 0, 1500),
+            _seg("s1", "sentence", "second part of the idea", 1700, 3200),
+            _seg("s2", "sentence", "a separate later point entirely", 6200, 7800),
+        ]},
+        perception=None, motion=None,
+    )
+    words = _words([
+        ("first", 0, 400), ("part", 400, 800), ("of", 800, 1000),
+        ("the", 1000, 1200), ("idea", 1200, 1500),
+        ("second", 1700, 2100), ("part", 2100, 2500), ("of", 2500, 2700),
+        ("the", 2700, 2900), ("idea", 2900, 3200),
+        ("a", 6200, 6400), ("separate", 6400, 6900), ("later", 6900, 7300),
+        ("point", 7300, 7600), ("entirely", 7600, 7800),
+    ])
+    src = _src("gggggggg-1", 12000, words)
+    counts = [len(hc._speech_candidates(clip, src, None, hc.energy_to_params(e)))
+              for e in (0.0, 0.5, 0.8)]
+    assert counts == sorted(counts), counts        # non-decreasing with energy
+    assert counts[0] == 2, counts   # low energy: s0+s1 merge, s2 stays apart (3s pause)
+    assert counts[-1] == 3, counts  # sentence level: all three distinct
+    print("ok  test_clustering_gradient")
 
 
 def test_take_stacking_collapses_repeats(monkeypatch=None):
@@ -142,7 +175,7 @@ def test_action_snaps_to_calm_motion_seam():
         ], "take_quality_events": []},
         motion=motion,
     )
-    heroes = hc._action_candidates(clip, energy=0.0, field=None)
+    heroes = hc._action_candidates(clip, hc.energy_to_params(0.0), None)
     assert len(heroes) == 1, heroes
     h = heroes[0]
     assert h.modality == "action" and h.label == "hits the ball"
@@ -175,9 +208,9 @@ def test_action_fused_avoids_speech():
         audio={"dialogue_cut_cost": dlg, "dialogue_cut_hop_ms": 100, "dialogue_cut_points": [],
                "beat_cut_cost": [], "beat_cut_hop_ms": 100, "beat_cut_points": []},
     )
-    field = hc._build_field(clip, energy=0.5)
+    field = hc._build_field(clip, 0.5)
     assert field is not None
-    heroes = hc._action_candidates(clip, energy=0.5, field=field)
+    heroes = hc._action_candidates(clip, hc.energy_to_params(0.5), field)
     assert len(heroes) == 1, heroes
     h = heroes[0]
     assert not (1800 < h.src_out_ms < 2600), h.src_out_ms   # not inside the speech
@@ -195,13 +228,14 @@ def test_action_skipped_without_motion():
         ]},
         motion=None,
     )
-    assert hc._action_candidates(clip, energy=0.5, field=None) == []
+    assert hc._action_candidates(clip, hc.energy_to_params(0.5), None) == []
     print("ok  test_action_skipped_without_motion")
 
 
 def main():
     test_speech_drops_offcamera_and_short()
     test_energy_selects_granularity()
+    test_clustering_gradient()
     test_take_stacking_collapses_repeats()
     test_action_snaps_to_calm_motion_seam()
     test_action_fused_avoids_speech()

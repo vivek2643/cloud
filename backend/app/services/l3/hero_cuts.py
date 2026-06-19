@@ -4,25 +4,31 @@ Hero-cuts assembly: the single ranked feed of "usable moments" for a project.
 This is the V1 product surface. It is a deterministic, post-VLM assembly over
 artifacts L1/L2/L3 already produced -- no new model call:
 
-  * SPEECH heroes  come from the L1 ``dialogue_segments`` lens (topic/sentence),
-    which are already snapped to silence troughs and carry off-camera /
-    backchannel flags. Crisp boundaries, the strongest path.
+  * SPEECH heroes  come from the L1 ``dialogue_segments`` SENTENCES (already
+    snapped to silence troughs, speaker-tagged, off-camera-flagged, and present
+    on every clip). The energy dial sets granularity by CLUSTERING them: whole
+    answers at low energy, sentences in the middle, clauses at the top.
   * ACTION / VISUAL heroes come from the VLM's ``content_units`` (kind = action
-    / visual), with boundaries snapped through the FUSED SEAM FIELD -- one grid
-    that fuses dialogue/camera vetoes with action/beat attractors, so an action
-    cut can never land inside a spoken word (the old camera-only snapper bled
-    background dialogue) while still hugging the motion impact.
+    / visual).
+
+Every hero's boundaries flow through the FUSED SEAM FIELD -- one grid that
+fuses dialogue/camera vetoes with action/beat attractors -- so a cut can never
+land inside a spoken word or a camera move, and the energy dial sets the
+tightness (snap-window width + veto-bounded breathing room) identically for
+speech, action and moments.
 
 The split of responsibility (see the design discussion):
   * The VLM PREDICTS what is usable + groups takes (``content_units`` /
-    ``content_key`` / ``take_quality_events``). Fuzzy, run once, persisted.
-  * Deterministic models CUT the frames (silence troughs, motion troughs) and
-    RANK (``score_span``). Pure arithmetic over stored data -> reproducible.
+    ``content_key`` / ``take_quality_events`` / visible-``speaking`` spans).
+    Fuzzy, run once, persisted.
+  * Deterministic models CUT the frames (the fused seam field) and RANK
+    (``score_span``). Pure arithmetic over stored data -> reproducible.
 
 Repeats of the same content are collapsed into ONE hero with its takes stacked
 behind it (best in front), reusing the near-duplicate clustering from
-``l3.takes``. The ``energy`` knob (0..1) is deterministic: it chooses the speech
-granularity (topic vs sentence) and how tightly action spans are trimmed.
+``l3.takes``. The ``energy`` knob (0..1) is the single deterministic dial:
+granularity (answers -> sentences -> clauses), tightness (loose -> frame-tight),
+and whether action+dialogue is fused into one moment -- see ``l3.energy``.
 
 Best-effort throughout: a missing artifact for a file simply yields fewer (or
 no) heroes for it; nothing here raises.
@@ -39,6 +45,7 @@ from difflib import SequenceMatcher
 from app.config import get_settings
 from app.services.l1 import fused_seams as fseams
 from app.services.l3 import score_span as ss
+from app.services.l3.energy import EnergyParams, energy_to_params
 from app.services.l3.takes import build_take_groups, normalize_key
 
 # Cross-file consolidation: collapse heroes whose *displayed line* is the same
@@ -53,16 +60,14 @@ logger = logging.getLogger(__name__)
 
 
 # --- Energy knob ----------------------------------------------------------
-# Deterministic mapping from the single energy slider (0 = calm/broad,
-# 1 = punchy/sharp) to concrete, signal-level choices. Phase 2 refines this;
-# for now it controls speech granularity + action trim tightness.
-ENERGY_SENTENCE_THRESHOLD = 0.5   # >= this -> sentence-level speech (shorter)
-# Only at high energy do we sub-split a multi-sentence VLM unit into its
-# sentences; below this the *delivered line* (the VLM unit) stays whole, so we
-# never chop one continuous delivery into fragments.
-ENERGY_SUBSPLIT_THRESHOLD = 0.75
-ACTION_SNAP_WINDOW_MS = 1_500     # how far to search for a calm motion seam
-ACTION_TIGHT_WINDOW_MS = 600      # the search window shrinks as energy rises
+# The single energy dial -> concrete, deterministic cut parameters lives in
+# ``l3.energy`` (``energy_to_params``). It controls BOTH axes monotonically:
+#   * granularity -- low energy clusters sentences into whole answers; high
+#     energy keeps sentences; the top sub-splits sentences into clauses.
+#   * tightness   -- low energy cuts loose (wide fused search + pre/post-roll);
+#     high energy cuts close (narrow search, zero padding).
+ACTION_SNAP_WINDOW_MS = 1_500     # fallback (no fused field) calm-seam search
+ACTION_TIGHT_WINDOW_MS = 600      # ... shrinks as energy rises
 
 # A speech hero needs at least this much real content to be worth surfacing.
 MIN_SPEECH_WORDS = 3
@@ -351,6 +356,51 @@ def _snap_action_bounds(motion: dict, raw_in: int, raw_out: int,
     return in_ms, out_ms
 
 
+# Cost above this in the fused field counts as "no longer safe" -- padding stops
+# here so loose breathing room never bleeds into speech / a camera move / impact.
+_PAD_VETO_COST = 0.5
+
+
+def _pad_safe(field: Optional[fseams.FusedField], ts: int, delta_ms: int,
+              direction: int, duration_ms: int) -> int:
+    """Extend a (already-snapped) boundary by up to ``delta_ms`` in ``direction``
+    (+1 = outward past the out-point, -1 = before the in-point) for loose
+    breathing room -- but ONLY through frames the fused field still calls safe.
+    Stops the instant cost rises into a veto (speech, camera move, impact), so
+    loose padding can only ever fill clean dead air, never pull in bad footage."""
+    if field is None or delta_ms <= 0 or not field.cost:
+        return ts
+    hop = field.hop_ms or 100
+    cur = ts
+    for _ in range(max(0, delta_ms // hop)):
+        nxt = cur + direction * hop
+        if nxt < 0 or (duration_ms and nxt > duration_ms):
+            break
+        j = max(0, min(len(field.cost) - 1, int(round(nxt / hop))))
+        if field.cost[j] > _PAD_VETO_COST:     # would enter a veto -> stop here
+            break
+        cur = nxt
+    return cur
+
+
+def _snap_fused(field: Optional[fseams.FusedField], raw_in: int, raw_out: int,
+                params: EnergyParams, duration_ms: int) -> Tuple[int, int]:
+    """Snap a rough [in,out] to the safest fused seams (search width = the
+    energy-scaled snap window), then add energy-scaled, veto-bounded breathing
+    room. The single path every hero's boundaries flow through, so the dial
+    controls tightness identically for speech, action and moments."""
+    if field is None:
+        return raw_in, raw_out
+    in_ms, out_ms = fseams.snap_bounds(
+        field, raw_in, raw_out, energy=params.energy, duration_ms=duration_ms,
+        base_win_ms=params.snap_window_ms, tight_win_ms=params.snap_window_ms)
+    in_ms = _pad_safe(field, in_ms, params.pad_in_ms, -1, duration_ms)
+    out_ms = _pad_safe(field, out_ms, params.pad_out_ms, +1, duration_ms)
+    if out_ms <= in_ms:
+        out_ms = in_ms + 1
+    return in_ms, out_ms
+
+
 # --------------------------------------------------------------------------
 # Per-modality candidate builders
 # --------------------------------------------------------------------------
@@ -418,16 +468,66 @@ def _trim_to_speaking(
     return new_in, new_out, kept
 
 
-def _overlapping_sentences(sentences: List[dict], start_ms: int, end_ms: int) -> List[dict]:
-    """Dialogue sentences (already silence-snapped by L1) overlapping a VLM
-    unit's rough span -- the bridge that turns fuzzy VLM ms into clean cuts."""
-    out = []
-    for s in sentences:
-        a = int(s.get("raw_in_ms", s.get("src_in_ms", 0)))
-        b = int(s.get("raw_out_ms", s.get("src_out_ms", 0)))
-        if ss._overlap_ms(a, b, start_ms, end_ms) > 0:
-            out.append(s)
-    return out
+def _lexicon_offcamera(seg: dict) -> bool:
+    """The L1 lexicon's verdict that a sentence is off-camera audio: a production
+    cue / off-screen line / pure backchannel. Used as the pre-filter before
+    clustering (the VLM speaking-span gate refines the edges afterwards)."""
+    flags = seg.get("flags") or []
+    return any(f in flags for f in _OFFCAMERA_FLAGS) or "backchannel" in flags
+
+
+def _cluster_sentences(sentences: List[dict], cluster_gap_ms: int) -> List[List[dict]]:
+    """Granularity = clustering. Merge adjacent sentences from the same speaker
+    whose inter-sentence silence is shorter than ``cluster_gap_ms`` into one
+    block. Low energy -> big gap -> whole answers; ``cluster_gap_ms == 0`` ->
+    never merge -> each sentence stands alone. Speaker changes always break a
+    cluster (we never fuse two people into one 'answer')."""
+    sents = sorted(sentences, key=lambda s: int(s.get("src_in_ms", 0)))
+    clusters: List[List[dict]] = []
+    for s in sents:
+        if clusters:
+            prev = clusters[-1][-1]
+            gap = int(s.get("src_in_ms", 0)) - int(prev.get("src_out_ms", 0))
+            if s.get("speaker") == prev.get("speaker") and gap < cluster_gap_ms:
+                clusters[-1].append(s)
+                continue
+        clusters.append([s])
+    return clusters
+
+
+def _cluster_span(members: List[dict]) -> Tuple[int, int, int, int, str, Optional[str], List[str]]:
+    """Collapse a cluster of sentences into one rough span: silence-snapped
+    in/out, the raw (un-snapped) envelope for VLM quality lookup, joined text,
+    the speaker, and any quality flags carried up from the members."""
+    in_ms = min(int(s.get("src_in_ms", 0)) for s in members)
+    out_ms = max(int(s.get("src_out_ms", 0)) for s in members)
+    raw_in = min(int(s.get("raw_in_ms", s.get("src_in_ms", 0))) for s in members)
+    raw_out = max(int(s.get("raw_out_ms", s.get("src_out_ms", 0))) for s in members)
+    text = " ".join((s.get("text") or "").strip() for s in members).strip()
+    speaker = members[0].get("speaker")
+    flags = list(dict.fromkeys(
+        f for s in members for f in (s.get("flags") or []) if f in ("noisy", "overlap")))
+    return in_ms, out_ms, raw_in, raw_out, text, speaker, flags
+
+
+def _split_by_pauses(words: List[dict], lo: int, hi: int,
+                     gap_ms: int) -> List[Tuple[int, int, str]]:
+    """Top-of-dial clause split: break a span's words wherever the inter-word
+    pause reaches ``gap_ms``. Each chunk -> (start, end, text). Returns [] when
+    no words fall in the span (caller keeps the whole cluster)."""
+    span = [w for w in words
+            if int(w.get("start_ms", 0)) < hi and int(w.get("end_ms", 0)) > lo]
+    if not span:
+        return []
+    chunks: List[List[dict]] = [[span[0]]]
+    for w in span[1:]:
+        if int(w.get("start_ms", 0)) - int(chunks[-1][-1].get("end_ms", 0)) >= gap_ms:
+            chunks.append([w])
+        else:
+            chunks[-1].append(w)
+    return [(int(c[0]["start_ms"]), int(c[-1]["end_ms"]),
+             " ".join((x.get("text") or "").strip() for x in c).strip())
+            for c in chunks]
 
 
 def _make_speech_hero(
@@ -458,126 +558,71 @@ def _make_speech_hero(
 
 
 def _speech_candidates(
-    clip: _ClipInputs, source: Optional[ss.SpanSource], energy: float
+    clip: _ClipInputs, source: Optional[ss.SpanSource],
+    field: Optional[fseams.FusedField], params: EnergyParams,
 ) -> List[HeroCut]:
-    """Speech heroes anchored on the VLM's understanding of the clip.
+    """Speech heroes from the L1 dialogue sentences, clustered by energy.
 
-    The VLM's speech ``content_units`` define *what one delivered line is* (often
-    spanning several transcript sentences); we snap each unit's boundaries to the
-    L1 silence-snapped dialogue sentences it overlaps, so the cut is clean AND
-    the delivery stays whole instead of being chopped at every sentence period.
-    Energy only sub-splits a multi-sentence unit at high settings.
+    Sentences are the universal base atom -- already silence-snapped, speaker-
+    tagged and off-camera-flagged, and present on every clip (unlike the VLM's
+    content_units, which are often empty on long-form footage). The energy dial
+    sets the granularity by *clustering* them:
 
-    Off-camera audio is dropped two ways: the L1 production-cue lexicon, and --
-    the authoritative signal -- the VLM's visible-speaking spans (audio with no
-    on-camera speaker is a crew cue / off-frame voice). Flub/restart attempts are
-    suppressed. When the VLM never ran, we fall back to the L1 dialogue lens.
+      * low energy  -> merge adjacent same-speaker sentences into whole answers,
+      * mid energy   -> sentences stand alone,
+      * top energy   -> sub-split each sentence into clauses at its pauses.
+
+    Each block's boundaries then flow through the fused seam field for the
+    energy-scaled tightness (snap window + veto-bounded breathing room). Off-
+    camera audio is dropped by the L1 production-cue lexicon and, where the VLM
+    logged them, refined by its visible-speaking spans (edge-trim crew cues,
+    drop wholly off-frame blocks).
     """
     perception = clip.perception or {}
     quality_events = perception.get("take_quality_events") or []
     speaking = perception.get("speaking") or []
-    units = [u for u in (perception.get("content_units") or [])
-             if (u.get("kind") or "").lower() == "speech"]
-    sentences = clip.dialogue.get("sentence") or []
+    sentences = clip.dialogue.get("sentence") or clip.dialogue.get("topic") or []
+    if not sentences:
+        return []
 
-    # Fallback: no VLM speech units -> the old dialogue-lens path (best effort).
-    if not units:
-        return _speech_candidates_from_lens(clip, source, energy, quality_events)
+    usable = [s for s in sentences if not _lexicon_offcamera(s)]
+    if not usable:
+        return []
 
+    words = source.words if source is not None else []
     out: List[HeroCut] = []
-    for u in units:
-        uid = str(u.get("unit_id", "sp"))
-        raw_in, raw_out = int(u.get("start_ms", 0)), int(u.get("end_ms", 0))
-        if raw_out <= raw_in:
-            continue
+    for ci, members in enumerate(_cluster_sentences(usable, params.cluster_gap_ms)):
+        c_in, c_out, raw_in, raw_out, c_text, speaker, flags = _cluster_span(members)
 
-        members = _overlapping_sentences(sentences, raw_in, raw_out)
-        # Off-camera gate. When the VLM logged visible-speaking spans they are the
-        # authority (more reliable than the L1 lexicon, which over-flags): a unit
-        # the speaker is not visibly delivering is off-frame audio / a crew cue.
-        # Only when the VLM gave us nothing do we fall back to the L1 lexicon.
-        if speaking:
-            if _speaking_coverage(speaking, raw_in, raw_out) < SPEAKING_COVERAGE_MIN:
-                continue
-        elif members and all(
-            any(f in (s.get("flags") or []) for f in _OFFCAMERA_FLAGS)
-            or "backchannel" in (s.get("flags") or [])
-            for s in members
-        ):
-            continue
-
-        # Snap to L1 sentence boundaries (clean silence cuts); fall back to raw.
-        if members:
-            in_ms = min(int(s.get("src_in_ms", raw_in)) for s in members)
-            out_ms = max(int(s.get("src_out_ms", raw_out)) for s in members)
-            speaker = members[0].get("speaker")
-            extra = [f for s in members for f in (s.get("flags") or []) if f in ("noisy", "overlap")]
+        # Top-of-dial: fragment the block into clauses at its internal pauses.
+        if params.clause_gap_ms > 0 and words:
+            pieces = _split_by_pauses(words, c_in, c_out, params.clause_gap_ms) \
+                or [(c_in, c_out, c_text)]
         else:
-            in_ms, out_ms, speaker, extra = raw_in, raw_out, None, []
+            pieces = [(c_in, c_out, c_text)]
 
-        # Default keeps the delivered line whole; only high energy fragments it.
-        sub = members if (energy >= ENERGY_SUBSPLIT_THRESHOLD and len(members) > 1) else None
-        if sub:
-            for s in sub:
-                s_in, s_out = int(s.get("src_in_ms", 0)), int(s.get("src_out_ms", 0))
-                s_text = s.get("text") or ""
-                # Trim crew cues bleeding into this sentence's edges (VLM authority).
-                if speaking and source is not None:
-                    tr = _trim_to_speaking(source.words, speaking, s_in, s_out)
-                    if tr:
-                        s_in, s_out, kw = tr
-                        s_text = " ".join((w.get("text") or "").strip() for w in kw).strip()
-                h = _make_speech_hero(
-                    clip, source, quality_events,
-                    f"{uid}:{s.get('seg_id', 's')}",
-                    s_in, s_out,
-                    int(s.get("raw_in_ms", 0)), int(s.get("raw_out_ms", 0)),
-                    s_text, s.get("speaker"),
-                    [f for f in (s.get("flags") or []) if f in ("noisy", "overlap")],
-                )
-                if h:
-                    out.append(h)
-        else:
-            text = " ".join((s.get("text") or "").strip() for s in members).strip() \
-                if members else (u.get("label") or u.get("content_key") or "")
-            # Trim off-camera crew cues (e.g. "go") that the L1 sentence swept in
-            # but the VLM's speaking spans place outside the on-camera delivery.
+        for pi, (p_in, p_out, p_text) in enumerate(pieces):
+            in_ms, out_ms, text = p_in, p_out, (p_text or c_text)
+
+            # Trim off-camera crew cues bleeding into the edges (VLM authority).
             if speaking and source is not None:
                 tr = _trim_to_speaking(source.words, speaking, in_ms, out_ms)
                 if tr:
                     in_ms, out_ms, kw = tr
                     text = " ".join((w.get("text") or "").strip() for w in kw).strip()
+
+            # Drop a block whose audio has no visible speaker (off-frame voice).
+            if speaking and _speaking_coverage(speaking, in_ms, out_ms) < SPEAKING_COVERAGE_MIN:
+                continue
+
+            # Tightness: snap to fused seams + energy-scaled breathing room.
+            in_ms, out_ms = _snap_fused(field, in_ms, out_ms, params, clip.duration_ms)
+
+            uid = f"sp{ci}" if len(pieces) == 1 else f"sp{ci}:{pi}"
             h = _make_speech_hero(clip, source, quality_events, uid,
-                                  in_ms, out_ms, raw_in, raw_out, text,
-                                  speaker, list(dict.fromkeys(extra)))
+                                  in_ms, out_ms, raw_in, raw_out, text, speaker, flags)
             if h:
                 out.append(h)
-    return out
-
-
-def _speech_candidates_from_lens(
-    clip: _ClipInputs, source: Optional[ss.SpanSource], energy: float,
-    quality_events: List[dict],
-) -> List[HeroCut]:
-    """Fallback speech path for clips with no VLM perception: the L1 dialogue
-    lens at the energy-selected granularity, off-camera/backchannel dropped."""
-    level = "sentence" if energy >= ENERGY_SENTENCE_THRESHOLD else "topic"
-    segs = clip.dialogue.get(level) or clip.dialogue.get("topic") or []
-    out: List[HeroCut] = []
-    for seg in segs:
-        flags = list(seg.get("flags") or [])
-        if any(f in flags for f in _OFFCAMERA_FLAGS) or "backchannel" in flags:
-            continue
-        h = _make_speech_hero(
-            clip, source, quality_events, seg.get("seg_id", "sp"),
-            int(seg.get("src_in_ms", 0)), int(seg.get("src_out_ms", 0)),
-            int(seg.get("raw_in_ms", seg.get("src_in_ms", 0))),
-            int(seg.get("raw_out_ms", seg.get("src_out_ms", 0))),
-            seg.get("text") or "", seg.get("speaker"),
-            [f for f in flags if f in ("noisy", "overlap")],
-        )
-        if h:
-            out.append(h)
     return out
 
 
@@ -620,12 +665,13 @@ def _combined_candidates(
     return out
 
 
-def _action_candidates(clip: _ClipInputs, energy: float,
+def _action_candidates(clip: _ClipInputs, params: EnergyParams,
                        field: Optional[fseams.FusedField]) -> List[HeroCut]:
     """Action / visual heroes from the VLM's content_units, snapped through the
     FUSED SEAM FIELD (dialogue/camera vetoes + action/beat attractors) so a cut
-    never lands inside speech. Falls back to the camera-only snapper if the fused
-    field is unavailable. Only fires when the VLM units and motion grid exist."""
+    never lands inside speech and gets the same energy-scaled tightness as
+    speech. Falls back to the camera-only snapper if the fused field is
+    unavailable. Only fires when the VLM units and motion grid exist."""
     if not clip.perception or not clip.motion:
         return []
     units = clip.perception.get("content_units") or []
@@ -640,11 +686,10 @@ def _action_candidates(clip: _ClipInputs, energy: float,
         if raw_out <= raw_in:
             continue
         if field is not None:
-            in_ms, out_ms = fseams.snap_bounds(field, raw_in, raw_out,
-                                               energy=energy, duration_ms=clip.duration_ms)
+            in_ms, out_ms = _snap_fused(field, raw_in, raw_out, params, clip.duration_ms)
         else:
             in_ms, out_ms = _snap_action_bounds(clip.motion, raw_in, raw_out,
-                                                clip.duration_ms, energy)
+                                                clip.duration_ms, params.energy)
         vlm = _vlm_quality_score(quality_events, raw_in, raw_out)
         label = (u.get("label") or u.get("content_key") or kind).strip()
         out.append(HeroCut(
@@ -788,24 +833,27 @@ def _consolidate_speech(heroes: List[HeroCut]) -> List[HeroCut]:
 def build_hero_cuts(file_ids: List[str], energy: float = 0.5) -> List[Dict[str, Any]]:
     """The ranked hero feed for a set of clips.
 
-    `energy` (0..1) is deterministic: it selects speech granularity (topic vs
-    sentence) and tightens action trims. Returns hero dicts sorted best-first.
+    `energy` (0..1) is the single deterministic dial: it sets speech granularity
+    (clustered answers -> sentences -> clauses), cut tightness (loose breathing
+    room -> frame-tight) and whether action+dialogue is fused into one moment.
+    Returns hero dicts sorted best-first.
     """
     if not file_ids:
         return []
-    energy = max(0.0, min(1.0, float(energy)))
+    params = energy_to_params(energy)
 
     inputs = _load_inputs(file_ids)
     sources = ss.load_sources(file_ids)
 
     heroes: List[HeroCut] = []
     for fid, clip in inputs.items():
-        field = _build_field(clip, energy)
-        sp = _speech_candidates(clip, sources.get(fid), energy)
-        ac = _action_candidates(clip, energy, field)
+        field = _build_field(clip, params.energy)
+        sp = _speech_candidates(clip, sources.get(fid), field, params)
+        ac = _action_candidates(clip, params, field)
         heroes.extend(sp)
         heroes.extend(ac)
-        heroes.extend(_combined_candidates(clip, sp, ac))
+        if params.fuse_moments:
+            heroes.extend(_combined_candidates(clip, sp, ac))
 
     heroes = _stack_takes(heroes, file_ids)
     heroes.sort(key=lambda h: h.score, reverse=True)
