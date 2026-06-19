@@ -33,7 +33,34 @@ import webbrowser
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Per-channel render colors (kept in sync with the legend in HTML_TEMPLATE).
-CH_COLORS = {"beat": "#ffb454", "action": "#ff6e9c", "camera": "#56b6ff"}
+CH_COLORS = {"beat": "#ffb454", "action": "#ff6e9c", "camera": "#56b6ff",
+             "fused": "#9d7bff"}
+
+
+def _fused_channel(duration_ms, dialogue, af, md, energy=0.5):
+    """Build the FUSED seam field from whatever component grids exist, as a
+    viz channel (cost + the ranked discrete seams as points)."""
+    from app.services.l1.fused_seams import compute_fused_field
+
+    field = compute_fused_field(
+        duration_ms=duration_ms, energy=energy,
+        dialogue_cost=(dialogue or {}).get("cut_cost"),
+        dialogue_hop=(dialogue or {}).get("hop_ms", 100),
+        dialogue_points=(dialogue or {}).get("cut_points"),
+        camera_cost=(md or {}).get("camera_cut_cost"),
+        action_cost=(md or {}).get("action_cut_cost"),
+        action_points=(md or {}).get("action_points"),
+        motion_hop=(md or {}).get("hop_ms", 100),
+        beat_cost=(af or {}).get("beat_cut_cost"),
+        beat_points=(af or {}).get("beat_cut_points"),
+        beat_hop=(af or {}).get("beat_cut_hop_ms", 100),
+    )
+    return {
+        "label": "FUSED", "color": CH_COLORS["fused"],
+        "hop_ms": field.hop_ms, "cost": field.cost,
+        "points": [{"ts_ms": s.ts_ms, "kind": s.kind, "score": round(s.q, 3)}
+                   for s in field.seams[:80]],
+    }
 
 
 def _load_from_db(file_id: str) -> dict:
@@ -116,6 +143,8 @@ def _load_from_db(file_id: str) -> dict:
             "clip, then retry."
         )
 
+    channels.append(_fused_channel(duration_ms, dialogue, af, md))
+
     return {"name": f["name"], "duration_ms": duration_ms,
             "dialogue": dialogue, "channels": channels}
 
@@ -175,6 +204,12 @@ def _demo_data() -> dict:
         {"label": "camera/distortion", "color": CH_COLORS["camera"], "hop_ms": hop,
          "cost": camera_cost, "points": []},
     ]
+    channels.append(_fused_channel(
+        duration_ms, dialogue,
+        {"beat_cut_cost": beat.cost, "beat_cut_points": beat.points, "beat_cut_hop_ms": beat.hop_ms},
+        {"camera_cut_cost": camera_cost, "action_cut_cost": action_cost,
+         "action_points": [{"ts_ms": t} for t in impacts], "hop_ms": hop},
+    ))
     return {"name": "DEMO — synthetic clip (dialogue+beat real, motion faked)",
             "duration_ms": duration_ms, "dialogue": dialogue, "channels": channels}
 
@@ -233,6 +268,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     <span><i class="sw" style="background:#ffb454"></i>beat</span>
     <span><i class="sw" style="background:#ff6e9c"></i>action</span>
     <span><i class="sw" style="background:#56b6ff"></i>camera/distortion</span>
+    <span><i class="sw" style="background:#9d7bff"></i>FUSED seam field</span>
     <span><i class="sw" style="background:#5b6470"></i>RMS energy</span>
     <span><i class="sw" style="background:#e0533d"></i>filler word</span>
   </div>
