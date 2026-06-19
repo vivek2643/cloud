@@ -120,8 +120,8 @@ def test_take_stacking_collapses_repeats(monkeypatch=None):
 
 
 def test_action_snaps_to_calm_motion_seam():
-    """An action content_unit is snapped to the calmest (lowest camera_cut_cost)
-    frame near each raw boundary, and only fires when motion+perception exist."""
+    """Fallback path (no fused field): an action content_unit is snapped to the
+    calmest (lowest camera_cut_cost) frame near each raw boundary."""
     # hop=100ms; calm (0.05) dips sit at 800ms (idx8) and 2100ms (idx21).
     cost = [0.9] * 30
     cost[8] = 0.05    # calm just before the action -> in-point
@@ -142,13 +142,47 @@ def test_action_snaps_to_calm_motion_seam():
         ], "take_quality_events": []},
         motion=motion,
     )
-    heroes = hc._action_candidates(clip, energy=0.0)
+    heroes = hc._action_candidates(clip, energy=0.0, field=None)
     assert len(heroes) == 1, heroes
     h = heroes[0]
     assert h.modality == "action" and h.label == "hits the ball"
     assert h.src_in_ms == 800, h.src_in_ms
     assert h.src_out_ms == 2100, h.src_out_ms
     print("ok  test_action_snaps_to_calm_motion_seam")
+
+
+def test_action_fused_avoids_speech():
+    """With a fused field present, an action unit whose raw out-point sits inside
+    speech is pulled OUT of the spoken region instead of bleeding into it."""
+    n = 30
+    dlg = [0.0] * n
+    for i in range(18, 26):       # speech (dialogue veto) over 1.8s..2.6s
+        dlg[i] = 1.0
+    action_cost = [1.0] * n
+    action_cost[10] = 0.0          # motion impact at 1.0s (attractor for the in-point)
+    motion = {
+        "hop_ms": 100, "action_energy": [0.7] * n,
+        "action_cut_cost": action_cost, "camera_cut_cost": [0.2] * n, "action_points": [],
+    }
+    clip = hc._ClipInputs(
+        file_id="eeeeeeee-1", duration_ms=3000,
+        dialogue={"topic": [], "sentence": []},
+        perception={"content_units": [
+            {"unit_id": "u1", "kind": "action", "label": "swing",
+             "start_ms": 1000, "end_ms": 2000},  # raw out=2.0s is INSIDE speech
+        ], "take_quality_events": []},
+        motion=motion,
+        audio={"dialogue_cut_cost": dlg, "dialogue_cut_hop_ms": 100, "dialogue_cut_points": [],
+               "beat_cut_cost": [], "beat_cut_hop_ms": 100, "beat_cut_points": []},
+    )
+    field = hc._build_field(clip, energy=0.5)
+    assert field is not None
+    heroes = hc._action_candidates(clip, energy=0.5, field=field)
+    assert len(heroes) == 1, heroes
+    h = heroes[0]
+    assert not (1800 < h.src_out_ms < 2600), h.src_out_ms   # not inside the speech
+    assert h.src_out_ms <= 1800, h.src_out_ms               # trimmed to before it
+    print("ok  test_action_fused_avoids_speech")
 
 
 def test_action_skipped_without_motion():
@@ -161,7 +195,7 @@ def test_action_skipped_without_motion():
         ]},
         motion=None,
     )
-    assert hc._action_candidates(clip, energy=0.5) == []
+    assert hc._action_candidates(clip, energy=0.5, field=None) == []
     print("ok  test_action_skipped_without_motion")
 
 
@@ -170,6 +204,7 @@ def main():
     test_energy_selects_granularity()
     test_take_stacking_collapses_repeats()
     test_action_snaps_to_calm_motion_seam()
+    test_action_fused_avoids_speech()
     test_action_skipped_without_motion()
     print("\nall hero-cuts tests passed")
 

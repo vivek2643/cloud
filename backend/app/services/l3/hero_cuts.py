@@ -8,9 +8,10 @@ artifacts L1/L2/L3 already produced -- no new model call:
     which are already snapped to silence troughs and carry off-camera /
     backchannel flags. Crisp boundaries, the strongest path.
   * ACTION / VISUAL heroes come from the VLM's ``content_units`` (kind = action
-    / visual), with boundaries snapped to the deterministic motion grid
-    (``camera_cut_cost`` troughs = the calmest, most stable frame to cut on).
-    Fuzzier boundaries, as expected without a transcript to lean on.
+    / visual), with boundaries snapped through the FUSED SEAM FIELD -- one grid
+    that fuses dialogue/camera vetoes with action/beat attractors, so an action
+    cut can never land inside a spoken word (the old camera-only snapper bled
+    background dialogue) while still hugging the motion impact.
 
 The split of responsibility (see the design discussion):
   * The VLM PREDICTS what is usable + groups takes (``content_units`` /
@@ -36,6 +37,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from difflib import SequenceMatcher
 
 from app.config import get_settings
+from app.services.l1 import fused_seams as fseams
 from app.services.l3 import score_span as ss
 from app.services.l3.takes import build_take_groups, normalize_key
 
@@ -160,6 +162,7 @@ class _ClipInputs:
     dialogue: Dict[str, list]                # {"sentence": [...], "topic": [...]}
     perception: Optional[dict]
     motion: Optional[dict]                    # motion_dynamics row as a dict
+    audio: Optional[dict] = None             # audio_features cut grids (dialogue/beat)
 
 
 def _load_inputs(file_ids: List[str]) -> Dict[str, _ClipInputs]:
@@ -175,18 +178,22 @@ def _load_inputs(file_ids: List[str]) -> Dict[str, _ClipInputs]:
                    ds.segments,
                    cp.perception,
                    md.hop_ms, md.action_energy, md.action_cut_cost,
-                   md.camera_cut_cost, md.action_points
+                   md.camera_cut_cost, md.action_points,
+                   af.dialogue_cut_cost, af.dialogue_cut_hop_ms, af.dialogue_cut_points,
+                   af.beat_cut_cost, af.beat_cut_hop_ms, af.beat_cut_points
               from files f
               left join dialogue_segments ds on ds.file_id = f.id
               left join clip_perception   cp on cp.file_id = f.id
               left join motion_dynamics   md on md.file_id = f.id
+              left join audio_features    af on af.file_id = f.id
              where f.id = any(%s::uuid[])
             """,
             (file_ids,),
         ).fetchall()
 
     for (fid, dur_s, segments, perception, hop_ms, action_energy,
-         action_cost, camera_cost, action_points) in rows:
+         action_cost, camera_cost, action_points,
+         dlg_cost, dlg_hop, dlg_points, beat_cost, beat_hop, beat_points) in rows:
         seg_doc = _as_doc(segments) or {}
         motion = None
         if hop_ms:
@@ -197,6 +204,16 @@ def _load_inputs(file_ids: List[str]) -> Dict[str, _ClipInputs]:
                 "camera_cut_cost": _as_list(camera_cost),
                 "action_points": _as_list(action_points),
             }
+        audio = None
+        if dlg_cost or beat_cost:
+            audio = {
+                "dialogue_cut_cost": _as_list(dlg_cost),
+                "dialogue_cut_hop_ms": int(dlg_hop) if dlg_hop else 100,
+                "dialogue_cut_points": _as_list(dlg_points),
+                "beat_cut_cost": _as_list(beat_cost),
+                "beat_cut_hop_ms": int(beat_hop) if beat_hop else 100,
+                "beat_cut_points": _as_list(beat_points),
+            }
         out[fid] = _ClipInputs(
             file_id=fid,
             duration_ms=int(float(dur_s) * 1000),
@@ -206,6 +223,7 @@ def _load_inputs(file_ids: List[str]) -> Dict[str, _ClipInputs]:
             },
             perception=_as_doc(perception),
             motion=motion,
+            audio=audio,
         )
     return out
 
@@ -275,6 +293,28 @@ def _action_score(motion: dict, raw_in: int, raw_out: int, vlm: Optional[float])
 # --------------------------------------------------------------------------
 # Boundary snapping (action/visual) -- speech is already snapped by L1
 # --------------------------------------------------------------------------
+
+def _build_field(clip: _ClipInputs, energy: float) -> Optional[fseams.FusedField]:
+    """The fused seam field for a clip: one cut-cost grid composing the dialogue
+    and camera vetoes with the action and beat attractors. None when the clip has
+    neither audio cut grids nor a motion grid (nothing to fuse)."""
+    a, m = clip.audio or {}, clip.motion or {}
+    if not a and not m:
+        return None
+    return fseams.compute_fused_field(
+        duration_ms=clip.duration_ms, energy=energy,
+        dialogue_cost=a.get("dialogue_cut_cost"),
+        dialogue_hop=a.get("dialogue_cut_hop_ms", 100),
+        dialogue_points=a.get("dialogue_cut_points"),
+        camera_cost=m.get("camera_cut_cost"),
+        action_cost=m.get("action_cut_cost"),
+        action_points=m.get("action_points"),
+        motion_hop=m.get("hop_ms", 100),
+        beat_cost=a.get("beat_cut_cost"),
+        beat_points=a.get("beat_cut_points"),
+        beat_hop=a.get("beat_cut_hop_ms", 100),
+    )
+
 
 def _snap_calm(cost: List[float], hop_ms: int, raw_ms: int,
                lo_ms: int, hi_ms: int) -> int:
@@ -517,10 +557,12 @@ def _combined_candidates(
     return out
 
 
-def _action_candidates(clip: _ClipInputs, energy: float) -> List[HeroCut]:
-    """Action / visual heroes from the VLM's content_units, snapped to the
-    deterministic motion grid. Only fires when both the VLM units and the motion
-    grid exist (no transcript anchor for these)."""
+def _action_candidates(clip: _ClipInputs, energy: float,
+                       field: Optional[fseams.FusedField]) -> List[HeroCut]:
+    """Action / visual heroes from the VLM's content_units, snapped through the
+    FUSED SEAM FIELD (dialogue/camera vetoes + action/beat attractors) so a cut
+    never lands inside speech. Falls back to the camera-only snapper if the fused
+    field is unavailable. Only fires when the VLM units and motion grid exist."""
     if not clip.perception or not clip.motion:
         return []
     units = clip.perception.get("content_units") or []
@@ -534,8 +576,12 @@ def _action_candidates(clip: _ClipInputs, energy: float) -> List[HeroCut]:
         raw_in, raw_out = int(u.get("start_ms", 0)), int(u.get("end_ms", 0))
         if raw_out <= raw_in:
             continue
-        in_ms, out_ms = _snap_action_bounds(clip.motion, raw_in, raw_out,
-                                            clip.duration_ms, energy)
+        if field is not None:
+            in_ms, out_ms = fseams.snap_bounds(field, raw_in, raw_out,
+                                               energy=energy, duration_ms=clip.duration_ms)
+        else:
+            in_ms, out_ms = _snap_action_bounds(clip.motion, raw_in, raw_out,
+                                                clip.duration_ms, energy)
         vlm = _vlm_quality_score(quality_events, raw_in, raw_out)
         label = (u.get("label") or u.get("content_key") or kind).strip()
         out.append(HeroCut(
@@ -691,8 +737,9 @@ def build_hero_cuts(file_ids: List[str], energy: float = 0.5) -> List[Dict[str, 
 
     heroes: List[HeroCut] = []
     for fid, clip in inputs.items():
+        field = _build_field(clip, energy)
         sp = _speech_candidates(clip, sources.get(fid), energy)
-        ac = _action_candidates(clip, energy)
+        ac = _action_candidates(clip, energy, field)
         heroes.extend(sp)
         heroes.extend(ac)
         heroes.extend(_combined_candidates(clip, sp, ac))
