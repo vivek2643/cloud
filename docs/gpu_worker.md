@@ -44,6 +44,8 @@ A worker with no `WORKER_QUEUES` set pulls **all** queues (handy for local dev:
 | `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | ✅ | |
 | `R2_BUCKET_NAME` | – | defaults to `aerodrive` |
 | `ANTHROPIC_API_KEY` | – | L3 edit-time reasoning + vision (the editor/director) |
+| `HF_TOKEN` | – | Hugging Face token for the **pyannote** diarization backend (the default). Needed once you've accepted the gated-model licenses (see below). Omit it and diarization falls back to the CPU embedding backend. |
+| `DIARIZATION_BACKEND` | – | `pyannote` (default, GPU), `neural` (Resemblyzer, CPU), or `mfcc`. |
 | `GPU_WORKERS` | – | # of GPU-queue processes (default = detected GPU count) |
 | `CPU_WORKERS` | – | # of render processes (default `2`) |
 | `WORKER_CONCURRENCY` | – | per-process concurrency (default `1`; keep low for VRAM) |
@@ -105,8 +107,26 @@ docker run -d --gpus all --restart unless-stopped \
   --name edso-fleet ghcr.io/<you>/cloud-worker:latest bash run_workers.sh
 ```
 
-Mounting `/models` persists the weights (Whisper/SigLIP) across
+Mounting `/models` persists the weights (Whisper/SigLIP/pyannote) across
 restarts so reboots don't re-download them.
+
+---
+
+## 3b. Enable the pyannote diarization backend (one-time)
+
+The default `DIARIZATION_BACKEND=pyannote` uses gated Hugging Face models. Once
+per HF account:
+
+1. Create a read token at https://huggingface.co/settings/tokens and set
+   `HF_TOKEN=hf_...` in your `.env`.
+2. Accept the license on each gated model page (click "Agree"):
+   - https://huggingface.co/pyannote/speaker-diarization-3.1
+   - https://huggingface.co/pyannote/segmentation-3.0
+
+The first ingest downloads the weights into `/models` (persisted by the volume).
+If `HF_TOKEN` is missing or the licenses aren't accepted, the worker logs a
+warning and **falls back to the `neural` (Resemblyzer) backend** — ingest still
+succeeds, just with the weaker diarizer.
 
 ---
 

@@ -36,6 +36,10 @@ PHRASE_GAP_MS = 250        # gap that breaks a phrase (a breath)
 G_SENTENCE_MS = 350        # max gap bridged inside one sentence
 SENT_L_MAX_MS = 12_000     # cap a sentence clip length
 SENT_L_MIN_MS = 1_200      # below this, try to merge a fragment forward
+# A short tail like "matters" after "...what actually" reads as one line. Rejoin
+# it to the PREVIOUS clip when that clip didn't end on terminal punctuation
+# (i.e. it's grammatically unfinished) and the pause between them is modest.
+REJOIN_FRAGMENT_GAP_MS = 1_000
 TOPIC_GAP_MS = 1_200       # gap that starts a new topic
 BACKCHANNEL_MAX_MS = 1_000 # an interjection this short can be bridged
 
@@ -281,9 +285,10 @@ def _merge_short_forward(units: List[_Unit]) -> List[_Unit]:
         u = units[i]
         dur = u.raw_out_ms - u.raw_in_ms
         complete = u.text.strip().endswith(SENTENCE_FINAL)
+        short = dur < SENT_L_MIN_MS and not u.is_backchannel and not complete
+        # Forward: a short head folds into the next same-speaker unit.
         if (
-            dur < SENT_L_MIN_MS and not u.is_backchannel and not complete
-            and i + 1 < len(units)
+            short and i + 1 < len(units)
             and units[i + 1].speaker == u.speaker
             and units[i + 1].raw_in_ms - u.raw_out_ms <= G_SENTENCE_MS
         ):
@@ -296,6 +301,20 @@ def _merge_short_forward(units: List[_Unit]) -> List[_Unit]:
             )
             out.append(merged)
             i += 2
+            continue
+        # Backward: a short tail rejoins the previous clip when that clip is
+        # grammatically unfinished (no terminal punctuation) -- "matters" after
+        # "...what actually". Bounded gap so two real sentences never fuse.
+        if (
+            short and out
+            and out[-1].speaker == u.speaker
+            and not out[-1].text.strip().endswith(SENTENCE_FINAL)
+            and u.raw_in_ms - out[-1].raw_out_ms <= REJOIN_FRAGMENT_GAP_MS
+        ):
+            prev = out[-1]
+            prev.raw_out_ms = u.raw_out_ms
+            prev.text = (prev.text + " " + u.text).strip()
+            i += 1
             continue
         out.append(u)
         i += 1

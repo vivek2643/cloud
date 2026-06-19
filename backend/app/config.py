@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import List
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 
@@ -27,13 +28,24 @@ class Settings(BaseSettings):
     # L1 guardrail: anything longer than this just gets S1 (proxy + thumb).
     max_l1_duration_seconds: int = 3600
 
-    # L1 Stage 6: CPU speaker diarization (who-says-what). Labels each word with
-    # a per-file speaker id ("S0", "S1", ...). "mfcc" is the dependency-free
-    # default (librosa + sklearn, no GPU, no model download); a stronger
-    # backend (ecapa / pyannote) can be slotted in later behind this flag.
+    # L1 Stage 6: speaker diarization (who-says-what). Labels each word with a
+    # per-file speaker id ("S0", "S1", ...). Backends, strongest first:
+    #   "pyannote" (default) -- pyannote.audio 3.1 (VAD + neural segmentation +
+    #       overlap-aware resegmentation). GPU when present; needs HF_TOKEN and a
+    #       one-time license acceptance for the gated models. Falls back to the
+    #       embedding path below if unavailable (no token / not installed).
+    #   "neural" -- Resemblyzer GE2E d-vectors + agglomerative clustering
+    #       (ships its weights, CPU-only, no token). The fallback authority.
+    #   "mfcc"   -- classical MFCC+pitch, fully dependency-free.
     enable_diarization: bool = True
-    diarization_backend: str = "neural"
+    diarization_backend: str = "pyannote"
     diarization_max_speakers: int = 8
+    # Hugging Face access token (env HF_TOKEN). Required only for the pyannote
+    # backend's gated models; empty on CPU/local dev triggers the neural fallback.
+    huggingface_token: str = Field(
+        default="",
+        validation_alias=AliasChoices("HF_TOKEN", "HUGGINGFACE_TOKEN", "huggingface_token"),
+    )
 
     # Anthropic credentials (used by the L3 edit orchestrator).
     anthropic_api_key: str = ""

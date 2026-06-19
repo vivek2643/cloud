@@ -14,11 +14,12 @@ ENV PYTHONUNBUFFERED=1 \
     TORCH_HOME=/models
 
 # System libs: ffmpeg (transcode/slice), libGL + glib (opencv-headless),
-# git (some pip deps fetch from VCS).
+# libsndfile1 (soundfile/torchaudio I/O used by pyannote), git (VCS pip deps).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         libgl1 \
         libglib2.0-0 \
+        libsndfile1 \
         git \
     && rm -rf /var/lib/apt/lists/*
 

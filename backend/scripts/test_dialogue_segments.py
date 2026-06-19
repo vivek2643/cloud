@@ -166,6 +166,48 @@ def test_offscreen_loudness_flag():
     print("ok: isolated off-mic (quiet) speech flagged offscreen")
 
 
+def test_diarization_smooths_phantom_speaker_blips():
+    from app.services.l1 import diarization as dz
+    # Trailing word flipped to a phantom S1 -> folds back into S0 ("matters").
+    words = [
+        {"start_ms": 0, "end_ms": 400}, {"start_ms": 450, "end_ms": 900},
+        {"start_ms": 950, "end_ms": 1400}, {"start_ms": 2000, "end_ms": 2400},
+    ]
+    spk = ["S0", "S0", "S0", "S1"]
+    dz._smooth_speakers(words, spk)
+    assert spk == ["S0", "S0", "S0", "S0"], spk
+    # A sandwiched 1-word other-speaker blip also collapses.
+    words2 = [{"start_ms": i * 500, "end_ms": i * 500 + 400} for i in range(5)]
+    spk2 = ["S0", "S0", "S1", "S0", "S0"]
+    dz._smooth_speakers(words2, spk2)
+    assert spk2 == ["S0"] * 5, spk2
+    # A genuine, long second-speaker turn is NOT smoothed away.
+    words3 = [{"start_ms": i * 600, "end_ms": i * 600 + 500} for i in range(6)]
+    spk3 = ["S0", "S0", "S1", "S1", "S1", "S0"]
+    dz._smooth_speakers(words3, spk3)
+    assert spk3 == ["S0", "S0", "S1", "S1", "S1", "S0"], spk3
+    print("ok: diarization folds phantom trailing/sandwiched blips, keeps real turns")
+
+
+def test_rejoin_trailing_fragment():
+    # "...what actually" (unfinished) + a 0.5s "matters" tail after a ~700ms pause.
+    words = [
+        _w(2000, 2400, "what", "S0"), _w(2430, 3600, "actually", "S0"),
+        _w(4300, 4800, "matters", "S0"),
+    ]
+    out = d.build_dialogue_segments(words, wav_path=None)
+    texts = [s["text"] for s in out["sentence"]]
+    assert len(texts) == 1 and "actually matters" in texts[0], texts
+    # But a finished previous line (terminal punctuation) does NOT absorb a tail.
+    words2 = [
+        _w(2000, 2400, "Done", "S0"), _w(2430, 3600, "already.", "S0"),
+        _w(4300, 4800, "Matters", "S0"),
+    ]
+    out2 = d.build_dialogue_segments(words2, wav_path=None)
+    assert len(out2["sentence"]) == 2, [s["text"] for s in out2["sentence"]]
+    print("ok: short tail rejoins an unfinished line; a finished line stays split")
+
+
 def main():
     test_phrases_split_on_speaker_and_gap()
     test_sentences_break_on_punctuation_and_speaker()
@@ -175,6 +217,8 @@ def main():
     test_end_to_end_silent_envelope()
     test_production_cue_flagged_and_kept_out_of_topics()
     test_offscreen_loudness_flag()
+    test_diarization_smooths_phantom_speaker_blips()
+    test_rejoin_trailing_fragment()
     print("\nALL DIALOGUE SEGMENT TESTS PASSED")
 
 

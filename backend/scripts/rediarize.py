@@ -1,26 +1,29 @@
 """
-Backfill: re-run speaker diarization with the NEURAL backend on already-analyzed
-clips, then re-run the (cheap, no-Gemini) L2 audio/visual speaker fusion so the
-person<->voice links match the new speaker ids.
+Backfill: re-run speaker diarization on already-analyzed clips (default backend =
+the configured DIARIZATION_BACKEND, i.e. pyannote), rebuild the Dialogues lens
+from the new speakers, then re-run the (cheap, no-Gemini) L2 audio/visual speaker
+fusion + off-camera flagging so everything matches the new speaker ids.
 
-Why: the classical MFCC+pitch diarizer collapses two same-gender speakers into a
-single "S0" (silhouette < gate), which made a two-way interview look like a
-monologue downstream. The neural d-vector backend separates them. This script
-reuses each clip's proxy audio + existing transcript words; it does NOT re-run
-Whisper or Gemini.
+Why: the old homemade clusterer mislabels short words (a sentence tail flips to a
+phantom S0/S1) and collapses same-gender speakers. The pyannote backend is a real
+diarization pipeline (VAD + neural segmentation + overlap-aware resegmentation).
+This script reuses each clip's proxy audio + existing transcript words; it does
+NOT re-run Whisper or Gemini.
 
 For each file:
   1. download the proxy, demux a 16 kHz wav
-  2. diarize(words, backend="neural") -> per-word speaker ids
+  2. diarize(words, backend=...) -> per-word speaker ids (smoothed)
   3. write speakers back into transcripts.segments
-  4. reload the L2 perception, clear stale voice links, re-fuse against the new
-     turns, and persist
+  4. rebuild dialogue_segments (sentence + topic) from the new words
+  5. reload the L2 perception, clear stale voice links, re-fuse against the new
+     turns, re-apply the off-camera flag, and persist
 
 Usage:
   cd backend && .venv/bin/python scripts/rediarize.py                # all clips with a transcript
   cd backend && .venv/bin/python scripts/rediarize.py <file_id> ...  # specific clips
   cd backend && .venv/bin/python scripts/rediarize.py --thread <id>  # a thread's clips
   add --min-speakers 2 to force >=2 clusters (e.g. known multicam interview)
+  add --backend neural to force the CPU fallback (e.g. no HF token locally)
 """
 from __future__ import annotations
 
@@ -109,11 +112,46 @@ def _refuse(file_id: str, min_conf_clear: bool = True) -> str:
             "update clip_perception set perception=%s::jsonb where file_id=%s",
             (json.dumps(perc.model_dump(mode="json")), file_id),
         )
+    # Re-apply the off-camera flag now that the on-camera voice set is known.
+    try:
+        from app.services.l2.perception import _flag_offscreen_dialogue
+        _flag_offscreen_dialogue(file_id, perc)
+    except Exception as e:  # noqa: BLE001
+        print(f"    (offscreen flagging skipped: {type(e).__name__}: {e})")
     links = [(p.local_id, p.voice_speaker_id) for p in perc.persons if p.voice_speaker_id]
     return f"refused -> links {links}" if links else "refused -> no confident links"
 
 
-def rediarize_one(file_id: str, min_speakers: int, max_speakers: int) -> None:
+def _rebuild_dialogue(file_id: str, flat: list, wav_path: str) -> None:
+    """Rebuild the Dialogues-lens selects from the freshly-diarized words so the
+    smoothed speakers + fragment-rejoin take effect on already-analyzed clips."""
+    from app.services.l1 import dialogue_segments as dlg_mod
+
+    words = [
+        {
+            "start_ms": w.get("start_ms", 0), "end_ms": w.get("end_ms", 0),
+            "text": w.get("text", ""), "is_filler": w.get("is_filler", False),
+            "speaker": w.get("speaker"),
+        }
+        for w in flat
+    ]
+    result = dlg_mod.build_dialogue_segments(words, wav_path)
+    with _pg_conn() as c:
+        c.execute(
+            """
+            insert into dialogue_segments (file_id, schema_version, segments)
+            values (%s, %s, %s::jsonb)
+            on conflict (file_id) do update set
+                schema_version = excluded.schema_version,
+                segments = excluded.segments,
+                created_at = now()
+            """,
+            (file_id, dlg_mod.SCHEMA_VERSION, json.dumps(result)),
+        )
+
+
+def rediarize_one(file_id: str, min_speakers: int, max_speakers: int,
+                  backend: str) -> None:
     with _pg_conn() as c:
         frow = c.execute("select name, r2_proxy_key, r2_key from files where id=%s",
                          (file_id,)).fetchone()
@@ -134,18 +172,21 @@ def rediarize_one(file_id: str, min_speakers: int, max_speakers: int) -> None:
         src = os.path.join(td, "src"); wav = os.path.join(td, "a.wav")
         _download_from_r2(src_key, src)
         _demux_wav(src, wav)
-        res = diar_mod.diarize(wav, flat, backend="neural",
+        res = diar_mod.diarize(wav, flat, backend=backend,
                                min_speakers=min_speakers, max_speakers=max_speakers)
 
-    spk = res.speaker_by_word
-    if not spk or len(spk) != len(refs):
-        print(f"  {file_id[:8]} {name:22} diarize returned nothing usable"); return
-    for w, s in zip(refs, spk):
-        if s is not None:
-            w["speaker"] = s
-    with _pg_conn() as c:
-        c.execute("update transcripts set segments=%s::jsonb where file_id=%s",
-                  (json.dumps(segments), file_id))
+        spk = res.speaker_by_word
+        if not spk or len(spk) != len(refs):
+            print(f"  {file_id[:8]} {name:22} diarize returned nothing usable"); return
+        for w, s in zip(refs, spk):
+            if s is not None:
+                w["speaker"] = s
+        with _pg_conn() as c:
+            c.execute("update transcripts set segments=%s::jsonb where file_id=%s",
+                      (json.dumps(segments), file_id))
+        # Rebuild the Dialogues lens while the wav is still on disk (needs it for
+        # silence-snapped cut points).
+        _rebuild_dialogue(file_id, flat, wav)
 
     # turn count per speaker for a quick sanity readout
     from collections import Counter
@@ -163,16 +204,22 @@ def main() -> None:
     ap.add_argument("--max-speakers", type=int, default=8,
                     help="upper bound on clusters (cap to the real cast size to "
                          "stop one voice splitting into spurious extras)")
+    ap.add_argument("--backend", default=None,
+                    help="diarization backend: pyannote | neural | mfcc "
+                         "(default: the configured DIARIZATION_BACKEND)")
     args = ap.parse_args()
+
+    from app.config import get_settings
+    backend = args.backend or get_settings().diarization_backend
 
     ids = _resolve_file_ids(args)
     if not ids:
         print("no files to process"); return
-    print(f"re-diarizing {len(ids)} clip(s) with the neural backend "
+    print(f"re-diarizing {len(ids)} clip(s) with the {backend!r} backend "
           f"(min_speakers={args.min_speakers}, max_speakers={args.max_speakers}):")
     for fid in ids:
         try:
-            rediarize_one(fid, args.min_speakers, args.max_speakers)
+            rediarize_one(fid, args.min_speakers, args.max_speakers, backend)
         except Exception as e:  # noqa: BLE001
             print(f"  {fid[:8]}  FAILED: {type(e).__name__}: {e}")
     print("done.")
