@@ -33,14 +33,19 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from difflib import SequenceMatcher
+
 from app.config import get_settings
 from app.services.l3 import score_span as ss
-from app.services.l3.takes import (
-    Attempt,
-    MIN_KEY_TOKENS,
-    cluster_attempts,
-    normalize_key,
-)
+from app.services.l3.takes import build_take_groups, normalize_key
+
+# Cross-file consolidation: collapse heroes whose *displayed line* is the same
+# scripted line shot as separate takes. Strict on purpose -- high ratio + a
+# length guard + a token floor -- so distinct sentences never merge (this is the
+# pass that must not regress into the old fuzzy over-merge).
+_MERGE_RATIO = 0.90
+_MERGE_MIN_TOKENS = 4
+_MERGE_LEN_RATIO = 0.7
 
 logger = logging.getLogger(__name__)
 
@@ -375,47 +380,122 @@ def _action_candidates(clip: _ClipInputs, energy: float) -> List[HeroCut]:
 # Take stacking: collapse repeats into one hero, best in front
 # --------------------------------------------------------------------------
 
-def _stack_takes(heroes: List[HeroCut]) -> List[HeroCut]:
-    """Group near-duplicate speech heroes (same line said twice) into one hero
-    carrying its alternates. Reuses the content-key clustering from l3.takes.
-    Action/visual heroes are not text-comparable, so they pass through."""
+def _overlap_ms(a0: int, a1: int, b0: int, b1: int) -> int:
+    return max(0, min(a1, b1) - max(a0, b0))
+
+
+def _stack_takes(heroes: List[HeroCut], file_ids: List[str]) -> List[HeroCut]:
+    """Collapse re-delivered content into one hero carrying its alternates.
+
+    The grouping is *not* re-derived here -- it comes from `l3.takes`, the same
+    authoritative source the rest of the system uses. `build_take_groups` finds
+    deliveries of the same content via the VLM's content_keys and restart
+    markers (and a transcript-sentence fallback), and only returns groups with
+    >= 2 real attempts. We map each attempt onto the speech hero it overlaps and
+    fold the losers into the winner's `alt_takes`. This is conservative on
+    purpose: it avoids the fuzzy-text over-merging that previously hid dozens of
+    distinct sentences behind a single card.
+
+    Action/visual heroes are not take-comparable, so they pass through.
+    """
     speech = [h for h in heroes if h.modality == "speech"]
     others = [h for h in heroes if h.modality != "speech"]
+    if not speech:
+        return heroes
 
-    # Build Attempts keyed by normalized text so the clusterer can match.
-    by_id: Dict[str, HeroCut] = {}
-    attempts: List[Attempt] = []
+    by_file: Dict[str, List[HeroCut]] = {}
     for h in speech:
-        key = normalize_key(h.label)
-        if len(key.split()) < MIN_KEY_TOKENS:
-            # Too generic to group reliably -> stands alone.
-            by_id[h.hero_id] = h
-            attempts.append(Attempt(
-                attempt_id=h.hero_id, file_id=h.file_id, unit_id=h.hero_id,
-                start_ms=h.src_in_ms, end_ms=h.src_out_ms, kind="speech",
-                content_key=h.hero_id, text=h.label,
-            ))
-            continue
-        by_id[h.hero_id] = h
-        attempts.append(Attempt(
-            attempt_id=h.hero_id, file_id=h.file_id, unit_id=h.hero_id,
-            start_ms=h.src_in_ms, end_ms=h.src_out_ms, kind="speech",
-            content_key=key, text=h.label,
-        ))
+        by_file.setdefault(h.file_id, []).append(h)
 
+    def hero_for(att) -> Optional[HeroCut]:
+        best, best_ov = None, 0
+        for h in by_file.get(att.file_id, []):
+            ov = _overlap_ms(h.src_in_ms, h.src_out_ms, att.start_ms, att.end_ms)
+            if ov > best_ov:
+                best, best_ov = h, ov
+        return best
+
+    consumed: set[str] = set()
     stacked: List[HeroCut] = []
-    for group in cluster_attempts(attempts):
-        members = [by_id[a.attempt_id] for a in group.attempts]
-        members.sort(key=lambda h: h.score, reverse=True)
-        best = members[0]
-        best.take_count = len(members)
-        best.alt_takes = [
-            HeroTake(m.file_id, m.src_in_ms, m.src_out_ms, m.score)
-            for m in members[1:]
-        ]
-        stacked.append(best)
+    for group in build_take_groups(file_ids):
+        # Pair every attempt with the hero it overlaps (or None -> raw span).
+        members = [(hero_for(a), a) for a in group.attempts]
+        # The front of the stack is the best-scored hero among the deliveries.
+        candidates = [h for h, _ in members if h is not None and h.hero_id not in consumed]
+        if not candidates:
+            continue
+        front = max(candidates, key=lambda h: h.score)
+        front_att_id = next(a.attempt_id for h, a in members if h is front)
 
-    return stacked + others
+        alts: List[HeroTake] = []
+        for h, a in members:
+            if a.attempt_id == front_att_id:
+                continue
+            if h is not None and h is not front:
+                alts.append(HeroTake(h.file_id, h.src_in_ms, h.src_out_ms, h.score))
+                consumed.add(h.hero_id)
+            else:
+                # A delivery with no distinct hero (e.g. a restart sub-span of
+                # the front line): expose it as a raw alternate span.
+                alts.append(HeroTake(a.file_id, a.start_ms, a.end_ms, 0.0))
+        if not alts:
+            continue
+        front.take_count = 1 + len(alts)
+        front.alt_takes = sorted(alts, key=lambda t: t.score, reverse=True)
+        consumed.add(front.hero_id)
+        stacked.append(front)
+
+    solo = [h for h in speech if h.hero_id not in consumed]
+    # Second pass: collapse remaining heroes that show the *same line* (scripted
+    # repeats across takes/files) which content-key grouping missed.
+    speech_out = _consolidate_speech(stacked + solo)
+    return speech_out + others
+
+
+def _strict_same_line(a: str, b: str) -> bool:
+    """True when two displayed lines are the same scripted line (take of each
+    other): high text ratio, similar length, and long enough to be meaningful."""
+    ta, tb = a.split(), b.split()
+    if len(ta) < _MERGE_MIN_TOKENS or len(tb) < _MERGE_MIN_TOKENS:
+        return False
+    if min(len(ta), len(tb)) / max(len(ta), len(tb)) < _MERGE_LEN_RATIO:
+        return False
+    return SequenceMatcher(None, a, b).ratio() >= _MERGE_RATIO
+
+
+def _consolidate_speech(heroes: List[HeroCut]) -> List[HeroCut]:
+    """Greedy, strict merge of heroes that present the same line. Folds losers
+    (and their existing alternates) into the highest-scoring hero's stack."""
+    groups: List[List[HeroCut]] = []
+    keys: List[str] = []
+    for h in heroes:
+        k = normalize_key(h.label)
+        placed = False
+        for gi, gk in enumerate(keys):
+            if _strict_same_line(k, gk):
+                groups[gi].append(h)
+                placed = True
+                break
+        if not placed:
+            groups.append([h])
+            keys.append(k)
+
+    out: List[HeroCut] = []
+    for g in groups:
+        if len(g) == 1:
+            out.append(g[0])
+            continue
+        front = max(g, key=lambda h: h.score)
+        alts: List[HeroTake] = list(front.alt_takes)
+        for m in g:
+            if m is front:
+                continue
+            alts.append(HeroTake(m.file_id, m.src_in_ms, m.src_out_ms, m.score))
+            alts.extend(m.alt_takes)
+        front.alt_takes = sorted(alts, key=lambda t: t.score, reverse=True)
+        front.take_count = 1 + len(front.alt_takes)
+        out.append(front)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -440,6 +520,6 @@ def build_hero_cuts(file_ids: List[str], energy: float = 0.5) -> List[Dict[str, 
         heroes.extend(_speech_candidates(clip, sources.get(fid), energy))
         heroes.extend(_action_candidates(clip, energy))
 
-    heroes = _stack_takes(heroes)
+    heroes = _stack_takes(heroes, file_ids)
     heroes.sort(key=lambda h: h.score, reverse=True)
     return [h.to_dict() for h in heroes]

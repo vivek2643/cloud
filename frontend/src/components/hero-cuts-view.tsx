@@ -5,7 +5,7 @@ import { useAuthStore } from "@/stores/auth-store";
 import { useDriveStore } from "@/stores/drive-store";
 import { FileIcon } from "./file-icon";
 import {
-  getHeroCuts,
+  getHeroCutsFeed,
   getFilePlaybackUrl,
   type HeroCut,
   type HeroModality,
@@ -36,7 +36,7 @@ export function HeroCutsView() {
   const token = useAuthStore((s) => s.session?.access_token);
   const files = useDriveStore((s) => s.files);
   const [energy, setEnergy] = useState(0.5);
-  const [data, setData] = useState<Record<string, HeroCut[]>>({});
+  const [heroes, setHeroes] = useState<HeroCut[]>([]);
   const [loading, setLoading] = useState(false);
   const urlCache = useRef<Record<string, Promise<string | null>>>({});
 
@@ -47,33 +47,42 @@ export function HeroCutsView() {
       ),
     [files]
   );
+  const filesById = useMemo(() => {
+    const m: Record<string, FileRecord> = {};
+    for (const f of files) m[f.id] = f;
+    return m;
+  }, [files]);
 
-  // Refetch the feed whenever the clip set or the (debounced) energy changes.
+  // One combined feed across every ready clip, so repeated takes of the same
+  // content stack across files. Refetch on clip-set / (debounced) energy change.
+  const candidateIds = useMemo(() => candidates.map((f) => f.id), [candidates]);
+  const candidateKey = candidateIds.join(",");
   useEffect(() => {
-    if (!token || candidates.length === 0) {
-      setData({});
+    if (!token || candidateIds.length === 0) {
+      setHeroes([]);
       return;
     }
     let cancelled = false;
     setLoading(true);
     const t = setTimeout(() => {
-      Promise.allSettled(
-        candidates.map((f) => getHeroCuts(f.id, energy, token))
-      ).then((results) => {
-        if (cancelled) return;
-        const next: Record<string, HeroCut[]> = {};
-        results.forEach((r, i) => {
-          if (r.status === "fulfilled") next[candidates[i].id] = r.value.heroes ?? [];
+      getHeroCutsFeed(candidateIds, energy, token)
+        .then((r) => {
+          if (cancelled) return;
+          setHeroes(r.heroes ?? []);
+          setLoading(false);
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setHeroes([]);
+          setLoading(false);
         });
-        setData(next);
-        setLoading(false);
-      });
     }, 250);
     return () => {
       cancelled = true;
       clearTimeout(t);
     };
-  }, [token, candidates, energy]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, candidateKey, energy]);
 
   const getUrl = useCallback(
     (fileId: string): Promise<string | null> => {
@@ -88,10 +97,8 @@ export function HeroCutsView() {
     [token]
   );
 
-  const sections = candidates
-    .map((f) => ({ file: f, heroes: data[f.id] ?? [] }))
-    .filter((s) => s.heroes.length > 0);
-  const totalClips = sections.reduce((n, s) => n + s.heroes.length, 0);
+  const visible = heroes.filter((h) => filesById[h.file_id]);
+  const totalClips = visible.length;
 
   return (
     <div>
@@ -131,7 +138,7 @@ export function HeroCutsView() {
         </p>
       )}
 
-      {!loading && sections.length === 0 && (
+      {!loading && totalClips === 0 && (
         <div className="flex flex-col items-center justify-center py-24 text-center">
           <Star size={36} style={{ color: "var(--accent)" }} />
           <p className="mt-4 text-lg font-semibold">No hero cuts yet</p>
@@ -142,22 +149,18 @@ export function HeroCutsView() {
         </div>
       )}
 
-      {!loading &&
-        sections.map(({ file, heroes }) => (
-          <section key={file.id} className="mb-8">
-            <h3
-              className="mb-3 truncate text-xs font-semibold uppercase tracking-wider"
-              style={{ color: "var(--muted)" }}
-            >
-              {file.name}
-            </h3>
-            <div className="grid grid-cols-2 gap-4 md:grid-cols-3 2xl:grid-cols-4">
-              {heroes.map((h) => (
-                <HeroClipCard key={h.hero_id} file={file} hero={h} getUrl={getUrl} />
-              ))}
-            </div>
-          </section>
-        ))}
+      {!loading && totalClips > 0 && (
+        <div className="grid grid-cols-2 gap-4 md:grid-cols-3 2xl:grid-cols-4">
+          {visible.map((h) => (
+            <HeroClipCard
+              key={h.hero_id}
+              file={filesById[h.file_id]!}
+              hero={h}
+              getUrl={getUrl}
+            />
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -281,10 +284,28 @@ function HeroClipCard({
   }
 
   return (
-    <div
-      className="group relative flex flex-col overflow-hidden rounded-xl border transition-colors hover:border-[var(--accent)]"
-      style={{ borderColor: "var(--border)", background: "var(--background)" }}
-    >
+    <div className="relative">
+      {/* Stacked-take pile: best in front, alternates peeking out behind. */}
+      {hero.take_count > 1 && (
+        <>
+          <div
+            aria-hidden
+            className="pointer-events-none absolute inset-0 translate-x-1.5 translate-y-1.5 rounded-xl border"
+            style={{ borderColor: "var(--border)", background: "var(--background)", zIndex: 0 }}
+          />
+          {hero.take_count > 2 && (
+            <div
+              aria-hidden
+              className="pointer-events-none absolute inset-0 translate-x-3 translate-y-3 rounded-xl border"
+              style={{ borderColor: "var(--border)", background: "var(--background)", opacity: 0.6, zIndex: 0 }}
+            />
+          )}
+        </>
+      )}
+      <div
+        className="group relative z-[1] flex flex-col overflow-hidden rounded-xl border transition-colors hover:border-[var(--accent)]"
+        style={{ borderColor: "var(--border)", background: "var(--background)" }}
+      >
       <div
         onMouseEnter={handleEnter}
         onMouseLeave={handleLeave}
@@ -374,10 +395,14 @@ function HeroClipCard({
         </span>
       </div>
 
-      <div className="p-2.5">
-        <p className="line-clamp-2 text-sm leading-snug" style={{ minHeight: "2.5em" }}>
-          {hero.label || <em style={{ color: "var(--muted)" }}>(no label)</em>}
-        </p>
+        <div className="p-2.5">
+          <p className="line-clamp-2 text-sm leading-snug" style={{ minHeight: "2.5em" }}>
+            {hero.label || <em style={{ color: "var(--muted)" }}>(no label)</em>}
+          </p>
+          <p className="mt-1 truncate text-[11px]" style={{ color: "var(--muted)" }}>
+            {file.name}
+          </p>
+        </div>
       </div>
     </div>
   );

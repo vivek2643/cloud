@@ -184,6 +184,16 @@ export function getHeroCuts(fileId: string, energy: number, token: string) {
   );
 }
 
+// One combined feed across many clips: repeated takes of the same content stack
+// across files (best in front), instead of one isolated feed per file.
+export function getHeroCutsFeed(fileIds: string[], energy: number, token: string) {
+  return request<HeroCutsResponse>(`/api/files/hero-cuts`, {
+    method: "POST",
+    token,
+    body: JSON.stringify({ file_ids: fileIds, energy }),
+  });
+}
+
 // --- Upload ---
 
 export interface PresignResponse {

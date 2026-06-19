@@ -1,12 +1,18 @@
 from __future__ import annotations
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from app.auth import get_current_user_id
 from app.services.supabase_client import get_supabase
 from app.services.r2 import generate_presigned_get
 from app.models.schemas import FileResponse, FileUpdate, FileMoveRequest
 
 router = APIRouter(prefix="/api/files", tags=["files"])
+
+
+class HeroCutsFeedRequest(BaseModel):
+    file_ids: List[str] = Field(default_factory=list)
+    energy: float = Field(0.5, ge=0.0, le=1.0)
 
 
 @router.get("", response_model=List[FileResponse])
@@ -191,6 +197,32 @@ def get_hero_cuts(
 
     heroes = build_hero_cuts([file_id], energy=energy)
     return {"heroes": heroes, "energy": energy, "ready": bool(heroes)}
+
+
+@router.post("/hero-cuts")
+def get_hero_cuts_feed(
+    payload: HeroCutsFeedRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """One combined hero-cuts feed across many clips, so repeated takes of the
+    same content stack across files (best in front). Ownership is verified for
+    every requested file; unknown/foreign ids are dropped."""
+    file_ids = list(dict.fromkeys(payload.file_ids or []))
+    if not file_ids:
+        return {"heroes": [], "energy": payload.energy, "ready": False}
+
+    sb = get_supabase()
+    owned = (
+        sb.table("files").select("id").eq("user_id", user_id).in_("id", file_ids).execute()
+    )
+    owned_ids = [r["id"] for r in (owned.data or [])]
+    if not owned_ids:
+        raise HTTPException(status_code=404, detail="No matching files")
+
+    from app.services.l3.hero_cuts import build_hero_cuts
+
+    heroes = build_hero_cuts(owned_ids, energy=payload.energy)
+    return {"heroes": heroes, "energy": payload.energy, "ready": bool(heroes)}
 
 
 @router.get("/{file_id}/l1")

@@ -88,18 +88,34 @@ def test_energy_selects_granularity():
     print("ok  test_energy_selects_granularity")
 
 
-def test_take_stacking_collapses_repeats():
-    """The same line delivered twice becomes ONE hero with take_count=2, the
-    higher-scoring delivery in front."""
-    a = hc.HeroCut("h1", "f1", "speech", "the product changes everything for you", 0, 2000, score=0.6)
-    b = hc.HeroCut("h2", "f2", "speech", "the product changes everything for you", 0, 2000, score=0.9)
-    c = hc.HeroCut("h3", "f3", "speech", "a totally different sentence about pricing", 0, 2000, score=0.7)
-    stacked = hc._stack_takes([a, b, c])
+def test_take_stacking_collapses_repeats(monkeypatch=None):
+    """A take group (from l3.takes) of two deliveries collapses into ONE hero
+    with take_count=2, higher-scoring delivery in front, loser as an alt. An
+    unrelated hero stays solo. Stacking maps the group's attempts onto heroes by
+    time-overlap, so `build_take_groups` is stubbed to isolate the fold logic."""
+    from app.services.l3 import takes as tk
+
+    a = hc.HeroCut("h1", "fff", "speech", "the product changes everything", 1000, 2000, score=0.6)
+    b = hc.HeroCut("h2", "fff", "speech", "the product changes everything", 5000, 6000, score=0.9)
+    c = hc.HeroCut("h3", "fff", "speech", "a different sentence about pricing", 8000, 9000, score=0.7)
+
+    group = tk.TakeGroup(group_id="tg1", content_key="product changes everything", attempts=[
+        tk.Attempt("fff:u1:0", "fff", "u1", 1000, 2000, "speech", "product changes everything", "...", False),
+        tk.Attempt("fff:u2:0", "fff", "u2", 5000, 6000, "speech", "product changes everything", "...", False),
+    ])
+    orig = hc.build_take_groups
+    hc.build_take_groups = lambda file_ids: [group]
+    try:
+        stacked = hc._stack_takes([a, b, c], ["fff"])
+    finally:
+        hc.build_take_groups = orig
+
     assert len(stacked) == 2, [h.label for h in stacked]
     repeated = next(h for h in stacked if "product" in h.label)
     assert repeated.take_count == 2
     assert repeated.score == 0.9            # best in front
     assert len(repeated.alt_takes) == 1 and repeated.alt_takes[0].score == 0.6
+    assert any("pricing" in h.label and h.take_count == 1 for h in stacked)
     print("ok  test_take_stacking_collapses_repeats")
 
 
