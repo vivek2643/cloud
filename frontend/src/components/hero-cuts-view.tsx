@@ -17,6 +17,7 @@ const MODALITY_STYLE: Record<HeroModality, { color: string; label: string }> = {
   speech: { color: "#6366f1", label: "speech" },
   action: { color: "#f59e0b", label: "action" },
   visual: { color: "#06b6d4", label: "visual" },
+  moment: { color: "#10b981", label: "dialogue + action" },
 };
 
 function fmtDur(ms: number): string {

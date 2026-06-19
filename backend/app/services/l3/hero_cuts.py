@@ -55,11 +55,20 @@ logger = logging.getLogger(__name__)
 # 1 = punchy/sharp) to concrete, signal-level choices. Phase 2 refines this;
 # for now it controls speech granularity + action trim tightness.
 ENERGY_SENTENCE_THRESHOLD = 0.5   # >= this -> sentence-level speech (shorter)
+# Only at high energy do we sub-split a multi-sentence VLM unit into its
+# sentences; below this the *delivered line* (the VLM unit) stays whole, so we
+# never chop one continuous delivery into fragments.
+ENERGY_SUBSPLIT_THRESHOLD = 0.75
 ACTION_SNAP_WINDOW_MS = 1_500     # how far to search for a calm motion seam
 ACTION_TIGHT_WINDOW_MS = 600      # the search window shrinks as energy rises
 
 # A speech hero needs at least this much real content to be worth surfacing.
 MIN_SPEECH_WORDS = 3
+# A spoken span this poorly covered by the VLM's visible-speaking spans is
+# almost certainly off-camera audio (a crew cue like "go", a voice off-frame).
+SPEAKING_COVERAGE_MIN = 0.25
+# Speech and action units within this gap are one moment (the dialogue+action cut).
+COMBINE_GAP_MS = 1_500
 # Hidden-by-default flags inherited from the dialogue lens.
 _OFFCAMERA_FLAGS = ("offscreen", "production_cue")
 
@@ -302,43 +311,208 @@ def _snap_action_bounds(motion: dict, raw_in: int, raw_out: int,
 # Per-modality candidate builders
 # --------------------------------------------------------------------------
 
+def _speaking_coverage(speaking: List[dict], start_ms: int, end_ms: int) -> float:
+    """Fraction of [start,end] covered by the union of the VLM's visible-speaking
+    spans. ~1.0 means someone is clearly speaking on camera the whole time; ~0
+    means the audio has no visible speaker (off-frame voice / crew cue)."""
+    dur = max(1, end_ms - start_ms)
+    ivals = sorted(
+        (max(start_ms, int(s.get("start_ms", 0))), min(end_ms, int(s.get("end_ms", 0))))
+        for s in speaking
+        if ss._overlap_ms(int(s.get("start_ms", 0)), int(s.get("end_ms", 0)), start_ms, end_ms) > 0
+    )
+    covered, cur_e = 0, start_ms
+    for a, b in ivals:
+        a = max(a, cur_e)
+        if b > a:
+            covered += b - a
+            cur_e = b
+    return covered / dur
+
+
+def _overlapping_sentences(sentences: List[dict], start_ms: int, end_ms: int) -> List[dict]:
+    """Dialogue sentences (already silence-snapped by L1) overlapping a VLM
+    unit's rough span -- the bridge that turns fuzzy VLM ms into clean cuts."""
+    out = []
+    for s in sentences:
+        a = int(s.get("raw_in_ms", s.get("src_in_ms", 0)))
+        b = int(s.get("raw_out_ms", s.get("src_out_ms", 0)))
+        if ss._overlap_ms(a, b, start_ms, end_ms) > 0:
+            out.append(s)
+    return out
+
+
+def _make_speech_hero(
+    clip: _ClipInputs, source: Optional[ss.SpanSource], quality_events: List[dict],
+    uid: str, in_ms: int, out_ms: int, raw_in: int, raw_out: int,
+    text: str, speaker: Optional[str], extra_flags: List[str],
+) -> Optional[HeroCut]:
+    if out_ms <= in_ms:
+        return None
+    if source is not None:
+        metrics = ss.score_span(source, in_ms, out_ms)
+    else:
+        metrics = {"speech_ratio": 1.0, "word_count": len(text.split())}
+    if int(metrics.get("word_count", 0)) < MIN_SPEECH_WORDS:
+        return None
+    vlm = _vlm_quality_score(quality_events, raw_in, raw_out)
+    return HeroCut(
+        hero_id=f"{clip.file_id[:8]}:{uid}",
+        file_id=clip.file_id,
+        modality="speech",
+        label=text.strip(),
+        src_in_ms=in_ms,
+        src_out_ms=out_ms,
+        score=_speech_score(metrics, vlm),
+        speaker=speaker,
+        flags=extra_flags,
+    )
+
+
 def _speech_candidates(
     clip: _ClipInputs, source: Optional[ss.SpanSource], energy: float
 ) -> List[HeroCut]:
-    """Speech heroes from the dialogue lens at the energy-selected granularity.
-    Off-camera / backchannel selects are dropped (not usable as heroes)."""
+    """Speech heroes anchored on the VLM's understanding of the clip.
+
+    The VLM's speech ``content_units`` define *what one delivered line is* (often
+    spanning several transcript sentences); we snap each unit's boundaries to the
+    L1 silence-snapped dialogue sentences it overlaps, so the cut is clean AND
+    the delivery stays whole instead of being chopped at every sentence period.
+    Energy only sub-splits a multi-sentence unit at high settings.
+
+    Off-camera audio is dropped two ways: the L1 production-cue lexicon, and --
+    the authoritative signal -- the VLM's visible-speaking spans (audio with no
+    on-camera speaker is a crew cue / off-frame voice). Flub/restart attempts are
+    suppressed. When the VLM never ran, we fall back to the L1 dialogue lens.
+    """
+    perception = clip.perception or {}
+    quality_events = perception.get("take_quality_events") or []
+    speaking = perception.get("speaking") or []
+    units = [u for u in (perception.get("content_units") or [])
+             if (u.get("kind") or "").lower() == "speech"]
+    sentences = clip.dialogue.get("sentence") or []
+
+    # Fallback: no VLM speech units -> the old dialogue-lens path (best effort).
+    if not units:
+        return _speech_candidates_from_lens(clip, source, energy, quality_events)
+
+    out: List[HeroCut] = []
+    for u in units:
+        uid = str(u.get("unit_id", "sp"))
+        raw_in, raw_out = int(u.get("start_ms", 0)), int(u.get("end_ms", 0))
+        if raw_out <= raw_in:
+            continue
+
+        members = _overlapping_sentences(sentences, raw_in, raw_out)
+        # Off-camera gate. When the VLM logged visible-speaking spans they are the
+        # authority (more reliable than the L1 lexicon, which over-flags): a unit
+        # the speaker is not visibly delivering is off-frame audio / a crew cue.
+        # Only when the VLM gave us nothing do we fall back to the L1 lexicon.
+        if speaking:
+            if _speaking_coverage(speaking, raw_in, raw_out) < SPEAKING_COVERAGE_MIN:
+                continue
+        elif members and all(
+            any(f in (s.get("flags") or []) for f in _OFFCAMERA_FLAGS)
+            or "backchannel" in (s.get("flags") or [])
+            for s in members
+        ):
+            continue
+
+        # Snap to L1 sentence boundaries (clean silence cuts); fall back to raw.
+        if members:
+            in_ms = min(int(s.get("src_in_ms", raw_in)) for s in members)
+            out_ms = max(int(s.get("src_out_ms", raw_out)) for s in members)
+            speaker = members[0].get("speaker")
+            extra = [f for s in members for f in (s.get("flags") or []) if f in ("noisy", "overlap")]
+        else:
+            in_ms, out_ms, speaker, extra = raw_in, raw_out, None, []
+
+        # Default keeps the delivered line whole; only high energy fragments it.
+        sub = members if (energy >= ENERGY_SUBSPLIT_THRESHOLD and len(members) > 1) else None
+        if sub:
+            for s in sub:
+                h = _make_speech_hero(
+                    clip, source, quality_events,
+                    f"{uid}:{s.get('seg_id', 's')}",
+                    int(s.get("src_in_ms", 0)), int(s.get("src_out_ms", 0)),
+                    int(s.get("raw_in_ms", 0)), int(s.get("raw_out_ms", 0)),
+                    s.get("text") or "", s.get("speaker"),
+                    [f for f in (s.get("flags") or []) if f in ("noisy", "overlap")],
+                )
+                if h:
+                    out.append(h)
+        else:
+            text = " ".join((s.get("text") or "").strip() for s in members).strip() \
+                if members else (u.get("label") or u.get("content_key") or "")
+            h = _make_speech_hero(clip, source, quality_events, uid,
+                                  in_ms, out_ms, raw_in, raw_out, text,
+                                  speaker, list(dict.fromkeys(extra)))
+            if h:
+                out.append(h)
+    return out
+
+
+def _speech_candidates_from_lens(
+    clip: _ClipInputs, source: Optional[ss.SpanSource], energy: float,
+    quality_events: List[dict],
+) -> List[HeroCut]:
+    """Fallback speech path for clips with no VLM perception: the L1 dialogue
+    lens at the energy-selected granularity, off-camera/backchannel dropped."""
     level = "sentence" if energy >= ENERGY_SENTENCE_THRESHOLD else "topic"
     segs = clip.dialogue.get(level) or clip.dialogue.get("topic") or []
-    quality_events = (clip.perception or {}).get("take_quality_events") or []
-
     out: List[HeroCut] = []
     for seg in segs:
         flags = list(seg.get("flags") or [])
         if any(f in flags for f in _OFFCAMERA_FLAGS) or "backchannel" in flags:
             continue
-        text = (seg.get("text") or "").strip()
-        in_ms, out_ms = int(seg.get("src_in_ms", 0)), int(seg.get("src_out_ms", 0))
-        if out_ms <= in_ms:
-            continue
+        h = _make_speech_hero(
+            clip, source, quality_events, seg.get("seg_id", "sp"),
+            int(seg.get("src_in_ms", 0)), int(seg.get("src_out_ms", 0)),
+            int(seg.get("raw_in_ms", seg.get("src_in_ms", 0))),
+            int(seg.get("raw_out_ms", seg.get("src_out_ms", 0))),
+            seg.get("text") or "", seg.get("speaker"),
+            [f for f in flags if f in ("noisy", "overlap")],
+        )
+        if h:
+            out.append(h)
+    return out
 
-        if source is not None:
-            metrics = ss.score_span(source, in_ms, out_ms)
-        else:
-            metrics = {"speech_ratio": 1.0, "word_count": len(text.split())}
-        if int(metrics.get("word_count", 0)) < MIN_SPEECH_WORDS:
+
+def _combined_candidates(
+    clip: _ClipInputs, speech: List[HeroCut], action: List[HeroCut]
+) -> List[HeroCut]:
+    """The dialogue+action cut: when a spoken line sits right next to an action
+    beat, surface the whole moment as one hero spanning both -- cut on the speech
+    (silence) boundary at one end and the action (motion) boundary at the other.
+    Emitted *in addition* to the speech-only and action-only heroes, so the
+    editor sees every usable framing of the moment (just the line, just the
+    action, or both together)."""
+    out: List[HeroCut] = []
+    for a in action:
+        # Pair the action with its single nearest adjacent spoken line.
+        best, best_gap = None, COMBINE_GAP_MS + 1
+        for s in speech:
+            (e_in, e_out), (l_in, l_out) = sorted(
+                [(s.src_in_ms, s.src_out_ms), (a.src_in_ms, a.src_out_ms)]
+            )
+            gap = l_in - e_out  # <=0 when they overlap
+            if gap < best_gap:
+                best, best_gap = s, gap
+        if best is None or best_gap > COMBINE_GAP_MS:
             continue
-        vlm = _vlm_quality_score(quality_events, seg.get("raw_in_ms", in_ms),
-                                 seg.get("raw_out_ms", out_ms))
+        s = best
+        in_ms, out_ms = min(s.src_in_ms, a.src_in_ms), max(s.src_out_ms, a.src_out_ms)
+        label = (f"{a.label} \u2192 {s.label}" if a.src_in_ms < s.src_in_ms
+                 else f"{s.label} \u2192 {a.label}")
         out.append(HeroCut(
-            hero_id=f"{clip.file_id[:8]}:{seg.get('seg_id', 'sp')}",
+            hero_id=f"{clip.file_id[:8]}:moment:{a.hero_id.rsplit(':', 1)[-1]}",
             file_id=clip.file_id,
-            modality="speech",
-            label=text,
+            modality="moment",
+            label=label[:200],
             src_in_ms=in_ms,
             src_out_ms=out_ms,
-            score=_speech_score(metrics, vlm),
-            speaker=seg.get("speaker"),
-            flags=[f for f in flags if f in ("noisy", "overlap")],
+            score=max(s.score, a.score),
+            speaker=s.speaker,
         ))
     return out
 
@@ -517,8 +691,11 @@ def build_hero_cuts(file_ids: List[str], energy: float = 0.5) -> List[Dict[str, 
 
     heroes: List[HeroCut] = []
     for fid, clip in inputs.items():
-        heroes.extend(_speech_candidates(clip, sources.get(fid), energy))
-        heroes.extend(_action_candidates(clip, energy))
+        sp = _speech_candidates(clip, sources.get(fid), energy)
+        ac = _action_candidates(clip, energy)
+        heroes.extend(sp)
+        heroes.extend(ac)
+        heroes.extend(_combined_candidates(clip, sp, ac))
 
     heroes = _stack_takes(heroes, file_ids)
     heroes.sort(key=lambda h: h.score, reverse=True)

@@ -147,7 +147,7 @@ export function getDialogues(fileId: string, token: string) {
 
 // --- Hero Cuts lens ---
 
-export type HeroModality = "speech" | "action" | "visual";
+export type HeroModality = "speech" | "action" | "visual" | "moment";
 
 export interface HeroTake {
   file_id: string;
