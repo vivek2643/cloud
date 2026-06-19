@@ -14,13 +14,15 @@ ENV PYTHONUNBUFFERED=1 \
     TORCH_HOME=/models
 
 # System libs: ffmpeg (transcode/slice), libGL + glib (opencv-headless),
-# libsndfile1 (soundfile/torchaudio I/O used by pyannote), git (VCS pip deps).
+# libsndfile1 (soundfile/torchaudio I/O used by pyannote), git (VCS pip deps),
+# build-essential (gcc/make to compile C-extension wheels, e.g. webrtcvad).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         libgl1 \
         libglib2.0-0 \
         libsndfile1 \
         git \
+        build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app/backend
