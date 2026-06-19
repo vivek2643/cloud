@@ -297,7 +297,7 @@ function VideoCard({
   const session = useAuthStore((s) => s.session);
   const [playUrl, setPlayUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [muted, setMuted] = useState(true);
+  const [muted, setMuted] = useState(false);
   // `desiredPlaying` is our intent; `playing` reflects what the element is
   // actually doing. A "pinned" play (via the center button) survives the
   // mouse leaving, whereas a hover-preview stops when the cursor moves away.

@@ -195,7 +195,7 @@ function DialogueClipCard({
   getUrl: (fileId: string) => Promise<string | null>;
 }) {
   const [playUrl, setPlayUrl] = useState<string | null>(null);
-  const [muted, setMuted] = useState(true);
+  const [muted, setMuted] = useState(false);
   const [desiredPlaying, setDesiredPlaying] = useState(false);
   const [playing, setPlaying] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
