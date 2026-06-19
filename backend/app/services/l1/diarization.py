@@ -169,7 +169,22 @@ def _get_pyannote_pipeline():
             from app.services.ml_device import torch_device
 
             token = get_settings().huggingface_token or None
-            pipe = Pipeline.from_pretrained(_PYANNOTE_MODEL, use_auth_token=token)
+            # PyTorch 2.6 flipped torch.load's default to weights_only=True, which
+            # rejects pyannote's official checkpoints (they pickle a TorchVersion
+            # global -> UnpicklingError). The weights come from the gated HF repo
+            # we just authenticated against, so a full load is safe; force
+            # weights_only=False for the duration of the load, then restore.
+            _orig_torch_load = torch.load
+
+            def _trusting_load(*args, **kwargs):
+                kwargs["weights_only"] = False
+                return _orig_torch_load(*args, **kwargs)
+
+            torch.load = _trusting_load
+            try:
+                pipe = Pipeline.from_pretrained(_PYANNOTE_MODEL, use_auth_token=token)
+            finally:
+                torch.load = _orig_torch_load
             if pipe is None:
                 # pyannote returns None (not an exception) when the model is
                 # gated and the token is missing or hasn't accepted the license.
