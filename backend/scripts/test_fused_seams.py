@@ -45,6 +45,26 @@ def test_action_attracts_within_safe_region():
     print("ok  action attractor")
 
 
+def test_attractor_needs_room():
+    """With base safety held EQUAL (0.5) at two impacts, the impact in open space
+    gets the attractor boost while the one wedged between vetoes does not -- so an
+    impact in a cramped breath can't manufacture a confident cut."""
+    dlg = _const(0.0)
+    dlg[13] = dlg[14] = dlg[16] = dlg[17] = 1.0   # vetoes hugging a 1-hop notch
+    dlg[15] = 0.5                                  # cramped impact: base safety 0.5
+    for i in range(28, 33):
+        dlg[i] = 0.5                               # open impact: same base safety 0.5
+    action = _const(1.0)
+    action[15] = 0.0
+    action[30] = 0.0
+    field = fs.compute_fused_field(duration_ms=DUR, dialogue_cost=dlg, action_cost=action,
+                                   action_points=[{"ts_ms": 1500}, {"ts_ms": 3000}])
+    cramped, openq = field.q_at(1500), field.q_at(3000)
+    assert openq > cramped, (openq, cramped)          # boost only where there's room
+    assert abs(cramped - 0.5) < 0.02, cramped         # cramped impact got no boost
+    print("ok  attractor needs room")
+
+
 def test_veto_beats_attractor():
     """An impact landing ON a spoken word stays vetoed -- safety dominates."""
     dlg = _const(0.0)

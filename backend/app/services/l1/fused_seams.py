@@ -67,6 +67,14 @@ SEAM_MERGE_MS = 60
 # affects which discrete seams we advertise, never where we can cut.
 SEAM_Q_FLOOR = 0.25
 
+# An attractor (action impact / beat) may only BOOST a cut that has this much
+# clean "room" around it -- i.e. the veto safety stays high across +/- this
+# window. This stops a motion impact that lands in a ~140 ms breath between two
+# words from scoring ~1 (a confident cut mid-sentence). It does NOT touch the
+# dialogue veto, so genuine sentence-end / pause seams are unaffected; it only
+# withholds the attractor bonus where there isn't space to cut cleanly.
+ATTRACTOR_ROOM_MS = 250
+
 GRID_HOP_MS = 100
 
 
@@ -110,6 +118,19 @@ def _resample(cost: Optional[Sequence[float]], src_hop: int, n: int,
     for i in range(n):
         j = int(round((i * hop_ms) / src_hop))
         out.append(float(cost[j]) if 0 <= j < len(cost) else fill)
+    return out
+
+
+def _erode(values: List[float], w: int) -> List[float]:
+    """Min-filter (grayscale erosion): out[i] = min(values[i-w .. i+w]). Used to
+    require an attractor to sit in a SUSTAINED safe window, not a 1-hop notch."""
+    n = len(values)
+    if n == 0 or w <= 0:
+        return list(values)
+    out = [0.0] * n
+    for i in range(n):
+        lo, hi = max(0, i - w), min(n - 1, i + w)
+        out[i] = min(values[lo:hi + 1])
     return out
 
 
@@ -183,6 +204,7 @@ def compute_fused_field(
     dialogue_points: Optional[Sequence] = None,
     beat_points: Optional[Sequence] = None,
     action_points: Optional[Sequence] = None,
+    attractor_room_ms: int = ATTRACTOR_ROOM_MS,
 ) -> FusedField:
     """Compose the per-channel grids into one fused seam field. See module docstring."""
     n = n_hops(duration_ms, hop_ms)
@@ -199,11 +221,15 @@ def compute_fused_field(
 
     lam = LAMBDA_MIN + (LAMBDA_MAX - LAMBDA_MIN) * clamp01(energy)
 
+    # "Room" gate: eroded safety so an attractor only earns its bonus where the
+    # safe window is sustained (not a mid-sentence breath between two words).
+    safety = [(1.0 - d[i]) * (1.0 - cam[i]) * protect[i] for i in range(n)]
+    room = _erode(safety, max(1, round(attractor_room_ms / hop_ms)))
+
     cost: List[float] = []
     for i in range(n):
-        safety = (1.0 - d[i]) * (1.0 - cam[i]) * protect[i]
-        reward = max(1.0 - act[i], 1.0 - beat[i])
-        q = clamp01(safety * (1.0 + lam * reward))
+        reward = max(1.0 - act[i], 1.0 - beat[i]) * room[i]
+        q = clamp01(safety[i] * (1.0 + lam * reward))
         cost.append(round(1.0 - q, 4))
 
     candidates: List[Tuple[int, str, str]] = []
