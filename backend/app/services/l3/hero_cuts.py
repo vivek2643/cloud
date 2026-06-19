@@ -69,6 +69,10 @@ MIN_SPEECH_WORDS = 3
 # A spoken span this poorly covered by the VLM's visible-speaking spans is
 # almost certainly off-camera audio (a crew cue like "go", a voice off-frame).
 SPEAKING_COVERAGE_MIN = 0.25
+# Tolerance when deciding if an edge word is "on camera": the VLM's speaking
+# spans start a touch late / end a touch early, so give a word's midpoint this
+# much slack before calling it off-camera.
+EDGE_TRIM_TOL_MS = 150
 # Speech and action units within this gap are one moment (the dialogue+action cut).
 COMBINE_GAP_MS = 1_500
 # Hidden-by-default flags inherited from the dialogue lens.
@@ -370,6 +374,50 @@ def _speaking_coverage(speaking: List[dict], start_ms: int, end_ms: int) -> floa
     return covered / dur
 
 
+def _on_camera_word(w: dict, speaking: List[dict]) -> bool:
+    """True if a word's midpoint falls within (a bit of slack around) any of the
+    VLM's visible-speaking spans -- i.e. someone is on camera delivering it."""
+    mid = (int(w.get("start_ms", 0)) + int(w.get("end_ms", 0))) // 2
+    return any(
+        int(s.get("start_ms", 0)) - EDGE_TRIM_TOL_MS <= mid <= int(s.get("end_ms", 0)) + EDGE_TRIM_TOL_MS
+        for s in speaking
+    )
+
+
+def _trim_to_speaking(
+    words: List[dict], speaking: List[dict], win_in: int, win_out: int
+) -> Optional[Tuple[int, int, List[dict]]]:
+    """Trim off-camera words bleeding into the EDGES of a speech span (the crew
+    "go"/"action" before a take, an off-frame voice after). Walks in from both
+    ends dropping words whose midpoint isn't covered by a visible-speaking span,
+    stopping at the first on-camera word. Interior words are never touched.
+
+    Returns (new_in, new_out, kept_words) when an edge was trimmed, landing the
+    cut in the silence gap just outside the kept words; None when nothing needed
+    trimming (so the caller keeps the clean sentence boundary + text)."""
+    span = [w for w in words
+            if int(w.get("start_ms", 0)) < win_out and int(w.get("end_ms", 0)) > win_in]
+    if not span:
+        return None
+    i, j = 0, len(span)
+    while i < j and not _on_camera_word(span[i], speaking):
+        i += 1
+    while j > i and not _on_camera_word(span[j - 1], speaking):
+        j -= 1
+    if i == 0 and j == len(span):
+        return None                       # no off-camera edge words
+    kept = span[i:j]
+    if len(kept) < MIN_SPEECH_WORDS:
+        return None                       # nothing usable survives the trim
+    new_in = win_in
+    if i > 0:                             # land in the gap after the last crew word
+        new_in = max(win_in, (int(span[i - 1]["end_ms"]) + int(kept[0]["start_ms"])) // 2)
+    new_out = win_out
+    if j < len(span):
+        new_out = min(win_out, (int(kept[-1]["end_ms"]) + int(span[j]["start_ms"])) // 2)
+    return new_in, new_out, kept
+
+
 def _overlapping_sentences(sentences: List[dict], start_ms: int, end_ms: int) -> List[dict]:
     """Dialogue sentences (already silence-snapped by L1) overlapping a VLM
     unit's rough span -- the bridge that turns fuzzy VLM ms into clean cuts."""
@@ -471,12 +519,20 @@ def _speech_candidates(
         sub = members if (energy >= ENERGY_SUBSPLIT_THRESHOLD and len(members) > 1) else None
         if sub:
             for s in sub:
+                s_in, s_out = int(s.get("src_in_ms", 0)), int(s.get("src_out_ms", 0))
+                s_text = s.get("text") or ""
+                # Trim crew cues bleeding into this sentence's edges (VLM authority).
+                if speaking and source is not None:
+                    tr = _trim_to_speaking(source.words, speaking, s_in, s_out)
+                    if tr:
+                        s_in, s_out, kw = tr
+                        s_text = " ".join((w.get("text") or "").strip() for w in kw).strip()
                 h = _make_speech_hero(
                     clip, source, quality_events,
                     f"{uid}:{s.get('seg_id', 's')}",
-                    int(s.get("src_in_ms", 0)), int(s.get("src_out_ms", 0)),
+                    s_in, s_out,
                     int(s.get("raw_in_ms", 0)), int(s.get("raw_out_ms", 0)),
-                    s.get("text") or "", s.get("speaker"),
+                    s_text, s.get("speaker"),
                     [f for f in (s.get("flags") or []) if f in ("noisy", "overlap")],
                 )
                 if h:
@@ -484,6 +540,13 @@ def _speech_candidates(
         else:
             text = " ".join((s.get("text") or "").strip() for s in members).strip() \
                 if members else (u.get("label") or u.get("content_key") or "")
+            # Trim off-camera crew cues (e.g. "go") that the L1 sentence swept in
+            # but the VLM's speaking spans place outside the on-camera delivery.
+            if speaking and source is not None:
+                tr = _trim_to_speaking(source.words, speaking, in_ms, out_ms)
+                if tr:
+                    in_ms, out_ms, kw = tr
+                    text = " ".join((w.get("text") or "").strip() for w in kw).strip()
             h = _make_speech_hero(clip, source, quality_events, uid,
                                   in_ms, out_ms, raw_in, raw_out, text,
                                   speaker, list(dict.fromkeys(extra)))
