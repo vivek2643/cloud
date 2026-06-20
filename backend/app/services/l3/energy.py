@@ -69,7 +69,7 @@ class EnergyParams:
     # action / performance
     action_merge_gap_ms: int
     action_anchor_mode: str         # unit | onset | impact
-    action_split_at_impact: bool    # Sharp detent only (energy == 1)
+    action_split_at_impact: bool    # Sharp band (energy >= 0.8): windup + payoff
     # overlay — reaction
     reaction_merge_gap_ms: int
     reaction_min_intensity: float
@@ -138,7 +138,7 @@ def energy_to_params(energy: float) -> EnergyParams:
         fuse_moments=e < FUSE_MOMENTS_BELOW,
         action_merge_gap_ms=_ACTION_MERGE[band],
         action_anchor_mode=_ACTION_ANCHOR[band],
-        action_split_at_impact=e >= 1.0,
+        action_split_at_impact=e >= BAND_EDGES[3],
         reaction_merge_gap_ms=_REACTION_MERGE[band],
         reaction_min_intensity=_REACTION_MIN_INTENSITY[band],
         reaction_min_duration_ms=_REACTION_MIN_DURATION[band],

@@ -5,7 +5,7 @@ Flow (one procrastinate task per file):
   1. Gate: skip if disabled, no API key, or the clip is longer than the limit.
   2. Pull the L1 transcript + diarization as timing scaffolding.
   3. Download the 1080p proxy (cheap, plenty for perception).
-  4. One structured-JSON Gemini call -> ClipPerception.
+  4. One JSON Gemini call (prompt-carried schema, validated client-side) -> ClipPerception.
   5. Fuse: map visual person ids <-> diarization speaker ids by overlap.
   6. Persist to clip_perception + flip files.l2_status.
 
@@ -28,6 +28,7 @@ from procrastinate import RetryStrategy
 from app.config import get_settings
 from app.services.jobs import app
 from app.services.l2 import gemini_video, prompt as l2_prompt
+from app.services.l2.cutaways import thin_cutaways
 from app.services.l2.schema import ClipPerception, SCHEMA_VERSION
 from app.services.processing import _download_from_r2
 from app.services.supabase_client import get_supabase
@@ -130,6 +131,23 @@ def _load_transcript_context(
     return load_turns(
         file_id, turn_gap_ms=_TURN_GAP_MS, max_chars=_MAX_TRANSCRIPT_CHARS
     )
+
+
+def _load_editorial_context(file_id: str, duration_s: float) -> dict:
+    """L1 dialogue counts passed to the VLM so cutaway density scales with beats."""
+    ctx: dict = {"duration_ms": int(duration_s * 1000), "sentence_count": 0, "topic_count": 0}
+    try:
+        with _pg_conn() as conn:
+            row = conn.execute(
+                "select segments from dialogue_segments where file_id = %s", (file_id,)
+            ).fetchone()
+        if row and row[0]:
+            doc = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+            ctx["sentence_count"] = len(doc.get("sentence") or [])
+            ctx["topic_count"] = len(doc.get("topic") or [])
+    except Exception:
+        logger.exception("L2: dialogue context unavailable for %s", file_id)
+    return ctx
 
 
 # --------------------------------------------------------------------------
@@ -304,10 +322,12 @@ def l2_perception(file_id: str) -> None:
 
     try:
         transcript_text, speaker_ids, speaker_turns = _load_transcript_context(file_id)
+        editorial_context = _load_editorial_context(file_id, duration_s)
         user_prompt = l2_prompt.build_user_prompt(
             duration_seconds=duration_s,
             transcript_text=transcript_text,
             speaker_ids=speaker_ids,
+            editorial_context=editorial_context,
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -331,14 +351,17 @@ def l2_perception(file_id: str) -> None:
                 _stage_fail(conn, file_id, "perception JSON did not validate against schema")
             return
 
-        _fuse_speakers(result.parsed, speaker_turns)
-        _persist(file_id, result.parsed, result.usage, result.model)
+        perception = result.parsed
+        usage = dict(result.usage or {})
+        _fuse_speakers(perception, speaker_turns)
+        thin_cutaways(perception)
+        _persist(file_id, perception, usage, result.model)
 
         # Refine the Dialogues lens now that we know who is actually on camera:
         # any diarized voice with no visible speaker is off-screen crew. Best-
         # effort -- a failure here must never fail the L2 perception task.
         try:
-            _flag_offscreen_dialogue(file_id, result.parsed)
+            _flag_offscreen_dialogue(file_id, perception)
         except Exception:
             logger.exception("L2: off-camera dialogue flagging failed for %s", file_id)
 
@@ -346,11 +369,12 @@ def l2_perception(file_id: str) -> None:
         with _pg_conn() as conn:
             _stage_done(conn, file_id)
         logger.info(
-            "L2 complete for %s (%d persons, %d events, %d tok out)",
+            "L2 complete for %s (%d persons, %d events, %d cutaways, %d tok out)",
             file_id,
-            len(result.parsed.persons),
-            len(result.parsed.events),
-            (result.usage or {}).get("output_tokens", 0),
+            len(perception.persons),
+            len(perception.events),
+            len(perception.cutaways),
+            usage.get("output_tokens", 0),
         )
     except psycopg.errors.ForeignKeyViolation:
         logger.info("L2: file %s deleted mid-run; abandoning cleanly.", file_id)

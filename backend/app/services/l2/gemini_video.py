@@ -12,6 +12,7 @@ in google-genai on hosts that don't run L2.
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -22,6 +23,25 @@ from pydantic import BaseModel
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+def _schema_prompt_suffix(response_schema: Type[BaseModel]) -> str:
+    """Render the response model's JSON Schema as a prompt instruction.
+
+    Used when we drive output WITHOUT constrained decoding (`response_schema`),
+    because the full ClipPerception is too complex for Gemini's structured-output
+    state machine. The model emits free JSON guided by this schema and we
+    re-validate it client-side.
+    """
+    schema = response_schema.model_json_schema()
+    return (
+        "\n\nReturn a SINGLE JSON object (no markdown, no prose) that conforms to "
+        "this JSON Schema. Use null or omit optional fields you cannot fill; use "
+        "empty arrays for tracks that do not apply.\n\n"
+        "=== JSON SCHEMA ===\n"
+        + json.dumps(schema, separators=(",", ":"))
+        + "\n=== END JSON SCHEMA ==="
+    )
 
 
 def _sdk():
@@ -70,8 +90,15 @@ def analyze_video(
     system_instruction: str,
     prompt: str,
     response_schema: Type[BaseModel],
+    constrained: bool = False,
 ) -> VideoAnalysisResult:
     """Upload `video_path`, run one structured-JSON perception call, clean up.
+
+    `constrained=True` uses Gemini's `response_schema` (constrained decoding);
+    only safe for small schemas. For complex schemas (our full ClipPerception)
+    leave it False: we ask for JSON via the prompt (carrying the schema) and
+    re-validate the result with the pydantic model on our side. This avoids the
+    "schema produces too many states" 400 while keeping a single video call.
 
     Returns the parsed pydantic instance (best effort) plus the raw text and
     token usage. Raises on hard SDK/transport failures so procrastinate retries.
@@ -111,18 +138,22 @@ def analyze_video(
         config_kwargs: dict[str, Any] = {
             "system_instruction": system_instruction,
             "response_mime_type": "application/json",
-            "response_schema": response_schema,
             "max_output_tokens": settings.l2_max_output_tokens,
             "temperature": 0.2,
         }
+        if constrained:
+            config_kwargs["response_schema"] = response_schema
         media_res = _media_resolution(types, settings.l2_media_resolution)
         if media_res is not None:
             config_kwargs["media_resolution"] = media_res
 
+        # Without constrained decoding the model needs the schema in-prompt.
+        text_prompt = prompt if constrained else prompt + _schema_prompt_suffix(response_schema)
+
         logger.info("L2: requesting perception from %s", model)
         resp = client.models.generate_content(
             model=model,
-            contents=[video_part, types.Part(text=prompt)],
+            contents=[video_part, types.Part(text=text_prompt)],
             config=types.GenerateContentConfig(**config_kwargs),
         )
 
@@ -146,6 +177,45 @@ def analyze_video(
                 logger.warning("L2: failed to delete uploaded Gemini file %s", getattr(uploaded, "name", "?"))
 
 
+def _salvage_truncated_json(text: str) -> Optional[str]:
+    """Repair JSON cut off by the output-token ceiling on long clips.
+
+    Truncate to the last complete object close (``}``), drop a dangling comma,
+    then append the closers needed to balance any still-open arrays/objects.
+    This discards the incomplete trailing element but keeps everything before it.
+    """
+    last = text.rfind("}")
+    if last == -1:
+        return None
+    s = text[: last + 1]
+
+    stack = []
+    in_str = False
+    esc = False
+    for ch in s:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+
+    s = s.rstrip()
+    if s.endswith(","):
+        s = s[:-1]
+    closers = "".join("}" if c == "{" else "]" for c in reversed(stack))
+    return s + closers
+
+
 def _extract_parsed(resp, response_schema: Type[BaseModel]) -> Optional[BaseModel]:
     """Prefer the SDK's auto-parsed instance; fall back to parsing the raw text."""
     parsed = getattr(resp, "parsed", None)
@@ -157,5 +227,15 @@ def _extract_parsed(resp, response_schema: Type[BaseModel]) -> Optional[BaseMode
     try:
         return response_schema.model_validate_json(text)
     except Exception:
+        # Long clips can exceed the output-token ceiling, truncating the JSON.
+        # Try to salvage a valid prefix before giving up.
+        try:
+            repaired = _salvage_truncated_json(text)
+            if repaired:
+                result = response_schema.model_validate_json(repaired)
+                logger.warning("L2: salvaged truncated Gemini JSON (dropped trailing partial)")
+                return result
+        except Exception:
+            pass
         logger.exception("L2: could not validate Gemini JSON against the schema")
         return None

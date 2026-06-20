@@ -243,19 +243,29 @@ def _unit_from_words(words: Sequence[dict]) -> _Unit:
 
 def merge_sentences(words: Sequence[dict]) -> List[_Unit]:
     """Group words into sentence units. A new sentence starts on a speaker
-    change, a gap > G_SENTENCE_MS, after sentence-final punctuation, or at the
-    length cap. Word-level (not phrase-level) so punctuation inside one breath
-    still splits two sentences."""
+    change, a gap > G_SENTENCE_MS, after sentence-final punctuation, at the
+    length cap, or before more speech would absorb a merge-immune micro-
+    utterance (backchannel / production cue)."""
+    flat = [w for w in (words or []) if (w.get("text") or "").strip()]
+    if not flat:
+        return []
+
+    clip_start = min(int(w.get("start_ms", 0)) for w in flat)
+    clip_end = max(int(w.get("end_ms", 0)) for w in flat)
+
     units: List[_Unit] = []
     cur: List[dict] = []
+    last_flushed_out: Optional[int] = None
 
     def flush():
+        nonlocal last_flushed_out
         if cur:
             units.append(_unit_from_words(cur))
+            last_flushed_out = units[-1].raw_out_ms
 
     prev_end: Optional[int] = None
     prev_spk: Optional[str] = None
-    for w in words:
+    for w in flat:
         s = int(w.get("start_ms", 0))
         spk = w.get("speaker")
         if cur:
@@ -264,7 +274,14 @@ def merge_sentences(words: Sequence[dict]) -> List[_Unit]:
             too_long = (int(w.get("end_ms", s)) - cur_s) > SENT_L_MAX_MS
             last_txt = (cur[-1].get("text") or "").strip()
             sentence_end = last_txt.endswith(SENTENCE_FINAL)
-            if spk != prev_spk or gap > G_SENTENCE_MS or sentence_end or too_long:
+            should_break = (
+                spk != prev_spk or gap > G_SENTENCE_MS or sentence_end or too_long
+            )
+            if not should_break:
+                head = _unit_from_words(cur)
+                if _is_production_cue(head, last_flushed_out, s, clip_start, clip_end):
+                    should_break = True
+            if should_break:
                 flush()
                 cur = []
         cur.append(w)
@@ -272,20 +289,62 @@ def merge_sentences(words: Sequence[dict]) -> List[_Unit]:
         prev_spk = spk
     flush()
 
-    return _merge_short_forward(units)
+    return _merge_short_forward(units, clip_start, clip_end)
 
 
-def _merge_short_forward(units: List[_Unit]) -> List[_Unit]:
+def _is_production_cue(
+    u: _Unit, prev_out: Optional[int], next_in: Optional[int],
+    clip_start: int, clip_end: int,
+) -> bool:
+    """A short, isolated crew cue ('action', 'go', 'cut') rather than dialogue.
+    Strong cues fire when isolated anywhere; ambiguous (weak) cues additionally
+    require sitting near a clip edge, so a mid-sentence 'go' is never touched."""
+    toks = [t for t in (_norm(w) for w in u.text.split()) if t]
+    if not toks or len(toks) > CUE_MAX_WORDS:
+        return False
+    if (u.raw_out_ms - u.raw_in_ms) > CUE_MAX_MS:
+        return False
+    gap_before = (u.raw_in_ms - prev_out) if prev_out is not None else 10 ** 9
+    gap_after = (next_in - u.raw_out_ms) if next_in is not None else 10 ** 9
+    if max(gap_before, gap_after) < CUE_ISOLATION_MS:
+        return False  # nestled between other speech -> almost certainly real
+    near_edge = (
+        (u.raw_in_ms - clip_start) <= CUE_EDGE_MS
+        or (clip_end - u.raw_out_ms) <= CUE_EDGE_MS
+    )
+    if all(t in STRONG_CUE_WORDS for t in toks):
+        return True
+    if near_edge and all(t in (STRONG_CUE_WORDS | WEAK_CUE_WORDS) for t in toks):
+        return True
+    return False
+
+
+def _is_merge_immune(
+    u: _Unit, prev_out: Optional[int], next_in: Optional[int],
+    clip_start: int, clip_end: int,
+) -> bool:
+    """Atomic micro-utterances that must survive short-fragment coalescence."""
+    if u.is_backchannel:
+        return True
+    return _is_production_cue(u, prev_out, next_in, clip_start, clip_end)
+
+
+def _merge_short_forward(
+    units: List[_Unit], clip_start: int, clip_end: int,
+) -> List[_Unit]:
     """Fold a sub-SENT_L_MIN fragment into the next unit when it's the same
-    speaker and close, so we don't emit 300ms shards. Backchannels are left
-    alone (they're meaningful as-is)."""
+    speaker and close, so we don't emit 300ms shards. Backchannels and
+    production cues are merge-immune (classified before coalescence)."""
     out: List[_Unit] = []
     i = 0
     while i < len(units):
         u = units[i]
+        prev_out = units[i - 1].raw_out_ms if i > 0 else None
+        next_in = units[i + 1].raw_in_ms if i + 1 < len(units) else None
+        immune = _is_merge_immune(u, prev_out, next_in, clip_start, clip_end)
         dur = u.raw_out_ms - u.raw_in_ms
         complete = u.text.strip().endswith(SENTENCE_FINAL)
-        short = dur < SENT_L_MIN_MS and not u.is_backchannel and not complete
+        short = dur < SENT_L_MIN_MS and not immune and not complete
         # Forward: a short head folds into the next same-speaker unit.
         if (
             short and i + 1 < len(units)
@@ -324,32 +383,6 @@ def _merge_short_forward(units: List[_Unit]) -> List[_Unit]:
 # ---------------------------------------------------------------------------
 # Off-camera / production-cue marking
 # ---------------------------------------------------------------------------
-
-def _is_production_cue(
-    u: _Unit, prev_out: Optional[int], next_in: Optional[int],
-    clip_start: int, clip_end: int,
-) -> bool:
-    """A short, isolated crew cue ('action', 'go', 'cut') rather than dialogue.
-    Strong cues fire when isolated anywhere; ambiguous (weak) cues additionally
-    require sitting near a clip edge, so a mid-sentence 'go' is never touched."""
-    toks = [t for t in (_norm(w) for w in u.text.split()) if t]
-    if not toks or len(toks) > CUE_MAX_WORDS:
-        return False
-    if (u.raw_out_ms - u.raw_in_ms) > CUE_MAX_MS:
-        return False
-    gap_before = (u.raw_in_ms - prev_out) if prev_out is not None else 10 ** 9
-    gap_after = (next_in - u.raw_out_ms) if next_in is not None else 10 ** 9
-    if max(gap_before, gap_after) < CUE_ISOLATION_MS:
-        return False  # nestled between other speech -> almost certainly real
-    near_edge = (
-        (u.raw_in_ms - clip_start) <= CUE_EDGE_MS
-        or (clip_end - u.raw_out_ms) <= CUE_EDGE_MS
-    )
-    if all(t in STRONG_CUE_WORDS for t in toks):
-        return True
-    if near_edge and all(t in (STRONG_CUE_WORDS | WEAK_CUE_WORDS) for t in toks):
-        return True
-    return False
 
 
 def _mark_offscreen_units(

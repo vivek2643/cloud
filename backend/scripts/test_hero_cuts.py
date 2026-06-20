@@ -290,6 +290,23 @@ def test_action_core_preserved():
     print("ok  test_action_core_preserved")
 
 
+def test_action_split_at_sharp():
+    """Sharp band: editorial split at impact (windup + payoff), even when fused
+    seam quality at impact is poor -- outer edges snap, hinge does not."""
+    clip = _clip_multi()
+    field = hc._build_field(clip, 0.85)
+    params = hc.energy_to_params(0.85)
+    assert params.action_split_at_impact
+    heroes = hc._action_candidates(clip, params, field)
+    acts = [h for h in heroes if h.modality == hc.anc.AFF_ACTION]
+    assert len(acts) == 2, [(h.label, h.src_in_ms, h.src_out_ms) for h in acts]
+    assert min(h.src_in_ms for h in acts) <= 6000
+    assert max(h.src_out_ms for h in acts) >= 7800
+    assert any("windup" in h.label for h in acts)
+    assert any("payoff" in h.label for h in acts)
+    print("ok  test_action_split_at_sharp")
+
+
 def test_coverage_every_anchor_in_a_segment():
     """The coverage guarantee: every (non-trivial) anchor lands inside some
     produced segment -- so there is no usable moment only reachable in raw."""
@@ -332,6 +349,7 @@ def main():
     test_action_skipped_without_motion()
     test_reaction_and_broll_surface_as_overlay()
     test_action_core_preserved()
+    test_action_split_at_sharp()
     test_coverage_every_anchor_in_a_segment()
     print("\nall hero-cuts tests passed")
 

@@ -28,12 +28,31 @@ from __future__ import annotations
 from enum import Enum
 from typing import List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def _to_unit(v):
+    """Coerce a model-supplied score into 0..1.
+
+    We deliberately drop ``ge``/``le`` Field bounds (Option B): without
+    constrained decoding the model occasionally returns out-of-range values
+    (e.g. a 1-5 rubric number bleeding into a 0..1 field). Clamp instead of
+    failing validation: map (1, 5] -> /5, then clamp to [0, 1].
+    """
+    if v is None:
+        return None
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    if x > 1.0:
+        x = x / 5.0 if x <= 5.0 else 1.0
+    return max(0.0, min(1.0, x))
 
 # v2 adds coarse spatial framing signals (subject `region`s + clip
 # `frame_orientation`) used by the editor's auto-reframe/crop. Older v1 rows
 # simply lack them and fall back to centered framing.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 # --------------------------------------------------------------------------
@@ -172,10 +191,20 @@ class Region(BaseModel):
     0..1 of width/height). Approximate is fine -- a loose box around the
     head/subject, NOT a tight detection. The editor uses the box CENTER to keep
     the subject in frame when reframing to another aspect (e.g. a 9:16 reel)."""
-    x: float = Field(ge=0.0, le=1.0, description="left edge, fraction of width")
-    y: float = Field(ge=0.0, le=1.0, description="top edge, fraction of height")
-    w: float = Field(ge=0.0, le=1.0, description="width, fraction of frame width")
-    h: float = Field(ge=0.0, le=1.0, description="height, fraction of frame height")
+    x: float = Field(description="left edge, fraction of width")
+    y: float = Field(description="top edge, fraction of height")
+    w: float = Field(description="width, fraction of frame width")
+    h: float = Field(description="height, fraction of frame height")
+
+    @field_validator("x", "y", "w", "h", mode="before")
+    @classmethod
+    def _clamp_region(cls, v):
+        if v is None:
+            return 0.0
+        try:
+            return max(0.0, min(1.0, float(v)))
+        except (TypeError, ValueError):
+            return 0.0
 
 
 class GraphicKind(str, Enum):
@@ -297,6 +326,18 @@ class Person(BaseModel):
 # Temporal tracks (sparse, timestamped events)
 # --------------------------------------------------------------------------
 
+def _lenient_event_change(v):
+    """Coerce an unknown ``change`` value to None instead of failing the whole
+    doc. Without constrained decoding the model sometimes puts a cutaway kind
+    ('reaction', 'gaze') here; drop it rather than reject the entire perception."""
+    if v is None or isinstance(v, EventChange):
+        return v
+    try:
+        return EventChange(v)
+    except ValueError:
+        return None
+
+
 class Event(BaseModel):
     """One beat on the timeline. `actor` is optional so the timeline generalizes
     beyond people (a door opening, a car passing). Multi-actor moments are split
@@ -308,6 +349,11 @@ class Event(BaseModel):
     actor: Optional[str] = Field(None, description="person local_id, or null for non-person events")
     target: Optional[str] = Field(None, description="person local_id or object name the action is directed at")
     change: Optional[EventChange] = None
+
+    @field_validator("change", mode="before")
+    @classmethod
+    def _coerce_change(cls, v):
+        return _lenient_event_change(v)
     interaction_id: Optional[str] = Field(None, description="links the per-actor events of one shared moment")
     region: Optional[Region] = Field(
         None, description="where in the frame this beat happens (coarse box); used to reframe onto the action"
@@ -328,8 +374,13 @@ class Reaction(BaseModel):
     end_ms: int
     subject: str = Field(description="person local_id reacting")
     type: Optional[ReactionType] = None
-    intensity: Optional[float] = Field(None, ge=0.0, le=1.0)
+    intensity: Optional[float] = Field(None, description="0..1")
     trigger: Optional[str] = Field(None, description="what prompted it, e.g. 'p2's joke', 'the reveal'")
+
+    @field_validator("intensity", mode="before")
+    @classmethod
+    def _norm_intensity(cls, v):
+        return _to_unit(v)
 
 
 class GazeSpan(BaseModel):
@@ -362,12 +413,64 @@ class EnvironmentEvent(BaseModel):
     description: str
     change: Optional[EventChange] = None
 
+    @field_validator("change", mode="before")
+    @classmethod
+    def _coerce_change(cls, v):
+        return _lenient_event_change(v)
+
 
 class GraphicTextEvent(BaseModel):
     start_ms: int
     end_ms: int
     kind: Optional[GraphicKind] = None
     text: Optional[str] = Field(None, description="verbatim text if legible")
+
+
+# --------------------------------------------------------------------------
+# Editorial cutaways (sparse overlay layer -- the only feed source for
+# reactions / b-roll / inserts in the anchor pipeline when populated)
+# --------------------------------------------------------------------------
+
+class CutawayAffordance(str, Enum):
+    reaction = "reaction"
+    broll = "broll"
+    insert = "insert"
+
+
+class CutawayKind(str, Enum):
+    reaction = "reaction"
+    gaze = "gaze"
+    broll_hold = "broll_hold"
+    broll_move = "broll_move"
+    reveal = "reveal"
+    graphic = "graphic"
+    environment = "environment"
+    interaction = "interaction"
+
+
+class CutawayMoment(BaseModel):
+    """One overlay moment an editor would cut TO -- not every visible change."""
+    start_ms: int
+    end_ms: int
+    kind: CutawayKind
+    affordance: CutawayAffordance
+    subject: Optional[str] = Field(None, description="person local_id when relevant")
+    label: str = Field(description="short human-facing label for the card")
+    trigger: Optional[str] = Field(None, description="what prompted a reaction")
+    intensity: Optional[float] = Field(None, description="0..1")
+    editorial_role: Optional[str] = Field(
+        None,
+        description="e.g. listener_reaction, establishing, product_reveal",
+    )
+    salience_hint: Optional[float] = Field(
+        None, description="how cut-worthy (higher = stronger), 0..1"
+    )
+    peak_ms: Optional[int] = Field(None, description="peak frame for reactions")
+
+    @field_validator("intensity", "salience_hint", mode="before")
+    @classmethod
+    def _norm_unit(cls, v):
+        return _to_unit(v)
 
 
 # --------------------------------------------------------------------------
@@ -422,8 +525,16 @@ class TakeQualityEvent(BaseModel):
     start_ms: int
     end_ms: int
     dimension: QualityDimension
-    score: int = Field(ge=1, le=5, description="1=poor .. 3=acceptable .. 5=excellent")
+    score: int = Field(description="1=poor .. 3=acceptable .. 5=excellent")
     evidence: Optional[str] = Field(None, description="what you observed, concretely")
+
+    @field_validator("score", mode="before")
+    @classmethod
+    def _clamp_score(cls, v):
+        try:
+            return max(1, min(5, int(round(float(v)))))
+        except (TypeError, ValueError):
+            return 3
 
 
 class RestartMarker(BaseModel):
@@ -466,6 +577,10 @@ class ClipPerception(BaseModel):
     speaking: List[SpeakingSpan] = Field(default_factory=list)
     environment_events: List[EnvironmentEvent] = Field(default_factory=list)
     graphic_text_events: List[GraphicTextEvent] = Field(default_factory=list)
+
+    # Sparse overlay catalog: reactions, b-roll handles, inserts worth cutting to.
+    # When non-empty, downstream overlay anchors read ONLY this list.
+    cutaways: List[CutawayMoment] = Field(default_factory=list)
 
     # Take selection (span-level). Empty for clips with no comparable content.
     content_units: List[ContentUnit] = Field(default_factory=list)

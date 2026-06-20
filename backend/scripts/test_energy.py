@@ -61,7 +61,8 @@ def test_bands_and_action_modes():
     assert balanced.band == 2 and balanced.action_anchor_mode == "onset"
     assert tight.band == 3 and tight.action_anchor_mode == "impact"
     assert sharp.action_split_at_impact is True
-    assert energy_to_params(0.9).action_split_at_impact is False
+    assert energy_to_params(0.8).action_split_at_impact is True
+    assert energy_to_params(0.79).action_split_at_impact is False
     assert broad.reaction_min_intensity > sharp.reaction_min_intensity
     assert broad.territory_strict and not sharp.territory_strict
     print("ok  bands and action modes")

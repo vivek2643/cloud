@@ -813,24 +813,34 @@ def _prep_overlay_group(
     return kept
 
 
+# Sharp-band split: editorial hinge at impact; fused field snaps outer edges only.
+_ACTION_SPLIT_MIN_WINDUP_MS = 150
+_ACTION_SPLIT_MAX_WINDUP_MS = 400
+
+
+def _action_min_windup_ms(unit_len_ms: int) -> int:
+    """Scale windup floor with beat length (short actions need less runway)."""
+    if unit_len_ms <= 0:
+        return _ACTION_SPLIT_MIN_WINDUP_MS
+    scaled = unit_len_ms // 5
+    return max(_ACTION_SPLIT_MIN_WINDUP_MS, min(_ACTION_SPLIT_MAX_WINDUP_MS, scaled))
+
+
 def _action_pieces(
     anchor: anc.Anchor, motion: Optional[dict], params: EnergyParams,
     field: Optional[fseams.FusedField], clip: _ClipInputs,
 ) -> List[Tuple[int, int, str]]:
     """One or two (core_in, core_out, label_suffix) per action anchor."""
     mode = params.action_anchor_mode
-    if params.action_split_at_impact and field is not None:
+    if params.action_split_at_impact:
         impact = anchor.ts_ms
         onset = _motion_onset_ms(motion, anchor.start_ms, anchor.end_ms)
-        if impact > onset + 400:
-            lo = max(0, impact - 250)
-            hi = min(clip.duration_ms or impact + 250, impact + 250)
-            seam = fseams.snap_point(field, impact, lo, max(lo + 1, hi))
-            if field.q_at(seam) >= fseams.SEAM_Q_FLOOR and onset < seam < anchor.end_ms:
-                return [
-                    (onset, seam, " · windup"),
-                    (seam, anchor.end_ms, " · payoff"),
-                ]
+        min_windup = _action_min_windup_ms(anchor.end_ms - anchor.start_ms)
+        if impact >= onset + min_windup and onset < impact < anchor.end_ms:
+            return [
+                (onset, impact, " · windup"),
+                (impact, anchor.end_ms, " · payoff"),
+            ]
     cin, cout = _action_core(anchor, motion, mode)
     return [(cin, cout, "")]
 

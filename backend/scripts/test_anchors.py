@@ -24,14 +24,14 @@ def test_gathers_every_kind():
     perception = {
         "content_units": [{"unit_id": "u1", "kind": "action", "label": "drops and misses",
                            "start_ms": 6000, "end_ms": 7500}],
-        "reactions": [{"start_ms": 7500, "end_ms": 8000, "subject": "p1",
-                       "type": "smile", "intensity": 0.7, "trigger": "the miss"}],
-        "camera_craft": [{"start_ms": 0, "end_ms": 5000, "movement": "static",
-                          "subject_focus": "p1 face"}],
-        "events": [{"id": "e1", "start_ms": 22000, "end_ms": 23000, "change": "reveal",
-                    "description": "slide changes to the insight"}],
-        "graphic_text_events": [{"start_ms": 22000, "end_ms": 25000, "kind": "on_screen_text",
-                                 "text": "The Insight"}],
+        "cutaways": [
+            {"start_ms": 7500, "end_ms": 8000, "kind": "reaction", "affordance": "reaction",
+             "subject": "p1", "label": "smile · the miss", "intensity": 0.7, "trigger": "the miss"},
+            {"start_ms": 0, "end_ms": 5000, "kind": "broll_hold", "affordance": "broll",
+             "label": "p1 face"},
+            {"start_ms": 22000, "end_ms": 23000, "kind": "reveal", "affordance": "insert",
+             "label": "slide changes to the insight"},
+        ],
         "take_quality_events": [],
     }
     motion = {"hop_ms": 100, "action_energy": [0.8] * 100,
@@ -149,6 +149,37 @@ def test_salience_from_intensity_and_words():
     rx = sorted([a for a in al if a.affordance == an.AFF_REACTION], key=lambda a: a.salience)
     assert rx[0].salience < rx[-1].salience and rx[-1].salience >= 0.85, [a.salience for a in rx]
     print("ok  salience from intensity / words")
+
+
+def test_cutaway_path_preferred_over_legacy():
+    """When cutaways is populated, legacy reactions/broll/insert tracks are ignored."""
+    perception = {
+        "cutaways": [
+            {"start_ms": 1000, "end_ms": 2000, "kind": "reaction", "affordance": "reaction",
+             "subject": "p2", "label": "listener laugh", "intensity": 0.8},
+        ],
+        "reactions": [
+            {"start_ms": 1000, "end_ms": 2000, "subject": "p1", "type": "nod", "intensity": 0.3},
+        ],
+        "camera_craft": [{"start_ms": 0, "end_ms": 8000, "movement": "static"}],
+    }
+    al = an.gather_anchors(duration_ms=10000, perception=perception)
+    rx = [a for a in al if a.affordance == an.AFF_REACTION]
+    assert len(rx) == 1 and "listener laugh" in rx[0].text, rx
+    assert an.AFF_BROLL not in {a.affordance for a in al}
+    print("ok  cutaway path preferred over legacy")
+
+
+def test_legacy_overlay_fallback():
+    """Old L2 JSON without cutaways still surfaces overlays from legacy tracks."""
+    perception = {
+        "reactions": [{"start_ms": 0, "end_ms": 500, "subject": "p1", "type": "nod", "intensity": 0.5}],
+        "camera_craft": [{"start_ms": 0, "end_ms": 5000, "movement": "static", "subject_focus": "wide"}],
+    }
+    al = an.gather_anchors(duration_ms=10000, perception=perception)
+    assert an.AFF_REACTION in {a.affordance for a in al}
+    assert an.AFF_BROLL in {a.affordance for a in al}
+    print("ok  legacy overlay fallback")
 
 
 if __name__ == "__main__":

@@ -344,6 +344,67 @@ def _insert_anchors(perception: dict) -> List[Anchor]:
     return out
 
 
+def _cutaway_anchors(cutaways: List[dict]) -> List[Anchor]:
+    """Sparse L2 cutaways -> overlay anchors (reactions, b-roll, inserts)."""
+    _KIND_MAP = {
+        "reaction": "expression",
+        "gaze": "gaze",
+        "broll_hold": "hold",
+        "broll_move": "move",
+        "reveal": "reveal",
+        "graphic": "graphic",
+        "environment": "environment",
+        "interaction": "interaction",
+    }
+    _AFF_MAP = {
+        "reaction": AFF_REACTION,
+        "broll": AFF_BROLL,
+        "insert": AFF_INSERT,
+    }
+    out: List[Anchor] = []
+    for c in cutaways:
+        aff_key = (c.get("affordance") or "").lower()
+        affordance = _AFF_MAP.get(aff_key)
+        if not affordance:
+            continue
+        a, b = int(c.get("start_ms", 0)), int(c.get("end_ms", 0))
+        if b <= a:
+            continue
+        kind = (c.get("kind") or aff_key).lower()
+        anchor_kind = _KIND_MAP.get(kind, kind)
+        if affordance == AFF_BROLL:
+            ha, hb = _hold_core(a, b)
+        elif affordance == AFF_INSERT and kind != "interaction":
+            ha, hb = a, min(b, a + MAX_HOLD_MS)
+        else:
+            ha, hb = a, b
+        peak = c.get("peak_ms")
+        ts = int(peak) if peak is not None else (ha + hb) // 2
+        ts = max(ha, min(ts, hb))
+        sal = c.get("salience_hint")
+        if sal is None:
+            sal = c.get("intensity")
+        if sal is None:
+            sal = 0.55 if affordance == AFF_INSERT else 0.5
+        label = (c.get("label") or kind).strip()
+        out.append(Anchor(
+            ts_ms=ts, start_ms=ha, end_ms=hb, kind=anchor_kind, affordance=affordance,
+            salience=_clamp01(float(sal)), actor=c.get("subject"), text=label[:200],
+        ))
+    return out
+
+
+def _overlay_anchors_legacy(perception: dict) -> List[Anchor]:
+    """Pre-cutaways L2 artifacts -> overlay anchors (backward compatible)."""
+    out: List[Anchor] = []
+    out += _reaction_anchors(perception)
+    out += _gaze_anchors(perception)
+    out += _broll_anchors(perception)
+    out += _insert_anchors(perception)
+    out += _interaction_anchors(perception)
+    return out
+
+
 def _gaze_anchors(perception: dict) -> List[Anchor]:
     """Held looks that DEPART from the subject's dominant eyeline -> overlay
     reaction anchors. The cutaway value of a glance is in the *shift* (attention
@@ -515,11 +576,11 @@ def gather_anchors(
     anchors: List[Anchor] = []
     anchors += _speech_anchors(sentences, quality)
     anchors += _action_anchors(perception, motion, quality)
-    anchors += _reaction_anchors(perception)
-    anchors += _gaze_anchors(perception)
-    anchors += _broll_anchors(perception)
-    anchors += _insert_anchors(perception)
-    anchors += _interaction_anchors(perception)
+    cutaways = perception.get("cutaways") or []
+    if cutaways:
+        anchors += _cutaway_anchors(cutaways)
+    else:
+        anchors += _overlay_anchors_legacy(perception)
     anchors += _audio_event_anchors(audio, sentences, duration_ms)
 
     # Clamp to the clip and drop degenerate spans.

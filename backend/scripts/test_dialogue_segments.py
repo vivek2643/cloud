@@ -151,6 +151,23 @@ def test_production_cue_flagged_and_kept_out_of_topics():
     print("ok: isolated crew cue flagged + excluded from topics; mid-sentence 'go' kept")
 
 
+def test_production_cue_survives_short_forward_merge():
+    # "Cut" sits only 150ms before the real line -- old forward-merge would glue
+    # them; merge-immunity keeps the cue atomic so it can be flagged + dropped.
+    words = [
+        _w(0, 250, "Cut", "S0"),
+        _w(400, 800, "Today", "S0"),
+        _w(830, 1200, "we're", "S0"),
+        _w(1230, 1600, "cooking.", "S0"),
+    ]
+    out = d.build_dialogue_segments(words, wav_path=None)
+    cue = [s for s in out["sentence"] if s["text"].strip().lower() == "cut"]
+    assert cue and "production_cue" in cue[0]["flags"], out["sentence"]
+    real = [s for s in out["sentence"] if "cooking" in s["text"]]
+    assert real and "cut" not in real[0]["text"].lower().split()[:1], real[0]["text"]
+    print("ok: production cue stays separate from following speech when gap < merge threshold")
+
+
 def test_offscreen_loudness_flag():
     # speech_ref -5 dB; an isolated quiet word (-25 dB) at the start is off-mic.
     rms = [-5.0] * 400
@@ -216,6 +233,7 @@ def main():
     test_overlap_flag_on_crosstalk()
     test_end_to_end_silent_envelope()
     test_production_cue_flagged_and_kept_out_of_topics()
+    test_production_cue_survives_short_forward_merge()
     test_offscreen_loudness_flag()
     test_diarization_smooths_phantom_speaker_blips()
     test_rejoin_trailing_fragment()
