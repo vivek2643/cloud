@@ -50,6 +50,32 @@ def test_moments_fuse_low_split_high():
     print("ok  moments fuse low / split high")
 
 
+def test_bands_and_action_modes():
+    broad = energy_to_params(0.0)
+    calm = energy_to_params(0.3)
+    balanced = energy_to_params(0.5)
+    tight = energy_to_params(0.7)
+    sharp = energy_to_params(1.0)
+    assert broad.band == 0 and broad.action_anchor_mode == "unit"
+    assert broad.action_merge_gap_ms > 0
+    assert balanced.band == 2 and balanced.action_anchor_mode == "onset"
+    assert tight.band == 3 and tight.action_anchor_mode == "impact"
+    assert sharp.action_split_at_impact is True
+    assert energy_to_params(0.9).action_split_at_impact is False
+    assert broad.reaction_min_intensity > sharp.reaction_min_intensity
+    assert broad.territory_strict and not sharp.territory_strict
+    print("ok  bands and action modes")
+
+
+def test_overlay_thresholds_monotonic():
+    es = [0.0, 0.25, 0.5, 0.75, 1.0]
+    rx = [energy_to_params(e).reaction_min_intensity for e in es]
+    br = [energy_to_params(e).broll_min_salience for e in es]
+    assert rx == sorted(rx, reverse=True), rx
+    assert br == sorted(br, reverse=True), br
+    print("ok  overlay thresholds monotonic")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

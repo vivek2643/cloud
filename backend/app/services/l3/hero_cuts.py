@@ -46,6 +46,7 @@ from app.config import get_settings
 from app.services.l1 import fused_seams as fseams
 from app.services.l3 import anchors as anc
 from app.services.l3 import score_span as ss
+from app.services.l3 import territory as terr
 from app.services.l3.energy import EnergyParams, energy_to_params
 from app.services.l3.takes import build_take_groups, normalize_key
 
@@ -692,6 +693,188 @@ def _combined_candidates(
     return out
 
 
+def _merge_gap_for_aff(params: EnergyParams, aff: str) -> int:
+    if aff == anc.AFF_ACTION:
+        return params.action_merge_gap_ms
+    if aff == anc.AFF_REACTION:
+        return params.reaction_merge_gap_ms
+    if aff == anc.AFF_BROLL:
+        return params.broll_merge_gap_ms
+    if aff == anc.AFF_INSERT:
+        return 0
+    return params.cluster_gap_ms
+
+
+def _motion_onset_ms(motion: Optional[dict], unit_in: int, unit_out: int) -> int:
+    """First hop inside the unit where action energy rises above a local baseline."""
+    if not motion:
+        return unit_in
+    hop = max(1, int(motion.get("hop_ms", 100)))
+    energy = motion.get("action_energy") or []
+    if not energy:
+        return unit_in
+    i0 = max(0, unit_in // hop)
+    i1 = min(len(energy) - 1, unit_out // hop)
+    if i0 > i1:
+        return unit_in
+    seg = [energy[i] for i in range(i0, i1 + 1)]
+    lo = sorted(seg)[max(0, len(seg) // 4)]
+    hi = max(seg)
+    if hi - lo < 0.05:
+        return unit_in
+    thresh = lo + 0.4 * (hi - lo)
+    for i in range(i0, i1 + 1):
+        if energy[i] >= thresh:
+            return max(unit_in, i * hop)
+    return unit_in
+
+
+def _action_core(anchor: anc.Anchor, motion: Optional[dict], mode: str) -> Tuple[int, int]:
+    """Editorial core for an action/performance beat before snapping."""
+    unit_in, unit_out = anchor.start_ms, anchor.end_ms
+    impact = anchor.ts_ms
+    if mode == "unit":
+        return unit_in, unit_out
+    onset = _motion_onset_ms(motion, unit_in, unit_out)
+    if mode == "onset":
+        return onset, unit_out
+    # impact: mandatory region is contact through settle (preamble is droppable)
+    return min(max(onset, impact), unit_out), unit_out
+
+
+def _snap_segment(
+    field: Optional[fseams.FusedField], core_in: int, core_out: int,
+    params: EnergyParams, clip: _ClipInputs, aff: str,
+) -> Tuple[int, int]:
+    if field is not None:
+        in_ms, out_ms = fseams.snap_around_core(
+            field, core_in, core_out,
+            win_ms=params.snap_window_ms, duration_ms=clip.duration_ms)
+        if aff != anc.AFF_ACTION:
+            in_ms = _pad_safe(field, in_ms, params.pad_in_ms, -1, clip.duration_ms)
+            out_ms = _pad_safe(field, out_ms, params.pad_out_ms, +1, clip.duration_ms)
+        return in_ms, out_ms
+    if clip.motion and aff == anc.AFF_ACTION:
+        return _snap_action_bounds(clip.motion, core_in, core_out,
+                                   clip.duration_ms, params.energy)
+    return core_in, core_out
+
+
+def _collapse_insert_anchors(items: List[anc.Anchor], gap_ms: int) -> List[anc.Anchor]:
+    """Merge repeated graphic/on-screen labels into one anchor (Broad/Calm)."""
+    if not items:
+        return items
+    out: List[anc.Anchor] = []
+    for a in sorted(items, key=lambda x: x.start_ms):
+        key = (a.text or a.kind or "").strip().lower()
+        if out and key and key == (out[-1].text or out[-1].kind or "").strip().lower():
+            prev = out[-1]
+            if a.start_ms - prev.end_ms <= gap_ms:
+                out[-1] = anc.Anchor(
+                    ts_ms=prev.ts_ms, start_ms=prev.start_ms, end_ms=max(prev.end_ms, a.end_ms),
+                    kind=prev.kind, affordance=prev.affordance,
+                    salience=max(prev.salience, a.salience), actor=prev.actor or a.actor,
+                    text=prev.text, audio_role=prev.audio_role, source_id=prev.source_id,
+                )
+                continue
+        out.append(a)
+    return out
+
+
+def _prep_overlay_group(
+    group: List[anc.Anchor], aff: str, params: EnergyParams,
+    speaking: List[dict],
+) -> List[anc.Anchor]:
+    """Filter + collapse overlay anchors for this energy band."""
+    kept: List[anc.Anchor] = []
+    for a in group:
+        if a.kind == "audio_event":
+            if a.salience < params.audio_min_salience:
+                continue
+        elif aff == anc.AFF_REACTION:
+            dur = a.end_ms - a.start_ms
+            if dur < params.reaction_min_duration_ms:
+                continue
+            if a.salience < params.reaction_min_intensity:
+                continue
+        elif aff == anc.AFF_BROLL:
+            if a.salience < params.broll_min_salience:
+                continue
+            if params.broll_prefer_low_speech:
+                occ = terr.speech_occupation(a.start_ms, a.end_ms, speaking)
+                if occ >= 0.5 and a.salience < 0.65:
+                    continue
+        elif aff == anc.AFF_INSERT:
+            if a.salience < params.insert_min_salience:
+                continue
+        kept.append(a)
+    if aff == anc.AFF_INSERT and params.insert_collapse_graphics:
+        kept = _collapse_insert_anchors(kept, gap_ms=30_000)
+    return kept
+
+
+def _action_pieces(
+    anchor: anc.Anchor, motion: Optional[dict], params: EnergyParams,
+    field: Optional[fseams.FusedField], clip: _ClipInputs,
+) -> List[Tuple[int, int, str]]:
+    """One or two (core_in, core_out, label_suffix) per action anchor."""
+    mode = params.action_anchor_mode
+    if params.action_split_at_impact and field is not None:
+        impact = anchor.ts_ms
+        onset = _motion_onset_ms(motion, anchor.start_ms, anchor.end_ms)
+        if impact > onset + 400:
+            lo = max(0, impact - 250)
+            hi = min(clip.duration_ms or impact + 250, impact + 250)
+            seam = fseams.snap_point(field, impact, lo, max(lo + 1, hi))
+            if field.q_at(seam) >= fseams.SEAM_Q_FLOOR and onset < seam < anchor.end_ms:
+                return [
+                    (onset, seam, " · windup"),
+                    (seam, anchor.end_ms, " · payoff"),
+                ]
+    cin, cout = _action_core(anchor, motion, mode)
+    return [(cin, cout, "")]
+
+
+def _action_segments(
+    group: List[anc.Anchor], clip: _ClipInputs, field: Optional[fseams.FusedField],
+    params: EnergyParams, quality_events: List[dict],
+) -> List[HeroCut]:
+    out: List[HeroCut] = []
+    motion = clip.motion
+    for ci, members in enumerate(_cluster_anchors(group, params.action_merge_gap_ms)):
+        if params.action_merge_gap_ms > 0 and len(members) > 1:
+            # Broad/Calm: one card for merged beats
+            anchor = max(members, key=lambda m: m.salience)
+            cin, cout = min(m.start_ms for m in members), max(m.end_ms for m in members)
+            pieces = [(cin, cout, "")]
+            label_base = (anchor.text or "action").strip()
+        else:
+            anchor = members[0]
+            pieces = _action_pieces(anchor, motion, params, field, clip)
+            label_base = (anchor.text or "action").strip()
+        for pi, (cin, cout, suffix) in enumerate(pieces):
+            if cout <= cin:
+                continue
+            in_ms, out_ms = _snap_segment(field, cin, cout, params, clip, anc.AFF_ACTION)
+            vlm = _vlm_quality_score(quality_events, cin, cout)
+            score = _beat_score([anchor], vlm, territory_mult=1.0)
+            if score < _MIN_BEAT_SALIENCE:
+                continue
+            out.append(HeroCut(
+                hero_id=f"{clip.file_id[:8]}:act{ci}{pi}",
+                file_id=clip.file_id,
+                modality=anc.AFF_ACTION,
+                label=(label_base + suffix)[:200],
+                src_in_ms=in_ms,
+                src_out_ms=out_ms,
+                speaker=anchor.actor,
+                affordances=[anc.AFF_ACTION],
+                audio_role=anc.SYNC,
+                score=score,
+            ))
+    return out
+
+
 def _cluster_anchors(anchors: List[anc.Anchor], gap_ms: int) -> List[List[anc.Anchor]]:
     """Cluster same-affordance, same-actor anchors whose inter-gap is shorter
     than ``gap_ms`` -- the SAME granularity machine as speech, generalized to any
@@ -710,31 +893,25 @@ def _cluster_anchors(anchors: List[anc.Anchor], gap_ms: int) -> List[List[anc.An
     return clusters
 
 
-def _beat_score(members: List[anc.Anchor], vlm: Optional[float]) -> float:
-    """Rank for a non-speech segment: the anchors' salience (already derived from
-    the right signals -- motion energy, reaction intensity, hold length), nudged
-    by the VLM quality where it overlaps, then weighted so silent cutaways sit
-    just below primary content in the default feed."""
+def _beat_score(
+    members: List[anc.Anchor], vlm: Optional[float], *, territory_mult: float = 1.0,
+) -> float:
+    """Rank for a non-speech segment, with optional territory demotion."""
     base = max(m.salience for m in members)
     if vlm is not None:
         base = 0.7 * base + 0.3 * vlm
     w = _AFFORDANCE_WEIGHT.get(members[0].affordance, 0.7)
-    return max(0.0, min(1.0, base * w))
+    return max(0.0, min(1.0, base * w * territory_mult))
 
 
 def _beat_segments(clip: _ClipInputs, field: Optional[fseams.FusedField],
                    params: EnergyParams, anchors: List[anc.Anchor]) -> List[HeroCut]:
-    """Every NON-speech anchor (action / reaction / b-roll / insert) as a
-    segment, via ONE path: cluster by energy, then snap boundaries through the
-    fused field *around the core* so the impact / expression is never clipped.
-    This both fixes action (the racquet contact + miss stays whole) and adds the
-    entire cutaway vocabulary (reactions, holds, reveals) that was invisible."""
-    # No fused field AND no motion grid -> no basis for a safe boundary, so we
-    # decline to emit raw-extent cuts (they would be sloppy). Clips with speech
-    # always have a field (the dialogue cost), so this only skips signal-less ones.
+    """NON-speech anchors as segments -- per-affordance energy semantics."""
     if field is None and not clip.motion:
         return []
-    quality_events = (clip.perception or {}).get("take_quality_events") or []
+    perception = clip.perception or {}
+    speaking = perception.get("speaking") or []
+    quality_events = perception.get("take_quality_events") or []
     out: List[HeroCut] = []
     by_aff: Dict[str, List[anc.Anchor]] = {}
     for a in anchors:
@@ -742,26 +919,26 @@ def _beat_segments(clip: _ClipInputs, field: Optional[fseams.FusedField],
             continue
         by_aff.setdefault(a.affordance, []).append(a)
 
-    for aff, group in by_aff.items():
-        for ci, members in enumerate(_cluster_anchors(group, params.cluster_gap_ms)):
+    for aff, raw in by_aff.items():
+        if aff == anc.AFF_ACTION:
+            group = raw
+            out.extend(_action_segments(group, clip, field, params, quality_events))
+            continue
+        group = _prep_overlay_group(raw, aff, params, speaking)
+        merge_gap = _merge_gap_for_aff(params, aff)
+        if aff == anc.AFF_INSERT:
+            merge_gap = 2000 if params.insert_collapse_graphics else 0
+        elif aff == anc.AFF_REACTION and any(m.kind == "audio_event" for m in group):
+            merge_gap = params.audio_merge_gap_ms
+        for ci, members in enumerate(_cluster_anchors(group, merge_gap)):
             core_in = min(m.start_ms for m in members)
             core_out = max(m.end_ms for m in members)
-            if field is not None:
-                in_ms, out_ms = fseams.snap_around_core(
-                    field, core_in, core_out,
-                    win_ms=params.snap_window_ms, duration_ms=clip.duration_ms)
-                # Overlay cutaways get a touch of veto-bounded handle for placement.
-                if aff != anc.AFF_ACTION:
-                    in_ms = _pad_safe(field, in_ms, params.pad_in_ms, -1, clip.duration_ms)
-                    out_ms = _pad_safe(field, out_ms, params.pad_out_ms, +1, clip.duration_ms)
-            elif clip.motion and aff == anc.AFF_ACTION:
-                in_ms, out_ms = _snap_action_bounds(clip.motion, core_in, core_out,
-                                                    clip.duration_ms, params.energy)
-            else:
-                in_ms, out_ms = core_in, core_out
+            in_ms, out_ms = _snap_segment(field, core_in, core_out, params, clip, aff)
             best = max(members, key=lambda m: m.salience)
+            t_mult = terr.territory_multiplier(
+                best, speaking=speaking, strict=params.territory_strict)
             vlm = _vlm_quality_score(quality_events, core_in, core_out)
-            score = _beat_score(members, vlm)
+            score = _beat_score(members, vlm, territory_mult=t_mult)
             if score < _MIN_BEAT_SALIENCE:
                 continue
             label = (best.text or aff).strip()

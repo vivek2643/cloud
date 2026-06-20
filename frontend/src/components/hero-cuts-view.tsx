@@ -11,7 +11,7 @@ import {
   type HeroModality,
   type FileRecord,
 } from "@/lib/api";
-import { Star, Play, Pause, Volume2, VolumeX, Layers, Zap } from "lucide-react";
+import { Star, Play, Volume2, VolumeX, Layers, Zap } from "lucide-react";
 
 const MODALITY_STYLE: Record<HeroModality, { color: string; label: string }> = {
   speech: { color: "#6366f1", label: "speech" },
@@ -55,6 +55,7 @@ export function HeroCutsView() {
   const [filter, setFilter] = useState<HeroModality | "all">("all");
   const [heroes, setHeroes] = useState<HeroCut[]>([]);
   const [loading, setLoading] = useState(false);
+  const [activeHeroId, setActiveHeroId] = useState<string | null>(null);
   const urlCache = useRef<Record<string, Promise<string | null>>>({});
 
   const candidates = useMemo(
@@ -204,6 +205,11 @@ export function HeroCutsView() {
               file={filesById[h.file_id]!}
               hero={h}
               getUrl={getUrl}
+              isActive={activeHeroId === h.hero_id}
+              onActivate={() => setActiveHeroId(h.hero_id)}
+              onDeactivate={() =>
+                setActiveHeroId((id) => (id === h.hero_id ? null : id))
+              }
             />
           ))}
         </div>
@@ -216,17 +222,21 @@ function HeroClipCard({
   file,
   hero,
   getUrl,
+  isActive,
+  onActivate,
+  onDeactivate,
 }: {
   file: FileRecord;
   hero: HeroCut;
   getUrl: (fileId: string) => Promise<string | null>;
+  isActive: boolean;
+  onActivate: () => void;
+  onDeactivate: () => void;
 }) {
   const [playUrl, setPlayUrl] = useState<string | null>(null);
   const [muted, setMuted] = useState(false);
-  const [desiredPlaying, setDesiredPlaying] = useState(false);
   const [playing, setPlaying] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
-  const pinnedRef = useRef(false);
 
   const inSec = hero.src_in_ms / 1000;
   const outSec = hero.src_out_ms / 1000;
@@ -246,20 +256,25 @@ function HeroClipCard({
   useEffect(() => {
     const v = videoRef.current;
     if (!v || !playUrl) return;
-    if (desiredPlaying) {
+    if (isActive) {
       try {
         if (v.currentTime < inSec || v.currentTime >= outSec) v.currentTime = inSec;
       } catch {
         /* ignore */
       }
       v.muted = muted;
-      v.play().then(() => setPlaying(true)).catch(() => {});
+      v.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
     } else {
       v.pause();
       setPlaying(false);
+      try {
+        v.currentTime = inSec;
+      } catch {
+        /* ignore */
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [desiredPlaying, playUrl]);
+  }, [isActive, playUrl, muted]);
 
   function onLoadedMetadata() {
     const v = videoRef.current;
@@ -284,34 +299,12 @@ function HeroClipCard({
   }
 
   async function handleEnter() {
-    if (pinnedRef.current) return;
+    onActivate();
     await ensureUrl();
-    setDesiredPlaying(true);
   }
 
   function handleLeave() {
-    if (pinnedRef.current) return;
-    setDesiredPlaying(false);
-    const v = videoRef.current;
-    if (v) {
-      try {
-        v.currentTime = inSec;
-      } catch {
-        /* ignore */
-      }
-    }
-  }
-
-  async function handleCenterToggle(e: React.MouseEvent) {
-    e.stopPropagation();
-    if (desiredPlaying) {
-      pinnedRef.current = false;
-      setDesiredPlaying(false);
-    } else {
-      pinnedRef.current = true;
-      await ensureUrl();
-      setDesiredPlaying(true);
-    }
+    onDeactivate();
   }
 
   function onDragStart(e: React.DragEvent) {
@@ -356,7 +349,6 @@ function HeroClipCard({
       <div
         onMouseEnter={handleEnter}
         onMouseLeave={handleLeave}
-        onClick={handleCenterToggle}
         draggable
         onDragStart={onDragStart}
         className="relative flex aspect-video cursor-pointer items-center justify-center overflow-hidden"
@@ -405,21 +397,15 @@ function HeroClipCard({
           </span>
         )}
 
-        {/* Center play / pause. */}
-        <button
-          onClick={handleCenterToggle}
-          className={`absolute left-1/2 top-1/2 z-20 flex h-11 w-11 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full shadow-lg transition-all ${
-            playing ? "opacity-0 group-hover:opacity-100" : "opacity-100"
+        {/* Hover preview hint — playback is hover-driven only. */}
+        <span
+          className={`pointer-events-none absolute left-1/2 top-1/2 z-20 flex h-11 w-11 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full shadow-lg transition-opacity ${
+            playing ? "opacity-0" : "opacity-100 group-hover:opacity-0"
           }`}
           style={{ background: "var(--accent)" }}
-          title={playing ? "Pause" : "Play clip"}
         >
-          {playing ? (
-            <Pause size={20} className="text-white" fill="white" />
-          ) : (
-            <Play size={20} className="ml-0.5 text-white" fill="white" />
-          )}
-        </button>
+          <Play size={20} className="ml-0.5 text-white" fill="white" />
+        </span>
 
         {/* Mute toggle (top-right). */}
         {playUrl && (
