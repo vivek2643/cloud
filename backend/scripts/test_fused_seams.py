@@ -102,6 +102,24 @@ def test_snap_moves_off_vetoed_point():
     print("ok  snap avoids vetoed region")
 
 
+def test_snap_around_core_never_clips_core():
+    """The core (e.g. the racquet swing + miss) sits in a vetoed/high-motion
+    region; snap_around_core must land the in-point at/before core_in and the
+    out-point at/after core_out -- never inside -- so the payoff is never cut."""
+    # Core = 2.0..2.8s (a busy action beat). Calm rests just outside it.
+    cam = _const(0.9)
+    for i in range(0, 19):     # calm before
+        cam[i] = 0.05
+    for i in range(29, 40):    # calm after the beat
+        cam[i] = 0.05
+    field = fs.compute_fused_field(duration_ms=DUR, camera_cost=cam)
+    in_ms, out_ms = fs.snap_around_core(field, 2000, 2800, win_ms=1200, duration_ms=DUR)
+    assert in_ms <= 2000, in_ms          # never starts inside the core
+    assert out_ms >= 2800, out_ms        # never ends inside the core
+    assert in_ms >= 1500 and out_ms <= 3200    # but stays within the search window
+    print("ok  snap_around_core never clips core")
+
+
 def test_missing_channels_are_neutral():
     """No grids at all -> everything is safe (degrades gracefully)."""
     field = fs.compute_fused_field(duration_ms=DUR)

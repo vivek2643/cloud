@@ -18,7 +18,22 @@ const MODALITY_STYLE: Record<HeroModality, { color: string; label: string }> = {
   action: { color: "#f59e0b", label: "action" },
   visual: { color: "#06b6d4", label: "visual" },
   moment: { color: "#10b981", label: "dialogue + action" },
+  reaction: { color: "#ec4899", label: "reaction" },
+  broll: { color: "#06b6d4", label: "b-roll" },
+  insert: { color: "#a78bfa", label: "insert" },
 };
+
+// Filter chips over the ONE feed -- this is how every edit style (soundbites,
+// action beats, cutaways) is served without a separate pipeline.
+const FILTERS: { key: HeroModality | "all"; label: string }[] = [
+  { key: "all", label: "All" },
+  { key: "speech", label: "Speech" },
+  { key: "action", label: "Action" },
+  { key: "moment", label: "Moments" },
+  { key: "reaction", label: "Reactions" },
+  { key: "broll", label: "B-roll" },
+  { key: "insert", label: "Inserts" },
+];
 
 function fmtDur(ms: number): string {
   const s = ms / 1000;
@@ -37,6 +52,7 @@ export function HeroCutsView() {
   const token = useAuthStore((s) => s.session?.access_token);
   const files = useDriveStore((s) => s.files);
   const [energy, setEnergy] = useState(0.5);
+  const [filter, setFilter] = useState<HeroModality | "all">("all");
   const [heroes, setHeroes] = useState<HeroCut[]>([]);
   const [loading, setLoading] = useState(false);
   const urlCache = useRef<Record<string, Promise<string | null>>>({});
@@ -98,7 +114,13 @@ export function HeroCutsView() {
     [token]
   );
 
-  const visible = heroes.filter((h) => filesById[h.file_id]);
+  const present = useMemo(() => heroes.filter((h) => filesById[h.file_id]), [heroes, filesById]);
+  const counts = useMemo(() => {
+    const c: Record<string, number> = {};
+    for (const h of present) c[h.modality] = (c[h.modality] ?? 0) + 1;
+    return c;
+  }, [present]);
+  const visible = filter === "all" ? present : present.filter((h) => h.modality === filter);
   const totalClips = visible.length;
 
   return (
@@ -126,12 +148,36 @@ export function HeroCutsView() {
             {energyLabel(energy)}
           </span>
         </div>
-        {totalClips > 0 && (
+        {present.length > 0 && (
           <span className="text-sm" style={{ color: "var(--muted)" }}>
-            {totalClips} hero cut{totalClips === 1 ? "" : "s"}
+            {totalClips} of {present.length} cut{present.length === 1 ? "" : "s"}
           </span>
         )}
       </div>
+
+      {present.length > 0 && (
+        <div className="mb-5 flex flex-wrap gap-2">
+          {FILTERS.filter((f) => f.key === "all" || (counts[f.key] ?? 0) > 0).map((f) => {
+            const active = filter === f.key;
+            const n = f.key === "all" ? present.length : counts[f.key] ?? 0;
+            const accent = f.key === "all" ? "var(--accent)" : MODALITY_STYLE[f.key as HeroModality].color;
+            return (
+              <button
+                key={f.key}
+                onClick={() => setFilter(f.key)}
+                className="rounded-full border px-3 py-1 text-xs font-medium transition-colors"
+                style={{
+                  borderColor: active ? accent : "var(--border)",
+                  background: active ? accent : "transparent",
+                  color: active ? "#fff" : "var(--muted)",
+                }}
+              >
+                {f.label} <span style={{ opacity: 0.7 }}>{n}</span>
+              </button>
+            );
+          })}
+        </div>
+      )}
 
       {loading && (
         <p className="py-12 text-center text-sm" style={{ color: "var(--muted)" }}>
@@ -331,12 +377,21 @@ function HeroClipCard({
         )}
         {!playUrl && <FileIcon type={(isVideo ? "video" : "audio") as "video"} size={32} />}
 
-        {/* Modality badge (top-left). */}
+        {/* Modality badge (top-left), with an OVERLAY marker for silent cutaways
+            (reactions / b-roll / inserts) the editor lays over other audio. */}
         <span
-          className="absolute left-2 top-2 z-20 rounded px-1.5 py-0.5 text-[11px] font-semibold capitalize text-white"
+          className="absolute left-2 top-2 z-20 flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-semibold capitalize text-white"
           style={{ background: modality.color }}
         >
           {modality.label}
+          {hero.audio_role === "overlay" && (
+            <span
+              className="rounded-sm bg-black/30 px-1 text-[9px] uppercase tracking-wide"
+              title="Silent cutaway \u2014 lay this over your main audio"
+            >
+              overlay
+            </span>
+          )}
         </span>
 
         {/* Take-stack badge (top-left, below modality) when repeats exist. */}

@@ -275,3 +275,30 @@ def snap_bounds(
     if out_ms <= in_ms:
         out_ms = max(raw_out, in_ms + 1)
     return in_ms, out_ms
+
+
+def snap_around_core(
+    field: FusedField, core_in: int, core_out: int, *,
+    win_ms: int = SNAP_BASE_WIN_MS, duration_ms: int = 0,
+) -> Tuple[int, int]:
+    """Snap boundaries to safe seams that lie STRICTLY OUTSIDE the core
+    ``[core_in, core_out]`` -- the universal core-preservation rule. The in-point
+    is searched only in ``[core_in - win, core_in]`` and the out-point only in
+    ``[core_out, core_out + win]``, so the core (a whole word, the racquet
+    contact + its miss, an expression peak) can never be clipped, regardless of
+    energy. Both prefer the seam closest to the core (the tightest safe cut),
+    expanding outward only to reach a cleaner one.
+
+    This subsumes the old per-modality logic: speech keeps its words because the
+    dialogue veto already lives in the field; action keeps its impact because the
+    impact sits between ``core_in`` and ``core_out`` and is never a boundary."""
+    if not field.cost:
+        return core_in, core_out
+    in_ms = snap_point(field, core_in, max(0, core_in - win_ms), core_in)
+    hi = min(duration_ms, core_out + win_ms) if duration_ms else core_out + win_ms
+    out_ms = snap_point(field, core_out, core_out, max(core_out + 1, hi))
+    if in_ms > core_in:
+        in_ms = core_in
+    if out_ms < core_out:
+        out_ms = core_out
+    return in_ms, out_ms

@@ -147,7 +147,16 @@ export function getDialogues(fileId: string, token: string) {
 
 // --- Hero Cuts lens ---
 
-export type HeroModality = "speech" | "action" | "visual" | "moment";
+export type HeroModality =
+  | "speech"
+  | "action"
+  | "visual"
+  | "moment"
+  | "reaction"
+  | "broll"
+  | "insert";
+
+export type HeroAudioRole = "sync" | "overlay";
 
 export interface HeroTake {
   file_id: string;
@@ -167,6 +176,8 @@ export interface HeroCut {
   score: number;
   speaker: string | null;
   flags: string[];
+  affordances: string[];
+  audio_role: HeroAudioRole;
   take_count: number;
   alt_takes: HeroTake[];
 }

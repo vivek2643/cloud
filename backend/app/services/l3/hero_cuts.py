@@ -44,6 +44,7 @@ from difflib import SequenceMatcher
 
 from app.config import get_settings
 from app.services.l1 import fused_seams as fseams
+from app.services.l3 import anchors as anc
 from app.services.l3 import score_span as ss
 from app.services.l3.energy import EnergyParams, energy_to_params
 from app.services.l3.takes import build_take_groups, normalize_key
@@ -83,6 +84,20 @@ COMBINE_GAP_MS = 1_500
 # Hidden-by-default flags inherited from the dialogue lens.
 _OFFCAMERA_FLAGS = ("offscreen", "production_cue")
 
+# Primary content (speech/action) ranks above silent cutaways by default, so the
+# top of the feed is the substance; cutaways stay one filter-click away. A pure
+# rank nudge -- it never hides anything.
+_AFFORDANCE_WEIGHT = {
+    anc.AFF_SPEECH: 1.00,
+    anc.AFF_ACTION: 1.00,
+    anc.AFF_REACTION: 0.82,
+    anc.AFF_BROLL: 0.72,
+    anc.AFF_INSERT: 0.70,
+}
+# A beat segment needs at least this salience to be worth surfacing as a card
+# (everything is still reachable in raw via the timeline; this just declutters).
+_MIN_BEAT_SALIENCE = 0.15
+
 
 @dataclass
 class HeroTake:
@@ -105,13 +120,15 @@ class HeroTake:
 class HeroCut:
     hero_id: str
     file_id: str
-    modality: str                 # speech | action | visual
+    modality: str                 # the DOMINANT affordance (speech|action|reaction|broll|insert)
     label: str                    # human-facing text / description
     src_in_ms: int
     src_out_ms: int
     score: float                  # 0..1 rank key
     speaker: Optional[str] = None
     flags: List[str] = field(default_factory=list)
+    affordances: List[str] = field(default_factory=list)  # all editorial uses (filter keys)
+    audio_role: str = anc.SYNC    # sync (carries its sound) | overlay (silent cutaway)
     take_count: int = 1           # how many comparable takes exist (incl. this)
     alt_takes: List[HeroTake] = field(default_factory=list)  # the losers, best-first
 
@@ -127,6 +144,8 @@ class HeroCut:
             "score": round(self.score, 3),
             "speaker": self.speaker,
             "flags": self.flags,
+            "affordances": self.affordances or [self.modality],
+            "audio_role": self.audio_role,
             "take_count": self.take_count,
             "alt_takes": [t.to_dict() for t in self.alt_takes],
         }
@@ -189,7 +208,8 @@ def _load_inputs(file_ids: List[str]) -> Dict[str, _ClipInputs]:
                    md.hop_ms, md.action_energy, md.action_cut_cost,
                    md.camera_cut_cost, md.action_points,
                    af.dialogue_cut_cost, af.dialogue_cut_hop_ms, af.dialogue_cut_points,
-                   af.beat_cut_cost, af.beat_cut_hop_ms, af.beat_cut_points
+                   af.beat_cut_cost, af.beat_cut_hop_ms, af.beat_cut_points,
+                   af.rms_db, af.prosody_hop_ms
               from files f
               left join dialogue_segments ds on ds.file_id = f.id
               left join clip_perception   cp on cp.file_id = f.id
@@ -202,7 +222,8 @@ def _load_inputs(file_ids: List[str]) -> Dict[str, _ClipInputs]:
 
     for (fid, dur_s, segments, perception, hop_ms, action_energy,
          action_cost, camera_cost, action_points,
-         dlg_cost, dlg_hop, dlg_points, beat_cost, beat_hop, beat_points) in rows:
+         dlg_cost, dlg_hop, dlg_points, beat_cost, beat_hop, beat_points,
+         rms_db, prosody_hop) in rows:
         seg_doc = _as_doc(segments) or {}
         motion = None
         if hop_ms:
@@ -214,7 +235,7 @@ def _load_inputs(file_ids: List[str]) -> Dict[str, _ClipInputs]:
                 "action_points": _as_list(action_points),
             }
         audio = None
-        if dlg_cost or beat_cost:
+        if dlg_cost or beat_cost or rms_db:
             audio = {
                 "dialogue_cut_cost": _as_list(dlg_cost),
                 "dialogue_cut_hop_ms": int(dlg_hop) if dlg_hop else 100,
@@ -222,6 +243,8 @@ def _load_inputs(file_ids: List[str]) -> Dict[str, _ClipInputs]:
                 "beat_cut_cost": _as_list(beat_cost),
                 "beat_cut_hop_ms": int(beat_hop) if beat_hop else 100,
                 "beat_cut_points": _as_list(beat_points),
+                "rms_db": _as_list(rms_db),
+                "prosody_hop_ms": int(prosody_hop) if prosody_hop else 0,
             }
         out[fid] = _ClipInputs(
             file_id=fid,
@@ -547,13 +570,15 @@ def _make_speech_hero(
     return HeroCut(
         hero_id=f"{clip.file_id[:8]}:{uid}",
         file_id=clip.file_id,
-        modality="speech",
+        modality=anc.AFF_SPEECH,
         label=text.strip(),
         src_in_ms=in_ms,
         src_out_ms=out_ms,
         score=_speech_score(metrics, vlm),
         speaker=speaker,
         flags=extra_flags,
+        affordances=[anc.AFF_SPEECH],
+        audio_role=anc.SYNC,
     )
 
 
@@ -661,47 +686,109 @@ def _combined_candidates(
             src_out_ms=out_ms,
             score=max(s.score, a.score),
             speaker=s.speaker,
+            affordances=[anc.AFF_SPEECH, anc.AFF_ACTION],
+            audio_role=anc.SYNC,
         ))
+    return out
+
+
+def _cluster_anchors(anchors: List[anc.Anchor], gap_ms: int) -> List[List[anc.Anchor]]:
+    """Cluster same-affordance, same-actor anchors whose inter-gap is shorter
+    than ``gap_ms`` -- the SAME granularity machine as speech, generalized to any
+    anchor. Low energy merges adjacent beats into one moment; ``gap_ms == 0``
+    keeps every beat separate."""
+    items = sorted(anchors, key=lambda a: a.start_ms)
+    clusters: List[List[anc.Anchor]] = []
+    for a in items:
+        if clusters:
+            prev = clusters[-1][-1]
+            gap = a.start_ms - prev.end_ms
+            if a.actor == prev.actor and gap < gap_ms:
+                clusters[-1].append(a)
+                continue
+        clusters.append([a])
+    return clusters
+
+
+def _beat_score(members: List[anc.Anchor], vlm: Optional[float]) -> float:
+    """Rank for a non-speech segment: the anchors' salience (already derived from
+    the right signals -- motion energy, reaction intensity, hold length), nudged
+    by the VLM quality where it overlaps, then weighted so silent cutaways sit
+    just below primary content in the default feed."""
+    base = max(m.salience for m in members)
+    if vlm is not None:
+        base = 0.7 * base + 0.3 * vlm
+    w = _AFFORDANCE_WEIGHT.get(members[0].affordance, 0.7)
+    return max(0.0, min(1.0, base * w))
+
+
+def _beat_segments(clip: _ClipInputs, field: Optional[fseams.FusedField],
+                   params: EnergyParams, anchors: List[anc.Anchor]) -> List[HeroCut]:
+    """Every NON-speech anchor (action / reaction / b-roll / insert) as a
+    segment, via ONE path: cluster by energy, then snap boundaries through the
+    fused field *around the core* so the impact / expression is never clipped.
+    This both fixes action (the racquet contact + miss stays whole) and adds the
+    entire cutaway vocabulary (reactions, holds, reveals) that was invisible."""
+    # No fused field AND no motion grid -> no basis for a safe boundary, so we
+    # decline to emit raw-extent cuts (they would be sloppy). Clips with speech
+    # always have a field (the dialogue cost), so this only skips signal-less ones.
+    if field is None and not clip.motion:
+        return []
+    quality_events = (clip.perception or {}).get("take_quality_events") or []
+    out: List[HeroCut] = []
+    by_aff: Dict[str, List[anc.Anchor]] = {}
+    for a in anchors:
+        if a.affordance == anc.AFF_SPEECH:
+            continue
+        by_aff.setdefault(a.affordance, []).append(a)
+
+    for aff, group in by_aff.items():
+        for ci, members in enumerate(_cluster_anchors(group, params.cluster_gap_ms)):
+            core_in = min(m.start_ms for m in members)
+            core_out = max(m.end_ms for m in members)
+            if field is not None:
+                in_ms, out_ms = fseams.snap_around_core(
+                    field, core_in, core_out,
+                    win_ms=params.snap_window_ms, duration_ms=clip.duration_ms)
+                # Overlay cutaways get a touch of veto-bounded handle for placement.
+                if aff != anc.AFF_ACTION:
+                    in_ms = _pad_safe(field, in_ms, params.pad_in_ms, -1, clip.duration_ms)
+                    out_ms = _pad_safe(field, out_ms, params.pad_out_ms, +1, clip.duration_ms)
+            elif clip.motion and aff == anc.AFF_ACTION:
+                in_ms, out_ms = _snap_action_bounds(clip.motion, core_in, core_out,
+                                                    clip.duration_ms, params.energy)
+            else:
+                in_ms, out_ms = core_in, core_out
+            best = max(members, key=lambda m: m.salience)
+            vlm = _vlm_quality_score(quality_events, core_in, core_out)
+            score = _beat_score(members, vlm)
+            if score < _MIN_BEAT_SALIENCE:
+                continue
+            label = (best.text or aff).strip()
+            out.append(HeroCut(
+                hero_id=f"{clip.file_id[:8]}:{aff[:3]}{ci}",
+                file_id=clip.file_id,
+                modality=aff,
+                label=label[:200],
+                src_in_ms=in_ms,
+                src_out_ms=out_ms,
+                speaker=best.actor,
+                affordances=[aff],
+                audio_role=best.audio_role,
+                score=score,
+            ))
     return out
 
 
 def _action_candidates(clip: _ClipInputs, params: EnergyParams,
                        field: Optional[fseams.FusedField]) -> List[HeroCut]:
-    """Action / visual heroes from the VLM's content_units, snapped through the
-    FUSED SEAM FIELD (dialogue/camera vetoes + action/beat attractors) so a cut
-    never lands inside speech and gets the same energy-scaled tightness as
-    speech. Falls back to the camera-only snapper if the fused field is
-    unavailable. Only fires when the VLM units and motion grid exist."""
-    if not clip.perception or not clip.motion:
-        return []
-    units = clip.perception.get("content_units") or []
-    quality_events = clip.perception.get("take_quality_events") or []
-
-    out: List[HeroCut] = []
-    for u in units:
-        kind = (u.get("kind") or "").lower()
-        if kind not in ("action", "visual"):
-            continue
-        raw_in, raw_out = int(u.get("start_ms", 0)), int(u.get("end_ms", 0))
-        if raw_out <= raw_in:
-            continue
-        if field is not None:
-            in_ms, out_ms = _snap_fused(field, raw_in, raw_out, params, clip.duration_ms)
-        else:
-            in_ms, out_ms = _snap_action_bounds(clip.motion, raw_in, raw_out,
-                                                clip.duration_ms, params.energy)
-        vlm = _vlm_quality_score(quality_events, raw_in, raw_out)
-        label = (u.get("label") or u.get("content_key") or kind).strip()
-        out.append(HeroCut(
-            hero_id=f"{clip.file_id[:8]}:{u.get('unit_id', 'act')}",
-            file_id=clip.file_id,
-            modality=kind,
-            label=label,
-            src_in_ms=in_ms,
-            src_out_ms=out_ms,
-            score=_action_score(clip.motion, raw_in, raw_out, vlm),
-        ))
-    return out
+    """DEPRECATED shim: action/visual now flow through ``_beat_segments`` over the
+    anchor layer. Kept as a thin wrapper so older callers/tests still work."""
+    anchors = anc.gather_anchors(
+        duration_ms=clip.duration_ms,
+        perception=clip.perception, motion=clip.motion)
+    action = [a for a in anchors if a.affordance in (anc.AFF_ACTION, anc.AFF_BROLL, anc.AFF_INSERT)]
+    return _beat_segments(clip, field, params, action)
 
 
 # --------------------------------------------------------------------------
@@ -830,13 +917,22 @@ def _consolidate_speech(heroes: List[HeroCut]) -> List[HeroCut]:
 # Public entry point
 # --------------------------------------------------------------------------
 
-def build_hero_cuts(file_ids: List[str], energy: float = 0.5) -> List[Dict[str, Any]]:
-    """The ranked hero feed for a set of clips.
+def build_hero_cuts(
+    file_ids: List[str], energy: float = 0.5,
+    affordances: Optional[List[str]] = None,
+    audio_role: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """The ranked, universal segment feed for a set of clips.
 
-    `energy` (0..1) is the single deterministic dial: it sets speech granularity
-    (clustered answers -> sentences -> clauses), cut tightness (loose breathing
-    room -> frame-tight) and whether action+dialogue is fused into one moment.
-    Returns hero dicts sorted best-first.
+    Every editable moment -- speech, action, reaction, b-roll hold, insert -- is
+    one ``segment`` built over the ANCHOR layer (``l3.anchors``): cluster anchors
+    by the energy dial, then snap boundaries through the fused seam field *around
+    the core* so the words / impact / expression are never clipped.
+
+    `energy` (0..1) is the single deterministic dial (granularity + tightness).
+    `affordances` / `audio_role` are optional FILTERS over the one feed -- the
+    way every edit style (action reel, podcast A-roll, B-roll cutaways) is served
+    without a separate pipeline. Returns hero dicts sorted best-first.
     """
     if not file_ids:
         return []
@@ -848,13 +944,22 @@ def build_hero_cuts(file_ids: List[str], energy: float = 0.5) -> List[Dict[str, 
     heroes: List[HeroCut] = []
     for fid, clip in inputs.items():
         field = _build_field(clip, params.energy)
+        anchors = anc.gather_anchors(
+            duration_ms=clip.duration_ms, dialogue=clip.dialogue,
+            perception=clip.perception, motion=clip.motion, audio=clip.audio)
         sp = _speech_candidates(clip, sources.get(fid), field, params)
-        ac = _action_candidates(clip, params, field)
+        beats = _beat_segments(clip, field, params, anchors)
         heroes.extend(sp)
-        heroes.extend(ac)
+        heroes.extend(beats)
         if params.fuse_moments:
-            heroes.extend(_combined_candidates(clip, sp, ac))
+            action = [b for b in beats if b.modality == anc.AFF_ACTION]
+            heroes.extend(_combined_candidates(clip, sp, action))
 
     heroes = _stack_takes(heroes, file_ids)
+    if affordances:
+        want = set(affordances)
+        heroes = [h for h in heroes if want & set(h.affordances or [h.modality])]
+    if audio_role:
+        heroes = [h for h in heroes if h.audio_role == audio_role]
     heroes.sort(key=lambda h: h.score, reverse=True)
     return [h.to_dict() for h in heroes]

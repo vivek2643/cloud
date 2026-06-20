@@ -213,9 +213,98 @@ def test_action_fused_avoids_speech():
     heroes = hc._action_candidates(clip, hc.energy_to_params(0.5), field)
     assert len(heroes) == 1, heroes
     h = heroes[0]
-    assert not (1800 < h.src_out_ms < 2600), h.src_out_ms   # not inside the speech
-    assert h.src_out_ms <= 1800, h.src_out_ms               # trimmed to before it
+    # Core-preservation: the boundary never lands INSIDE the spoken word...
+    assert not (1800 < h.src_out_ms < 2600), h.src_out_ms
+    # ...and the action core (ends at 2000) is never clipped -- the out lands at a
+    # clean seam at/after the core (here, just after the speech ends ~2600).
+    assert h.src_out_ms >= 2000, h.src_out_ms
     print("ok  test_action_fused_avoids_speech")
+
+
+def _clip_multi():
+    """A clip with speech + a reaction + a held shot + an action beat + audio and
+    motion grids, so a real fused field can be built."""
+    n = 120  # 12s at 100ms
+    dlg = [0.0] * n
+    for i in range(10, 30):     # speech 1.0-3.0s
+        dlg[i] = 1.0
+    cam = [0.05] * n
+    for i in range(60, 78):     # busy motion during the action 6.0-7.8s
+        cam[i] = 0.8
+    action_cost = [1.0] * n
+    action_cost[68] = 0.0       # impact ~6.8s
+    motion = {"hop_ms": 100, "action_energy": [0.7] * n,
+              "action_cut_cost": action_cost, "camera_cut_cost": cam,
+              "action_points": [{"ts_ms": 6800, "score": 1.0}]}
+    audio = {"dialogue_cut_cost": dlg, "dialogue_cut_hop_ms": 100, "dialogue_cut_points": [],
+             "beat_cut_cost": [], "beat_cut_hop_ms": 100, "beat_cut_points": []}
+    perception = {
+        "content_type": "vlog",
+        "editability": {"primary_axis": "action"},
+        "content_units": [{"unit_id": "u1", "kind": "action", "label": "drops and misses",
+                           "start_ms": 6000, "end_ms": 7800}],
+        "reactions": [{"start_ms": 8200, "end_ms": 8900, "subject": "p1",
+                       "type": "smile", "intensity": 0.7, "trigger": "the miss"}],
+        "camera_craft": [{"start_ms": 9000, "end_ms": 11500, "movement": "static",
+                          "subject_focus": "wide room"}],
+        "take_quality_events": [],
+    }
+    clip = hc._ClipInputs(
+        file_id="ffffffff-1", duration_ms=12000,
+        dialogue={"topic": [], "sentence": [
+            _seg("s0", "sentence", "here is a clean on camera spoken line", 1000, 3000)]},
+        perception=perception, motion=motion, audio=audio)
+    return clip
+
+
+def test_reaction_and_broll_surface_as_overlay():
+    """The whole cutaway vocabulary (reactions, held b-roll) now appears in the
+    feed as OVERLAY segments -- the thing that was completely invisible before."""
+    clip = _clip_multi()
+    field = hc._build_field(clip, 0.5)
+    anchors = hc.anc.gather_anchors(duration_ms=clip.duration_ms, dialogue=clip.dialogue,
+                                    perception=clip.perception, motion=clip.motion)
+    beats = hc._beat_segments(clip, field, hc.energy_to_params(0.5), anchors)
+    mods = {b.modality for b in beats}
+    assert hc.anc.AFF_REACTION in mods and hc.anc.AFF_BROLL in mods and hc.anc.AFF_ACTION in mods, mods
+    rx = next(b for b in beats if b.modality == hc.anc.AFF_REACTION)
+    assert rx.audio_role == hc.anc.OVERLAY
+    act = next(b for b in beats if b.modality == hc.anc.AFF_ACTION)
+    assert act.audio_role == hc.anc.SYNC
+    print("ok  test_reaction_and_broll_surface_as_overlay")
+
+
+def test_action_core_preserved():
+    """Core-preservation: the action segment always contains the whole beat
+    (6000-7800) -- the miss/payoff can never be clipped, at any energy."""
+    clip = _clip_multi()
+    for e in (0.0, 0.5, 1.0):
+        field = hc._build_field(clip, e)
+        anchors = hc.anc.gather_anchors(duration_ms=clip.duration_ms, dialogue=clip.dialogue,
+                                        perception=clip.perception, motion=clip.motion)
+        beats = hc._beat_segments(clip, field, hc.energy_to_params(e), anchors)
+        act = next(b for b in beats if b.modality == hc.anc.AFF_ACTION)
+        assert act.src_in_ms <= 6000, (e, act.src_in_ms)
+        assert act.src_out_ms >= 7800, (e, act.src_out_ms)
+    print("ok  test_action_core_preserved")
+
+
+def test_coverage_every_anchor_in_a_segment():
+    """The coverage guarantee: every (non-trivial) anchor lands inside some
+    produced segment -- so there is no usable moment only reachable in raw."""
+    clip = _clip_multi()
+    field = hc._build_field(clip, 0.5)
+    src = _src("ffffffff-1", 12000, _words([
+        ("here", 1000, 1300), ("is", 1300, 1500), ("a", 1500, 1600), ("clean", 1600, 2000),
+        ("on", 2000, 2200), ("camera", 2200, 2600), ("spoken", 2600, 2900), ("line", 2900, 3000)]))
+    params = hc.energy_to_params(0.5)
+    anchors = hc.anc.gather_anchors(duration_ms=clip.duration_ms, dialogue=clip.dialogue,
+                                    perception=clip.perception, motion=clip.motion)
+    segs = hc._speech_candidates(clip, src, field, params) + hc._beat_segments(clip, field, params, anchors)
+    for a in anchors:
+        covered = any(hc._overlap_ms(s.src_in_ms, s.src_out_ms, a.start_ms, a.end_ms) > 0 for s in segs)
+        assert covered, f"anchor {a.kind} {a.start_ms}-{a.end_ms} not covered by any segment"
+    print("ok  test_coverage_every_anchor_in_a_segment")
 
 
 def test_action_skipped_without_motion():
@@ -240,6 +329,9 @@ def main():
     test_action_snaps_to_calm_motion_seam()
     test_action_fused_avoids_speech()
     test_action_skipped_without_motion()
+    test_reaction_and_broll_surface_as_overlay()
+    test_action_core_preserved()
+    test_coverage_every_anchor_in_a_segment()
     print("\nall hero-cuts tests passed")
 
 
