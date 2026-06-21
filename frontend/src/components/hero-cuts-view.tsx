@@ -11,7 +11,7 @@ import {
   type HeroModality,
   type FileRecord,
 } from "@/lib/api";
-import { Star, Play, Volume2, VolumeX, Layers, Zap, Sparkles } from "lucide-react";
+import { Star, Play, Volume2, VolumeX, Layers, Zap, Sparkles, Scissors } from "lucide-react";
 
 const MODALITY_STYLE: Record<HeroModality, { color: string; label: string }> = {
   speech: { color: "#6366f1", label: "speech" },
@@ -491,10 +491,22 @@ function HeroClipCard({
           </button>
         )}
 
-        {/* Duration badge (bottom-right). */}
-        <span className="absolute bottom-2 right-2 z-10 rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-medium text-white">
-          {fmtDur(hero.duration_ms)}
-        </span>
+        {/* Duration badge (bottom-right). When breaths are excised (Sharp band),
+            show the played length and a jump-cut marker; tooltip notes the cuts. */}
+        {hero.keep_spans && hero.keep_spans.length > 1 ? (
+          <span
+            className="absolute bottom-2 right-2 z-10 flex items-center gap-1 rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-medium text-white"
+            title={`${hero.keep_spans.length - 1} breath${
+              hero.keep_spans.length > 2 ? "s" : ""
+            } removed \u2014 ${fmtDur(hero.duration_ms)} of source plays in ${fmtDur(hero.play_ms)}`}
+          >
+            <Scissors size={10} /> {fmtDur(hero.play_ms)}
+          </span>
+        ) : (
+          <span className="absolute bottom-2 right-2 z-10 rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-medium text-white">
+            {fmtDur(hero.duration_ms)}
+          </span>
+        )}
 
         {/* Score badge (bottom-left). */}
         <span

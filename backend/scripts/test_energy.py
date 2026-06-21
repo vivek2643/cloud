@@ -9,7 +9,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.services.l3.energy import energy_to_params, PURE_SENTENCE_ENERGY  # noqa: E402
+from app.services.l3.energy import (  # noqa: E402
+    energy_to_params, PURE_SENTENCE_ENERGY,
+    SPEECH_BREATH_HI_MS, SPEECH_BREATH_LO_MS,
+)
 
 
 def test_clamps():
@@ -18,17 +21,37 @@ def test_clamps():
     print("ok  clamps")
 
 
-def test_granularity_monotonic():
-    """cluster_gap shrinks as energy rises (coarse->fine), hits 0 at sentences,
-    then clause subsplit turns on at the top."""
-    es = [i / 20 for i in range(21)]
-    gaps = [energy_to_params(e).cluster_gap_ms for e in es]
-    assert gaps == sorted(gaps, reverse=True), gaps          # non-increasing
-    assert energy_to_params(0.0).cluster_gap_ms > 0          # answers merge at low energy
-    assert energy_to_params(PURE_SENTENCE_ENERGY).cluster_gap_ms == 0
-    assert energy_to_params(0.5).clause_gap_ms == 0          # no subsplit mid-range
-    assert energy_to_params(1.0).clause_gap_ms > 0           # clauses at the top
-    print("ok  granularity monotonic")
+def test_granularity_tiers():
+    """The dial zooms through the L1 hierarchy: blocks -> topic -> sentence.
+    Block tiers carry a topic-merge gap that shrinks (huge -> medium -> off)."""
+    units = [energy_to_params(i / 20).speech_unit for i in range(21)]
+    order = {"block": 0, "topic": 1, "sentence": 2}
+    ranks = [order[u] for u in units]
+    assert ranks == sorted(ranks), units                     # coarse -> fine, no regressions
+    assert energy_to_params(0.0).speech_unit == "block"      # broad answers merge
+    assert energy_to_params(0.5).speech_unit == "topic"      # balanced = one answer
+    assert energy_to_params(1.0).speech_unit == "sentence"   # sharp = per sentence
+    # Merge gap only applies to block tiers and is non-increasing.
+    gaps = [energy_to_params(i / 20).speech_merge_gap_ms for i in range(21)]
+    assert gaps == sorted(gaps, reverse=True), gaps
+    assert energy_to_params(0.0).speech_merge_gap_ms > energy_to_params(0.5).speech_merge_gap_ms
+    assert energy_to_params(0.5).speech_merge_gap_ms == 0    # topic tier emits native
+    assert energy_to_params(1.0).speech_merge_gap_ms == 0
+    print("ok  granularity tiers")
+
+
+def test_breath_removal_progressive():
+    """Breath removal is off through Tight, then ramps in across the Sharp band:
+    long-pauses-only at the onset (0.8) down to short breaths at full energy."""
+    assert energy_to_params(0.5).speech_breath_gap_ms == 0     # topic: contiguous
+    assert energy_to_params(0.7).speech_breath_gap_ms == 0     # Tight: keep breath
+    assert energy_to_params(0.8).speech_breath_gap_ms == SPEECH_BREATH_HI_MS
+    assert energy_to_params(1.0).speech_breath_gap_ms == SPEECH_BREATH_LO_MS
+    # Within the Sharp band the threshold only tightens (removes progressively more).
+    sharp = [energy_to_params(0.8 + i / 100).speech_breath_gap_ms for i in range(0, 21)]
+    assert sharp == sorted(sharp, reverse=True), sharp
+    assert SPEECH_BREATH_LO_MS < SPEECH_BREATH_HI_MS
+    print("ok  breath removal progressive")
 
 
 def test_tightness_monotonic():

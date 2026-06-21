@@ -137,6 +137,17 @@ class HeroCut:
     member_seg_ids: List[str] = field(default_factory=list)
     recommended: bool = True            # in the curated "Recommended" pool?
     recommend_reason: Optional[str] = None  # why dropped (when not recommended)
+    # Internal jump-cut edit-list: the spoken runs to KEEP after progressive
+    # breath removal (Sharp band). None = play the span contiguously. Each pair
+    # is (in_ms, out_ms) inside [src_in_ms, src_out_ms]; the gaps between them
+    # are the excised breaths.
+    keep_spans: Optional[List[Tuple[int, int]]] = None
+
+    def play_ms(self) -> int:
+        """On-screen duration once breaths are excised (kept spans only)."""
+        if not self.keep_spans:
+            return self.src_out_ms - self.src_in_ms
+        return sum(max(0, b - a) for a, b in self.keep_spans)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -147,6 +158,9 @@ class HeroCut:
             "src_in_ms": self.src_in_ms,
             "src_out_ms": self.src_out_ms,
             "duration_ms": self.src_out_ms - self.src_in_ms,
+            "play_ms": self.play_ms(),
+            "keep_spans": ([{"in_ms": a, "out_ms": b} for a, b in self.keep_spans]
+                           if self.keep_spans else None),
             "score": round(self.score, 3),
             "speaker": self.speaker,
             "flags": self.flags,
@@ -506,58 +520,119 @@ def _lexicon_offcamera(seg: dict) -> bool:
     return any(f in flags for f in _OFFCAMERA_FLAGS) or "backchannel" in flags
 
 
-def _cluster_sentences(sentences: List[dict], cluster_gap_ms: int) -> List[List[dict]]:
-    """Granularity = clustering. Merge adjacent sentences from the same speaker
-    whose inter-sentence silence is shorter than ``cluster_gap_ms`` into one
-    block. Low energy -> big gap -> whole answers; ``cluster_gap_ms == 0`` ->
-    never merge -> each sentence stands alone. Speaker changes always break a
-    cluster (we never fuse two people into one 'answer')."""
-    sents = sorted(sentences, key=lambda s: int(s.get("src_in_ms", 0)))
-    clusters: List[List[dict]] = []
-    for s in sents:
-        if clusters:
-            prev = clusters[-1][-1]
-            gap = int(s.get("src_in_ms", 0)) - int(prev.get("src_out_ms", 0))
-            if s.get("speaker") == prev.get("speaker") and gap < cluster_gap_ms:
-                clusters[-1].append(s)
+def _usable_seg(seg: dict) -> bool:
+    """A speech segment worth a card: on-camera and not a standalone backchannel
+    ('mhm'/'yeah' only survive bridged inside a topic, never as their own clip)."""
+    if _lexicon_offcamera(seg):
+        return False
+    if "backchannel" in (seg.get("flags") or []):
+        return False
+    return True
+
+
+def _child_ids(seg: dict) -> List[str]:
+    """The L1 sentence ids under a segment: a topic's children, else the seg
+    itself (a sentence has no children)."""
+    kids = seg.get("child_seg_ids") or []
+    if kids:
+        return [k for k in kids if k]
+    sid = seg.get("seg_id")
+    return [sid] if sid else []
+
+
+def _unit_from_seg(clip: _ClipInputs, seg: dict) -> dict:
+    """One L1 segment (sentence or topic) -> a speech unit."""
+    return {
+        "in": int(seg.get("src_in_ms", 0)),
+        "out": int(seg.get("src_out_ms", 0)),
+        "raw_in": int(seg.get("raw_in_ms", seg.get("src_in_ms", 0))),
+        "raw_out": int(seg.get("raw_out_ms", seg.get("src_out_ms", 0))),
+        "text": (seg.get("text") or "").strip(),
+        "speaker": seg.get("speaker"),
+        "flags": [f for f in (seg.get("flags") or []) if f in ("noisy", "overlap")],
+        "member_seg_ids": [recommend.member_key(clip.file_id, i) for i in _child_ids(seg)],
+    }
+
+
+def _merge_topics(topics: List[dict], gap_ms: int) -> List[List[dict]]:
+    """Merge consecutive SAME-SPEAKER topics whose silence gap is shorter than
+    ``gap_ms`` into one block (the coarse zoom-out levels). Speaker change always
+    breaks a block -- we never fuse two people into one clip."""
+    tops = sorted(topics, key=lambda s: int(s.get("src_in_ms", 0)))
+    blocks: List[List[dict]] = []
+    for t in tops:
+        if blocks and gap_ms > 0:
+            prev = blocks[-1][-1]
+            gap = int(t.get("src_in_ms", 0)) - int(prev.get("src_out_ms", 0))
+            if t.get("speaker") == prev.get("speaker") and gap < gap_ms:
+                blocks[-1].append(t)
                 continue
-        clusters.append([s])
-    return clusters
+        blocks.append([t])
+    return blocks
 
 
-def _cluster_span(members: List[dict]) -> Tuple[int, int, int, int, str, Optional[str], List[str]]:
-    """Collapse a cluster of sentences into one rough span: silence-snapped
-    in/out, the raw (un-snapped) envelope for VLM quality lookup, joined text,
-    the speaker, and any quality flags carried up from the members."""
-    in_ms = min(int(s.get("src_in_ms", 0)) for s in members)
-    out_ms = max(int(s.get("src_out_ms", 0)) for s in members)
-    raw_in = min(int(s.get("raw_in_ms", s.get("src_in_ms", 0))) for s in members)
-    raw_out = max(int(s.get("raw_out_ms", s.get("src_out_ms", 0))) for s in members)
-    text = " ".join((s.get("text") or "").strip() for s in members).strip()
-    speaker = members[0].get("speaker")
-    flags = list(dict.fromkeys(
-        f for s in members for f in (s.get("flags") or []) if f in ("noisy", "overlap")))
-    return in_ms, out_ms, raw_in, raw_out, text, speaker, flags
+def _block_unit(clip: _ClipInputs, group: List[dict]) -> dict:
+    """A merged run of topics -> one speech unit (block)."""
+    text = " ".join((g.get("text") or "").strip() for g in group).strip()
+    child: List[str] = []
+    for g in group:
+        child += _child_ids(g)
+    return {
+        "in": min(int(g.get("src_in_ms", 0)) for g in group),
+        "out": max(int(g.get("src_out_ms", 0)) for g in group),
+        "raw_in": min(int(g.get("raw_in_ms", g.get("src_in_ms", 0))) for g in group),
+        "raw_out": max(int(g.get("raw_out_ms", g.get("src_out_ms", 0))) for g in group),
+        "text": text,
+        "speaker": group[0].get("speaker"),
+        "flags": list(dict.fromkeys(
+            f for g in group for f in (g.get("flags") or []) if f in ("noisy", "overlap"))),
+        "member_seg_ids": [recommend.member_key(clip.file_id, i) for i in child],
+    }
 
 
-def _split_by_pauses(words: List[dict], lo: int, hi: int,
-                     gap_ms: int) -> List[Tuple[int, int, str]]:
-    """Top-of-dial clause split: break a span's words wherever the inter-word
-    pause reaches ``gap_ms``. Each chunk -> (start, end, text). Returns [] when
-    no words fall in the span (caller keeps the whole cluster)."""
-    span = [w for w in words
-            if int(w.get("start_ms", 0)) < hi and int(w.get("end_ms", 0)) > lo]
-    if not span:
-        return []
-    chunks: List[List[dict]] = [[span[0]]]
-    for w in span[1:]:
-        if int(w.get("start_ms", 0)) - int(chunks[-1][-1].get("end_ms", 0)) >= gap_ms:
-            chunks.append([w])
-        else:
-            chunks[-1].append(w)
-    return [(int(c[0]["start_ms"]), int(c[-1]["end_ms"]),
-             " ".join((x.get("text") or "").strip() for x in c).strip())
-            for c in chunks]
+def _speech_units(clip: _ClipInputs, params: EnergyParams,
+                  sentences: List[dict], topics: List[dict]) -> List[dict]:
+    """Select the L1 tier for this energy band: sentence, topic, or a merged
+    block of topics. Each level has clean, language-bounded edges by construction
+    (no re-clustering by raw silence)."""
+    tier = params.speech_unit
+    if tier == "sentence":
+        segs = [s for s in sentences if _usable_seg(s)] or [t for t in topics if _usable_seg(t)]
+        return [_unit_from_seg(clip, s) for s in segs]
+    # Topic-based tiers. Fall back to sentences-as-topics when no topic tier.
+    tops = [t for t in topics if _usable_seg(t)] or [s for s in sentences if _usable_seg(s)]
+    if tier == "topic":
+        return [_unit_from_seg(clip, t) for t in tops]
+    return [_block_unit(clip, g) for g in _merge_topics(tops, params.speech_merge_gap_ms)]
+
+
+def _breath_keep_spans(words: List[dict], lo: int, hi: int,
+                       gap_ms: int) -> Optional[List[Tuple[int, int]]]:
+    """Progressive breath removal: return the spoken runs to KEEP inside
+    [lo, hi], excising every internal silent gap >= ``gap_ms`` (the breaths
+    between words). The result is a jump-cut edit-list -- the same content,
+    dead air deleted. Edges stay on the snapped boundaries (lo/hi); only
+    *internal* breaths are cut. Returns None when there's nothing to excise
+    (no qualifying gap), so the cut just plays contiguously."""
+    if gap_ms <= 0:
+        return None
+    span = sorted(
+        (w for w in words
+         if int(w.get("start_ms", 0)) < hi and int(w.get("end_ms", 0)) > lo),
+        key=lambda w: int(w.get("start_ms", 0)))
+    if len(span) < 2:
+        return None
+    spans: List[Tuple[int, int]] = []
+    seg_start = lo
+    for prev, nxt in zip(span, span[1:]):
+        if int(nxt.get("start_ms", 0)) - int(prev.get("end_ms", 0)) >= gap_ms:
+            seg_end = min(hi, int(prev.get("end_ms", 0)))
+            if seg_end > seg_start:
+                spans.append((seg_start, seg_end))
+            seg_start = max(lo, int(nxt.get("start_ms", 0)))
+    if hi > seg_start:
+        spans.append((seg_start, hi))
+    return spans if len(spans) > 1 else None
 
 
 def _make_speech_hero(
@@ -565,6 +640,7 @@ def _make_speech_hero(
     uid: str, in_ms: int, out_ms: int, raw_in: int, raw_out: int,
     text: str, speaker: Optional[str], extra_flags: List[str],
     member_seg_ids: Optional[List[str]] = None,
+    keep_spans: Optional[List[Tuple[int, int]]] = None,
 ) -> Optional[HeroCut]:
     if out_ms <= in_ms:
         return None
@@ -587,6 +663,7 @@ def _make_speech_hero(
         flags=extra_flags,
         affordances=[anc.AFF_SPEECH],
         member_seg_ids=list(member_seg_ids or []),
+        keep_spans=keep_spans,
     )
 
 
@@ -594,76 +671,60 @@ def _speech_candidates(
     clip: _ClipInputs, source: Optional[ss.SpanSource],
     field: Optional[fseams.FusedField], params: EnergyParams,
 ) -> List[HeroCut]:
-    """Speech heroes from the L1 dialogue sentences, clustered by energy.
+    """Speech heroes selected from the L1 dialogue HIERARCHY by energy band.
 
-    Sentences are the universal base atom -- already silence-snapped, speaker-
-    tagged and off-camera-flagged, and present on every clip (unlike the VLM's
-    content_units, which are often empty on long-form footage). The energy dial
-    sets the granularity by *clustering* them:
+    The dial picks a TIER (not a silence threshold), so every level has clean,
+    language-bounded edges by construction:
 
-      * low energy  -> merge adjacent same-speaker sentences into whole answers,
-      * mid energy   -> sentences stand alone,
-      * top energy   -> sub-split each sentence into clauses at its pauses.
+      * Broad/Calm   -> blocks: merge same-speaker topics (huge/medium gap),
+      * Balanced      -> topic: one complete answer/thought,
+      * Tight/Sharp   -> sentence (Sharp loses its breath in the later step).
 
-    Each block's boundaries then flow through the fused seam field for the
+    Each unit's boundaries then flow through the fused seam field for the
     energy-scaled tightness (snap window + veto-bounded breathing room). Off-
     camera audio is dropped by the L1 production-cue lexicon and, where the VLM
     logged them, refined by its visible-speaking spans (edge-trim crew cues,
-    drop wholly off-frame blocks).
+    drop wholly off-frame units).
     """
     perception = clip.perception or {}
     quality_events = perception.get("take_quality_events") or []
     speaking = perception.get("speaking") or []
-    sentences = clip.dialogue.get("sentence") or clip.dialogue.get("topic") or []
-    if not sentences:
+    sentences = clip.dialogue.get("sentence") or []
+    topics = clip.dialogue.get("topic") or []
+    if not sentences and not topics:
         return []
 
-    usable = [s for s in sentences if not _lexicon_offcamera(s)]
-    if not usable:
-        return []
-
-    words = source.words if source is not None else []
     out: List[HeroCut] = []
-    for ci, members in enumerate(_cluster_sentences(usable, params.cluster_gap_ms)):
-        c_in, c_out, raw_in, raw_out, c_text, speaker, flags = _cluster_span(members)
-        # All clause pieces of this block inherit the block's source sentence ids
-        # (the LLM verdict lives at the sentence level; clauses roll up to it).
-        # Namespaced by file: per-file seg_ids collide across clips.
-        member_seg_ids = [
-            recommend.member_key(clip.file_id, s["seg_id"])
-            for s in members if s.get("seg_id")
-        ]
+    for ci, u in enumerate(_speech_units(clip, params, sentences, topics)):
+        in_ms, out_ms, text = u["in"], u["out"], u["text"]
+        raw_in, raw_out, speaker, flags = u["raw_in"], u["raw_out"], u["speaker"], u["flags"]
 
-        # Top-of-dial: fragment the block into clauses at its internal pauses.
-        if params.clause_gap_ms > 0 and words:
-            pieces = _split_by_pauses(words, c_in, c_out, params.clause_gap_ms) \
-                or [(c_in, c_out, c_text)]
-        else:
-            pieces = [(c_in, c_out, c_text)]
+        # Trim off-camera crew cues bleeding into the edges (VLM authority).
+        if speaking and source is not None:
+            tr = _trim_to_speaking(source.words, speaking, in_ms, out_ms)
+            if tr:
+                in_ms, out_ms, kw = tr
+                text = " ".join((w.get("text") or "").strip() for w in kw).strip()
 
-        for pi, (p_in, p_out, p_text) in enumerate(pieces):
-            in_ms, out_ms, text = p_in, p_out, (p_text or c_text)
+        # Drop a unit whose audio has no visible speaker (off-frame voice).
+        if speaking and _speaking_coverage(speaking, in_ms, out_ms) < SPEAKING_COVERAGE_MIN:
+            continue
 
-            # Trim off-camera crew cues bleeding into the edges (VLM authority).
-            if speaking and source is not None:
-                tr = _trim_to_speaking(source.words, speaking, in_ms, out_ms)
-                if tr:
-                    in_ms, out_ms, kw = tr
-                    text = " ".join((w.get("text") or "").strip() for w in kw).strip()
+        # Tightness: snap to fused seams + energy-scaled breathing room.
+        in_ms, out_ms = _snap_fused(field, in_ms, out_ms, params, clip.duration_ms)
 
-            # Drop a block whose audio has no visible speaker (off-frame voice).
-            if speaking and _speaking_coverage(speaking, in_ms, out_ms) < SPEAKING_COVERAGE_MIN:
-                continue
+        # Sharp band: excise internal breaths -> jump-cut edit-list.
+        keep_spans = None
+        if params.speech_breath_gap_ms > 0 and source is not None:
+            keep_spans = _breath_keep_spans(
+                source.words, in_ms, out_ms, params.speech_breath_gap_ms)
 
-            # Tightness: snap to fused seams + energy-scaled breathing room.
-            in_ms, out_ms = _snap_fused(field, in_ms, out_ms, params, clip.duration_ms)
-
-            uid = f"sp{ci}" if len(pieces) == 1 else f"sp{ci}:{pi}"
-            h = _make_speech_hero(clip, source, quality_events, uid,
-                                  in_ms, out_ms, raw_in, raw_out, text, speaker, flags,
-                                  member_seg_ids=member_seg_ids)
-            if h:
-                out.append(h)
+        h = _make_speech_hero(clip, source, quality_events, f"sp{ci}",
+                              in_ms, out_ms, raw_in, raw_out, text, speaker, flags,
+                              member_seg_ids=u["member_seg_ids"],
+                              keep_spans=keep_spans)
+        if h:
+            out.append(h)
     return out
 
 
@@ -717,7 +778,7 @@ def _merge_gap_for_aff(params: EnergyParams, aff: str) -> int:
         return params.broll_merge_gap_ms
     if aff == anc.AFF_INSERT:
         return 0
-    return params.cluster_gap_ms
+    return 0
 
 
 def _motion_onset_ms(motion: Optional[dict], unit_in: int, unit_out: int) -> int:

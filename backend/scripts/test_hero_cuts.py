@@ -91,10 +91,10 @@ def test_energy_selects_granularity():
 
 
 def test_clustering_gradient():
-    """Granularity is monotonic in energy: rising energy never yields FEWER
-    speech heroes (answers -> sentences -> clauses), and a long pause is never
-    merged across even at low energy."""
-    # Three sentences: s0,s1 close together (0.2s gap), s2 after a 3s pause.
+    """Granularity zooms through the hierarchy: rising energy never yields FEWER
+    speech heroes. Broad merges a same-speaker run into one block (gaps under the
+    'huge' threshold); sentence level splits them all apart."""
+    # Three same-speaker sentences spanning sub-'huge' gaps (0.2s, 3.0s).
     clip = hc._ClipInputs(
         file_id="gggggggg-1", duration_ms=12000,
         dialogue={"topic": [], "sentence": [
@@ -116,9 +116,39 @@ def test_clustering_gradient():
     counts = [len(hc._speech_candidates(clip, src, None, hc.energy_to_params(e)))
               for e in (0.0, 0.5, 0.8)]
     assert counts == sorted(counts), counts        # non-decreasing with energy
-    assert counts[0] == 2, counts   # low energy: s0+s1 merge, s2 stays apart (3s pause)
+    assert counts[0] == 1, counts   # broad: one same-speaker block (gaps < huge)
     assert counts[-1] == 3, counts  # sentence level: all three distinct
     print("ok  test_clustering_gradient")
+
+
+def test_sharp_breath_removal_edit_list():
+    """Sharp band excises an internal breath into a jump-cut edit-list: same
+    sentence, dead air deleted. Tight keeps it contiguous (no keep_spans)."""
+    clip = hc._ClipInputs(
+        file_id="hhhhhhhh-1", duration_ms=6000,
+        dialogue={"topic": [], "sentence": [
+            _seg("s0", "sentence", "the product really changes everything today", 0, 3500),
+        ]},
+        perception=None, motion=None,
+    )
+    # One long internal breath (900ms) between 'really' and 'changes'.
+    words = _words([
+        ("the", 0, 300), ("product", 300, 800), ("really", 800, 1300),
+        ("changes", 2200, 2700), ("everything", 2700, 3200), ("today", 3200, 3500),
+    ])
+    src = _src("hhhhhhhh-1", 6000, words)
+    tight = hc._speech_candidates(clip, src, None, hc.energy_to_params(0.7))
+    sharp = hc._speech_candidates(clip, src, None, hc.energy_to_params(1.0))
+    assert len(tight) == 1 and tight[0].keep_spans is None, tight   # with breath
+    assert len(sharp) == 1, sharp
+    ks = sharp[0].keep_spans
+    assert ks is not None and len(ks) == 2, ks                      # breath excised
+    assert ks[0][1] <= 1300 and ks[1][0] >= 2200, ks               # cut spans the gap
+    assert sharp[0].play_ms() < sharp[0].src_out_ms - sharp[0].src_in_ms
+    d = sharp[0].to_dict()
+    assert d["play_ms"] == sharp[0].play_ms() and d["play_ms"] < d["duration_ms"]
+    assert len(d["keep_spans"]) == 2 and "in_ms" in d["keep_spans"][0]
+    print("ok  test_sharp_breath_removal_edit_list")
 
 
 def test_take_stacking_collapses_repeats(monkeypatch=None):
@@ -357,6 +387,7 @@ def main():
     test_speech_drops_offcamera_and_short()
     test_energy_selects_granularity()
     test_clustering_gradient()
+    test_sharp_breath_removal_edit_list()
     test_take_stacking_collapses_repeats()
     test_action_snaps_to_calm_motion_seam()
     test_action_fused_avoids_speech()

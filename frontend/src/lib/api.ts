@@ -171,6 +171,12 @@ export interface HeroCut {
   src_in_ms: number;
   src_out_ms: number;
   duration_ms: number;
+  // On-screen duration after progressive breath removal (Sharp band). Equals
+  // duration_ms unless keep_spans is set; then it's the kept (spoken) time.
+  play_ms: number;
+  // Jump-cut edit-list: spoken runs to KEEP inside [src_in_ms, src_out_ms];
+  // the gaps between them are excised breaths. null = play contiguously.
+  keep_spans?: { in_ms: number; out_ms: number }[] | null;
   score: number;
   speaker: string | null;
   flags: string[];

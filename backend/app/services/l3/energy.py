@@ -14,11 +14,24 @@ from dataclasses import dataclass
 from typing import Optional
 
 # --- Speech (granularity + tightness) -----------------------------------------
-CLUSTER_GAP_MAX_MS = 2500
-CLUSTER_CURVE = 3.0
-PURE_SENTENCE_ENERGY = 0.8
-CLAUSE_GAP_HI_MS = 1000
-CLAUSE_GAP_TOP_MS = 120
+# Granularity = which TIER of the L1 hierarchy we emit, per band (not a silence
+# threshold). Topic is the pivot (Balanced = one complete answer); zoom out by
+# merging same-speaker topics into blocks, zoom in to sentences. Bands 3 and 4
+# emit the same sentence unit -- "with breath" vs "without breath" is the
+# progressive breath-removal step layered on top later.
+_SPEECH_UNIT = ("block", "block", "topic", "sentence", "sentence")
+# Topic-merge gap for the block tiers (huge -> medium); 0 = emit the native tier.
+_SPEECH_MERGE_MS = (4000, 2000, 0, 0, 0)
+
+# Progressive breath removal (Sharp band only): excise internal silent gaps
+# whose length >= the threshold, turning a sentence into a jump-cut edit-list.
+# Active only above the Tight/Sharp edge -- Tight keeps its breath. Ramps from
+# "long pauses only" at the Sharp onset down to "even short breaths" at full
+# energy, so the dial removes progressively more dead air. 0 = no removal.
+SPEECH_BREATH_HI_MS = 700      # at Sharp onset (0.8): only long pauses go
+SPEECH_BREATH_LO_MS = 220      # at max energy (1.0): tight, snappy jump-cuts
+
+PURE_SENTENCE_ENERGY = 0.8     # padding fades to zero by here (kept for tightness)
 
 SNAP_WINDOW_LOOSE_MS = 1300
 SNAP_WINDOW_TIGHT_MS = 350
@@ -84,8 +97,9 @@ class EnergyParams:
     energy: float
     band: int                       # 0..4 Broad .. Sharp
     # speech
-    cluster_gap_ms: int
-    clause_gap_ms: int
+    speech_unit: str                # block | topic | sentence (which L1 tier)
+    speech_merge_gap_ms: int        # topic-merge gap for block tiers (0 = native)
+    speech_breath_gap_ms: int       # excise internal gaps >= this (0 = keep breath)
     snap_window_ms: int
     pad_in_ms: int
     pad_out_ms: int
@@ -143,23 +157,22 @@ def energy_to_params(energy: float) -> EnergyParams:
     e = _clamp01(float(energy))
     band = energy_band(e)
 
-    if e < PURE_SENTENCE_ENERGY:
-        frac = e / PURE_SENTENCE_ENERGY
-        cluster_gap = round(CLUSTER_GAP_MAX_MS * (1.0 - frac) ** CLUSTER_CURVE)
-        clause_gap = 0
-    else:
-        cluster_gap = 0
-        frac = (e - PURE_SENTENCE_ENERGY) / (1.0 - PURE_SENTENCE_ENERGY)
-        clause_gap = round(_lerp(frac, CLAUSE_GAP_HI_MS, CLAUSE_GAP_TOP_MS))
-
     snap = round(_lerp(e, SNAP_WINDOW_LOOSE_MS, SNAP_WINDOW_TIGHT_MS))
     pad_factor = max(0.0, 1.0 - e / PURE_SENTENCE_ENERGY)
+
+    # Breath removal ramps in only across the Sharp band (energy >= top edge).
+    if e >= BAND_EDGES[3]:
+        frac = (e - BAND_EDGES[3]) / (1.0 - BAND_EDGES[3])
+        breath_gap = round(_lerp(frac, SPEECH_BREATH_HI_MS, SPEECH_BREATH_LO_MS))
+    else:
+        breath_gap = 0
 
     return EnergyParams(
         energy=e,
         band=band,
-        cluster_gap_ms=cluster_gap,
-        clause_gap_ms=clause_gap,
+        speech_unit=_SPEECH_UNIT[band],
+        speech_merge_gap_ms=_SPEECH_MERGE_MS[band],
+        speech_breath_gap_ms=breath_gap,
         snap_window_ms=snap,
         pad_in_ms=round(PAD_IN_LOOSE_MS * pad_factor),
         pad_out_ms=round(PAD_OUT_LOOSE_MS * pad_factor),
