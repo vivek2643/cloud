@@ -23,7 +23,11 @@ def get_llm(provider: Optional[str] = None, model: Optional[str] = None) -> LLMC
         from app.services.llm.gemini_client import GeminiClient
 
         return GeminiClient(model=model)
+    if name == "openai":
+        from app.services.llm.openai_client import OpenAIClient
+
+        return OpenAIClient(model=model)
 
     raise ValueError(
-        f"Unknown llm_provider {name!r}. Expected 'anthropic' or 'gemini'."
+        f"Unknown llm_provider {name!r}. Expected 'anthropic', 'gemini', or 'openai'."
     )

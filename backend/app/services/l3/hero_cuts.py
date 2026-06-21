@@ -45,6 +45,7 @@ from difflib import SequenceMatcher
 from app.config import get_settings
 from app.services.l1 import fused_seams as fseams
 from app.services.l3 import anchors as anc
+from app.services.l3 import recommend
 from app.services.l3 import score_span as ss
 from app.services.l3 import territory as terr
 from app.services.l3.energy import EnergyParams, energy_to_params
@@ -132,6 +133,11 @@ class HeroCut:
     audio_role: str = anc.SYNC    # sync (carries its sound) | overlay (silent cutaway)
     take_count: int = 1           # how many comparable takes exist (incl. this)
     alt_takes: List[HeroTake] = field(default_factory=list)  # the losers, best-first
+    # Source dialogue sentence ids this cut spans (speech/moment cuts only).
+    # Internal: drives the LLM-filtration "contains a keeper" recommendation rule.
+    member_seg_ids: List[str] = field(default_factory=list)
+    recommended: bool = True            # in the curated "Recommended" pool?
+    recommend_reason: Optional[str] = None  # why dropped (when not recommended)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -149,6 +155,8 @@ class HeroCut:
             "audio_role": self.audio_role,
             "take_count": self.take_count,
             "alt_takes": [t.to_dict() for t in self.alt_takes],
+            "recommended": self.recommended,
+            "recommend_reason": self.recommend_reason,
         }
 
 
@@ -558,6 +566,7 @@ def _make_speech_hero(
     clip: _ClipInputs, source: Optional[ss.SpanSource], quality_events: List[dict],
     uid: str, in_ms: int, out_ms: int, raw_in: int, raw_out: int,
     text: str, speaker: Optional[str], extra_flags: List[str],
+    member_seg_ids: Optional[List[str]] = None,
 ) -> Optional[HeroCut]:
     if out_ms <= in_ms:
         return None
@@ -580,6 +589,7 @@ def _make_speech_hero(
         flags=extra_flags,
         affordances=[anc.AFF_SPEECH],
         audio_role=anc.SYNC,
+        member_seg_ids=list(member_seg_ids or []),
     )
 
 
@@ -619,6 +629,13 @@ def _speech_candidates(
     out: List[HeroCut] = []
     for ci, members in enumerate(_cluster_sentences(usable, params.cluster_gap_ms)):
         c_in, c_out, raw_in, raw_out, c_text, speaker, flags = _cluster_span(members)
+        # All clause pieces of this block inherit the block's source sentence ids
+        # (the LLM verdict lives at the sentence level; clauses roll up to it).
+        # Namespaced by file: per-file seg_ids collide across clips.
+        member_seg_ids = [
+            recommend.member_key(clip.file_id, s["seg_id"])
+            for s in members if s.get("seg_id")
+        ]
 
         # Top-of-dial: fragment the block into clauses at its internal pauses.
         if params.clause_gap_ms > 0 and words:
@@ -646,7 +663,8 @@ def _speech_candidates(
 
             uid = f"sp{ci}" if len(pieces) == 1 else f"sp{ci}:{pi}"
             h = _make_speech_hero(clip, source, quality_events, uid,
-                                  in_ms, out_ms, raw_in, raw_out, text, speaker, flags)
+                                  in_ms, out_ms, raw_in, raw_out, text, speaker, flags,
+                                  member_seg_ids=member_seg_ids)
             if h:
                 out.append(h)
     return out
@@ -689,6 +707,7 @@ def _combined_candidates(
             speaker=s.speaker,
             affordances=[anc.AFF_SPEECH, anc.AFF_ACTION],
             audio_role=anc.SYNC,
+            member_seg_ids=list(s.member_seg_ids),
         ))
     return out
 
@@ -1108,6 +1127,7 @@ def build_hero_cuts(
     file_ids: List[str], energy: float = 0.5,
     affordances: Optional[List[str]] = None,
     audio_role: Optional[str] = None,
+    recommendation_verdict: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """The ranked, universal segment feed for a set of clips.
 
@@ -1143,6 +1163,7 @@ def build_hero_cuts(
             heroes.extend(_combined_candidates(clip, sp, action))
 
     heroes = _stack_takes(heroes, file_ids)
+    _apply_recommendations(heroes, file_ids, recommendation_verdict)
     if affordances:
         want = set(affordances)
         heroes = [h for h in heroes if want & set(h.affordances or [h.modality])]
@@ -1150,3 +1171,36 @@ def build_hero_cuts(
         heroes = [h for h in heroes if h.audio_role == audio_role]
     heroes.sort(key=lambda h: h.score, reverse=True)
     return [h.to_dict() for h in heroes]
+
+
+def _apply_recommendations(
+    heroes: List[HeroCut], file_ids: List[str],
+    verdict: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> None:
+    """Tag each cut `recommended` from the energy-independent LLM sentence
+    verdict, using the "contains a keeper" rule: a speech/moment cut is
+    recommended if it spans at least one kept sentence (an unseen sentence
+    defaults to kept). Non-speech cuts are recommended by default (they're
+    already sparse-curated by L2 + the energy salience floors).
+
+    The verdict can be passed in (the API fetches it once, with a readiness
+    flag); otherwise it's fetched here (non-blocking). Fail-open: an empty
+    verdict leaves everything recommended, so the pool is never hidden.
+    """
+    if verdict is None:
+        verdict = recommend.get_recommendation_map(file_ids)
+    if not verdict:
+        return
+
+    for h in heroes:
+        if not h.member_seg_ids:
+            continue  # non-speech cut -> stays recommended by default
+        kept = any(verdict.get(sid, {}).get("keep", True) for sid in h.member_seg_ids)
+        h.recommended = kept
+        if not kept:
+            # Surface the first available drop reason for the full-feed view.
+            for sid in h.member_seg_ids:
+                r = verdict.get(sid, {}).get("reason")
+                if r:
+                    h.recommend_reason = r
+                    break

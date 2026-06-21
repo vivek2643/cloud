@@ -11,7 +11,7 @@ import {
   type HeroModality,
   type FileRecord,
 } from "@/lib/api";
-import { Star, Play, Volume2, VolumeX, Layers, Zap } from "lucide-react";
+import { Star, Play, Volume2, VolumeX, Layers, Zap, Sparkles } from "lucide-react";
 
 const MODALITY_STYLE: Record<HeroModality, { color: string; label: string }> = {
   speech: { color: "#6366f1", label: "speech" },
@@ -23,10 +23,18 @@ const MODALITY_STYLE: Record<HeroModality, { color: string; label: string }> = {
   insert: { color: "#a78bfa", label: "insert" },
 };
 
+type FilterKey = HeroModality | "all" | "recommended";
+
+// Distinct accent for the LLM-curated "Recommended" view (a quality axis,
+// orthogonal to the modality chips below).
+const RECOMMENDED_COLOR = "#22c55e";
+
 // Filter chips over the ONE feed -- this is how every edit style (soundbites,
-// action beats, cutaways) is served without a separate pipeline.
-const FILTERS: { key: HeroModality | "all"; label: string }[] = [
+// action beats, cutaways) is served without a separate pipeline. "Recommended"
+// is a quality filter (LLM-picked), the rest are modality filters.
+const FILTERS: { key: FilterKey; label: string }[] = [
   { key: "all", label: "All" },
+  { key: "recommended", label: "Recommended" },
   { key: "speech", label: "Speech" },
   { key: "action", label: "Action" },
   { key: "moment", label: "Moments" },
@@ -52,10 +60,14 @@ export function HeroCutsView() {
   const token = useAuthStore((s) => s.session?.access_token);
   const files = useDriveStore((s) => s.files);
   const [energy, setEnergy] = useState(0.5);
-  const [filter, setFilter] = useState<HeroModality | "all">("all");
+  const [filter, setFilter] = useState<FilterKey>("all");
   const [heroes, setHeroes] = useState<HeroCut[]>([]);
   const [loading, setLoading] = useState(false);
   const [activeHeroId, setActiveHeroId] = useState<string | null>(null);
+  const [recsPending, setRecsPending] = useState(false);
+  const [recoNonce, setRecoNonce] = useState(0);
+  const recoAttempts = useRef(0);
+  const isPoll = useRef(false);
   const urlCache = useRef<Record<string, Promise<string | null>>>({});
 
   const candidates = useMemo(
@@ -75,32 +87,57 @@ export function HeroCutsView() {
   // content stack across files. Refetch on clip-set / (debounced) energy change.
   const candidateIds = useMemo(() => candidates.map((f) => f.id), [candidates]);
   const candidateKey = candidateIds.join(",");
+
+  // Reset the recommendations poll whenever the clip set changes.
+  useEffect(() => {
+    recoAttempts.current = 0;
+  }, [candidateKey]);
+
   useEffect(() => {
     if (!token || candidateIds.length === 0) {
       setHeroes([]);
       return;
     }
     let cancelled = false;
-    setLoading(true);
-    const t = setTimeout(() => {
-      getHeroCutsFeed(candidateIds, energy, token)
-        .then((r) => {
-          if (cancelled) return;
-          setHeroes(r.heroes ?? []);
-          setLoading(false);
-        })
-        .catch(() => {
-          if (cancelled) return;
-          setHeroes([]);
-          setLoading(false);
-        });
-    }, 250);
+    const poll = isPoll.current; // background re-fetch while picks compute
+    isPoll.current = false;
+    if (!poll) setLoading(true);
+    const t = setTimeout(
+      () => {
+        getHeroCutsFeed(candidateIds, energy, token)
+          .then((r) => {
+            if (cancelled) return;
+            setHeroes(r.heroes ?? []);
+            setLoading(false);
+            // LLM filtration runs in the background; poll until it lands so the
+            // "Recommended" picks appear without a manual refresh.
+            if (r.recommendations_ready === false && recoAttempts.current < 24) {
+              recoAttempts.current += 1;
+              setRecsPending(true);
+              setTimeout(() => {
+                if (cancelled) return;
+                isPoll.current = true;
+                setRecoNonce((n) => n + 1);
+              }, 5000);
+            } else {
+              recoAttempts.current = 0;
+              setRecsPending(false);
+            }
+          })
+          .catch(() => {
+            if (cancelled) return;
+            setHeroes([]);
+            setLoading(false);
+          });
+      },
+      poll ? 0 : 250
+    );
     return () => {
       cancelled = true;
       clearTimeout(t);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token, candidateKey, energy]);
+  }, [token, candidateKey, energy, recoNonce]);
 
   const getUrl = useCallback(
     (fileId: string): Promise<string | null> => {
@@ -121,7 +158,13 @@ export function HeroCutsView() {
     for (const h of present) c[h.modality] = (c[h.modality] ?? 0) + 1;
     return c;
   }, [present]);
-  const visible = filter === "all" ? present : present.filter((h) => h.modality === filter);
+  const recCount = useMemo(() => present.filter((h) => h.recommended).length, [present]);
+  const visible =
+    filter === "all"
+      ? present
+      : filter === "recommended"
+      ? present.filter((h) => h.recommended)
+      : present.filter((h) => h.modality === filter);
   const totalClips = visible.length;
 
   return (
@@ -149,19 +192,42 @@ export function HeroCutsView() {
             {energyLabel(energy)}
           </span>
         </div>
-        {present.length > 0 && (
-          <span className="text-sm" style={{ color: "var(--muted)" }}>
-            {totalClips} of {present.length} cut{present.length === 1 ? "" : "s"}
-          </span>
-        )}
+        <div className="flex items-center gap-3">
+          {recsPending && (
+            <span
+              className="flex items-center gap-1.5 text-xs"
+              style={{ color: RECOMMENDED_COLOR }}
+              title="The LLM is curating recommended picks in the background"
+            >
+              <Sparkles size={13} className="animate-pulse" /> curating picks…
+            </span>
+          )}
+          {present.length > 0 && (
+            <span className="text-sm" style={{ color: "var(--muted)" }}>
+              {totalClips} of {present.length} cut{present.length === 1 ? "" : "s"}
+            </span>
+          )}
+        </div>
       </div>
 
       {present.length > 0 && (
         <div className="mb-5 flex flex-wrap gap-2">
-          {FILTERS.filter((f) => f.key === "all" || (counts[f.key] ?? 0) > 0).map((f) => {
+          {FILTERS.filter((f) =>
+            f.key === "all"
+              ? true
+              : f.key === "recommended"
+              ? recCount > 0
+              : (counts[f.key] ?? 0) > 0
+          ).map((f) => {
             const active = filter === f.key;
-            const n = f.key === "all" ? present.length : counts[f.key] ?? 0;
-            const accent = f.key === "all" ? "var(--accent)" : MODALITY_STYLE[f.key as HeroModality].color;
+            const n =
+              f.key === "all" ? present.length : f.key === "recommended" ? recCount : counts[f.key] ?? 0;
+            const accent =
+              f.key === "all"
+                ? "var(--accent)"
+                : f.key === "recommended"
+                ? RECOMMENDED_COLOR
+                : MODALITY_STYLE[f.key as HeroModality].color;
             return (
               <button
                 key={f.key}
@@ -386,11 +452,23 @@ function HeroClipCard({
           )}
         </span>
 
-        {/* Take-stack badge (top-left, below modality) when repeats exist. */}
-        {hero.take_count > 1 && (
+        {/* Recommended marker (top-left, below modality) — the LLM-curated pick.
+            Left column avoids the hover mute button at top-right. */}
+        {hero.recommended && (
           <span
             className="absolute left-2 top-9 z-20 flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-semibold text-white"
-            style={{ background: "rgba(0,0,0,0.6)" }}
+            style={{ background: RECOMMENDED_COLOR }}
+            title="Recommended pick"
+          >
+            <Sparkles size={11} /> Pick
+          </span>
+        )}
+
+        {/* Take-stack badge (top-left, below the badges above) when repeats exist. */}
+        {hero.take_count > 1 && (
+          <span
+            className="absolute left-2 z-20 flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-semibold text-white"
+            style={{ background: "rgba(0,0,0,0.6)", top: hero.recommended ? "4rem" : "2.25rem" }}
             title={`${hero.take_count} takes of this content \u2014 best shown`}
           >
             <Layers size={11} /> {hero.take_count} takes

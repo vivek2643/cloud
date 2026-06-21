@@ -51,11 +51,19 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-4-5-20250929"
 
-    # Provider-agnostic LLM backbone. "anthropic" (default) or "gemini". All L3
-    # model calls route through app.services.llm.get_llm() keyed on this value.
+    # Provider-agnostic LLM backbone. "anthropic" (default), "gemini", or
+    # "openai". All L3 model calls route through app.services.llm.get_llm()
+    # keyed on this value (or an explicit per-feature override).
     llm_provider: str = "anthropic"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-pro"
+
+    # OpenAI credentials. Used by feature-level calls that opt in via get_llm(
+    # provider="openai", ...) -- e.g. the recommendations filtration pass.
+    openai_api_key: str = ""
+    # Small/cheap GPT-5-class model is plenty for text classification; override
+    # via the OPENAI_MODEL env var.
+    openai_model: str = "gpt-5-mini"
 
     # --- L2: VLM perception layer (Gemini) -------------------------------
     # A single Gemini pass over the whole clip that produces the rich, single-
@@ -100,6 +108,21 @@ class Settings(BaseSettings):
     # Prompt caching on the stable system/tools/catalog prefix (Anthropic only);
     # this is what makes a many-iteration Opus loop affordable.
     llm_prompt_caching: bool = True
+
+    # --- Recommendations: LLM filtration of the hero-cuts feed ------------
+    # A single, energy-independent text call judges each dialogue sentence
+    # keep/drop; the feed then flags cuts via the "contains a keeper" rule.
+    # Provider/model are overridable so this feature can move independently of
+    # the L3 backbone (we pilot OpenAI here, leaving L3 on Anthropic).
+    enable_recommendations: bool = True
+    recommend_provider: str = "openai"
+    # Empty -> the provider's default model (e.g. openai_model).
+    recommend_model: str = ""
+    recommend_max_output_tokens: int = 4096
+    # Reasoning depth for the filtration call. Sentence keep/drop is classification,
+    # not deep reasoning, so "low" keeps a GPT-5 model's latency sane (the default
+    # effort can take ~30s+). minimal|low|medium|high.
+    recommend_effort: str = "low"
 
     @property
     def r2_endpoint(self) -> str:
