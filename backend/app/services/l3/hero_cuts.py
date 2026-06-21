@@ -152,7 +152,6 @@ class HeroCut:
             "speaker": self.speaker,
             "flags": self.flags,
             "affordances": self.affordances or [self.modality],
-            "audio_role": self.audio_role,
             "take_count": self.take_count,
             "alt_takes": [t.to_dict() for t in self.alt_takes],
             "recommended": self.recommended,
@@ -814,7 +813,7 @@ def _prep_overlay_group(
             dur = a.end_ms - a.start_ms
             if dur < params.reaction_min_duration_ms:
                 continue
-            if a.salience < params.reaction_min_intensity:
+            if a.salience < params.reaction_min_warrant:
                 continue
         elif aff == anc.AFF_BROLL:
             if a.salience < params.broll_min_salience:
@@ -933,6 +932,22 @@ def _beat_score(
     return max(0.0, min(1.0, base * w * territory_mult))
 
 
+def _core_inset(core_in: int, core_out: int, peak: int,
+                target: Optional[int]) -> Tuple[int, int]:
+    """Inset an overlay span (b-roll / reaction) toward its peak to ``target`` ms
+    (the energy band's handle length = negative padding). ``target`` None / span
+    already shorter -> keep the full shot. Only ever shrinks; the fused-seam snap
+    then cleans the inset edges."""
+    if not target or core_out - core_in <= target:
+        return core_in, core_out
+    half = target // 2
+    center = max(core_in, min(peak, core_out))
+    ci = max(core_in, center - half)
+    co = min(core_out, ci + target)
+    ci = max(core_in, co - target)  # rebalance if clipped at the tail
+    return ci, co
+
+
 def _beat_segments(clip: _ClipInputs, field: Optional[fseams.FusedField],
                    params: EnergyParams, anchors: List[anc.Anchor]) -> List[HeroCut]:
     """NON-speech anchors as segments -- per-affordance energy semantics."""
@@ -962,8 +977,18 @@ def _beat_segments(clip: _ClipInputs, field: Optional[fseams.FusedField],
         for ci, members in enumerate(_cluster_anchors(group, merge_gap)):
             core_in = min(m.start_ms for m in members)
             core_out = max(m.end_ms for m in members)
-            in_ms, out_ms = _snap_segment(field, core_in, core_out, params, clip, aff)
             best = max(members, key=lambda m: m.salience)
+            if aff == anc.AFF_BROLL:
+                # Energy-aware handle: the VLM hands us the full end-to-end shot;
+                # inset toward the peak to the band's core target (Broad = full).
+                core_in, core_out = _core_inset(
+                    core_in, core_out, best.ts_ms, params.broll_core_ms)
+            elif aff == anc.AFF_REACTION:
+                # Same negative-padding mechanism: trim the expression toward its
+                # peak as energy rises (Broad = full span).
+                core_in, core_out = _core_inset(
+                    core_in, core_out, best.ts_ms, params.reaction_core_ms)
+            in_ms, out_ms = _snap_segment(field, core_in, core_out, params, clip, aff)
             t_mult = terr.territory_multiplier(
                 best, speaking=speaking, strict=params.territory_strict)
             vlm = _vlm_quality_score(quality_events, core_in, core_out)

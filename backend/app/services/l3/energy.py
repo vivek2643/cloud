@@ -11,6 +11,7 @@ Everything here is a pure function of the energy float.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 # --- Speech (granularity + tightness) -----------------------------------------
 CLUSTER_GAP_MAX_MS = 2500
@@ -35,14 +36,26 @@ _ACTION_MERGE = (2500, 1500, 0, 0, 0)
 _ACTION_ANCHOR = ("unit", "unit", "onset", "impact", "impact")
 
 # Reaction
+# Energy does NOT change HOW MANY reactions surface -- relevance (the "warrant":
+# reacting to an action, a strong expression, or a long preceding turn) decides
+# that, so the floor is flat across bands. Energy only changes the CUT: how the
+# reaction is grouped (merge) and how tight it is trimmed (core, below).
 _REACTION_MERGE = (2000, 1200, 600, 0, 0)
-_REACTION_MIN_INTENSITY = (0.65, 0.55, 0.45, 0.35, 0.25)
+_REACTION_MIN_WARRANT = (0.55, 0.55, 0.55, 0.55, 0.55)
 _REACTION_MIN_DURATION = (1200, 1000, 800, 600, 500)
+# Target handle length per band, inset around the expression peak at CUT time
+# (negative padding). Broad = None = keep the full VLM span; higher energy trims
+# to a punchy core, the same mechanism as b-roll.
+_REACTION_CORE_MS = (None, 2200, 1600, 1100, 800)
 
 # B-roll
 _BROLL_MERGE = (4000, 2500, 0, 0, 0)
 _BROLL_MIN_SALIENCE = (0.55, 0.45, 0.35, 0.25, 0.20)
 _BROLL_LOW_SPEECH = (True, True, False, False, False)
+# Target handle length per band, inset around the shot's peak/middle at CUT time
+# (the VLM hands us the full end-to-end shot). Broad = None = keep the full shot
+# (capped only by the anchor safety guard); higher energy trims to a punchy core.
+_BROLL_CORE_MS = (None, 4000, 3000, 2000, 1500)
 
 # Insert
 _INSERT_COLLAPSE = (True, True, False, False, False)
@@ -72,12 +85,14 @@ class EnergyParams:
     action_split_at_impact: bool    # Sharp band (energy >= 0.8): windup + payoff
     # overlay — reaction
     reaction_merge_gap_ms: int
-    reaction_min_intensity: float
+    reaction_min_warrant: float
     reaction_min_duration_ms: int
+    reaction_core_ms: Optional[int]   # target handle length (None = full span)
     # overlay — b-roll
     broll_merge_gap_ms: int
     broll_min_salience: float
     broll_prefer_low_speech: bool
+    broll_core_ms: Optional[int]    # target handle length (None = full shot)
     # overlay — insert
     insert_collapse_graphics: bool
     insert_min_salience: float
@@ -140,11 +155,13 @@ def energy_to_params(energy: float) -> EnergyParams:
         action_anchor_mode=_ACTION_ANCHOR[band],
         action_split_at_impact=e >= BAND_EDGES[3],
         reaction_merge_gap_ms=_REACTION_MERGE[band],
-        reaction_min_intensity=_REACTION_MIN_INTENSITY[band],
+        reaction_min_warrant=_REACTION_MIN_WARRANT[band],
         reaction_min_duration_ms=_REACTION_MIN_DURATION[band],
+        reaction_core_ms=_REACTION_CORE_MS[band],
         broll_merge_gap_ms=_BROLL_MERGE[band],
         broll_min_salience=_BROLL_MIN_SALIENCE[band],
         broll_prefer_low_speech=_BROLL_LOW_SPEECH[band],
+        broll_core_ms=_BROLL_CORE_MS[band],
         insert_collapse_graphics=_INSERT_COLLAPSE[band],
         insert_min_salience=_INSERT_MIN_SALIENCE[band],
         audio_min_salience=_AUDIO_MIN_SALIENCE[band],

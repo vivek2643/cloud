@@ -435,21 +435,12 @@ function HeroClipCard({
         )}
         {!playUrl && <FileIcon type={(isVideo ? "video" : "audio") as "video"} size={32} />}
 
-        {/* Modality badge (top-left), with an OVERLAY marker for silent cutaways
-            (reactions / b-roll / inserts) the editor lays over other audio. */}
+        {/* Modality badge (top-left). */}
         <span
           className="absolute left-2 top-2 z-20 flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-semibold capitalize text-white"
           style={{ background: modality.color }}
         >
           {modality.label}
-          {hero.audio_role === "overlay" && (
-            <span
-              className="rounded-sm bg-black/30 px-1 text-[9px] uppercase tracking-wide"
-              title="Silent cutaway \u2014 lay this over your main audio"
-            >
-              overlay
-            </span>
-          )}
         </span>
 
         {/* Recommended marker (top-left, below modality) — the LLM-curated pick.

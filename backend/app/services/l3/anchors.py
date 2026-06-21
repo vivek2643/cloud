@@ -28,6 +28,7 @@ dependency, so it is trivially testable and reusable.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -63,6 +64,9 @@ _OFFCAMERA_FLAGS = ("offscreen", "production_cue")
 # a representative, bounded slice from its middle so it stays a usable card.
 MAX_HOLD_MS = 5000
 MIN_HOLD_MS = 1500
+# B-roll keeps its FULL extent into the cut engine (energy then insets it to a
+# per-band core); this is only a sanity guard against a multi-minute locked span.
+BROLL_MAX_HOLD_MS = 15000
 
 # A gaze is a cutaway only when it DEPARTS from the subject's dominant eyeline
 # (their baseline composition). In an interview the baseline is off-camera (the
@@ -74,12 +78,12 @@ MIN_GAZE_MS = 700
 _INTERACTION_SKIP = {"conversation"}
 
 
-def _hold_core(a: int, b: int) -> tuple:
-    """Bound a long held span to a representative middle slice of <= MAX_HOLD_MS."""
-    if b - a <= MAX_HOLD_MS:
+def _hold_core(a: int, b: int, cap: int = MAX_HOLD_MS) -> tuple:
+    """Bound a long held span to a representative middle slice of <= ``cap``."""
+    if b - a <= cap:
         return a, b
     mid = (a + b) // 2
-    half = MAX_HOLD_MS // 2
+    half = cap // 2
     return mid - half, mid + half
 
 
@@ -236,7 +240,8 @@ def _action_anchors(perception: dict, motion: dict, quality: List[dict]) -> List
 
 
 def _reaction_anchors(perception: dict) -> List[Anchor]:
-    """Facial reactions -> overlay cutaway anchors. Salience = intensity."""
+    """Facial reactions -> reaction anchors. Salience starts at intensity; the
+    warrant pass (``_apply_reaction_warrant``) later upgrades it from context."""
     out: List[Anchor] = []
     for r in (perception.get("reactions") or []):
         a, b = int(r.get("start_ms", 0)), int(r.get("end_ms", 0))
@@ -251,6 +256,73 @@ def _reaction_anchors(perception: dict) -> List[Anchor]:
             actor=r.get("subject"), text=label,
         ))
     return out
+
+
+# --- Reaction warrant: a reaction earns a card only when it is reacting TO
+# something -- a physical action beat, a strong expression, or another person's
+# long preceding turn. We fold these into the reaction's salience so the flat
+# energy floor (energy.py) keeps only the justified ones, regardless of band.
+_REACTION_ACTION_LOOKBACK_MS = 1500   # an action this close before counts as the trigger
+_REACTION_TURN_GAP_MS = 800           # merge same-speaker spans into one turn
+_REACTION_LISTEN_FULL_MS = 8000       # preceding turn length that earns full warrant
+_REACTION_ACTION_WARRANT = 0.85       # warrant granted by an action trigger
+
+
+def _speech_turns(speaking: List[dict]) -> List[tuple]:
+    """Merge consecutive same-subject speaking spans into turns -> (subject, a, b)."""
+    spans = sorted(
+        ((s.get("subject"), int(s.get("start_ms", 0)), int(s.get("end_ms", 0)))
+         for s in speaking if int(s.get("end_ms", 0)) > int(s.get("start_ms", 0))),
+        key=lambda t: t[1],
+    )
+    turns: List[list] = []
+    for subj, a, b in spans:
+        if turns and turns[-1][0] == subj and a - turns[-1][2] <= _REACTION_TURN_GAP_MS:
+            turns[-1][2] = max(turns[-1][2], b)
+        else:
+            turns.append([subj, a, b])
+    return [tuple(t) for t in turns]
+
+
+def _action_spans(perception: dict) -> List[tuple]:
+    """Physical action / performance beats from content_units -> (start, end)."""
+    out: List[tuple] = []
+    for u in (perception.get("content_units") or []):
+        if (u.get("kind") or "").lower() in ("action", "performance"):
+            a, b = int(u.get("start_ms", 0)), int(u.get("end_ms", 0))
+            if b > a:
+                out.append((a, b))
+    return out
+
+
+def _reaction_warrant(a: int, b: int, actor, intensity: float,
+                      turns: List[tuple], actions: List[tuple]) -> float:
+    """Best available reason this reaction earns a spot (0..1)."""
+    w = float(intensity)
+    # Reacting to an action beat that overlaps or just precedes the onset.
+    lo = a - _REACTION_ACTION_LOOKBACK_MS
+    for (sa, sb) in actions:
+        if sb >= lo and sa <= b:
+            w = max(w, _REACTION_ACTION_WARRANT)
+            break
+    # Reacting after ANOTHER person's turn -- longer point => more warranted.
+    for (subj, ta, tb) in turns:
+        if subj == actor:
+            continue
+        if ta <= a <= tb or 0 <= a - tb <= _REACTION_ACTION_LOOKBACK_MS:
+            w = max(w, min(1.0, (tb - ta) / _REACTION_LISTEN_FULL_MS))
+    return _clamp01(w)
+
+
+def _apply_reaction_warrant(anchors: List[Anchor], perception: dict) -> None:
+    """Rewrite each reaction anchor's salience to its context warrant (in place)."""
+    reacts = [a for a in anchors if a.affordance == AFF_REACTION]
+    if not reacts:
+        return
+    turns = _speech_turns(perception.get("speaking") or [])
+    actions = _action_spans(perception)
+    for a in reacts:
+        a.salience = _reaction_warrant(a.start_ms, a.end_ms, a.actor, a.salience, turns, actions)
 
 
 # Intentional moves are more dynamic than a locked-off shot, so rank them a touch
@@ -268,6 +340,7 @@ def _broll_anchors(perception: dict) -> List[Anchor]:
     get the whole move as one clean handle."""
     out: List[Anchor] = []
     seen: List[tuple] = []
+    primary = _primary_subjects(perception)
     for c in (perception.get("camera_craft") or []):
         mv = (c.get("movement") or "static")
         moving = mv != "static"
@@ -275,11 +348,15 @@ def _broll_anchors(perception: dict) -> List[Anchor]:
         # motion. (When the VLM didn't judge deliberateness, trust a named move.)
         if moving and c.get("is_deliberate") is False:
             continue
+        # Self-quieting: a STATIC hold framed on the dominant on-screen subject is
+        # the A-roll, not a cutaway (mirrors the cutaway-track gate).
+        if not moving and _focus_names_primary(c.get("subject_focus"), primary):
+            continue
         a, b = int(c.get("start_ms", 0)), int(c.get("end_ms", 0))
         if b - a < MIN_HOLD_MS:           # too short to be a usable shot
             continue
         seen.append((a, b))
-        ha, hb = _hold_core(a, b)
+        ha, hb = _hold_core(a, b, cap=BROLL_MAX_HOLD_MS)
         sal = _clamp01((b - a) / 6000.0 + (_MOVE_SALIENCE_BONUS if moving else 0.0))
         label = (c.get("subject_focus") or ("held shot" if not moving else mv.replace("_", " ")))
         out.append(Anchor(
@@ -291,10 +368,12 @@ def _broll_anchors(perception: dict) -> List[Anchor]:
     for e in (perception.get("events") or []):
         if e.get("change") != "holds":
             continue
+        if e.get("actor") in primary:        # held framing on the dominant subject
+            continue
         a, b = int(e.get("start_ms", 0)), int(e.get("end_ms", 0))
         if b - a < MIN_HOLD_MS or any(_overlap(a, b, x0, x1) > 0 for x0, x1 in seen):
             continue
-        ha, hb = _hold_core(a, b)
+        ha, hb = _hold_core(a, b, cap=BROLL_MAX_HOLD_MS)
         out.append(Anchor(
             ts_ms=(ha + hb) // 2, start_ms=ha, end_ms=hb, kind="hold", affordance=AFF_BROLL,
             salience=_clamp01((b - a) / 6000.0), actor=e.get("actor"),
@@ -344,6 +423,55 @@ def _insert_anchors(perception: dict) -> List[Anchor]:
     return out
 
 
+def _primary_subjects(perception: dict) -> set:
+    """The on-camera people who ARE the A-roll: anyone who speaks on camera, plus
+    anyone the VLM tags as the main subject/host. A static b-roll 'hold' OF one of
+    these is just the talking-head framing, not a cutaway."""
+    ids = {s.get("subject") for s in (perception.get("speaking") or []) if s.get("subject")}
+    for p in (perception.get("persons") or []):
+        role = (p.get("role") or "").lower()
+        if any(k in role for k in ("main", "subject", "host", "primary")):
+            if p.get("local_id"):
+                ids.add(p.get("local_id"))
+    return ids
+
+
+# B-roll kinds that are merely the dominant subject held in frame (vs a deliberate
+# move, which can be a legit push/pan worth cutting to).
+_BROLL_STATIC_KINDS = {"broll_hold", "hold", ""}
+
+
+def _focus_names_primary(text: Optional[str], primary: set) -> bool:
+    """True when a free-text subject_focus (e.g. 'p1 looking at laptop') names one
+    of the primary on-screen people."""
+    if not text or not primary:
+        return False
+    toks = set(re.split(r"[^a-z0-9]+", text.lower()))
+    return any((pid or "").lower() in toks for pid in primary)
+
+
+def _filter_redundant_broll(cutaways: List[dict], perception: dict) -> List[dict]:
+    """Self-quieting baseline: drop b-roll cutaways that are a STATIC hold of the
+    dominant on-screen subject -- they show nothing beyond the A-roll framing
+    (e.g. a podcast's endless 'p1 looking at laptop'). Non-dominant/None subjects
+    (true cutaways to objects, environment, a listener) and deliberate MOVES
+    survive. Intent-free: a clip with no on-camera speaker has no dominant subject,
+    so nothing is dropped (a visual reel keeps everything)."""
+    primary = _primary_subjects(perception)
+    if not primary:
+        return cutaways
+    out: List[dict] = []
+    for c in cutaways:
+        if (
+            (c.get("affordance") or "").lower() == "broll"
+            and c.get("subject") in primary
+            and (c.get("kind") or "").lower() in _BROLL_STATIC_KINDS
+        ):
+            continue
+        out.append(c)
+    return out
+
+
 def _cutaway_anchors(cutaways: List[dict]) -> List[Anchor]:
     """Sparse L2 cutaways -> overlay anchors (reactions, b-roll, inserts)."""
     _KIND_MAP = {
@@ -373,7 +501,7 @@ def _cutaway_anchors(cutaways: List[dict]) -> List[Anchor]:
         kind = (c.get("kind") or aff_key).lower()
         anchor_kind = _KIND_MAP.get(kind, kind)
         if affordance == AFF_BROLL:
-            ha, hb = _hold_core(a, b)
+            ha, hb = _hold_core(a, b, cap=BROLL_MAX_HOLD_MS)
         elif affordance == AFF_INSERT and kind != "interaction":
             ha, hb = a, min(b, a + MAX_HOLD_MS)
         else:
@@ -578,10 +706,15 @@ def gather_anchors(
     anchors += _action_anchors(perception, motion, quality)
     cutaways = perception.get("cutaways") or []
     if cutaways:
+        cutaways = _filter_redundant_broll(cutaways, perception)
         anchors += _cutaway_anchors(cutaways)
     else:
         anchors += _overlay_anchors_legacy(perception)
     anchors += _audio_event_anchors(audio, sentences, duration_ms)
+
+    # Reactions earn their salience from context (action / intensity / listening),
+    # uniformly across the legacy and cutaways paths.
+    _apply_reaction_warrant(anchors, perception)
 
     # Clamp to the clip and drop degenerate spans.
     for a in anchors:

@@ -156,8 +156,6 @@ export type HeroModality =
   | "broll"
   | "insert";
 
-export type HeroAudioRole = "sync" | "overlay";
-
 export interface HeroTake {
   file_id: string;
   src_in_ms: number;
@@ -177,7 +175,6 @@ export interface HeroCut {
   speaker: string | null;
   flags: string[];
   affordances: string[];
-  audio_role: HeroAudioRole;
   take_count: number;
   alt_takes: HeroTake[];
   // LLM filtration: is this cut in the curated "Recommended" pool? (energy-aware
