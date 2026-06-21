@@ -304,8 +304,17 @@ function HeroClipCard({
   const [playing, setPlaying] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
 
-  const inSec = hero.src_in_ms / 1000;
-  const outSec = hero.src_out_ms / 1000;
+  // Kept spans in seconds. With a breath-removal edit-list (Sharp band) the
+  // preview plays each kept run and jumps the excised gaps; otherwise it's the
+  // single [src_in, src_out] span.
+  const segs = useMemo<[number, number][]>(() => {
+    if (hero.keep_spans && hero.keep_spans.length > 0) {
+      return hero.keep_spans.map((k) => [k.in_ms / 1000, k.out_ms / 1000]);
+    }
+    return [[hero.src_in_ms / 1000, hero.src_out_ms / 1000]];
+  }, [hero.keep_spans, hero.src_in_ms, hero.src_out_ms]);
+  const inSec = segs[0][0];
+  const outSec = segs[segs.length - 1][1];
   const isVideo = file.file_type === "video";
   const modality = MODALITY_STYLE[hero.modality] ?? MODALITY_STYLE.speech;
 
@@ -355,11 +364,24 @@ function HeroClipCard({
   function onTimeUpdate() {
     const v = videoRef.current;
     if (!v) return;
-    if (v.currentTime >= outSec - 0.02 || v.currentTime < inSec - 0.3) {
+    const t = v.currentTime;
+    const seek = (to: number) => {
       try {
-        v.currentTime = inSec;
+        v.currentTime = to;
       } catch {
         /* ignore */
+      }
+    };
+    // Past the end (or rewound before the start): loop to the first kept span.
+    if (t >= outSec - 0.02 || t < inSec - 0.3) {
+      seek(inSec);
+      return;
+    }
+    // Inside an excised breath: jump straight to the next kept span's start.
+    for (let i = 0; i < segs.length - 1; i++) {
+      if (t >= segs[i][1] - 0.02 && t < segs[i + 1][0]) {
+        seek(segs[i + 1][0]);
+        return;
       }
     }
   }
