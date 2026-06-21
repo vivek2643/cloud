@@ -130,7 +130,6 @@ class HeroCut:
     speaker: Optional[str] = None
     flags: List[str] = field(default_factory=list)
     affordances: List[str] = field(default_factory=list)  # all editorial uses (filter keys)
-    audio_role: str = anc.SYNC    # sync (carries its sound) | overlay (silent cutaway)
     take_count: int = 1           # how many comparable takes exist (incl. this)
     alt_takes: List[HeroTake] = field(default_factory=list)  # the losers, best-first
     # Source dialogue sentence ids this cut spans (speech/moment cuts only).
@@ -587,7 +586,6 @@ def _make_speech_hero(
         speaker=speaker,
         flags=extra_flags,
         affordances=[anc.AFF_SPEECH],
-        audio_role=anc.SYNC,
         member_seg_ids=list(member_seg_ids or []),
     )
 
@@ -705,7 +703,6 @@ def _combined_candidates(
             score=max(s.score, a.score),
             speaker=s.speaker,
             affordances=[anc.AFF_SPEECH, anc.AFF_ACTION],
-            audio_role=anc.SYNC,
             member_seg_ids=list(s.member_seg_ids),
         ))
     return out
@@ -792,7 +789,7 @@ def _collapse_insert_anchors(items: List[anc.Anchor], gap_ms: int) -> List[anc.A
                     ts_ms=prev.ts_ms, start_ms=prev.start_ms, end_ms=max(prev.end_ms, a.end_ms),
                     kind=prev.kind, affordance=prev.affordance,
                     salience=max(prev.salience, a.salience), actor=prev.actor or a.actor,
-                    text=prev.text, audio_role=prev.audio_role, source_id=prev.source_id,
+                    text=prev.text, source_id=prev.source_id,
                 )
                 continue
         out.append(a)
@@ -897,7 +894,6 @@ def _action_segments(
                 src_out_ms=out_ms,
                 speaker=anchor.actor,
                 affordances=[anc.AFF_ACTION],
-                audio_role=anc.SYNC,
                 score=score,
             ))
     return out
@@ -988,6 +984,11 @@ def _beat_segments(clip: _ClipInputs, field: Optional[fseams.FusedField],
                 # peak as energy rises (Broad = full span).
                 core_in, core_out = _core_inset(
                     core_in, core_out, best.ts_ms, params.reaction_core_ms)
+            elif aff == anc.AFF_INSERT:
+                # Onset-anchored, so the peak is the start -> this trims the TAIL
+                # from the reveal as energy rises (Broad = full onset handle).
+                core_in, core_out = _core_inset(
+                    core_in, core_out, best.ts_ms, params.insert_core_ms)
             in_ms, out_ms = _snap_segment(field, core_in, core_out, params, clip, aff)
             t_mult = terr.territory_multiplier(
                 best, speaking=speaking, strict=params.territory_strict)
@@ -1005,7 +1006,6 @@ def _beat_segments(clip: _ClipInputs, field: Optional[fseams.FusedField],
                 src_out_ms=out_ms,
                 speaker=best.actor,
                 affordances=[aff],
-                audio_role=best.audio_role,
                 score=score,
             ))
     return out
@@ -1151,7 +1151,6 @@ def _consolidate_speech(heroes: List[HeroCut]) -> List[HeroCut]:
 def build_hero_cuts(
     file_ids: List[str], energy: float = 0.5,
     affordances: Optional[List[str]] = None,
-    audio_role: Optional[str] = None,
     recommendation_verdict: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """The ranked, universal segment feed for a set of clips.
@@ -1162,9 +1161,9 @@ def build_hero_cuts(
     the core* so the words / impact / expression are never clipped.
 
     `energy` (0..1) is the single deterministic dial (granularity + tightness).
-    `affordances` / `audio_role` are optional FILTERS over the one feed -- the
-    way every edit style (action reel, podcast A-roll, B-roll cutaways) is served
-    without a separate pipeline. Returns hero dicts sorted best-first.
+    `affordances` is an optional FILTER over the one feed -- the way every edit
+    style (action reel, podcast A-roll, B-roll cutaways) is served without a
+    separate pipeline. Returns hero dicts sorted best-first.
     """
     if not file_ids:
         return []
@@ -1192,8 +1191,6 @@ def build_hero_cuts(
     if affordances:
         want = set(affordances)
         heroes = [h for h in heroes if want & set(h.affordances or [h.modality])]
-    if audio_role:
-        heroes = [h for h in heroes if h.audio_role == audio_role]
     heroes.sort(key=lambda h: h.score, reverse=True)
     return [h.to_dict() for h in heroes]
 

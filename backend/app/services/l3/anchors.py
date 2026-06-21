@@ -18,8 +18,6 @@ Each anchor carries:
     what boundaries must never clip.
   * a ``kind`` (the source signal) and an ``affordance`` (the editorial bucket:
     what you'd reach for it for) -- affordance is a *filter*, never a pipeline.
-  * an ``audio_role``: ``sync`` (carries its own sound: speech, an impact) vs
-    ``overlay`` (silent cutaway: a reaction, a b-roll hold).
   * a ``salience`` 0..1 derived from existing signals, so marginal moments stay
     reachable but rank low (never hidden).
 
@@ -39,17 +37,6 @@ AFF_ACTION = "action"      # a physical action beat / impact (sync)
 AFF_REACTION = "reaction"  # a facial reaction / expression (overlay cutaway)
 AFF_BROLL = "broll"        # a held, stable composition (overlay)
 AFF_INSERT = "insert"      # a beat worth an insert: reveal/entrance/graphic (overlay)
-
-SYNC = "sync"
-OVERLAY = "overlay"
-
-_AUDIO_ROLE = {
-    AFF_SPEECH: SYNC,
-    AFF_ACTION: SYNC,
-    AFF_REACTION: OVERLAY,
-    AFF_BROLL: OVERLAY,
-    AFF_INSERT: OVERLAY,
-}
 
 # VLM event `change` values that mark a discrete visual insert beat. (Action is
 # NOT read from events -- ``action_*`` is overloaded with speech onsets; action
@@ -101,15 +88,6 @@ class Anchor:
     speaker: Optional[str] = None    # diarized speaker (speech)
     flags: List[str] = field(default_factory=list)
     source_id: Optional[str] = None  # originating artifact id (seg_id/unit_id/event id)
-    # sync (carries its own sound) vs overlay (silent cutaway). Defaults from the
-    # affordance, but is a real field so a moment with measured non-speech audio
-    # (an audible laugh on a reaction) can be sync while a silent nod stays overlay
-    # -- audio_role is a physical property of the span, not a category constant.
-    audio_role: Optional[str] = None
-
-    def __post_init__(self):
-        if self.audio_role is None:
-            self.audio_role = _AUDIO_ROLE.get(self.affordance, OVERLAY)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -117,7 +95,7 @@ class Anchor:
             "kind": self.kind, "affordance": self.affordance,
             "salience": round(self.salience, 3), "actor": self.actor,
             "text": self.text, "speaker": self.speaker, "flags": self.flags,
-            "audio_role": self.audio_role, "source_id": self.source_id,
+            "source_id": self.source_id,
         }
 
 
@@ -607,8 +585,8 @@ _SPEECH_PAD_MS = 200           # ignore energy hugging speech edges (on/offset t
 def _audio_event_anchors(audio: dict, sentences: List[dict], duration_ms: int) -> List[Anchor]:
     """Audible NON-SPEECH moments from the RMS envelope minus the speech mask.
     Pure signal: a contiguous run that is loud (relative to the clip's own speech
-    level) yet covered by no spoken words. Emitted as a SYNC moment (the sound is
-    the point). Generic -- no laugh/applause labels, just 'audible, not speech'."""
+    level) yet covered by no spoken words (the sound is the point). Generic -- no
+    laugh/applause labels, just 'audible, not speech'."""
     rms = audio.get("rms_db") or []
     hop = int(audio.get("prosody_hop_ms") or 0)
     if not rms or hop <= 0:
@@ -667,7 +645,7 @@ def _audio_event_anchors(audio: dict, sentences: List[dict], duration_ms: int) -
         sal = _clamp01(0.35 + 0.5 * ((loud - floor) / span))   # louder vs speech -> higher
         out.append(Anchor(
             ts_ms=(ha + hb) // 2, start_ms=ha, end_ms=hb, kind="audio_event",
-            affordance=AFF_REACTION, audio_role=SYNC, salience=sal,
+            affordance=AFF_REACTION, salience=sal,
             text="audible (non-speech)",
         ))
     return out

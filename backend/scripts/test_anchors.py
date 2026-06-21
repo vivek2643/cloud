@@ -90,18 +90,18 @@ def test_mapping_gaps_now_surface():
     }
     al = an.gather_anchors(duration_ms=30000, perception=perception)
     perf = [a for a in al if a.kind == "action_beat"]
-    assert perf and perf[0].affordance == an.AFF_ACTION and perf[0].audio_role == an.SYNC, al
+    assert perf and perf[0].affordance == an.AFF_ACTION, al
     gz = [a for a in al if a.kind == "gaze"]
-    assert len(gz) == 1 and gz[0].affordance == an.AFF_REACTION and gz[0].audio_role == an.OVERLAY, gz
+    assert len(gz) == 1 and gz[0].affordance == an.AFF_REACTION, gz
     assert "at object" in gz[0].text, gz[0].text   # the departure, not the baseline
     it = [a for a in al if a.kind == "interaction"]
-    assert len(it) == 1 and it[0].affordance == an.AFF_INSERT and it[0].audio_role == an.OVERLAY, it
+    assert len(it) == 1 and it[0].affordance == an.AFF_INSERT, it
     assert all("conversation" not in (a.text or "") for a in it)
     print("ok  mapping gaps surface (performance/gaze/interaction)")
 
 
 def test_audio_event_is_sound_minus_speech():
-    """A loud, non-speech region (laughter/applause) becomes a SYNC audio_event
+    """A loud, non-speech region (laughter/applause) becomes an audio_event
     anchor; loud regions covered by speech do NOT (that's just speech)."""
     hop = 100
     n = 100                       # 10s envelope
@@ -115,28 +115,8 @@ def test_audio_event_is_sound_minus_speech():
     al = an.gather_anchors(duration_ms=10000, dialogue={"sentence": sentences}, audio=audio)
     ev = [a for a in al if a.kind == "audio_event"]
     assert len(ev) == 1, ev                      # the burst, not the speech
-    assert ev[0].audio_role == an.SYNC, ev[0].audio_role
     assert 5500 <= ev[0].ts_ms <= 8000, ev[0].ts_ms
-    print("ok  audio event = sound minus speech (sync)")
-
-
-def test_audio_role_is_a_field_not_a_constant():
-    """audio_role defaults from affordance but can be overridden per-anchor, so an
-    audible reaction is sync while a silent reaction stays overlay."""
-    silent = an.Anchor(0, 0, 1, "expression", an.AFF_REACTION)
-    audible = an.Anchor(0, 0, 1, "audio_event", an.AFF_REACTION, audio_role=an.SYNC)
-    assert silent.audio_role == an.OVERLAY and audible.audio_role == an.SYNC
-    print("ok  audio_role is a per-anchor field")
-
-
-def test_audio_role_split():
-    """speech/action carry sync audio; reaction/broll/insert are silent overlays."""
-    assert an.Anchor(0, 0, 1, "speech", an.AFF_SPEECH).audio_role == an.SYNC
-    assert an.Anchor(0, 0, 1, "action_beat", an.AFF_ACTION).audio_role == an.SYNC
-    assert an.Anchor(0, 0, 1, "expression", an.AFF_REACTION).audio_role == an.OVERLAY
-    assert an.Anchor(0, 0, 1, "hold", an.AFF_BROLL).audio_role == an.OVERLAY
-    assert an.Anchor(0, 0, 1, "reveal", an.AFF_INSERT).audio_role == an.OVERLAY
-    print("ok  audio role split (sync vs overlay)")
+    print("ok  audio event = sound minus speech")
 
 
 def test_salience_from_intensity_and_words():

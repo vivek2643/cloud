@@ -257,9 +257,9 @@ def _clip_multi():
     return clip
 
 
-def test_reaction_and_broll_surface_as_overlay():
+def test_reaction_and_broll_surface_as_cutaways():
     """The whole cutaway vocabulary (reactions, held b-roll) now appears in the
-    feed as OVERLAY segments -- the thing that was completely invisible before."""
+    feed alongside action -- the thing that was completely invisible before."""
     clip = _clip_multi()
     field = hc._build_field(clip, 0.5)
     anchors = hc.anc.gather_anchors(duration_ms=clip.duration_ms, dialogue=clip.dialogue,
@@ -267,11 +267,7 @@ def test_reaction_and_broll_surface_as_overlay():
     beats = hc._beat_segments(clip, field, hc.energy_to_params(0.5), anchors)
     mods = {b.modality for b in beats}
     assert hc.anc.AFF_REACTION in mods and hc.anc.AFF_BROLL in mods and hc.anc.AFF_ACTION in mods, mods
-    rx = next(b for b in beats if b.modality == hc.anc.AFF_REACTION)
-    assert rx.audio_role == hc.anc.OVERLAY
-    act = next(b for b in beats if b.modality == hc.anc.AFF_ACTION)
-    assert act.audio_role == hc.anc.SYNC
-    print("ok  test_reaction_and_broll_surface_as_overlay")
+    print("ok  test_reaction_and_broll_surface_as_cutaways")
 
 
 def test_action_core_preserved():
@@ -347,7 +343,7 @@ def main():
     test_action_snaps_to_calm_motion_seam()
     test_action_fused_avoids_speech()
     test_action_skipped_without_motion()
-    test_reaction_and_broll_surface_as_overlay()
+    test_reaction_and_broll_surface_as_cutaways()
     test_action_core_preserved()
     test_action_split_at_sharp()
     test_coverage_every_anchor_in_a_segment()

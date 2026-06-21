@@ -58,8 +58,14 @@ _BROLL_LOW_SPEECH = (True, True, False, False, False)
 _BROLL_CORE_MS = (None, 4000, 3000, 2000, 1500)
 
 # Insert
+# Inserts are sparse and already meaningful (a reveal / title / interaction the
+# VLM flagged), so we barely filter -- a flat low floor keeps nearly all. Energy
+# only changes the CUT: dedup repeated graphics (collapse) + negative padding.
 _INSERT_COLLAPSE = (True, True, False, False, False)
-_INSERT_MIN_SALIENCE = (0.50, 0.42, 0.35, 0.30, 0.25)
+_INSERT_MIN_SALIENCE = (0.30, 0.30, 0.30, 0.30, 0.30)
+# Target handle length per band, inset from the onset at CUT time (the insert is
+# start-anchored, so this trims the tail). Broad = None = full onset handle.
+_INSERT_CORE_MS = (None, 4000, 3000, 2000, 1500)
 
 # Audible non-speech
 _AUDIO_MIN_SALIENCE = (0.75, 0.65, 0.55, 0.45, 0.35)
@@ -96,6 +102,7 @@ class EnergyParams:
     # overlay — insert
     insert_collapse_graphics: bool
     insert_min_salience: float
+    insert_core_ms: Optional[int]     # target handle length (None = full onset handle)
     # overlay — audio events
     audio_min_salience: float
     audio_merge_gap_ms: int
@@ -164,6 +171,7 @@ def energy_to_params(energy: float) -> EnergyParams:
         broll_core_ms=_BROLL_CORE_MS[band],
         insert_collapse_graphics=_INSERT_COLLAPSE[band],
         insert_min_salience=_INSERT_MIN_SALIENCE[band],
+        insert_core_ms=_INSERT_CORE_MS[band],
         audio_min_salience=_AUDIO_MIN_SALIENCE[band],
         audio_merge_gap_ms=_AUDIO_MERGE[band],
         territory_strict=_TERRITORY_STRICT[band],
