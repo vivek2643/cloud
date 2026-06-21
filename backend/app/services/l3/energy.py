@@ -30,10 +30,15 @@ FUSE_MOMENTS_BELOW = 0.6
 # --- Five bands (match UI: Broad, Calm, Balanced, Tight, Sharp) ---------------
 BAND_EDGES = (0.2, 0.4, 0.6, 0.8)   # band i covers [edge[i-1], edge[i]) with 0 at start
 
-# Action merge gap per band (0 = no merge)
-_ACTION_MERGE = (2500, 1500, 0, 0, 0)
+# Action merge gap per band (0 = no merge). Smoothed so Balanced still lightly
+# groups instead of a cliff to no-clustering above Calm.
+_ACTION_MERGE = (2500, 1500, 800, 0, 0)
 # unit | onset | impact
 _ACTION_ANCHOR = ("unit", "unit", "onset", "impact", "impact")
+# Target handle length per band, inset around the IMPACT at cut time (negative
+# padding, impact-forward via lead_frac=0). Broad/Calm = None = full unit extent;
+# performances are exempt (a song/dance keeps its full duration).
+_ACTION_CORE_MS = (None, None, 3500, 2500, 1800)
 
 # Reaction
 # Energy does NOT change HOW MANY reactions surface -- relevance (the "warrant":
@@ -89,6 +94,7 @@ class EnergyParams:
     action_merge_gap_ms: int
     action_anchor_mode: str         # unit | onset | impact
     action_split_at_impact: bool    # Sharp band (energy >= 0.8): windup + payoff
+    action_core_ms: Optional[int]   # target handle length (None = full unit)
     # overlay — reaction
     reaction_merge_gap_ms: int
     reaction_min_warrant: float
@@ -161,6 +167,7 @@ def energy_to_params(energy: float) -> EnergyParams:
         action_merge_gap_ms=_ACTION_MERGE[band],
         action_anchor_mode=_ACTION_ANCHOR[band],
         action_split_at_impact=e >= BAND_EDGES[3],
+        action_core_ms=_ACTION_CORE_MS[band],
         reaction_merge_gap_ms=_REACTION_MERGE[band],
         reaction_min_warrant=_REACTION_MIN_WARRANT[band],
         reaction_min_duration_ms=_REACTION_MIN_DURATION[band],

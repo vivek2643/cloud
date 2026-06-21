@@ -182,7 +182,8 @@ def _action_anchors(perception: dict, motion: dict, quality: List[dict]) -> List
         return [(ts, sc) for ts, sc in impacts if a <= ts <= b]
 
     out: List[Anchor] = []
-    action_spans: List[tuple] = []   # (start, end, text, region, source_id)
+    # (start, end, text, region, source_id, is_performance, actor)
+    action_spans: List[tuple] = []
     for u in (perception.get("content_units") or []):
         kind = (u.get("kind") or "").lower()
         a, b = int(u.get("start_ms", 0)), int(u.get("end_ms", 0))
@@ -190,9 +191,13 @@ def _action_anchors(perception: dict, motion: dict, quality: List[dict]) -> List
             continue
         text = (u.get("label") or u.get("content_key") or kind)
         if kind in ("action", "performance"):
-            # A performance (song/dance/bit) is a sustained physical+expressive
-            # delivery -- sync content, same bucket/handling as an action beat.
-            action_spans.append((a, b, text, None, str(u.get("unit_id", ""))))
+            # A performance (song/dance/bit) is a sustained delivery: same sync
+            # bucket as an action beat, but the *kind* is preserved so cut-time
+            # tightening can keep its full duration (never trim to a core).
+            parts = u.get("participants") or []
+            actor = u.get("subject") or u.get("actor") or (parts[0] if parts else None)
+            action_spans.append((a, b, text, u.get("region"),
+                                 str(u.get("unit_id", "")), kind == "performance", actor))
         elif kind == "visual":
             ha, hb = _hold_core(a, b)
             out.append(Anchor(
@@ -201,7 +206,7 @@ def _action_anchors(perception: dict, motion: dict, quality: List[dict]) -> List
                 text=text[:200], source_id=str(u.get("unit_id", "")),
             ))
 
-    for (a, b, text, region, sid) in action_spans:
+    for (a, b, text, region, sid, is_perf, actor) in action_spans:
         inside = _impact_in(a, b)
         ts = max(inside, key=lambda t: t[1])[0] if inside else (a + b) // 2
         sal = _mean(energy, a // hop, b // hop) if energy else 0.4
@@ -211,8 +216,9 @@ def _action_anchors(perception: dict, motion: dict, quality: List[dict]) -> List
         if q is not None:
             sal = _clamp01(0.7 * sal + 0.3 * q)
         out.append(Anchor(
-            ts_ms=ts, start_ms=a, end_ms=b, kind="action_beat", affordance=AFF_ACTION,
-            salience=_clamp01(sal), region=region, text=text[:200], source_id=sid,
+            ts_ms=ts, start_ms=a, end_ms=b,
+            kind="performance" if is_perf else "action_beat", affordance=AFF_ACTION,
+            salience=_clamp01(sal), actor=actor, region=region, text=text[:200], source_id=sid,
         ))
     return out
 

@@ -89,7 +89,8 @@ def test_mapping_gaps_now_surface():
         "take_quality_events": [],
     }
     al = an.gather_anchors(duration_ms=30000, perception=perception)
-    perf = [a for a in al if a.kind == "action_beat"]
+    # The fixture's content_unit is a performance -> kind preserved, action bucket.
+    perf = [a for a in al if a.kind == "performance"]
     assert perf and perf[0].affordance == an.AFF_ACTION, al
     gz = [a for a in al if a.kind == "gaze"]
     assert len(gz) == 1 and gz[0].affordance == an.AFF_REACTION, gz

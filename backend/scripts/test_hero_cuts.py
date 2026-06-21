@@ -303,6 +303,24 @@ def test_action_split_at_sharp():
     print("ok  test_action_split_at_sharp")
 
 
+def test_action_core_caps_and_performance_exempt():
+    """Sharp band: a long action beat is core-capped impact-forward (negative
+    padding), while a performance keeps its full duration (never trimmed)."""
+    params = hc.energy_to_params(1.0)            # Sharp: split on, core 1800
+    motion = {"hop_ms": 100, "action_energy": [0.7] * 200}
+    act = hc.anc.Anchor(ts_ms=5000, start_ms=2000, end_ms=12000,
+                        kind="action_beat", affordance=hc.anc.AFF_ACTION, salience=0.8)
+    pieces = hc._action_pieces(act, motion, params, None, None)
+    payoff = [p for p in pieces if "payoff" in p[2]]
+    assert payoff, pieces
+    pin, pout, _ = payoff[0]
+    assert pout - pin <= params.action_core_ms + 5, (pin, pout)
+    perf = hc.anc.Anchor(ts_ms=15000, start_ms=13000, end_ms=19000,
+                        kind="performance", affordance=hc.anc.AFF_ACTION, salience=0.8)
+    assert hc._action_pieces(perf, motion, params, None, None) == [(13000, 19000, "")]
+    print("ok  test_action_core_caps_and_performance_exempt")
+
+
 def test_coverage_every_anchor_in_a_segment():
     """The coverage guarantee: every (non-trivial) anchor lands inside some
     produced segment -- so there is no usable moment only reachable in raw."""
@@ -346,6 +364,7 @@ def main():
     test_reaction_and_broll_surface_as_cutaways()
     test_action_core_preserved()
     test_action_split_at_sharp()
+    test_action_core_caps_and_performance_exempt()
     test_coverage_every_anchor_in_a_segment()
     print("\nall hero-cuts tests passed")
 

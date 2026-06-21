@@ -63,6 +63,12 @@ def test_bands_and_action_modes():
     assert sharp.action_split_at_impact is True
     assert energy_to_params(0.8).action_split_at_impact is True
     assert energy_to_params(0.79).action_split_at_impact is False
+    # Action: smooth merge ramp (Balanced still lightly groups) + impact core
+    # tightens with energy (Broad/Calm = full unit).
+    assert broad.action_merge_gap_ms > calm.action_merge_gap_ms > balanced.action_merge_gap_ms
+    assert balanced.action_merge_gap_ms > 0 and sharp.action_merge_gap_ms == 0
+    assert broad.action_core_ms is None and calm.action_core_ms is None
+    assert balanced.action_core_ms > tight.action_core_ms > sharp.action_core_ms > 0
     # Reaction COUNT is energy-independent (flat warrant floor); only the CUT
     # tightens: Broad keeps the full span, Sharp trims to a punchy core.
     assert broad.reaction_min_warrant == sharp.reaction_min_warrant

@@ -846,17 +846,24 @@ def _action_pieces(
     field: Optional[fseams.FusedField], clip: _ClipInputs,
 ) -> List[Tuple[int, int, str]]:
     """One or two (core_in, core_out, label_suffix) per action anchor."""
-    mode = params.action_anchor_mode
+    # A performance (song/dance/bit) keeps its full duration -- never trimmed.
+    if anchor.kind == "performance":
+        return [(anchor.start_ms, anchor.end_ms, "")]
+    impact = anchor.ts_ms
+    core = params.action_core_ms
     if params.action_split_at_impact:
-        impact = anchor.ts_ms
         onset = _motion_onset_ms(motion, anchor.start_ms, anchor.end_ms)
         min_windup = _action_min_windup_ms(anchor.end_ms - anchor.start_ms)
         if impact >= onset + min_windup and onset < impact < anchor.end_ms:
+            # Payoff is impact-forward and core-capped; windup stays the run-up.
+            pin, pout = _core_inset(impact, anchor.end_ms, impact, core, lead_frac=_ACTION_LEAD)
             return [
                 (onset, impact, " · windup"),
-                (impact, anchor.end_ms, " · payoff"),
+                (pin, pout, " · payoff"),
             ]
-    cin, cout = _action_core(anchor, motion, mode)
+    cin, cout = _action_core(anchor, motion, params.action_anchor_mode)
+    # Negative padding: impact-forward core cap (Broad/Calm core None = full).
+    cin, cout = _core_inset(cin, cout, impact, core, lead_frac=_ACTION_LEAD)
     return [(cin, cout, "")]
 
 
@@ -928,17 +935,30 @@ def _beat_score(
     return max(0.0, min(1.0, base * w * territory_mult))
 
 
+# How much of the negative-padding window sits BEFORE the peak (the rest is the
+# payoff / settle after it). The peak is rarely centered, so each affordance
+# anchors its core differently: an onset insert keeps only the tail, an action
+# stays impact-forward, a reaction keeps the apex + settle, a b-roll move keeps
+# the run-in to its arrival.
+_INSERT_LEAD = 0.0        # peak = onset -> keep the reveal + tail
+_ACTION_LEAD = 0.0        # peak = impact -> impact-forward, drop the windup
+_REACTION_LEAD = 0.3      # peak = apex -> keep mostly the apex + settle
+_BROLL_HOLD_LEAD = 0.5    # uniform hold -> symmetric is fine
+_BROLL_MOVE_LEAD = 0.8    # peak = arrival -> keep the run-in to it
+
+
 def _core_inset(core_in: int, core_out: int, peak: int,
-                target: Optional[int]) -> Tuple[int, int]:
-    """Inset an overlay span (b-roll / reaction) toward its peak to ``target`` ms
-    (the energy band's handle length = negative padding). ``target`` None / span
-    already shorter -> keep the full shot. Only ever shrinks; the fused-seam snap
-    then cleans the inset edges."""
+                target: Optional[int], *, lead_frac: float = 0.5) -> Tuple[int, int]:
+    """Inset a span toward ``peak`` to ``target`` ms (the energy band's handle
+    length = negative padding). Keep ``lead_frac`` of the window BEFORE the peak
+    and the remainder after (the payoff / settle), clamped to [core_in, core_out].
+    ``target`` None / span already shorter -> unchanged. Only ever shrinks; the
+    fused-seam snap then cleans the inset edges. ``lead_frac=0.5`` is centered."""
     if not target or core_out - core_in <= target:
         return core_in, core_out
-    half = target // 2
-    center = max(core_in, min(peak, core_out))
-    ci = max(core_in, center - half)
+    peak = max(core_in, min(peak, core_out))
+    lead = int(round(target * lead_frac))
+    ci = max(core_in, peak - lead)
     co = min(core_out, ci + target)
     ci = max(core_in, co - target)  # rebalance if clipped at the tail
     return ci, co
@@ -975,20 +995,23 @@ def _beat_segments(clip: _ClipInputs, field: Optional[fseams.FusedField],
             core_out = max(m.end_ms for m in members)
             best = max(members, key=lambda m: m.salience)
             if aff == anc.AFF_BROLL:
-                # Energy-aware handle: the VLM hands us the full end-to-end shot;
-                # inset toward the peak to the band's core target (Broad = full).
+                # Energy-aware handle: the VLM hands us the full end-to-end shot.
+                # A held composition is uniform (center is fine); a MOVE pays off
+                # at its arrival, so keep the run-in to the peak instead.
+                lead = _BROLL_MOVE_LEAD if best.kind == "move" else _BROLL_HOLD_LEAD
                 core_in, core_out = _core_inset(
-                    core_in, core_out, best.ts_ms, params.broll_core_ms)
+                    core_in, core_out, best.ts_ms, params.broll_core_ms, lead_frac=lead)
             elif aff == anc.AFF_REACTION:
-                # Same negative-padding mechanism: trim the expression toward its
-                # peak as energy rises (Broad = full span).
+                # Trim toward the apex (peak_ms when the VLM gives one, else the
+                # midpoint biased late) so we keep the apex + settle, not build-up.
                 core_in, core_out = _core_inset(
-                    core_in, core_out, best.ts_ms, params.reaction_core_ms)
+                    core_in, core_out, best.ts_ms, params.reaction_core_ms,
+                    lead_frac=_REACTION_LEAD)
             elif aff == anc.AFF_INSERT:
-                # Onset-anchored, so the peak is the start -> this trims the TAIL
-                # from the reveal as energy rises (Broad = full onset handle).
+                # Onset-anchored (peak = start) -> trims the TAIL from the reveal.
                 core_in, core_out = _core_inset(
-                    core_in, core_out, best.ts_ms, params.insert_core_ms)
+                    core_in, core_out, best.ts_ms, params.insert_core_ms,
+                    lead_frac=_INSERT_LEAD)
             in_ms, out_ms = _snap_segment(field, core_in, core_out, params, clip, aff)
             t_mult = terr.territory_multiplier(
                 best, speaking=speaking, strict=params.territory_strict)
