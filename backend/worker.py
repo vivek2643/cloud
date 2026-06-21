@@ -42,7 +42,6 @@ def _warmup() -> None:
 
 async def main() -> None:
     register_tasks()
-    _warmup()
 
     # Concurrency defaults to 1 (Whisper + SigLIP saturate one CPU). On a GPU
     # box you can raise it via WORKER_CONCURRENCY, but a single GPU usually
@@ -51,6 +50,11 @@ async def main() -> None:
     concurrency = int(os.getenv("WORKER_CONCURRENCY", "1"))
     queues_env = os.getenv("WORKER_QUEUES", "").strip()
     queues = [q.strip() for q in queues_env.split(",") if q.strip()] or None
+
+    # Only the ingest workers run Whisper; L2 (Gemini) and L3 (Claude) workers
+    # are network-bound, so skip the model warmup/load for them.
+    if queues is None or "gpu" in queues:
+        _warmup()
 
     logger.info(
         "Worker ready; concurrency=%d queues=%s; entering main loop.",

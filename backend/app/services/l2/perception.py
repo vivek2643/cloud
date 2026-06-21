@@ -291,7 +291,7 @@ def _persist_unparsed(file_id: str, raw_text: str, usage: dict, model: str) -> N
 # Top-level procrastinate task
 # --------------------------------------------------------------------------
 
-@app.task(name="l2_perception", queue="gpu", retry=RetryStrategy(max_attempts=2, exponential_wait=8))
+@app.task(name="l2_perception", queue="l2", retry=RetryStrategy(max_attempts=2, exponential_wait=8))
 def l2_perception(file_id: str) -> None:
     settings = get_settings()
 
