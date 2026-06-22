@@ -64,27 +64,18 @@ def test_action_ts_is_the_impact():
     print("ok  action ts = strongest impact, core extent kept")
 
 
-def test_mapping_gaps_now_surface():
-    """The three previously-ignored-but-stored tracks now become anchors:
-    performance content_units -> action (sync); gaze -> reaction (overlay);
-    interactions -> insert (overlay). 'conversation' interactions stay in speech."""
+def test_overlay_kinds_surface_from_cutaways():
+    """Performance content_units -> action (sync). The sparse cutaways track
+    carries the full overlay vocabulary: a gaze departure -> reaction, an
+    interaction -> insert."""
     perception = {
         "content_units": [{"unit_id": "perf1", "kind": "performance",
                            "label": "sings the chorus", "start_ms": 1000, "end_ms": 5000}],
-        "gaze": [
-            # baseline eyeline = to_camera (longest) -> not a cutaway
-            {"start_ms": 0, "end_ms": 4000, "subject": "p1", "direction": "to_camera"},
-            # a held DEPARTURE to an object -> surfaces
-            {"start_ms": 6000, "end_ms": 7200, "subject": "p1",
-             "direction": "at_object", "target": "the prototype"},
-            # a micro-dart departure -> too short, dropped
-            {"start_ms": 8000, "end_ms": 8100, "subject": "p1", "direction": "off_camera"},
-        ],
-        "interactions": [
-            {"id": "i1", "kind": "handshake", "start_ms": 11000, "end_ms": 12500,
-             "participants": ["p1", "p2"], "description": "p1 and p2 shake hands"},
-            {"id": "i2", "kind": "conversation", "start_ms": 0, "end_ms": 30000,
-             "participants": ["p1", "p2"]},  # just talking -> skipped
+        "cutaways": [
+            {"start_ms": 6000, "end_ms": 7200, "kind": "gaze", "affordance": "reaction",
+             "subject": "p1", "label": "looks at the prototype"},
+            {"start_ms": 11000, "end_ms": 12500, "kind": "interaction", "affordance": "insert",
+             "label": "handshake · p1 and p2 shake hands"},
         ],
         "take_quality_events": [],
     }
@@ -94,11 +85,9 @@ def test_mapping_gaps_now_surface():
     assert perf and perf[0].affordance == an.AFF_ACTION, al
     gz = [a for a in al if a.kind == "gaze"]
     assert len(gz) == 1 and gz[0].affordance == an.AFF_REACTION, gz
-    assert "at object" in gz[0].text, gz[0].text   # the departure, not the baseline
     it = [a for a in al if a.kind == "interaction"]
     assert len(it) == 1 and it[0].affordance == an.AFF_INSERT, it
-    assert all("conversation" not in (a.text or "") for a in it)
-    print("ok  mapping gaps surface (performance/gaze/interaction)")
+    print("ok  overlay kinds surface from cutaways (performance/gaze/interaction)")
 
 
 def test_audio_event_is_sound_minus_speech():
@@ -120,20 +109,23 @@ def test_audio_event_is_sound_minus_speech():
     print("ok  audio event = sound minus speech")
 
 
-def test_salience_from_intensity_and_words():
-    """Reaction salience tracks intensity; speech salience tracks word count."""
-    p = {"reactions": [
-        {"start_ms": 0, "end_ms": 500, "subject": "p1", "type": "nod", "intensity": 0.2},
-        {"start_ms": 1000, "end_ms": 1500, "subject": "p1", "type": "laugh", "intensity": 0.9},
+def test_salience_from_intensity():
+    """Reaction salience tracks the cutaway's intensity."""
+    p = {"cutaways": [
+        {"start_ms": 0, "end_ms": 500, "kind": "reaction", "affordance": "reaction",
+         "subject": "p1", "label": "nod", "intensity": 0.2},
+        {"start_ms": 1000, "end_ms": 1500, "kind": "reaction", "affordance": "reaction",
+         "subject": "p1", "label": "laugh", "intensity": 0.9},
     ]}
     al = an.gather_anchors(duration_ms=5000, perception=p)
     rx = sorted([a for a in al if a.affordance == an.AFF_REACTION], key=lambda a: a.salience)
     assert rx[0].salience < rx[-1].salience and rx[-1].salience >= 0.85, [a.salience for a in rx]
-    print("ok  salience from intensity / words")
+    print("ok  salience from intensity")
 
 
-def test_cutaway_path_preferred_over_legacy():
-    """When cutaways is populated, legacy reactions/broll/insert tracks are ignored."""
+def test_overlays_come_only_from_cutaways():
+    """Overlays are read solely from the sparse cutaways track; the raw L2
+    reactions / camera_craft tracks are never minted into anchors."""
     perception = {
         "cutaways": [
             {"start_ms": 1000, "end_ms": 2000, "kind": "reaction", "affordance": "reaction",
@@ -148,19 +140,7 @@ def test_cutaway_path_preferred_over_legacy():
     rx = [a for a in al if a.affordance == an.AFF_REACTION]
     assert len(rx) == 1 and "listener laugh" in rx[0].text, rx
     assert an.AFF_BROLL not in {a.affordance for a in al}
-    print("ok  cutaway path preferred over legacy")
-
-
-def test_legacy_overlay_fallback():
-    """Old L2 JSON without cutaways still surfaces overlays from legacy tracks."""
-    perception = {
-        "reactions": [{"start_ms": 0, "end_ms": 500, "subject": "p1", "type": "nod", "intensity": 0.5}],
-        "camera_craft": [{"start_ms": 0, "end_ms": 5000, "movement": "static", "subject_focus": "wide"}],
-    }
-    al = an.gather_anchors(duration_ms=10000, perception=perception)
-    assert an.AFF_REACTION in {a.affordance for a in al}
-    assert an.AFF_BROLL in {a.affordance for a in al}
-    print("ok  legacy overlay fallback")
+    print("ok  overlays come only from cutaways")
 
 
 if __name__ == "__main__":

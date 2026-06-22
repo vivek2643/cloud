@@ -26,7 +26,6 @@ dependency, so it is trivially testable and reusable.
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -38,11 +37,6 @@ AFF_REACTION = "reaction"  # a facial reaction / expression (overlay cutaway)
 AFF_BROLL = "broll"        # a held, stable composition (overlay)
 AFF_INSERT = "insert"      # a beat worth an insert: reveal/entrance/graphic (overlay)
 
-# VLM event `change` values that mark a discrete visual insert beat. (Action is
-# NOT read from events -- ``action_*`` is overloaded with speech onsets; action
-# comes only from the VLM's content_units. See ``_action_anchors``.)
-_INSERT_CHANGES = {"reveal", "enters_frame", "exits_frame", "setup", "holds"}
-
 # Hidden-by-default dialogue lexicon flags (off-camera audio).
 _OFFCAMERA_FLAGS = ("offscreen", "production_cue")
 
@@ -50,19 +44,9 @@ _OFFCAMERA_FLAGS = ("offscreen", "production_cue")
 # whole take. A static span can run for minutes (a locked-off interview); we emit
 # a representative, bounded slice from its middle so it stays a usable card.
 MAX_HOLD_MS = 5000
-MIN_HOLD_MS = 1500
 # B-roll keeps its FULL extent into the cut engine (energy then insets it to a
 # per-band core); this is only a sanity guard against a multi-minute locked span.
 BROLL_MAX_HOLD_MS = 15000
-
-# A gaze is a cutaway only when it DEPARTS from the subject's dominant eyeline
-# (their baseline composition). In an interview the baseline is off-camera (the
-# subject faces the interviewer) so off-camera is not 69 cutaways; in a vlog the
-# baseline is to-camera so a glance off-screen IS the event. Per-subject, no
-# content_type. `unsure` is noise; a look must be held (not a micro-dart).
-MIN_GAZE_MS = 700
-# An interaction kind that is just people talking is already covered by speech.
-_INTERACTION_SKIP = {"conversation"}
 
 
 def _hold_core(a: int, b: int, cap: int = MAX_HOLD_MS) -> tuple:
@@ -223,25 +207,6 @@ def _action_anchors(perception: dict, motion: dict, quality: List[dict]) -> List
     return out
 
 
-def _reaction_anchors(perception: dict) -> List[Anchor]:
-    """Facial reactions -> reaction anchors. Salience starts at intensity; the
-    warrant pass (``_apply_reaction_warrant``) later upgrades it from context."""
-    out: List[Anchor] = []
-    for r in (perception.get("reactions") or []):
-        a, b = int(r.get("start_ms", 0)), int(r.get("end_ms", 0))
-        if b <= a:
-            continue
-        typ = (r.get("type") or "reaction")
-        trig = r.get("trigger")
-        label = f"{typ}" + (f" \u00b7 {trig}" if trig else "")
-        out.append(Anchor(
-            ts_ms=(a + b) // 2, start_ms=a, end_ms=b, kind="expression",
-            affordance=AFF_REACTION, salience=_clamp01(float(r.get("intensity") or 0.5)),
-            actor=r.get("subject"), text=label,
-        ))
-    return out
-
-
 # --- Reaction warrant: a reaction earns a card only when it is reacting TO
 # something -- a physical action beat, a strong expression, or another person's
 # long preceding turn. We fold these into the reaction's salience so the flat
@@ -309,104 +274,6 @@ def _apply_reaction_warrant(anchors: List[Anchor], perception: dict) -> None:
         a.salience = _reaction_warrant(a.start_ms, a.end_ms, a.actor, a.salience, turns, actions)
 
 
-# Intentional moves are more dynamic than a locked-off shot, so rank them a touch
-# higher at equal length.
-_MOVE_SALIENCE_BONUS = 0.15
-
-
-def _broll_anchors(perception: dict) -> List[Anchor]:
-    """Usable shots -> overlay b-roll anchors. A shot is usable footage iff it is
-    either held (``static``) OR an INTENTIONAL move -- and intentionality is read
-    from the VLM's universal ``is_deliberate`` flag, NOT a movement-name allowlist.
-    So a deliberate handheld push survives and an incidental wobble drops, with no
-    per-movement special-casing. A move is bad to cut *through* (the fused field
-    vetoes mid-move seams) but premium to cut *to*; boundaries snap later so you
-    get the whole move as one clean handle."""
-    out: List[Anchor] = []
-    seen: List[tuple] = []
-    primary = _primary_subjects(perception)
-    for c in (perception.get("camera_craft") or []):
-        mv = (c.get("movement") or "static")
-        moving = mv != "static"
-        # Universal property: keep held shots and deliberate moves; drop incidental
-        # motion. (When the VLM didn't judge deliberateness, trust a named move.)
-        if moving and c.get("is_deliberate") is False:
-            continue
-        # Self-quieting: a STATIC hold framed on the dominant on-screen subject is
-        # the A-roll, not a cutaway (mirrors the cutaway-track gate).
-        if not moving and _focus_names_primary(c.get("subject_focus"), primary):
-            continue
-        a, b = int(c.get("start_ms", 0)), int(c.get("end_ms", 0))
-        if b - a < MIN_HOLD_MS:           # too short to be a usable shot
-            continue
-        seen.append((a, b))
-        ha, hb = _hold_core(a, b, cap=BROLL_MAX_HOLD_MS)
-        sal = _clamp01((b - a) / 6000.0 + (_MOVE_SALIENCE_BONUS if moving else 0.0))
-        label = (c.get("subject_focus") or ("held shot" if not moving else mv.replace("_", " ")))
-        out.append(Anchor(
-            ts_ms=(ha + hb) // 2, start_ms=ha, end_ms=hb,
-            kind=("move" if moving else "hold"), affordance=AFF_BROLL,
-            salience=sal, region=c.get("region"),
-            text=(f"{mv.replace('_', ' ')} \u00b7 {label}" if moving else label),
-        ))
-    for e in (perception.get("events") or []):
-        if e.get("change") != "holds":
-            continue
-        if e.get("actor") in primary:        # held framing on the dominant subject
-            continue
-        a, b = int(e.get("start_ms", 0)), int(e.get("end_ms", 0))
-        if b - a < MIN_HOLD_MS or any(_overlap(a, b, x0, x1) > 0 for x0, x1 in seen):
-            continue
-        ha, hb = _hold_core(a, b, cap=BROLL_MAX_HOLD_MS)
-        out.append(Anchor(
-            ts_ms=(ha + hb) // 2, start_ms=ha, end_ms=hb, kind="hold", affordance=AFF_BROLL,
-            salience=_clamp01((b - a) / 6000.0), actor=e.get("actor"),
-            region=e.get("region"), text=(e.get("description") or "held shot")[:200],
-        ))
-    return out
-
-
-def _insert_anchors(perception: dict) -> List[Anchor]:
-    """Discrete beats worth an insert: reveals / entrances / exits / on-screen
-    graphics / environment changes -> overlay anchors. An insert marks an ONSET
-    (the reveal, the graphic appearing), so the handle is start-anchored and
-    bounded -- a persistent watermark must not become a clip-length card."""
-    def _ins(a: int) -> int:
-        return a + MAX_HOLD_MS
-
-    out: List[Anchor] = []
-    for e in (perception.get("events") or []):
-        ch = e.get("change")
-        if ch not in _INSERT_CHANGES or ch == "holds":
-            continue
-        a, b = int(e.get("start_ms", 0)), int(e.get("end_ms", 0))
-        if b <= a:
-            continue
-        out.append(Anchor(
-            ts_ms=a, start_ms=a, end_ms=min(b, _ins(a)), kind=str(ch), affordance=AFF_INSERT,
-            salience=0.5, actor=e.get("actor"), region=e.get("region"),
-            text=(e.get("description") or ch)[:200], source_id=str(e.get("id", "")),
-        ))
-    for g in (perception.get("graphic_text_events") or []):
-        a, b = int(g.get("start_ms", 0)), int(g.get("end_ms", 0))
-        if b <= a:
-            continue
-        txt = (g.get("text") or g.get("kind") or "graphic")
-        out.append(Anchor(
-            ts_ms=a, start_ms=a, end_ms=min(b, _ins(a)), kind="graphic", affordance=AFF_INSERT,
-            salience=0.55 if g.get("text") else 0.4, text=str(txt)[:200],
-        ))
-    for ev in (perception.get("environment_events") or []):
-        a, b = int(ev.get("start_ms", 0)), int(ev.get("end_ms", 0))
-        if b <= a:
-            continue
-        out.append(Anchor(
-            ts_ms=a, start_ms=a, end_ms=min(b, _ins(a)), kind="environment", affordance=AFF_INSERT,
-            salience=0.45, text=(ev.get("description") or "environment")[:200],
-        ))
-    return out
-
-
 def _primary_subjects(perception: dict) -> set:
     """The on-camera people who ARE the A-roll: anyone who speaks on camera, plus
     anyone the VLM tags as the main subject/host. A static b-roll 'hold' OF one of
@@ -423,15 +290,6 @@ def _primary_subjects(perception: dict) -> set:
 # B-roll kinds that are merely the dominant subject held in frame (vs a deliberate
 # move, which can be a legit push/pan worth cutting to).
 _BROLL_STATIC_KINDS = {"broll_hold", "hold", ""}
-
-
-def _focus_names_primary(text: Optional[str], primary: set) -> bool:
-    """True when a free-text subject_focus (e.g. 'p1 looking at laptop') names one
-    of the primary on-screen people."""
-    if not text or not primary:
-        return False
-    toks = set(re.split(r"[^a-z0-9]+", text.lower()))
-    return any((pid or "").lower() in toks for pid in primary)
 
 
 def _filter_redundant_broll(cutaways: List[dict], perception: dict) -> List[dict]:
@@ -502,78 +360,6 @@ def _cutaway_anchors(cutaways: List[dict]) -> List[Anchor]:
         out.append(Anchor(
             ts_ms=ts, start_ms=ha, end_ms=hb, kind=anchor_kind, affordance=affordance,
             salience=_clamp01(float(sal)), actor=c.get("subject"), text=label[:200],
-        ))
-    return out
-
-
-def _overlay_anchors_legacy(perception: dict) -> List[Anchor]:
-    """Pre-cutaways L2 artifacts -> overlay anchors (backward compatible)."""
-    out: List[Anchor] = []
-    out += _reaction_anchors(perception)
-    out += _gaze_anchors(perception)
-    out += _broll_anchors(perception)
-    out += _insert_anchors(perception)
-    out += _interaction_anchors(perception)
-    return out
-
-
-def _gaze_anchors(perception: dict) -> List[Anchor]:
-    """Held looks that DEPART from the subject's dominant eyeline -> overlay
-    reaction anchors. The cutaway value of a glance is in the *shift* (attention
-    leaves the baseline), so we first learn each subject's modal direction (by
-    total time) and surface only the held departures. This self-quiets on
-    interviews (off-camera baseline) and lights up on vlogs (to-camera baseline),
-    with no content-type logic."""
-    spans = [g for g in (perception.get("gaze") or [])
-             if (g.get("direction") or "") and int(g.get("end_ms", 0)) > int(g.get("start_ms", 0))]
-    # Per-subject baseline eyeline = the direction holding the most total time.
-    by_subj: Dict[str, Dict[str, int]] = {}
-    for g in spans:
-        d = (g.get("direction") or "").lower()
-        dur = int(g.get("end_ms", 0)) - int(g.get("start_ms", 0))
-        by_subj.setdefault(g.get("subject"), {})[d] = by_subj.get(g.get("subject"), {}).get(d, 0) + dur
-    baseline = {s: max(dd, key=dd.get) for s, dd in by_subj.items()}
-
-    out: List[Anchor] = []
-    for g in spans:
-        d = (g.get("direction") or "").lower()
-        if d == "unsure" or d == baseline.get(g.get("subject")):
-            continue                                   # noise, or the baseline eyeline
-        a, b = int(g.get("start_ms", 0)), int(g.get("end_ms", 0))
-        if b - a < MIN_GAZE_MS:
-            continue
-        ha, hb = _hold_core(a, b)
-        tgt = g.get("target")
-        label = "looks " + d.replace("_", " ") + (f" \u00b7 {tgt}" if tgt else "")
-        out.append(Anchor(
-            ts_ms=(ha + hb) // 2, start_ms=ha, end_ms=hb, kind="gaze",
-            affordance=AFF_REACTION, salience=0.5 if tgt else 0.4,
-            actor=g.get("subject"), text=label,
-        ))
-    return out
-
-
-def _interaction_anchors(perception: dict) -> List[Anchor]:
-    """Relational beats (handshake / hug / hand-off / ...) -> overlay insert
-    anchors: a discrete people-moment worth cutting to. Plain 'conversation' is
-    skipped -- that content already lives in speech."""
-    out: List[Anchor] = []
-    for it in (perception.get("interactions") or []):
-        kind = (it.get("kind") or "").lower()
-        if kind in _INTERACTION_SKIP:
-            continue
-        a, b = int(it.get("start_ms", 0)), int(it.get("end_ms", 0))
-        if b <= a:
-            continue
-        ha, hb = _hold_core(a, b)
-        parts = it.get("participants") or []
-        label = (it.get("description") or kind or "interaction")
-        out.append(Anchor(
-            ts_ms=(ha + hb) // 2, start_ms=ha, end_ms=hb, kind="interaction",
-            affordance=AFF_INSERT, salience=0.55,
-            actor=(parts[0] if parts else None),
-            text=(f"{kind} \u00b7 {label}" if kind else label)[:200],
-            source_id=str(it.get("id", "")),
         ))
     return out
 
@@ -688,16 +474,12 @@ def gather_anchors(
     anchors: List[Anchor] = []
     anchors += _speech_anchors(sentences, quality)
     anchors += _action_anchors(perception, motion, quality)
-    cutaways = perception.get("cutaways") or []
-    if cutaways:
-        cutaways = _filter_redundant_broll(cutaways, perception)
-        anchors += _cutaway_anchors(cutaways)
-    else:
-        anchors += _overlay_anchors_legacy(perception)
+    cutaways = _filter_redundant_broll(perception.get("cutaways") or [], perception)
+    anchors += _cutaway_anchors(cutaways)
     anchors += _audio_event_anchors(audio, sentences, duration_ms)
 
-    # Reactions earn their salience from context (action / intensity / listening),
-    # uniformly across the legacy and cutaways paths.
+    # Reactions (from the cutaways track + non-speech audio) earn their salience
+    # from context (action / intensity / listening).
     _apply_reaction_warrant(anchors, perception)
 
     # Clamp to the clip and drop degenerate spans.

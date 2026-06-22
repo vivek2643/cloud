@@ -20,6 +20,18 @@ from app.services.l3 import hero_cuts as hc  # noqa: E402
 from app.services.l3 import score_span as ss  # noqa: E402
 
 
+def _action_beats(clip, params, field):
+    """Action/visual/insert hero cuts: gather anchors, keep the sync+overlay
+    affordances, run the beat engine. (Mirrors the production path in
+    ``_file_heroes``; a test-only convenience.)"""
+    anchors = hc.anc.gather_anchors(
+        duration_ms=clip.duration_ms,
+        perception=clip.perception, motion=clip.motion)
+    action = [a for a in anchors
+              if a.affordance in (hc.anc.AFF_ACTION, hc.anc.AFF_BROLL, hc.anc.AFF_INSERT)]
+    return hc._beat_segments(clip, field, params, action)
+
+
 def _src(file_id: str, duration_ms: int, words):
     return ss.SpanSource(
         file_id=file_id, duration_ms=duration_ms, words=words,
@@ -205,7 +217,7 @@ def test_action_snaps_to_calm_motion_seam():
         ], "take_quality_events": []},
         motion=motion,
     )
-    heroes = hc._action_candidates(clip, hc.energy_to_params(0.0), None)
+    heroes = _action_beats(clip, hc.energy_to_params(0.0), None)
     assert len(heroes) == 1, heroes
     h = heroes[0]
     assert h.modality == "action" and h.label == "hits the ball"
@@ -240,7 +252,7 @@ def test_action_fused_avoids_speech():
     )
     field = hc._build_field(clip, 0.5)
     assert field is not None
-    heroes = hc._action_candidates(clip, hc.energy_to_params(0.5), field)
+    heroes = _action_beats(clip, hc.energy_to_params(0.5), field)
     assert len(heroes) == 1, heroes
     h = heroes[0]
     # Core-preservation: the boundary never lands INSIDE the spoken word...
@@ -273,10 +285,14 @@ def _clip_multi():
         "editability": {"primary_axis": "action"},
         "content_units": [{"unit_id": "u1", "kind": "action", "label": "drops and misses",
                            "start_ms": 6000, "end_ms": 7800}],
-        "reactions": [{"start_ms": 8200, "end_ms": 9100, "subject": "p1",
-                       "type": "smile", "intensity": 0.7, "trigger": "the miss"}],
-        "camera_craft": [{"start_ms": 9000, "end_ms": 11500, "movement": "static",
-                          "subject_focus": "wide room"}],
+        # Overlay moments live in the sparse cutaways track (the single source the
+        # anchor layer reads): a listener reaction + a held b-roll shot.
+        "cutaways": [
+            {"start_ms": 8200, "end_ms": 9100, "kind": "reaction", "affordance": "reaction",
+             "subject": "p1", "label": "smile", "trigger": "the miss", "intensity": 0.7},
+            {"start_ms": 9000, "end_ms": 11500, "kind": "broll_hold", "affordance": "broll",
+             "label": "wide room"},
+        ],
         "take_quality_events": [],
     }
     clip = hc._ClipInputs(
@@ -323,7 +339,7 @@ def test_action_split_at_sharp():
     field = hc._build_field(clip, 0.85)
     params = hc.energy_to_params(0.85)
     assert params.action_split_at_impact
-    heroes = hc._action_candidates(clip, params, field)
+    heroes = _action_beats(clip, params, field)
     acts = [h for h in heroes if h.modality == hc.anc.AFF_ACTION]
     assert len(acts) == 2, [(h.label, h.src_in_ms, h.src_out_ms) for h in acts]
     assert min(h.src_in_ms for h in acts) <= 6000
@@ -379,7 +395,7 @@ def test_action_skipped_without_motion():
         ]},
         motion=None,
     )
-    assert hc._action_candidates(clip, hc.energy_to_params(0.5), None) == []
+    assert _action_beats(clip, hc.energy_to_params(0.5), None) == []
     print("ok  test_action_skipped_without_motion")
 
 

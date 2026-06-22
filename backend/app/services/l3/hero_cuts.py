@@ -1110,17 +1110,6 @@ def _beat_segments(clip: _ClipInputs, field: Optional[fseams.FusedField],
     return out
 
 
-def _action_candidates(clip: _ClipInputs, params: EnergyParams,
-                       field: Optional[fseams.FusedField]) -> List[HeroCut]:
-    """DEPRECATED shim: action/visual now flow through ``_beat_segments`` over the
-    anchor layer. Kept as a thin wrapper so older callers/tests still work."""
-    anchors = anc.gather_anchors(
-        duration_ms=clip.duration_ms,
-        perception=clip.perception, motion=clip.motion)
-    action = [a for a in anchors if a.affordance in (anc.AFF_ACTION, anc.AFF_BROLL, anc.AFF_INSERT)]
-    return _beat_segments(clip, field, params, action)
-
-
 # --------------------------------------------------------------------------
 # Take stacking: collapse repeats into one hero, best in front
 # --------------------------------------------------------------------------
