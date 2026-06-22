@@ -626,8 +626,11 @@ def make_edit(file_ids: List[str], brief: str,
     segments = _segments_from_picks(picks, by_id)
 
     # Call 4: Coverage (overlays + fit), only when the spine frees its picture.
+    # Off by default -- V1 is a pure assembler (pick + order), so it emits no
+    # overlay operations; enable autoedit_coverage to bring it back.
     coverage: dict = {}
-    if plan.spine_kind in _VIDEO_FREE_SPINES and coverage_pool and segments:
+    if (settings.autoedit_coverage and plan.spine_kind in _VIDEO_FREE_SPINES
+            and coverage_pool and segments):
         spans, total = layers.spine_spans(segments)
         spine_view = [{
             "seg_id": s.seg["seg_id"],

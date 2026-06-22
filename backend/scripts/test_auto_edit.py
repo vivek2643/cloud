@@ -150,6 +150,7 @@ def test_make_edit_end_to_end(monkeypatch=None):
             {"hero_id": "fb:x", "from_ms": 2000, "to_ms": 3500, "reason": "cover"}],
             "notes": "kept it sparse"}),
     )
+    # Default: pure assembler -- no coverage pass, no overlay operations.
     try:
         result = ae.make_edit(["f1", "fb"], "make a punchy reel", llm=llm)
     finally:
@@ -160,10 +161,54 @@ def test_make_edit_end_to_end(monkeypatch=None):
     assert result.plan.energy == 0.7 and result.plan.aspect == "portrait"
     assert doc["format"]["aspect"] == "portrait"
     assert [s["hero_id"] for s in doc["timeline"]] == ["f1:a", "f1:b"], doc["timeline"]
-    assert len(doc["operations"]) == 1 and doc["operations"][0]["type"] == "place_video"
+    assert doc["operations"] == [], doc["operations"]
     assert doc["resolved"]["video_layers"], "resolved layers must exist"
+    assert llm.calls == ["DIRECTOR", "EDITOR"], llm.calls
+    print("ok  make_edit end-to-end (pure assembler: pick + order, no ops)")
+
+
+def test_make_edit_coverage_when_enabled():
+    """With autoedit_coverage on, the coverage pass runs and lays an overlay."""
+    feed = [
+        _cut("f1:a", "f1", label="the hook line", score=0.9),
+        _cut("f1:b", "f1", label="the middle point", score=0.7),
+        _cut("fb:x", "fb", modality="broll", label="b-roll pour", t_out=4000),
+    ]
+    orig_cards, orig_feed = ae._clip_cards, ae.hero_store.get_hero_feed
+    import app.services.render.tasks as rt
+    orig_dur = rt._durations
+    ae._clip_cards = lambda fids: {f: {"file_id": f, "name": f, "duration_ms": 600000,
+                                       "best_use": [], "topics": [], "people": []}
+                                   for f in fids}
+    ae.hero_store.get_hero_feed = lambda fids, energy=0.5, **kw: feed
+    rt._durations = lambda fids: {f: 600000 for f in fids}
+    llm = FakeLLM(
+        director=json.dumps({"energy": 0.7, "aspect": "portrait",
+                             "spine_kind": "dialogue", "intent": "tell it",
+                             "beats": [{"purpose": "hook", "intent": "open"}]}),
+        editor=json.dumps({"picks": [
+            {"hero_id": "f1:a", "beat": "hook", "reason": "strong open"},
+            {"hero_id": "f1:b", "beat": None, "reason": "support"},
+        ]}),
+        coverage=json.dumps({"overlays": [
+            {"hero_id": "fb:x", "from_ms": 2000, "to_ms": 3500, "reason": "cover"}],
+            "notes": "kept it sparse"}),
+    )
+    from app.config import get_settings
+    settings = get_settings()
+    prev = settings.autoedit_coverage
+    settings.autoedit_coverage = True
+    try:
+        result = ae.make_edit(["f1", "fb"], "make a punchy reel", llm=llm)
+    finally:
+        settings.autoedit_coverage = prev
+        ae._clip_cards, ae.hero_store.get_hero_feed = orig_cards, orig_feed
+        rt._durations = orig_dur
+
+    doc = result.document
+    assert len(doc["operations"]) == 1 and doc["operations"][0]["type"] == "place_video"
     assert llm.calls == ["DIRECTOR", "EDITOR", "COVERAGE"], llm.calls
-    print("ok  make_edit end-to-end (3 calls -> resolved doc)")
+    print("ok  make_edit coverage path (enabled -> 1 overlay op)")
 
 
 def test_make_edit_fallback_on_editor_failure():
@@ -195,6 +240,7 @@ def main():
     test_operations_from_coverage()
     test_apply_trims()
     test_make_edit_end_to_end()
+    test_make_edit_coverage_when_enabled()
     test_make_edit_fallback_on_editor_failure()
     print("\nall auto-edit tests passed")
 

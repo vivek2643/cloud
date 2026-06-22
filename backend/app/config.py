@@ -138,6 +138,10 @@ class Settings(BaseSettings):
     autoedit_max_output_tokens: int = 16384
     # Deep reasoning for the editorial calls (taste, story, ordering).
     autoedit_effort: str = "high"
+    # V1 is a pure clip ASSEMBLER: pick the right clips and order them, nothing
+    # else. Leave False to skip the coverage/overlay pass (no place_video ops);
+    # flip True to let it lay B-roll / reaction / insert overlays on the spine.
+    autoedit_coverage: bool = False
 
     @property
     def r2_endpoint(self) -> str:
