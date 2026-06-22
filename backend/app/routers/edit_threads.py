@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from app.auth import get_current_user_id
+from app.services.l3 import auto_edit
 from app.services.l3 import store
 from app.services.l3.orchestrator import send_user_message, start_thread
 
@@ -31,6 +32,9 @@ router = APIRouter(prefix="/api/edit/threads", tags=["edit"])
 class CreateThreadBody(BaseModel):
     file_ids: List[str] = Field(min_length=1)
     brief: str = ""
+    # "agent" = the Claude agentic loop (default); "auto" = the L3 v2 one-shot
+    # prompt-driven auto-editor (OpenAI).
+    mode: str = "agent"
 
 
 class MessageBody(BaseModel):
@@ -88,8 +92,11 @@ def _sanitize_operations(operations: List[dict]) -> List[dict]:
 
 @router.post("")
 def create_thread(body: CreateThreadBody, user_id: str = Depends(get_current_user_id)):
-    thread_id = start_thread(user_id, body.file_ids, body.brief)
-    return {"thread_id": thread_id, "status": "drafting"}
+    if body.mode == "auto":
+        thread_id = auto_edit.start_thread(user_id, body.file_ids, body.brief)
+    else:
+        thread_id = start_thread(user_id, body.file_ids, body.brief)
+    return {"thread_id": thread_id, "status": "drafting", "mode": body.mode}
 
 
 @router.get("")

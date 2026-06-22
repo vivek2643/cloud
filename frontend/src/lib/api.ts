@@ -586,12 +586,22 @@ export interface EditVersionListItem {
   created_at: string;
 }
 
-export function createEditThread(fileIds: string[], brief: string, token: string) {
-  return request<{ thread_id: string; status: EditThreadStatus }>("/api/edit/threads", {
-    method: "POST",
-    body: JSON.stringify({ file_ids: fileIds, brief }),
-    token,
-  });
+export type EditMode = "agent" | "auto";
+
+export function createEditThread(
+  fileIds: string[],
+  brief: string,
+  token: string,
+  mode: EditMode = "agent"
+) {
+  return request<{ thread_id: string; status: EditThreadStatus; mode: EditMode }>(
+    "/api/edit/threads",
+    {
+      method: "POST",
+      body: JSON.stringify({ file_ids: fileIds, brief, mode }),
+      token,
+    }
+  );
 }
 
 export function listEditThreads(token: string) {

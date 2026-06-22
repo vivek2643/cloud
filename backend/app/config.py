@@ -124,6 +124,21 @@ class Settings(BaseSettings):
     # effort can take ~30s+). minimal|low|medium|high.
     recommend_effort: str = "low"
 
+    # --- L3 v2: prompt-driven auto-editor (OpenAI) -----------------------
+    # A simple, deterministic 3-call pipeline (Director -> Editor -> Coverage)
+    # that turns a one-line brief into a full Edit Document: guess the energy,
+    # build the hero-cuts feed at that energy, select + order the cuts, then
+    # lay light coverage. Provider/model overridable so it can pilot on OpenAI
+    # while the agentic L3 stays on Anthropic.
+    enable_autoedit: bool = True
+    autoedit_provider: str = "openai"
+    # The strongest available OpenAI model: this is creative selection +
+    # ordering, not cheap classification. Override via OPENAI / env if needed.
+    autoedit_model: str = "gpt-5"
+    autoedit_max_output_tokens: int = 16384
+    # Deep reasoning for the editorial calls (taste, story, ordering).
+    autoedit_effort: str = "high"
+
     @property
     def r2_endpoint(self) -> str:
         return f"https://{self.r2_account_id}.r2.cloudflarestorage.com"

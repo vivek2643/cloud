@@ -28,6 +28,7 @@ import {
   type EditThread,
   type EditThreadStatus,
   type EditOperation,
+  type EditMode,
 } from "@/lib/api";
 
 const POLL_MS = 2000;
@@ -99,6 +100,9 @@ export function AiEditPanel() {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // "agent" = the multi-turn Claude loop you can refine; "auto" = the one-shot
+  // OpenAI auto-editor (each send starts a fresh draft from the prompt).
+  const [mode, setMode] = useState<EditMode>("agent");
   // Portal target for the bottom editor dock (program monitor + timeline) that
   // lives in the main area, pro-editor style.
   const [dockEl, setDockEl] = useState<HTMLElement | null>(null);
@@ -191,11 +195,13 @@ export function AiEditPanel() {
     setInput("");
     setError(null);
     setBusy(true);
-    const nextTurns = [...userTurns, text];
+    // Auto mode is one-shot: every prompt drafts a fresh edit (no refine loop).
+    const startFresh = mode === "auto" || !threadId;
+    const nextTurns = startFresh ? [text] : [...userTurns, text];
     setUserTurns(nextTurns);
     try {
-      if (!threadId) {
-        const { thread_id } = await createEditThread(aiScopeFileIds, text, token);
+      if (startFresh) {
+        const { thread_id } = await createEditThread(aiScopeFileIds, text, token, mode);
         setThreadId(thread_id);
         saveThreadId(scope, thread_id);
         saveTurns(thread_id, nextTurns);
@@ -275,6 +281,28 @@ export function AiEditPanel() {
           {status && <StatusBadge status={status} />}
         </div>
         <div className="flex items-center gap-1">
+          <div
+            className="flex items-center rounded-full border p-0.5 text-xs"
+            style={{ borderColor: "var(--border)" }}
+            title="Agent: refine over a conversation · Auto: one-shot draft from the prompt"
+          >
+            {(["agent", "auto"] as EditMode[]).map((m) => {
+              const active = mode === m;
+              return (
+                <button
+                  key={m}
+                  onClick={() => setMode(m)}
+                  className="rounded-full px-2 py-0.5 font-medium capitalize transition-colors"
+                  style={{
+                    background: active ? "var(--accent)" : "transparent",
+                    color: active ? "#fff" : "var(--muted)",
+                  }}
+                >
+                  {m}
+                </button>
+              );
+            })}
+          </div>
           <span
             className="rounded-full px-2 py-0.5 text-xs"
             style={{ background: "var(--accent-soft)", color: "var(--muted)" }}
@@ -368,7 +396,9 @@ export function AiEditPanel() {
             }}
             rows={1}
             placeholder={
-              threadId
+              mode === "auto"
+                ? "Describe the edit — drafts a fresh cut each time… (e.g. punchy 30s reel)"
+                : threadId
                 ? "Refine the edit, or answer above…"
                 : "Describe the edit you want… (e.g. a punchy 60s pitch)"
             }
