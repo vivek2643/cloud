@@ -130,13 +130,13 @@ def test_make_edit_end_to_end(monkeypatch=None):
         _cut("f1:b", "f1", label="the middle point", score=0.7),
         _cut("fb:x", "fb", modality="broll", label="b-roll pour", t_out=4000),
     ]
-    orig_cards, orig_feed = ae._clip_cards, ae.build_hero_cuts
+    orig_cards, orig_feed = ae._clip_cards, ae.hero_store.get_hero_feed
     import app.services.render.tasks as rt
     orig_dur = rt._durations
     ae._clip_cards = lambda fids: {f: {"file_id": f, "name": f, "duration_ms": 600000,
                                        "best_use": [], "topics": [], "people": []}
                                    for f in fids}
-    ae.build_hero_cuts = lambda fids, energy=0.5, **kw: feed
+    ae.hero_store.get_hero_feed = lambda fids, energy=0.5, **kw: feed
     rt._durations = lambda fids: {f: 600000 for f in fids}
     llm = FakeLLM(
         director=json.dumps({"energy": 0.7, "aspect": "portrait",
@@ -153,7 +153,7 @@ def test_make_edit_end_to_end(monkeypatch=None):
     try:
         result = ae.make_edit(["f1", "fb"], "make a punchy reel", llm=llm)
     finally:
-        ae._clip_cards, ae.build_hero_cuts = orig_cards, orig_feed
+        ae._clip_cards, ae.hero_store.get_hero_feed = orig_cards, orig_feed
         rt._durations = orig_dur
 
     doc = result.document
@@ -168,13 +168,13 @@ def test_make_edit_end_to_end(monkeypatch=None):
 
 def test_make_edit_fallback_on_editor_failure():
     feed = [_cut("f1:a", "f1", score=0.9), _cut("f1:b", "f1", score=0.4)]
-    orig_cards, orig_feed = ae._clip_cards, ae.build_hero_cuts
+    orig_cards, orig_feed = ae._clip_cards, ae.hero_store.get_hero_feed
     import app.services.render.tasks as rt
     orig_dur = rt._durations
     ae._clip_cards = lambda fids: {f: {"file_id": f, "name": f, "duration_ms": 60000,
                                        "best_use": [], "topics": [], "people": []}
                                    for f in fids}
-    ae.build_hero_cuts = lambda fids, energy=0.5, **kw: feed
+    ae.hero_store.get_hero_feed = lambda fids, energy=0.5, **kw: feed
     rt._durations = lambda fids: {f: 60000 for f in fids}
     # Editor returns no usable picks -> deterministic fallback kicks in.
     llm = FakeLLM(director=json.dumps({"energy": 0.5, "spine_kind": "dialogue"}),
@@ -182,7 +182,7 @@ def test_make_edit_fallback_on_editor_failure():
     try:
         result = ae.make_edit(["f1"], "", llm=llm)
     finally:
-        ae._clip_cards, ae.build_hero_cuts = orig_cards, orig_feed
+        ae._clip_cards, ae.hero_store.get_hero_feed = orig_cards, orig_feed
         rt._durations = orig_dur
     assert result.selected >= 1, "fallback must still produce a draft"
     print("ok  make_edit fallback on editor failure")

@@ -194,19 +194,49 @@ def _match(a: str, b: str) -> float:
 
 
 def cluster_attempts(attempts: List[Attempt]) -> List[TakeGroup]:
-    """Greedy near-duplicate clustering on the normalized content key."""
+    """Greedy near-duplicate clustering on the normalized content key.
+
+    Most lines are distinct (a 300-attempt project clusters into ~300 groups),
+    so a naive O(n^2) full ``SequenceMatcher.ratio()`` over every (attempt,
+    group) pair dominates the whole feed (~40s). We keep the exact same result
+    but prune the comparison with two guaranteed UPPER BOUNDS on ratio that are
+    far cheaper than the real edit-distance:
+      * length bound  ratio <= 2*min(la,lb)/(la+lb): a single integer test.
+      * quick_ratio() the multiset-overlap bound difflib ships for this.
+    Only when both clear the threshold do we pay for the full ``.ratio()``.
+    """
     groups: List[TakeGroup] = []
+    keys: List[str] = []          # group content_key, index-aligned with groups
+    lens: List[int] = []          # len(key), for the length bound
+    # autojunk left at its default so .ratio() matches the original _match()
+    # exactly; quick_ratio()/the length bound stay valid upper bounds either way.
+    sm = SequenceMatcher()
     for att in attempts:
+        k = att.content_key
+        lk = len(k)
+        sm.set_seq1(k)
         best: Optional[TakeGroup] = None
         best_score = MATCH_THRESHOLD
-        for g in groups:
-            s = _match(att.content_key, g.content_key)
+        for gi in range(len(groups)):
+            lg = lens[gi]
+            # Length upper bound: skip pairs that can't reach the threshold.
+            if 2 * min(lk, lg) < MATCH_THRESHOLD * (lk + lg):
+                continue
+            gk = keys[gi]
+            if k == gk:
+                best, best_score = groups[gi], 1.0
+                break
+            sm.set_seq2(gk)
+            if sm.quick_ratio() < best_score:
+                continue
+            s = sm.ratio()
             if s >= best_score:
-                best, best_score = g, s
+                best, best_score = groups[gi], s
         if best is None:
-            groups.append(
-                TakeGroup(group_id=f"tg{len(groups) + 1}", content_key=att.content_key, attempts=[att])
-            )
+            groups.append(TakeGroup(group_id=f"tg{len(groups) + 1}",
+                                    content_key=k, attempts=[att]))
+            keys.append(k)
+            lens.append(lk)
         else:
             best.attempts.append(att)
     return groups

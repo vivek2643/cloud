@@ -59,6 +59,21 @@ _MERGE_RATIO = 0.90
 _MERGE_MIN_TOKENS = 4
 _MERGE_LEN_RATIO = 0.7
 
+# Bump whenever the per-file cut logic changes (energy params, candidate
+# builders, scoring) so the precompute cache invalidates and recomputes.
+PARAMS_VERSION = 1
+
+# The five canonical product energy LEVELS = the band centers (Broad .. Sharp).
+# Hero cuts are precomputed at exactly these after L2; any requested energy
+# snaps to the nearest band, so a level is always served from cache.
+BAND_ENERGIES: Tuple[float, ...] = (0.1, 0.3, 0.5, 0.7, 0.9)
+
+
+def band_energy(band: int) -> float:
+    """Representative energy for a band index (0..4)."""
+    return BAND_ENERGIES[max(0, min(band, len(BAND_ENERGIES) - 1))]
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -117,6 +132,13 @@ class HeroTake:
             "score": round(self.score, 3),
         }
 
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "HeroTake":
+        return cls(
+            file_id=d["file_id"], src_in_ms=int(d["src_in_ms"]),
+            src_out_ms=int(d["src_out_ms"]), score=float(d.get("score", 0.0)),
+        )
+
 
 @dataclass
 class HeroCut:
@@ -170,6 +192,32 @@ class HeroCut:
             "recommended": self.recommended,
             "recommend_reason": self.recommend_reason,
         }
+
+    def to_cache(self) -> Dict[str, Any]:
+        """Serialize for the per-file precompute cache. Same as the public dict
+        plus the internal ``member_seg_ids`` (the on-read recommendation tagging
+        needs them). Cached cuts are PRE-stacking, so alt_takes is empty."""
+        d = self.to_dict()
+        d["member_seg_ids"] = self.member_seg_ids
+        return d
+
+    @classmethod
+    def from_cache(cls, d: Dict[str, Any]) -> "HeroCut":
+        ks = d.get("keep_spans")
+        keep = [(int(s["in_ms"]), int(s["out_ms"])) for s in ks] if ks else None
+        return cls(
+            hero_id=d["hero_id"], file_id=d["file_id"], modality=d["modality"],
+            label=d.get("label", ""), src_in_ms=int(d["src_in_ms"]),
+            src_out_ms=int(d["src_out_ms"]), score=float(d.get("score", 0.0)),
+            speaker=d.get("speaker"), flags=list(d.get("flags") or []),
+            affordances=list(d.get("affordances") or []),
+            take_count=int(d.get("take_count", 1)),
+            alt_takes=[HeroTake.from_dict(t) for t in (d.get("alt_takes") or [])],
+            member_seg_ids=list(d.get("member_seg_ids") or []),
+            recommended=bool(d.get("recommended", True)),
+            recommend_reason=d.get("recommend_reason"),
+            keep_spans=keep,
+        )
 
 
 # --------------------------------------------------------------------------
@@ -1184,13 +1232,20 @@ def _stack_takes(heroes: List[HeroCut], file_ids: List[str]) -> List[HeroCut]:
 
 def _strict_same_line(a: str, b: str) -> bool:
     """True when two displayed lines are the same scripted line (take of each
-    other): high text ratio, similar length, and long enough to be meaningful."""
+    other): high text ratio, similar length, and long enough to be meaningful.
+
+    ``quick_ratio()`` is a guaranteed upper bound on ``ratio()`` and far cheaper,
+    so it prunes the bulk of non-matching pairs before the full edit-distance --
+    same result, but it keeps the O(n^2) consolidation pass fast on big feeds."""
     ta, tb = a.split(), b.split()
     if len(ta) < _MERGE_MIN_TOKENS or len(tb) < _MERGE_MIN_TOKENS:
         return False
     if min(len(ta), len(tb)) / max(len(ta), len(tb)) < _MERGE_LEN_RATIO:
         return False
-    return SequenceMatcher(None, a, b).ratio() >= _MERGE_RATIO
+    sm = SequenceMatcher(None, a, b)
+    if sm.quick_ratio() < _MERGE_RATIO:
+        return False
+    return sm.ratio() >= _MERGE_RATIO
 
 
 def _consolidate_speech(heroes: List[HeroCut]) -> List[HeroCut]:
@@ -1252,24 +1307,44 @@ def build_hero_cuts(
     if not file_ids:
         return []
     params = energy_to_params(energy)
-
     inputs = _load_inputs(file_ids)
     sources = ss.load_sources(file_ids)
 
     heroes: List[HeroCut] = []
     for fid, clip in inputs.items():
-        field = _build_field(clip, params.energy)
-        anchors = anc.gather_anchors(
-            duration_ms=clip.duration_ms, dialogue=clip.dialogue,
-            perception=clip.perception, motion=clip.motion, audio=clip.audio)
-        sp = _speech_candidates(clip, sources.get(fid), field, params)
-        beats = _beat_segments(clip, field, params, anchors)
-        heroes.extend(sp)
-        heroes.extend(beats)
-        if params.fuse_moments:
-            action = [b for b in beats if b.modality == anc.AFF_ACTION]
-            heroes.extend(_combined_candidates(clip, sp, action))
+        heroes.extend(_file_heroes(clip, sources.get(fid), params))
 
+    return _assemble(heroes, file_ids, recommendation_verdict, affordances)
+
+
+def _file_heroes(
+    clip: _ClipInputs, source: Optional[ss.SpanSource], params: EnergyParams,
+) -> List[HeroCut]:
+    """All hero cuts for ONE clip at one energy -- the heavy, per-file work
+    (fused field, anchors, speech/beat/combined candidates). Pure given the
+    clip's stored artifacts, so its output is what the precompute cache stores
+    (one entry per file per energy band). No cross-file stacking here."""
+    field = _build_field(clip, params.energy)
+    anchors = anc.gather_anchors(
+        duration_ms=clip.duration_ms, dialogue=clip.dialogue,
+        perception=clip.perception, motion=clip.motion, audio=clip.audio)
+    sp = _speech_candidates(clip, source, field, params)
+    beats = _beat_segments(clip, field, params, anchors)
+    heroes: List[HeroCut] = list(sp) + list(beats)
+    if params.fuse_moments:
+        action = [b for b in beats if b.modality == anc.AFF_ACTION]
+        heroes.extend(_combined_candidates(clip, sp, action))
+    return heroes
+
+
+def _assemble(
+    heroes: List[HeroCut], file_ids: List[str],
+    recommendation_verdict: Optional[Dict[str, Dict[str, Any]]] = None,
+    affordances: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Cross-file finishing pass over per-file heroes: stack repeated takes,
+    tag recommendations, optional affordance filter, rank best-first. Cheap
+    relative to ``_file_heroes`` -- this is the only work done on a cache hit."""
     heroes = _stack_takes(heroes, file_ids)
     _apply_recommendations(heroes, file_ids, recommendation_verdict)
     if affordances:
@@ -1277,6 +1352,33 @@ def build_hero_cuts(
         heroes = [h for h in heroes if want & set(h.affordances or [h.modality])]
     heroes.sort(key=lambda h: h.score, reverse=True)
     return [h.to_dict() for h in heroes]
+
+
+def compute_file_cache(file_id: str, energy: float) -> List[Dict[str, Any]]:
+    """The per-file, pre-stacking hero cuts at one energy, serialized for the
+    precompute cache (includes internal member_seg_ids). Empty if the file has
+    no usable artifacts yet."""
+    inputs = _load_inputs([file_id])
+    clip = inputs.get(file_id)
+    if clip is None:
+        return []
+    params = energy_to_params(energy)
+    source = ss.load_sources([file_id]).get(file_id)
+    return [h.to_cache() for h in _file_heroes(clip, source, params)]
+
+
+def assemble_cached(
+    cached_by_file: Dict[str, List[Dict[str, Any]]], file_ids: List[str],
+    recommendation_verdict: Optional[Dict[str, Dict[str, Any]]] = None,
+    affordances: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Rehydrate per-file cached cuts and run the cross-file finishing pass --
+    the read path that avoids recomputing the per-file work."""
+    heroes: List[HeroCut] = []
+    for fid in file_ids:
+        for d in cached_by_file.get(fid, []) or []:
+            heroes.append(HeroCut.from_cache(d))
+    return _assemble(heroes, file_ids, recommendation_verdict, affordances)
 
 
 def _apply_recommendations(

@@ -42,9 +42,8 @@ from procrastinate import RetryStrategy
 
 from app.config import get_settings
 from app.services.jobs import app
-from app.services.l3 import framing, layers
+from app.services.l3 import framing, hero_store, layers
 from app.services.l3.energy import energy_band
-from app.services.l3.hero_cuts import build_hero_cuts
 from app.services.llm import LLMClient, get_llm, user_message
 
 logger = logging.getLogger(__name__)
@@ -60,6 +59,13 @@ _VIDEO_FREE_SPINES = ("dialogue", "music")
 
 _ASPECTS = ("landscape", "portrait", "square")
 _SPINE_KINDS = ("dialogue", "music", "visual", "sync", "other")
+
+# Per-call reasoning effort. Only the Editor's selection + ordering benefits from
+# deep reasoning; the Director (energy/aspect guess) and Coverage (overlay
+# placement) are shallow calls, so they run cheap/fast. The Editor falls through
+# to settings.autoedit_effort (default "high").
+_DIRECTOR_EFFORT = "low"
+_COVERAGE_EFFORT = "low"
 
 
 # --------------------------------------------------------------------------
@@ -149,20 +155,6 @@ def _clip_cards(file_ids: List[str]) -> Dict[str, dict]:
     return {fid: cards[fid] for fid in file_ids if fid in cards}
 
 
-def _modality_rollup(feed: List[dict]) -> Dict[str, Dict[str, int]]:
-    """Per-file count of cuts by modality at the chosen energy -- the signal that
-    tells the Director 'this is a talking-head project' vs. 'an action reel'."""
-    out: Dict[str, Dict[str, int]] = {}
-    for c in feed:
-        fid = c.get("file_id")
-        if not fid:
-            continue
-        out.setdefault(fid, {})
-        m = c.get("modality") or "other"
-        out[fid][m] = out[fid].get(m, 0) + 1
-    return out
-
-
 # --------------------------------------------------------------------------
 # JSON helpers
 # --------------------------------------------------------------------------
@@ -188,13 +180,14 @@ def _clamp01(x: float) -> float:
     return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
 
 
-def _run_json(llm: LLMClient, system: str, prompt: str) -> Optional[dict]:
+def _run_json(llm: LLMClient, system: str, prompt: str,
+              effort: Optional[str] = None) -> Optional[dict]:
     settings = get_settings()
     resp = llm.run(
         system=system,
         messages=[user_message(prompt)],
         max_tokens=settings.autoedit_max_output_tokens,
-        effort=settings.autoedit_effort or None,
+        effort=effort or (settings.autoedit_effort or None),
     )
     return _parse_json(resp.text)
 
@@ -234,13 +227,10 @@ _DIRECTOR_SYSTEM = (
 )
 
 
-def _director_prompt(brief: str, cards: Dict[str, dict],
-                     rollups: Dict[str, Dict[str, int]]) -> str:
+def _director_prompt(brief: str, cards: Dict[str, dict]) -> str:
     lines: List[str] = [f"BRIEF: {brief.strip() or '(none given -- infer a sensible edit)'}", ""]
     lines.append(f"PROJECT: {len(cards)} clip(s).")
     for c in cards.values():
-        roll = rollups.get(c["file_id"], {})
-        roll_str = " · ".join(f"{n} {m}" for m, n in sorted(roll.items())) or "no cuts"
         dur_s = round(c["duration_ms"] / 1000.0, 1)
         bits = [f'CLIP "{c["name"]}" ({dur_s}s)']
         meta = []
@@ -272,7 +262,6 @@ def _director_prompt(brief: str, cards: Dict[str, dict],
             ctx.append(f"mood: {c['mood']}")
         if ctx:
             bits.append("  " + " | ".join(ctx))
-        bits.append(f"  contains: {roll_str}")
         if c.get("notes"):
             bits.append(f"  notes: {c['notes']}")
         lines.append("\n".join(bits))
@@ -307,9 +296,9 @@ def _coerce_plan(doc: Optional[dict]) -> Plan:
     return plan
 
 
-def _director(brief: str, cards: Dict[str, dict],
-              rollups: Dict[str, Dict[str, int]], llm: LLMClient) -> Plan:
-    doc = _run_json(llm, _DIRECTOR_SYSTEM, _director_prompt(brief, cards, rollups))
+def _director(brief: str, cards: Dict[str, dict], llm: LLMClient) -> Plan:
+    doc = _run_json(llm, _DIRECTOR_SYSTEM, _director_prompt(brief, cards),
+                    effort=_DIRECTOR_EFFORT)
     return _coerce_plan(doc)
 
 
@@ -430,7 +419,8 @@ def _coverage_prompt(brief: str, plan: Plan, spine_view: List[dict],
 def _coverage(brief: str, plan: Plan, spine_view: List[dict],
               coverage_pool: List[dict], total_ms: int, llm: LLMClient) -> dict:
     doc = _run_json(llm, _COVERAGE_SYSTEM,
-                    _coverage_prompt(brief, plan, spine_view, coverage_pool, total_ms))
+                    _coverage_prompt(brief, plan, spine_view, coverage_pool, total_ms),
+                    effort=_COVERAGE_EFFORT)
     return doc or {}
 
 
@@ -611,13 +601,15 @@ def make_edit(file_ids: List[str], brief: str,
 
     cards = _clip_cards(file_ids)
 
-    # Call 1: Director (energy + plan). Build a neutral feed first only to give
-    # the director a modality rollup; the real pool is rebuilt at its energy.
-    probe = build_hero_cuts(file_ids, energy=0.5)
-    plan = _director(brief, cards, _modality_rollup(probe), llm)
+    # Call 1: Director (energy + plan) from the clip summary cards alone -- the
+    # cards' content_type / primary_axis / best_use already distinguish a
+    # talking-head from an action reel, so we don't pay for a throwaway feed
+    # build just to count modalities.
+    plan = _director(brief, cards, llm)
 
-    # Engine: the full cut feed at the director's energy.
-    feed = build_hero_cuts(file_ids, energy=plan.energy)
+    # Engine: the full cut feed at the director's energy, served from the
+    # precompute cache (snaps to the nearest band; lazily backfills a miss).
+    feed = hero_store.get_hero_feed(file_ids, energy=plan.energy)
     by_id = {c["hero_id"]: c for c in feed}
     spine_pool = [c for c in feed if c.get("modality") in _SPINE_MODALITIES]
     coverage_pool = [c for c in feed if c.get("modality") in _COVERAGE_MODALITIES]
