@@ -54,11 +54,38 @@ def _feel_ease(feel: Optional[str]) -> str:
 # Signal access (one batched perception read; motion read per file, cached)
 # --------------------------------------------------------------------------
 
+def _pg_conn():
+    import psycopg
+
+    from app.config import get_settings
+
+    return psycopg.connect(get_settings().database_url, autocommit=True)
+
+
+def _load_perceptions(file_ids: List[str]) -> Dict[str, dict]:
+    """file_id -> parsed L2 perception dict (skips missing/unparseable)."""
+    if not file_ids:
+        return {}
+    import json
+
+    out: Dict[str, dict] = {}
+    with _pg_conn() as conn:
+        rows = conn.execute(
+            "select file_id::text, perception from clip_perception where file_id = any(%s::uuid[])",
+            (file_ids,),
+        ).fetchall()
+    for fid, perception in rows:
+        doc = perception if isinstance(perception, dict) else (
+            json.loads(perception) if perception else None
+        )
+        if doc and not doc.get("_parse_error"):
+            out[fid] = doc
+    return out
+
+
 def _load_motion_centroids(file_id: str) -> List[dict]:
     """Action points (with centroids) for a clip, or [] if none/unavailable."""
     try:
-        from app.services.l3.engine import _pg_conn
-
         with _pg_conn() as conn:
             row = conn.execute(
                 "select action_points from motion_dynamics where file_id = %s",
@@ -294,9 +321,7 @@ def annotate_document(document: dict) -> dict:
         return document
 
     try:
-        from app.services.l3.catalog import load_perceptions
-
-        perceptions = load_perceptions(sorted(file_ids))
+        perceptions = _load_perceptions(sorted(file_ids))
     except Exception:
         logger.debug("framing: perception load failed", exc_info=True)
         perceptions = {}

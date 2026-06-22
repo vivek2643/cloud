@@ -24,11 +24,9 @@ import { useAuthStore } from "@/stores/auth-store";
 import {
   createEditThread,
   getEditThread,
-  sendEditMessage,
   type EditThread,
   type EditThreadStatus,
   type EditOperation,
-  type EditMode,
 } from "@/lib/api";
 
 const POLL_MS = 2000;
@@ -100,9 +98,6 @@ export function AiEditPanel() {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // "agent" = the multi-turn Claude loop you can refine; "auto" = the one-shot
-  // OpenAI auto-editor (each send starts a fresh draft from the prompt).
-  const [mode, setMode] = useState<EditMode>("agent");
   // Portal target for the bottom editor dock (program monitor + timeline) that
   // lives in the main area, pro-editor style.
   const [dockEl, setDockEl] = useState<HTMLElement | null>(null);
@@ -195,45 +190,16 @@ export function AiEditPanel() {
     setInput("");
     setError(null);
     setBusy(true);
-    // Auto mode is one-shot: every prompt drafts a fresh edit (no refine loop).
-    const startFresh = mode === "auto" || !threadId;
-    const nextTurns = startFresh ? [text] : [...userTurns, text];
+    // The auto-editor is one-shot: every prompt drafts a fresh edit.
+    const nextTurns = [text];
     setUserTurns(nextTurns);
     try {
-      if (startFresh) {
-        const { thread_id } = await createEditThread(aiScopeFileIds, text, token, mode);
-        setThreadId(thread_id);
-        saveThreadId(scope, thread_id);
-        saveTurns(thread_id, nextTurns);
-        startPolling(thread_id);
-        await refresh(thread_id);
-      } else {
-        saveTurns(threadId, nextTurns);
-        await sendEditMessage(threadId, { text }, token);
-        startPolling(threadId);
-        await refresh(threadId);
-      }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "The edit run failed.");
-      setBusy(false);
-    }
-  }
-
-  async function handleAnswers(answers: Record<string, string>, note?: string) {
-    if (!threadId || !token || busy) return;
-    setError(null);
-    setBusy(true);
-    const label =
-      "Answered: " +
-      Object.values(answers).join(" · ") +
-      (note ? ` — ${note}` : "");
-    const nextTurns = [...userTurns, label];
-    setUserTurns(nextTurns);
-    saveTurns(threadId, nextTurns);
-    try {
-      await sendEditMessage(threadId, { answers, text: note }, token);
-      startPolling(threadId);
-      await refresh(threadId);
+      const { thread_id } = await createEditThread(aiScopeFileIds, text, token);
+      setThreadId(thread_id);
+      saveThreadId(scope, thread_id);
+      saveTurns(thread_id, nextTurns);
+      startPolling(thread_id);
+      await refresh(thread_id);
     } catch (e) {
       setError(e instanceof Error ? e.message : "The edit run failed.");
       setBusy(false);
@@ -261,8 +227,6 @@ export function AiEditPanel() {
 
   const doc = thread?.document ?? null;
   const status = thread?.status;
-  const questions =
-    status === "awaiting_user" ? thread?.open_questions ?? [] : [];
 
   return (
     <>
@@ -281,28 +245,6 @@ export function AiEditPanel() {
           {status && <StatusBadge status={status} />}
         </div>
         <div className="flex items-center gap-1">
-          <div
-            className="flex items-center rounded-full border p-0.5 text-xs"
-            style={{ borderColor: "var(--border)" }}
-            title="Agent: refine over a conversation · Auto: one-shot draft from the prompt"
-          >
-            {(["agent", "auto"] as EditMode[]).map((m) => {
-              const active = mode === m;
-              return (
-                <button
-                  key={m}
-                  onClick={() => setMode(m)}
-                  className="rounded-full px-2 py-0.5 font-medium capitalize transition-colors"
-                  style={{
-                    background: active ? "var(--accent)" : "transparent",
-                    color: active ? "#fff" : "var(--muted)",
-                  }}
-                >
-                  {m}
-                </button>
-              );
-            })}
-          </div>
           <span
             className="rounded-full px-2 py-0.5 text-xs"
             style={{ background: "var(--accent-soft)", color: "var(--muted)" }}
@@ -364,10 +306,6 @@ export function AiEditPanel() {
           </div>
         )}
 
-        {questions.length > 0 && (
-          <QuestionForm questions={questions} onSubmit={handleAnswers} disabled={busy} />
-        )}
-
         {error && (
           <div
             className="flex items-start gap-2 rounded-lg border p-3 text-sm"
@@ -395,13 +333,7 @@ export function AiEditPanel() {
               }
             }}
             rows={1}
-            placeholder={
-              mode === "auto"
-                ? "Describe the edit — drafts a fresh cut each time… (e.g. punchy 30s reel)"
-                : threadId
-                ? "Refine the edit, or answer above…"
-                : "Describe the edit you want… (e.g. a punchy 60s pitch)"
-            }
+            placeholder="Describe the edit — drafts a fresh cut each time… (e.g. punchy 30s reel)"
             className="max-h-32 min-h-[24px] flex-1 resize-none bg-transparent text-sm outline-none"
           />
           <button
@@ -681,71 +613,3 @@ function OperationsView({
   );
 }
 
-function QuestionForm({
-  questions,
-  onSubmit,
-  disabled,
-}: {
-  questions: NonNullable<EditThread["open_questions"]>;
-  onSubmit: (answers: Record<string, string>, note?: string) => void;
-  disabled: boolean;
-}) {
-  const [answers, setAnswers] = useState<Record<string, string>>({});
-  const [note, setNote] = useState("");
-
-  const allAnswered = questions.every((q) => answers[q.q_id]);
-
-  return (
-    <div
-      className="space-y-3 rounded-2xl border p-3"
-      style={{ background: "var(--accent-soft)", borderColor: "var(--accent)" }}
-    >
-      <p className="text-sm font-semibold">A couple of decisions</p>
-      {questions.map((q) => (
-        <div key={q.q_id} className="space-y-1.5">
-          <p className="text-sm">{q.question}</p>
-          {q.why && (
-            <p className="text-xs" style={{ color: "var(--muted)" }}>
-              {q.why}
-            </p>
-          )}
-          <div className="flex flex-wrap gap-1.5">
-            {(q.options && q.options.length > 0 ? q.options : [q.default]).map((opt) => {
-              const active = answers[q.q_id] === opt;
-              return (
-                <button
-                  key={opt}
-                  onClick={() => setAnswers((a) => ({ ...a, [q.q_id]: opt }))}
-                  className="rounded-full border px-2.5 py-1 text-xs transition-colors"
-                  style={{
-                    background: active ? "var(--accent)" : "var(--background)",
-                    color: active ? "#fff" : "var(--foreground)",
-                    borderColor: active ? "var(--accent)" : "var(--border)",
-                  }}
-                >
-                  {opt}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      ))}
-      <input
-        type="text"
-        value={note}
-        onChange={(e) => setNote(e.target.value)}
-        placeholder="Add a note (optional)…"
-        className="w-full rounded-lg border bg-transparent px-2.5 py-1.5 text-sm outline-none"
-        style={{ borderColor: "var(--border)" }}
-      />
-      <button
-        onClick={() => onSubmit(answers, note.trim() || undefined)}
-        disabled={disabled || !allAnswered}
-        className="w-full rounded-lg py-2 text-sm font-medium text-white transition-opacity disabled:opacity-40"
-        style={{ background: "var(--accent)" }}
-      >
-        Submit answers
-      </button>
-    </div>
-  );
-}

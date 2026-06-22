@@ -47,14 +47,10 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("HF_TOKEN", "HUGGINGFACE_TOKEN", "huggingface_token"),
     )
 
-    # Anthropic credentials (used by the L3 edit orchestrator).
-    anthropic_api_key: str = ""
-    anthropic_model: str = "claude-sonnet-4-5-20250929"
-
-    # Provider-agnostic LLM backbone. "anthropic" (default), "gemini", or
-    # "openai". All L3 model calls route through app.services.llm.get_llm()
-    # keyed on this value (or an explicit per-feature override).
-    llm_provider: str = "anthropic"
+    # Provider-agnostic LLM backbone. "openai" (default) or "gemini". All model
+    # calls route through app.services.llm.get_llm() keyed on this value (or an
+    # explicit per-feature override).
+    llm_provider: str = "openai"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-pro"
 
@@ -91,29 +87,11 @@ class Settings(BaseSettings):
     # uploaded video before giving up.
     l2_file_active_timeout_seconds: int = 300
 
-    # --- L3: edit orchestrator (Claude Opus agentic tool-loop) ------------
-    # The creative brain: picks material/order/rough timing over the L1+L2 text
-    # analysis and drives the deterministic cut-engine tools; never places
-    # exact frames itself (the cost grids do).
-    l3_model: str = "claude-opus-4-8"
-    # Guardrails so the inner reason->tool loop is always bounded.
-    l3_max_iterations: int = 40
-    l3_max_output_tokens: int = 16384
-    # Extended-thinking toggle: > 0 enables adaptive thinking on the model
-    # (modern Opus ignores the exact number; depth is steered by effort below).
-    l3_thinking_budget_tokens: int = 8192
-    # Reasoning depth for adaptive thinking: low|medium|high|xhigh|max.
-    # "high" is the default; "xhigh" is recommended for heavy agentic loops.
-    l3_effort: str = "high"
-    # Prompt caching on the stable system/tools/catalog prefix (Anthropic only);
-    # this is what makes a many-iteration Opus loop affordable.
-    llm_prompt_caching: bool = True
-
     # --- Recommendations: LLM filtration of the hero-cuts feed ------------
     # A single, energy-independent text call judges each dialogue sentence
     # keep/drop; the feed then flags cuts via the "contains a keeper" rule.
     # Provider/model are overridable so this feature can move independently of
-    # the L3 backbone (we pilot OpenAI here, leaving L3 on Anthropic).
+    # the default LLM backbone.
     enable_recommendations: bool = True
     recommend_provider: str = "openai"
     # Empty -> the provider's default model (e.g. openai_model).
@@ -124,12 +102,11 @@ class Settings(BaseSettings):
     # effort can take ~30s+). minimal|low|medium|high.
     recommend_effort: str = "low"
 
-    # --- L3 v2: prompt-driven auto-editor (OpenAI) -----------------------
+    # --- L3: prompt-driven auto-editor (OpenAI) --------------------------
     # A simple, deterministic 3-call pipeline (Director -> Editor -> Coverage)
     # that turns a one-line brief into a full Edit Document: guess the energy,
     # build the hero-cuts feed at that energy, select + order the cuts, then
-    # lay light coverage. Provider/model overridable so it can pilot on OpenAI
-    # while the agentic L3 stays on Anthropic.
+    # lay light coverage. Provider/model overridable.
     enable_autoedit: bool = True
     autoedit_provider: str = "openai"
     # The strongest available OpenAI model: this is creative selection +

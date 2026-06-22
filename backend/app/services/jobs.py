@@ -58,5 +58,4 @@ def register_tasks() -> None:
     from app.services.l2 import perception  # noqa: F401
     from app.services.l3 import auto_edit  # noqa: F401
     from app.services.l3 import hero_store  # noqa: F401
-    from app.services.l3 import orchestrator  # noqa: F401
     from app.services.render import tasks as render_tasks  # noqa: F401

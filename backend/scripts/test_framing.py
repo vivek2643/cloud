@@ -155,7 +155,6 @@ def test_focus_priority_and_centers() -> None:
 def test_orientation_mapping_and_annotate() -> None:
     """frame_orientation -> clockwise rotate; annotate bakes focus+rotate onto segs."""
     from app.services.l3 import framing
-    import app.services.l3.catalog as cat
 
     assert framing.orientation_rotate({"frame_orientation": "rotate_cw90"}) == 90
     assert framing.orientation_rotate({"frame_orientation": "rotate_ccw90"}) == 270
@@ -168,14 +167,14 @@ def test_orientation_mapping_and_annotate() -> None:
         "speaking": [{"start_ms": 0, "end_ms": 2000, "subject": "p1",
                       "region": {"x": 0.55, "y": 0.1, "w": 0.4, "h": 0.8}}],
     }
-    orig = cat.load_perceptions
-    cat.load_perceptions = lambda fids: {"f1": perc}
+    orig = framing._load_perceptions
+    framing._load_perceptions = lambda fids: {"f1": perc}
     try:
         doc = {"format": {"aspect": "portrait"},
                "timeline": [{"seg_id": "s1", "file_id": "f1", "in_ms": 0, "out_ms": 2000}]}
         framing.annotate_document(doc)
     finally:
-        cat.load_perceptions = orig
+        framing._load_perceptions = orig
     tr = doc["timeline"][0]["transform"]
     assert tr["rotate"] == 90 and abs(tr["focus"]["cx"] - 0.75) < 1e-6, tr
     print("  OK  orientation->rotate; annotate bakes focus+rotate onto segments")
@@ -252,10 +251,9 @@ def test_motion_builds_zoompan_and_cover_base() -> None:
 def test_motion_annotate_idempotent() -> None:
     """annotate bakes motion under the chosen style and clears it when back to static."""
     from app.services.l3 import framing
-    import app.services.l3.catalog as cat
 
-    orig = cat.load_perceptions
-    cat.load_perceptions = lambda fids: {}
+    orig = framing._load_perceptions
+    framing._load_perceptions = lambda fids: {}
     try:
         doc = {"format": {"aspect": "portrait", "motion_style": "push_in", "motion_feel": "glide"},
                "timeline": [{"seg_id": "s1", "file_id": "f1", "in_ms": 0, "out_ms": 3000}]}
@@ -266,7 +264,7 @@ def test_motion_annotate_idempotent() -> None:
         framing.annotate_document(doc)
         assert "motion" not in (doc["timeline"][0].get("transform") or {}), doc
     finally:
-        cat.load_perceptions = orig
+        framing._load_perceptions = orig
     print("  OK  annotate bakes motion; clears it when style returns to static")
 
 

@@ -586,19 +586,16 @@ export interface EditVersionListItem {
   created_at: string;
 }
 
-export type EditMode = "agent" | "auto";
-
 export function createEditThread(
   fileIds: string[],
   brief: string,
-  token: string,
-  mode: EditMode = "agent"
+  token: string
 ) {
-  return request<{ thread_id: string; status: EditThreadStatus; mode: EditMode }>(
+  return request<{ thread_id: string; status: EditThreadStatus; mode: string }>(
     "/api/edit/threads",
     {
       method: "POST",
-      body: JSON.stringify({ file_ids: fileIds, brief, mode }),
+      body: JSON.stringify({ file_ids: fileIds, brief }),
       token,
     }
   );
@@ -610,17 +607,6 @@ export function listEditThreads(token: string) {
 
 export function getEditThread(id: string, token: string) {
   return request<EditThread>(`/api/edit/threads/${id}`, { token });
-}
-
-export function sendEditMessage(
-  id: string,
-  payload: { text?: string; answers?: Record<string, string> },
-  token: string
-) {
-  return request<{ ok: boolean; status: EditThreadStatus }>(
-    `/api/edit/threads/${id}/message`,
-    { method: "POST", body: JSON.stringify(payload), token }
-  );
 }
 
 export function listEditVersions(id: string, token: string) {

@@ -1,9 +1,9 @@
 """
 Provider-agnostic LLM adapter.
 
-Every L3 model call (chat editor, agentic director, cut-only agent, JSON
-helpers) routes through this package so switching Claude <-> Gemini is a
-config change (`llm_provider`) rather than a rewrite.
+Every model call (the auto-editor's director/editor passes, the
+recommendations filtration, JSON helpers) routes through this package so
+switching providers is a config change (`llm_provider`) rather than a rewrite.
 
 Public surface:
   get_llm()            -> an LLMClient for the configured provider

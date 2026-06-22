@@ -1,11 +1,10 @@
-"""L3: the edit orchestrator.
+"""L3: the auto-editor.
 
-Two brains over the cached analysis layers:
-  * Claude Opus (creative): reads the L1+L2 text analysis, decides what
-    material to use, in what order, with what intent -- and asks the user
-    when genuinely blocked.
-  * A deterministic cut-engine (mechanical): snaps every proposed cut to the
-    L1 cost grids, fits the total duration, and scores/validates assemblies.
+A prompt-driven, OpenAI-backed pipeline over the cached L1+L2 analysis layers:
+  * builds a hero-cuts feed (the usable moments) at a guessed energy,
+  * selects + orders the cuts into a story (Director -> Editor),
+  * optionally lays light coverage,
+then resolves the result into a layer set.
 
 The deliverable is a versioned Edit Document, not a render.
 """

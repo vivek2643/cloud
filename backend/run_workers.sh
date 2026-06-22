@@ -66,10 +66,10 @@ echo "  l2-worker -> queue=l2 concurrency=$L2_CONCURRENCY"
 CUDA_VISIBLE_DEVICES="" WORKER_QUEUES="l2" WORKER_CONCURRENCY="$L2_CONCURRENCY" python worker.py &
 pids+=($!)
 
-# --- CPU workers: L3 edit orchestrator (network-bound Claude calls) -------
+# --- CPU workers: L3 auto-editor (network-bound OpenAI calls) -------------
 # Renders were removed, so the old "cpu" render queue is dead; these processes
-# now serve the L3 editor's "l3" queue (kept "cpu" too for forward-compat).
-# Running L3 here keeps minutes-long Opus loops off the GPU ingest workers.
+# now serve the L3 auto-editor's "l3" queue (kept "cpu" too for forward-compat).
+# Running L3 here keeps the network-bound editor calls off the GPU ingest workers.
 for ((j = 0; j < CPU_WORKERS; j++)); do
   echo "  cpu-worker $j -> queue=cpu,l3"
   CUDA_VISIBLE_DEVICES="" WORKER_QUEUES="cpu,l3" python worker.py &
