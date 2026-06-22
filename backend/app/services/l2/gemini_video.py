@@ -28,10 +28,10 @@ logger = logging.getLogger(__name__)
 def _schema_prompt_suffix(response_schema: Type[BaseModel]) -> str:
     """Render the response model's JSON Schema as a prompt instruction.
 
-    Used when we drive output WITHOUT constrained decoding (`response_schema`),
-    because the full ClipPerception is too complex for Gemini's structured-output
-    state machine. The model emits free JSON guided by this schema and we
-    re-validate it client-side.
+    The full ClipPerception is too complex for Gemini's structured-output state
+    machine (constrained decoding 400s with "schema produces too many states"),
+    so we carry the schema in the prompt instead: the model emits free JSON
+    guided by this and we re-validate it client-side.
     """
     schema = response_schema.model_json_schema()
     return (
@@ -90,15 +90,14 @@ def analyze_video(
     system_instruction: str,
     prompt: str,
     response_schema: Type[BaseModel],
-    constrained: bool = False,
 ) -> VideoAnalysisResult:
     """Upload `video_path`, run one structured-JSON perception call, clean up.
 
-    `constrained=True` uses Gemini's `response_schema` (constrained decoding);
-    only safe for small schemas. For complex schemas (our full ClipPerception)
-    leave it False: we ask for JSON via the prompt (carrying the schema) and
-    re-validate the result with the pydantic model on our side. This avoids the
-    "schema produces too many states" 400 while keeping a single video call.
+    We never use Gemini's constrained decoding here: the full ClipPerception is
+    too complex for its structured-output state machine, so we ask for JSON via
+    the prompt (carrying the schema) and re-validate with the pydantic model on
+    our side. This avoids the "schema produces too many states" 400 while
+    keeping a single video call.
 
     Returns the parsed pydantic instance (best effort) plus the raw text and
     token usage. Raises on hard SDK/transport failures so procrastinate retries.
@@ -141,14 +140,12 @@ def analyze_video(
             "max_output_tokens": settings.l2_max_output_tokens,
             "temperature": 0.2,
         }
-        if constrained:
-            config_kwargs["response_schema"] = response_schema
         media_res = _media_resolution(types, settings.l2_media_resolution)
         if media_res is not None:
             config_kwargs["media_resolution"] = media_res
 
-        # Without constrained decoding the model needs the schema in-prompt.
-        text_prompt = prompt if constrained else prompt + _schema_prompt_suffix(response_schema)
+        # The model needs the schema carried in-prompt (no constrained decoding).
+        text_prompt = prompt + _schema_prompt_suffix(response_schema)
 
         logger.info("L2: requesting perception from %s", model)
         resp = client.models.generate_content(

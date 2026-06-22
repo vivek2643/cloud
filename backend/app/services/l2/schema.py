@@ -561,7 +561,6 @@ class ClipPerception(BaseModel):
     logline: Optional[str] = Field(None, description="one sentence: what this clip is and what happens in it")
     synopsis: Optional[str] = Field(None, description="a short chronological paragraph describing the take start to finish")
     topics: List[str] = Field(default_factory=list)
-    keywords: List[str] = Field(default_factory=list)
 
     look: Optional[Look] = None
     setting: Optional[Setting] = None

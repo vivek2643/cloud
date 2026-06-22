@@ -164,25 +164,3 @@ def build_user_prompt(
         lines.append("This clip has no usable speech transcript (silent or non-speech audio).")
 
     return "\n".join(lines)
-
-
-def build_cutaways_prompt(
-    *,
-    duration_seconds: float,
-    editorial_context: Optional[dict] = None,
-) -> str:
-    """Second-pass prompt: sparse overlay cutaways only."""
-    lines = [
-        f"Analyze the attached clip (~{duration_seconds:.1f}s) and return ONLY "
-        "the `cutaways` array.",
-        "Populate cutaways with overlay moments an editor would cut the picture to.",
-        "Prefer fewer, stronger cutaways -- not every micro-expression or static frame.",
-        "Do NOT include the speaker's own delivery face while they talk.",
-    ]
-    ctx = editorial_context or {}
-    if ctx.get("sentence_count") is not None:
-        lines.append(
-            f"Speech sentences already tagged: {int(ctx['sentence_count'])} -- "
-            "aim for roughly one cutaway per strong editorial beat, not per second."
-        )
-    return "\n".join(lines)
