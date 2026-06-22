@@ -22,17 +22,11 @@ protobuf==5.29.3
 torch==2.6.0
 torchvision==0.21.0
 librosa==0.10.2.post1
-# Neural speaker-embedding (GE2E d-vector) for diarization; ships its own
-# weights, CPU-only, runs on the torch above. Separates same-gender speakers
-# the classical MFCC backend cannot. webrtcvad is its VAD dependency.
-resemblyzer==0.1.4
-webrtcvad==2.0.10
-# Real diarization (DIARIZATION_BACKEND=pyannote, the default): VAD + neural
-# segmentation + overlap-aware resegmentation. Runs on the GPU worker. Uses the
-# gated models pyannote/speaker-diarization-3.1, pyannote/segmentation-3.0 and a
-# wespeaker embedding, so the GPU box needs HF_TOKEN + a one-time license
-# acceptance. torchaudio matches the torch pin (already in the CUDA base image).
-# Missing token / CPU-only dev -> code falls back to the resemblyzer backend.
+# Speaker diarization: VAD + neural segmentation + overlap-aware resegmentation.
+# Runs on the GPU worker. Uses the gated models pyannote/speaker-diarization-3.1,
+# pyannote/segmentation-3.0 and a wespeaker embedding, so the GPU box needs
+# HF_TOKEN + a one-time license acceptance. torchaudio matches the torch pin
+# (already in the CUDA base image). If unavailable, speakers are left unset.
 pyannote.audio==3.3.2
 torchaudio==2.6.0
 opencv-python-headless==4.11.0.86

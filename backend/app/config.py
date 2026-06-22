@@ -29,19 +29,14 @@ class Settings(BaseSettings):
     max_l1_duration_seconds: int = 3600
 
     # L1 Stage 6: speaker diarization (who-says-what). Labels each word with a
-    # per-file speaker id ("S0", "S1", ...). Backends, strongest first:
-    #   "pyannote" (default) -- pyannote.audio 3.1 (VAD + neural segmentation +
-    #       overlap-aware resegmentation). GPU when present; needs HF_TOKEN and a
-    #       one-time license acceptance for the gated models. Falls back to the
-    #       embedding path below if unavailable (no token / not installed).
-    #   "neural" -- Resemblyzer GE2E d-vectors + agglomerative clustering
-    #       (ships its weights, CPU-only, no token). The fallback authority.
-    #   "mfcc"   -- classical MFCC+pitch, fully dependency-free.
+    # per-file speaker id ("S0", "S1", ...) via pyannote.audio 3.1 (VAD + neural
+    # segmentation + overlap-aware resegmentation), on GPU when present. Needs
+    # HF_TOKEN and a one-time license acceptance for the gated models. Soft
+    # signal: if pyannote is unavailable, speakers are simply left unset.
     enable_diarization: bool = True
-    diarization_backend: str = "pyannote"
     diarization_max_speakers: int = 8
-    # Hugging Face access token (env HF_TOKEN). Required only for the pyannote
-    # backend's gated models; empty on CPU/local dev triggers the neural fallback.
+    # Hugging Face access token (env HF_TOKEN). Required for the pyannote
+    # diarization models; empty on CPU/local dev leaves speakers unset.
     huggingface_token: str = Field(
         default="",
         validation_alias=AliasChoices("HF_TOKEN", "HUGGINGFACE_TOKEN", "huggingface_token"),

@@ -144,7 +144,6 @@ def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
             select integrated_lufs, true_peak_db,
                    is_musical, bpm,
                    onsets_ms, silence_intervals,
-                   acoustic_tags, event_segments,
                    dialogue_cut_cost, dialogue_cut_hop_ms, dialogue_cut_points,
                    beat_cut_cost, beat_cut_hop_ms, beat_cut_points
               from audio_features where file_id = %s
@@ -163,8 +162,6 @@ def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
                 "onset_count": len(af["onsets_ms"] or []),
                 "silence_interval_count": len(af["silence_intervals"] or []),
                 "silence_intervals": af["silence_intervals"],
-                "acoustic_tags": af["acoustic_tags"],
-                "event_segments": af["event_segments"],
                 # Dialogue cut-cost grid (0=ideal seam .. 1=forbidden). The full
                 # curve is included for visualization; "safe to cut" = 1 - cost.
                 "dialogue_cut_hop_ms": af["dialogue_cut_hop_ms"],
