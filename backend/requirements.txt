@@ -38,7 +38,7 @@ numpy<2.0
 
 # --- LLM backbones ---
 # Default backbone (LLM_PROVIDER=openai, plus per-feature calls e.g. the
-# auto-editor and recommendations).
+# auto-editor).
 openai==2.43.0
 # Alternate backbone (LLM_PROVIDER=gemini) + the L2 perception pass. Only
 # imported when selected.

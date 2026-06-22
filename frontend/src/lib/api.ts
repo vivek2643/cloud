@@ -183,20 +183,12 @@ export interface HeroCut {
   affordances: string[];
   take_count: number;
   alt_takes: HeroTake[];
-  // LLM filtration: is this cut in the curated "Recommended" pool? (energy-aware
-  // via the "contains a kept sentence" rule). recommend_reason explains a drop.
-  recommended?: boolean;
-  recommend_reason?: string | null;
 }
 
 export interface HeroCutsResponse {
   heroes: HeroCut[];
   energy: number;
   ready: boolean;
-  recommended_count?: number;
-  // False while the LLM filtration is still computing in the background (the
-  // feed shows everything until it lands); the UI polls until this is true.
-  recommendations_ready?: boolean;
 }
 
 export function getHeroCuts(fileId: string, energy: number, token: string) {

@@ -1,9 +1,9 @@
 """
 Provider-agnostic LLM adapter.
 
-Every model call (the auto-editor's director/editor passes, the
-recommendations filtration, JSON helpers) routes through this package so
-switching providers is a config change (`llm_provider`) rather than a rewrite.
+Every model call (the auto-editor's director/editor passes, JSON helpers)
+routes through this package so switching providers is a config change
+(`llm_provider`) rather than a rewrite.
 
 Public surface:
   get_llm()            -> an LLMClient for the configured provider

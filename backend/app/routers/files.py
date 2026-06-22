@@ -194,13 +194,9 @@ def get_hero_cuts(
         raise HTTPException(status_code=404, detail="File not found")
 
     from app.services.l3.hero_store import get_hero_feed
-    from app.services.l3.recommend import get_recommendations
 
-    verdict, recs_ready = get_recommendations([file_id])
-    heroes = get_hero_feed([file_id], energy=energy, recommendation_verdict=verdict)
-    rec = sum(1 for h in heroes if h.get("recommended"))
-    return {"heroes": heroes, "energy": energy, "ready": bool(heroes),
-            "recommended_count": rec, "recommendations_ready": recs_ready}
+    heroes = get_hero_feed([file_id], energy=energy)
+    return {"heroes": heroes, "energy": energy, "ready": bool(heroes)}
 
 
 @router.post("/hero-cuts")
@@ -224,13 +220,9 @@ def get_hero_cuts_feed(
         raise HTTPException(status_code=404, detail="No matching files")
 
     from app.services.l3.hero_store import get_hero_feed
-    from app.services.l3.recommend import get_recommendations
 
-    verdict, recs_ready = get_recommendations(owned_ids)
-    heroes = get_hero_feed(owned_ids, energy=payload.energy, recommendation_verdict=verdict)
-    rec = sum(1 for h in heroes if h.get("recommended"))
-    return {"heroes": heroes, "energy": payload.energy, "ready": bool(heroes),
-            "recommended_count": rec, "recommendations_ready": recs_ready}
+    heroes = get_hero_feed(owned_ids, energy=payload.energy)
+    return {"heroes": heroes, "energy": payload.energy, "ready": bool(heroes)}
 
 
 @router.get("/{file_id}/l1")

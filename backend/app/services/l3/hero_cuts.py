@@ -45,7 +45,6 @@ from difflib import SequenceMatcher
 from app.config import get_settings
 from app.services.l1 import fused_seams as fseams
 from app.services.l3 import anchors as anc
-from app.services.l3 import recommend
 from app.services.l3 import score_span as ss
 from app.services.l3 import territory as terr
 from app.services.l3.energy import EnergyParams, energy_to_params
@@ -154,11 +153,6 @@ class HeroCut:
     affordances: List[str] = field(default_factory=list)  # all editorial uses (filter keys)
     take_count: int = 1           # how many comparable takes exist (incl. this)
     alt_takes: List[HeroTake] = field(default_factory=list)  # the losers, best-first
-    # Source dialogue sentence ids this cut spans (speech/moment cuts only).
-    # Internal: drives the LLM-filtration "contains a keeper" recommendation rule.
-    member_seg_ids: List[str] = field(default_factory=list)
-    recommended: bool = True            # in the curated "Recommended" pool?
-    recommend_reason: Optional[str] = None  # why dropped (when not recommended)
     # Internal jump-cut edit-list: the spoken runs to KEEP after progressive
     # breath removal (Sharp band). None = play the span contiguously. Each pair
     # is (in_ms, out_ms) inside [src_in_ms, src_out_ms]; the gaps between them
@@ -189,17 +183,12 @@ class HeroCut:
             "affordances": self.affordances or [self.modality],
             "take_count": self.take_count,
             "alt_takes": [t.to_dict() for t in self.alt_takes],
-            "recommended": self.recommended,
-            "recommend_reason": self.recommend_reason,
         }
 
     def to_cache(self) -> Dict[str, Any]:
-        """Serialize for the per-file precompute cache. Same as the public dict
-        plus the internal ``member_seg_ids`` (the on-read recommendation tagging
-        needs them). Cached cuts are PRE-stacking, so alt_takes is empty."""
-        d = self.to_dict()
-        d["member_seg_ids"] = self.member_seg_ids
-        return d
+        """Serialize for the per-file precompute cache. Cached cuts are
+        PRE-stacking, so alt_takes is empty."""
+        return self.to_dict()
 
     @classmethod
     def from_cache(cls, d: Dict[str, Any]) -> "HeroCut":
@@ -213,9 +202,6 @@ class HeroCut:
             affordances=list(d.get("affordances") or []),
             take_count=int(d.get("take_count", 1)),
             alt_takes=[HeroTake.from_dict(t) for t in (d.get("alt_takes") or [])],
-            member_seg_ids=list(d.get("member_seg_ids") or []),
-            recommended=bool(d.get("recommended", True)),
-            recommend_reason=d.get("recommend_reason"),
             keep_spans=keep,
         )
 
@@ -578,16 +564,6 @@ def _usable_seg(seg: dict) -> bool:
     return True
 
 
-def _child_ids(seg: dict) -> List[str]:
-    """The L1 sentence ids under a segment: a topic's children, else the seg
-    itself (a sentence has no children)."""
-    kids = seg.get("child_seg_ids") or []
-    if kids:
-        return [k for k in kids if k]
-    sid = seg.get("seg_id")
-    return [sid] if sid else []
-
-
 def _unit_from_seg(clip: _ClipInputs, seg: dict) -> dict:
     """One L1 segment (sentence or topic) -> a speech unit."""
     return {
@@ -598,7 +574,6 @@ def _unit_from_seg(clip: _ClipInputs, seg: dict) -> dict:
         "text": (seg.get("text") or "").strip(),
         "speaker": seg.get("speaker"),
         "flags": [f for f in (seg.get("flags") or []) if f in ("noisy", "overlap")],
-        "member_seg_ids": [recommend.member_key(clip.file_id, i) for i in _child_ids(seg)],
     }
 
 
@@ -622,9 +597,6 @@ def _merge_topics(topics: List[dict], gap_ms: int) -> List[List[dict]]:
 def _block_unit(clip: _ClipInputs, group: List[dict]) -> dict:
     """A merged run of topics -> one speech unit (block)."""
     text = " ".join((g.get("text") or "").strip() for g in group).strip()
-    child: List[str] = []
-    for g in group:
-        child += _child_ids(g)
     return {
         "in": min(int(g.get("src_in_ms", 0)) for g in group),
         "out": max(int(g.get("src_out_ms", 0)) for g in group),
@@ -634,7 +606,6 @@ def _block_unit(clip: _ClipInputs, group: List[dict]) -> dict:
         "speaker": group[0].get("speaker"),
         "flags": list(dict.fromkeys(
             f for g in group for f in (g.get("flags") or []) if f in ("noisy", "overlap"))),
-        "member_seg_ids": [recommend.member_key(clip.file_id, i) for i in child],
     }
 
 
@@ -687,7 +658,6 @@ def _make_speech_hero(
     clip: _ClipInputs, source: Optional[ss.SpanSource], quality_events: List[dict],
     uid: str, in_ms: int, out_ms: int, raw_in: int, raw_out: int,
     text: str, speaker: Optional[str], extra_flags: List[str],
-    member_seg_ids: Optional[List[str]] = None,
     keep_spans: Optional[List[Tuple[int, int]]] = None,
 ) -> Optional[HeroCut]:
     if out_ms <= in_ms:
@@ -710,7 +680,6 @@ def _make_speech_hero(
         speaker=speaker,
         flags=extra_flags,
         affordances=[anc.AFF_SPEECH],
-        member_seg_ids=list(member_seg_ids or []),
         keep_spans=keep_spans,
     )
 
@@ -769,7 +738,6 @@ def _speech_candidates(
 
         h = _make_speech_hero(clip, source, quality_events, f"sp{ci}",
                               in_ms, out_ms, raw_in, raw_out, text, speaker, flags,
-                              member_seg_ids=u["member_seg_ids"],
                               keep_spans=keep_spans)
         if h:
             out.append(h)
@@ -812,7 +780,6 @@ def _combined_candidates(
             score=max(s.score, a.score),
             speaker=s.speaker,
             affordances=[anc.AFF_SPEECH, anc.AFF_ACTION],
-            member_seg_ids=list(s.member_seg_ids),
         ))
     return out
 
@@ -1290,7 +1257,6 @@ def _consolidate_speech(heroes: List[HeroCut]) -> List[HeroCut]:
 def build_hero_cuts(
     file_ids: List[str], energy: float = 0.5,
     affordances: Optional[List[str]] = None,
-    recommendation_verdict: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """The ranked, universal segment feed for a set of clips.
 
@@ -1314,7 +1280,7 @@ def build_hero_cuts(
     for fid, clip in inputs.items():
         heroes.extend(_file_heroes(clip, sources.get(fid), params))
 
-    return _assemble(heroes, file_ids, recommendation_verdict, affordances)
+    return _assemble(heroes, file_ids, affordances)
 
 
 def _file_heroes(
@@ -1339,14 +1305,12 @@ def _file_heroes(
 
 def _assemble(
     heroes: List[HeroCut], file_ids: List[str],
-    recommendation_verdict: Optional[Dict[str, Dict[str, Any]]] = None,
     affordances: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Cross-file finishing pass over per-file heroes: stack repeated takes,
-    tag recommendations, optional affordance filter, rank best-first. Cheap
-    relative to ``_file_heroes`` -- this is the only work done on a cache hit."""
+    optional affordance filter, rank best-first. Cheap relative to
+    ``_file_heroes`` -- this is the only work done on a cache hit."""
     heroes = _stack_takes(heroes, file_ids)
-    _apply_recommendations(heroes, file_ids, recommendation_verdict)
     if affordances:
         want = set(affordances)
         heroes = [h for h in heroes if want & set(h.affordances or [h.modality])]
@@ -1356,8 +1320,7 @@ def _assemble(
 
 def compute_file_cache(file_id: str, energy: float) -> List[Dict[str, Any]]:
     """The per-file, pre-stacking hero cuts at one energy, serialized for the
-    precompute cache (includes internal member_seg_ids). Empty if the file has
-    no usable artifacts yet."""
+    precompute cache. Empty if the file has no usable artifacts yet."""
     inputs = _load_inputs([file_id])
     clip = inputs.get(file_id)
     if clip is None:
@@ -1369,7 +1332,6 @@ def compute_file_cache(file_id: str, energy: float) -> List[Dict[str, Any]]:
 
 def assemble_cached(
     cached_by_file: Dict[str, List[Dict[str, Any]]], file_ids: List[str],
-    recommendation_verdict: Optional[Dict[str, Dict[str, Any]]] = None,
     affordances: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Rehydrate per-file cached cuts and run the cross-file finishing pass --
@@ -1378,37 +1340,4 @@ def assemble_cached(
     for fid in file_ids:
         for d in cached_by_file.get(fid, []) or []:
             heroes.append(HeroCut.from_cache(d))
-    return _assemble(heroes, file_ids, recommendation_verdict, affordances)
-
-
-def _apply_recommendations(
-    heroes: List[HeroCut], file_ids: List[str],
-    verdict: Optional[Dict[str, Dict[str, Any]]] = None,
-) -> None:
-    """Tag each cut `recommended` from the energy-independent LLM sentence
-    verdict, using the "contains a keeper" rule: a speech/moment cut is
-    recommended if it spans at least one kept sentence (an unseen sentence
-    defaults to kept). Non-speech cuts are recommended by default (they're
-    already sparse-curated by L2 + the energy salience floors).
-
-    The verdict can be passed in (the API fetches it once, with a readiness
-    flag); otherwise it's fetched here (non-blocking). Fail-open: an empty
-    verdict leaves everything recommended, so the pool is never hidden.
-    """
-    if verdict is None:
-        verdict = recommend.get_recommendation_map(file_ids)
-    if not verdict:
-        return
-
-    for h in heroes:
-        if not h.member_seg_ids:
-            continue  # non-speech cut -> stays recommended by default
-        kept = any(verdict.get(sid, {}).get("keep", True) for sid in h.member_seg_ids)
-        h.recommended = kept
-        if not kept:
-            # Surface the first available drop reason for the full-feed view.
-            for sid in h.member_seg_ids:
-                r = verdict.get(sid, {}).get("reason")
-                if r:
-                    h.recommend_reason = r
-                    break
+    return _assemble(heroes, file_ids, affordances)

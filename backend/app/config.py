@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.5-pro"
 
     # OpenAI credentials. Used by feature-level calls that opt in via get_llm(
-    # provider="openai", ...) -- e.g. the recommendations filtration pass.
+    # provider="openai", ...) -- e.g. the L3 auto-editor.
     openai_api_key: str = ""
     # Small/cheap GPT-5-class model is plenty for text classification; override
     # via the OPENAI_MODEL env var.
@@ -81,21 +81,6 @@ class Settings(BaseSettings):
     # Files API upload poll: how long to wait for Gemini to finish ingesting the
     # uploaded video before giving up.
     l2_file_active_timeout_seconds: int = 300
-
-    # --- Recommendations: LLM filtration of the hero-cuts feed ------------
-    # A single, energy-independent text call judges each dialogue sentence
-    # keep/drop; the feed then flags cuts via the "contains a keeper" rule.
-    # Provider/model are overridable so this feature can move independently of
-    # the default LLM backbone.
-    enable_recommendations: bool = True
-    recommend_provider: str = "openai"
-    # Empty -> the provider's default model (e.g. openai_model).
-    recommend_model: str = ""
-    recommend_max_output_tokens: int = 4096
-    # Reasoning depth for the filtration call. Sentence keep/drop is classification,
-    # not deep reasoning, so "low" keeps a GPT-5 model's latency sane (the default
-    # effort can take ~30s+). minimal|low|medium|high.
-    recommend_effort: str = "low"
 
     # --- L3: prompt-driven auto-editor (OpenAI) --------------------------
     # A simple, deterministic 3-call pipeline (Director -> Editor -> Coverage)

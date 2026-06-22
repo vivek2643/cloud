@@ -180,7 +180,6 @@ def defer_precompute(file_id: str) -> None:
 
 def get_hero_feed(
     file_ids: List[str], energy: float = 0.5,
-    recommendation_verdict: Optional[Dict[str, Dict[str, Any]]] = None,
     affordances: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """The ranked hero-cuts feed, served from the per-file precompute cache.
@@ -192,20 +191,13 @@ def get_hero_feed(
     if not file_ids:
         return []
     band = energy_band(energy)
-    # Never block the feed on recommendations: apply them ONLY when a ready
-    # verdict is explicitly passed in. An empty/None verdict means "not settled
-    # yet" -> serve the feed now (everything kept) and let the caller's
-    # background poll fold the picks in once they land. This also keeps the
-    # editor (which passes nothing) off the LLM path entirely.
-    verdict = recommendation_verdict or {}
     try:
         cached_by_file = _cached_or_backfill(file_ids, band)
     except Exception:
         logger.exception("hero feed: cache path failed; live build")
         return hc.build_hero_cuts(file_ids, hc.band_energy(band),
-                                  affordances=affordances,
-                                  recommendation_verdict=verdict)
-    return hc.assemble_cached(cached_by_file, file_ids, verdict, affordances)
+                                  affordances=affordances)
+    return hc.assemble_cached(cached_by_file, file_ids, affordances)
 
 
 def _cached_or_backfill(file_ids: List[str], band: int) -> Dict[str, List[Dict[str, Any]]]:
