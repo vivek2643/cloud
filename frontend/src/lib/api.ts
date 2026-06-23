@@ -55,6 +55,13 @@ export function deleteFolder(id: string, token: string) {
   return request<void>(`/api/folders/${id}`, { method: "DELETE", token });
 }
 
+export function getFolderCovers(folderId: string, token: string, limit = 3) {
+  return request<{ urls: string[] }>(
+    `/api/folders/${folderId}/covers?limit=${limit}`,
+    { token },
+  );
+}
+
 // --- Files ---
 
 export interface FileRecord {

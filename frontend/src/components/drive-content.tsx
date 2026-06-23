@@ -6,7 +6,7 @@ import { useDriveStore } from "@/stores/drive-store";
 import { useAuthStore } from "@/stores/auth-store";
 import { FileIcon } from "./file-icon";
 import { formatBytes, formatDuration } from "@/lib/utils";
-import { getFilePlaybackUrl, deleteFile } from "@/lib/api";
+import { getFilePlaybackUrl, deleteFile, getFolderCovers } from "@/lib/api";
 import {
   MoreHorizontal,
   Loader2,
@@ -95,7 +95,7 @@ export function DriveContent({ onFileContextMenu, onFolderContextMenu }: DriveCo
           {q ? "No matches" : "This folder is empty"}
         </p>
         <p className="mt-1 text-xs" style={{ color: "var(--muted)" }}>
-          {q ? "Try a different search" : "Drag and drop videos here or upload"}
+          {q ? "Try a different search" : "Drag and drop videos here"}
         </p>
       </div>
     );
@@ -199,6 +199,114 @@ function FileMenu({
   );
 }
 
+// --- Project (folder) card: stacked-perspective thumbnail + name below ---
+
+function ClipPanel({
+  src,
+  className,
+  style,
+}: {
+  src?: string;
+  className: string;
+  style: React.CSSProperties;
+}) {
+  // Video frame thumbnail when available, otherwise a neutral grey placeholder
+  // so the stack still reads as three clips.
+  return (
+    <span className={`${className} overflow-hidden`} style={style}>
+      {src ? (
+        <img
+          src={src}
+          alt=""
+          className="h-full w-full object-cover"
+          draggable={false}
+        />
+      ) : null}
+    </span>
+  );
+}
+
+function ProjectCard({
+  folder,
+  onOpen,
+  onContextMenu,
+}: {
+  folder: Folder;
+  onOpen: () => void;
+  onContextMenu: (e: React.MouseEvent) => void;
+}) {
+  const token = useAuthStore((s) => s.session?.access_token);
+  const [covers, setCovers] = useState<string[]>([]);
+
+  useEffect(() => {
+    if (!token) return;
+    let active = true;
+    getFolderCovers(folder.id, token, 3)
+      .then((res) => {
+        if (active) setCovers(res.urls ?? []);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [folder.id, token]);
+
+  // Center clip gets the first frame; the two angled panels behind get the next
+  // two (falling back to grey placeholders).
+  const center = covers[0];
+  const left = covers[1];
+  const right = covers[2];
+
+  return (
+    <button
+      onDoubleClick={onOpen}
+      onContextMenu={onContextMenu}
+      className="group flex flex-col gap-1.5 text-left"
+      title={folder.name}
+    >
+      <div
+        className="relative aspect-[4/3] w-full overflow-hidden rounded-xl border transition-colors group-hover:border-[var(--accent)]"
+        style={{ borderColor: "var(--border)", background: "var(--sidebar)" }}
+      >
+        <div className="absolute inset-0 flex items-center justify-center" style={{ perspective: "520px" }}>
+          <ClipPanel
+            src={left}
+            className="absolute rounded"
+            style={{
+              width: "40%",
+              height: "30%",
+              background: "rgba(255,255,255,0.06)",
+              transform: "translateX(-58%) rotateY(38deg)",
+            }}
+          />
+          <ClipPanel
+            src={right}
+            className="absolute rounded"
+            style={{
+              width: "40%",
+              height: "30%",
+              background: "rgba(255,255,255,0.06)",
+              transform: "translateX(58%) rotateY(-38deg)",
+            }}
+          />
+          <ClipPanel
+            src={center}
+            className="relative z-10 rounded"
+            style={{
+              width: "52%",
+              height: "40%",
+              background: "rgba(255,255,255,0.16)",
+            }}
+          />
+        </div>
+      </div>
+      <span className="truncate px-0.5 text-xs" style={{ color: "var(--foreground)" }}>
+        {folder.name}
+      </span>
+    </button>
+  );
+}
+
 // --- Grid View ---
 
 function GridView({
@@ -233,21 +341,14 @@ function GridView({
     <div className="space-y-7">
       {folders.length > 0 && (
         <section>
-          <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--muted)" }}>
-            Folders
-          </h3>
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+          <div className="grid grid-cols-3 gap-3 sm:grid-cols-4 md:grid-cols-5">
             {folders.map((folder) => (
-              <button
+              <ProjectCard
                 key={folder.id}
-                onDoubleClick={() => onNavigate(folder.id)}
+                folder={folder}
+                onOpen={() => onNavigate(folder.id)}
                 onContextMenu={(e) => { e.preventDefault(); onFolderContextMenu?.(folder, e); }}
-                className="flex items-center gap-2.5 rounded-lg border p-3 text-left transition-colors hover:border-[var(--accent)]"
-                style={{ borderColor: "var(--border)" }}
-              >
-                <FileIcon type="folder" />
-                <span className="truncate text-sm">{folder.name}</span>
-              </button>
+              />
             ))}
           </div>
         </section>
@@ -448,9 +549,9 @@ function VideoCard({
             title={playing ? "Pause" : "Play"}
           >
             {playing ? (
-              <Pause size={22} className="text-white" fill="white" />
+              <Pause size={22} fill="currentColor" style={{ color: "var(--background)" }} />
             ) : (
-              <Play size={22} className="ml-0.5 text-white" fill="white" />
+              <Play size={22} className="ml-0.5" fill="currentColor" style={{ color: "var(--background)" }} />
             )}
           </button>
         )}

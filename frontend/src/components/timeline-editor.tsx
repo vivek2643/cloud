@@ -233,8 +233,8 @@ export function TimelineEditor({
           <button
             onClick={save}
             disabled={!dirty || saving}
-            className="flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-medium text-white transition-opacity disabled:opacity-30"
-            style={{ background: "var(--accent)" }}
+            className="flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-opacity disabled:opacity-30"
+            style={{ background: "var(--accent)", color: "var(--background)" }}
             title="Save as a new version"
           >
             {saving ? <Loader2 size={13} className="animate-spin" /> : <Save size={13} />}

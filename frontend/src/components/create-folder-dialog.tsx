@@ -45,13 +45,13 @@ export function CreateFolderDialog({ open, onClose, onCreate }: Props) {
           <X size={16} />
         </button>
 
-        <h2 className="text-lg font-semibold">New Folder</h2>
+        <h2 className="text-lg font-semibold">New Project</h2>
         <form onSubmit={handleSubmit} className="mt-4 space-y-4">
           <input
             ref={inputRef}
             value={name}
             onChange={(e) => setName(e.target.value)}
-            placeholder="Folder name"
+            placeholder="Project name"
             className="w-full rounded-lg border px-3 py-2 text-sm outline-none focus:ring-2"
             style={{ borderColor: "var(--border)", background: "var(--sidebar)" }}
           />
@@ -67,8 +67,8 @@ export function CreateFolderDialog({ open, onClose, onCreate }: Props) {
             <button
               type="submit"
               disabled={!name.trim()}
-              className="rounded-lg px-4 py-2 text-sm font-medium text-white transition-colors disabled:opacity-50"
-              style={{ background: "var(--accent)" }}
+              className="rounded-lg px-4 py-2 text-sm font-medium transition-colors disabled:opacity-50"
+              style={{ background: "var(--accent)", color: "var(--background)" }}
             >
               Create
             </button>

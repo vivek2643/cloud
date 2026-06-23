@@ -118,7 +118,7 @@ export function DialoguesView() {
               className="rounded-md px-4 py-1.5 text-sm font-medium capitalize transition-colors"
               style={{
                 background: level === lv ? "var(--accent)" : "transparent",
-                color: level === lv ? "#fff" : "var(--accent)",
+                color: level === lv ? "var(--background)" : "var(--accent)",
               }}
             >
               {lv}
@@ -360,9 +360,9 @@ function DialogueClipCard({
           title={playing ? "Pause" : "Play clip"}
         >
           {playing ? (
-            <Pause size={20} className="text-white" fill="white" />
+            <Pause size={20} fill="currentColor" style={{ color: "var(--background)" }} />
           ) : (
-            <Play size={20} className="ml-0.5 text-white" fill="white" />
+            <Play size={20} className="ml-0.5" fill="currentColor" style={{ color: "var(--background)" }} />
           )}
         </button>
 

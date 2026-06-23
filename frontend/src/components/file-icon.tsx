@@ -18,15 +18,6 @@ const TYPE_ICONS = {
   folder: FolderClosed,
 } as const;
 
-const TYPE_COLORS = {
-  video: "#8b5cf6",
-  image: "#ec4899",
-  audio: "#f59e0b",
-  document: "#f97316",
-  other: "#6b7280",
-  folder: "#f97316",
-};
-
 export function FileIcon({
   type,
   size = 20,
@@ -35,6 +26,5 @@ export function FileIcon({
   size?: number;
 }) {
   const Icon = TYPE_ICONS[type];
-  const color = TYPE_COLORS[type];
-  return <Icon size={size} style={{ color }} />;
+  return <Icon size={size} style={{ color: "var(--foreground)" }} />;
 }

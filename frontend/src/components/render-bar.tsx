@@ -114,8 +114,8 @@ export function RenderBar({
         <button
           onClick={start}
           disabled={busy || disabled}
-          className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium text-white transition-opacity disabled:opacity-40"
-          style={{ background: "var(--accent)" }}
+          className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-opacity disabled:opacity-40"
+          style={{ background: "var(--accent)", color: "var(--background)" }}
           title={disabled ? "No timeline to render yet" : "Render this edit to a file"}
         >
           {busy ? <Loader2 size={13} className="animate-spin" /> : <Clapperboard size={13} />}

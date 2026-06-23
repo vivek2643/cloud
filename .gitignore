@@ -39,3 +39,6 @@ backend/logs/
 *.log
 coverage/
 .vercel
+
+# Source assets (pitch deck, design sources — app uses frontend/public/)
+Assets/

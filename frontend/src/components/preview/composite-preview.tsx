@@ -350,8 +350,8 @@ export function CompositePreview({ token }: { token: string | undefined }) {
             </button>
             <button
               onClick={togglePlay}
-              className="rounded-full p-1.5 text-white"
-              style={{ background: "var(--accent)" }}
+              className="rounded-full p-1.5"
+              style={{ background: "var(--accent)", color: "var(--background)" }}
               title={playing ? "Pause" : "Play"}
             >
               {playing ? <Pause size={15} /> : <Play size={15} />}

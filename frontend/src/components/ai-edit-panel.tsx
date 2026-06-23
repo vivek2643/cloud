@@ -339,8 +339,8 @@ export function AiEditPanel() {
           <button
             onClick={handleSend}
             disabled={!input.trim() || busy}
-            className="rounded-lg p-1.5 text-white transition-opacity disabled:opacity-30"
-            style={{ background: "var(--accent)" }}
+            className="rounded-lg p-1.5 transition-opacity disabled:opacity-30"
+            style={{ background: "var(--accent)", color: "var(--background)" }}
             title="Send"
           >
             <Send size={15} />
@@ -390,7 +390,7 @@ function Bubble({ role, children }: { role: "user" | "assistant"; children: Reac
         className="max-w-[85%] whitespace-pre-wrap rounded-2xl px-3 py-2 text-sm"
         style={
           isUser
-            ? { background: "var(--accent)", color: "#fff" }
+            ? { background: "var(--accent)", color: "var(--background)" }
             : { background: "var(--background)", border: "1px solid var(--border)" }
         }
       >

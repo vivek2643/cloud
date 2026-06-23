@@ -1,78 +1,37 @@
 "use client";
 
-import { useState } from "react";
 import { DriveContent } from "@/components/drive-content";
-import { DialoguesView } from "@/components/dialogues-view";
 import { HeroCutsView } from "@/components/hero-cuts-view";
-import { Layers, Crosshair, Star, MessageSquare } from "lucide-react";
+import { useDriveStore } from "@/stores/drive-store";
 
-type Tab = "versioned" | "hero" | "dialogues" | "crux";
-
-const TABS: { id: Tab; label: string; icon: typeof Layers }[] = [
-  { id: "versioned", label: "Versioned", icon: Layers },
-  { id: "hero", label: "Hero Cuts", icon: Star },
-  { id: "dialogues", label: "Dialogues", icon: MessageSquare },
-  { id: "crux", label: "Crux", icon: Crosshair },
-];
+const STAGE_LABELS: Record<string, string> = {
+  color: "Colour grading",
+  captions: "Captions",
+};
 
 /**
- * The per-project lens switcher. A folder is one project, so the lenses
- * (Versioned / Dialogues / Crux / Highlights) operate on the files inside the
- * current folder. The drive root deliberately has no lenses.
+ * Renders the active project stage selected in the left sidebar. "Media" lists
+ * every video in the project; "Cuts" surfaces the Hero Cuts (speech / action /
+ * etc. with the energy bar). Remaining stages are placeholders for now.
  */
 export function ProjectLenses() {
-  const [activeTab, setActiveTab] = useState<Tab>("versioned");
+  const projectStage = useDriveStore((s) => s.projectStage);
 
-  return (
-    <div>
-      <div className="mb-6 flex flex-wrap items-center gap-1.5 border-b pb-3" style={{ borderColor: "var(--border)" }}>
-        {TABS.map((t) => {
-          const active = t.id === activeTab;
-          const Icon = t.icon;
-          return (
-            <button
-              key={t.id}
-              onClick={() => setActiveTab(t.id)}
-              className="flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-sm font-medium transition-colors"
-              style={{
-                background: active ? "var(--accent)" : "transparent",
-                color: active ? "#fff" : "var(--muted)",
-                border: active ? "1px solid var(--accent)" : "1px solid var(--border)",
-              }}
-            >
-              <Icon size={15} />
-              {t.label}
-            </button>
-          );
-        })}
-      </div>
-
-      {activeTab === "versioned" ? (
-        <DriveContent />
-      ) : activeTab === "hero" ? (
-        <HeroCutsView />
-      ) : activeTab === "dialogues" ? (
-        <DialoguesView />
-      ) : (
-        <ComingSoon tab={activeTab} />
-      )}
-    </div>
-  );
+  if (projectStage === "media") return <DriveContent />;
+  if (projectStage === "cuts") return <HeroCutsView />;
+  return <ComingSoon label={STAGE_LABELS[projectStage] ?? "Coming soon"} />;
 }
 
-function ComingSoon({ tab }: { tab: Tab }) {
-  const copy = { icon: <Crosshair size={36} style={{ color: "var(--accent)" }} />, title: "Crux", body: "The key moments in this project's footage will surface here." };
-  void tab;
+function ComingSoon({ label }: { label: string }) {
   return (
     <div className="flex flex-col items-center justify-center py-24 text-center">
-      {copy.icon}
-      <p className="mt-4 text-lg font-semibold">{copy.title}</p>
+      <p className="text-lg font-semibold">{label}</p>
       <p className="mt-1 max-w-sm text-sm" style={{ color: "var(--muted)" }}>
-        {copy.body}
+        This stage will be available here soon.
       </p>
       <span
         className="mt-4 rounded-full px-3 py-1 text-xs font-medium"
-        style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
+        style={{ background: "var(--accent-soft)", color: "var(--foreground)" }}
       >
         Coming soon
       </span>

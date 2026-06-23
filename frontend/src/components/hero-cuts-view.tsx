@@ -11,7 +11,8 @@ import {
   type HeroModality,
   type FileRecord,
 } from "@/lib/api";
-import { Star, Play, Volume2, VolumeX, Layers, Zap, Scissors } from "lucide-react";
+import { Star, Play, Volume2, VolumeX, Layers, Scissors, ChevronDown, Check } from "lucide-react";
+import { EditButton } from "./search-edit-bar";
 
 const MODALITY_STYLE: Record<HeroModality, { color: string; label: string }> = {
   speech: { color: "#6366f1", label: "speech" },
@@ -30,11 +31,8 @@ type FilterKey = HeroModality | "all";
 const FILTERS: { key: FilterKey; label: string }[] = [
   { key: "all", label: "All" },
   { key: "speech", label: "Speech" },
-  { key: "action", label: "Action" },
-  { key: "moment", label: "Moments" },
   { key: "reaction", label: "Reactions" },
   { key: "broll", label: "B-roll" },
-  { key: "insert", label: "Inserts" },
 ];
 
 function fmtDur(ms: number): string {
@@ -130,66 +128,44 @@ export function HeroCutsView() {
 
   return (
     <div>
-      <div className="mb-5 flex flex-wrap items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
-          <Zap size={16} style={{ color: "var(--accent)" }} />
-          <span className="text-sm font-medium" style={{ color: "var(--muted)" }}>
-            Energy
-          </span>
-          <input
-            type="range"
-            min={0}
-            max={1}
-            step={0.1}
-            value={energy}
-            onChange={(e) => setEnergy(parseFloat(e.target.value))}
-            className="w-44 cursor-pointer accent-[var(--accent)]"
-            title={"Broad/calm cuts \u2192 sharp/punchy cuts"}
-          />
-          <span
-            className="min-w-16 rounded-md px-2 py-0.5 text-xs font-semibold"
-            style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
-          >
-            {energyLabel(energy)}
-          </span>
-        </div>
-        <div className="flex items-center gap-3">
-          {present.length > 0 && (
-            <span className="text-sm" style={{ color: "var(--muted)" }}>
-              {totalClips} of {present.length} cut{present.length === 1 ? "" : "s"}
-            </span>
-          )}
-        </div>
+      {/* Takes / framing / format dropdowns */}
+      <div className="mb-6 flex flex-wrap items-center gap-2.5">
+        <PillDropdown options={["Best Takes", "All takes"]} />
+        <PillDropdown options={["Landscape", "Portrait"]} />
+        <PillDropdown options={["Frame Adjusted", "Original"]} />
       </div>
 
-      {present.length > 0 && (
-        <div className="mb-5 flex flex-wrap gap-2">
-          {FILTERS.filter((f) =>
-            f.key === "all" ? true : (counts[f.key] ?? 0) > 0
-          ).map((f) => {
+      {/* Energy bar — narrower, centered, thin track with a draggable scroller. */}
+      <div className="mb-7">
+        <EnergyBar value={energy} onChange={setEnergy} />
+      </div>
+
+      {/* Filters grouped close on the left, highlighted Edit pinned right. */}
+      <div className="mb-6 flex items-center justify-between gap-6">
+        <div className="flex items-center gap-2">
+          {FILTERS.map((f) => {
             const active = filter === f.key;
             const n = f.key === "all" ? present.length : counts[f.key] ?? 0;
-            const accent =
-              f.key === "all"
-                ? "var(--accent)"
-                : MODALITY_STYLE[f.key as HeroModality].color;
             return (
               <button
                 key={f.key}
                 onClick={() => setFilter(f.key)}
-                className="rounded-full border px-3 py-1 text-xs font-medium transition-colors"
+                className="flex items-center gap-1.5 rounded-full px-4 py-1.5 text-sm font-medium transition-colors"
                 style={{
-                  borderColor: active ? accent : "var(--border)",
-                  background: active ? accent : "transparent",
-                  color: active ? "#fff" : "var(--muted)",
+                  background: active ? "var(--accent)" : "transparent",
+                  color: active ? "var(--background)" : "var(--foreground)",
                 }}
               >
-                {f.label} <span style={{ opacity: 0.7 }}>{n}</span>
+                {f.label}
+                <span className="text-xs" style={{ opacity: 0.55 }}>
+                  {n}
+                </span>
               </button>
             );
           })}
         </div>
-      )}
+        <EditButton />
+      </div>
 
       {loading && (
         <p className="py-12 text-center text-sm" style={{ color: "var(--muted)" }}>
@@ -225,6 +201,136 @@ export function HeroCutsView() {
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+function PillDropdown({ options }: { options: string[] }) {
+  const [open, setOpen] = useState(false);
+  const [selected, setSelected] = useState(options[0]);
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium transition-colors hover:bg-[var(--sidebar)]"
+        style={{ borderColor: "rgba(255,255,255,0.4)", color: "var(--foreground)" }}
+      >
+        {selected}
+        <ChevronDown size={15} style={{ color: "var(--muted)" }} />
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-30" onClick={() => setOpen(false)} />
+          <div
+            className="absolute left-0 z-40 mt-1.5 min-w-[170px] overflow-hidden rounded-xl border shadow-xl"
+            style={{ background: "var(--background)", borderColor: "var(--border)" }}
+          >
+            {options.map((opt) => (
+              <button
+                key={opt}
+                onClick={() => {
+                  setSelected(opt);
+                  setOpen(false);
+                }}
+                className="flex w-full items-center justify-between px-3.5 py-2 text-sm transition-colors hover:bg-[var(--sidebar)]"
+                style={{ color: selected === opt ? "var(--foreground)" : "var(--muted)" }}
+              >
+                {opt}
+                {selected === opt && <Check size={14} />}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function EnergyBar({
+  value,
+  onChange,
+}: {
+  value: number;
+  onChange: (v: number) => void;
+}) {
+  const trackRef = useRef<HTMLDivElement>(null);
+  const valueRef = useRef(value);
+  valueRef.current = value;
+
+  // Map a click/drag x to one of 5 stops. On a discrete click we guarantee the
+  // handle moves at least one stop toward the click, so it never feels stuck.
+  const apply = useCallback(
+    (clientX: number, isClick: boolean) => {
+      const el = trackRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const t = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+      let snapped = Math.round(t * 4) / 4;
+      const cur = valueRef.current;
+      if (isClick && snapped === cur) {
+        if (t > cur) snapped = Math.min(1, cur + 0.25);
+        else if (t < cur) snapped = Math.max(0, cur - 0.25);
+      }
+      if (snapped !== cur) onChange(snapped);
+    },
+    [onChange]
+  );
+
+  const handlePointerDown = useCallback(
+    (e: React.PointerEvent) => {
+      e.preventDefault();
+      apply(e.clientX, true);
+      const move = (ev: PointerEvent) => apply(ev.clientX, false);
+      const up = () => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+    },
+    [apply]
+  );
+
+  return (
+    <div className="mx-auto flex w-3/4 items-center gap-4">
+      <span className="shrink-0 pl-1 text-sm font-medium" style={{ color: "var(--foreground)" }}>
+        Energy
+      </span>
+      <div
+        ref={trackRef}
+        onPointerDown={handlePointerDown}
+        className="relative flex-1 cursor-pointer select-none py-4"
+        style={{ touchAction: "none" }}
+      >
+        <div
+          className="h-px w-full rounded-full"
+          style={{ background: "rgba(255,255,255,0.16)" }}
+        />
+        {/* Bright white filled portion to the left of the handle. */}
+        <div
+          className="absolute left-0 top-1/2 h-px -translate-y-1/2 rounded-full"
+          style={{
+            width: `${value * 100}%`,
+            background: "var(--foreground)",
+            transition: "width 0.35s cubic-bezier(0.22, 1, 0.36, 1)",
+          }}
+        />
+        <div
+          className="absolute top-1/2 h-3.5 w-[3px] -translate-y-1/2 rounded-full"
+          style={{
+            left: `calc(${value * 100}% - 1.5px)`,
+            background: "var(--foreground)",
+            transition: "left 0.35s cubic-bezier(0.22, 1, 0.36, 1)",
+          }}
+        />
+      </div>
+      <span
+        className="inline-flex min-w-[74px] shrink-0 items-center justify-center rounded-md px-3 py-1 text-xs font-semibold"
+        style={{ background: "var(--accent)", color: "var(--background)" }}
+      >
+        {energyLabel(value)}
+      </span>
     </div>
   );
 }
@@ -428,7 +534,7 @@ function HeroClipCard({
           }`}
           style={{ background: "var(--accent)" }}
         >
-          <Play size={20} className="ml-0.5 text-white" fill="white" />
+          <Play size={20} className="ml-0.5" fill="currentColor" style={{ color: "var(--background)" }} />
         </span>
 
         {/* Mute toggle (top-right). */}

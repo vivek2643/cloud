@@ -3,6 +3,7 @@ from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query
 from app.auth import get_current_user_id
 from app.services.supabase_client import get_supabase
+from app.services.r2 import generate_presigned_get
 from app.models.schemas import FolderCreate, FolderUpdate, FolderResponse, BreadcrumbItem
 
 router = APIRouter(prefix="/api/folders", tags=["folders"])
@@ -82,6 +83,35 @@ def delete_folder(
     if not result.data:
         raise HTTPException(status_code=404, detail="Folder not found")
     return {"ok": True}
+
+
+@router.get("/{folder_id}/covers")
+def get_folder_covers(
+    folder_id: str,
+    limit: int = Query(3, ge=1, le=6),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Return presigned thumbnail URLs for the first few videos in a folder.
+
+    Used to render the project card's stacked-clip preview. Best-effort: files
+    without a generated thumbnail are skipped."""
+    sb = get_supabase()
+    result = (
+        sb.table("files")
+        .select("id, r2_thumbnail_key, created_at")
+        .eq("user_id", user_id)
+        .eq("folder_id", folder_id)
+        .eq("file_type", "video")
+        .order("created_at")
+        .execute()
+    )
+    keys = [
+        row["r2_thumbnail_key"]
+        for row in (result.data or [])
+        if row.get("r2_thumbnail_key")
+    ][:limit]
+    urls = [generate_presigned_get(k, expires_in=7200) for k in keys]
+    return {"urls": urls}
 
 
 @router.get("/{folder_id}/breadcrumb", response_model=List[BreadcrumbItem])

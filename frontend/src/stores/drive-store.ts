@@ -3,6 +3,9 @@ import type { Folder, FileRecord } from "@/lib/api";
 
 export type ViewMode = "grid" | "list";
 
+// The project workspace stages shown in the left sidebar.
+export type ProjectStage = "media" | "cuts" | "color" | "captions";
+
 interface UploadItem {
   id: string;
   file: File;
@@ -18,6 +21,7 @@ interface DriveState {
   files: FileRecord[];
   loading: boolean;
   viewMode: ViewMode;
+  projectStage: ProjectStage;
   selectedIds: Set<string>;
   searchQuery: string;
   uploads: UploadItem[];
@@ -34,6 +38,7 @@ interface DriveState {
   removeFile: (id: string) => void;
   setLoading: (loading: boolean) => void;
   setViewMode: (mode: ViewMode) => void;
+  setProjectStage: (stage: ProjectStage) => void;
   setSearchQuery: (q: string) => void;
   toggleSelected: (id: string) => void;
   clearSelection: () => void;
@@ -48,6 +53,7 @@ export const useDriveStore = create<DriveState>((set) => ({
   files: [],
   loading: false,
   viewMode: "grid",
+  projectStage: "media",
   selectedIds: new Set(),
   searchQuery: "",
   uploads: [],
@@ -68,6 +74,7 @@ export const useDriveStore = create<DriveState>((set) => ({
     }),
   setLoading: (loading) => set({ loading }),
   setViewMode: (mode) => set({ viewMode: mode }),
+  setProjectStage: (stage) => set({ projectStage: stage }),
   setSearchQuery: (q) => set({ searchQuery: q }),
   toggleSelected: (id) =>
     set((state) => {

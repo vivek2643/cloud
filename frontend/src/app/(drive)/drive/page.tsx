@@ -1,18 +1,13 @@
 "use client";
 
-import { useEffect, useCallback, useRef, useState } from "react";
+import { useEffect, useCallback, useState } from "react";
 import { useDriveStore } from "@/stores/drive-store";
 import { useAuthStore } from "@/stores/auth-store";
 import { getFolders, getFiles, createFolder } from "@/lib/api";
-import { UploadZone, useUploadFiles } from "@/components/upload-zone";
+import { UploadZone } from "@/components/upload-zone";
 import { DriveContent } from "@/components/drive-content";
 import { CreateFolderDialog } from "@/components/create-folder-dialog";
-import { SearchEditBar } from "@/components/search-edit-bar";
-import { FolderPlus, Upload, X } from "lucide-react";
-
-const VIDEO_EXTENSIONS =
-  ".mp4,.mov,.avi,.mkv,.webm,.m4v,.wmv,.flv,.mxf,.mts," +
-  ".mp3,.wav,.m4a,.aac,.flac,.ogg,.oga,.opus,.wma,.aiff";
+import { FolderPlus, X, Search } from "lucide-react";
 
 export default function DrivePage() {
   const session = useAuthStore((s) => s.session);
@@ -24,10 +19,10 @@ export default function DrivePage() {
     uploads,
     selectedIds,
     clearSelection,
+    searchQuery,
+    setSearchQuery,
   } = useDriveStore();
   const [showNewFolder, setShowNewFolder] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const uploadFiles = useUploadFiles();
 
   const loadContents = useCallback(async () => {
     if (!session?.access_token) return;
@@ -62,20 +57,39 @@ export default function DrivePage() {
     loadContents();
   }
 
-  function handleFileInputChange(e: React.ChangeEvent<HTMLInputElement>) {
-    const files = e.target.files;
-    if (files && files.length > 0) {
-      uploadFiles(Array.from(files));
-      e.target.value = "";
-    }
-  }
-
   const selectedCount = selectedIds.size;
 
   return (
     <UploadZone>
       <div className="flex-1 p-6">
-        <SearchEditBar />
+        {/* Centered project search */}
+        <div className="mx-auto mb-8 w-full max-w-2xl">
+          <div className="relative">
+            <Search
+              size={18}
+              className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2"
+              style={{ color: "var(--muted)" }}
+            />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search projects"
+              className="w-full rounded-full border bg-transparent py-2.5 pl-11 pr-10 text-sm outline-none transition-colors focus:border-[var(--accent)]"
+              style={{ borderColor: "var(--border)", background: "var(--sidebar)" }}
+            />
+            {searchQuery && (
+              <button
+                onClick={() => setSearchQuery("")}
+                className="absolute right-3 top-1/2 -translate-y-1/2 rounded p-0.5 transition-opacity hover:opacity-70"
+                style={{ color: "var(--muted)" }}
+                title="Clear search"
+              >
+                <X size={15} />
+              </button>
+            )}
+          </div>
+        </div>
 
         {/* Library actions (projects live in folders; lenses appear inside one) */}
         <div className="mb-6 flex flex-wrap items-center justify-between gap-3 border-b pb-3" style={{ borderColor: "var(--border)" }}>
@@ -99,24 +113,8 @@ export default function DrivePage() {
               style={{ borderColor: "var(--border)" }}
             >
               <FolderPlus size={16} />
-              New Folder
+              New Project
             </button>
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              className="flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors hover:border-[var(--accent)]"
-              style={{ borderColor: "var(--border)", color: "var(--accent)" }}
-            >
-              <Upload size={16} />
-              Upload
-            </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              multiple
-              accept={VIDEO_EXTENSIONS}
-              className="hidden"
-              onChange={handleFileInputChange}
-            />
           </div>
         </div>
 
