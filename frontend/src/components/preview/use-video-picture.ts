@@ -24,6 +24,17 @@ export interface PictureHandle {
   stop: () => void;
 }
 
+/** Seek only when not already mid-seek: stacking seeks on a remote MP4 stalls
+ * the decoder (black frame / freeze). Let the in-flight seek land first. */
+function safeSeek(el: HTMLMediaElement, sec: number) {
+  if (el.seeking) return;
+  try {
+    el.currentTime = sec;
+  } catch {
+    /* not ready */
+  }
+}
+
 function topLayerAt(resolved: ResolvedTimeline, t: number): ResolvedVideoLayer | null {
   let top: ResolvedVideoLayer | null = null;
   for (const v of resolved.video_layers) {
@@ -97,13 +108,7 @@ export function useVideoPicture(
 
     if (frontLayer.current === top.layer_id) {
       // Still inside the current layer — let it free-run, drift-correct only.
-      if (Math.abs(f.currentTime - want) > DRIFT_S) {
-        try {
-          f.currentTime = want;
-        } catch {
-          /* not ready */
-        }
-      }
+      if (Math.abs(f.currentTime - want) > DRIFT_S) safeSeek(f, want);
       if (playing && f.paused) void f.play().catch(() => {});
       else if (!playing && !f.paused) f.pause();
     } else {
@@ -111,13 +116,7 @@ export function useVideoPicture(
       // if it was preloaded + pre-seeked for this layer; else load front now.
       const b = back();
       if (b && backLayer.current === top.layer_id && b.readyState >= 1) {
-        if (Math.abs(b.currentTime - want) > DRIFT_S) {
-          try {
-            b.currentTime = want;
-          } catch {
-            /* ignore */
-          }
-        }
+        if (Math.abs(b.currentTime - want) > DRIFT_S) safeSeek(b, want);
         frontIsA.current = !frontIsA.current;
         frontLayer.current = top.layer_id;
         backLayer.current = "";
@@ -128,11 +127,7 @@ export function useVideoPicture(
         if (f.src !== url) f.src = url;
         frontLayer.current = top.layer_id;
         const onReady = () => {
-          try {
-            f.currentTime = want;
-          } catch {
-            /* ignore */
-          }
+          safeSeek(f, want);
           if (playing) void f.play().catch(() => {});
         };
         if (f.readyState >= 1) onReady();
@@ -157,11 +152,7 @@ export function useVideoPicture(
           const seekBack = () => {
             const nwant =
               (next.src_in_ms + Math.max(0, t + PREFETCH_MS - next.prog_start_ms)) / 1000;
-            try {
-              b.currentTime = nwant;
-            } catch {
-              /* ignore */
-            }
+            safeSeek(b, nwant);
           };
           if (b.readyState >= 1) seekBack();
           else b.addEventListener("loadedmetadata", seekBack, { once: true });

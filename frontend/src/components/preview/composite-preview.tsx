@@ -16,7 +16,7 @@ import { getFile, getFilePlaybackUrl, type ResolvedTimeline } from "@/lib/api";
 import { resolveTimeline, sampleMotion } from "@/lib/resolve-timeline";
 import { useEditDocStore } from "@/stores/edit-doc-store";
 import { useTransport, FRAME_MS, formatTimecode } from "@/stores/transport-store";
-import { useAudioMixer } from "./use-audio-mixer";
+import { useAudioEngine } from "./use-audio-engine";
 import { useVideoPicture } from "./use-video-picture";
 
 /**
@@ -60,9 +60,10 @@ export function CompositePreview({ token }: { token: string | undefined }) {
   const setDuration = useTransport((s) => s.setDuration);
   const resetTransport = useTransport((s) => s.reset);
 
-  // Engine internals (continuous clock; published time is frame-snapped).
+  // Engine internals. The AUDIO ENGINE is the master clock (sample-accurate);
+  // the rAF loop just reads it to drive the picture + publish a frame-snapped
+  // program time. `progRef` mirrors the clock for seeks/resumes.
   const progRef = useRef(0);
-  const lastTsRef = useRef(0);
   const lastFrameRef = useRef(-1);
   const rafRef = useRef<number | null>(null);
 
@@ -77,7 +78,7 @@ export function CompositePreview({ token }: { token: string | undefined }) {
     return Array.from(s).filter(Boolean);
   }, [resolved]);
 
-  const mixer = useAudioMixer(resolved, urls);
+  const engine = useAudioEngine(resolved, urls);
   const picture = useVideoPicture(resolved, urls);
 
   // Resolve playback URLs + source durations for every referenced clip.
@@ -131,64 +132,54 @@ export function CompositePreview({ token }: { token: string | undefined }) {
     setDuration(duration);
   }, [duration, setDuration]);
 
-  // The rAF clock: advance the continuous internal clock, drive the media, and
-  // publish a frame-snapped time only when the frame index changes (≈fps Hz).
-  const loop = useCallback(
-    (ts: number) => {
-      if (lastTsRef.current) {
-        const dt = ts - lastTsRef.current;
-        const t = progRef.current + dt;
-        if (t >= duration) {
-          progRef.current = 0;
-          lastFrameRef.current = 0;
-          mixer.sync(0, false);
-          picture.sync(0, false);
-          publish(0);
-          setPlaying(false); // the [playing] effect stops the engine
-          return;
-        }
-        progRef.current = t;
-        mixer.sync(t, true);
-        picture.sync(t, true);
-        const frame = Math.round(t / FRAME_MS);
-        if (frame !== lastFrameRef.current) {
-          lastFrameRef.current = frame;
-          publish(frame * FRAME_MS);
-        }
-      }
-      lastTsRef.current = ts;
-      rafRef.current = requestAnimationFrame(loop);
-    },
-    [duration, mixer, picture, publish, setPlaying]
-  );
-
-  // Start/stop the engine purely from the shared `playing` flag, so the play
-  // button here and spacebar/scrub on the timeline drive the same machine.
-  useEffect(() => {
-    if (!playing || !hasTimeline) {
-      mixer.stop();
-      picture.stop();
-      stopRaf();
-      lastTsRef.current = 0;
+  // The rAF loop: read the audio master clock, drive the picture, and publish a
+  // frame-snapped time only when the frame index changes (≈fps Hz). No audio is
+  // touched here — it's already scheduled on the AudioContext.
+  const loop = useCallback(() => {
+    const t = engine.nowMs();
+    if (duration > 0 && t >= duration) {
+      engine.pause();
+      engine.seek(0, false);
+      progRef.current = 0;
+      lastFrameRef.current = 0;
+      picture.sync(0, false);
+      publish(0);
+      setPlaying(false); // the [playing] effect tears down the loop
       return;
     }
-    mixer.arm();
-    lastTsRef.current = 0;
-    mixer.sync(progRef.current, true);
+    progRef.current = t;
+    picture.sync(t, true);
+    const frame = Math.round(t / FRAME_MS);
+    if (frame !== lastFrameRef.current) {
+      lastFrameRef.current = frame;
+      publish(frame * FRAME_MS);
+    }
+    rafRef.current = requestAnimationFrame(loop);
+  }, [duration, engine, picture, publish, setPlaying]);
+
+  // Start/stop purely from the shared `playing` flag, so the play button here
+  // and spacebar/scrub on the timeline drive the same machine.
+  useEffect(() => {
+    if (!playing || !hasTimeline) {
+      engine.pause();
+      picture.stop();
+      stopRaf();
+      return;
+    }
+    engine.play(progRef.current);
     picture.sync(progRef.current, true);
     stopRaf();
     rafRef.current = requestAnimationFrame(loop);
     return stopRaf;
-  }, [playing, hasTimeline, loop, mixer, picture, stopRaf]);
+  }, [playing, hasTimeline, loop, engine, picture, stopRaf]);
 
-  // External seek (timeline click/scrub, step buttons, monitor scrubber): jump
-  // the engine clock + media to the requested frame.
+  // External seek (timeline click/scrub, step buttons, monitor scrubber): move
+  // the master clock + reschedule audio + park the picture on the new frame.
   useEffect(() => {
     progRef.current = seekTargetMs;
-    lastTsRef.current = 0;
     lastFrameRef.current = Math.round(seekTargetMs / FRAME_MS);
     const playingNow = useTransport.getState().playing;
-    mixer.sync(seekTargetMs, playingNow);
+    engine.seek(seekTargetMs, playingNow);
     picture.sync(seekTargetMs, playingNow);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [seekSeq]);
@@ -199,8 +190,8 @@ export function CompositePreview({ token }: { token: string | undefined }) {
   }
 
   useEffect(() => {
-    mixer.setMuted(muted);
-  }, [muted, mixer]);
+    engine.setMuted(muted);
+  }, [muted, engine]);
 
   // Reset to the start whenever the plan changes shape (segment count / ids).
   const shapeKey = useMemo(
@@ -209,19 +200,20 @@ export function CompositePreview({ token }: { token: string | undefined }) {
   );
   useEffect(() => {
     resetTransport();
+    engine.stop();
     progRef.current = 0;
-    lastTsRef.current = 0;
     lastFrameRef.current = 0;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shapeKey]);
 
-  // While paused, keep the picture parked on the current frame as edits change
-  // what's under the playhead.
+  // Edits re-resolve the timeline: decode any new files and reschedule audio
+  // from the current playhead so the change is heard immediately. While paused
+  // we just re-park the picture; the audio re-arms on the next play.
   useEffect(() => {
-    if (!useTransport.getState().playing) {
-      mixer.sync(progRef.current, false);
-      picture.sync(progRef.current, false);
-    }
+    engine.prepare();
+    const playingNow = useTransport.getState().playing;
+    engine.seek(progRef.current, playingNow);
+    picture.sync(progRef.current, playingNow);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [resolved, urls]);
 

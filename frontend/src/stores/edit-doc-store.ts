@@ -52,6 +52,9 @@ interface EditDocState {
 
   /** Seed/replace baseline + working state from an authoritative document. */
   seed: (threadId: string, version: number, doc: EditDocument | null) => void;
+  /** Wipe everything back to an empty document (used when starting fresh, so the
+   * preview/timeline don't keep showing/playing a previous edit). */
+  clear: () => void;
   /** Replace baseline after a successful save/agent write (keeps working == baseline). */
   commit: (version: number, doc: EditDocument) => void;
   revert: () => void;
@@ -108,6 +111,18 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       selected: null,
     });
   },
+
+  clear: () =>
+    set({
+      threadId: null,
+      baseVersion: 0,
+      baselineTimeline: [],
+      baselineOperations: [],
+      timeline: [],
+      operations: [],
+      aspect: "landscape",
+      selected: null,
+    }),
 
   commit: (version, doc) => {
     const timeline = doc.timeline ?? [];

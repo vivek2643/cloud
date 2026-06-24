@@ -20,6 +20,7 @@ import { RenderBar } from "@/components/render-bar";
 import { TimelineEditor } from "@/components/timeline-editor";
 import { CompositePreview } from "@/components/preview/composite-preview";
 import { useEditDocStore } from "@/stores/edit-doc-store";
+import { useTransport } from "@/stores/transport-store";
 import { useAuthStore } from "@/stores/auth-store";
 import {
   createEditThread,
@@ -49,6 +50,19 @@ function saveThreadId(scope: string, id: string) {
 }
 function clearThreadId(scope: string) {
   window.localStorage.removeItem(`edit-thread:${scope}`);
+}
+/** Wipe EVERY persisted edit thread (all scopes) + their transcripts, so nothing
+ * auto-loads and a fresh start is truly empty. */
+function clearAllPersistedThreads() {
+  if (typeof window === "undefined") return;
+  const keys: string[] = [];
+  for (let i = 0; i < window.localStorage.length; i++) {
+    const k = window.localStorage.key(i);
+    if (k && (k.startsWith("edit-thread:") || k.startsWith("edit-msgs:") || k.startsWith("edit-turns:"))) {
+      keys.push(k);
+    }
+  }
+  keys.forEach((k) => window.localStorage.removeItem(k));
 }
 function loadMsgs(threadId: string): ChatMsg[] {
   if (typeof window === "undefined") return [];
@@ -158,7 +172,11 @@ export function AiEditPanel() {
         }).catch(() => {});
       });
     } else {
+      // No saved thread for this scope -> ensure the preview/timeline are empty.
       setMessages([]);
+      useTransport.getState().reset();
+      clearDoc();
+      seededRef.current = "";
     }
     return stopPolling;
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -172,6 +190,7 @@ export function AiEditPanel() {
   // changes (agent wrote a new version, or we loaded a thread). Keyed on
   // version so 2s polls don't wipe in-progress manual edits.
   const seedDoc = useEditDocStore((s) => s.seed);
+  const clearDoc = useEditDocStore((s) => s.clear);
   const seededRef = useRef<string>("");
   useEffect(() => {
     if (!thread?.id) return;
@@ -229,7 +248,12 @@ export function AiEditPanel() {
 
   function handleNewThread() {
     stopPolling();
-    clearThreadId(scope);
+    // A fresh start must also empty the LIVE preview/timeline + stop playback,
+    // otherwise the previous edit keeps showing (and its audio keeps playing).
+    useTransport.getState().reset();
+    clearDoc();
+    seededRef.current = "";
+    clearAllPersistedThreads();
     setThreadId(null);
     setThread(null);
     setMessages([]);
