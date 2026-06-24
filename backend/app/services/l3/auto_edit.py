@@ -42,7 +42,7 @@ from procrastinate import RetryStrategy
 
 from app.config import get_settings
 from app.services.jobs import app
-from app.services.l3 import framing, hero_store, layers
+from app.services.l3 import arrange, footage_map, framing, hero_store, layers
 from app.services.l3.energy import energy_band
 from app.services.llm import LLMClient, get_llm, user_message
 
@@ -589,11 +589,23 @@ def _fallback_picks(spine_pool: List[dict], plan: Plan) -> List[dict]:
 
 
 def make_edit(file_ids: List[str], brief: str,
-              *, llm: Optional[LLMClient] = None) -> AutoEditResult:
-    """The full pipeline: brief + clips -> resolved Edit Document.
+              *, llm: Optional[LLMClient] = None,
+              prior_document: Optional[dict] = None) -> AutoEditResult:
+    """The pipeline: brief + clips -> resolved Edit Document.
 
-    ``llm`` is injectable for testing / model-swapping; defaults to the
-    configured auto-edit provider (OpenAI)."""
+    Two bounded calls. The DIRECTOR reads the per-clip summary cards and frames
+    the edit (energy / aspect / target / intent). The ARRANGER then gets the
+    WHOLE footage map -- every clip, every moment, its energy levels and atoms --
+    and freely picks + orders the timeline (Cursor-over-a-codebase, no spine /
+    overlay / angle vocabulary). Placements are validated against the map and
+    compiled deterministically into the same Edit Document the player reads.
+
+    ``prior_document`` (a refinement turn) is shown to the arranger as a
+    map-overlay so it edits the existing timeline in the same ids instead of
+    rebuilding from scratch. ``llm`` is injectable for testing / model-swapping.
+
+    Fails OPEN: a missing map or a failed arranger call degrades to a
+    deterministic draft (top moments by score), so a thread always lands."""
     settings = get_settings()
     if llm is None:
         llm = get_llm(provider=settings.autoedit_provider or None,
@@ -601,61 +613,31 @@ def make_edit(file_ids: List[str], brief: str,
 
     cards = _clip_cards(file_ids)
 
-    # Call 1: Director (energy + plan) from the clip summary cards alone -- the
-    # cards' content_type / primary_axis / best_use already distinguish a
-    # talking-head from an action reel, so we don't pay for a throwaway feed
-    # build just to count modalities.
+    # Call 1: Director -- the high-level frame (energy/aspect/target/intent) from
+    # the clip summary cards alone.
     plan = _director(brief, cards, llm)
 
-    # Engine: the full cut feed at the director's energy, served from the
-    # precompute cache (snaps to the nearest band; lazily backfills a miss).
-    feed = hero_store.get_hero_feed(file_ids, energy=plan.energy)
-    by_id = {c["hero_id"]: c for c in feed}
-    spine_pool = [c for c in feed if c.get("modality") in _SPINE_MODALITIES]
-    coverage_pool = [c for c in feed if c.get("modality") in _COVERAGE_MODALITIES]
+    # Engine: the whole footage library as a compact, complete map (Tier-0),
+    # served from the moment-tree cache (lazily (re)built on a signature change).
+    fmap = footage_map.assemble_map(file_ids)
+    map_struct = fmap.get("struct") or {"clips": []}
+    overlay = arrange.timeline_overlay(prior_document)
 
-    # Call 3: Editor (select + order the spine).
-    picks: List[dict] = []
+    # Call 2: Arranger -- pick + order the timeline over the full map.
+    placements: List[arrange.Placement] = []
     try:
-        picks = _editor(brief, plan, spine_pool, llm)
+        placements = arrange.arrange(
+            brief, map_struct, plan, llm=llm,
+            map_text=fmap.get("text") or "", current_timeline=overlay or None)
     except Exception:
-        logger.exception("auto_edit: editor call failed; using fallback picks")
-    if not picks:
-        picks = _fallback_picks(spine_pool, plan)
+        logger.exception("auto_edit: arranger call failed; using fallback")
+    if not placements:
+        placements = arrange.fallback_placements(map_struct, plan)
 
-    segments = _segments_from_picks(picks, by_id)
-
-    # Call 4: Coverage (overlays + fit), only when the spine frees its picture.
-    # Off by default -- V1 is a pure assembler (pick + order), so it emits no
-    # overlay operations; enable autoedit_coverage to bring it back.
-    coverage: dict = {}
-    if (settings.autoedit_coverage and plan.spine_kind in _VIDEO_FREE_SPINES
-            and coverage_pool and segments):
-        spans, total = layers.spine_spans(segments)
-        spine_view = [{
-            "seg_id": s.seg["seg_id"],
-            "prog_start_ms": s.prog_start_ms,
-            "prog_end_ms": s.prog_end_ms,
-            "content": s.seg.get("content"),
-        } for s in spans]
-        try:
-            coverage = _coverage(brief, plan, spine_view, coverage_pool, total, llm)
-        except Exception:
-            logger.exception("auto_edit: coverage call failed (continuing)")
-
-    segments = _apply_trims(segments, coverage, plan)
-    _, total_ms = layers.spine_spans(segments)
-    operations = _operations_from_coverage(coverage, by_id, total_ms)
-
-    notes = []
-    if isinstance(coverage.get("notes"), str) and coverage["notes"].strip():
-        notes.append(coverage["notes"].strip())
-    summary = plan.intent or "Auto-assembled edit."
-
-    document = _build_document(brief, plan, segments, operations,
-                               file_ids, summary, notes)
+    document = arrange.compile_placements(brief, plan, placements, map_struct, file_ids)
     return AutoEditResult(document=document, plan=plan,
-                          feed_size=len(feed), selected=len(segments))
+                          feed_size=int(fmap.get("moment_count") or 0),
+                          selected=len(document.get("timeline") or []))
 
 
 # --------------------------------------------------------------------------
@@ -673,8 +655,13 @@ def run_thread(thread_id: str) -> None:
         return
     store.set_thread_status(thread_id, "drafting")
 
+    # A refinement turn iterates on the existing cut: hand the arranger the
+    # current timeline as a map-overlay so it edits in the same ids.
+    prior_document, _ = store.latest_document(thread_id)
+
     try:
-        result = make_edit(thread["file_ids"], thread.get("brief") or "")
+        result = make_edit(thread["file_ids"], thread.get("brief") or "",
+                           prior_document=prior_document)
     except Exception:
         logger.exception("auto_edit: make_edit failed for %s", thread_id)
         store.set_thread_status(thread_id, "failed")

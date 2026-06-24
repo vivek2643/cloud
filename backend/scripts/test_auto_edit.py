@@ -123,114 +123,129 @@ def test_apply_trims():
     print("ok  apply_trims drops + fits target")
 
 
-def test_make_edit_end_to_end(monkeypatch=None):
-    """Full pipeline with stubbed clip cards / feed / durations + FakeLLM."""
-    feed = [
-        _cut("f1:a", "f1", label="the hook line", score=0.9),
-        _cut("f1:b", "f1", label="the middle point", score=0.7),
-        _cut("fb:x", "fb", modality="broll", label="b-roll pour", t_out=4000),
-    ]
-    orig_cards, orig_feed = ae._clip_cards, ae.hero_store.get_hero_feed
+def _moment(mid, fid, gist, in_ms, out_ms, modality="speech", score=0.6,
+            hero_id=None, extra_variants=None, atoms=None):
+    """A map moment with a balanced variant (plus optional widen/atoms)."""
+    variants = {"balanced": {"level": "balanced", "band": 2, "in_ms": in_ms,
+                             "out_ms": out_ms, "play_ms": out_ms - in_ms,
+                             "keep_spans": None, "score": score,
+                             "hero_id": hero_id or f"{fid}:h"}}
+    if extra_variants:
+        variants.update(extra_variants)
+    return {"moment_id": mid, "file_id": fid, "modality": modality, "gist": gist,
+            "speaker": "S0", "flags": [], "affordances": [modality], "score": score,
+            "in_ms": in_ms, "out_ms": out_ms, "play_ms": out_ms - in_ms,
+            "variants": variants, "atoms": atoms or []}
+
+
+def _map_struct(moments, fid="f1", duration_ms=600000):
+    return {"clips": [{"file_id": fid, "name": fid, "duration_ms": duration_ms,
+                       "content_type": None, "primary_axis": None, "mood": None,
+                       "people": [], "topics": [], "logline": None,
+                       "moment_count": len(moments), "moments": moments}]}
+
+
+def _stub_map(struct):
+    """Patch footage_map.assemble_map + render durations to a fixed map. Returns
+    a restore() callable."""
     import app.services.render.tasks as rt
+    orig_cards = ae._clip_cards
+    orig_map = ae.footage_map.assemble_map
     orig_dur = rt._durations
-    ae._clip_cards = lambda fids: {f: {"file_id": f, "name": f, "duration_ms": 600000,
-                                       "best_use": [], "topics": [], "people": []}
-                                   for f in fids}
-    ae.hero_store.get_hero_feed = lambda fids, energy=0.5, **kw: feed
-    rt._durations = lambda fids: {f: 600000 for f in fids}
+    fids = [c["file_id"] for c in struct["clips"]]
+    n = sum(c["moment_count"] for c in struct["clips"])
+    ae._clip_cards = lambda f: {x: {"file_id": x, "name": x, "duration_ms": 600000,
+                                    "best_use": [], "topics": [], "people": []} for x in f}
+    ae.footage_map.assemble_map = lambda f: {"text": "(map)", "struct": struct,
+                                             "clip_count": len(fids), "moment_count": n}
+    rt._durations = lambda f: {x: 600000 for x in f}
+
+    def restore():
+        ae._clip_cards = orig_cards
+        ae.footage_map.assemble_map = orig_map
+        rt._durations = orig_dur
+    return restore
+
+
+def test_make_edit_end_to_end(monkeypatch=None):
+    """Director frames it; arranger picks + orders moments over the whole map;
+    placements compile to a contiguous main line (no ops by default)."""
+    struct = _map_struct([
+        _moment("f1:m00", "f1", "the hook line", 0, 2000, score=0.9, hero_id="f1:a"),
+        _moment("f1:m01", "f1", "the middle point", 2000, 4000, score=0.7, hero_id="f1:b"),
+    ])
+    restore = _stub_map(struct)
+    # The arranger system prompt contains "EDITOR" -> served from the editor slot.
     llm = FakeLLM(
         director=json.dumps({"energy": 0.7, "aspect": "portrait",
                              "spine_kind": "dialogue", "intent": "tell it",
                              "beats": [{"purpose": "hook", "intent": "open"}]}),
-        editor=json.dumps({"picks": [
-            {"hero_id": "f1:a", "beat": "hook", "reason": "strong open"},
-            {"hero_id": "f1:b", "beat": None, "reason": "support"},
-        ]}),
-        coverage=json.dumps({"overlays": [
-            {"hero_id": "fb:x", "from_ms": 2000, "to_ms": 3500, "reason": "cover"}],
-            "notes": "kept it sparse"}),
+        editor=json.dumps({"timeline": [
+            {"ref": "f1:m00", "level": "balanced", "track": 0, "reason": "strong open"},
+            {"ref": "f1:m01", "level": "balanced", "track": 0, "reason": "support"},
+        ], "notes": "tight"}),
     )
-    # Default: pure assembler -- no coverage pass, no overlay operations.
     try:
-        result = ae.make_edit(["f1", "fb"], "make a punchy reel", llm=llm)
+        result = ae.make_edit(["f1"], "make a punchy reel", llm=llm)
     finally:
-        ae._clip_cards, ae.hero_store.get_hero_feed = orig_cards, orig_feed
-        rt._durations = orig_dur
+        restore()
 
     doc = result.document
     assert result.plan.energy == 0.7 and result.plan.aspect == "portrait"
     assert doc["format"]["aspect"] == "portrait"
-    assert [s["hero_id"] for s in doc["timeline"]] == ["f1:a", "f1:b"], doc["timeline"]
+    assert [s["ref"] for s in doc["timeline"]] == ["f1:m00", "f1:m01"], doc["timeline"]
+    assert [(s["in_ms"], s["out_ms"]) for s in doc["timeline"]] == [(0, 2000), (2000, 4000)]
     assert doc["operations"] == [], doc["operations"]
     assert doc["resolved"]["video_layers"], "resolved layers must exist"
     assert llm.calls == ["DIRECTOR", "EDITOR"], llm.calls
-    print("ok  make_edit end-to-end (pure assembler: pick + order, no ops)")
+    print("ok  make_edit end-to-end (director + arranger over the map)")
 
 
-def test_make_edit_coverage_when_enabled():
-    """With autoedit_coverage on, the coverage pass runs and lays an overlay."""
-    feed = [
-        _cut("f1:a", "f1", label="the hook line", score=0.9),
-        _cut("f1:b", "f1", label="the middle point", score=0.7),
-        _cut("fb:x", "fb", modality="broll", label="b-roll pour", t_out=4000),
-    ]
-    orig_cards, orig_feed = ae._clip_cards, ae.hero_store.get_hero_feed
-    import app.services.render.tasks as rt
-    orig_dur = rt._durations
-    ae._clip_cards = lambda fids: {f: {"file_id": f, "name": f, "duration_ms": 600000,
-                                       "best_use": [], "topics": [], "people": []}
-                                   for f in fids}
-    ae.hero_store.get_hero_feed = lambda fids, energy=0.5, **kw: feed
-    rt._durations = lambda fids: {f: 600000 for f in fids}
+def test_make_edit_overlay_track():
+    """A placement on track >= 1 with a program anchor compiles to a place_video
+    overlay operation (free multi-track, no spine/coverage vocabulary)."""
+    struct = _map_struct([
+        _moment("f1:m00", "f1", "the hook line", 0, 4000, score=0.9, hero_id="f1:a"),
+        _moment("f1:b00", "f1", "b-roll pour", 8000, 12000, modality="broll",
+                score=0.6, hero_id="f1:bx"),
+    ])
+    restore = _stub_map(struct)
     llm = FakeLLM(
-        director=json.dumps({"energy": 0.7, "aspect": "portrait",
-                             "spine_kind": "dialogue", "intent": "tell it",
-                             "beats": [{"purpose": "hook", "intent": "open"}]}),
-        editor=json.dumps({"picks": [
-            {"hero_id": "f1:a", "beat": "hook", "reason": "strong open"},
-            {"hero_id": "f1:b", "beat": None, "reason": "support"},
+        director=json.dumps({"energy": 0.5, "aspect": "landscape", "spine_kind": "dialogue",
+                             "intent": "x"}),
+        editor=json.dumps({"timeline": [
+            {"ref": "f1:m00", "level": "balanced", "track": 0},
+            {"ref": "f1:b00", "level": "balanced", "track": 1, "from_ms": 1000,
+             "reason": "cover"},
         ]}),
-        coverage=json.dumps({"overlays": [
-            {"hero_id": "fb:x", "from_ms": 2000, "to_ms": 3500, "reason": "cover"}],
-            "notes": "kept it sparse"}),
     )
-    from app.config import get_settings
-    settings = get_settings()
-    prev = settings.autoedit_coverage
-    settings.autoedit_coverage = True
     try:
-        result = ae.make_edit(["f1", "fb"], "make a punchy reel", llm=llm)
+        result = ae.make_edit(["f1"], "reel", llm=llm)
     finally:
-        settings.autoedit_coverage = prev
-        ae._clip_cards, ae.hero_store.get_hero_feed = orig_cards, orig_feed
-        rt._durations = orig_dur
-
+        restore()
     doc = result.document
-    assert len(doc["operations"]) == 1 and doc["operations"][0]["type"] == "place_video"
-    assert llm.calls == ["DIRECTOR", "EDITOR", "COVERAGE"], llm.calls
-    print("ok  make_edit coverage path (enabled -> 1 overlay op)")
+    assert len(doc["timeline"]) == 1, doc["timeline"]          # only track-0 on the line
+    assert len(doc["operations"]) == 1, doc["operations"]
+    assert doc["operations"][0]["type"] == "place_video"
+    assert doc["operations"][0]["from_ms"] == 1000
+    print("ok  make_edit overlay track -> place_video op")
 
 
-def test_make_edit_fallback_on_editor_failure():
-    feed = [_cut("f1:a", "f1", score=0.9), _cut("f1:b", "f1", score=0.4)]
-    orig_cards, orig_feed = ae._clip_cards, ae.hero_store.get_hero_feed
-    import app.services.render.tasks as rt
-    orig_dur = rt._durations
-    ae._clip_cards = lambda fids: {f: {"file_id": f, "name": f, "duration_ms": 60000,
-                                       "best_use": [], "topics": [], "people": []}
-                                   for f in fids}
-    ae.hero_store.get_hero_feed = lambda fids, energy=0.5, **kw: feed
-    rt._durations = lambda fids: {f: 60000 for f in fids}
-    # Editor returns no usable picks -> deterministic fallback kicks in.
+def test_make_edit_fallback_on_arranger_failure():
+    struct = _map_struct([
+        _moment("f1:m00", "f1", "best", 0, 2000, score=0.9),
+        _moment("f1:m01", "f1", "weak", 2000, 4000, score=0.3),
+    ])
+    restore = _stub_map(struct)
+    # Arranger returns an empty timeline -> deterministic fallback kicks in.
     llm = FakeLLM(director=json.dumps({"energy": 0.5, "spine_kind": "dialogue"}),
-                  editor=json.dumps({"picks": []}))
+                  editor=json.dumps({"timeline": []}))
     try:
         result = ae.make_edit(["f1"], "", llm=llm)
     finally:
-        ae._clip_cards, ae.hero_store.get_hero_feed = orig_cards, orig_feed
-        rt._durations = orig_dur
+        restore()
     assert result.selected >= 1, "fallback must still produce a draft"
-    print("ok  make_edit fallback on editor failure")
+    print("ok  make_edit fallback on arranger failure")
 
 
 def main():
@@ -240,8 +255,8 @@ def main():
     test_operations_from_coverage()
     test_apply_trims()
     test_make_edit_end_to_end()
-    test_make_edit_coverage_when_enabled()
-    test_make_edit_fallback_on_editor_failure()
+    test_make_edit_overlay_track()
+    test_make_edit_fallback_on_arranger_failure()
     print("\nall auto-edit tests passed")
 
 

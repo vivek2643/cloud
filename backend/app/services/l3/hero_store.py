@@ -222,3 +222,53 @@ def _cached_or_backfill(file_ids: List[str], band: int) -> Dict[str, List[Dict[s
             _put_row(conn, fid, band, energy, sig, cuts)
             out[fid] = cuts
     return out
+
+
+# --------------------------------------------------------------------------
+# Multi-band accessors (for the footage-map / moment-tree builder)
+# --------------------------------------------------------------------------
+
+def signatures_for(file_ids: List[str]) -> Dict[str, Optional[str]]:
+    """Public content signature per file (None when the file has no usable
+    artifacts yet). Used by downstream caches (e.g. the footage moment-tree) so
+    they invalidate in lockstep with the hero-cut precompute."""
+    if not file_ids:
+        return {}
+    with _pg_conn() as conn:
+        _ensure_table(conn)
+        return _signatures(conn, file_ids)
+
+
+def get_band_cuts(file_ids: List[str]) -> Dict[str, Dict[int, List[Dict[str, Any]]]]:
+    """Every band's PRE-stacking per-file cuts: ``{file_id: {band: [cut, ...]}}``.
+
+    Mirrors the lazy backfill of :func:`get_hero_feed` but exposes all five
+    bands for each file (no cross-file stacking) -- the multi-resolution input
+    the moment-tree builder collapses into moments + variants. Fail-open per
+    band/file: a compute error leaves that band empty rather than raising."""
+    out: Dict[str, Dict[int, List[Dict[str, Any]]]] = {fid: {} for fid in file_ids}
+    if not file_ids:
+        return out
+    with _pg_conn() as conn:
+        _ensure_table(conn)
+        sigs = _signatures(conn, file_ids)
+        for band in range(_N_BANDS):
+            energy = hc.band_energy(band)
+            rows = _get_rows(conn, file_ids, band)
+            for fid in file_ids:
+                sig = sigs.get(fid)
+                if sig is None:
+                    out[fid][band] = []
+                    continue
+                hit = rows.get(fid)
+                if hit and hit["source_version"] == sig:
+                    out[fid][band] = hit["cuts"]
+                    continue
+                try:
+                    cuts = hc.compute_file_cache(fid, energy)
+                    _put_row(conn, fid, band, energy, sig, cuts)
+                except Exception:
+                    logger.exception("band cuts: compute failed file=%s band=%s", fid, band)
+                    cuts = []
+                out[fid][band] = cuts
+    return out
