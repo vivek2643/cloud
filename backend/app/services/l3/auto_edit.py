@@ -653,6 +653,7 @@ def run_thread(thread_id: str) -> None:
     if thread is None:
         logger.info("auto_edit: thread %s gone; skipping.", thread_id)
         return
+    logger.info("auto_edit: run_thread start thread=%s", thread_id)
     store.set_thread_status(thread_id, "drafting")
 
     # A refinement turn iterates on the existing cut: hand the arranger the
@@ -702,10 +703,14 @@ def _defer_run(thread_id: str) -> None:
 
 
 def start_thread(user_id: str, file_ids: List[str], brief: str) -> str:
-    """Create an auto-edit thread, seed the brief turn, enqueue the pipeline."""
+    """Create a CHAT-FIRST edit thread. Nothing is drafted on creation: the
+    assistant converses and only runs an edit once the user confirms one (see
+    ``converse.respond`` + the /messages route). A non-empty ``brief`` is seeded
+    as the user's opening message so the conversation has a starting point."""
     from app.services.l3 import store
 
     thread_id = store.create_thread(user_id, file_ids, brief)
-    store.append_turn(thread_id, "user", brief or "Auto-edit the best cut from these clips.")
-    _defer_run(thread_id)
+    if brief.strip():
+        store.append_turn(thread_id, "user", brief.strip())
+    store.set_thread_status(thread_id, "ready")
     return thread_id

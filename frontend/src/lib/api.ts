@@ -600,6 +600,20 @@ export function createEditThread(
   );
 }
 
+export interface ThreadMessageResult {
+  reply: string;
+  intent: "chat" | "edit";
+  applying: boolean;
+}
+
+export function sendThreadMessage(id: string, text: string, token: string) {
+  return request<ThreadMessageResult>(`/api/edit/threads/${id}/messages`, {
+    method: "POST",
+    body: JSON.stringify({ text }),
+    token,
+  });
+}
+
 export function listEditThreads(token: string) {
   return request<{ threads: EditThreadListItem[] }>("/api/edit/threads", { token });
 }

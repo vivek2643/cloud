@@ -2,15 +2,18 @@
 L3 edit-thread API.
 
 Endpoints:
-  POST /api/edit/threads                     start a thread (clips + brief)
+  POST /api/edit/threads                     start a (chat-first) thread
+  POST /api/edit/threads/{id}/messages       a conversational turn
   GET  /api/edit/threads                     list my threads
   GET  /api/edit/threads/{id}                thread + latest document
   PUT  /api/edit/threads/{id}/document       save a human edit of the timeline
   GET  /api/edit/threads/{id}/versions       document version history
   GET  /api/edit/threads/{id}/versions/{v}   one specific document version
 
-The auto-editor runs asynchronously on the worker; clients poll GET {id}
-(status moves drafting -> ready). Each prompt drafts a fresh edit (one-shot).
+Chat-first: a thread is a conversation. The assistant talks, answers, and
+proposes edits; it only runs the arranger once the user CONFIRMS an edit, at
+which point the run happens asynchronously on the worker and clients poll
+GET {id} (status moves drafting -> ready).
 """
 from __future__ import annotations
 
@@ -30,6 +33,10 @@ router = APIRouter(prefix="/api/edit/threads", tags=["edit"])
 class CreateThreadBody(BaseModel):
     file_ids: List[str] = Field(min_length=1)
     brief: str = ""
+
+
+class MessageBody(BaseModel):
+    text: str = Field(min_length=1)
 
 
 class EditDocumentBody(BaseModel):
@@ -80,8 +87,39 @@ def _sanitize_operations(operations: List[dict]) -> List[dict]:
 
 @router.post("")
 def create_thread(body: CreateThreadBody, user_id: str = Depends(get_current_user_id)):
+    """Start a CHAT-FIRST edit thread. No edit is drafted on creation -- the
+    assistant converses and only edits once the user confirms one."""
     thread_id = auto_edit.start_thread(user_id, body.file_ids, body.brief)
-    return {"thread_id": thread_id, "status": "drafting", "mode": "auto"}
+    return {"thread_id": thread_id, "status": "ready", "mode": "chat"}
+
+
+@router.post("/{thread_id}/messages")
+def post_message(
+    thread_id: str, body: MessageBody, user_id: str = Depends(get_current_user_id)
+):
+    """A conversational turn. Appends the user's message, lets the assistant
+    reply, and -- only when the user has confirmed an edit -- kicks off the
+    arranger run on the worker (the client polls the thread for the new version).
+
+    Returns the assistant's reply and whether an edit is now being applied."""
+    _owned_thread(thread_id, user_id)
+    from app.services.l3 import converse
+
+    text = body.text.strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="Empty message")
+
+    store.append_turn(thread_id, "user", text)
+    result = converse.respond(thread_id)
+    store.append_turn(thread_id, "assistant", result.reply)
+
+    if result.intent == "edit" and result.brief:
+        store.update_brief(thread_id, result.brief)
+        store.set_thread_status(thread_id, "drafting")
+        auto_edit._defer_run(thread_id)
+        return {"reply": result.reply, "intent": "edit", "applying": True}
+
+    return {"reply": result.reply, "intent": "chat", "applying": False}
 
 
 @router.get("")

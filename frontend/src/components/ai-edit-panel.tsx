@@ -24,6 +24,7 @@ import { useAuthStore } from "@/stores/auth-store";
 import {
   createEditThread,
   getEditThread,
+  sendThreadMessage,
   type EditThread,
   type EditThreadStatus,
   type EditOperation,
@@ -31,11 +32,13 @@ import {
 
 const POLL_MS = 2000;
 
+type ChatMsg = { role: "user" | "assistant"; text: string };
+
 function scopeKey(ids: string[]) {
   return [...ids].sort().join(",");
 }
 
-// --- localStorage helpers (thread id + the user's typed turns per scope) ---
+// --- localStorage helpers (thread id + the chat transcript per thread) ---
 
 function loadThreadId(scope: string): string | null {
   if (typeof window === "undefined") return null;
@@ -47,16 +50,16 @@ function saveThreadId(scope: string, id: string) {
 function clearThreadId(scope: string) {
   window.localStorage.removeItem(`edit-thread:${scope}`);
 }
-function loadTurns(threadId: string): string[] {
+function loadMsgs(threadId: string): ChatMsg[] {
   if (typeof window === "undefined") return [];
   try {
-    return JSON.parse(window.localStorage.getItem(`edit-turns:${threadId}`) || "[]");
+    return JSON.parse(window.localStorage.getItem(`edit-msgs:${threadId}`) || "[]");
   } catch {
     return [];
   }
 }
-function saveTurns(threadId: string, turns: string[]) {
-  window.localStorage.setItem(`edit-turns:${threadId}`, JSON.stringify(turns));
+function saveMsgs(threadId: string, msgs: ChatMsg[]) {
+  window.localStorage.setItem(`edit-msgs:${threadId}`, JSON.stringify(msgs));
 }
 
 const STATUS_LABEL: Record<EditThreadStatus, string> = {
@@ -94,7 +97,7 @@ export function AiEditPanel() {
 
   const [threadId, setThreadId] = useState<string | null>(null);
   const [thread, setThread] = useState<EditThread | null>(null);
-  const [userTurns, setUserTurns] = useState<string[]>([]);
+  const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -147,7 +150,7 @@ export function AiEditPanel() {
     setThreadId(existing);
     setThread(null);
     if (existing) {
-      setUserTurns(loadTurns(existing));
+      setMessages(loadMsgs(existing));
       refresh(existing).then(() => {
         // resume polling if it was mid-draft
         getEditThread(existing, token || "").then((t) => {
@@ -155,7 +158,7 @@ export function AiEditPanel() {
         }).catch(() => {});
       });
     } else {
-      setUserTurns([]);
+      setMessages([]);
     }
     return stopPolling;
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -163,7 +166,7 @@ export function AiEditPanel() {
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
-  }, [thread, userTurns, busy]);
+  }, [thread, messages, busy]);
 
   // Seed the live working-document store whenever the authoritative version
   // changes (agent wrote a new version, or we loaded a thread). Keyed on
@@ -190,18 +193,36 @@ export function AiEditPanel() {
     setInput("");
     setError(null);
     setBusy(true);
-    // The auto-editor is one-shot: every prompt drafts a fresh edit.
-    const nextTurns = [text];
-    setUserTurns(nextTurns);
+
+    // Optimistically show the user's message right away.
+    const withUser: ChatMsg[] = [...messages, { role: "user", text }];
+    setMessages(withUser);
+
     try {
-      const { thread_id } = await createEditThread(aiScopeFileIds, text, token);
-      setThreadId(thread_id);
-      saveThreadId(scope, thread_id);
-      saveTurns(thread_id, nextTurns);
-      startPolling(thread_id);
-      await refresh(thread_id);
+      // Chat-first: ensure a thread exists (creating one drafts nothing), then
+      // send the message into the conversation.
+      let id = threadId;
+      if (!id) {
+        const created = await createEditThread(aiScopeFileIds, "", token);
+        id = created.thread_id;
+        setThreadId(id);
+        saveThreadId(scope, id);
+      }
+
+      const res = await sendThreadMessage(id, text, token);
+      const withReply: ChatMsg[] = [...withUser, { role: "assistant", text: res.reply }];
+      setMessages(withReply);
+      saveMsgs(id, withReply);
+
+      if (res.applying) {
+        // The assistant confirmed an edit; the arranger runs on the worker.
+        startPolling(id);
+        await refresh(id);
+      } else {
+        setBusy(false);
+      }
     } catch (e) {
-      setError(e instanceof Error ? e.message : "The edit run failed.");
+      setError(e instanceof Error ? e.message : "Message failed.");
       setBusy(false);
     }
   }
@@ -211,7 +232,7 @@ export function AiEditPanel() {
     clearThreadId(scope);
     setThreadId(null);
     setThread(null);
-    setUserTurns([]);
+    setMessages([]);
     setInput("");
     setError(null);
     setBusy(false);
@@ -284,25 +305,23 @@ export function AiEditPanel() {
 
       {/* Conversation */}
       <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto px-4 py-4">
-        {!threadId && (
-          <EmptyState />
-        )}
+        {messages.length === 0 && !busy && <EmptyState />}
 
-        {userTurns.map((t, i) => (
-          <Bubble key={`u${i}`} role="user">
-            {t}
+        {messages.map((m, i) => (
+          <Bubble key={`m${i}`} role={m.role}>
+            {m.text}
           </Bubble>
         ))}
 
         {doc && <DocumentView doc={doc} version={thread?.document_version ?? null} />}
 
-        {busy && status === "drafting" && (
+        {busy && (
           <div
             className="flex items-center gap-2 text-sm"
             style={{ color: "var(--muted)" }}
           >
             <Loader2 size={14} className="animate-spin" />
-            Planning the cut…
+            {status === "drafting" ? "Applying the edit…" : "Thinking…"}
           </div>
         )}
 
@@ -333,7 +352,7 @@ export function AiEditPanel() {
               }
             }}
             rows={1}
-            placeholder="Describe the edit — drafts a fresh cut each time… (e.g. punchy 30s reel)"
+            placeholder="Message EDSO — ask anything, or describe an edit…"
             className="max-h-32 min-h-[24px] flex-1 resize-none bg-transparent text-sm outline-none"
           />
           <button
@@ -373,10 +392,10 @@ function EmptyState() {
   return (
     <div className="flex flex-col items-center py-10 text-center">
       <Sparkles size={30} style={{ color: "var(--accent)" }} />
-      <p className="mt-3 text-sm font-semibold">Describe your edit</p>
+      <p className="mt-3 text-sm font-semibold">Chat about your footage</p>
       <p className="mt-1 max-w-[18rem] text-xs" style={{ color: "var(--muted)" }}>
-        Tell the editor what you want — length, tone, the story to tell. It reads
-        your footage, drafts a cut, and asks when it needs a decision.
+        Ask about your clips, talk through ideas, or describe an edit. EDSO only
+        changes the timeline after it proposes a cut and you say go.
       </p>
     </div>
   );
