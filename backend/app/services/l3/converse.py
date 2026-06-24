@@ -26,8 +26,11 @@ from app.services.llm import LLMClient, get_llm
 
 logger = logging.getLogger(__name__)
 
-# Keep the footage-map context bounded so chat stays cheap + snappy.
-_MAP_CHAR_CAP = 6000
+# The chat brain gets the WHOLE footage map (every clip + moment) so it has the
+# same total awareness the arranger does -- like handing a coding agent the full
+# repo map. The cap is only a runaway guard for pathologically large libraries
+# (~35k chars for 7 clips / 263 moments; ~9k tokens), well within context.
+_MAP_CHAR_CAP = 200_000
 
 
 @dataclass
