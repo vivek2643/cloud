@@ -65,12 +65,22 @@ interface EditDocState {
   trim: (segId: string, edge: "in" | "out", absMs: number) => void;
   nudge: (segId: string, edge: "in" | "out", delta: number) => void;
   move: (segId: string, dir: -1 | 1) => void;
+  /** Reorder a spine segment to an absolute index (drag-to-reorder). */
+  reorderSeg: (segId: string, toIndex: number) => void;
   split: (segId: string) => void;
   remove: (segId: string) => void;
 
   // --- operation mutators ---
   setGain: (opId: string, gainDb: number) => void;
   removeOp: (opId: string) => void;
+  /** Reposition a placed clip (place_video/pick_angle/place_audio) on the
+   * program clock, keeping its duration. `maxMs` clamps the end to the base. */
+  setOpFrom: (opId: string, fromMs: number, maxMs: number) => void;
+  /** Trim a placed clip's in/out edge in PROGRAM ms; the source range shifts
+   * with the moved edge so the visible content stays aligned. */
+  setOpEdge: (opId: string, edge: "in" | "out", progMs: number, maxMs: number) => void;
+  /** Restack a placed video clip onto another video layer (cross-track drag). */
+  setOpZ: (opId: string, z: number) => void;
 }
 
 export const useEditDocStore = create<EditDocState>((set, get) => ({
@@ -171,6 +181,19 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       return { timeline: next };
     }),
 
+  reorderSeg: (segId, toIndex) =>
+    set((st) => {
+      const from = st.timeline.findIndex((s) => s.seg_id === segId);
+      if (from < 0) return {};
+      const next = [...st.timeline];
+      const [moved] = next.splice(from, 1);
+      const ti = Math.max(0, Math.min(Math.round(toIndex), next.length));
+      next.splice(ti, 0, moved);
+      // No-op guard: identical order.
+      if (next.every((s, i) => s.seg_id === st.timeline[i].seg_id)) return {};
+      return { timeline: next };
+    }),
+
   split: (segId) =>
     set((st) => {
       const i = st.timeline.findIndex((s) => s.seg_id === segId);
@@ -203,4 +226,38 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
 
   removeOp: (opId) =>
     set((st) => ({ operations: st.operations.filter((o) => o.op_id !== opId) })),
+
+  setOpFrom: (opId, fromMs, maxMs) =>
+    set((st) => ({
+      operations: st.operations.map((o) => {
+        if (o.op_id !== opId || o.from_ms == null || o.to_ms == null) return o;
+        const dur = o.to_ms - o.from_ms;
+        const from = Math.max(0, Math.min(Math.round(fromMs), Math.max(0, maxMs - dur)));
+        return { ...o, from_ms: from, to_ms: from + dur };
+      }),
+    })),
+
+  setOpEdge: (opId, edge, progMs, maxMs) =>
+    set((st) => ({
+      operations: st.operations.map((o) => {
+        if (o.op_id !== opId || o.from_ms == null || o.to_ms == null) return o;
+        const srcIn = Math.round(o.src_in_ms ?? 0);
+        const srcOut = Math.round(o.src_out_ms ?? 0);
+        if (edge === "in") {
+          const from = Math.max(0, Math.min(Math.round(progMs), o.to_ms - MIN_SEG_MS));
+          const d = from - o.from_ms;
+          return { ...o, from_ms: from, src_in_ms: Math.max(0, srcIn + d) };
+        }
+        const to = Math.max(o.from_ms + MIN_SEG_MS, Math.min(Math.round(progMs), maxMs));
+        const d = to - o.to_ms;
+        return { ...o, to_ms: to, src_out_ms: Math.max(srcIn + 1, srcOut + d) };
+      }),
+    })),
+
+  setOpZ: (opId, z) =>
+    set((st) => ({
+      operations: st.operations.map((o) =>
+        o.op_id === opId ? { ...o, z: Math.round(z) } : o
+      ),
+    })),
 }));

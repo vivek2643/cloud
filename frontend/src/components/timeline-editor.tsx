@@ -13,37 +13,29 @@ import {
   VolumeX,
   Loader2,
   AlertCircle,
+  Play,
+  Pause,
 } from "lucide-react";
 import {
   saveEditDocument,
   listEditVersions,
   getEditVersion,
   type EditDocument,
-  type EditSegment,
   type EditOperation,
   type EditVersionListItem,
 } from "@/lib/api";
 import { useEditDocStore } from "@/stores/edit-doc-store";
+import { useTransport, formatTimecode, snapMs } from "@/stores/transport-store";
+import { documentToProject, type ProjectClip } from "@/lib/edit-project";
 
 function fmt(ms: number) {
   const s = Math.max(0, Math.round(ms / 1000));
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
-type Span = { seg: EditSegment; start: number; end: number };
-
-function layout(timeline: EditSegment[]): { spans: Span[]; total: number } {
-  let t = 0;
-  const spans: Span[] = [];
-  for (const seg of timeline) {
-    const dur = Math.max(0, seg.out_ms - seg.in_ms);
-    spans.push({ seg, start: t, end: t + dur });
-    t += dur;
-  }
-  return { spans, total: t };
-}
-
 const LABEL_W = 44;
+const LANE_GAP = 8; // matches the gap-2 between a lane label and its track
+const TRACK_LEFT = LABEL_W + LANE_GAP;
 
 export function TimelineEditor({
   threadId,
@@ -66,6 +58,10 @@ export function TimelineEditor({
   const removeSeg = useEditDocStore((s) => s.remove);
   const setGain = useEditDocStore((s) => s.setGain);
   const removeOpStore = useEditDocStore((s) => s.removeOp);
+  const setOpFrom = useEditDocStore((s) => s.setOpFrom);
+  const setOpEdge = useEditDocStore((s) => s.setOpEdge);
+  const setOpZ = useEditDocStore((s) => s.setOpZ);
+  const reorderSeg = useEditDocStore((s) => s.reorderSeg);
   const revertStore = useEditDocStore((s) => s.revert);
   const setWorking = useEditDocStore((s) => s.setWorking);
   const commit = useEditDocStore((s) => s.commit);
@@ -85,6 +81,7 @@ export function TimelineEditor({
   const [trackW, setTrackW] = useState(600);
 
   const trackRef = useRef<HTMLDivElement>(null);
+  const trackEls = useRef<Map<string, HTMLDivElement>>(new Map());
   const muteCache = useRef<Record<string, number>>({});
 
   useEffect(() => {
@@ -96,36 +93,73 @@ export function TimelineEditor({
     return () => ro.disconnect();
   }, []);
 
-  const { spans, total } = useMemo(() => layout(timeline), [timeline]);
+  const aspect = useEditDocStore((s) => s.aspect);
+  const project = useMemo(
+    () => documentToProject(timeline, operations, aspect),
+    [timeline, operations, aspect]
+  );
+  const total = project.durationMs;
   const pxPerMs = total > 0 ? trackW / total : 0;
 
-  const coverage = useMemo(() => operations.filter((o) => o.type === "place_video"), [operations]);
-  const anglePicks = useMemo(() => operations.filter((o) => o.type === "pick_angle"), [operations]);
-  const beds = useMemo(
-    () => operations.filter((o) => o.type === "place_audio"),
-    [operations]
-  );
-  const bedRoles = useMemo(() => {
-    const roles: string[] = [];
-    for (const b of beds) {
-      const r = b.role || "music";
-      if (!roles.includes(r)) roles.push(r);
-    }
-    return roles;
-  }, [beds]);
+  // Shared transport — playhead position + play state live in the same store the
+  // program monitor reads, so the two surfaces are always in lockstep.
+  const progMs = useTransport((s) => s.progMs);
+  const playing = useTransport((s) => s.playing);
+  const seek = useTransport((s) => s.seek);
+  const step = useTransport((s) => s.step);
+  const togglePlaying = useTransport((s) => s.togglePlaying);
 
-  // --- trim via drag handles (spine video; audio is coupled to it) ---
-  function startTrim(segId: string, edge: "in" | "out", e: React.PointerEvent) {
+  const playheadPx = pxPerMs > 0 ? Math.min(Math.max(progMs * pxPerMs, 0), trackW) : 0;
+
+  // Keyboard transport: space = play/pause, ←/→ = step a frame (shift = 10).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const el = document.activeElement as HTMLElement | null;
+      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable))
+        return;
+      if (e.code === "Space") {
+        e.preventDefault();
+        togglePlaying();
+      } else if (e.code === "ArrowLeft") {
+        e.preventDefault();
+        step(e.shiftKey ? -10 : -1);
+      } else if (e.code === "ArrowRight") {
+        e.preventDefault();
+        step(e.shiftKey ? 10 : 1);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [togglePlaying, step]);
+
+  function selectClip(clip: ProjectClip) {
+    if (clip.origin.kind === "spine") {
+      setSelectedOp(null);
+      select(clip.origin.segId);
+    } else {
+      select(null);
+      setSelectedOp(clip.origin.opId);
+    }
+  }
+
+  // --- trim a clip's edge by dragging its handle (frame-snapped) ---
+  function startTrim(clip: ProjectClip, edge: "in" | "out", e: React.PointerEvent) {
     e.preventDefault();
     e.stopPropagation();
+    if (pxPerMs <= 0 || !clip.trimmable) return;
+    selectClip(clip);
     const startX = e.clientX;
-    const seg = timeline.find((s) => s.seg_id === segId);
-    if (!seg || pxPerMs <= 0) return;
-    const startIn = seg.in_ms;
-    const startOut = seg.out_ms;
     const onMove = (ev: PointerEvent) => {
-      const dMs = Math.round((ev.clientX - startX) / pxPerMs);
-      trimSeg(segId, edge, edge === "in" ? startIn + dMs : startOut + dMs);
+      const dMs = (ev.clientX - startX) / pxPerMs;
+      if (clip.origin.kind === "spine") {
+        // source-domain trim (in_ms/out_ms); the coupled audio follows.
+        const base = edge === "in" ? clip.srcInMs : clip.srcOutMs;
+        trimSeg(clip.origin.segId, edge, snapMs(base + dMs));
+      } else {
+        // program-domain trim on a placed op.
+        const base = edge === "in" ? clip.progStartMs : clip.progEndMs;
+        setOpEdge(clip.origin.opId, edge, snapMs(base + dMs), total);
+      }
     };
     const onUp = () => {
       window.removeEventListener("pointermove", onMove);
@@ -135,13 +169,80 @@ export function TimelineEditor({
     window.addEventListener("pointerup", onUp);
   }
 
-  function selectSeg(id: string) {
-    setSelectedOp(null);
-    select(id);
+  /** Which rendered track the pointer is currently over (vertical hit-test). */
+  function trackAtY(clientY: number) {
+    for (const track of project.tracks) {
+      const el = trackEls.current.get(track.id);
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      if (clientY >= r.top && clientY <= r.bottom) return track;
+    }
+    return null;
   }
-  function selectOp(id: string) {
-    select(null);
-    setSelectedOp(id);
+
+  // --- move a placed clip freely along the program clock + across video
+  //     layers (horizontal = reposition, vertical = restack onto another
+  //     video track's z). Frame-snapped. ---
+  function startMove(clip: ProjectClip, e: React.PointerEvent) {
+    if (!clip.movable || clip.origin.kind !== "op") return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (pxPerMs <= 0) return;
+    selectClip(clip);
+    const opId = clip.origin.opId;
+    const startX = e.clientX;
+    const startFrom = clip.progStartMs;
+    const onMove = (ev: PointerEvent) => {
+      const dMs = (ev.clientX - startX) / pxPerMs;
+      setOpFrom(opId, snapMs(startFrom + dMs), total);
+      // Cross-track: only video overlays restack, only onto another non-base
+      // video layer (never onto the spine or an audio track).
+      if (clip.kind === "video") {
+        const tgt = trackAtY(ev.clientY);
+        if (tgt && tgt.kind === "video" && !tgt.isBase && tgt.z !== clip.z) {
+          setOpZ(opId, tgt.z);
+        }
+      }
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
+  // --- drag a base (spine) video clip to reorder it within the spine ---
+  function startReorder(clip: ProjectClip, e: React.PointerEvent) {
+    if (clip.origin.kind !== "spine" || clip.kind !== "video") return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (pxPerMs <= 0) return;
+    selectClip(clip);
+    const segId = clip.origin.segId;
+    const baseId = clip.trackId;
+    const onMove = (ev: PointerEvent) => {
+      const el = trackEls.current.get(baseId);
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const progMs = (ev.clientX - rect.left) / pxPerMs;
+      // Insertion index among the OTHER base clips (count whose midpoint is
+      // left of the cursor) — matches reorderSeg's post-removal splice index.
+      const others = project.clips.filter(
+        (c) => c.trackId === baseId && c.id !== clip.id
+      );
+      let idx = 0;
+      for (const c of others) {
+        if (progMs > (c.progStartMs + c.progEndMs) / 2) idx++;
+      }
+      reorderSeg(segId, idx);
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
   }
 
   function toggleMute(op: EditOperation) {
@@ -259,128 +360,119 @@ export function TimelineEditor({
         </div>
       )}
 
-      {/* Lanes: video on top, audio below (shared time scale) */}
-      <div className="space-y-1">
-        {/* Coverage (V2) — only when present */}
-        {coverage.length > 0 && (
-          <Lane label="V2">
-            <div className="relative h-full w-full">
-              {coverage.map((op) => (
-                <Block
-                  key={op.op_id}
-                  left={(op.from_ms ?? 0) * pxPerMs}
-                  width={Math.max(4, ((op.to_ms ?? 0) - (op.from_ms ?? 0)) * pxPerMs)}
-                  selected={selectedOp === op.op_id}
-                  onClick={() => selectOp(op.op_id)}
-                  color="#7c5cff"
-                  title={`Coverage ${op.source_file_id?.slice(0, 6)} · ${fmt(op.from_ms ?? 0)}–${fmt(op.to_ms ?? 0)}`}
-                >
-                  cover
-                </Block>
-              ))}
-            </div>
-          </Lane>
-        )}
+      {/* Transport strip */}
+      <div className="flex items-center gap-1">
+        <button
+          onClick={togglePlaying}
+          disabled={total <= 0}
+          className="rounded-full p-1.5 transition-opacity disabled:opacity-30"
+          style={{ background: "var(--accent)", color: "var(--background)" }}
+          title={playing ? "Pause (space)" : "Play (space)"}
+        >
+          {playing ? <Pause size={13} /> : <Play size={13} />}
+        </button>
+        <IconBtn title="Previous frame (←)" onClick={() => step(-1)}>
+          <ChevronLeft size={14} />
+        </IconBtn>
+        <IconBtn title="Next frame (→)" onClick={() => step(1)}>
+          <ChevronRight size={14} />
+        </IconBtn>
+        <span className="ml-auto text-[11px] tabular-nums" style={{ color: "var(--muted)" }}>
+          {formatTimecode(progMs)} <span style={{ opacity: 0.5 }}>/ {formatTimecode(total)}</span>
+        </span>
+      </div>
 
-        {/* Angle switches (VA) — synced multicam re-points the spine picture */}
-        {anglePicks.length > 0 && (
-          <Lane label="VA">
-            <div className="relative h-full w-full">
-              {anglePicks.map((op) => (
-                <Block
-                  key={op.op_id}
-                  left={(op.from_ms ?? 0) * pxPerMs}
-                  width={Math.max(4, ((op.to_ms ?? 0) - (op.from_ms ?? 0)) * pxPerMs)}
-                  selected={selectedOp === op.op_id}
-                  onClick={() => selectOp(op.op_id)}
-                  color="#1f9ed1"
-                  title={`Angle ${op.source_file_id?.slice(0, 6)} · ${fmt(op.from_ms ?? 0)}–${fmt(op.to_ms ?? 0)}`}
-                >
-                  angle
-                </Block>
-              ))}
-            </div>
-          </Lane>
-        )}
+      {/* Ruler + lanes + playhead (shared time scale) */}
+      <div className="relative">
+        <TimeRuler total={total} pxPerMs={pxPerMs} onSeek={seek} />
 
-        {/* Video spine (V1) — editable */}
-        <Lane label="V1" trackRef={trackRef}>
-          <div className="relative h-full w-full">
-            {spans.map(({ seg, start, end }) => {
-              const isSel = selected === seg.seg_id;
-              return (
-                <Block
-                  key={seg.seg_id}
-                  left={start * pxPerMs}
-                  width={Math.max(8, (end - start) * pxPerMs)}
-                  selected={isSel}
-                  onClick={() => selectSeg(seg.seg_id)}
-                  color="var(--accent)"
-                  title={`${seg.file_id.slice(0, 6)} · ${fmt(seg.in_ms)}–${fmt(seg.out_ms)}`}
-                >
-                  <span
-                    onPointerDown={(e) => startTrim(seg.seg_id, "in", e)}
-                    className="absolute left-0 top-0 h-full w-1.5 cursor-ew-resize"
-                    style={{ background: "rgba(0,0,0,0.35)" }}
-                  />
-                  <span className="truncate px-2">{seg.file_id.slice(0, 4)}</span>
-                  <span
-                    onPointerDown={(e) => startTrim(seg.seg_id, "out", e)}
-                    className="absolute right-0 top-0 h-full w-1.5 cursor-ew-resize"
-                    style={{ background: "rgba(0,0,0,0.35)" }}
-                  />
-                </Block>
-              );
-            })}
-          </div>
-        </Lane>
-
-        {/* Audio spine (A1) — coupled to V1, mirrors the same spans */}
-        <Lane label="A1">
-          <div className="relative h-full w-full">
-            {spans.map(({ seg, start, end }) => (
-              <Block
-                key={seg.seg_id}
-                left={start * pxPerMs}
-                width={Math.max(8, (end - start) * pxPerMs)}
-                selected={selected === seg.seg_id}
-                onClick={() => selectSeg(seg.seg_id)}
-                color="#2bb673"
-                title={`Dialogue · ${seg.file_id.slice(0, 6)}`}
-                muted
+        {/* Tracks: generic NLE lanes (top → bottom), one Block per clip. */}
+        <div className="space-y-1">
+          {project.tracks.map((track) => {
+            const trackClips = project.clips.filter((c) => c.trackId === track.id);
+            const isWidthTrack = track.isBase && track.kind === "video";
+            return (
+              <Lane
+                key={track.id}
+                label={track.label}
+                innerRef={(el) => {
+                  const m = trackEls.current;
+                  if (el) m.set(track.id, el);
+                  else m.delete(track.id);
+                  if (isWidthTrack)
+                    (trackRef as React.MutableRefObject<HTMLDivElement | null>).current = el;
+                }}
               >
-                <span className="truncate px-2">dlg</span>
-              </Block>
-            ))}
-          </div>
-        </Lane>
+                <div className="relative h-full w-full">
+                  {trackClips.map((clip) => {
+                    const selectedClip =
+                      clip.origin.kind === "spine"
+                        ? selected === clip.origin.segId
+                        : selectedOp === clip.origin.opId;
+                    const bodyDrag = clip.movable
+                      ? (e: React.PointerEvent) => startMove(clip, e)
+                      : clip.kind === "video" && clip.origin.kind === "spine"
+                        ? (e: React.PointerEvent) => startReorder(clip, e)
+                        : undefined;
+                    return (
+                      <Block
+                        key={clip.id}
+                        left={clip.progStartMs * pxPerMs}
+                        width={Math.max(8, (clip.progEndMs - clip.progStartMs) * pxPerMs)}
+                        selected={selectedClip}
+                        onClick={() => selectClip(clip)}
+                        onBodyPointerDown={bodyDrag}
+                        color={clip.color}
+                        muted={clip.muted}
+                        movable={!!bodyDrag}
+                        title={`${clip.label} · ${fmt(clip.progStartMs)}–${fmt(clip.progEndMs)}`}
+                      >
+                        {clip.trimmable && (
+                          <span
+                            onPointerDown={(e) => startTrim(clip, "in", e)}
+                            className="absolute left-0 top-0 h-full w-1.5 cursor-ew-resize"
+                            style={{ background: "rgba(0,0,0,0.35)" }}
+                          />
+                        )}
+                        <span className="pointer-events-none truncate px-2">{clip.label}</span>
+                        {clip.trimmable && (
+                          <span
+                            onPointerDown={(e) => startTrim(clip, "out", e)}
+                            className="absolute right-0 top-0 h-full w-1.5 cursor-ew-resize"
+                            style={{ background: "rgba(0,0,0,0.35)" }}
+                          />
+                        )}
+                      </Block>
+                    );
+                  })}
+                </div>
+              </Lane>
+            );
+          })}
+        </div>
 
-        {/* Bed lanes (music / sfx) */}
-        {bedRoles.map((role, i) => (
-          <Lane key={role} label={`A${i + 2}`}>
-            <div className="relative h-full w-full">
-              {beds
-                .filter((b) => (b.role || "music") === role)
-                .map((op) => {
-                  const muted = (op.gain_db ?? 0) <= -119;
-                  return (
-                    <Block
-                      key={op.op_id}
-                      left={(op.from_ms ?? 0) * pxPerMs}
-                      width={Math.max(4, ((op.to_ms ?? 0) - (op.from_ms ?? 0)) * pxPerMs)}
-                      selected={selectedOp === op.op_id}
-                      onClick={() => selectOp(op.op_id)}
-                      color={role === "sfx" ? "#e0883a" : "#3a86e0"}
-                      title={`${role} · ${fmt(op.from_ms ?? 0)}–${fmt(op.to_ms ?? 0)}`}
-                      muted={muted}
-                    >
-                      <span className="truncate px-2">{role}</span>
-                    </Block>
-                  );
-                })}
-            </div>
-          </Lane>
-        ))}
+        {/* Playhead — spans the ruler + every lane */}
+        {pxPerMs > 0 && (
+          <div
+            className="pointer-events-none absolute bottom-0 z-10"
+            style={{ left: TRACK_LEFT + playheadPx, top: 0 }}
+          >
+            <div className="h-full" style={{ width: 2, background: "var(--foreground)" }} />
+            <div
+              className="absolute"
+              style={{
+                top: 0,
+                left: 1,
+                transform: "translateX(-50%)",
+                width: 0,
+                height: 0,
+                borderLeft: "4px solid transparent",
+                borderRight: "4px solid transparent",
+                borderTop: "6px solid var(--foreground)",
+              }}
+            />
+          </div>
+        )}
       </div>
 
       {/* Inspector: selected clip (spine) or selected layer (op) */}
@@ -445,14 +537,94 @@ export function TimelineEditor({
   );
 }
 
+/** Clickable/scrubbable time ruler, aligned to the lane tracks. */
+function TimeRuler({
+  total,
+  pxPerMs,
+  onSeek,
+}: {
+  total: number;
+  pxPerMs: number;
+  onSeek: (ms: number) => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const draggingRef = useRef(false);
+
+  const seekAtClientX = useCallback(
+    (clientX: number) => {
+      const el = ref.current;
+      if (!el || pxPerMs <= 0) return;
+      const rect = el.getBoundingClientRect();
+      onSeek((clientX - rect.left) / pxPerMs);
+    },
+    [pxPerMs, onSeek]
+  );
+
+  const onPointerDown = (e: React.PointerEvent) => {
+    if (pxPerMs <= 0) return;
+    e.preventDefault();
+    draggingRef.current = true;
+    seekAtClientX(e.clientX);
+    const onMove = (ev: PointerEvent) => {
+      if (draggingRef.current) seekAtClientX(ev.clientX);
+    };
+    const onUp = () => {
+      draggingRef.current = false;
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  };
+
+  const ticks: React.ReactNode[] = [];
+  if (pxPerMs > 0 && total > 0) {
+    const secPx = 1000 * pxPerMs;
+    const candidates = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
+    let stepSec = candidates[candidates.length - 1];
+    for (const s of candidates) {
+      if (s * secPx >= 48) {
+        stepSec = s;
+        break;
+      }
+    }
+    for (let sec = 0; sec * 1000 <= total + 1; sec += stepSec) {
+      const left = sec * 1000 * pxPerMs;
+      ticks.push(
+        <div key={sec} className="absolute top-0 flex flex-col items-start" style={{ left }}>
+          <div style={{ width: 1, height: 5, background: "var(--border)" }} />
+          <span className="mt-0.5 text-[9px] tabular-nums" style={{ color: "var(--muted)" }}>
+            {formatTimecode(sec * 1000)}
+          </span>
+        </div>
+      );
+    }
+  }
+
+  return (
+    <div className="mb-1 flex items-stretch gap-2">
+      <span className="shrink-0" style={{ width: LABEL_W }} />
+      <div
+        ref={ref}
+        onPointerDown={onPointerDown}
+        className="relative h-6 min-w-0 flex-1 cursor-pointer select-none"
+        style={{ touchAction: "none" }}
+        title="Click or drag to scrub"
+      >
+        {ticks}
+      </div>
+    </div>
+  );
+}
+
 function Lane({
   label,
   children,
-  trackRef,
+  innerRef,
 }: {
   label: string;
   children: React.ReactNode;
-  trackRef?: React.Ref<HTMLDivElement>;
+  innerRef?: (el: HTMLDivElement | null) => void;
 }) {
   return (
     <div className="flex items-stretch gap-2">
@@ -463,7 +635,7 @@ function Lane({
         {label}
       </span>
       <div
-        ref={trackRef}
+        ref={innerRef}
         className="relative h-9 min-w-0 flex-1 overflow-hidden rounded"
         style={{ background: "var(--sidebar)" }}
       >
@@ -478,25 +650,32 @@ function Block({
   width,
   selected,
   onClick,
+  onBodyPointerDown,
   color,
   title,
   children,
   muted,
+  movable,
 }: {
   left: number;
   width: number;
   selected: boolean;
   onClick: () => void;
+  onBodyPointerDown?: (e: React.PointerEvent) => void;
   color: string;
   title: string;
   children: React.ReactNode;
   muted?: boolean;
+  movable?: boolean;
 }) {
   return (
     <div
       onClick={onClick}
+      onPointerDown={onBodyPointerDown}
       title={title}
-      className="absolute top-0 flex h-full cursor-pointer items-center overflow-hidden rounded text-[10px] text-white"
+      className={`absolute top-0 flex h-full items-center overflow-hidden rounded text-[10px] text-white ${
+        movable ? "cursor-grab active:cursor-grabbing" : "cursor-pointer"
+      }`}
       style={{
         left,
         width,
@@ -504,6 +683,7 @@ function Block({
         opacity: muted ? 0.45 : 1,
         outline: selected ? "2px solid var(--foreground)" : "none",
         outlineOffset: -2,
+        touchAction: "none",
       }}
     >
       {children}

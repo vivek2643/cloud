@@ -15,13 +15,9 @@ import {
 import { getFile, getFilePlaybackUrl, type ResolvedTimeline } from "@/lib/api";
 import { resolveTimeline, sampleMotion } from "@/lib/resolve-timeline";
 import { useEditDocStore } from "@/stores/edit-doc-store";
+import { useTransport, FRAME_MS, formatTimecode } from "@/stores/transport-store";
 import { useAudioMixer } from "./use-audio-mixer";
 import { useVideoPicture } from "./use-video-picture";
-
-function fmtClock(ms: number): string {
-  const s = Math.max(0, Math.floor(ms / 1000));
-  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
-}
 
 /**
  * Program monitor. Reads the LIVE working document from the edit store, resolves
@@ -49,14 +45,25 @@ export function CompositePreview({ token }: { token: string | undefined }) {
     aspect === "portrait" ? "9 / 16" : aspect === "square" ? "1 / 1" : "16 / 9";
 
   const [urls, setUrls] = useState<Record<string, string>>({});
-  const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(false);
-  const [progMs, setProgMs] = useState(0);
 
+  // Shared transport: the single source of truth for program time + play state,
+  // read by both this monitor and the timeline so they stay in lockstep.
+  const playing = useTransport((s) => s.playing);
+  const progMs = useTransport((s) => s.progMs);
+  const seekSeq = useTransport((s) => s.seekSeq);
+  const seekTargetMs = useTransport((s) => s.seekTargetMs);
+  const setPlaying = useTransport((s) => s.setPlaying);
+  const togglePlaying = useTransport((s) => s.togglePlaying);
+  const publish = useTransport((s) => s.publish);
+  const seekTo = useTransport((s) => s.seek);
+  const setDuration = useTransport((s) => s.setDuration);
+  const resetTransport = useTransport((s) => s.reset);
+
+  // Engine internals (continuous clock; published time is frame-snapped).
   const progRef = useRef(0);
-  const playingRef = useRef(false);
   const lastTsRef = useRef(0);
-  const lastDisplayRef = useRef(0);
+  const lastFrameRef = useRef(-1);
   const rafRef = useRef<number | null>(null);
 
   const duration = resolved?.duration_ms ?? 0;
@@ -119,70 +126,77 @@ export function CompositePreview({ token }: { token: string | undefined }) {
     }
   }, []);
 
-  const pauseAll = useCallback(() => {
-    playingRef.current = false;
-    setPlaying(false);
-    mixer.stop();
-    picture.stop();
-    stopRaf();
-  }, [mixer, picture, stopRaf]);
+  // Publish program duration so the transport can clamp seeks.
+  useEffect(() => {
+    setDuration(duration);
+  }, [duration, setDuration]);
 
+  // The rAF clock: advance the continuous internal clock, drive the media, and
+  // publish a frame-snapped time only when the frame index changes (≈fps Hz).
   const loop = useCallback(
     (ts: number) => {
       if (lastTsRef.current) {
         const dt = ts - lastTsRef.current;
-        let t = progRef.current + dt;
+        const t = progRef.current + dt;
         if (t >= duration) {
-          t = duration;
           progRef.current = 0;
-          lastDisplayRef.current = 0;
+          lastFrameRef.current = 0;
           mixer.sync(0, false);
           picture.sync(0, false);
-          pauseAll();
-          setProgMs(0);
+          publish(0);
+          setPlaying(false); // the [playing] effect stops the engine
           return;
         }
         progRef.current = t;
         mixer.sync(t, true);
         picture.sync(t, true);
-        if (Math.abs(t - lastDisplayRef.current) >= 100) {
-          lastDisplayRef.current = t;
-          setProgMs(t);
+        const frame = Math.round(t / FRAME_MS);
+        if (frame !== lastFrameRef.current) {
+          lastFrameRef.current = frame;
+          publish(frame * FRAME_MS);
         }
       }
       lastTsRef.current = ts;
       rafRef.current = requestAnimationFrame(loop);
     },
-    [duration, mixer, picture, pauseAll]
+    [duration, mixer, picture, publish, setPlaying]
   );
 
-  function togglePlay() {
-    if (!hasTimeline) return;
-    if (playingRef.current) {
-      pauseAll();
+  // Start/stop the engine purely from the shared `playing` flag, so the play
+  // button here and spacebar/scrub on the timeline drive the same machine.
+  useEffect(() => {
+    if (!playing || !hasTimeline) {
+      mixer.stop();
+      picture.stop();
+      stopRaf();
+      lastTsRef.current = 0;
       return;
     }
     mixer.arm();
-    playingRef.current = true;
-    setPlaying(true);
     lastTsRef.current = 0;
     mixer.sync(progRef.current, true);
     picture.sync(progRef.current, true);
     stopRaf();
     rafRef.current = requestAnimationFrame(loop);
-  }
+    return stopRaf;
+  }, [playing, hasTimeline, loop, mixer, picture, stopRaf]);
 
-  const seek = useCallback(
-    (t: number) => {
-      progRef.current = t;
-      lastDisplayRef.current = t;
-      lastTsRef.current = 0;
-      setProgMs(t);
-      mixer.sync(t, playingRef.current);
-      picture.sync(t, playingRef.current);
-    },
-    [mixer, picture]
-  );
+  // External seek (timeline click/scrub, step buttons, monitor scrubber): jump
+  // the engine clock + media to the requested frame.
+  useEffect(() => {
+    progRef.current = seekTargetMs;
+    lastTsRef.current = 0;
+    lastFrameRef.current = Math.round(seekTargetMs / FRAME_MS);
+    const playingNow = useTransport.getState().playing;
+    mixer.sync(seekTargetMs, playingNow);
+    picture.sync(seekTargetMs, playingNow);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seekSeq]);
+
+  function handleTogglePlay() {
+    if (!hasTimeline) return;
+    togglePlaying();
+  }
 
   useEffect(() => {
     mixer.setMuted(muted);
@@ -194,17 +208,17 @@ export function CompositePreview({ token }: { token: string | undefined }) {
     [resolved]
   );
   useEffect(() => {
-    pauseAll();
+    resetTransport();
     progRef.current = 0;
-    lastDisplayRef.current = 0;
-    setProgMs(0);
+    lastTsRef.current = 0;
+    lastFrameRef.current = 0;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shapeKey]);
 
-  // While paused, still keep the picture parked on the current frame as edits
-  // change what's under the playhead.
+  // While paused, keep the picture parked on the current frame as edits change
+  // what's under the playhead.
   useEffect(() => {
-    if (!playingRef.current) {
+    if (!useTransport.getState().playing) {
       mixer.sync(progRef.current, false);
       picture.sync(progRef.current, false);
     }
@@ -313,16 +327,16 @@ export function CompositePreview({ token }: { token: string | undefined }) {
           </div>
         )}
 
-        {hasTimeline && (activeVideo?.kind === "coverage" || activeBeds > 0) && (
+        {hasTimeline && ((activeVideo && activeVideo.z > 0) || activeBeds > 0) && (
           <div className="absolute left-2 top-2 flex gap-1">
-            {activeVideo?.kind === "coverage" && (
+            {activeVideo && activeVideo.z > 0 && (
               <span className="flex items-center gap-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] text-white">
-                <Layers size={10} /> coverage
+                <Layers size={10} /> overlay
               </span>
             )}
             {activeBeds > 0 && (
               <span className="flex items-center gap-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] text-white">
-                <Music size={10} /> {activeBeds} bed{activeBeds === 1 ? "" : "s"}
+                <Music size={10} /> {activeBeds} audio
               </span>
             )}
           </div>
@@ -336,20 +350,21 @@ export function CompositePreview({ token }: { token: string | undefined }) {
             type="range"
             min={0}
             max={Math.max(1, duration)}
+            step={FRAME_MS}
             value={Math.min(progMs, duration)}
-            onChange={(e) => seek(Number(e.target.value))}
+            onChange={(e) => seekTo(Number(e.target.value))}
             className="mt-2 w-full accent-[var(--accent)]"
           />
           <div className="mt-1 flex items-center gap-2">
             <button
-              onClick={() => seek(Math.max(0, progMs - 5000))}
+              onClick={() => seekTo(progMs - 5000)}
               className="rounded p-1 transition-colors hover:bg-[var(--accent-soft)]"
               title="Back 5s"
             >
               <SkipBack size={15} />
             </button>
             <button
-              onClick={togglePlay}
+              onClick={handleTogglePlay}
               className="rounded-full p-1.5"
               style={{ background: "var(--accent)", color: "var(--background)" }}
               title={playing ? "Pause" : "Play"}
@@ -357,7 +372,7 @@ export function CompositePreview({ token }: { token: string | undefined }) {
               {playing ? <Pause size={15} /> : <Play size={15} />}
             </button>
             <button
-              onClick={() => seek(Math.min(duration, progMs + 5000))}
+              onClick={() => seekTo(progMs + 5000)}
               className="rounded p-1 transition-colors hover:bg-[var(--accent-soft)]"
               title="Forward 5s"
             >
@@ -371,7 +386,7 @@ export function CompositePreview({ token }: { token: string | undefined }) {
               {muted ? <VolumeX size={15} /> : <Volume2 size={15} />}
             </button>
             <span className="ml-auto text-xs tabular-nums" style={{ color: "var(--muted)" }}>
-              {fmtClock(progMs)} / {fmtClock(duration)}
+              {formatTimecode(progMs)} / {formatTimecode(duration)}
             </span>
           </div>
         </>
