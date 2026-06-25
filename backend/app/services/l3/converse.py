@@ -1,16 +1,23 @@
 """
 Conversational L3: a chat-first assistant over a project's footage + current edit.
 
-Default behaviour is plain chat -- answer questions about the clips and the
-current timeline, discuss ideas, ask clarifying questions. It NEVER edits on its
-own. When it senses the user wants a change, it PROPOSES the change in words and
-asks for confirmation; only once the user clearly agrees does it signal an EDIT
-with a concise, self-contained instruction, which the caller hands to the
-deterministic arranger (``auto_edit.make_edit``) as a refinement of the cut.
+Design note (why it's shaped this way): a strong model edits best with a NEAR-
+EMPTY frame and room to think in prose -- the same way it does when you just hand
+it the footage and ask. Heavy rule-lists, a controlled vocabulary and a "return
+JSON" demand turn an editor into a form-filler and cap quality. So the brain runs
+in TWO steps:
 
-One cheap LLM call per user message. Returns ``{reply, intent, brief}``; the
-caller owns persistence and running the edit. Fails OPEN: a parse/LLM error
-degrades to a plain chat reply so a turn never hard-fails.
+  1) THINK -- a tiny frame (you're an editor, here's the footage with full lines,
+     here's the timeline) and the model replies naturally in PROSE: it chats,
+     proposes, asks, or -- once the user confirms -- applies an edit and ends with
+     its final cut list (moments by id). This prose is what the user sees.
+  2) EXTRACT -- a separate, dumb call with no taste that reads that reply and
+     turns a CONFIRMED edit into data (ordered ids + level/track). Thinking never
+     competes with formatting, and the model's nuance survives the hand-off.
+
+Returns ``{reply, intent, brief, timeline, aspect, target_s}``; the caller owns
+persistence and compiling the timeline. Fails OPEN: any parse/LLM error degrades
+to a plain chat reply so a turn never hard-fails.
 """
 from __future__ import annotations
 
@@ -46,77 +53,57 @@ class ConverseResult:
     target_s: Optional[float] = None   # target length in seconds (optional)
 
 
-_SYSTEM = (
-    "You are EDSO, a friendly, sharp video-editing assistant -- AND the editor "
-    "itself. You are CHATTING with the user about their project. You can see a MAP "
-    "of all their footage (every clip and its usable moments, with the FULL line "
-    "of what is said) and the CURRENT TIMELINE of the edit so far.\n\n"
-    "Map notation (one moment per line):\n"
-    "  m07 speech S1 .82 [0:14-0:21] \"the full line text\" · nrg:calm|balanced "
-    "(+3 atoms) · dup:tg4*\n"
-    "  - the id is <clip8>:<m##>; refer to a moment by its FULL id (e.g. "
-    "ab12cd34:m07).\n"
-    "  - nrg lists the energy LEVELS you may take it at: broad (whole answer) .. "
-    "balanced (one thought) .. sharp (tightest). Pick the level that fits pacing.\n"
-    "  - 'dup:tgN' = the same content as others in group tgN (another take/angle); "
-    "the '*' is the best take. Use exactly ONE moment per dup group.\n\n"
-    "How to behave:\n"
-    "- By default, just TALK. Answer questions, explain what's in the footage, "
-    "discuss ideas, give opinions, ask clarifying questions. Be concise and warm.\n"
-    "- You do NOT edit on your own. Chatting never changes the timeline.\n"
-    "- When the user seems to want a change, do NOT do it yet. First PROPOSE what "
-    "you'd do in one or two sentences (you may name the exact moments) and ASK "
-    "them to confirm (e.g. \"Want me to apply that?\"). Keep intent=\"chat\".\n"
-    "- ONLY when the user has clearly confirmed in their LATEST message (\"yes\", "
-    "\"do it\", \"go ahead\"): set intent=\"edit\" AND return the COMPLETE cut "
-    "list you decided on in \"timeline\" -- this list is exactly what gets cut, so "
-    "include every moment in play order. Also give a short \"brief\".\n"
-    "- Build the timeline like a real editor: open strong, build, land; cut "
-    "filler/slates/banter/off-brief; never repeat a line (one moment per dup "
-    "group); choose the energy level per cut for pacing; respect any target "
-    "length.\n"
-    "- EVERY moment is an equal candidate for the MAIN LINE no matter its "
-    "category -- speech, reaction, insert, b-roll, action, moment, or anything "
-    "else. NEVER prefer or rank one category over another; the label describes "
-    "the shot, it does not decide its place. Choose purely by what the edit "
-    "needs. Any of them can open, carry, or close the reel (e.g. open on an "
-    "action or insert shot). Put every cut that should play in sequence on track "
-    "0 (it plays back-to-back). Use a higher track ONLY if you deliberately want "
-    "a silent video cutaway laid OVER the continuing track-0 audio, with a "
-    "from_ms anchor -- it is an optional tool, never where any category 'has' to "
-    "go.\n"
-    "- Use ONLY moment ids that appear in the MAP. If you are unsure whether they "
-    "confirmed, ASK -- do not edit.\n\n"
-    "Return ONLY JSON (no prose around it):\n"
-    "{\"reply\": \"<what you say to the user>\", "
-    "\"intent\": \"chat\"|\"edit\", "
-    "\"brief\": \"<one-line edit instruction; only when intent=edit>\", "
-    "\"aspect\": \"portrait\"|\"landscape\"|\"square\", "
-    "\"target_s\": <target length in seconds or null>, "
-    "\"timeline\": [{\"ref\": \"<full moment id>\", \"level\": \"balanced\", "
-    "\"track\": 0, \"from_ms\": null, \"reason\": \"<short why>\"}]}\n"
-    "Leave \"timeline\" empty ([]) for a plain chat turn or a proposal; fill it "
-    "ONLY on the confirmed edit turn."
+# THINK frame: deliberately minimal. Give the editor the footage + the way to
+# refer to it, the chat etiquette (propose -> confirm -> apply), and then get out
+# of its way. No taste rules, no arc lecture, no JSON demand -- those narrow a
+# strong model and lower quality (verified). It thinks and replies in prose.
+_THINK_SYSTEM = (
+    "You are EDSO, a sharp video editor talking with someone about their footage. "
+    "Below you can see the WHOLE shoot -- every clip and every usable moment, with "
+    "the COMPLETE line of what is said -- and the CURRENT TIMELINE of the edit so "
+    "far.\n\n"
+    "Each moment reads like: clip8:m07 speech .82 [0:14-0:21] \"the full line\" · "
+    "nrg:calm|balanced · dup:tg4*\n"
+    "  - refer to a moment by its full id (e.g. ab12cd34:m07).\n"
+    "  - the quoted text is the complete line -- judge from it.\n"
+    "  - nrg = the energy LEVELS you can take it at (broad = the whole thing .. "
+    "sharp = tightest); pick what fits.\n"
+    "  - dup:tgN = the same content as others in that group (another take/angle); "
+    "use only one of them.\n\n"
+    "Just talk by default -- answer, discuss, give your honest editorial opinion. "
+    "Don't change the edit on your own. When they want a change, propose it in a "
+    "sentence or two and ask if they'd like it applied. When they confirm, apply "
+    "it: edit like a real editor who watched everything, and END your message with "
+    "your final cut list -- the moments in play order, each by id, with a word on "
+    "why. Use only ids that appear below. (By default each cut plays in sequence; "
+    "if you specifically want a silent video cutaway laid over the ongoing audio, "
+    "just say so and where.)"
 )
 
+# EXTRACT step: a dumb parser with NO taste. It only turns a CONFIRMED, applied
+# edit into data; otherwise it's a chat turn. Kept tiny + map-free so it's cheap.
+_EXTRACT_SYSTEM = "You convert an editor's decision into data. Return ONLY JSON, nothing else."
 
-# One internal pass on a COMMITTED edit only: the brain critiques its own cut
-# list before it lands (draft -> critique -> final), the same self-check a real
-# editor does on a first assembly. Plain chat turns never trigger this.
-_CRITIQUE_PROMPT = (
-    "Before this is applied, review your own cut list as a tough editor, then "
-    "return the FINAL version in the SAME JSON schema. Check, and fix if needed:\n"
-    "- ARC: does it open on the strongest moment, build, and land? Reorder if a "
-    "weak cut opens or a strong one is buried.\n"
-    "- DEDUP: is any line or content repeated? Keep exactly ONE moment per dup "
-    "group (the best take) and drop the rest.\n"
-    "- FILLER: cut anything off-brief, slates, dead air, rambling tails; tighten "
-    "each cut to the energy level that carries the point.\n"
-    "- DELIVERY: for each kept moment, is the chosen level right for the pacing? "
-    "Adjust levels.\n"
-    "- LENGTH: if there is a target, hit it -- trim the weakest cuts to fit.\n"
-    "Return ONLY the JSON (reply, intent, brief, aspect, target_s, timeline), "
-    "keeping intent=\"edit\". If the draft was already right, return it unchanged."
+_EXTRACT_INSTR = (
+    "Below is a chat between a user and a video editor, ending with the editor's "
+    "latest message. Decide the intent and, if an edit was just APPLIED, extract "
+    "it.\n"
+    "- intent = \"edit\" ONLY if the user CONFIRMED a change AND the editor's "
+    "latest message commits to a concrete cut list. A proposal/question, or any "
+    "turn the user hasn't confirmed, is intent = \"chat\".\n"
+    "- When intent = \"edit\", extract the editor's FINAL cut list IN ORDER, each "
+    "moment by the exact id it used. For each: copy the energy level if the editor "
+    "named one (broad/calm/balanced/tight/sharp), set track (0 = main line, which "
+    "is the default; >=1 only if the editor described an overlay) and from_ms if "
+    "it gave an overlay anchor, and a short reason.\n"
+    "- aspect: portrait/landscape/square if mentioned, else \"\". target_s: the "
+    "target length in seconds if mentioned, else null. brief: one line summarising "
+    "the applied edit.\n"
+    "Return ONLY this JSON:\n"
+    "{\"intent\": \"chat\"|\"edit\", \"brief\": \"\", \"aspect\": \"\", "
+    "\"target_s\": null, \"timeline\": [{\"ref\": \"id\", \"level\": \"\", "
+    "\"track\": 0, \"from_ms\": null, \"reason\": \"\"}]}\n\n"
+    "CHAT:\n"
 )
 
 
@@ -139,10 +126,11 @@ def _context_block(file_ids: List[str], document: Optional[dict]) -> str:
 def respond(thread_id: str, *, llm: Optional[LLMClient] = None) -> ConverseResult:
     """Produce the assistant's reply to the latest user turn on a thread.
 
-    Reads the thread's message history + footage map + current timeline and
-    returns what to say plus whether the user has confirmed an edit (and, if so,
-    the instruction to run). The caller appends the reply turn and, on an EDIT,
-    runs the arranger."""
+    Step 1 THINK: the editor reads the footage + timeline and replies in prose
+    (chat / propose / apply). Step 2 EXTRACT: a separate dumb call turns a
+    confirmed, applied edit into the structured cut list the caller compiles.
+    The prose reply is what the user sees; the caller persists it and, on an
+    edit, compiles the timeline."""
     settings = get_settings()
     if llm is None:
         llm = get_llm(provider=settings.autoedit_provider or None,
@@ -155,7 +143,7 @@ def respond(thread_id: str, *, llm: Optional[LLMClient] = None) -> ConverseResul
     if not messages:
         return ConverseResult(reply="Tell me what you'd like to do with these clips.")
 
-    system = _SYSTEM + "\n\n" + _context_block(file_ids, document)
+    system = _THINK_SYSTEM + "\n\n" + _context_block(file_ids, document)
     max_tokens = settings.autoedit_max_output_tokens
     # cache_system keeps the resident map cached across turns (Anthropic/Gemini;
     # a no-op on OpenAI) so multi-turn chat stays cheap and fast.
@@ -163,42 +151,32 @@ def respond(thread_id: str, *, llm: Optional[LLMClient] = None) -> ConverseResul
         resp = llm.run(system=system, messages=messages,
                        max_tokens=max_tokens, cache_system=True)
     except Exception:
-        logger.exception("converse: llm call failed for thread %s", thread_id)
+        logger.exception("converse: think call failed for thread %s", thread_id)
         return ConverseResult(reply="Sorry -- I hit an error there. Mind trying again?")
 
-    result = _to_result(resp.text)
-
-    # Reasoning loop -- ONLY on a committed edit that produced a cut list: have
-    # the brain critique its own draft and return the final timeline before it
-    # lands. One extra call on edit turns; plain chat stays single-call/fast.
-    if result.intent == "edit" and result.timeline:
-        try:
-            crit_messages = list(messages) + [
-                resp.assistant_message, user_message(_CRITIQUE_PROMPT)]
-            resp2 = llm.run(system=system, messages=crit_messages,
-                            max_tokens=max_tokens, cache_system=True)
-            refined = _to_result(resp2.text)
-            if refined.intent == "edit" and refined.timeline:
-                result = refined
-        except Exception:
-            logger.exception("converse: critique pass failed; keeping draft")
-
-    return result
+    reply = (resp.text or "").strip() or "…"
+    return _extract_decision(llm, messages, reply)
 
 
-def _to_result(text: Optional[str]) -> ConverseResult:
-    """Parse one model turn into a ConverseResult. A non-JSON answer degrades to
-    a plain chat reply so a turn never hard-fails."""
-    data = _parse(text)
-    if not data:
-        return ConverseResult(reply=(text or "").strip() or "…")
+def _extract_decision(llm: LLMClient, messages: List[dict], reply: str) -> ConverseResult:
+    """Turn the editor's prose reply into a routed result. The extractor only
+    fires intent=edit when the user confirmed and a concrete cut list was applied;
+    any failure degrades to a plain chat reply (the prose still reaches the user)."""
+    convo = _render_convo(messages, reply)
+    try:
+        r = llm.run(system=_EXTRACT_SYSTEM,
+                    messages=[user_message(_EXTRACT_INSTR + convo)],
+                    max_tokens=2000)
+        data = _parse(r.text) or {}
+    except Exception:
+        logger.exception("converse: extract call failed; treating as chat")
+        data = {}
 
     intent = str(data.get("intent") or "chat").strip().lower()
     if intent not in ("chat", "edit"):
         intent = "chat"
-    brief = str(data.get("brief") or "").strip()
-    reply = str(data.get("reply") or "").strip()
     timeline = _coerce_timeline(data.get("timeline"))
+    brief = str(data.get("brief") or "").strip()
     aspect = str(data.get("aspect") or "").strip().lower()
     if aspect not in ("portrait", "landscape", "square"):
         aspect = ""
@@ -207,12 +185,26 @@ def _to_result(text: Optional[str]) -> ConverseResult:
         target_s = float(target_s) if target_s is not None else None
     except (TypeError, ValueError):
         target_s = None
+    # An edit must carry an actual cut list, else it's just talk.
+    if intent == "edit" and not timeline:
+        intent = "chat"
     if intent == "edit" and not brief:
-        intent = "chat"            # no instruction -> nothing to run; keep talking
-    if not reply:
-        reply = "On it -- applying that now." if intent == "edit" else "…"
+        brief = "applied edit"
     return ConverseResult(reply=reply, intent=intent, brief=brief,
                           timeline=timeline, aspect=aspect, target_s=target_s)
+
+
+def _render_convo(messages: List[dict], reply: str) -> str:
+    """Compact transcript for the extractor: the last few turns + the editor's
+    just-made reply. Map-free, so this call stays cheap."""
+    lines: List[str] = []
+    for m in messages[-6:]:
+        role = "USER" if m.get("role") == "user" else "EDITOR"
+        text = str(m.get("content") or "").strip()
+        if text:
+            lines.append(f"{role}: {text}")
+    lines.append(f"EDITOR (just now): {reply}")
+    return "\n".join(lines)
 
 
 def _coerce_timeline(raw: Any) -> List[dict]:
