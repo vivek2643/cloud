@@ -501,6 +501,7 @@ function HeroClipCard({
             playsInline
             preload="metadata"
             muted={muted}
+            draggable={false}
             onLoadedMetadata={onLoadedMetadata}
             onTimeUpdate={onTimeUpdate}
             className="h-full w-full bg-black object-contain"

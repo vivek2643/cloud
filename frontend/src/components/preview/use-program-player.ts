@@ -7,10 +7,12 @@
  * prefetch that overshoots short cuts. Instead we keep a small POOL of media
  * elements and treat each timeline CLIP as something we assign to a slot:
  *
- *  - Each slot is a muted <video> whose decoded audio is tapped into a Web Audio
- *    graph (MediaElementSource -> per-slot GainNode -> master -> destination).
- *    `el.muted = true` dodges the autoplay policy while the GRAPH still receives
- *    audio, so we get real mixing (duck / levels / de-click fades) for free.
+ *  - Each slot is a <video> whose decoded audio is tapped into a Web Audio graph
+ *    (MediaElementSource -> per-slot GainNode -> master -> destination), so we
+ *    get real mixing (duck / levels / de-click fades) for free. The element is
+ *    NOT `muted` — Chrome routes a muted element's audio as SILENCE into the
+ *    MediaElementSource, so muting kills the graph. We rely on the user's Play
+ *    gesture (sticky activation) to satisfy the autoplay policy instead.
  *  - At any program instant the VISIBLE picture is the top-z active video clip's
  *    slot; every audible clip's slot drives its gain. Picture visibility and
  *    audibility are independent, so dialogue keeps playing under a B-roll cut.
@@ -59,6 +61,7 @@ interface Slot {
   gain: GainNode;
   clip: Clip | null;
   needsSeek: boolean;
+  wantSec: number | null; // last requested park position (applied once loadable)
   queuedSeek: number | null; // coalesced seek target while mid-seek
 }
 
@@ -225,7 +228,9 @@ export function useProgramPlayer(
     if (ctx && master && container && poolRef.current.length === 0) {
       for (let i = 0; i < POOL_SIZE; i++) {
         const el = document.createElement("video");
-        el.muted = true; // dodge autoplay; audio still flows through the graph
+        // NOT muted: a muted element feeds SILENCE into the MediaElementSource
+        // in Chrome. The user's Play gesture satisfies autoplay instead.
+        el.muted = false;
         el.playsInline = true;
         el.preload = "auto";
         el.crossOrigin = "anonymous";
@@ -241,7 +246,14 @@ export function useProgramPlayer(
         const node = ctx.createMediaElementSource(el);
         node.connect(gain);
         gain.connect(master);
-        const slot: Slot = { el, gain, clip: null, needsSeek: false, queuedSeek: null };
+        const slot: Slot = {
+          el,
+          gain,
+          clip: null,
+          needsSeek: false,
+          wantSec: null,
+          queuedSeek: null,
+        };
         el.addEventListener("seeked", () => {
           if (slot.queuedSeek != null) {
             const s = slot.queuedSeek;
@@ -253,6 +265,25 @@ export function useProgramPlayer(
             }
           }
         });
+        // A park requested before the media was loadable (readyState 0) is
+        // deferred and applied here — otherwise the picture stays black while
+        // PAUSED (the rAF loop isn't running to retry the seek).
+        const applyParkedSeek = () => {
+          if (!slot.needsSeek || slot.wantSec == null) return;
+          if (el.seeking) {
+            slot.queuedSeek = slot.wantSec;
+            return;
+          }
+          try {
+            el.currentTime = slot.wantSec;
+            slot.needsSeek = false;
+          } catch {
+            /* still not ready; a later event/frame retries */
+          }
+        };
+        el.addEventListener("loadedmetadata", applyParkedSeek);
+        el.addEventListener("loadeddata", applyParkedSeek);
+        el.addEventListener("canplay", applyParkedSeek);
         container.appendChild(el);
         poolRef.current.push(slot);
       }
@@ -281,6 +312,7 @@ export function useProgramPlayer(
     const url = urlsRef.current[clip.fileId];
     if (url && slot.el.src !== url) slot.el.src = url;
     slot.needsSeek = true;
+    slot.wantSec = null;
   };
 
   /** Full per-frame reconcile: assign needed clips to slots, then drive each
@@ -333,8 +365,14 @@ export function useProgramPlayer(
       const want = (clip.srcInMs + rel) / 1000;
 
       if (slot.needsSeek) {
-        seekSlot(slot, want);
-        slot.needsSeek = false;
+        slot.wantSec = want;
+        // Only consume the seek once the element can actually accept it; before
+        // HAVE_METADATA the assignment is dropped, so leave needsSeek set and let
+        // the loadedmetadata/loadeddata listener (or a later frame) apply it.
+        if (slot.el.readyState >= 1) {
+          seekSlot(slot, want);
+          slot.needsSeek = false;
+        }
       } else if (active_ && playing) {
         if (Math.abs(slot.el.currentTime - want) > DRIFT_S) seekSlot(slot, want);
       }
@@ -438,6 +476,7 @@ export function useProgramPlayer(
     for (const s of poolRef.current) {
       s.clip = null;
       s.needsSeek = false;
+      s.wantSec = null;
       s.queuedSeek = null;
       try {
         s.el.pause();

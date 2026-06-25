@@ -333,6 +333,7 @@ function DialogueClipCard({
             playsInline
             preload="metadata"
             muted={muted}
+            draggable={false}
             onLoadedMetadata={onLoadedMetadata}
             onTimeUpdate={onTimeUpdate}
             className="h-full w-full bg-black object-contain"
