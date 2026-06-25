@@ -292,21 +292,26 @@ def _fmt_ts(ms: int) -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
-def _moment_line(m: Dict[str, Any]) -> str:
+def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     levels = list(m["variants"].keys())
     nrg = "|".join(L for L in _LEVEL_NAMES if L in levels)
     spk = f" {m['speaker']}" if m.get("speaker") else ""
     gist = (m.get("gist") or "").strip().replace("\n", " ")
-    if len(gist) > 80:
+    # Resident mode gives the model the FULL line so it picks by reading, not
+    # guessing; compact (paged) mode truncates and relies on inspect_moment.
+    if compact and len(gist) > 80:
         gist = gist[:77] + "..."
     atoms = f" (+{len(m['atoms'])} atoms)" if m.get("atoms") else ""
+    dup = ""
+    if m.get("dup_group"):
+        dup = f" · dup:{m['dup_group']}{'*' if m.get('dup_best') else ''}"
     return (f"  {m['moment_id'].split(':')[-1]} {m['modality']}{spk} "
             f".{int(round(m['score'] * 100)):02d} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])}] "
-            f"\"{gist}\" · nrg:{nrg}{atoms}")
+            f"\"{gist}\" · nrg:{nrg}{atoms}{dup}")
 
 
-def _clip_block(tree: Dict[str, Any]) -> str:
+def _clip_block(tree: Dict[str, Any], *, compact: bool = False) -> str:
     head_bits = [f"{tree['duration_ms'] // 1000}s"]
     if tree.get("content_type"):
         head_bits.append(tree["content_type"])
@@ -318,26 +323,121 @@ def _clip_block(tree: Dict[str, Any]) -> str:
         head_bits.append("people:" + ",".join(tree["people"]))
     header = (f"CLIP {tree['file_id'][:8]} \"{tree['name']}\" · "
               + " · ".join(head_bits))
-    lines = [header] + [_moment_line(m) for m in tree["moments"]]
+    lines = [header] + [_moment_line(m, compact=compact) for m in tree["moments"]]
     return "\n".join(lines)
 
 
-def assemble_map(file_ids: List[str]) -> Dict[str, Any]:
+# --------------------------------------------------------------------------
+# Cross-clip duplicate linking (same line delivered as multiple takes/angles)
+# --------------------------------------------------------------------------
+
+def _best_overlap_moment(
+    moments: List[Dict[str, Any]], start_ms: int, end_ms: int
+) -> Optional[Dict[str, Any]]:
+    """The moment whose span overlaps [start_ms, end_ms] the most (or None)."""
+    best: Optional[Dict[str, Any]] = None
+    best_ov = 0
+    for m in moments:
+        ov = _overlap_ms(int(m["in_ms"]), int(m["out_ms"]), start_ms, end_ms)
+        if ov > best_ov:
+            best_ov, best = ov, m
+    return best if best_ov > 0 else None
+
+
+def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Link moments that deliver the SAME content across clips/angles.
+
+    Reconciles cross-clip take groups (``takes.build_take_groups``) onto the
+    moment-tree by time overlap, tags each linked moment in place with its
+    ``dup_group`` and whether it's the engine's pre-picked best take, and returns
+    a render-ready summary. This is cross-set dependent (it changes with the file
+    set), so it is computed per request and never baked into the per-file tree
+    cache. Fail-open: any error yields no links.
+    """
+    file_ids = [t["file_id"] for t in trees]
+    if len(file_ids) < 1:
+        return []
+    try:
+        from app.services.l3 import takes  # lazy: keep footage_map import-light
+        groups = takes.build_take_groups(file_ids)
+    except Exception:
+        logger.exception("footage map: take grouping failed; no dup links")
+        return []
+
+    by_file = {t["file_id"]: t.get("moments", []) for t in trees}
+    summary: List[Dict[str, Any]] = []
+    for g in groups:
+        linked: Dict[str, Dict[str, Any]] = {}   # moment_id -> moment
+        restart_ids: set = set()
+        for a in g.attempts:
+            m = _best_overlap_moment(by_file.get(a.file_id, []), a.start_ms, a.end_ms)
+            if m is None:
+                continue
+            linked.setdefault(m["moment_id"], m)
+            if a.is_restart:
+                restart_ids.add(m["moment_id"])
+        # A real choice needs >= 2 DISTINCT moments (one moment alone is not a
+        # take decision -- the engine already collapsed its own bands).
+        if len(linked) < 2:
+            continue
+        # Engine best take: highest-scoring moment, preferring a non-restart.
+        best = max(
+            linked.values(),
+            key=lambda m: (m["moment_id"] not in restart_ids, float(m.get("score", 0.0))),
+        )
+        for mid, m in linked.items():
+            m["dup_group"] = g.group_id
+            m["dup_best"] = (mid == best["moment_id"])
+        summary.append({
+            "group_id": g.group_id,
+            "best": best["moment_id"],
+            "members": list(linked.keys()),
+            "text": (g.attempts[0].text or "").strip(),
+        })
+    return summary
+
+
+def _dups_block(summary: List[Dict[str, Any]]) -> str:
+    if not summary:
+        return ""
+    lines = ["DUPLICATE GROUPS (same line, multiple takes/angles -- place ONE "
+             "per group; the * is the engine's best take, override only if "
+             "another reads/looks better):"]
+    for d in summary:
+        members = " ".join(
+            (mid + "*" if mid == d["best"] else mid) for mid in d["members"]
+        )
+        gist = d["text"].replace("\n", " ")
+        if len(gist) > 80:
+            gist = gist[:77] + "..."
+        lines.append(f"  {d['group_id']}: {members}  \"{gist}\"")
+    return "\n".join(lines)
+
+
+def assemble_map(file_ids: List[str], *, compact: bool = False) -> Dict[str, Any]:
     """The Tier-0 footage index for the arranger.
 
-    Returns ``{"text": ..., "struct": {...}}`` where ``text`` is the compact,
-    complete one-line-per-moment index dropped into the prompt and ``struct`` is
-    the machine-readable trees the arranger/compiler resolve placements against.
+    Returns ``{"text", "struct", "clip_count", "moment_count", "dup_groups"}``
+    where ``text`` is the one-line-per-moment index dropped into the prompt and
+    ``struct`` is the machine-readable trees the arranger/compiler resolve
+    placements against. ``compact`` truncates gists for the paged (over-budget)
+    path; resident mode emits the full line. Moments are tagged in place with
+    cross-clip duplicate links.
     """
     trees = get_trees(file_ids)
     ordered = [trees[fid] for fid in file_ids if fid in trees]
-    text = "\n\n".join(_clip_block(t) for t in ordered)
+    dups = _annotate_dups(ordered)   # tags moments in `ordered` in place
+    text = "\n\n".join(_clip_block(t, compact=compact) for t in ordered)
+    dblock = _dups_block(dups)
+    if dblock:
+        text = f"{text}\n\n{dblock}"
     n_moments = sum(t["moment_count"] for t in ordered)
     return {
         "text": text,
         "struct": {"clips": ordered},
         "clip_count": len(ordered),
         "moment_count": n_moments,
+        "dup_groups": dups,
     }
 
 

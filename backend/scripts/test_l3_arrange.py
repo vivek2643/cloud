@@ -18,10 +18,17 @@ if BACKEND not in sys.path:
 
 from app.services.l3 import arrange as ar  # noqa: E402
 from app.services.l3 import footage_map as fm  # noqa: E402
+from app.services.llm.base import LLMResponse  # noqa: E402
 
 
 class _FakeLLM:
-    """Returns a fixed JSON body for the one arranger call."""
+    """Returns a fixed JSON body for every arranger pass.
+
+    The arranger reasons in a draft -> critique cycle (>= 2 passes), so the fake
+    must honor the real ``LLMResponse`` contract: each turn's
+    ``assistant_message`` is appended back onto the running messages list. The
+    same body is returned each pass, so the critique pass reproduces the draft.
+    """
     def __init__(self, text: str) -> None:
         self._text = text
 
@@ -30,9 +37,11 @@ class _FakeLLM:
         return "fake"
 
     def run(self, *, system, messages, max_tokens=2048, effort=None, **kw):
-        class _R:
-            text = self._text
-        return _R()
+        return LLMResponse(
+            text=self._text,
+            assistant_message={"role": "assistant",
+                               "content": [{"type": "text", "text": self._text}]},
+        )
 
 
 class _Plan:

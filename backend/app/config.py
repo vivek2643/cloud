@@ -100,6 +100,20 @@ class Settings(BaseSettings):
     # flip True to let it lay B-roll / reaction / insert overlays on the spine.
     autoedit_coverage: bool = False
 
+    # --- L3 arranger: the cut-picking reasoning brain --------------------
+    # Resident mode (default) holds the whole footage map in one context and
+    # runs a draft -> self-critique cycle. When the map text exceeds this many
+    # chars it is PAGED instead: a compact index + on-demand inspect tools, so
+    # we degrade gracefully instead of blindly truncating.
+    arranger_resident_char_budget: int = 180_000
+    # Reasoning passes in resident mode (2 = draft, then critique + revise).
+    arranger_passes: int = 2
+    # Effort for the draft pass; the final (critique) pass uses autoedit_effort.
+    arranger_draft_effort: str = "medium"
+    # Paged mode: effort per turn and a hard cap on tool/reason turns.
+    arranger_paged_effort: str = "medium"
+    arranger_max_turns: int = 12
+
     @property
     def r2_endpoint(self) -> str:
         return f"https://{self.r2_account_id}.r2.cloudflarestorage.com"

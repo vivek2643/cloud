@@ -32,6 +32,9 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from app.config import get_settings
+from app.services.llm import user_message
+
 logger = logging.getLogger(__name__)
 
 # Overlay z (matches layers.Z_COVERAGE); imported lazily in the compiler to keep
@@ -128,28 +131,53 @@ class _MapIndex:
 _ARRANGER_SYSTEM = (
     "You are the EDITOR of a video. You are given a BRIEF and a complete MAP of "
     "all available footage: every clip, and within each clip every usable MOMENT "
-    "with the energy LEVELS it can be taken at and the finer ATOMS it can split "
-    "into. Nothing is hidden -- this is the whole library.\n\n"
-    "Build the timeline. Your only job is to choose the right moments, at the "
-    "right energy, and place them in the order they should play.\n\n"
+    "with the FULL line of what is said, the energy LEVELS it can be taken at, and "
+    "the finer ATOMS it can split into. Nothing is hidden -- this is the whole "
+    "library, and you can read every line in full. Edit like a real editor who has "
+    "watched all the footage: read for meaning, not keywords.\n\n"
     "Map notation (one moment per line):\n"
-    "  m07 speech S1 .82 [0:14-0:21] \"the line text\" · nrg:calm|balanced (+3 atoms)\n"
+    "  m07 speech S1 .82 [0:14-0:21] \"the full line text\" · nrg:calm|balanced (+3 atoms) · dup:tg4*\n"
     "  - the id is <clip8>:<m##>; refer to a moment by its FULL id (e.g. ab12cd34:m07).\n"
+    "  - the quoted text is the COMPLETE line -- judge delivery and relevance from it.\n"
     "  - nrg lists the levels you may take it at: broad (whole answer) .. balanced "
     "(one thought) .. sharp (tightest). Pick the level that fits the pacing.\n"
     "  - '(+N atoms)' means the moment splits into N finer sub-cuts; to use just a "
-    "piece, refer to an atom id you retrieved instead.\n\n"
-    "Rules:\n"
-    "- Use ONLY ids that appear in the map. Order them for narrative: open strong, "
-    "build, end with impact.\n"
-    "- Cut filler and anything off-brief; never place two moments that say the same "
-    "thing. Fewer, stronger moments beat a long flabby list.\n"
-    "- Everything you place on track 0 is the main line and plays back-to-back with "
-    "no gaps. (Overlays on higher tracks are optional and rarely needed.)\n"
+    "piece, refer to an atom id.\n"
+    "  - 'dup:tgN' means this moment is the SAME content as others in group tgN "
+    "(another take or camera angle). The '*' marks the engine's best take. Place "
+    "exactly ONE moment per dup group -- prefer the '*' unless another reads or "
+    "looks better. A DUPLICATE GROUPS section lists each group's members.\n\n"
+    "What makes a good edit (your taste):\n"
+    "- Open strong: a hook/cold-open that earns attention, then build, then land.\n"
+    "- Tell ONE coherent story arc; cut anything off-brief, slates, mic-checks, "
+    "banter, dead tangents. The map is raw footage -- not all of it belongs.\n"
+    "- Never say the same thing twice (respect dup groups AND near-repeats).\n"
+    "- Fewer, stronger moments beat a long flabby list. Honor speaker roles.\n"
+    "- Choose energy LEVEL per cut for pacing; tighten for momentum, widen to let "
+    "a key beat breathe.\n"
+    "- Everything on track 0 is the main line and plays back-to-back with no gaps. "
+    "Overlays on higher tracks are optional and rarely needed.\n"
     "- Respect the target length if one is given.\n\n"
-    "Return ONLY JSON (no prose):\n"
-    '{"timeline": [{"ref": "<id>", "level": "balanced", "track": 0, '
-    '"reason": "<short why>"}], "notes": "<one line>"}'
+    "How to work, in two steps:\n"
+    "1) DRAFT: first write a one-paragraph THESIS (the arc and why), then the draft "
+    "timeline JSON.\n"
+    "2) You will then be asked to CRITIQUE your own draft and return the FINAL JSON.\n\n"
+    "JSON shape (the timeline is what matters):\n"
+    '{"thesis": "<the arc>", "timeline": [{"ref": "<id>", "level": "balanced", '
+    '"track": 0, "reason": "<short why>"}], "notes": "<one line>"}'
+)
+
+_CRITIQUE_PROMPT = (
+    "Now critique your own draft as a tough editor, then return the FINAL timeline.\n"
+    "Check, in order:\n"
+    "- Redundancy: any two cuts that say the same thing? Any dup-group placed more "
+    "than once? Drop the weaker one.\n"
+    "- Opening: does cut 1 actually hook? If not, replace it.\n"
+    "- Arc + order: does it build and land, or wander? Reorder for story.\n"
+    "- Delivery/angle: for each dup group, is the chosen take the strongest read?\n"
+    "- Length: within the target? Cut the flabbiest beats to fit.\n"
+    "- Junk: remove any slate/mic-check/banter/off-brief moment that slipped in.\n"
+    "Return ONLY the final JSON (no prose), same shape as before."
 )
 
 
@@ -175,19 +203,64 @@ def arrange(brief: str, map_struct: Dict[str, Any], plan, *,
             current_timeline: Optional[str] = None) -> List[Placement]:
     """Run the arranger: brief + footage map -> ordered, validated placements.
 
-    ``plan`` carries energy/aspect/target defaults (the Director's read).
-    ``current_timeline`` is the optional refinement overlay (Phase 4). Returns
-    [] on any failure so the caller can fall back deterministically."""
-    from app.services.l3.auto_edit import _run_json   # lazy: avoid import cycle
+    The brain reads the whole map in one resident context and reasons in a
+    draft -> self-critique cycle (the faithful "edit like a human who watched
+    everything" path). When the map is too large to hold resident it pages: a
+    compact index + on-demand inspect tools (see ``orchestrator.run_paged``).
 
+    ``plan`` carries energy/aspect/target defaults (the Director's read).
+    ``current_timeline`` is the optional refinement overlay. Returns [] on any
+    failure so the caller can fall back deterministically."""
     index = _MapIndex(map_struct)
-    if map_text is None:
-        # Caller usually passes the precomputed text; rebuild a minimal one only
-        # if absent (keeps arrange() usable standalone / in tests).
-        map_text = ""
-    doc = _run_json(llm, _ARRANGER_SYSTEM,
-                    _arranger_prompt(brief, plan, map_text, current_timeline))
-    return _coerce_placements(doc, index)
+    map_text = map_text or ""
+    settings = get_settings()
+    budget = int(getattr(settings, "arranger_resident_char_budget", 180_000))
+
+    if map_text and len(map_text) > budget:
+        try:
+            from app.services.l3 import orchestrator   # lazy: paged path only
+            return orchestrator.run_paged(
+                brief, map_struct, plan, llm=llm, current_timeline=current_timeline)
+        except Exception:
+            logger.exception("arrange: paged path failed; deterministic fallback")
+            return []
+
+    return _resident_arrange(brief, plan, map_text, current_timeline, index, llm)
+
+
+def _resident_arrange(brief: str, plan, map_text: str,
+                      current_timeline: Optional[str], index: "_MapIndex",
+                      llm) -> List[Placement]:
+    """The whole map in one resident, cached context, reasoned over in a
+    draft -> critique+revise cycle. System + map are a stable prefix reused
+    across passes (``cache_system`` lets the provider reuse it), so iterating is
+    cheap. Falls back to the draft if the critique pass yields nothing usable."""
+    from app.services.l3.auto_edit import _parse_json   # lazy: avoid import cycle
+
+    settings = get_settings()
+    passes = int(getattr(settings, "arranger_passes", 2))
+    max_tokens = settings.autoedit_max_output_tokens
+    final_effort = (getattr(settings, "autoedit_effort", None) or "high")
+    draft_effort = (getattr(settings, "arranger_draft_effort", None)
+                    or (final_effort if passes <= 1 else "medium"))
+
+    messages = [user_message(_arranger_prompt(brief, plan, map_text, current_timeline))]
+
+    # Pass 1: thesis + draft.
+    r1 = llm.run(system=_ARRANGER_SYSTEM, messages=messages, max_tokens=max_tokens,
+                 effort=(final_effort if passes <= 1 else draft_effort),
+                 cache_system=True)
+    draft = _coerce_placements(_parse_json(r1.text), index)
+    if passes <= 1:
+        return draft
+
+    # Pass 2: critique own draft + revise. Reuses the identical cached prefix.
+    messages.append(r1.assistant_message)
+    messages.append(user_message(_CRITIQUE_PROMPT))
+    r2 = llm.run(system=_ARRANGER_SYSTEM, messages=messages, max_tokens=max_tokens,
+                 effort=final_effort, cache_system=True)
+    final = _coerce_placements(_parse_json(r2.text), index)
+    return final or draft
 
 
 def _coerce_placements(doc: Optional[dict], index: _MapIndex) -> List[Placement]:
