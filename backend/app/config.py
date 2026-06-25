@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     # via the OPENAI_MODEL env var.
     openai_model: str = "gpt-5-mini"
 
+    # Anthropic (Claude) credentials + default model. Used when a feature selects
+    # provider="anthropic" (e.g. the L3 editing brain). cache_system maps to
+    # Claude prompt caching (cache_control) for cheap multi-pass / multi-turn.
+    anthropic_api_key: str = ""
+    anthropic_model: str = "claude-opus-4-8"
+
     # --- L2: VLM perception layer (Gemini) -------------------------------
     # A single Gemini pass over the whole clip that produces the rich, single-
     # take "footage log" (clip-level look/setting, person identities, an event
@@ -88,10 +94,11 @@ class Settings(BaseSettings):
     # build the hero-cuts feed at that energy, select + order the cuts, then
     # lay light coverage. Provider/model overridable.
     enable_autoedit: bool = True
-    autoedit_provider: str = "openai"
-    # The strongest available OpenAI model: this is creative selection +
-    # ordering, not cheap classification. Override via OPENAI / env if needed.
-    autoedit_model: str = "gpt-5"
+    # The editing brain (converse + arranger) runs on the strongest available
+    # model -- this is creative selection + ordering, not cheap classification.
+    # Provider-neutral: flip to "openai"/"gemini" + a model id to swap backbones.
+    autoedit_provider: str = "anthropic"
+    autoedit_model: str = "claude-opus-4-8"
     autoedit_max_output_tokens: int = 16384
     # Deep reasoning for the editorial calls (taste, story, ordering).
     autoedit_effort: str = "high"
