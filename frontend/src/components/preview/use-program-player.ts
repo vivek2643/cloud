@@ -521,15 +521,25 @@ export function useProgramPlayer(
     };
   }, []);
 
-  return {
-    attachContainer,
-    prepare,
-    sync,
-    play,
-    pause,
-    seek,
-    nowMs,
-    setMuted,
-    stop,
-  };
+  // IMPORTANT: return a STABLE handle. The consumer's rAF `loop` and its
+  // play/pause effect depend on this object; if its identity changed every
+  // render (which happens ~every frame while playing, as the published time
+  // re-renders the monitor), those effects would tear down and re-run each
+  // frame — restarting playback and re-gating the clock continuously, which
+  // reads as "stuck + silent". All methods are useCallback-stable, so this memo
+  // never actually changes after mount.
+  return useMemo(
+    () => ({
+      attachContainer,
+      prepare,
+      sync,
+      play,
+      pause,
+      seek,
+      nowMs,
+      setMuted,
+      stop,
+    }),
+    [attachContainer, prepare, sync, play, pause, seek, nowMs, setMuted, stop]
+  );
 }
