@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Play,
   Pause,
@@ -13,17 +13,18 @@ import {
   Music,
 } from "lucide-react";
 import { getFile, getFilePlaybackUrl, type ResolvedTimeline } from "@/lib/api";
-import { resolveTimeline, sampleMotion } from "@/lib/resolve-timeline";
+import { resolveTimeline } from "@/lib/resolve-timeline";
 import { useEditDocStore } from "@/stores/edit-doc-store";
 import { useTransport, FRAME_MS, formatTimecode } from "@/stores/transport-store";
-import { useAudioEngine } from "./use-audio-engine";
-import { useVideoPicture } from "./use-video-picture";
+import { useProgramPlayer } from "./use-program-player";
 
 /**
  * Program monitor. Reads the LIVE working document from the edit store, resolves
  * it client-side (same logic as the backend renderer), and plays it back with a
- * WebAudio mixer + double-buffered video. Any timeline edit re-resolves and the
- * preview reflects it on the next frame — no save round-trip.
+ * pooled-media-element program player (see use-program-player): Web Audio mixes
+ * the audio, a slot pool shows/pre-warms the picture, and the AudioContext is
+ * the master clock. Any timeline edit re-resolves and the preview reflects it on
+ * the next frame — no save round-trip.
  */
 export function CompositePreview({ token }: { token: string | undefined }) {
   const timeline = useEditDocStore((s) => s.timeline);
@@ -78,8 +79,7 @@ export function CompositePreview({ token }: { token: string | undefined }) {
     return Array.from(s).filter(Boolean);
   }, [resolved]);
 
-  const engine = useAudioEngine(resolved, urls);
-  const picture = useVideoPicture(resolved, urls);
+  const player = useProgramPlayer(resolved, urls);
 
   // Resolve playback URLs + source durations for every referenced clip.
   useEffect(() => {
@@ -132,55 +132,53 @@ export function CompositePreview({ token }: { token: string | undefined }) {
     setDuration(duration);
   }, [duration, setDuration]);
 
-  // The rAF loop: read the audio master clock, drive the picture, and publish a
-  // frame-snapped time only when the frame index changes (≈fps Hz). No audio is
-  // touched here — it's already scheduled on the AudioContext.
+  // The rAF loop: read the master clock, drive the slot pool (picture + audio
+  // gains), and publish a frame-snapped time only when the frame index changes
+  // (≈fps Hz). All media work happens inside player.sync.
   const loop = useCallback(() => {
-    const t = engine.nowMs();
+    const t = player.nowMs();
     if (duration > 0 && t >= duration) {
-      engine.pause();
-      engine.seek(0, false);
+      player.pause();
+      player.seek(0, false);
+      player.sync(0, false);
       progRef.current = 0;
       lastFrameRef.current = 0;
-      picture.sync(0, false);
       publish(0);
       setPlaying(false); // the [playing] effect tears down the loop
       return;
     }
     progRef.current = t;
-    picture.sync(t, true);
+    player.sync(t, true);
     const frame = Math.round(t / FRAME_MS);
     if (frame !== lastFrameRef.current) {
       lastFrameRef.current = frame;
       publish(frame * FRAME_MS);
     }
     rafRef.current = requestAnimationFrame(loop);
-  }, [duration, engine, picture, publish, setPlaying]);
+  }, [duration, player, publish, setPlaying]);
 
   // Start/stop purely from the shared `playing` flag, so the play button here
   // and spacebar/scrub on the timeline drive the same machine.
   useEffect(() => {
     if (!playing || !hasTimeline) {
-      engine.pause();
-      picture.stop();
+      player.pause();
       stopRaf();
       return;
     }
-    engine.play(progRef.current);
-    picture.sync(progRef.current, true);
+    player.play(progRef.current);
     stopRaf();
     rafRef.current = requestAnimationFrame(loop);
     return stopRaf;
-  }, [playing, hasTimeline, loop, engine, picture, stopRaf]);
+  }, [playing, hasTimeline, loop, player, stopRaf]);
 
   // External seek (timeline click/scrub, step buttons, monitor scrubber): move
-  // the master clock + reschedule audio + park the picture on the new frame.
+  // the master clock + reposition every slot to the new frame.
   useEffect(() => {
     progRef.current = seekTargetMs;
     lastFrameRef.current = Math.round(seekTargetMs / FRAME_MS);
     const playingNow = useTransport.getState().playing;
-    engine.seek(seekTargetMs, playingNow);
-    picture.sync(seekTargetMs, playingNow);
+    player.seek(seekTargetMs, playingNow);
+    player.sync(seekTargetMs, playingNow);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [seekSeq]);
 
@@ -190,8 +188,8 @@ export function CompositePreview({ token }: { token: string | undefined }) {
   }
 
   useEffect(() => {
-    engine.setMuted(muted);
-  }, [muted, engine]);
+    player.setMuted(muted);
+  }, [muted, player]);
 
   // Reset to the start whenever the plan changes shape (segment count / ids).
   const shapeKey = useMemo(
@@ -200,20 +198,19 @@ export function CompositePreview({ token }: { token: string | undefined }) {
   );
   useEffect(() => {
     resetTransport();
-    engine.stop();
+    player.stop();
     progRef.current = 0;
     lastFrameRef.current = 0;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shapeKey]);
 
-  // Edits re-resolve the timeline: decode any new files and reschedule audio
-  // from the current playhead so the change is heard immediately. While paused
-  // we just re-park the picture; the audio re-arms on the next play.
+  // Edits re-resolve the timeline: re-park every slot from the current playhead
+  // so the change is reflected immediately (audio re-arms on the next frame).
   useEffect(() => {
-    engine.prepare();
+    player.prepare();
     const playingNow = useTransport.getState().playing;
-    engine.seek(progRef.current, playingNow);
-    picture.sync(progRef.current, playingNow);
+    player.seek(progRef.current, playingNow);
+    player.sync(progRef.current, playingNow);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [resolved, urls]);
 
@@ -236,50 +233,6 @@ export function CompositePreview({ token }: { token: string | undefined }) {
       ).length
     : 0;
 
-  // CSS framing for the visible picture, mirroring the render's transform chain
-  // (rotate -> fit -> zoom). cover/contain + anchor are exact; rotate/zoom are
-  // best-effort (the automatic Phase-1 path emits neither).
-  const videoStyle: CSSProperties = useMemo(() => {
-    const t = activeVideo?.transform;
-    // Motion (push-in/follow) fills a cover base; show a stable REPRESENTATIVE
-    // frame (the path's midpoint) so the preview indicates the zoom/track. The
-    // render animates the full path frame-by-frame (it is authoritative).
-    const mid = t?.motion ? sampleMotion(t.motion, t.motion.dur_ms / 2) : null;
-    const fit = mid ? "cover" : t?.fit ?? (aspect === "landscape" ? "contain" : "cover");
-    const anchor = t?.anchor ?? "center";
-    const focusPoint = mid ? { cx: mid.cx, cy: mid.cy } : t?.focus ?? null;
-    // A focus point wins over the anchor enum: place it via object-position so
-    // cover-crop keeps the subject in frame. This is the CSS approximation of the
-    // render's focus-centered crop (the render is authoritative).
-    let objectPosition: string;
-    if (focusPoint) {
-      const px = Math.round(Math.min(1, Math.max(0, focusPoint.cx)) * 100);
-      const py = Math.round(Math.min(1, Math.max(0, focusPoint.cy)) * 100);
-      objectPosition = `${px}% ${py}%`;
-    } else {
-      objectPosition =
-        anchor === "left"
-          ? "left center"
-          : anchor === "right"
-            ? "right center"
-            : anchor === "top"
-              ? "center top"
-              : anchor === "bottom"
-                ? "center bottom"
-                : "center";
-    }
-    const tf: string[] = [];
-    if (t?.rotate) tf.push(`rotate(${t.rotate}deg)`);
-    const scale = mid ? mid.scale : t?.zoom && t.zoom > 1 ? t.zoom : 1;
-    if (scale > 1) tf.push(`scale(${scale})`);
-    return {
-      transition: "opacity 60ms linear",
-      objectFit: fit,
-      objectPosition,
-      ...(tf.length ? { transform: tf.join(" ") } : {}),
-    };
-  }, [activeVideo, aspect]);
-
   return (
     <div className="border-b px-4 py-3" style={{ borderColor: "var(--border)" }}>
       <div className="flex w-full justify-center">
@@ -293,26 +246,11 @@ export function CompositePreview({ token }: { token: string | undefined }) {
           maxWidth: "100%",
         }}
       >
-        {hasTimeline ? (
-          <>
-            <video
-              ref={picture.attachA}
-              className="absolute inset-0 h-full w-full"
-              style={videoStyle}
-              muted
-              playsInline
-            />
-            <video
-              ref={picture.attachB}
-              className="absolute inset-0 h-full w-full"
-              style={videoStyle}
-              muted
-              playsInline
-            />
-          </>
-        ) : (
+        {/* The program player appends its pooled <video> elements here. */}
+        <div ref={player.attachContainer} className="absolute inset-0 h-full w-full" />
+        {!hasTimeline && (
           <div
-            className="flex h-full w-full items-center justify-center text-xs"
+            className="absolute inset-0 flex h-full w-full items-center justify-center text-xs"
             style={{ color: "#666" }}
           >
             <Film size={28} />

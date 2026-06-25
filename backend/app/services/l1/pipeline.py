@@ -195,9 +195,21 @@ def _encode_proxy(raw_path: str, proxy_path: str, is_hdr: bool = False) -> None:
     8-bit yuv420p, constant frame rate, bounded resolution (any orientation),
     rotation auto-applied, HDR tonemapped to SDR. Tries NVENC then libx264, and
     drops HDR tonemapping if this ffmpeg build can't do it -- so exotic uploads
-    (10-bit, HDR, VFR, rotated) still produce a working proxy instead of failing."""
+    (10-bit, HDR, VFR, rotated) still produce a working proxy instead of failing.
+
+    The proxy is also SEEK-OPTIMIZED for interactive editing: a keyframe is
+    forced every second (``-force_key_frames``, fps-agnostic so it holds for
+    24/25/30/60fps sources alike) and the moov atom is moved to the front
+    (``+faststart``). Frequent keyframes mean a scrub/cut lands near-instantly
+    (the decoder only walks <=1s to the target) instead of grinding through
+    libx264's default ~250-frame GOP -- the root of the preview seek stalls.
+    Denser keyframes also speed the perception pipeline's random-access decodes,
+    so the single proxy serves both consumers; the only cost is a modestly larger
+    file (more I-frames compress worse)."""
     common_out = [
         "-vsync", "cfr",  # normalize VFR (phone footage) to constant frame rate
+        # ~1s keyframe cadence, independent of source fps, so seeks are cheap.
+        "-force_key_frames", "expr:gte(t,n_forced*1)",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
         proxy_path,

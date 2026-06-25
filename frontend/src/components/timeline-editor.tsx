@@ -26,7 +26,7 @@ import {
 } from "@/lib/api";
 import { useEditDocStore } from "@/stores/edit-doc-store";
 import { useTransport, formatTimecode, snapMs } from "@/stores/transport-store";
-import { documentToProject, type ProjectClip } from "@/lib/edit-project";
+import { documentToProject, type ProjectClip, type ProjectTrack } from "@/lib/edit-project";
 
 function fmt(ms: number) {
   const s = Math.max(0, Math.round(ms / 1000));
@@ -37,12 +37,37 @@ const LABEL_W = 44;
 const LANE_GAP = 8; // matches the gap-2 between a lane label and its track
 const TRACK_LEFT = LABEL_W + LANE_GAP;
 
+/** A clip dragged from the Hero Cuts / Dialogues bins (see their onDragStart). */
+interface DropPayload {
+  file_id: string;
+  in_ms: number;
+  out_ms: number;
+  kind?: string;
+}
+
+function parseDrop(e: React.DragEvent): DropPayload | null {
+  const raw =
+    e.dataTransfer.getData("application/x-hero-cut") ||
+    e.dataTransfer.getData("application/x-dialogue-segment") ||
+    e.dataTransfer.getData("text/plain");
+  if (!raw) return null;
+  try {
+    const p = JSON.parse(raw) as Partial<DropPayload>;
+    if (!p.file_id || p.in_ms == null || p.out_ms == null) return null;
+    return { file_id: p.file_id, in_ms: Number(p.in_ms), out_ms: Number(p.out_ms), kind: p.kind };
+  } catch {
+    return null;
+  }
+}
+
 export function TimelineEditor({
   threadId,
+  ensureThread,
   token,
   onSaved,
 }: {
-  threadId: string;
+  threadId: string | null;
+  ensureThread: () => Promise<string | null>;
   token: string | undefined;
   onSaved: (version: number, document: EditDocument) => void;
 }) {
@@ -62,6 +87,8 @@ export function TimelineEditor({
   const setOpEdge = useEditDocStore((s) => s.setOpEdge);
   const setOpZ = useEditDocStore((s) => s.setOpZ);
   const reorderSeg = useEditDocStore((s) => s.reorderSeg);
+  const addSegment = useEditDocStore((s) => s.addSegment);
+  const addOp = useEditDocStore((s) => s.addOp);
   const revertStore = useEditDocStore((s) => s.revert);
   const setWorking = useEditDocStore((s) => s.setWorking);
   const commit = useEditDocStore((s) => s.commit);
@@ -245,6 +272,69 @@ export function TimelineEditor({
     window.addEventListener("pointerup", onUp);
   }
 
+  // --- drag clips IN from the Hero Cuts / Dialogues bins ---
+  // Base video lane (V1) = insert a spine cut at the drop index; an upper video
+  // lane = a placed overlay; an audio lane = a placed bed — all at the drop time.
+  const [dropTrack, setDropTrack] = useState<string | null>(null);
+
+  function progMsAtX(trackId: string, clientX: number): number {
+    const el = trackEls.current.get(trackId);
+    if (!el || pxPerMs <= 0) return progMs;
+    const rect = el.getBoundingClientRect();
+    return Math.max(0, snapMs((clientX - rect.left) / pxPerMs));
+  }
+
+  function spineIndexAtX(trackId: string, clientX: number): number {
+    const el = trackEls.current.get(trackId);
+    if (!el || pxPerMs <= 0) return timeline.length;
+    const rect = el.getBoundingClientRect();
+    const at = (clientX - rect.left) / pxPerMs;
+    let idx = 0;
+    for (const c of project.clips.filter((c) => c.trackId === trackId)) {
+      if (at > (c.progStartMs + c.progEndMs) / 2) idx++;
+    }
+    return idx;
+  }
+
+  function onLaneDragOver(track: ProjectTrack, e: React.DragEvent) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    if (dropTrack !== track.id) setDropTrack(track.id);
+  }
+
+  function onLaneDrop(track: ProjectTrack, e: React.DragEvent) {
+    e.preventDefault();
+    setDropTrack(null);
+    const p = parseDrop(e);
+    if (!p) return;
+    if (track.kind === "video" && track.isBase) {
+      addSegment(
+        { file_id: p.file_id, in_ms: p.in_ms, out_ms: p.out_ms },
+        spineIndexAtX(track.id, e.clientX)
+      );
+    } else if (track.kind === "video") {
+      addOp({
+        type: "place_video",
+        source_file_id: p.file_id,
+        src_in_ms: p.in_ms,
+        src_out_ms: p.out_ms,
+        from_ms: progMsAtX(track.id, e.clientX),
+        z: track.z,
+      });
+    } else {
+      addOp({
+        type: "place_audio",
+        source_file_id: p.file_id,
+        src_in_ms: p.in_ms,
+        src_out_ms: p.out_ms,
+        from_ms: progMsAtX(track.id, e.clientX),
+        role: "music",
+      });
+    }
+    // Make sure an edit session exists so the build can be saved later.
+    void ensureThread();
+  }
+
   function toggleMute(op: EditOperation) {
     const muted = (op.gain_db ?? 0) <= -119;
     if (muted) setGain(op.op_id, muteCache.current[op.op_id] ?? 0);
@@ -260,8 +350,13 @@ export function TimelineEditor({
     setSaving(true);
     setError(null);
     try {
+      const id = threadId ?? (await ensureThread());
+      if (!id) {
+        setError("Could not start an edit session to save into.");
+        return;
+      }
       const res = await saveEditDocument(
-        threadId,
+        id,
         { base_version: baseVersion, timeline, operations },
         token
       );
@@ -277,7 +372,7 @@ export function TimelineEditor({
     } finally {
       setSaving(false);
     }
-  }, [token, saving, threadId, baseVersion, timeline, operations, commit, onSaved]);
+  }, [token, saving, threadId, ensureThread, baseVersion, timeline, operations, commit, onSaved]);
 
   function revert() {
     revertStore();
@@ -286,6 +381,7 @@ export function TimelineEditor({
   }
 
   async function openHistory() {
+    if (!threadId) return;
     setShowHistory((v) => !v);
     if (!showHistory && token) {
       try {
@@ -298,7 +394,7 @@ export function TimelineEditor({
   }
 
   async function loadVersion(v: number) {
-    if (!token) return;
+    if (!token || !threadId) return;
     try {
       const { document } = await getEditVersion(threadId, v, token);
       setWorking(document.timeline ?? [], document.operations ?? []);
@@ -325,7 +421,7 @@ export function TimelineEditor({
           </span>
         </div>
         <div className="flex items-center gap-1">
-          <button onClick={openHistory} className="rounded-lg p-1.5 transition-colors hover:bg-[var(--accent-soft)]" title="Version history">
+          <button onClick={openHistory} disabled={!threadId} className="rounded-lg p-1.5 transition-colors hover:bg-[var(--accent-soft)] disabled:opacity-30" title="Version history">
             <History size={15} />
           </button>
           <button onClick={revert} disabled={!dirty || saving} className="rounded-lg p-1.5 transition-colors hover:bg-[var(--accent-soft)] disabled:opacity-30" title="Revert changes">
@@ -391,10 +487,16 @@ export function TimelineEditor({
           {project.tracks.map((track) => {
             const trackClips = project.clips.filter((c) => c.trackId === track.id);
             const isWidthTrack = track.isBase && track.kind === "video";
+            const showDropHint =
+              isWidthTrack && trackClips.length === 0 && timeline.length === 0;
             return (
               <Lane
                 key={track.id}
                 label={track.label}
+                highlight={dropTrack === track.id}
+                onDragOver={(e) => onLaneDragOver(track, e)}
+                onDragLeave={() => setDropTrack(null)}
+                onDrop={(e) => onLaneDrop(track, e)}
                 innerRef={(el) => {
                   const m = trackEls.current;
                   if (el) m.set(track.id, el);
@@ -404,6 +506,14 @@ export function TimelineEditor({
                 }}
               >
                 <div className="relative h-full w-full">
+                  {showDropHint && (
+                    <div
+                      className="pointer-events-none absolute inset-0 flex items-center justify-center text-[11px]"
+                      style={{ color: "var(--muted)" }}
+                    >
+                      Drag clips here from Hero Cuts or Dialogues to build your edit
+                    </div>
+                  )}
                   {trackClips.map((clip) => {
                     const selectedClip =
                       clip.origin.kind === "spine"
@@ -621,10 +731,18 @@ function Lane({
   label,
   children,
   innerRef,
+  highlight,
+  onDragOver,
+  onDragLeave,
+  onDrop,
 }: {
   label: string;
   children: React.ReactNode;
   innerRef?: (el: HTMLDivElement | null) => void;
+  highlight?: boolean;
+  onDragOver?: (e: React.DragEvent) => void;
+  onDragLeave?: (e: React.DragEvent) => void;
+  onDrop?: (e: React.DragEvent) => void;
 }) {
   return (
     <div className="flex items-stretch gap-2">
@@ -636,8 +754,15 @@ function Lane({
       </span>
       <div
         ref={innerRef}
+        onDragOver={onDragOver}
+        onDragLeave={onDragLeave}
+        onDrop={onDrop}
         className="relative h-9 min-w-0 flex-1 overflow-hidden rounded"
-        style={{ background: "var(--sidebar)" }}
+        style={{
+          background: "var(--sidebar)",
+          outline: highlight ? "2px dashed var(--accent)" : "none",
+          outlineOffset: -2,
+        }}
       >
         {children}
       </div>

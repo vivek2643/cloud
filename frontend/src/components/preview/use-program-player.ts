@@ -1,0 +1,496 @@
+/**
+ * Program player for the composite preview — the way browser NLEs (Canva, Veed,
+ * Clipchamp) actually do it.
+ *
+ * We do NOT decode whole files into PCM (that stalls the start and blows up
+ * memory), and we do NOT thrash one pair of <video> elements with a look-ahead
+ * prefetch that overshoots short cuts. Instead we keep a small POOL of media
+ * elements and treat each timeline CLIP as something we assign to a slot:
+ *
+ *  - Each slot is a muted <video> whose decoded audio is tapped into a Web Audio
+ *    graph (MediaElementSource -> per-slot GainNode -> master -> destination).
+ *    `el.muted = true` dodges the autoplay policy while the GRAPH still receives
+ *    audio, so we get real mixing (duck / levels / de-click fades) for free.
+ *  - At any program instant the VISIBLE picture is the top-z active video clip's
+ *    slot; every audible clip's slot drives its gain. Picture visibility and
+ *    audibility are independent, so dialogue keeps playing under a B-roll cut.
+ *  - The NEXT clip is assigned to a free slot and pre-seeked to its in-point, so
+ *    a cut (cross-file OR same-file jump) is just a visibility/gain swap — the
+ *    seek already happened off-screen. This is what hides the seek stall.
+ *
+ * The master clock is `AudioContext.currentTime` (monotonic). Elements are
+ * slaved to it: free-running inside a clip, drift-corrected, and re-seeked only
+ * at cuts. Seeking is cheap because the proxy is encoded with ~1s keyframes.
+ *
+ * Requires CORS on the media GET (enabled on the bucket) so `crossOrigin` tap is
+ * allowed; otherwise the MediaElementSource would output silence.
+ */
+import { useCallback, useEffect, useMemo, useRef } from "react";
+import type {
+  EditAspect,
+  LayerTransform,
+  ResolvedTimeline,
+} from "@/lib/api";
+import { sampleMotion } from "@/lib/resolve-timeline";
+
+const POOL_SIZE = 6;
+const DRIFT_S = 0.18; // re-seek a free-running element only past this much drift
+const PREWARM_MS = 1200; // assign + pre-seek a clip this long before it starts
+const GAIN_TC = 0.012; // gain smoothing time-constant (de-click cuts/duck)
+const START_LEAD_S = 0.04;
+
+/** A contiguous source span to play: spine segments carry BOTH picture + sound;
+ * coverage/angle are picture-only; beds are sound-only. */
+interface Clip {
+  id: string;
+  fileId: string;
+  srcInMs: number;
+  progStart: number;
+  progEnd: number;
+  hasVideo: boolean;
+  z: number;
+  transform?: LayerTransform;
+  hasAudio: boolean;
+  gainDb: number; // base + duck, already summed (constant per layer)
+}
+
+interface Slot {
+  el: HTMLVideoElement;
+  gain: GainNode;
+  clip: Clip | null;
+  needsSeek: boolean;
+  queuedSeek: number | null; // coalesced seek target while mid-seek
+}
+
+export interface ProgramPlayerHandle {
+  attachContainer: (el: HTMLDivElement | null) => void;
+  /** Ensure ctx/pool exist and the clip list is current. */
+  prepare: () => void;
+  /** Per-frame drive (called from the rAF loop and after seeks). */
+  sync: (t: number, playing: boolean) => void;
+  /** Begin playback from a program position (ms). */
+  play: (fromMs: number) => void;
+  /** Stop sounding; remember position. */
+  pause: () => void;
+  /** Jump to a program position; reschedules if playing. */
+  seek: (toMs: number, playing: boolean) => void;
+  /** Master program clock in ms (frozen until the first frame is ready). */
+  nowMs: () => number;
+  setMuted: (m: boolean) => void;
+  /** Hard stop + park everything (used on shape change / unmount). */
+  stop: () => void;
+}
+
+function dbToGain(db: number): number {
+  if (db <= -119) return 0;
+  return Math.min(1, Math.pow(10, db / 20));
+}
+
+/** Build the playable clip list: pair coincident spine video+audio into one
+ * clip, keep coverage/angle as picture-only and beds as sound-only. */
+function buildClips(resolved: ResolvedTimeline | null): Clip[] {
+  if (!resolved) return [];
+  const clips: Clip[] = [];
+  const audio = resolved.audio_layers.slice();
+  const consumed = new Set<number>();
+
+  const matchAudio = (fileId: string, ps: number, pe: number, srcIn: number): number => {
+    for (let i = 0; i < audio.length; i++) {
+      if (consumed.has(i)) continue;
+      const a = audio[i];
+      if (
+        a.source_file_id === fileId &&
+        Math.abs(a.prog_start_ms - ps) < 1 &&
+        Math.abs(a.prog_end_ms - pe) < 1 &&
+        Math.abs(a.src_in_ms - srcIn) < 1
+      ) {
+        return i;
+      }
+    }
+    return -1;
+  };
+
+  for (const v of resolved.video_layers) {
+    const ai = matchAudio(v.source_file_id, v.prog_start_ms, v.prog_end_ms, v.src_in_ms);
+    const a = ai >= 0 ? audio[ai] : null;
+    if (a) consumed.add(ai);
+    clips.push({
+      id: `c_${v.layer_id}`,
+      fileId: v.source_file_id,
+      srcInMs: v.src_in_ms,
+      progStart: v.prog_start_ms,
+      progEnd: v.prog_end_ms,
+      hasVideo: true,
+      z: v.z,
+      transform: v.transform,
+      hasAudio: !!a,
+      gainDb: a ? a.gain_db + a.duck_db : 0,
+    });
+  }
+  audio.forEach((a, i) => {
+    if (consumed.has(i)) return;
+    clips.push({
+      id: `c_${a.layer_id}`,
+      fileId: a.source_file_id,
+      srcInMs: a.src_in_ms,
+      progStart: a.prog_start_ms,
+      progEnd: a.prog_end_ms,
+      hasVideo: false,
+      z: -1,
+      hasAudio: true,
+      gainDb: a.gain_db + a.duck_db,
+    });
+  });
+  return clips;
+}
+
+/** CSS framing for the visible element, mirroring the render transform chain
+ * (rotate -> fit -> zoom) and the motion midpoint preview. */
+function applyFrameStyle(el: HTMLVideoElement, clip: Clip, aspect: EditAspect) {
+  const t = clip.transform;
+  const mid = t?.motion ? sampleMotion(t.motion, t.motion.dur_ms / 2) : null;
+  const fit = mid ? "cover" : t?.fit ?? (aspect === "landscape" ? "contain" : "cover");
+  const anchor = t?.anchor ?? "center";
+  const focus = mid ? { cx: mid.cx, cy: mid.cy } : t?.focus ?? null;
+  let objectPosition: string;
+  if (focus) {
+    const px = Math.round(Math.min(1, Math.max(0, focus.cx)) * 100);
+    const py = Math.round(Math.min(1, Math.max(0, focus.cy)) * 100);
+    objectPosition = `${px}% ${py}%`;
+  } else {
+    objectPosition =
+      anchor === "left"
+        ? "left center"
+        : anchor === "right"
+          ? "right center"
+          : anchor === "top"
+            ? "center top"
+            : anchor === "bottom"
+              ? "center bottom"
+              : "center";
+  }
+  const tf: string[] = [];
+  if (t?.rotate) tf.push(`rotate(${t.rotate}deg)`);
+  const scale = mid ? mid.scale : t?.zoom && t.zoom > 1 ? t.zoom : 1;
+  if (scale > 1) tf.push(`scale(${scale})`);
+  el.style.objectFit = fit;
+  el.style.objectPosition = objectPosition;
+  el.style.transform = tf.join(" ");
+}
+
+export function useProgramPlayer(
+  resolved: ResolvedTimeline | null,
+  urls: Record<string, string>
+): ProgramPlayerHandle {
+  const ctxRef = useRef<AudioContext | null>(null);
+  const masterRef = useRef<GainNode | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const poolRef = useRef<Slot[]>([]);
+
+  const clipsRef = useRef<Clip[]>([]);
+  const aspectRef = useRef<EditAspect>("landscape");
+  const urlsRef = useRef(urls);
+  urlsRef.current = urls;
+
+  // Master clock: program `originMs` corresponds to ctx time `t0`.
+  const playingRef = useRef(false);
+  const originMs = useRef(0);
+  const t0 = useRef(0);
+  const mutedRef = useRef(false);
+  // While non-null, the clock is HELD at this position until the visible
+  // element has a decoded frame (so the playhead never runs over black).
+  const pendingStart = useRef<number | null>(null);
+
+  const clips = useMemo(() => buildClips(resolved), [resolved]);
+  clipsRef.current = clips;
+  aspectRef.current = resolved?.aspect ?? "landscape";
+
+  const ensure = useCallback((): AudioContext | null => {
+    if (typeof window === "undefined") return null;
+    if (!ctxRef.current) {
+      const Ctor =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      if (!Ctor) return null;
+      const ctx = new Ctor();
+      const master = ctx.createGain();
+      master.gain.value = mutedRef.current ? 0 : 1;
+      master.connect(ctx.destination);
+      ctxRef.current = ctx;
+      masterRef.current = master;
+    }
+    const ctx = ctxRef.current;
+    const master = masterRef.current;
+    const container = containerRef.current;
+    if (ctx && master && container && poolRef.current.length === 0) {
+      for (let i = 0; i < POOL_SIZE; i++) {
+        const el = document.createElement("video");
+        el.muted = true; // dodge autoplay; audio still flows through the graph
+        el.playsInline = true;
+        el.preload = "auto";
+        el.crossOrigin = "anonymous";
+        el.setAttribute("aria-hidden", "true");
+        el.style.position = "absolute";
+        el.style.inset = "0";
+        el.style.width = "100%";
+        el.style.height = "100%";
+        el.style.opacity = "0";
+        el.style.transition = "opacity 60ms linear";
+        const gain = ctx.createGain();
+        gain.gain.value = 0;
+        const node = ctx.createMediaElementSource(el);
+        node.connect(gain);
+        gain.connect(master);
+        const slot: Slot = { el, gain, clip: null, needsSeek: false, queuedSeek: null };
+        el.addEventListener("seeked", () => {
+          if (slot.queuedSeek != null) {
+            const s = slot.queuedSeek;
+            slot.queuedSeek = null;
+            try {
+              el.currentTime = s;
+            } catch {
+              /* not ready */
+            }
+          }
+        });
+        container.appendChild(el);
+        poolRef.current.push(slot);
+      }
+    }
+    return ctxRef.current;
+  }, []);
+
+  /** Seek a slot, coalescing if a seek is already in flight (stacking seeks on
+   * a remote MP4 stalls the decoder). */
+  const seekSlot = (slot: Slot, sec: number) => {
+    const el = slot.el;
+    if (el.seeking) {
+      slot.queuedSeek = sec;
+      return;
+    }
+    try {
+      el.currentTime = sec;
+      slot.queuedSeek = null;
+    } catch {
+      slot.queuedSeek = sec;
+    }
+  };
+
+  const assignClip = (slot: Slot, clip: Clip) => {
+    slot.clip = clip;
+    const url = urlsRef.current[clip.fileId];
+    if (url && slot.el.src !== url) slot.el.src = url;
+    slot.needsSeek = true;
+  };
+
+  /** Full per-frame reconcile: assign needed clips to slots, then drive each
+   * slot's position/play/gain/visibility from the program time `t`. */
+  const reconcile = useCallback((t: number, playing: boolean) => {
+    const ctx = ensure();
+    if (!ctx) return;
+    const pool = poolRef.current;
+    if (pool.length === 0) return;
+    const cs = clipsRef.current;
+
+    const isActive = (c: Clip) => c.progStart <= t && t < c.progEnd;
+    const isPrewarm = (c: Clip) => playing && t < c.progStart && c.progStart <= t + PREWARM_MS;
+    const active = cs.filter(isActive);
+    const prewarm = cs.filter(isPrewarm);
+    const needed = [...active, ...prewarm];
+    const neededIds = new Set(needed.map((c) => c.id));
+
+    // Top-z active picture is what shows.
+    let visible: Clip | null = null;
+    for (const c of active) {
+      if (c.hasVideo && (!visible || c.z > visible.z)) visible = c;
+    }
+
+    const slotFor = (id: string) => pool.find((s) => s.clip?.id === id);
+    const isFree = (s: Slot) => !s.clip || !neededIds.has(s.clip.id);
+
+    // Assign active first (must never be evicted), then pre-warm into leftovers.
+    for (const clip of needed) {
+      if (slotFor(clip.id)) continue;
+      const slot =
+        pool.find((s) => isFree(s) && s.clip?.fileId === clip.fileId) ??
+        pool.find((s) => isFree(s));
+      if (slot) assignClip(slot, clip);
+    }
+
+    for (const slot of pool) {
+      const clip = slot.clip;
+      if (!clip || !neededIds.has(clip.id)) {
+        if (!slot.el.paused) slot.el.pause();
+        slot.gain.gain.setTargetAtTime(0, ctx.currentTime, GAIN_TC);
+        slot.el.style.opacity = "0";
+        continue;
+      }
+      const url = urlsRef.current[clip.fileId];
+      if (url && slot.el.src !== url) slot.el.src = url;
+
+      const active_ = isActive(clip);
+      const rel = Math.max(0, t - clip.progStart);
+      const want = (clip.srcInMs + rel) / 1000;
+
+      if (slot.needsSeek) {
+        seekSlot(slot, want);
+        slot.needsSeek = false;
+      } else if (active_ && playing) {
+        if (Math.abs(slot.el.currentTime - want) > DRIFT_S) seekSlot(slot, want);
+      }
+
+      const shouldPlay = playing && active_;
+      if (shouldPlay) {
+        if (slot.el.paused) void slot.el.play().catch(() => {});
+      } else if (!slot.el.paused) {
+        slot.el.pause();
+      }
+
+      const g = active_ && clip.hasAudio ? dbToGain(clip.gainDb) : 0;
+      slot.gain.gain.setTargetAtTime(g, ctx.currentTime, GAIN_TC);
+
+      if (clip === visible && active_) {
+        applyFrameStyle(slot.el, clip, aspectRef.current);
+        slot.el.style.opacity = "1";
+      } else {
+        slot.el.style.opacity = "0";
+      }
+    }
+  }, [ensure]);
+
+  const nowMs = useCallback((): number => {
+    if (pendingStart.current != null) return pendingStart.current;
+    const ctx = ctxRef.current;
+    if (!playingRef.current || !ctx) return originMs.current;
+    return originMs.current + Math.max(0, ctx.currentTime - t0.current) * 1000;
+  }, []);
+
+  const sync = useCallback(
+    (t: number, playing: boolean) => {
+      const ctx = ensure();
+      if (!ctx) return;
+      // Gated start: park + pre-seek at the pending position, and only release
+      // the clock once the visible element has a decoded frame.
+      if (playing && pendingStart.current != null) {
+        const at = pendingStart.current;
+        reconcile(at, false);
+        const vis = poolRef.current.find(
+          (s) => s.el.style.opacity === "1" && s.clip
+        );
+        const ready = !vis || (vis.el.readyState >= 2 && !vis.el.seeking);
+        if (ready) {
+          originMs.current = at;
+          t0.current = ctx.currentTime + START_LEAD_S;
+          pendingStart.current = null;
+        } else {
+          return; // hold the clock another frame
+        }
+      }
+      reconcile(t, playing);
+    },
+    [ensure, reconcile]
+  );
+
+  const play = useCallback(
+    (fromMs: number) => {
+      const ctx = ensure();
+      if (!ctx) return;
+      if (ctx.state === "suspended") void ctx.resume();
+      playingRef.current = true;
+      originMs.current = Math.max(0, fromMs);
+      pendingStart.current = Math.max(0, fromMs); // gate until first frame ready
+    },
+    [ensure]
+  );
+
+  const pause = useCallback(() => {
+    originMs.current = nowMs();
+    playingRef.current = false;
+    pendingStart.current = null;
+    for (const s of poolRef.current) if (!s.el.paused) s.el.pause();
+  }, [nowMs]);
+
+  const seek = useCallback(
+    (toMs: number, playing: boolean) => {
+      originMs.current = Math.max(0, toMs);
+      if (playing) {
+        pendingStart.current = Math.max(0, toMs); // re-gate on the new frame
+      } else {
+        pendingStart.current = null;
+        for (const s of poolRef.current) s.needsSeek = true;
+      }
+    },
+    []
+  );
+
+  const setMuted = useCallback((m: boolean) => {
+    mutedRef.current = m;
+    const ctx = ctxRef.current;
+    if (masterRef.current && ctx) {
+      masterRef.current.gain.setTargetAtTime(m ? 0 : 1, ctx.currentTime, 0.01);
+    }
+  }, []);
+
+  const stop = useCallback(() => {
+    playingRef.current = false;
+    pendingStart.current = null;
+    originMs.current = 0;
+    for (const s of poolRef.current) {
+      s.clip = null;
+      s.needsSeek = false;
+      s.queuedSeek = null;
+      try {
+        s.el.pause();
+        s.el.removeAttribute("src");
+        s.el.load();
+      } catch {
+        /* ignore */
+      }
+      s.el.style.opacity = "0";
+      const ctx = ctxRef.current;
+      if (ctx) s.gain.gain.setTargetAtTime(0, ctx.currentTime, 0.005);
+    }
+  }, []);
+
+  const prepare = useCallback(() => {
+    ensure();
+  }, [ensure]);
+
+  const attachContainer = useCallback((el: HTMLDivElement | null) => {
+    containerRef.current = el;
+    if (el) ensure();
+  }, [ensure]);
+
+  // Release the AudioContext + pooled elements on unmount.
+  useEffect(() => {
+    const pool = poolRef.current;
+    return () => {
+      for (const s of pool) {
+        try {
+          s.el.pause();
+          s.el.removeAttribute("src");
+          s.el.remove();
+        } catch {
+          /* ignore */
+        }
+      }
+      poolRef.current = [];
+      const ctx = ctxRef.current;
+      ctxRef.current = null;
+      masterRef.current = null;
+      if (ctx) void ctx.close().catch(() => {});
+    };
+  }, []);
+
+  return {
+    attachContainer,
+    prepare,
+    sync,
+    play,
+    pause,
+    seek,
+    nowMs,
+    setMuted,
+    stop,
+  };
+}

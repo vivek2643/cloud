@@ -246,6 +246,22 @@ export function AiEditPanel() {
     }
   }
 
+  // Ensure an edit session exists WITHOUT seeding the working doc (so manually
+  // dragged-in cuts aren't wiped). Used by the timeline's save + first drop.
+  const ensureThread = useCallback(async (): Promise<string | null> => {
+    if (threadId) return threadId;
+    if (!token) return null;
+    try {
+      const created = await createEditThread(aiScopeFileIds, "", token);
+      setThreadId(created.thread_id);
+      saveThreadId(scope, created.thread_id);
+      return created.thread_id;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not start an edit.");
+      return null;
+    }
+  }, [threadId, token, aiScopeFileIds, scope]);
+
   function handleNewThread() {
     stopPolling();
     // A fresh start must also empty the LIVE preview/timeline + stop playback,
@@ -392,19 +408,22 @@ export function AiEditPanel() {
       </div>
     </aside>
 
-    {/* Editable timeline dock, pinned full-width to the bottom of the main
-        area (left of the chat), pro-editor style. The program monitor stays in
-        the panel; this is the timeline track. */}
+    {/* Editable timeline dock, pinned full-width to the bottom of the main area
+        (left of the chat), pro-editor style. Always shown in edit mode so users
+        can drag clips in to build a timeline from scratch — not only after the
+        AI produces cuts. The program monitor stays in the panel. */}
     {dockEl &&
-      doc?.timeline &&
-      doc.timeline.length > 0 &&
-      threadId &&
       createPortal(
         <div
           className="max-h-[40vh] min-h-[200px] w-full overflow-y-auto border-t p-3"
           style={{ borderColor: "var(--border)", background: "var(--sidebar)" }}
         >
-          <TimelineEditor threadId={threadId} token={token} onSaved={handleSavedEdit} />
+          <TimelineEditor
+            threadId={threadId}
+            ensureThread={ensureThread}
+            token={token}
+            onSaved={handleSavedEdit}
+          />
         </div>,
         dockEl
       )}

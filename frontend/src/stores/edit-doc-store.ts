@@ -72,6 +72,22 @@ interface EditDocState {
   reorderSeg: (segId: string, toIndex: number) => void;
   split: (segId: string) => void;
   remove: (segId: string) => void;
+  /** Insert a spine cut from a dragged clip (default: append). Selects it. */
+  addSegment: (
+    seg: { file_id: string; in_ms: number; out_ms: number },
+    atIndex?: number
+  ) => void;
+  /** Add a placed video overlay / audio bed from a dragged clip. */
+  addOp: (op: {
+    type: "place_video" | "place_audio";
+    source_file_id: string;
+    src_in_ms: number;
+    src_out_ms: number;
+    from_ms: number;
+    z?: number;
+    role?: string;
+    audio_kind?: string;
+  }) => void;
 
   // --- operation mutators ---
   setGain: (opId: string, gainDb: number) => void;
@@ -230,6 +246,57 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
         timeline: st.timeline.filter((s) => s.seg_id !== segId),
         selected: st.selected === segId ? null : st.selected,
       };
+    }),
+
+  addSegment: (seg, atIndex) =>
+    set((st) => {
+      const inMs = Math.max(0, Math.round(seg.in_ms));
+      const outMs = Math.max(inMs + MIN_SEG_MS, Math.round(seg.out_ms));
+      const newSeg: EditSegment = {
+        seg_id: rid("se"),
+        file_id: seg.file_id,
+        in_ms: inMs,
+        out_ms: outMs,
+      };
+      const next = [...st.timeline];
+      const idx =
+        atIndex == null ? next.length : Math.max(0, Math.min(Math.round(atIndex), next.length));
+      next.splice(idx, 0, newSeg);
+      return { timeline: next, selected: newSeg.seg_id };
+    }),
+
+  addOp: (op) =>
+    set((st) => {
+      const srcIn = Math.max(0, Math.round(op.src_in_ms));
+      const srcOut = Math.max(srcIn + MIN_SEG_MS, Math.round(op.src_out_ms));
+      const from = Math.max(0, Math.round(op.from_ms));
+      const dur = srcOut - srcIn;
+      const newOp: EditOperation =
+        op.type === "place_video"
+          ? {
+              op_id: rid("pv"),
+              type: "place_video",
+              source_file_id: op.source_file_id,
+              src_in_ms: srcIn,
+              src_out_ms: srcOut,
+              from_ms: from,
+              to_ms: from + dur,
+              z: Math.round(op.z ?? 10),
+              opacity: 1,
+            }
+          : {
+              op_id: rid("pa"),
+              type: "place_audio",
+              source_file_id: op.source_file_id,
+              src_in_ms: srcIn,
+              src_out_ms: srcOut,
+              from_ms: from,
+              to_ms: from + dur,
+              role: op.role ?? "music",
+              audio_kind: op.audio_kind ?? "bed",
+              gain_db: 0,
+            };
+      return { operations: [...st.operations, newOp] };
     }),
 
   setGain: (opId, gainDb) =>
