@@ -114,7 +114,27 @@ def post_message(
     store.append_turn(thread_id, "assistant", result.reply)
 
     if result.intent == "edit" and result.brief:
+        thread = store.get_thread(thread_id)
+        file_ids = (thread or {}).get("file_ids") or []
         store.update_brief(thread_id, result.brief)
+
+        # The chat brain IS the editor: when it returned its picked cut list,
+        # compile THAT directly (deterministic, no second LLM) so what the user
+        # saw it reason about is exactly what gets cut. Fall back to the arranger
+        # only when no usable cut list came back.
+        if result.timeline:
+            try:
+                document = auto_edit.compile_chat_edit(
+                    file_ids, result.brief, result.timeline,
+                    aspect=result.aspect, target_s=result.target_s)
+            except Exception:  # noqa: BLE001 - never hard-fail an edit turn
+                document = None
+            if document is not None:
+                store.save_document(thread_id, document, created_by="auto")
+                store.set_thread_status(thread_id, "ready")
+                return {"reply": result.reply, "intent": "edit", "applying": True}
+
+        # Fallback: a confirmed edit with no usable cut list -> arranger run.
         store.set_thread_status(thread_id, "drafting")
         auto_edit._defer_run(thread_id)
         return {"reply": result.reply, "intent": "edit", "applying": True}

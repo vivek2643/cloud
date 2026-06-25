@@ -640,6 +640,35 @@ def make_edit(file_ids: List[str], brief: str,
                           selected=len(document.get("timeline") or []))
 
 
+def compile_chat_edit(
+    file_ids: List[str], brief: str, timeline: List[dict],
+    *, aspect: str = "", target_s: Optional[float] = None,
+) -> Optional[dict]:
+    """Compile a timeline the CHAT brain already picked, with NO second LLM call.
+
+    The conversational brain (``converse``) sees the whole footage map and now
+    proposes the actual cut list (moment ids + level + track). This realises
+    exactly that selection: validate its refs against the map and compile the
+    SAME Edit Document the arranger would -- so what the user saw it reason about
+    is what gets cut, instead of a separate arranger re-guessing from a prose
+    brief. Returns None when nothing validates (caller then falls back to the
+    arranger), so a confirmed edit never silently lands empty.
+    """
+    fmap = footage_map.assemble_map(file_ids)
+    map_struct = fmap.get("struct") or {"clips": []}
+    index = arrange._MapIndex(map_struct)
+    placements = arrange._coerce_placements({"timeline": timeline or []}, index)
+    if not placements:
+        return None
+    plan = Plan(
+        energy=0.5,
+        aspect=(aspect or "landscape"),
+        target_duration_ms=int(target_s * 1000) if target_s else None,
+        intent=brief,
+    )
+    return arrange.compile_placements(brief, plan, placements, map_struct, file_ids)
+
+
 # --------------------------------------------------------------------------
 # Thread run path (mirrors orchestrator.py; writes the same Edit Document)
 # --------------------------------------------------------------------------

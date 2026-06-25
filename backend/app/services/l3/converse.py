@@ -17,8 +17,8 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import dataclass, field
+from typing import Any, List, Optional
 
 from app.config import get_settings
 from app.services.l3 import arrange, footage_map, store
@@ -38,29 +38,57 @@ class ConverseResult:
     reply: str
     intent: str = "chat"      # "chat" | "edit"
     brief: str = ""           # the agreed edit instruction (only when intent="edit")
+    # The chat brain IS the editor: on an edit it returns the actual cut list it
+    # picked (moment ids + level + track), which the caller compiles directly --
+    # no separate arranger re-guess. Empty -> caller falls back to the arranger.
+    timeline: List[dict] = field(default_factory=list)
+    aspect: str = ""          # "portrait" | "landscape" | "square" (optional)
+    target_s: Optional[float] = None   # target length in seconds (optional)
 
 
 _SYSTEM = (
-    "You are EDSO, a friendly, sharp video-editing assistant. You are CHATTING "
-    "with the user about their project. You can see a MAP of all their footage "
-    "(every clip and its usable moments) and the CURRENT TIMELINE of the edit so "
-    "far.\n\n"
+    "You are EDSO, a friendly, sharp video-editing assistant -- AND the editor "
+    "itself. You are CHATTING with the user about their project. You can see a MAP "
+    "of all their footage (every clip and its usable moments, with the FULL line "
+    "of what is said) and the CURRENT TIMELINE of the edit so far.\n\n"
+    "Map notation (one moment per line):\n"
+    "  m07 speech S1 .82 [0:14-0:21] \"the full line text\" · nrg:calm|balanced "
+    "(+3 atoms) · dup:tg4*\n"
+    "  - the id is <clip8>:<m##>; refer to a moment by its FULL id (e.g. "
+    "ab12cd34:m07).\n"
+    "  - nrg lists the energy LEVELS you may take it at: broad (whole answer) .. "
+    "balanced (one thought) .. sharp (tightest). Pick the level that fits pacing.\n"
+    "  - 'dup:tgN' = the same content as others in group tgN (another take/angle); "
+    "the '*' is the best take. Use exactly ONE moment per dup group.\n\n"
     "How to behave:\n"
     "- By default, just TALK. Answer questions, explain what's in the footage, "
     "discuss ideas, give opinions, ask clarifying questions. Be concise and warm.\n"
     "- You do NOT edit on your own. Chatting never changes the timeline.\n"
-    "- When the user seems to want a change to the edit, do NOT do it yet. First "
-    "PROPOSE what you'd do in one or two sentences and ASK them to confirm (e.g. "
-    "\"Want me to apply that?\"). Keep intent = \"chat\" for a proposal.\n"
+    "- When the user seems to want a change, do NOT do it yet. First PROPOSE what "
+    "you'd do in one or two sentences (you may name the exact moments) and ASK "
+    "them to confirm (e.g. \"Want me to apply that?\"). Keep intent=\"chat\".\n"
     "- ONLY when the user has clearly confirmed in their LATEST message (\"yes\", "
-    "\"do it\", \"go ahead\", etc.) do you set intent = \"edit\" and put a clear, "
-    "self-contained instruction in \"brief\" describing exactly the edit to make "
-    "(what to keep / cut / reorder, the pacing, the length). Your reply should "
-    "tell them you're applying it.\n"
-    "- If you are unsure whether they confirmed, ASK -- do not edit.\n\n"
-    "Return ONLY JSON (no prose around it): {\"reply\": \"<what you say to the "
-    "user>\", \"intent\": \"chat\"|\"edit\", \"brief\": \"<edit instruction; only "
-    "when intent=edit, else empty>\"}"
+    "\"do it\", \"go ahead\"): set intent=\"edit\" AND return the COMPLETE cut "
+    "list you decided on in \"timeline\" -- this list is exactly what gets cut, so "
+    "include every moment in play order. Also give a short \"brief\".\n"
+    "- Build the timeline like a real editor: open strong, build, land; cut "
+    "filler/slates/banter/off-brief; never repeat a line (one moment per dup "
+    "group); choose the energy level per cut for pacing; respect any target "
+    "length. Everything on track 0 is the main line and plays back-to-back; put "
+    "b-roll/cutaways on track 1 (it covers the picture while the main audio "
+    "continues) with a from_ms anchor.\n"
+    "- Use ONLY moment ids that appear in the MAP. If you are unsure whether they "
+    "confirmed, ASK -- do not edit.\n\n"
+    "Return ONLY JSON (no prose around it):\n"
+    "{\"reply\": \"<what you say to the user>\", "
+    "\"intent\": \"chat\"|\"edit\", "
+    "\"brief\": \"<one-line edit instruction; only when intent=edit>\", "
+    "\"aspect\": \"portrait\"|\"landscape\"|\"square\", "
+    "\"target_s\": <target length in seconds or null>, "
+    "\"timeline\": [{\"ref\": \"<full moment id>\", \"level\": \"balanced\", "
+    "\"track\": 0, \"from_ms\": null, \"reason\": \"<short why>\"}]}\n"
+    "Leave \"timeline\" empty ([]) for a plain chat turn or a proposal; fill it "
+    "ONLY on the confirmed edit turn."
 )
 
 
@@ -117,11 +145,52 @@ def respond(thread_id: str, *, llm: Optional[LLMClient] = None) -> ConverseResul
         intent = "chat"
     brief = str(data.get("brief") or "").strip()
     reply = str(data.get("reply") or "").strip()
+    timeline = _coerce_timeline(data.get("timeline"))
+    aspect = str(data.get("aspect") or "").strip().lower()
+    if aspect not in ("portrait", "landscape", "square"):
+        aspect = ""
+    target_s = data.get("target_s")
+    try:
+        target_s = float(target_s) if target_s is not None else None
+    except (TypeError, ValueError):
+        target_s = None
     if intent == "edit" and not brief:
         intent = "chat"            # no instruction -> nothing to run; keep talking
     if not reply:
         reply = "On it -- applying that now." if intent == "edit" else "…"
-    return ConverseResult(reply=reply, intent=intent, brief=brief)
+    return ConverseResult(reply=reply, intent=intent, brief=brief,
+                          timeline=timeline, aspect=aspect, target_s=target_s)
+
+
+def _coerce_timeline(raw: Any) -> List[dict]:
+    """Keep only well-formed cut entries; validation against the map happens in
+    the compiler (``arrange._coerce_placements``), so here we just shape them."""
+    if not isinstance(raw, list):
+        return []
+    out: List[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        ref = str(item.get("ref") or "").strip()
+        if not ref:
+            continue
+        entry: dict = {"ref": ref}
+        if item.get("level"):
+            entry["level"] = str(item["level"]).strip().lower()
+        if item.get("track") is not None:
+            try:
+                entry["track"] = int(item["track"])
+            except (TypeError, ValueError):
+                pass
+        if item.get("from_ms") is not None:
+            try:
+                entry["from_ms"] = int(item["from_ms"])
+            except (TypeError, ValueError):
+                pass
+        if item.get("reason"):
+            entry["reason"] = str(item["reason"]).strip()
+        out.append(entry)
+    return out
 
 
 def _parse(text: Optional[str]) -> Optional[dict]:
