@@ -18,6 +18,7 @@ if BACKEND not in sys.path:
 
 from app.services.l3 import hero_cuts as hc  # noqa: E402
 from app.services.l3 import score_span as ss  # noqa: E402
+from app.services.l3.thought_segments import Span, Thought  # noqa: E402
 
 
 def _action_beats(clip, params, field):
@@ -192,6 +193,89 @@ def test_take_stacking_collapses_repeats(monkeypatch=None):
     assert len(repeated.alt_takes) == 1 and repeated.alt_takes[0].score == 0.6
     assert any("pricing" in h.label and h.take_count == 1 for h in stacked)
     print("ok  test_take_stacking_collapses_repeats")
+
+
+def _span(in_ms, out_ms, text, si, sj):
+    return Span(raw_in_ms=in_ms, raw_out_ms=out_ms, text=text, start_word=si, end_word=sj)
+
+
+def test_thought_bands_select_hierarchy():
+    """The five energy bands cut the SAME thought at different zoom levels:
+    turn/setup -> the run-up + idea, balanced -> the idea, tight -> the core
+    sentence, sharp -> the punchline clause (with matching in/out + text)."""
+    words = _words([
+        ("so", 0, 400), ("anyway", 400, 900),
+        ("we", 1000, 1300), ("almost", 1300, 1700), ("shut", 1700, 2100),
+        ("down", 2100, 2500), ("last", 2500, 2900), ("year", 2900, 3300),
+    ])
+    th = Thought(
+        speaker="S0",
+        thought=_span(1000, 3300, "we almost shut down last year", 2, 7),
+        core=_span(1000, 2500, "we almost shut down", 2, 5),
+        punch=_span(1300, 2500, "almost shut down", 3, 5),
+        setup=_span(0, 900, "so anyway", 0, 1),
+        strength=0.8,
+    )
+    clip = hc._ClipInputs(
+        file_id="tttttttt-1", duration_ms=5000,
+        dialogue={"topic": [], "sentence": []},
+        perception=None, motion=None, thoughts=[th])
+    src = _src("tttttttt-1", 5000, words)
+
+    def one(energy):
+        hs = hc._speech_candidates(clip, src, None, hc.energy_to_params(energy))
+        assert len(hs) == 1, (energy, [h.label for h in hs])
+        return hs[0]
+
+    balanced = one(0.5)
+    assert (balanced.src_in_ms, balanced.src_out_ms) == (1000, 3300), balanced
+    assert balanced.label == "we almost shut down last year"
+
+    tight = one(0.7)
+    assert (tight.src_in_ms, tight.src_out_ms) == (1000, 2500), tight
+    assert tight.label == "we almost shut down"
+
+    sharp = one(1.0)
+    assert (sharp.src_in_ms, sharp.src_out_ms) == (1300, 2500), sharp
+    assert sharp.label == "almost shut down"
+
+    calm = one(0.3)
+    assert calm.src_in_ms == 0 and calm.src_out_ms == 3300, calm   # setup + thought
+    assert calm.label.startswith("so anyway we almost"), calm.label
+    print("ok  test_thought_bands_select_hierarchy")
+
+
+def test_thought_turn_merge_at_broad():
+    """Broad merges consecutive same-speaker thoughts into one turn; Balanced
+    keeps them as separate thought cuts."""
+    words = _words([
+        ("so", 0, 400), ("anyway", 400, 900),
+        ("we", 1000, 1300), ("almost", 1300, 1700), ("shut", 1700, 2100), ("down", 2100, 2500),
+        ("one", 2600, 2900), ("customer", 2900, 3300), ("changed", 3300, 3700), ("everything", 3700, 4100),
+    ])
+    t1 = Thought(
+        speaker="S0",
+        thought=_span(1000, 2500, "we almost shut down", 2, 5),
+        core=_span(1000, 2500, "we almost shut down", 2, 5),
+        punch=_span(1300, 2500, "almost shut down", 3, 5),
+        setup=_span(0, 900, "so anyway", 0, 1), strength=0.8)
+    t2 = Thought(
+        speaker="S0",
+        thought=_span(2600, 4100, "one customer changed everything", 6, 9),
+        core=_span(2600, 4100, "one customer changed everything", 6, 9),
+        punch=_span(3300, 4100, "changed everything", 8, 9), setup=None, strength=0.7)
+    clip = hc._ClipInputs(
+        file_id="uuuuuuuu-1", duration_ms=6000,
+        dialogue={"topic": [], "sentence": []},
+        perception=None, motion=None, thoughts=[t1, t2])
+    src = _src("uuuuuuuu-1", 6000, words)
+
+    broad = hc._speech_candidates(clip, src, None, hc.energy_to_params(0.0))
+    assert len(broad) == 1, [h.label for h in broad]          # one merged turn
+    assert (broad[0].src_in_ms, broad[0].src_out_ms) == (0, 4100), broad[0]
+    balanced = hc._speech_candidates(clip, src, None, hc.energy_to_params(0.5))
+    assert len(balanced) == 2, [h.label for h in balanced]    # two thoughts
+    print("ok  test_thought_turn_merge_at_broad")
 
 
 def test_action_snaps_to_calm_motion_seam():
@@ -403,6 +487,8 @@ def main():
     test_speech_drops_offcamera_and_short()
     test_energy_selects_granularity()
     test_clustering_gradient()
+    test_thought_bands_select_hierarchy()
+    test_thought_turn_merge_at_broad()
     test_sharp_breath_removal_edit_list()
     test_take_stacking_collapses_repeats()
     test_action_snaps_to_calm_motion_seam()

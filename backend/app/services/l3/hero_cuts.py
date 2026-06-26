@@ -4,10 +4,12 @@ Hero-cuts assembly: the single ranked feed of "usable moments" for a project.
 This is the V1 product surface. It is a deterministic, post-VLM assembly over
 artifacts L1/L2/L3 already produced -- no new model call:
 
-  * SPEECH heroes  come from the L1 ``dialogue_segments`` SENTENCES (already
-    snapped to silence troughs, speaker-tagged, off-camera-flagged, and present
-    on every clip). The energy dial sets granularity by CLUSTERING them: whole
-    answers at low energy, sentences in the middle, clauses at the top.
+  * SPEECH heroes  come from the THOUGHT hierarchy (``l3.thought_segments``):
+    one speaker's self-contained idea, with a zoom ladder (turn -> setup ->
+    thought -> core -> punch). The energy dial picks the LEVEL: a whole turn at
+    the bottom, the complete thought in the middle, the punchline clause at the
+    top. (When a clip has no thoughts we fall back to the L1 sentence/topic
+    units.)
   * ACTION / VISUAL heroes come from the VLM's ``content_units`` (kind = action
     / visual).
 
@@ -60,7 +62,9 @@ _MERGE_LEN_RATIO = 0.7
 
 # Bump whenever the per-file cut logic changes (energy params, candidate
 # builders, scoring) so the precompute cache invalidates and recomputes.
-PARAMS_VERSION = 1
+# v2: speech bands now cut from the THOUGHT hierarchy (l3.thought_segments)
+# instead of the L1 sentence/topic tiers.
+PARAMS_VERSION = 2
 
 # The five canonical product energy LEVELS = the band centers (Broad .. Sharp).
 # Hero cuts are precomputed at exactly these after L2; any requested energy
@@ -246,6 +250,7 @@ class _ClipInputs:
     perception: Optional[dict]
     motion: Optional[dict]                    # motion_dynamics row as a dict
     audio: Optional[dict] = None             # audio_features cut grids (dialogue/beat)
+    thoughts: list = field(default_factory=list)  # l3.thought_segments.Thought (speech source)
 
 
 def _load_inputs(file_ids: List[str]) -> Dict[str, _ClipInputs]:
@@ -312,6 +317,18 @@ def _load_inputs(file_ids: List[str]) -> Dict[str, _ClipInputs]:
             motion=motion,
             audio=audio,
         )
+
+    # Attach the thought primitives (the speech source). Cached per file and
+    # lazily computed on a miss; imported here so the module import never pulls
+    # in the LLM adapter. The legacy sentence/topic units stay as the fallback
+    # when a clip has no thoughts (LLM unavailable + no dialogue segments).
+    from app.services.l3 import thought_segments as _tseg
+    for fid, clip in out.items():
+        try:
+            clip.thoughts = _tseg.get_thoughts(fid)
+        except Exception:
+            logger.exception("hero: thought load failed for %s", fid)
+            clip.thoughts = []
     return out
 
 
@@ -609,20 +626,89 @@ def _block_unit(clip: _ClipInputs, group: List[dict]) -> dict:
     }
 
 
-def _speech_units(clip: _ClipInputs, params: EnergyParams,
-                  sentences: List[dict], topics: List[dict]) -> List[dict]:
-    """Select the L1 tier for this energy band: sentence, topic, or a merged
-    block of topics. Each level has clean, language-bounded edges by construction
-    (no re-clustering by raw silence)."""
+def _legacy_speech_units(clip: _ClipInputs, params: EnergyParams,
+                         sentences: List[dict], topics: List[dict]) -> List[dict]:
+    """Fallback speech units from the L1 sentence/topic hierarchy, used only when
+    a clip has no thoughts. The energy level maps onto the old tiers: a thought
+    is roughly a topic, so turn->block(merged topics), setup/thought->topic,
+    core/punch->sentence. Each level has clean, language-bounded edges."""
     tier = params.speech_unit
-    if tier == "sentence":
+    if tier in ("core", "punch"):
         segs = [s for s in sentences if _usable_seg(s)] or [t for t in topics if _usable_seg(t)]
         return [_unit_from_seg(clip, s) for s in segs]
-    # Topic-based tiers. Fall back to sentences-as-topics when no topic tier.
+    # Thought/setup map onto the topic tier; turn merges topics into a block.
     tops = [t for t in topics if _usable_seg(t)] or [s for s in sentences if _usable_seg(s)]
-    if tier == "topic":
+    if tier in ("setup", "thought"):
         return [_unit_from_seg(clip, t) for t in tops]
     return [_block_unit(clip, g) for g in _merge_topics(tops, params.speech_merge_gap_ms)]
+
+
+# --- Thought-based speech units (the primary path) ------------------------
+
+def _thought_start_ms(t) -> int:
+    """The earliest ms of a thought INCLUDING its setup run-up."""
+    return int(t.setup.raw_in_ms if t.setup else t.thought.raw_in_ms)
+
+
+def _thought_text_with_setup(t) -> str:
+    if t.setup and (t.setup.text or "").strip():
+        return (t.setup.text + " " + t.thought.text).strip()
+    return (t.thought.text or "").strip()
+
+
+def _merge_thoughts(thoughts: list, gap_ms: int) -> List[list]:
+    """Group consecutive SAME-SPEAKER thoughts whose gap is shorter than
+    ``gap_ms`` into one turn (the Broad zoom-out). A speaker change always breaks
+    a group -- we never fuse two people into one clip."""
+    items = sorted(thoughts, key=_thought_start_ms)
+    groups: List[list] = []
+    for t in items:
+        if groups and gap_ms > 0:
+            prev = groups[-1][-1]
+            if t.speaker == prev.speaker and _thought_start_ms(t) - int(prev.thought.raw_out_ms) < gap_ms:
+                groups[-1].append(t)
+                continue
+        groups.append([t])
+    return groups
+
+
+def _speech_unit(in_ms: int, out_ms: int, text: str, speaker) -> Optional[dict]:
+    text = (text or "").strip()
+    if out_ms <= in_ms or not text:
+        return None
+    return {"in": int(in_ms), "out": int(out_ms), "raw_in": int(in_ms),
+            "raw_out": int(out_ms), "text": text, "speaker": speaker, "flags": []}
+
+
+def _band_thought_span(t, band: int) -> Tuple[int, int, str]:
+    """(in_ms, out_ms, text) for one thought at a non-Broad band."""
+    if band <= 1:        # Calm: the thought + the speaker's own run-up
+        in_ms = t.setup.raw_in_ms if t.setup else t.thought.raw_in_ms
+        return int(in_ms), int(t.thought.raw_out_ms), _thought_text_with_setup(t)
+    if band == 2:        # Balanced: the complete thought proper
+        return int(t.thought.raw_in_ms), int(t.thought.raw_out_ms), (t.thought.text or "")
+    if band == 3:        # Tight: the core sentence
+        return int(t.core.raw_in_ms), int(t.core.raw_out_ms), (t.core.text or "")
+    return int(t.punch.raw_in_ms), int(t.punch.raw_out_ms), (t.punch.text or "")  # Sharp: punchline
+
+
+def _thought_speech_units(thoughts: list, params: EnergyParams) -> List[dict]:
+    """Speech units for this energy band, built from the THOUGHT hierarchy --
+    one speaker's self-contained idea zoomed to the band level (turn / setup /
+    thought / core / punch). Edges are language-bounded by construction."""
+    band = params.band
+    raw: List[Optional[dict]] = []
+    if band == 0:        # Broad: merge consecutive same-speaker thoughts -> turn
+        for group in _merge_thoughts(thoughts, params.speech_merge_gap_ms):
+            in_ms = min(_thought_start_ms(t) for t in group)
+            out_ms = max(int(t.thought.raw_out_ms) for t in group)
+            text = " ".join(_thought_text_with_setup(t) for t in group).strip()
+            raw.append(_speech_unit(in_ms, out_ms, text, group[0].speaker))
+    else:
+        for t in thoughts:
+            in_ms, out_ms, text = _band_thought_span(t, band)
+            raw.append(_speech_unit(in_ms, out_ms, text, t.speaker))
+    return [u for u in raw if u]
 
 
 def _breath_keep_spans(words: List[dict], lo: int, hi: int,
@@ -688,31 +774,37 @@ def _speech_candidates(
     clip: _ClipInputs, source: Optional[ss.SpanSource],
     field: Optional[fseams.FusedField], params: EnergyParams,
 ) -> List[HeroCut]:
-    """Speech heroes selected from the L1 dialogue HIERARCHY by energy band.
+    """Speech heroes selected from the THOUGHT hierarchy by energy band.
 
-    The dial picks a TIER (not a silence threshold), so every level has clean,
-    language-bounded edges by construction:
+    The dial picks a LEVEL of the thought (not a silence threshold), so every
+    band has clean, language-bounded edges by construction:
 
-      * Broad/Calm   -> blocks: merge same-speaker topics (huge/medium gap),
-      * Balanced      -> topic: one complete answer/thought,
-      * Tight/Sharp   -> sentence (Sharp loses its breath in the later step).
+      * Broad     -> turn: merge consecutive same-speaker thoughts,
+      * Calm      -> setup + thought: the idea plus the speaker's own run-up,
+      * Balanced  -> thought: one complete idea (the pivot),
+      * Tight     -> core: the one sentence that carries it,
+      * Sharp     -> punch: the tightest landing clause (loses its breath later).
 
-    Each unit's boundaries then flow through the fused seam field for the
-    energy-scaled tightness (snap window + veto-bounded breathing room). Off-
-    camera audio is dropped by the L1 production-cue lexicon and, where the VLM
-    logged them, refined by its visible-speaking spans (edge-trim crew cues,
-    drop wholly off-frame units).
+    When a clip has no thoughts (LLM unavailable AND no dialogue segments) we
+    fall back to the legacy L1 sentence/topic units. Each unit's boundaries then
+    flow through the fused seam field for the energy-scaled tightness (snap
+    window + veto-bounded breathing room). Off-camera audio is dropped/edge-
+    trimmed using the VLM's visible-speaking spans where logged.
     """
     perception = clip.perception or {}
     quality_events = perception.get("take_quality_events") or []
     speaking = perception.get("speaking") or []
-    sentences = clip.dialogue.get("sentence") or []
-    topics = clip.dialogue.get("topic") or []
-    if not sentences and not topics:
+    if clip.thoughts:
+        units = _thought_speech_units(clip.thoughts, params)
+    else:
+        sentences = clip.dialogue.get("sentence") or []
+        topics = clip.dialogue.get("topic") or []
+        units = _legacy_speech_units(clip, params, sentences, topics)
+    if not units:
         return []
 
     out: List[HeroCut] = []
-    for ci, u in enumerate(_speech_units(clip, params, sentences, topics)):
+    for ci, u in enumerate(units):
         in_ms, out_ms, text = u["in"], u["out"], u["text"]
         raw_in, raw_out, speaker, flags = u["raw_in"], u["raw_out"], u["speaker"], u["flags"]
 

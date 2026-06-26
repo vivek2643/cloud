@@ -54,7 +54,7 @@ def _words():
 def test_llm_pass_maps_indices_to_ms():
     body = """{"thoughts":[
       {"speaker":"S0","thought":[0,5],"core":[0,3],"punch":[2,3],"setup":null,"strength":0.8},
-      {"speaker":"S0","thought":[6,10],"core":[7,10],"punch":[9,10],"setup":[6,6],"strength":0.7}
+      {"speaker":"S0","thought":[7,10],"core":[7,10],"punch":[9,10],"setup":[6,6],"strength":0.7}
     ]}"""
     out = ts.segment_with_llm(_words(), _FakeLLM(body))
     assert len(out) == 2, out
@@ -66,27 +66,28 @@ def test_llm_pass_maps_indices_to_ms():
     assert t0.setup is None
     assert abs(t0.strength - 0.8) < 1e-6
     t1 = out[1]
+    # setup sits BEFORE the thought (word 6 = "but"); thought proper is 7..10.
     assert t1.setup is not None and t1.setup.text == "but", t1.setup
-    assert t1.core.text == "one customer changed everything", t1.core.text
-    assert t1.thought.text.startswith("but one customer"), t1.thought.text
+    assert t1.thought.text == "one customer changed everything", t1.thought.text
     print("ok  test_llm_pass_maps_indices_to_ms")
 
 
 def test_validation_clamps_and_drops():
-    # punch sits OUTSIDE core -> reset to core; a 2-word thought is dropped;
-    # a non-dict and a malformed range are skipped.
+    # punch sits OUTSIDE core -> reset to core; setup overshoots into the thought
+    # and is clamped to before it; a 2-word thought is dropped; a non-dict and a
+    # malformed range are skipped.
     body = """{"thoughts":[
-      {"speaker":"S0","thought":[0,5],"core":[2,3],"punch":[0,1],"setup":[0,4],"strength":2.0},
-      {"speaker":"S0","thought":[6,7]},
+      {"speaker":"S0","thought":[2,7],"core":[4,5],"punch":[2,2],"setup":[0,5],"strength":2.0},
+      {"speaker":"S0","thought":[8,9]},
       "junk",
       {"speaker":"S0","thought":"nope"}
     ]}"""
     out = ts.segment_with_llm(_words(), _FakeLLM(body))
     assert len(out) == 1, out
     t = out[0]
-    # punch was illegal -> collapses to core (2..3 -> 2000..3800)
-    assert (t.punch.raw_in_ms, t.punch.raw_out_ms) == (2000, 3800), t.punch
-    # setup [0,4] clamped to before core start (core starts at idx 2) -> [0,1]
+    # punch was illegal (before core) -> collapses to core (4..5 -> 4000..5800)
+    assert (t.punch.raw_in_ms, t.punch.raw_out_ms) == (4000, 5800), t.punch
+    # setup [0,5] clamped to before the thought start (idx 2) -> [0,1]
     assert t.setup is not None and (t.setup.start_word, t.setup.end_word) == (0, 1), t.setup
     # strength clamped to [0,1]
     assert t.strength == 1.0, t.strength
@@ -131,12 +132,13 @@ def test_fallback_from_dialogue(monkeypatch=None):
     assert (t.thought.raw_in_ms, t.thought.raw_out_ms) == (0, 10000), t.thought
     # core = last child sentence (the payoff lands last)
     assert (t.core.raw_in_ms, t.core.raw_out_ms) == (5000, 10000), t.core
-    assert t.setup is not None and "almost" in t.setup.text, t.setup
+    # the L1 fallback has no reliable run-up notion -> setup is null
+    assert t.setup is None, t.setup
     print("ok  test_fallback_from_dialogue")
 
 
 def test_roundtrip_serialization():
-    body = '{"thoughts":[{"speaker":"S0","thought":[0,5],"core":[2,3],"punch":[2,3],"setup":[0,1],"strength":0.5}]}'
+    body = '{"thoughts":[{"speaker":"S0","thought":[2,5],"core":[2,3],"punch":[2,3],"setup":[0,1],"strength":0.5}]}'
     t = ts.segment_with_llm(_words(), _FakeLLM(body))[0]
     again = ts.Thought.from_dict(t.to_dict())
     assert again.to_dict() == t.to_dict()

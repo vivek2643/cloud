@@ -22,20 +22,20 @@ def test_clamps():
 
 
 def test_granularity_tiers():
-    """The dial zooms through the L1 hierarchy: blocks -> topic -> sentence.
-    Block tiers carry a topic-merge gap that shrinks (huge -> medium -> off)."""
+    """The dial zooms through the THOUGHT hierarchy: turn -> setup -> thought ->
+    core -> punch. Only the turn level carries a thought-merge gap."""
     units = [energy_to_params(i / 20).speech_unit for i in range(21)]
-    order = {"block": 0, "topic": 1, "sentence": 2}
+    order = {"turn": 0, "setup": 1, "thought": 2, "core": 3, "punch": 4}
     ranks = [order[u] for u in units]
     assert ranks == sorted(ranks), units                     # coarse -> fine, no regressions
-    assert energy_to_params(0.0).speech_unit == "block"      # broad answers merge
-    assert energy_to_params(0.5).speech_unit == "topic"      # balanced = one answer
-    assert energy_to_params(1.0).speech_unit == "sentence"   # sharp = per sentence
-    # Merge gap only applies to block tiers and is non-increasing.
+    assert energy_to_params(0.0).speech_unit == "turn"       # broad: merge whole turn
+    assert energy_to_params(0.5).speech_unit == "thought"    # balanced = one thought
+    assert energy_to_params(1.0).speech_unit == "punch"      # sharp = punchline clause
+    # Merge gap only applies to the turn level and is non-increasing.
     gaps = [energy_to_params(i / 20).speech_merge_gap_ms for i in range(21)]
     assert gaps == sorted(gaps, reverse=True), gaps
-    assert energy_to_params(0.0).speech_merge_gap_ms > energy_to_params(0.5).speech_merge_gap_ms
-    assert energy_to_params(0.5).speech_merge_gap_ms == 0    # topic tier emits native
+    assert energy_to_params(0.0).speech_merge_gap_ms > 0      # turn merges thoughts
+    assert energy_to_params(0.5).speech_merge_gap_ms == 0     # thought level emits native
     assert energy_to_params(1.0).speech_merge_gap_ms == 0
     print("ok  granularity tiers")
 

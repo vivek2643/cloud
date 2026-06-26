@@ -14,14 +14,24 @@ from dataclasses import dataclass
 from typing import Optional
 
 # --- Speech (granularity + tightness) -----------------------------------------
-# Granularity = which TIER of the L1 hierarchy we emit, per band (not a silence
-# threshold). Topic is the pivot (Balanced = one complete answer); zoom out by
-# merging same-speaker topics into blocks, zoom in to sentences. Bands 3 and 4
-# emit the same sentence unit -- "with breath" vs "without breath" is the
-# progressive breath-removal step layered on top later.
-_SPEECH_UNIT = ("block", "block", "topic", "sentence", "sentence")
-# Topic-merge gap for the block tiers (huge -> medium); 0 = emit the native tier.
-_SPEECH_MERGE_MS = (4000, 2000, 0, 0, 0)
+# Granularity = which LEVEL of the THOUGHT hierarchy we emit, per band (not a
+# silence threshold). A thought is one speaker's self-contained idea (see
+# l3.thought_segments); each level zooms it in or out and the levels NEST:
+#
+#   turn    -- every consecutive thought by the speaker        (Broad)
+#   setup   -- the thought + the speaker's own run-up into it   (Calm)
+#   thought -- the complete idea proper                         (Balanced, pivot)
+#   core    -- the one sentence that carries it                 (Tight)
+#   punch   -- the tightest landing clause                      (Sharp, + breath)
+#
+# Balanced is the pivot (one complete thought); zoom OUT by adding the setup then
+# merging same-speaker thoughts into a turn, zoom IN to the core sentence then
+# the punchline. The Sharp band additionally loses its internal breaths (the
+# progressive breath-removal step layered on later).
+_SPEECH_UNIT = ("turn", "setup", "thought", "core", "punch")
+# Thought-merge gap for the turn level (Broad only); 0 = emit the native level
+# (one thought per unit). Calm..Sharp never merge across thoughts.
+_SPEECH_MERGE_MS = (4000, 0, 0, 0, 0)
 
 # Progressive breath removal (Sharp band only): excise internal silent gaps
 # whose length >= the threshold, turning a sentence into a jump-cut edit-list.
@@ -97,8 +107,8 @@ class EnergyParams:
     energy: float
     band: int                       # 0..4 Broad .. Sharp
     # speech
-    speech_unit: str                # block | topic | sentence (which L1 tier)
-    speech_merge_gap_ms: int        # topic-merge gap for block tiers (0 = native)
+    speech_unit: str                # turn | setup | thought | core | punch (thought level)
+    speech_merge_gap_ms: int        # thought-merge gap for the turn level (0 = native)
     speech_breath_gap_ms: int       # excise internal gaps >= this (0 = keep breath)
     snap_window_ms: int
     pad_in_ms: int

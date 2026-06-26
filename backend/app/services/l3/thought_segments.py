@@ -166,15 +166,18 @@ _INSTR = (
     "Below is one clip's transcript. Every word is numbered `i:word`; a `[Sx]` "
     "marks where the speaker changes. Split it into thoughts IN ORDER.\n\n"
     "For each thought give word indices (inclusive) into the numbered words:\n"
-    "  - thought: the complete idea, start to end (one speaker).\n"
-    "  - core: the single sentence inside it that carries the point.\n"
-    "  - punch: the tightest clause that lands the point (often the end of core).\n"
-    "  - setup: the SAME speaker's run-up that sets the idea up, if any, else null "
-    "(it sits just before `core` and inside `thought`).\n"
+    "  - thought: the complete idea proper, start to end (one speaker) -- NOT "
+    "counting any throat-clearing run-up.\n"
+    "  - core: the single sentence inside `thought` that carries the point.\n"
+    "  - punch: the tightest clause inside `core` that lands the point.\n"
+    "  - setup: the SAME speaker's run-up that leads INTO the idea, if any, else "
+    "null. It sits JUST BEFORE `thought` -- its words come before thought's first "
+    "index, never inside it.\n"
     "  - strength: 0..1, how well it stands on its own as a clip.\n\n"
-    "Rules: a thought is one speaker only; punch is inside core, core is inside "
-    "thought; setup (if any) is inside thought and before core; cover every "
-    "spoken word across consecutive thoughts; don't label types -- just segment.\n\n"
+    "Rules: a thought is one speaker only; punch ⊆ core ⊆ thought; setup (if any) "
+    "is entirely before thought; cover every spoken word across consecutive "
+    "thoughts (a word is either a thought's setup or part of a thought); don't "
+    "label types -- just segment.\n\n"
     "Return ONLY this JSON:\n"
     "{\"thoughts\":[{\"speaker\":\"Sx\",\"thought\":[i,j],\"core\":[i,j],"
     "\"punch\":[i,j],\"setup\":[i,j]|null,\"strength\":0.0}]}\n\n"
@@ -248,10 +251,13 @@ def _coerce_thought(raw: Any, words: List[dict]) -> Optional[Thought]:
     if pj < pi:
         pi, pj = ci, cj
 
+    # Setup is the run-up BEFORE the thought (so Calm = setup + thought is a
+    # strictly wider level than Balanced = thought). Clamp it to end just before
+    # the thought's first word; drop it if nothing fits (e.g. thought at idx 0).
     setup_span: Optional[Span] = None
     setup = _pair(raw.get("setup"))
-    if setup is not None:
-        si, sj = max(ti, setup[0]), min(ci - 1, setup[1])
+    if setup is not None and ti > 0:
+        si, sj = max(0, setup[0]), min(ti - 1, setup[1])
         if sj >= si:
             setup_span = _span_from_words(words, si, sj)
 
@@ -325,9 +331,11 @@ def _span_from_seg(seg: dict) -> Span:
 def segment_fallback(file_id: str) -> List[Thought]:
     """Derive thoughts from the L1 dialogue hierarchy (no model).
 
-    Each TOPIC becomes a thought; its LAST child sentence is the core+punch (the
-    payoff usually lands last), and anything before it in the topic is the setup.
-    Ragged, but a safe floor so the speech path always has a source."""
+    Each TOPIC becomes a thought (the complete idea); its LAST child sentence is
+    the core+punch (the payoff usually lands last). Setup is left null -- the L1
+    hierarchy has no reliable notion of a same-speaker run-up, so Calm collapses
+    to the thought here. Ragged, but a safe floor so the speech path always has a
+    source."""
     dlg = _load_dialogue(file_id)
     topics = dlg.get("topic") or []
     sentences = {s.get("seg_id"): s for s in (dlg.get("sentence") or [])}
@@ -341,18 +349,10 @@ def segment_fallback(file_id: str) -> List[Thought]:
         if not thought.text or len(thought.text.split()) < _MIN_THOUGHT_WORDS:
             continue
         children = [sentences[c] for c in (t.get("child_seg_ids") or []) if c in sentences]
-        if children:
-            core = _span_from_seg(children[-1])
-            setup = None
-            if len(children) > 1 and core.raw_in_ms > thought.raw_in_ms:
-                setup = Span(raw_in_ms=thought.raw_in_ms, raw_out_ms=core.raw_in_ms,
-                             text=" ".join(_span_from_seg(c).text for c in children[:-1]).strip())
-        else:
-            core = thought
-            setup = None
+        core = _span_from_seg(children[-1]) if children else thought
         out.append(Thought(
             speaker=t.get("speaker"),
-            thought=thought, core=core, punch=core, setup=setup,
+            thought=thought, core=core, punch=core, setup=None,
             strength=0.6,
         ))
     return out
