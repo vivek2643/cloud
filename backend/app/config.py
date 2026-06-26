@@ -107,6 +107,21 @@ class Settings(BaseSettings):
     # flip True to let it lay B-roll / reaction / insert overlays on the spine.
     autoedit_coverage: bool = False
 
+    # --- L3 thought segmentation (the speech primitive) ------------------
+    # A post-L2 pass that splits a clip's speaker-tagged transcript into generic
+    # THOUGHTS -- one speaker's self-contained idea -- each with a zoom hierarchy
+    # (punchline -> core sentence -> thought -> + setup). This replaces the ragged
+    # ASR sentence/topic units as the speech source for the energy bands. Cached
+    # once per file; falls back to L1 dialogue_segments when the LLM is
+    # unavailable. Provider-neutral; empty -> reuse the autoedit (Opus) backbone.
+    enable_thought_segments: bool = True
+    thoughts_provider: str = ""
+    thoughts_model: str = ""
+    thoughts_max_output_tokens: int = 16384
+    # Payload guard: clips with more words than this skip the LLM pass and use
+    # the deterministic L1 fallback (paging the pass is a later concern).
+    thoughts_max_words: int = 8000
+
     # --- L3 arranger: the cut-picking reasoning brain --------------------
     # Resident mode (default) holds the whole footage map in one context and
     # runs a draft -> self-critique cycle. When the map text exceeds this many

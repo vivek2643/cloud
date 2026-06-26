@@ -316,6 +316,11 @@ def l2_perception(file_id: str) -> None:
         _set_l2_status(file_id, "skipped")
         # No perception, but L1 dialogue still yields speech cuts -> precompute.
         try:
+            from app.services.l3 import thought_segments
+            thought_segments.defer_thoughts(file_id)
+        except Exception:
+            logger.exception("L2: failed to enqueue thought pass for %s", file_id)
+        try:
             from app.services.l3 import hero_store
             hero_store.defer_precompute(file_id)
         except Exception:
@@ -374,6 +379,15 @@ def l2_perception(file_id: str) -> None:
         _set_l2_status(file_id, "ready")
         with _pg_conn() as conn:
             _stage_done(conn, file_id)
+
+        # Segment the transcript into thoughts (the speech primitive the energy
+        # bands cut from) now that L1+L2 exist, so the cache is warm before the
+        # feed is read. Best-effort on the same l2 queue.
+        try:
+            from app.services.l3 import thought_segments
+            thought_segments.defer_thoughts(file_id)
+        except Exception:
+            logger.exception("L2: failed to enqueue thought pass for %s", file_id)
 
         # Precompute the hero-cuts feed for all five energy bands now that every
         # input (L1 + L2) exists, so the product surface is always ready. Best-
