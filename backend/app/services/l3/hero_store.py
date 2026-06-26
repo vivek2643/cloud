@@ -26,7 +26,6 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 
-import psycopg
 from procrastinate import RetryStrategy
 
 from app.config import get_settings
@@ -39,7 +38,8 @@ logger = logging.getLogger(__name__)
 _N_BANDS = len(hc.BAND_ENERGIES)
 
 
-def _pg_conn() -> psycopg.Connection:
+def _pg_conn():
+    import psycopg
     return psycopg.connect(get_settings().database_url, autocommit=True)
 
 
@@ -237,6 +237,25 @@ def signatures_for(file_ids: List[str]) -> Dict[str, Optional[str]]:
     with _pg_conn() as conn:
         _ensure_table(conn)
         return _signatures(conn, file_ids)
+
+
+def get_anchor_cuts(file_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+    """The single ANCHOR-band cut-set per file: ``{file_id: [cut, ...]}``.
+
+    Each cut now owns its full zoom ladder, so the moment-tree needs only ONE
+    band -- the balanced anchor (one complete thought per cut) -- and reads
+    every other zoom off the rungs. Falls back per file to the nearest non-empty
+    band (tight/calm/sharp/broad) so a clip with no balanced cuts for its
+    modality still yields a tree. Replaces the old five-band geometric collapse.
+    """
+    if not file_ids:
+        return {}
+    bands = get_band_cuts(file_ids)
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for fid in file_ids:
+        by_band = bands.get(fid, {})
+        out[fid] = next((by_band[b] for b in (2, 3, 1, 4, 0) if by_band.get(b)), [])
+    return out
 
 
 def get_band_cuts(file_ids: List[str]) -> Dict[str, Dict[int, List[Dict[str, Any]]]]:

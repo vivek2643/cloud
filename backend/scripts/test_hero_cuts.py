@@ -195,6 +195,35 @@ def test_take_stacking_collapses_repeats(monkeypatch=None):
     print("ok  test_take_stacking_collapses_repeats")
 
 
+def test_best_take_prefers_on_camera_then_delivery():
+    """Best-take is deterministic: the take where the speaker is ON CAMERA wins
+    over a higher-SCORED but off-camera take; delivery breaks ties."""
+    from app.services.l3 import takes as tk
+
+    # b is lower-scored but on camera with cleaner delivery -> should lead.
+    a = hc.HeroCut("h1", "fff", "speech", "the product changes everything", 1000, 2000,
+                   score=0.9, quality={"on_camera": 0.0, "delivery": 0.5})
+    b = hc.HeroCut("h2", "fff", "speech", "the product changes everything", 5000, 6000,
+                   score=0.6, quality={"on_camera": 1.0, "delivery": 0.85})
+    group = tk.TakeGroup(group_id="tg1", content_key="product changes everything", attempts=[
+        tk.Attempt("fff:u1:0", "fff", "u1", 1000, 2000, "speech", "product changes everything", "...", False),
+        tk.Attempt("fff:u2:0", "fff", "u2", 5000, 6000, "speech", "product changes everything", "...", False),
+    ])
+    orig = hc.build_take_groups
+    hc.build_take_groups = lambda file_ids: [group]
+    try:
+        stacked = hc._stack_takes([a, b], ["fff"])
+    finally:
+        hc.build_take_groups = orig
+    assert len(stacked) == 1, stacked
+    front = stacked[0]
+    assert front.hero_id == "h2", "on-camera take must lead despite lower score"
+    assert front.take_count == 2
+    # _take_rank: on-camera beats off-camera regardless of score.
+    assert hc._take_rank(b) > hc._take_rank(a)
+    print("ok  test_best_take_prefers_on_camera_then_delivery")
+
+
 def _span(in_ms, out_ms, text, si, sj):
     return Span(raw_in_ms=in_ms, raw_out_ms=out_ms, text=text, start_word=si, end_word=sj)
 
@@ -400,6 +429,29 @@ def test_reaction_and_broll_surface_as_cutaways():
     print("ok  test_reaction_and_broll_surface_as_cutaways")
 
 
+def test_action_overlay_cuts_own_ladder_and_framing():
+    """Action + overlay cuts now carry an owned broad..sharp ladder, the actor
+    in `people`, and camera framing from camera_craft."""
+    clip = _clip_multi()
+    clip.perception["camera_craft"] = [
+        {"start_ms": 0, "end_ms": 12000, "shot_size": "wide", "angle": "eye_level",
+         "movement": "static", "subject_focus": "the room"},
+    ]
+    field = hc._build_field(clip, 0.5)
+    anchors = hc.anc.gather_anchors(duration_ms=clip.duration_ms, dialogue=clip.dialogue,
+                                    perception=clip.perception, motion=clip.motion)
+    beats = hc._beat_segments(clip, field, hc.energy_to_params(0.5), anchors)
+    act = next(b for b in beats if b.modality == hc.anc.AFF_ACTION)
+    assert [r.level for r in act.ladder] == ["broad", "calm", "balanced", "tight", "sharp"], act.ladder
+    bal = next(r for r in act.ladder if r.level == "balanced")
+    assert (bal.in_ms(), bal.out_ms()) == (act.src_in_ms, act.src_out_ms)
+    assert act.framing and act.framing["shot_size"] == "wide"
+    # Round-trips through the cache with facets intact.
+    back = hc.HeroCut.from_cache(act.to_dict())
+    assert len(back.ladder) == 5 and back.framing["movement"] == "static"
+    print("ok  test_action_overlay_cuts_own_ladder_and_framing")
+
+
 def test_action_core_preserved():
     """Core-preservation: the action segment always contains the whole beat
     (6000-7800) at Broad/Balanced; Sharp may split but payoff still covers the end."""
@@ -483,7 +535,188 @@ def test_action_skipped_without_motion():
     print("ok  test_action_skipped_without_motion")
 
 
+def _wspk(spec):
+    """spec: list of (text, start_ms, end_ms, speaker) -> diarized word dicts."""
+    return [{"text": t, "start_ms": s, "end_ms": e, "speaker": spk, "is_filler": False}
+            for t, s, e, spk in spec]
+
+
+def _one_thought_clip(file_id, perception):
+    from app.services.l3 import cast as cst
+    words = _wspk([
+        ("we", 1000, 1300, "S0"), ("almost", 1300, 1700, "S0"), ("shut", 1700, 2100, "S0"),
+        ("down", 2100, 2500, "S0"), ("last", 2500, 2900, "S0"), ("year", 2900, 3300, "S0"),
+    ])
+    th = Thought(
+        speaker="S0",
+        thought=_span(1000, 3300, "we almost shut down last year", 0, 5),
+        core=_span(1000, 2500, "we almost shut down", 0, 3),
+        punch=_span(1300, 2500, "almost shut down", 1, 3),
+        setup=None, strength=0.8)
+    clip = hc._ClipInputs(
+        file_id=file_id, duration_ms=5000,
+        dialogue={"topic": [], "sentence": []},
+        perception=perception, motion=None, thoughts=[th])
+    clip.cast = cst.build_cast(perception, words)
+    return clip, _src(file_id, 5000, words)
+
+
+def test_speech_cut_owns_ladder_and_resolves_speaker():
+    """A speech cut carries its full broad..sharp ladder, the selected rung
+    matches the flat span, and the speaker is the cast-resolved person."""
+    perception = {
+        "persons": [{"local_id": "p1", "role": "main subject",
+                     "frame_region": {"x": 0.3, "y": 0.1, "w": 0.4, "h": 0.6}}],
+        "speaking": [{"subject": "p1", "start_ms": 1000, "end_ms": 3300}],
+        "take_quality_events": [],
+    }
+    clip, src = _one_thought_clip("llllllll-1", perception)
+    hs = hc._speech_candidates(clip, src, None, hc.energy_to_params(0.5))
+    assert len(hs) == 1, hs
+    h = hs[0]
+    levels = [r.level for r in h.ladder]
+    assert levels == ["broad", "calm", "balanced", "tight", "sharp"], levels
+    # Selected (balanced) rung agrees with the flat span that plays.
+    bal = next(r for r in h.ladder if r.level == "balanced")
+    assert (bal.in_ms(), bal.out_ms()) == (h.src_in_ms, h.src_out_ms) == (1000, 3300)
+    # Speaker resolved to the on-screen person; people + framing + quality set.
+    assert h.speaker == "main subject", h.speaker
+    assert h.people and h.people[0]["person_id"] == "p1" and h.people[0]["on_camera"] is True
+    assert h.framing and h.framing["region"]["w"] == 0.4
+    assert h.quality and "delivery" in h.quality and h.quality["on_camera"] == 1.0
+    # Round-trips through the cache.
+    back = hc.HeroCut.from_cache(h.to_dict())
+    assert [r.level for r in back.ladder] == levels
+    print("ok  test_speech_cut_owns_ladder_and_resolves_speaker")
+
+
+def test_offcamera_speech_flagged_not_dropped():
+    """Off-frame voice (audio with no visible speaker) is KEPT and flagged
+    'offscreen', never discarded -- the off-camera interviewer survives."""
+    from app.services.l3 import cast as cst
+    # p1 is on camera early; the question at 5s is a different, off-screen voice.
+    words = _wspk([
+        ("so", 1000, 1300, "S0"), ("here", 1300, 1700, "S0"), ("we", 1700, 2100, "S0"),
+        ("are", 2100, 2500, "S0"),
+        ("what", 5000, 5300, "S9"), ("made", 5300, 5700, "S9"), ("you", 5700, 6000, "S9"),
+        ("start", 6000, 6400, "S9"), ("this", 6400, 6800, "S9"),
+    ])
+    th_on = Thought(speaker="S0",
+                    thought=_span(1000, 2500, "so here we are", 0, 3),
+                    core=_span(1000, 2500, "so here we are", 0, 3),
+                    punch=_span(1300, 2500, "here we are", 1, 3), setup=None, strength=0.6)
+    th_off = Thought(speaker="S9",
+                     thought=_span(5000, 6800, "what made you start this", 4, 8),
+                     core=_span(5000, 6800, "what made you start this", 4, 8),
+                     punch=_span(5300, 6800, "made you start this", 5, 8), setup=None, strength=0.7)
+    perception = {
+        "persons": [{"local_id": "p1"}],
+        "speaking": [{"subject": "p1", "start_ms": 1000, "end_ms": 2500}],
+        "take_quality_events": [],
+    }
+    clip = hc._ClipInputs(file_id="oooooooo-1", duration_ms=8000,
+                          dialogue={"topic": [], "sentence": []},
+                          perception=perception, motion=None, thoughts=[th_on, th_off])
+    clip.cast = cst.build_cast(perception, words)
+    hs = hc._speech_candidates(clip, _src("oooooooo-1", 8000, words), None,
+                               hc.energy_to_params(0.5))
+    # Both survive (never discarded); the off-screen question is flagged.
+    labels = {h.label: h for h in hs}
+    assert any("here we are" in L for L in labels), labels
+    off = next((h for L, h in labels.items() if "made you start" in L), None)
+    assert off is not None, "off-camera question must not be dropped"
+    assert "offscreen" in off.flags, off.flags
+    print("ok  test_offcamera_speech_flagged_not_dropped")
+
+
+def test_cohesion_moment_spans_modalities():
+    """A reaction overlapping a spoken line fuses into ONE multi-affordance
+    moment (union span, both affordances, union->dominant ladder) -- the old
+    action-only pairing generalized to any modality mix."""
+    s = hc.HeroCut("z:sp0", "zzzz", "speech", "that was incredible", 1000, 3000, score=0.7,
+                   speaker="host", affordances=["speech"],
+                   ladder=[hc.Rung("broad", [(1000, 3000)], "that was incredible", 0.7),
+                           hc.Rung("balanced", [(1000, 3000)], "that was incredible", 0.7)])
+    r = hc.HeroCut("z:rea0", "zzzz", "reaction", "grin", 2500, 3500, score=0.5,
+                   affordances=["reaction"], ladder=[hc.Rung("broad", [(2500, 3500)], "grin", 0.5)])
+    far = hc.HeroCut("z:act9", "zzzz", "action", "later beat", 30000, 31000, score=0.6,
+                     affordances=["action"], ladder=[hc.Rung("broad", [(30000, 31000)], "later beat", 0.6)])
+    clip = hc._ClipInputs(file_id="zzzzzzzz-1", duration_ms=40000,
+                          dialogue={"topic": [], "sentence": []}, perception={}, motion=None)
+    moments = hc._cohesion_moments(clip, [s, r, far])
+    assert len(moments) == 1, moments       # only the overlapping pair fuses
+    m = moments[0]
+    assert m.modality == "moment"
+    assert set(m.affordances) == {"speech", "reaction"}, m.affordances
+    assert (m.src_in_ms, m.src_out_ms) == (1000, 3500)
+    assert m.ladder[0].level == "broad" and m.ladder[0].spans == [(1000, 3500)]
+    # Dominant (speech) supplies the finer rung; speaker comes from the speech member.
+    assert any(rg.level == "balanced" for rg in m.ladder), m.ladder
+    assert m.speaker == "host", m.speaker
+    print("ok  test_cohesion_moment_spans_modalities")
+
+
+def test_cohesion_moment_uses_interaction_window():
+    """Two cuts that don't overlap still fuse when the VLM says they're one
+    interaction (shared interaction_id window)."""
+    a = hc.HeroCut("z:act0", "zzzz", "action", "p1 offers hand", 1000, 2000, score=0.6,
+                   affordances=["action"], ladder=[hc.Rung("broad", [(1000, 2000)], "p1 offers hand", 0.6)])
+    b = hc.HeroCut("z:rea0", "zzzz", "reaction", "p2 shakes", 6000, 7000, score=0.5,
+                   affordances=["reaction"], ladder=[hc.Rung("broad", [(6000, 7000)], "p2 shakes", 0.5)])
+    perception = {"events": [
+        {"id": "e1", "start_ms": 1000, "end_ms": 2000, "actor": "p1", "interaction_id": "x1"},
+        {"id": "e2", "start_ms": 6000, "end_ms": 7000, "actor": "p2", "interaction_id": "x1"},
+    ]}
+    clip = hc._ClipInputs(file_id="zzzzzzzz-2", duration_ms=10000,
+                          dialogue={"topic": [], "sentence": []}, perception=perception, motion=None)
+    moments = hc._cohesion_moments(clip, [a, b])
+    assert len(moments) == 1, moments       # interaction window bridges the 4s gap
+    assert (moments[0].src_in_ms, moments[0].src_out_ms) == (1000, 7000)
+    print("ok  test_cohesion_moment_uses_interaction_window")
+
+
+def test_facet_record_round_trips():
+    """The Cut facet record (ladder rungs + people/framing/quality) survives the
+    cache round-trip, and a rung's keep_spans/play_ms reflect a split."""
+    ladder = [
+        hc.Rung(level="balanced", spans=[(1000, 3300)], text="the whole thought", score=0.7),
+        hc.Rung(level="sharp", spans=[(1300, 1800), (2200, 2500)], text="punch", score=0.8),
+    ]
+    h = hc.HeroCut(
+        "z:sp0", "zzzz", "speech", "the whole thought", 1000, 3300, score=0.7,
+        speaker="interviewer", affordances=["speech"], ladder=ladder,
+        people=[{"voice_speaker_id": "S0", "person_id": "p1", "role": "interviewer",
+                 "on_camera": True, "region": {"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.5},
+                 "av_link_confidence": 1.0}],
+        framing={"shot_size": "medium", "angle": "eye_level", "movement": "static"},
+        quality={"delivery": 0.82, "vlm": 0.6},
+    )
+    # Rung helpers
+    sharp = ladder[1]
+    assert sharp.in_ms() == 1300 and sharp.out_ms() == 2500
+    assert sharp.play_ms() == 800 and sharp.keep_spans() == [(1300, 1800), (2200, 2500)]
+    assert ladder[0].keep_spans() is None        # single span plays contiguously
+
+    back = hc.HeroCut.from_cache(h.to_dict())
+    assert len(back.ladder) == 2 and back.ladder[1].level == "sharp"
+    assert back.ladder[1].spans == [(1300, 1800), (2200, 2500)]
+    assert back.people[0]["person_id"] == "p1" and back.people[0]["on_camera"] is True
+    assert back.framing["shot_size"] == "medium"
+    assert back.quality["delivery"] == 0.82
+    # A cut with no facets emits null (compact) and rehydrates empty.
+    plain = hc.HeroCut("z:sp1", "zzzz", "speech", "x", 0, 100, score=0.1)
+    d = plain.to_dict()
+    assert d["ladder"] is None and d["people"] is None
+    assert hc.HeroCut.from_cache(d).ladder == []
+    print("ok  test_facet_record_round_trips")
+
+
 def main():
+    test_facet_record_round_trips()
+    test_cohesion_moment_spans_modalities()
+    test_cohesion_moment_uses_interaction_window()
+    test_speech_cut_owns_ladder_and_resolves_speaker()
+    test_offcamera_speech_flagged_not_dropped()
     test_speech_drops_offcamera_and_short()
     test_energy_selects_granularity()
     test_clustering_gradient()
@@ -491,10 +724,12 @@ def main():
     test_thought_turn_merge_at_broad()
     test_sharp_breath_removal_edit_list()
     test_take_stacking_collapses_repeats()
+    test_best_take_prefers_on_camera_then_delivery()
     test_action_snaps_to_calm_motion_seam()
     test_action_fused_avoids_speech()
     test_action_skipped_without_motion()
     test_reaction_and_broll_surface_as_cutaways()
+    test_action_overlay_cuts_own_ladder_and_framing()
     test_action_core_preserved()
     test_action_split_at_sharp()
     test_action_core_caps_and_performance_exempt()

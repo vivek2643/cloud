@@ -203,3 +203,38 @@ def score_span(source: SpanSource, start_ms: int, end_ms: int) -> Dict[str, Any]
         metrics["true_peak_db"] = round(source.true_peak_db, 1)
 
     return metrics
+
+
+# A single dead gap longer than this mid-line reads as a stumble / "stuck
+# between words", not natural phrasing -- the thing that makes an otherwise
+# fine sentence unusable. Penalty saturates here.
+_DELIVERY_LONG_PAUSE_MS = 1500
+
+
+def delivery_score(metrics: Dict[str, Any]) -> float:
+    """Deterministic FLUENCY of a spoken span, 0..1 (higher = smoother delivery).
+
+    The objective half of best-take selection: how cleanly the line is *said*,
+    independent of WHAT is said. Penalizes fillers, a long mid-line dead gap (a
+    stumble / the speaker getting stuck between words), too much overall silence,
+    and a runaway/halting pace. Pure over the ``score_span`` metric vector, so it
+    is comparable across any two spans by construction.
+    """
+    fillers = float(metrics.get("filler_per_min", 0.0))
+    pause_ratio = float(metrics.get("pause_ratio", 0.0))
+    longest_pause = float(metrics.get("longest_pause_ms", 0.0))
+    wpm = float(metrics.get("wpm", 0.0))
+
+    filler_pen = min(1.0, fillers / 12.0)                       # ~12/min -> full
+    long_pause_pen = min(1.0, longest_pause / _DELIVERY_LONG_PAUSE_MS)
+    pause_pen = min(1.0, pause_ratio / 0.5)                     # >50% silence -> full
+    pace_pen = 0.0 if 90 <= wpm <= 190 else min(1.0, abs(wpm - 140) / 140.0)
+
+    fluency = (
+        1.0
+        - 0.35 * filler_pen
+        - 0.30 * long_pause_pen
+        - 0.20 * pause_pen
+        - 0.15 * pace_pen
+    )
+    return max(0.0, min(1.0, fluency))

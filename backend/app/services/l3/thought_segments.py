@@ -49,7 +49,9 @@ logger = logging.getLogger(__name__)
 
 # Bump when the thought shape or the prompt contract changes, so cached rows
 # recompute. Combined with the clip's word count into the cache signature.
-THOUGHT_SCHEMA_VERSION = 1
+# v2: prompt keeps questions as thoughts + allows degenerate depth (punch==core
+# ==thought for one-liners); the speech cut now owns its full zoom ladder.
+THOUGHT_SCHEMA_VERSION = 2
 
 # A thought needs at least this many real words to be worth keeping as a unit.
 _MIN_THOUGHT_WORDS = 3
@@ -177,7 +179,11 @@ _INSTR = (
     "Rules: a thought is one speaker only; punch ⊆ core ⊆ thought; setup (if any) "
     "is entirely before thought; cover every spoken word across consecutive "
     "thoughts (a word is either a thought's setup or part of a thought); don't "
-    "label types -- just segment.\n\n"
+    "label types -- just segment.\n"
+    "A QUESTION is a real thought (an interviewer's prompt, an aside) -- segment "
+    "it like any other, never skip it. When an idea is already a single short "
+    "line, the levels COLLAPSE: punch == core == thought is correct (don't invent "
+    "a tighter clause that isn't there).\n\n"
     "Return ONLY this JSON:\n"
     "{\"thoughts\":[{\"speaker\":\"Sx\",\"thought\":[i,j],\"core\":[i,j],"
     "\"punch\":[i,j],\"setup\":[i,j]|null,\"strength\":0.0}]}\n\n"

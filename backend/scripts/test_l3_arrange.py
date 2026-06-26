@@ -54,25 +54,38 @@ class _Plan:
     beats: list = []
 
 
-def _cut(hero_id, in_ms, out_ms, label="", modality="speech", score=0.6, keep_spans=None):
+def _rung(level, in_ms, out_ms, text="", score=0.6):
+    return {"level": level, "spans": [{"in_ms": in_ms, "out_ms": out_ms}],
+            "in_ms": in_ms, "out_ms": out_ms, "play_ms": out_ms - in_ms,
+            "text": text, "score": score}
+
+
+def _cut(hero_id, in_ms, out_ms, label="", modality="speech", score=0.6,
+         keep_spans=None, ladder=None):
     return {"hero_id": hero_id, "file_id": "ffffffff-1111", "modality": modality,
             "label": label, "src_in_ms": in_ms, "src_out_ms": out_ms,
             "play_ms": out_ms - in_ms, "keep_spans": keep_spans, "score": score,
-            "speaker": "S0", "affordances": [modality], "flags": []}
+            "speaker": "S0", "affordances": [modality], "flags": [], "ladder": ladder}
 
 
 def _map():
-    bands = {
-        0: [_cut("f:ans", 0, 8000, "whole answer", score=0.8)],
-        1: [_cut("f:ans", 0, 8000, "whole answer", score=0.8)],
-        2: [_cut("f:t0", 0, 4000, "we almost shut down", score=0.82),
-            _cut("f:t1", 4000, 8000, "one customer changed everything", score=0.78)],
-        3: [_cut("f:s0", 0, 2000, "we almost shut down", score=0.7),
-            _cut("f:s1", 2000, 4000, "out of money", score=0.66)],
-        4: [_cut("f:s0", 0, 2000, "we almost shut down", score=0.7),
-            _cut("f:s1", 2000, 4000, "out of money", score=0.66)],
-    }
-    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, bands)
+    # Two thought cuts, each owning its ladder: the whole answer (broad) widens
+    # over both; balanced is one thought per cut; tighter rungs zoom in.
+    c0 = _cut("f:t0", 0, 4000, "we almost shut down", score=0.82, ladder=[
+        _rung("broad", 0, 8000, "whole answer", 0.8),
+        _rung("calm", 0, 4000, "we almost shut down", 0.82),
+        _rung("balanced", 0, 4000, "we almost shut down", 0.82),
+        _rung("tight", 0, 2000, "we almost shut down", 0.7),
+        _rung("sharp", 500, 2000, "shut down", 0.7),
+    ])
+    c1 = _cut("f:t1", 4000, 8000, "one customer changed everything", score=0.78, ladder=[
+        _rung("broad", 0, 8000, "whole answer", 0.8),
+        _rung("calm", 4000, 8000, "one customer changed everything", 0.78),
+        _rung("balanced", 4000, 8000, "one customer changed everything", 0.78),
+        _rung("tight", 4000, 6000, "one customer", 0.7),
+        _rung("sharp", 6000, 8000, "changed everything", 0.71),
+    ])
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [c0, c1])
     return {"clips": [tree]}
 
 
@@ -116,20 +129,10 @@ def test_resolve_and_main_line_is_contiguous():
     print("ok  test_resolve_and_main_line_is_contiguous")
 
 
-def test_atom_ref_resolves_to_subcut():
-    places = [ar.Placement("f:s1", "sharp", 0)]   # an atom id
-    cuts = ar.resolve_placements(places, _map())
-    assert len(cuts) == 1
-    assert (cuts[0].src_in_ms, cuts[0].src_out_ms) == (2000, 4000), cuts
-    assert cuts[0].label == "out of money"
-    print("ok  test_atom_ref_resolves_to_subcut")
-
-
 def main():
     test_validates_and_normalises()
     test_illegal_level_falls_back()
     test_resolve_and_main_line_is_contiguous()
-    test_atom_ref_resolves_to_subcut()
     print("\nall arranger tests passed")
 
 

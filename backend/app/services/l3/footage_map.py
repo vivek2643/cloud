@@ -6,14 +6,13 @@ of every usable moment across every clip, but the raw hero-cuts feed is 5x
 redundant (the same content appears once per energy band) and far too verbose to
 drop into a prompt whole. This module is the breakdown + map + retrieval layer:
 
-  * ``build_clip_tree``   collapses one clip's five energy bands into a list of
-    MOMENTS. A moment is anchored on the BALANCED band ("one complete thought
-    per cut") and carries its multi-resolution VARIANTS -- every nested zoom of
-    the same content: widen to the turn/run-up it sits inside (broad/calm) or
-    tighten to the core sentence / punchline clause (tight/sharp). When a moment
-    genuinely splits into several finer sub-units (a legacy multi-sentence
-    topic), those are exposed as ATOMS the model can pick individually. No
-    content is hidden; coarser/finer cuts fold onto the moment they belong to.
+  * ``build_clip_tree``   turns one clip's cut-set into a list of MOMENTS. Each
+    cut now OWNS its zoom ladder (broad turn/run-up -> balanced thought -> tight
+    core -> sharp punch), so a moment reads its VARIANTS straight off that ladder
+    -- no cross-band geometric re-matching, no guessing which coarse cut a fine
+    one belongs to. One anchor band (balanced: "one complete thought per cut") is
+    all the tree needs; the rungs carry the rest. A split is just a rung with
+    several spans (a jump-cut keep-list), so the legacy ATOMS slot is gone.
 
   * ``assemble_map``      renders every clip's moments as a compact, complete
     text index (Tier-0: what goes in the prompt) plus the machine-readable
@@ -35,7 +34,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import get_settings
 from app.services.l3 import hero_cuts as hc
-from app.services.l3 import hero_store
 
 logger = logging.getLogger(__name__)
 
@@ -43,19 +41,23 @@ logger = logging.getLogger(__name__)
 # rebuild even if the underlying hero cuts (PARAMS_VERSION) did not.
 # v2: every nested level (incl. tight=core) is a selectable variant; atoms are
 # emitted only when a moment splits into >= 2 finer sub-units.
-TREE_VERSION = 2
+# v3: cuts OWN their ladder -- variants read straight off each cut's rungs from
+# one anchor band; no geometric re-matching, no atoms (a split is a multi-span
+# rung). Moments also carry the people/framing/quality facets.
+TREE_VERSION = 3
 
 # Band index -> energy-level name. Band 2 (energy 0.5) is the anchor: one
 # complete thought per cut. Lower = wider (whole answer), higher = tighter.
 _LEVEL_NAMES = ("broad", "calm", "balanced", "tight", "sharp")
 _ANCHOR_BAND = 2
-# Preference order for picking a fallback anchor band when band 2 is empty
-# (some clips have no balanced-band cuts for a given modality).
-_ANCHOR_FALLBACK = (2, 3, 1, 4, 0)
 
 
 def _level_name(band: int) -> str:
     return _LEVEL_NAMES[max(0, min(band, len(_LEVEL_NAMES) - 1))]
+
+
+def _band_of(level: Optional[str]) -> int:
+    return _LEVEL_NAMES.index(level) if level in _LEVEL_NAMES else _ANCHOR_BAND
 
 
 # --------------------------------------------------------------------------
@@ -70,102 +72,77 @@ def _out(cut: Dict[str, Any]) -> int:
     return int(cut.get("src_out_ms", 0))
 
 
-def _center(cut: Dict[str, Any]) -> float:
-    return (_in(cut) + _out(cut)) / 2.0
-
-
 def _overlap_ms(a0: int, a1: int, b0: int, b1: int) -> int:
     return max(0, min(a1, b1) - max(a0, b0))
 
 
-def _contains_center(outer: Dict[str, Any], inner: Dict[str, Any]) -> bool:
-    """True if the inner cut's center sits inside the outer cut's span."""
-    c = _center(inner)
-    return _in(outer) <= c <= _out(outer)
-
-
-def _variant(cut: Dict[str, Any], band: int) -> Dict[str, Any]:
-    """A selectable, single-span option for taking content at one energy."""
+def _variant_from_rung(rung: Dict[str, Any], hero_id: Optional[str]) -> Dict[str, Any]:
+    """A selectable option for taking this content at one energy, read straight
+    off a cut's owned ladder rung. A multi-span rung carries its jump-cut
+    keep-list (a split/breath-excised edit), otherwise the span plays whole."""
+    spans = rung.get("spans") or []
+    if spans:
+        in_ms = int(spans[0].get("in_ms", rung.get("in_ms", 0)))
+        out_ms = int(spans[-1].get("out_ms", rung.get("out_ms", 0)))
+    else:
+        in_ms, out_ms = int(rung.get("in_ms", 0)), int(rung.get("out_ms", 0))
+    keep = ([[int(s["in_ms"]), int(s["out_ms"])] for s in spans]
+            if len(spans) > 1 else None)
     return {
-        "level": _level_name(band),
-        "band": band,
-        "in_ms": _in(cut),
-        "out_ms": _out(cut),
-        "play_ms": int(cut.get("play_ms", _out(cut) - _in(cut))),
-        "keep_spans": cut.get("keep_spans"),
-        "score": float(cut.get("score", 0.0)),
-        "hero_id": cut.get("hero_id"),
+        "level": rung.get("level"),
+        "band": _band_of(rung.get("level")),
+        "in_ms": in_ms,
+        "out_ms": out_ms,
+        "play_ms": int(rung.get("play_ms", out_ms - in_ms)),
+        "keep_spans": keep,
+        "score": float(rung.get("score", 0.0)),
+        "hero_id": hero_id,
     }
 
 
-def _atom(cut: Dict[str, Any], band: int) -> Dict[str, Any]:
-    """One indivisible sub-unit the model can pick by id (legacy multi-split)."""
+def _flat_variant(cut: Dict[str, Any]) -> Dict[str, Any]:
+    """Synthesize the balanced variant from a cut's flat span when it carries no
+    ladder (legacy fallback cuts)."""
     return {
-        "atom_id": cut.get("hero_id"),
-        "in_ms": _in(cut),
-        "out_ms": _out(cut),
+        "level": _level_name(_ANCHOR_BAND), "band": _ANCHOR_BAND,
+        "in_ms": _in(cut), "out_ms": _out(cut),
         "play_ms": int(cut.get("play_ms", _out(cut) - _in(cut))),
         "keep_spans": cut.get("keep_spans"),
-        "gist": cut.get("label") or "",
-        "score": float(cut.get("score", 0.0)),
-        "band": band,
+        "score": float(cut.get("score", 0.0)), "hero_id": cut.get("hero_id"),
     }
 
 
 # --------------------------------------------------------------------------
-# Tree builder (pure: given a clip header + its five bands of cuts)
+# Tree builder (pure: given a clip header + its anchor-band cut-set)
 # --------------------------------------------------------------------------
 
 def build_clip_tree(
     file_id: str,
     header: Dict[str, Any],
-    band_cuts: Dict[int, List[Dict[str, Any]]],
+    cuts: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Collapse one clip's five energy bands into a moment-tree.
+    """Turn one clip's anchor-band cut-set into a moment-tree.
 
-    Each moment is anchored on the balanced band and folds in the coarser cut it
-    sits inside (widen variants) and the finer cuts it splits into (atoms). Pure
-    and deterministic given the inputs, so it is what the per-clip cache stores.
+    Every cut owns its full zoom ladder, so each moment's variants are read
+    directly off the cut's rungs -- no cross-band re-matching. Pure and
+    deterministic given the inputs, so it is what the per-clip cache stores.
     """
     fid8 = file_id[:8]
-
-    anchor_band = next((b for b in _ANCHOR_FALLBACK if band_cuts.get(b)), None)
-    anchors: List[Dict[str, Any]] = []
-    if anchor_band is not None:
-        anchors = sorted(band_cuts.get(anchor_band, []), key=_in)
-
-    coarser = [b for b in range(_ANCHOR_BAND) if band_cuts.get(b)]            # 0,1
-    finer = [b for b in range(_ANCHOR_BAND + 1, len(_LEVEL_NAMES))
-             if band_cuts.get(b)]                                            # 3,4
-
     moments: List[Dict[str, Any]] = []
-    for idx, cut in enumerate(anchors):
-        moment_id = f"{fid8}:m{idx:02d}"
-        variants: Dict[str, Dict[str, Any]] = {_level_name(_ANCHOR_BAND): _variant(cut, _ANCHOR_BAND)}
-
-        # Widen: the coarser cut (closest to balanced first) that contains this
-        # moment's center -- the "take the whole turn / with run-up" option.
-        for b in sorted(coarser, reverse=True):                              # 1 then 0
-            cand = [c for c in band_cuts[b] if _contains_center(c, cut)]
-            if cand:
-                widest = max(cand, key=lambda c: _overlap_ms(_in(c), _out(c), _in(cut), _out(cut)))
-                variants[_level_name(b)] = _variant(widest, b)
-
-        # Tighten: each finer band is either a single nested zoom of this moment
-        # (the core sentence / punchline clause) -> a selectable VARIANT, or, when
-        # the moment genuinely splits into several sub-units at that band (a
-        # legacy multi-sentence topic) -> ATOMS the model can pick individually.
-        # The finest genuine split wins the atoms slot.
-        atoms: List[Dict[str, Any]] = []
-        for b in sorted(finer):                                              # 3 then 4
-            inside = sorted((c for c in band_cuts[b] if _contains_center(cut, c)), key=_in)
-            if len(inside) == 1:
-                variants[_level_name(b)] = _variant(inside[0], b)
-            elif len(inside) > 1:
-                atoms = [_atom(c, b) for c in inside]
+    for idx, cut in enumerate(sorted(cuts, key=_in)):
+        hero_id = cut.get("hero_id")
+        variants: Dict[str, Dict[str, Any]] = {}
+        for rung in (cut.get("ladder") or []):
+            v = _variant_from_rung(rung, hero_id)
+            if v["level"]:
+                variants[v["level"]] = v
+        anchor = variants.get(_level_name(_ANCHOR_BAND))
+        if anchor is None:                       # no ladder -> use the flat span
+            anchor = _flat_variant(cut)
+            variants[anchor["level"]] = anchor
 
         moments.append({
-            "moment_id": moment_id,
+            "moment_id": f"{fid8}:m{idx:02d}",
             "file_id": file_id,
             "modality": cut.get("modality"),
             "affordances": cut.get("affordances") or ([cut.get("modality")] if cut.get("modality") else []),
@@ -173,11 +150,14 @@ def build_clip_tree(
             "gist": cut.get("label") or "",
             "flags": cut.get("flags") or [],
             "score": float(cut.get("score", 0.0)),
-            "in_ms": _in(cut),
-            "out_ms": _out(cut),
-            "play_ms": int(cut.get("play_ms", _out(cut) - _in(cut))),
+            "in_ms": anchor["in_ms"],
+            "out_ms": anchor["out_ms"],
+            "play_ms": anchor["play_ms"],
+            "people": cut.get("people") or [],
+            "framing": cut.get("framing"),
+            "quality": cut.get("quality"),
             "variants": variants,
-            "atoms": atoms,
+            "atoms": [],
         })
 
     return {
@@ -229,6 +209,7 @@ def get_trees(file_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     if not file_ids:
         return {}
 
+    from app.services.l3 import hero_store
     sigs = hero_store.signatures_for(file_ids)
     usable = [fid for fid in file_ids if sigs.get(fid)]
     if not usable:
@@ -285,13 +266,14 @@ def get_trees(file_ids: List[str]) -> Dict[str, Dict[str, Any]]:
 def _build_trees(file_ids: List[str], sigs: Dict[str, Optional[str]]) -> Dict[str, Dict[str, Any]]:
     """Build moment-trees for a set of files from their band cuts + headers."""
     from app.services.l3.auto_edit import _clip_cards
+    from app.services.l3 import hero_store
 
-    band_cuts = hero_store.get_band_cuts(file_ids)
+    anchor_cuts = hero_store.get_anchor_cuts(file_ids)
     headers = _clip_cards(file_ids)
     out: Dict[str, Dict[str, Any]] = {}
     for fid in file_ids:
         header = headers.get(fid) or {"name": fid, "duration_ms": 0}
-        tree = build_clip_tree(fid, header, band_cuts.get(fid, {}))
+        tree = build_clip_tree(fid, header, anchor_cuts.get(fid, []))
         if tree["moments"]:
             out[fid] = tree
     return out
@@ -306,37 +288,43 @@ def _fmt_ts(ms: int) -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
+def _affordance_tag(m: Dict[str, Any]) -> str:
+    """Show the full modality mix for multi-affordance moments (speech+reaction),
+    else the single modality -- so the brain sees a cut carries more than one
+    thing to land on."""
+    affs = [a for a in (m.get("affordances") or []) if a]
+    if len(affs) > 1:
+        return "+".join(affs)
+    return m.get("modality") or (affs[0] if affs else "")
+
+
+def _people_tag(m: Dict[str, Any]) -> str:
+    """Compact on/off-camera marker so the brain knows when the voice it's about
+    to cut to has no on-screen speaker (an off-camera interviewer / voiceover)."""
+    if "offscreen" in (m.get("flags") or []):
+        return " off-cam"
+    if any(p.get("on_camera") is False for p in (m.get("people") or [])):
+        return " off-cam"
+    return ""
+
+
 def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     levels = list(m["variants"].keys())
     nrg = "|".join(L for L in _LEVEL_NAMES if L in levels)
     spk = f" {m['speaker']}" if m.get("speaker") else ""
+    cam = _people_tag(m)
     gist = (m.get("gist") or "").strip().replace("\n", " ")
     # Resident mode gives the model the FULL line so it picks by reading, not
     # guessing; compact (paged) mode truncates and relies on inspect_moment.
     if compact and len(gist) > 80:
         gist = gist[:77] + "..."
-    atoms = ""
-    if m.get("atoms"):
-        if compact:
-            atoms = f" (+{len(m['atoms'])} atoms)"
-        else:
-            # Resident mode: expose each sub-unit by id + its gist so the model
-            # can pick one directly, not just know a count exists.
-            bits = []
-            for a in m["atoms"]:
-                aid = (a.get("atom_id") or "").split(":")[-1]
-                g = (a.get("gist") or "").strip().replace("\n", " ")
-                if len(g) > 48:
-                    g = g[:45] + "..."
-                bits.append(f'{aid}="{g}"')
-            atoms = " · atoms: " + " ".join(bits)
     dup = ""
     if m.get("dup_group"):
         dup = f" · dup:{m['dup_group']}{'*' if m.get('dup_best') else ''}"
-    return (f"  {m['moment_id'].split(':')[-1]} {m['modality']}{spk} "
+    return (f"  {m['moment_id'].split(':')[-1]} {_affordance_tag(m)}{spk}{cam} "
             f".{int(round(m['score'] * 100)):02d} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])}] "
-            f"\"{gist}\" · nrg:{nrg}{atoms}{dup}")
+            f"\"{gist}\" · nrg:{nrg}{dup}")
 
 
 def _clip_block(tree: Dict[str, Any], *, compact: bool = False) -> str:
@@ -358,6 +346,21 @@ def _clip_block(tree: Dict[str, Any], *, compact: bool = False) -> str:
 # --------------------------------------------------------------------------
 # Cross-clip duplicate linking (same line delivered as multiple takes/angles)
 # --------------------------------------------------------------------------
+
+def _take_key(m: Dict[str, Any], restart_ids: set) -> Tuple[bool, float, float, float]:
+    """Deterministic best-take order for a moment: not-a-retry, then speaker
+    on-camera, then delivery fluency, then score. Mirrors hero_cuts._take_rank so
+    the engine's pick is consistent whether read off heroes or the moment-tree."""
+    q = m.get("quality") or {}
+    on_cam = q.get("on_camera")
+    deliv = q.get("delivery")
+    return (
+        m["moment_id"] not in restart_ids,
+        float(on_cam) if on_cam is not None else 0.5,
+        float(deliv) if deliv is not None else 0.5,
+        float(m.get("score", 0.0)),
+    )
+
 
 def _best_overlap_moment(
     moments: List[Dict[str, Any]], start_ms: int, end_ms: int
@@ -408,11 +411,9 @@ def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         # take decision -- the engine already collapsed its own bands).
         if len(linked) < 2:
             continue
-        # Engine best take: highest-scoring moment, preferring a non-restart.
-        best = max(
-            linked.values(),
-            key=lambda m: (m["moment_id"] not in restart_ids, float(m.get("score", 0.0))),
-        )
+        # Engine best take, deterministic: avoid abandoned (restart) takes, then
+        # prefer the speaker ON CAMERA, then the cleaner DELIVERY, then score.
+        best = max(linked.values(), key=lambda m: _take_key(m, restart_ids))
         for mid, m in linked.items():
             m["dup_group"] = g.group_id
             m["dup_best"] = (mid == best["moment_id"])

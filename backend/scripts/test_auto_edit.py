@@ -197,7 +197,8 @@ def test_make_edit_end_to_end(monkeypatch=None):
     assert [(s["in_ms"], s["out_ms"]) for s in doc["timeline"]] == [(0, 2000), (2000, 4000)]
     assert doc["operations"] == [], doc["operations"]
     assert doc["resolved"]["video_layers"], "resolved layers must exist"
-    assert llm.calls == ["DIRECTOR", "EDITOR"], llm.calls
+    # Arranger runs a two-pass draft -> self-critique cycle (both EDITOR calls).
+    assert llm.calls == ["DIRECTOR", "EDITOR", "EDITOR"], llm.calls
     print("ok  make_edit end-to-end (director + arranger over the map)")
 
 

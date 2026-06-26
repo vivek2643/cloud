@@ -47,6 +47,7 @@ from difflib import SequenceMatcher
 from app.config import get_settings
 from app.services.l1 import fused_seams as fseams
 from app.services.l3 import anchors as anc
+from app.services.l3 import cast as cst
 from app.services.l3 import score_span as ss
 from app.services.l3 import territory as terr
 from app.services.l3.energy import EnergyParams, energy_to_params
@@ -64,7 +65,10 @@ _MERGE_LEN_RATIO = 0.7
 # builders, scoring) so the precompute cache invalidates and recomputes.
 # v2: speech bands now cut from the THOUGHT hierarchy (l3.thought_segments)
 # instead of the L1 sentence/topic tiers.
-PARAMS_VERSION = 2
+# v3: cuts are facet records -- each carries its owned zoom ladder + people
+# (cast-resolved speaker / on-camera / region) + delivery-quality facet; the
+# off-frame interviewer is flagged, not dropped.
+PARAMS_VERSION = 3
 
 # The five canonical product energy LEVELS = the band centers (Broad .. Sharp).
 # Hero cuts are precomputed at exactly these after L2; any requested energy
@@ -144,6 +148,56 @@ class HeroTake:
 
 
 @dataclass
+class Rung:
+    """One zoom level on a cut's intrinsic ladder.
+
+    A rung is "one-or-more spans": a single span is a plain zoom; a single
+    WIDER span is a coarsen/merge (it covers grouped neighbors); SEVERAL spans
+    are a split / jump-cut (the gaps between them are excised, exactly like
+    ``HeroCut.keep_spans``). The cut OWNS its ladder -- the levels come from its
+    own anchor/unit, never reconstructed by matching across separate passes.
+    """
+    level: str                              # broad|calm|balanced|tight|sharp (or modality-native)
+    spans: List[Tuple[int, int]]            # >=1 (in_ms, out_ms); gaps = jump-cuts
+    text: str = ""
+    score: float = 0.0
+
+    def in_ms(self) -> int:
+        return min(a for a, _ in self.spans) if self.spans else 0
+
+    def out_ms(self) -> int:
+        return max(b for _, b in self.spans) if self.spans else 0
+
+    def play_ms(self) -> int:
+        """On-screen duration once excised gaps are removed (kept spans only)."""
+        return sum(max(0, b - a) for a, b in self.spans)
+
+    def keep_spans(self) -> Optional[List[Tuple[int, int]]]:
+        """The jump-cut edit-list when this rung is a split (>1 span), else None
+        so a single-span rung plays contiguously."""
+        return list(self.spans) if len(self.spans) > 1 else None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "level": self.level,
+            "spans": [{"in_ms": a, "out_ms": b} for a, b in self.spans],
+            "in_ms": self.in_ms(),
+            "out_ms": self.out_ms(),
+            "play_ms": self.play_ms(),
+            "text": self.text,
+            "score": round(self.score, 3),
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "Rung":
+        spans = [(int(s["in_ms"]), int(s["out_ms"])) for s in (d.get("spans") or [])]
+        if not spans:
+            spans = [(int(d.get("in_ms", 0)), int(d.get("out_ms", 0)))]
+        return cls(level=str(d.get("level") or ""), spans=spans,
+                   text=str(d.get("text") or ""), score=float(d.get("score", 0.0)))
+
+
+@dataclass
 class HeroCut:
     hero_id: str
     file_id: str
@@ -162,6 +216,18 @@ class HeroCut:
     # is (in_ms, out_ms) inside [src_in_ms, src_out_ms]; the gaps between them
     # are the excised breaths.
     keep_spans: Optional[List[Tuple[int, int]]] = None
+    # --- Facets (the rich cut record; brain-facing, additive -- the UI ignores
+    # what it doesn't read). Populated by the per-modality builders; empty here.
+    # The cut's intrinsic zoom ladder (broad..sharp of ITS OWN content). The
+    # flat src_in/out_ms above is the rung selected for the requested energy.
+    ladder: List[Rung] = field(default_factory=list)
+    # Who is in this cut: [{voice_speaker_id, person_id, role, on_camera, region,
+    # av_link_confidence}] from the cast map. Never empty for resolved speech.
+    people: List[dict] = field(default_factory=list)
+    # Coarse framing for reframing/quality: {shot_size, angle, movement, region}.
+    framing: Optional[dict] = None
+    # Quality facet: {delivery, vlm, ...} -- deterministic + subjective scores.
+    quality: Optional[dict] = None
 
     def play_ms(self) -> int:
         """On-screen duration once breaths are excised (kept spans only)."""
@@ -187,6 +253,12 @@ class HeroCut:
             "affordances": self.affordances or [self.modality],
             "take_count": self.take_count,
             "alt_takes": [t.to_dict() for t in self.alt_takes],
+            # Facets (additive; UI-safe). Only emitted when populated so the
+            # feed/cache stay compact for cuts that don't carry them yet.
+            "ladder": [r.to_dict() for r in self.ladder] if self.ladder else None,
+            "people": self.people or None,
+            "framing": self.framing,
+            "quality": self.quality,
         }
 
     def to_cache(self) -> Dict[str, Any]:
@@ -207,6 +279,10 @@ class HeroCut:
             take_count=int(d.get("take_count", 1)),
             alt_takes=[HeroTake.from_dict(t) for t in (d.get("alt_takes") or [])],
             keep_spans=keep,
+            ladder=[Rung.from_dict(r) for r in (d.get("ladder") or [])],
+            people=list(d.get("people") or []),
+            framing=d.get("framing"),
+            quality=d.get("quality"),
         )
 
 
@@ -251,6 +327,7 @@ class _ClipInputs:
     motion: Optional[dict]                    # motion_dynamics row as a dict
     audio: Optional[dict] = None             # audio_features cut grids (dialogue/beat)
     thoughts: list = field(default_factory=list)  # l3.thought_segments.Thought (speech source)
+    cast: Optional["cst.ClipCast"] = None    # voice<->person map (built in _file_heroes)
 
 
 def _load_inputs(file_ids: List[str]) -> Dict[str, _ClipInputs]:
@@ -692,22 +769,75 @@ def _band_thought_span(t, band: int) -> Tuple[int, int, str]:
     return int(t.punch.raw_in_ms), int(t.punch.raw_out_ms), (t.punch.text or "")  # Sharp: punchline
 
 
+# Level names for a speech cut's owned ladder (broad..sharp), aligned with the
+# UI / footage-map band names. The cut OWNS these rungs -- the zoom levels of
+# ITS content -- so the energy dial just selects one (see Phase 4 read path).
+_SPEECH_LEVELS = ("broad", "calm", "balanced", "tight", "sharp")
+# The turn (broad) rung merges consecutive same-speaker thoughts; defined at the
+# Broad merge gap regardless of the band currently being emitted.
+_TURN_MERGE_GAP_MS = energy_to_params(0.0).speech_merge_gap_ms
+
+
+def _thought_ladder(t, turn_span: Tuple[int, int], turn_text: str) -> List[Rung]:
+    """The intrinsic zoom ladder a single thought OWNS: broad(turn) -> calm
+    (setup+thought) -> balanced(thought) -> tight(core) -> sharp(punch). Raw,
+    language-bounded spans; the fused-seam snap + breath excision are applied to
+    the rung the energy dial selects (the flat cut), not stored per rung yet."""
+    calm_in = int(t.setup.raw_in_ms if t.setup else t.thought.raw_in_ms)
+    s = float(getattr(t, "strength", 0.5))
+    return [
+        Rung("broad", [(int(turn_span[0]), int(turn_span[1]))], text=turn_text, score=s),
+        Rung("calm", [(calm_in, int(t.thought.raw_out_ms))],
+             text=_thought_text_with_setup(t), score=s),
+        Rung("balanced", [(int(t.thought.raw_in_ms), int(t.thought.raw_out_ms))],
+             text=(t.thought.text or ""), score=s),
+        Rung("tight", [(int(t.core.raw_in_ms), int(t.core.raw_out_ms))],
+             text=(t.core.text or ""), score=s),
+        Rung("sharp", [(int(t.punch.raw_in_ms), int(t.punch.raw_out_ms))],
+             text=(t.punch.text or ""), score=s),
+    ]
+
+
+def _turn_of(thoughts: list) -> Dict[int, Tuple[Tuple[int, int], str]]:
+    """Map each thought (by identity) to its turn's (span, text) -- the merged
+    run of consecutive same-speaker thoughts it belongs to (the broad rung)."""
+    out: Dict[int, Tuple[Tuple[int, int], str]] = {}
+    for group in _merge_thoughts(thoughts, _TURN_MERGE_GAP_MS):
+        tin = min(_thought_start_ms(t) for t in group)
+        tout = max(int(t.thought.raw_out_ms) for t in group)
+        ttext = " ".join(_thought_text_with_setup(t) for t in group).strip()
+        for t in group:
+            out[id(t)] = ((tin, tout), ttext)
+    return out
+
+
 def _thought_speech_units(thoughts: list, params: EnergyParams) -> List[dict]:
     """Speech units for this energy band, built from the THOUGHT hierarchy --
     one speaker's self-contained idea zoomed to the band level (turn / setup /
-    thought / core / punch). Edges are language-bounded by construction."""
+    thought / core / punch). Edges are language-bounded by construction. Each
+    unit carries the thought's full owned ``ladder`` so the cut keeps every zoom
+    (the energy dial selected this band's rung for the flat span)."""
     band = params.band
+    turn = _turn_of(thoughts)
     raw: List[Optional[dict]] = []
     if band == 0:        # Broad: merge consecutive same-speaker thoughts -> turn
         for group in _merge_thoughts(thoughts, params.speech_merge_gap_ms):
             in_ms = min(_thought_start_ms(t) for t in group)
             out_ms = max(int(t.thought.raw_out_ms) for t in group)
             text = " ".join(_thought_text_with_setup(t) for t in group).strip()
-            raw.append(_speech_unit(in_ms, out_ms, text, group[0].speaker))
+            u = _speech_unit(in_ms, out_ms, text, group[0].speaker)
+            if u:
+                u["ladder"] = [Rung("broad", [(in_ms, out_ms)], text=text,
+                                    score=max(float(getattr(t, "strength", 0.5)) for t in group))]
+                raw.append(u)
     else:
         for t in thoughts:
             in_ms, out_ms, text = _band_thought_span(t, band)
-            raw.append(_speech_unit(in_ms, out_ms, text, t.speaker))
+            u = _speech_unit(in_ms, out_ms, text, t.speaker)
+            if u:
+                turn_span, turn_text = turn.get(id(t), ((in_ms, out_ms), text))
+                u["ladder"] = _thought_ladder(t, turn_span, turn_text)
+                raw.append(u)
     return [u for u in raw if u]
 
 
@@ -740,11 +870,26 @@ def _breath_keep_spans(words: List[dict], lo: int, hi: int,
     return spans if len(spans) > 1 else None
 
 
+def _speech_quality(metrics: Dict[str, Any], vlm: Optional[float],
+                    on_camera: Optional[float]) -> Optional[dict]:
+    """The cut's quality facet: deterministic delivery fluency + the VLM's
+    subjective score + how on-camera the speaker is. None when nothing to say."""
+    q: Dict[str, Any] = {}
+    if metrics:
+        q["delivery"] = round(ss.delivery_score(metrics), 3)
+    if vlm is not None:
+        q["vlm"] = round(vlm, 3)
+    if on_camera is not None:
+        q["on_camera"] = round(on_camera, 3)
+    return q or None
+
+
 def _make_speech_hero(
     clip: _ClipInputs, source: Optional[ss.SpanSource], quality_events: List[dict],
     uid: str, in_ms: int, out_ms: int, raw_in: int, raw_out: int,
     text: str, speaker: Optional[str], extra_flags: List[str],
     keep_spans: Optional[List[Tuple[int, int]]] = None,
+    ladder: Optional[List[Rung]] = None,
 ) -> Optional[HeroCut]:
     if out_ms <= in_ms:
         return None
@@ -755,6 +900,15 @@ def _make_speech_hero(
     if int(metrics.get("word_count", 0)) < MIN_SPEECH_WORDS:
         return None
     vlm = _vlm_quality_score(quality_events, raw_in, raw_out)
+
+    # Resolve WHO is speaking via the cast map: the right on-screen person (not
+    # the raw diarization id), whether they're on camera, and their frame box.
+    member = clip.cast.resolve(speaker) if clip.cast else None
+    display_speaker = member.label() if member is not None else speaker
+    people = [member.to_dict()] if member is not None else []
+    on_cam = member.on_camera_ratio(in_ms, out_ms) if member is not None else None
+    region = member.region if member is not None else None
+
     return HeroCut(
         hero_id=f"{clip.file_id[:8]}:{uid}",
         file_id=clip.file_id,
@@ -763,10 +917,14 @@ def _make_speech_hero(
         src_in_ms=in_ms,
         src_out_ms=out_ms,
         score=_speech_score(metrics, vlm),
-        speaker=speaker,
+        speaker=display_speaker,
         flags=extra_flags,
         affordances=[anc.AFF_SPEECH],
         keep_spans=keep_spans,
+        ladder=ladder or [],
+        people=people,
+        framing=_framing_facet(clip, in_ms, out_ms, region),
+        quality=_speech_quality(metrics, vlm, on_cam),
     )
 
 
@@ -807,6 +965,7 @@ def _speech_candidates(
     for ci, u in enumerate(units):
         in_ms, out_ms, text = u["in"], u["out"], u["text"]
         raw_in, raw_out, speaker, flags = u["raw_in"], u["raw_out"], u["speaker"], u["flags"]
+        flags = list(flags)
 
         # Trim off-camera crew cues bleeding into the edges (VLM authority).
         if speaking and source is not None:
@@ -815,9 +974,14 @@ def _speech_candidates(
                 in_ms, out_ms, kw = tr
                 text = " ".join((w.get("text") or "").strip() for w in kw).strip()
 
-        # Drop a unit whose audio has no visible speaker (off-frame voice).
+        # NEVER DISCARD: audio with no visible speaker is off-frame voice (an
+        # off-camera interviewer's question, a voiceover) -- still usable, so we
+        # FLAG it rather than drop it and let the cast/ranker decide. The crew
+        # "go"/"action" cues are already edge-trimmed above; what survives here
+        # is real off-screen speech the brain may well want to keep.
         if speaking and _speaking_coverage(speaking, in_ms, out_ms) < SPEAKING_COVERAGE_MIN:
-            continue
+            if "offscreen" not in flags:
+                flags.append("offscreen")
 
         # Tightness: snap to fused seams + energy-scaled breathing room.
         in_ms, out_ms = _snap_fused(field, in_ms, out_ms, params, clip.duration_ms)
@@ -828,50 +992,143 @@ def _speech_candidates(
             keep_spans = _breath_keep_spans(
                 source.words, in_ms, out_ms, params.speech_breath_gap_ms)
 
+        # Reconcile the rung the energy dial selected with the snapped/excised
+        # flat output, so the cut's owned ladder agrees with what actually plays.
+        ladder = list(u.get("ladder") or [])
+        _reconcile_selected_rung(ladder, params.band, in_ms, out_ms, keep_spans, text)
+
         h = _make_speech_hero(clip, source, quality_events, f"sp{ci}",
                               in_ms, out_ms, raw_in, raw_out, text, speaker, flags,
-                              keep_spans=keep_spans)
+                              keep_spans=keep_spans, ladder=ladder)
         if h:
             out.append(h)
     return out
 
 
-def _combined_candidates(
-    clip: _ClipInputs, speech: List[HeroCut], action: List[HeroCut]
-) -> List[HeroCut]:
-    """The dialogue+action cut: when a spoken line sits right next to an action
-    beat, surface the whole moment as one hero spanning both -- cut on the speech
-    (silence) boundary at one end and the action (motion) boundary at the other.
-    Emitted *in addition* to the speech-only and action-only heroes, so the
-    editor sees every usable framing of the moment (just the line, just the
-    action, or both together)."""
-    out: List[HeroCut] = []
-    for a in action:
-        # Pair the action with its single nearest adjacent spoken line.
-        best, best_gap = None, COMBINE_GAP_MS + 1
-        for s in speech:
-            (e_in, e_out), (l_in, l_out) = sorted(
-                [(s.src_in_ms, s.src_out_ms), (a.src_in_ms, a.src_out_ms)]
-            )
-            gap = l_in - e_out  # <=0 when they overlap
-            if gap < best_gap:
-                best, best_gap = s, gap
-        if best is None or best_gap > COMBINE_GAP_MS:
+def _reconcile_selected_rung(
+    ladder: List[Rung], band: int, in_ms: int, out_ms: int,
+    keep_spans: Optional[List[Tuple[int, int]]], text: str,
+) -> None:
+    """Update the rung the dial selected (this band) to the snapped + breath-
+    excised spans that actually play, so the owned ladder stays truthful for the
+    level being served. Other rungs keep their raw, language-bounded spans."""
+    if not ladder or not (0 <= band < len(_SPEECH_LEVELS)):
+        return
+    level = _SPEECH_LEVELS[band]
+    spans = list(keep_spans) if keep_spans else [(int(in_ms), int(out_ms))]
+    for r in ladder:
+        if r.level == level:
+            r.spans = spans
+            if text:
+                r.text = text
+            return
+
+
+def _interaction_windows(perception: Optional[dict]) -> List[Tuple[int, int]]:
+    """Union span per VLM ``interaction_id`` -- the model's own statement that a
+    set of per-actor events is ONE shared moment (a handshake, a reaction to a
+    line). The cohesion signal that replaces blind time-gap pairing."""
+    by_id: Dict[str, Tuple[int, int]] = {}
+    for e in (perception or {}).get("events") or []:
+        iid = e.get("interaction_id")
+        if not iid:
             continue
-        s = best
-        in_ms, out_ms = min(s.src_in_ms, a.src_in_ms), max(s.src_out_ms, a.src_out_ms)
-        label = (f"{a.label} \u2192 {s.label}" if a.src_in_ms < s.src_in_ms
-                 else f"{s.label} \u2192 {a.label}")
+        a, b = int(e.get("start_ms", 0)), int(e.get("end_ms", 0))
+        if b <= a:
+            continue
+        cur = by_id.get(iid)
+        by_id[iid] = (min(cur[0], a), max(cur[1], b)) if cur else (a, b)
+    return list(by_id.values())
+
+
+def _cohesion_moments(clip: _ClipInputs, cuts: List[HeroCut]) -> List[HeroCut]:
+    """Multi-affordance MOMENTS driven by cohesion, not a fixed time gap.
+
+    Two cuts belong to the same moment when they overlap (or sit within
+    ``COMBINE_GAP_MS``) OR both fall inside one VLM interaction window. Each
+    multi-modality cluster becomes ONE union cut whose owned ladder is
+    union(broad) -> the dominant member's finer rungs, carrying the union of
+    affordances + people. Emitted IN ADDITION to the individual cuts, so the
+    editor still sees each framing (just the line, just the action, or the whole
+    moment). Generalizes the old action<->speech-only pairing to any modality
+    mix (reaction-to-a-line, action-under-narration, ...)."""
+    members = [c for c in cuts if c.modality != "moment"]
+    n = len(members)
+    if n < 2:
+        return []
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    # Link by overlap / proximity.
+    for i in range(n):
+        for j in range(i + 1, n):
+            gap = (max(members[i].src_in_ms, members[j].src_in_ms)
+                   - min(members[i].src_out_ms, members[j].src_out_ms))
+            if gap <= COMBINE_GAP_MS:
+                union(i, j)
+    # Link by shared VLM interaction window (trusted cohesion).
+    for w in _interaction_windows(clip.perception):
+        idxs = [k for k in range(n)
+                if _overlap_ms(members[k].src_in_ms, members[k].src_out_ms, w[0], w[1]) > 0]
+        for k in idxs[1:]:
+            union(idxs[0], k)
+
+    clusters: Dict[int, List[HeroCut]] = {}
+    for k in range(n):
+        clusters.setdefault(find(k), []).append(members[k])
+
+    out: List[HeroCut] = []
+    for root, group in clusters.items():
+        mods = {c.modality for c in group}
+        if len(group) < 2 or len(mods) < 2:
+            continue   # a single-modality run is already covered by its own cuts
+        ordered = sorted(group, key=lambda c: c.src_in_ms)
+        in_ms = min(c.src_in_ms for c in group)
+        out_ms = max(c.src_out_ms for c in group)
+        dominant = max(group, key=lambda c: c.score)
+        label = " \u2192 ".join(c.label for c in ordered if c.label)[:200]
+        affs = sorted({a for c in group for a in (c.affordances or [c.modality])})
+
+        # Ladder: union is the broad rung; the dominant member supplies the
+        # finer zoom (the whole moment -> the one cut that carries it).
+        ladder = [Rung("broad", [(in_ms, out_ms)], text=label, score=dominant.score)]
+        for r in dominant.ladder:
+            if r.level != "broad":
+                ladder.append(Rung(r.level, list(r.spans), r.text, r.score))
+
+        people: List[dict] = []
+        seen: set = set()
+        for c in ordered:
+            for p in (c.people or []):
+                key = (p.get("voice_speaker_id"), p.get("person_id"))
+                if key not in seen:
+                    seen.add(key)
+                    people.append(p)
+        speech_m = next((c for c in ordered if c.modality == anc.AFF_SPEECH), None)
+        speaker = speech_m.speaker if speech_m else dominant.speaker
         out.append(HeroCut(
-            hero_id=f"{clip.file_id[:8]}:moment:{a.hero_id.rsplit(':', 1)[-1]}",
+            hero_id=f"{clip.file_id[:8]}:moment:{root}",
             file_id=clip.file_id,
             modality="moment",
-            label=label[:200],
+            label=label,
             src_in_ms=in_ms,
             src_out_ms=out_ms,
-            score=max(s.score, a.score),
-            speaker=s.speaker,
-            affordances=[anc.AFF_SPEECH, anc.AFF_ACTION],
+            score=dominant.score,
+            speaker=speaker,
+            affordances=affs,
+            ladder=ladder,
+            people=people,
+            framing=dominant.framing,
         ))
     return out
 
@@ -1048,10 +1305,13 @@ def _action_segments(
             cin, cout = min(m.start_ms for m in members), max(m.end_ms for m in members)
             pieces = [(cin, cout, "")]
             label_base = (anchor.text or "action").strip()
+            ladder_base = [Rung("broad", [(cin, cout)], text=label_base,
+                                score=float(anchor.salience))]
         else:
             anchor = members[0]
             pieces = _action_pieces(anchor, motion, params, field, clip)
             label_base = (anchor.text or "action").strip()
+            ladder_base = _beat_ladder(anchor, motion, anc.AFF_ACTION)
         for pi, (cin, cout, suffix) in enumerate(pieces):
             if cout <= cin:
                 continue
@@ -1060,16 +1320,22 @@ def _action_segments(
             score = _beat_score([anchor], vlm, territory_mult=1.0)
             if score < _MIN_BEAT_SALIENCE:
                 continue
+            label = (label_base + suffix)[:200]
+            ladder = _copy_ladder(ladder_base)
+            _reconcile_selected_rung(ladder, params.band, in_ms, out_ms, None, label)
             out.append(HeroCut(
                 hero_id=f"{clip.file_id[:8]}:act{ci}{pi}",
                 file_id=clip.file_id,
                 modality=anc.AFF_ACTION,
-                label=(label_base + suffix)[:200],
+                label=label,
                 src_in_ms=in_ms,
                 src_out_ms=out_ms,
                 speaker=anchor.actor,
                 affordances=[anc.AFF_ACTION],
                 score=score,
+                ladder=ladder,
+                people=_beat_people(anchor),
+                framing=_framing_facet(clip, in_ms, out_ms, anchor.region),
             ))
     return out
 
@@ -1132,6 +1398,86 @@ def _core_inset(core_in: int, core_out: int, peak: int,
     return ci, co
 
 
+# --- Facets for non-speech cuts (framing / people / owned ladder) ------------
+
+def _camera_framing(perception: Optional[dict], in_ms: int, out_ms: int) -> dict:
+    """The dominant camera framing over a window from the VLM's camera_craft
+    timeline -- shot size / angle / movement / what the framing favors."""
+    best, best_ov = None, 0
+    for c in (perception or {}).get("camera_craft") or []:
+        ov = _overlap_ms(int(c.get("start_ms", 0)), int(c.get("end_ms", 0)), in_ms, out_ms)
+        if ov > best_ov:
+            best, best_ov = c, ov
+    if best is None:
+        return {}
+    out: dict = {}
+    for k in ("shot_size", "angle", "movement", "subject_focus"):
+        v = best.get(k)
+        if v is not None:
+            out[k] = v
+    return out
+
+
+def _framing_facet(clip: _ClipInputs, in_ms: int, out_ms: int,
+                   region: Optional[dict] = None) -> Optional[dict]:
+    """Framing facet for any cut: camera craft + the subject's frame box (for
+    reframing). None when there's nothing to record."""
+    f = _camera_framing(clip.perception, in_ms, out_ms)
+    if region:
+        f = dict(f)
+        f["region"] = region
+    return f or None
+
+
+def _beat_people(anchor: anc.Anchor) -> List[dict]:
+    """The actor facet for a non-speech cut (the person performing the beat)."""
+    if not anchor.actor:
+        return []
+    p: dict = {"person_id": anchor.actor, "on_camera": True}
+    if anchor.region:
+        p["region"] = anchor.region
+    return [p]
+
+
+def _overlay_core(aff: str, params: EnergyParams,
+                  kind: Optional[str] = None) -> Tuple[Optional[int], float]:
+    """(target handle length, lead fraction) for an overlay affordance at a band."""
+    if aff == anc.AFF_BROLL:
+        return params.broll_core_ms, (_BROLL_MOVE_LEAD if kind == "move" else _BROLL_HOLD_LEAD)
+    if aff == anc.AFF_REACTION:
+        return params.reaction_core_ms, _REACTION_LEAD
+    if aff == anc.AFF_INSERT:
+        return params.insert_core_ms, _INSERT_LEAD
+    return None, 0.5
+
+
+def _beat_ladder(anchor: anc.Anchor, motion: Optional[dict], aff: str) -> List[Rung]:
+    """The intrinsic zoom ladder a non-speech beat OWNS: broad/calm keep the full
+    beat, balanced..sharp inset toward the peak (impact / apex / arrival / onset)
+    to the per-band handle length -- the same negative-padding the flat cut uses,
+    computed once per rung. Raw (pre-snap); the selected rung is reconciled to
+    the snapped flat span at emit time."""
+    rungs: List[Rung] = []
+    for band in range(len(BAND_ENERGIES)):
+        p = energy_to_params(band_energy(band))
+        if aff == anc.AFF_ACTION:
+            cin, cout = _action_core(anchor, motion, p.action_anchor_mode)
+            cin, cout = _core_inset(cin, cout, anchor.ts_ms, p.action_core_ms, lead_frac=_ACTION_LEAD)
+        else:
+            core_ms, lead = _overlay_core(aff, p, anchor.kind)
+            cin, cout = _core_inset(anchor.start_ms, anchor.end_ms, anchor.ts_ms,
+                                    core_ms, lead_frac=lead)
+        if cout <= cin:
+            cin, cout = anchor.start_ms, anchor.end_ms
+        rungs.append(Rung(_SPEECH_LEVELS[band], [(int(cin), int(cout))],
+                          text=(anchor.text or aff), score=float(anchor.salience)))
+    return rungs
+
+
+def _copy_ladder(rungs: List[Rung]) -> List[Rung]:
+    return [Rung(r.level, list(r.spans), r.text, r.score) for r in rungs]
+
+
 def _beat_segments(clip: _ClipInputs, field: Optional[fseams.FusedField],
                    params: EnergyParams, anchors: List[anc.Anchor]) -> List[HeroCut]:
     """NON-speech anchors as segments -- per-affordance energy semantics."""
@@ -1187,17 +1533,25 @@ def _beat_segments(clip: _ClipInputs, field: Optional[fseams.FusedField],
             score = _beat_score(members, vlm, territory_mult=t_mult)
             if score < _MIN_BEAT_SALIENCE:
                 continue
-            label = (best.text or aff).strip()
+            label = (best.text or aff).strip()[:200]
+            if len(members) > 1:
+                ladder = [Rung("broad", [(in_ms, out_ms)], text=label, score=float(best.salience))]
+            else:
+                ladder = _beat_ladder(best, clip.motion, aff)
+                _reconcile_selected_rung(ladder, params.band, in_ms, out_ms, None, label)
             out.append(HeroCut(
                 hero_id=f"{clip.file_id[:8]}:{aff[:3]}{ci}",
                 file_id=clip.file_id,
                 modality=aff,
-                label=label[:200],
+                label=label,
                 src_in_ms=in_ms,
                 src_out_ms=out_ms,
                 speaker=best.actor,
                 affordances=[aff],
                 score=score,
+                ladder=ladder,
+                people=_beat_people(best),
+                framing=_framing_facet(clip, in_ms, out_ms, best.region),
             ))
     return out
 
@@ -1208,6 +1562,23 @@ def _beat_segments(clip: _ClipInputs, field: Optional[fseams.FusedField],
 
 def _overlap_ms(a0: int, a1: int, b0: int, b1: int) -> int:
     return max(0, min(a1, b1) - max(a0, b0))
+
+
+def _take_rank(h: HeroCut) -> Tuple[float, float, float]:
+    """Deterministic best-take order for the front of a stack: prefer the take
+    where the speaker is ON CAMERA, then the cleaner DELIVERY (fluency: fewer
+    fillers / no stumble), then the base score. Unknown on-camera/delivery sit at
+    a neutral 0.5 so they neither win nor lose by default. This is the objective
+    half of take selection -- exactly what the cast map + delivery score were
+    built to feed."""
+    q = h.quality or {}
+    on_cam = q.get("on_camera")
+    deliv = q.get("delivery")
+    return (
+        float(on_cam) if on_cam is not None else 0.5,
+        float(deliv) if deliv is not None else 0.5,
+        float(h.score),
+    )
 
 
 def _stack_takes(heroes: List[HeroCut], file_ids: List[str]) -> List[HeroCut]:
@@ -1250,7 +1621,7 @@ def _stack_takes(heroes: List[HeroCut], file_ids: List[str]) -> List[HeroCut]:
         candidates = [h for h, _ in members if h is not None and h.hero_id not in consumed]
         if not candidates:
             continue
-        front = max(candidates, key=lambda h: h.score)
+        front = max(candidates, key=_take_rank)
         front_att_id = next(a.attempt_id for h, a in members if h is front)
 
         alts: List[HeroTake] = []
@@ -1318,7 +1689,7 @@ def _consolidate_speech(heroes: List[HeroCut]) -> List[HeroCut]:
         if len(g) == 1:
             out.append(g[0])
             continue
-        front = max(g, key=lambda h: h.score)
+        front = max(g, key=_take_rank)
         alts: List[HeroTake] = list(front.alt_takes)
         for m in g:
             if m is front:
@@ -1372,6 +1743,10 @@ def _file_heroes(
     clip's stored artifacts, so its output is what the precompute cache stores
     (one entry per file per energy band). No cross-file stacking here."""
     field = _build_field(clip, params.energy)
+    # Resolve the cast (voice<->person, on/off camera, frame box) once per clip,
+    # so every speech cut carries the right speaker + framing facets.
+    if clip.cast is None:
+        clip.cast = cst.build_cast(clip.perception, source.words if source else [])
     anchors = anc.gather_anchors(
         duration_ms=clip.duration_ms, dialogue=clip.dialogue,
         perception=clip.perception, motion=clip.motion, audio=clip.audio)
@@ -1379,8 +1754,7 @@ def _file_heroes(
     beats = _beat_segments(clip, field, params, anchors)
     heroes: List[HeroCut] = list(sp) + list(beats)
     if params.fuse_moments:
-        action = [b for b in beats if b.modality == anc.AFF_ACTION]
-        heroes.extend(_combined_candidates(clip, sp, action))
+        heroes.extend(_cohesion_moments(clip, heroes))
     return heroes
 
 
