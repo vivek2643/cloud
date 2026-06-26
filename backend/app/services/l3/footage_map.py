@@ -8,10 +8,12 @@ drop into a prompt whole. This module is the breakdown + map + retrieval layer:
 
   * ``build_clip_tree``   collapses one clip's five energy bands into a list of
     MOMENTS. A moment is anchored on the BALANCED band ("one complete thought
-    per cut") and carries its multi-resolution VARIANTS -- widen it to the
-    coarser answer it sits inside (broad/calm), or tighten it to the finer
-    ATOMS it splits into (tight/sharp). No content is hidden; coarser/finer
-    cuts are folded onto the moment they belong to instead of repeated.
+    per cut") and carries its multi-resolution VARIANTS -- every nested zoom of
+    the same content: widen to the turn/run-up it sits inside (broad/calm) or
+    tighten to the core sentence / punchline clause (tight/sharp). When a moment
+    genuinely splits into several finer sub-units (a legacy multi-sentence
+    topic), those are exposed as ATOMS the model can pick individually. No
+    content is hidden; coarser/finer cuts fold onto the moment they belong to.
 
   * ``assemble_map``      renders every clip's moments as a compact, complete
     text index (Tier-0: what goes in the prompt) plus the machine-readable
@@ -39,7 +41,9 @@ logger = logging.getLogger(__name__)
 
 # Bump when the moment-tree shape / clustering logic changes so cached trees
 # rebuild even if the underlying hero cuts (PARAMS_VERSION) did not.
-TREE_VERSION = 1
+# v2: every nested level (incl. tight=core) is a selectable variant; atoms are
+# emitted only when a moment splits into >= 2 finer sub-units.
+TREE_VERSION = 2
 
 # Band index -> energy-level name. Band 2 (energy 0.5) is the anchor: one
 # complete thought per cut. Lower = wider (whole answer), higher = tighter.
@@ -94,6 +98,20 @@ def _variant(cut: Dict[str, Any], band: int) -> Dict[str, Any]:
     }
 
 
+def _atom(cut: Dict[str, Any], band: int) -> Dict[str, Any]:
+    """One indivisible sub-unit the model can pick by id (legacy multi-split)."""
+    return {
+        "atom_id": cut.get("hero_id"),
+        "in_ms": _in(cut),
+        "out_ms": _out(cut),
+        "play_ms": int(cut.get("play_ms", _out(cut) - _in(cut))),
+        "keep_spans": cut.get("keep_spans"),
+        "gist": cut.get("label") or "",
+        "score": float(cut.get("score", 0.0)),
+        "band": band,
+    }
+
+
 # --------------------------------------------------------------------------
 # Tree builder (pure: given a clip header + its five bands of cuts)
 # --------------------------------------------------------------------------
@@ -119,7 +137,6 @@ def build_clip_tree(
     coarser = [b for b in range(_ANCHOR_BAND) if band_cuts.get(b)]            # 0,1
     finer = [b for b in range(_ANCHOR_BAND + 1, len(_LEVEL_NAMES))
              if band_cuts.get(b)]                                            # 3,4
-    finest = finer[-1] if finer else None                                    # 4 else 3
 
     moments: List[Dict[str, Any]] = []
     for idx, cut in enumerate(anchors):
@@ -127,28 +144,25 @@ def build_clip_tree(
         variants: Dict[str, Dict[str, Any]] = {_level_name(_ANCHOR_BAND): _variant(cut, _ANCHOR_BAND)}
 
         # Widen: the coarser cut (closest to balanced first) that contains this
-        # moment's center -- the "take the whole answer" option.
+        # moment's center -- the "take the whole turn / with run-up" option.
         for b in sorted(coarser, reverse=True):                              # 1 then 0
             cand = [c for c in band_cuts[b] if _contains_center(c, cut)]
             if cand:
                 widest = max(cand, key=lambda c: _overlap_ms(_in(c), _out(c), _in(cut), _out(cut)))
                 variants[_level_name(b)] = _variant(widest, b)
 
-        # Tighten / atoms: the finer cuts whose center falls inside this moment
-        # -- the indivisible sub-units the model can pick individually.
+        # Tighten: each finer band is either a single nested zoom of this moment
+        # (the core sentence / punchline clause) -> a selectable VARIANT, or, when
+        # the moment genuinely splits into several sub-units at that band (a
+        # legacy multi-sentence topic) -> ATOMS the model can pick individually.
+        # The finest genuine split wins the atoms slot.
         atoms: List[Dict[str, Any]] = []
-        if finest is not None:
-            for c in sorted((c for c in band_cuts[finest] if _contains_center(cut, c)), key=_in):
-                atoms.append({
-                    "atom_id": c.get("hero_id"),
-                    "in_ms": _in(c),
-                    "out_ms": _out(c),
-                    "play_ms": int(c.get("play_ms", _out(c) - _in(c))),
-                    "keep_spans": c.get("keep_spans"),
-                    "gist": c.get("label") or "",
-                    "score": float(c.get("score", 0.0)),
-                    "band": finest,
-                })
+        for b in sorted(finer):                                              # 3 then 4
+            inside = sorted((c for c in band_cuts[b] if _contains_center(cut, c)), key=_in)
+            if len(inside) == 1:
+                variants[_level_name(b)] = _variant(inside[0], b)
+            elif len(inside) > 1:
+                atoms = [_atom(c, b) for c in inside]
 
         moments.append({
             "moment_id": moment_id,
@@ -301,7 +315,21 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     # guessing; compact (paged) mode truncates and relies on inspect_moment.
     if compact and len(gist) > 80:
         gist = gist[:77] + "..."
-    atoms = f" (+{len(m['atoms'])} atoms)" if m.get("atoms") else ""
+    atoms = ""
+    if m.get("atoms"):
+        if compact:
+            atoms = f" (+{len(m['atoms'])} atoms)"
+        else:
+            # Resident mode: expose each sub-unit by id + its gist so the model
+            # can pick one directly, not just know a count exists.
+            bits = []
+            for a in m["atoms"]:
+                aid = (a.get("atom_id") or "").split(":")[-1]
+                g = (a.get("gist") or "").strip().replace("\n", " ")
+                if len(g) > 48:
+                    g = g[:45] + "..."
+                bits.append(f'{aid}="{g}"')
+            atoms = " · atoms: " + " ".join(bits)
     dup = ""
     if m.get("dup_group"):
         dup = f" · dup:{m['dup_group']}{'*' if m.get('dup_best') else ''}"

@@ -84,8 +84,43 @@ def test_map_text_is_compact_and_complete():
     assert lines[0].startswith('CLIP ffffffff "Take 2"'), lines[0]
     assert len(lines) == 1 + tree["moment_count"]            # header + one line per moment
     assert "nrg:broad|calm|balanced" in lines[1], lines[1]
-    assert "(+2 atoms)" in lines[1], lines[1]
+    # Resident mode lists each atom by id + gist (not just a count).
+    assert "· atoms:" in lines[1] and 's0="' in lines[1], lines[1]
+    # Compact mode falls back to the count (paged path leans on inspect_moment).
+    cblock = fm._clip_block(tree, compact=True)
+    assert "(+2 atoms)" in cblock.splitlines()[1], cblock
     print("ok  test_map_text_is_compact_and_complete")
+
+
+def _thought_bands():
+    """A clip with ONE thought whose five levels are single nested spans: the
+    turn / run-up (broad/calm) -> the thought (balanced) -> the core sentence
+    (tight) -> the punchline clause (sharp)."""
+    return {
+        0: [_cut("f:turn", 0, 8000, "so anyway we almost shut the company down", score=0.8)],
+        1: [_cut("f:calm", 500, 4000, "so we almost shut the company down", score=0.8)],
+        2: [_cut("f:th", 1000, 4000, "we almost shut the company down", score=0.82)],
+        3: [_cut("f:core", 1000, 3000, "we almost shut down", score=0.7)],
+        4: [_cut("f:punch", 1500, 3000, "shut down", score=0.7)],
+    }
+
+
+def test_thought_levels_become_variants():
+    """Each nested level (incl. tight=core) is a selectable VARIANT, and a single
+    thought yields NO atoms (nothing to sub-pick)."""
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000},
+                              _thought_bands())
+    assert tree["moment_count"] == 1, tree["moment_count"]
+    m = tree["moments"][0]
+    assert set(m["variants"].keys()) == {"broad", "calm", "balanced", "tight", "sharp"}, \
+        m["variants"].keys()
+    assert m["variants"]["tight"]["out_ms"] == 3000, m["variants"]["tight"]
+    assert m["variants"]["sharp"]["in_ms"] == 1500, m["variants"]["sharp"]
+    assert m["atoms"] == [], m["atoms"]
+    line = fm._moment_line(m)
+    assert "nrg:broad|calm|balanced|tight|sharp" in line, line
+    assert "atoms" not in line, line
+    print("ok  test_thought_levels_become_variants")
 
 
 def test_anchor_fallback_when_balanced_empty():
@@ -102,6 +137,7 @@ def test_anchor_fallback_when_balanced_empty():
 def main():
     test_moments_anchor_on_balanced()
     test_widen_and_atoms_fold_in()
+    test_thought_levels_become_variants()
     test_map_text_is_compact_and_complete()
     test_anchor_fallback_when_balanced_empty()
     print("\nall footage-map tests passed")
