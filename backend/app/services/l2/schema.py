@@ -67,6 +67,16 @@ RelationType = Enum("RelationType", [(r, r) for r in vocab.RELATIONS], type=str)
 Role = Enum("Role", [(r, r) for r in vocab.ROLES], type=str)
 
 
+def _coerce_role(v):
+    """Lenient role: the schema is carried in-prompt (no constrained decoding),
+    so the model occasionally emits an out-of-vocab role (a relation name, a
+    'question'). Drop it to None rather than failing the WHOLE clip's parse."""
+    if v is None:
+        return None
+    s = str(getattr(v, "value", v)).strip().lower()
+    return s if s in vocab.ROLE_SET else None
+
+
 # --------------------------------------------------------------------------
 # Controlled vocabularies
 # --------------------------------------------------------------------------
@@ -372,6 +382,11 @@ class Event(BaseModel):
     )
     role: Optional[Role] = Field(None, description="narrative intent of this beat, when clear (e.g. 'establishing', 'climax')")
 
+    @field_validator("role", mode="before")
+    @classmethod
+    def _norm_role(cls, v):
+        return _coerce_role(v)
+
 
 class Interaction(BaseModel):
     id: str
@@ -396,6 +411,11 @@ class Reaction(BaseModel):
     @classmethod
     def _norm_intensity(cls, v):
         return _to_unit(v)
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def _norm_role(cls, v):
+        return _coerce_role(v)
 
 
 class GazeSpan(BaseModel):
@@ -491,6 +511,11 @@ class CutawayMoment(BaseModel):
     def _norm_unit(cls, v):
         return _to_unit(v)
 
+    @field_validator("role", mode="before")
+    @classmethod
+    def _norm_role(cls, v):
+        return _coerce_role(v)
+
 
 # --------------------------------------------------------------------------
 # Take selection (span-level): content units + localized quality + retries
@@ -530,6 +555,11 @@ class ContentUnit(BaseModel):
     role: Optional[Role] = Field(None, description="narrative intent of this unit, when clear (e.g. 'hook', 'answer', 'cta')")
     topic: Optional[str] = Field(None, description="the subject/topic this unit is about, for grouping and 'illustrates' links")
     entity: Optional[str] = Field(None, description="the concrete thing/person this unit centers on, when there is a clear one")
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def _norm_role(cls, v):
+        return _coerce_role(v)
 
 
 class QualityDimension(str, Enum):
@@ -638,5 +668,22 @@ class ClipPerception(BaseModel):
     # Typed graph over the logged beats (events / units / cutaways / reactions).
     # Empty when nothing connects (a single static b-roll clip).
     relations: List[Relation] = Field(default_factory=list)
+
+    @field_validator("relations", mode="before")
+    @classmethod
+    def _drop_bad_relations(cls, v):
+        """Keep only well-formed, in-vocab edges -- a stray relation type (the
+        model is prompt-guided, not constrained) drops that one edge instead of
+        failing the whole clip's parse."""
+        if not isinstance(v, list):
+            return v
+        out = []
+        for r in v:
+            if not isinstance(r, dict):
+                continue
+            t = str(r.get("type", "")).strip().lower()
+            if t in vocab.RELATION_SET and r.get("from_id") and r.get("to_id"):
+                out.append({**r, "type": t})
+        return out
 
     notes: Optional[str] = Field(None, description="caveats, low-confidence calls, anything ambiguous")
