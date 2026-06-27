@@ -17,24 +17,38 @@ import { EditButton } from "./search-edit-bar";
 const MODALITY_STYLE: Record<HeroModality, { color: string; label: string }> = {
   speech: { color: "#6366f1", label: "speech" },
   action: { color: "#f59e0b", label: "action" },
+  behavior: { color: "#f97316", label: "behavior" },
   visual: { color: "#06b6d4", label: "visual" },
-  moment: { color: "#10b981", label: "dialogue + action" },
+  moment: { color: "#10b981", label: "moment" },
   reaction: { color: "#ec4899", label: "reaction" },
   broll: { color: "#06b6d4", label: "b-roll" },
   insert: { color: "#a78bfa", label: "insert" },
 };
 
-type FilterKey = HeroModality | "all";
+// A tab is either the special "all" / "moment" view or an affordance filter.
+type FilterKey = "all" | "moment" | "speech" | "action" | "reaction" | "broll";
 
 // Filter chips over the ONE feed -- this is how every edit style (soundbites,
-// action beats, cutaways) is served without a separate pipeline.
+// action beats, cutaways) is served without a separate pipeline. "Moments" is a
+// VIEW (multi-affordance cuts), not a duplicate card; every other tab matches an
+// affordance the cut serves, so one rich cut can appear under several tabs.
 const FILTERS: { key: FilterKey; label: string }[] = [
   { key: "all", label: "All" },
   { key: "moment", label: "Moments" },
   { key: "speech", label: "Speech" },
+  { key: "action", label: "Action" },
   { key: "reaction", label: "Reactions" },
   { key: "broll", label: "B-roll" },
 ];
+
+// Does a cut serve a given tab? Moments = multi-affordance/has-coverage; an
+// affordance tab matches when the cut lists that affordance (modality fallback).
+function matchesFilter(h: HeroCut, key: FilterKey): boolean {
+  if (key === "all") return true;
+  if (key === "moment") return Boolean(h.is_moment);
+  const affs = h.affordances && h.affordances.length > 0 ? h.affordances : [h.modality];
+  return affs.includes(key);
+}
 
 function fmtDur(ms: number): string {
   const s = ms / 1000;
@@ -124,11 +138,16 @@ export function HeroCutsView() {
   const present = useMemo(() => heroes.filter((h) => filesById[h.file_id]), [heroes, filesById]);
   const counts = useMemo(() => {
     const c: Record<string, number> = {};
-    for (const h of present) c[h.modality] = (c[h.modality] ?? 0) + 1;
+    for (const f of FILTERS) {
+      if (f.key === "all") continue;
+      c[f.key] = present.filter((h) => matchesFilter(h, f.key)).length;
+    }
     return c;
   }, [present]);
-  const visible =
-    filter === "all" ? present : present.filter((h) => h.modality === filter);
+  const visible = useMemo(
+    () => (filter === "all" ? present : present.filter((h) => matchesFilter(h, filter))),
+    [present, filter]
+  );
   const totalClips = visible.length;
 
   return (
@@ -401,6 +420,12 @@ function HeroClipCard({
   const outSec = segs[segs.length - 1][1];
   const isVideo = file.file_type === "video";
   const modality = MODALITY_STYLE[hero.modality] ?? MODALITY_STYLE.speech;
+  // Secondary affordances this cut also serves (beyond its dominant modality) --
+  // what makes it a "moment". Coverage (alternate framings) is reachable too.
+  const extraAffordances = useMemo(
+    () => (hero.affordances ?? []).filter((a) => a !== hero.modality),
+    [hero.affordances, hero.modality]
+  );
 
   // "Frame Adjusted" reframes the clip to fill the chosen tile (center-crop);
   // "Original" letterboxes the full source frame. The proxy is already baked
@@ -550,12 +575,16 @@ function HeroClipCard({
         )}
         {!playUrl && <FileIcon type={(isVideo ? "video" : "audio") as "video"} size={32} />}
 
-        {/* Modality badge (top-left). */}
+        {/* Modality badge (top-left). A multi-affordance cut (a "moment") shows
+            the secondary uses it also serves -- one rich card, not duplicates. */}
         <span
           className="absolute left-2 top-2 z-20 flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-semibold capitalize text-white"
           style={{ background: modality.color }}
         >
           {modality.label}
+          {extraAffordances.length > 0 && (
+            <span style={{ opacity: 0.85 }}>+ {extraAffordances.join(" + ")}</span>
+          )}
         </span>
 
         {/* Take-stack badge (top-left, below the modality badge) when repeats exist. */}

@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional
 # the dominant affordance of a segment -- these are filters, not pipelines.
 AFF_SPEECH = "speech"      # a spoken line / answer (sync)
 AFF_ACTION = "action"      # a physical action beat / impact (sync)
+AFF_BEHAVIOR = "behavior"  # incidental on-camera physical business (event timeline)
 AFF_REACTION = "reaction"  # a facial reaction / expression (overlay cutaway)
 AFF_BROLL = "broll"        # a held, stable composition (overlay)
 AFF_INSERT = "insert"      # a beat worth an insert: reveal/entrance/graphic (overlay)
@@ -207,6 +208,78 @@ def _action_anchors(perception: dict, motion: dict, quality: List[dict]) -> List
     return out
 
 
+# --- Behavior: incidental physical business from the VLM event timeline -------
+# The VLM logs a sequential beat timeline ("p1 gestures", "p1 drinks coffee",
+# "p1 leans in"). These are NOT speech (no line) and NOT the sustained
+# performance the action content_units capture -- they're the on-camera subject's
+# physical business. They were previously DROPPED (events never became cuts). We
+# promote them to their own affordance so a coffee sip / a lean-in / an emphatic
+# gesture becomes a cuttable shot. Because the VLM emits events sequentially (they
+# never overlap), consecutive same-actor beats are stitched into ONE continuous
+# behavior (walk -> open -> step out) -- the deterministic continuity grouping
+# that replaces a fragile per-event before/after flag.
+EVENT_CONTINUITY_GAP_MS = 1200   # same-actor events within this gap = one behavior
+BEHAVIOR_MIN_MS = 600            # shorter than this isn't a usable held shot
+
+
+def _merge_events(events: List[dict]) -> List[dict]:
+    """Stitch consecutive SAME-ACTOR events whose inter-gap is short (or that share
+    a VLM interaction_id) into one continuous behavior span."""
+    usable = [e for e in events
+              if int(e.get("end_ms", 0)) > int(e.get("start_ms", 0)) and e.get("actor")]
+    usable.sort(key=lambda e: int(e.get("start_ms", 0)))
+    groups: List[List[dict]] = []
+    for e in usable:
+        if groups:
+            prev = groups[-1][-1]
+            gap = int(e.get("start_ms", 0)) - int(prev.get("end_ms", 0))
+            same_actor = e.get("actor") == prev.get("actor")
+            same_iid = bool(e.get("interaction_id")) and \
+                e.get("interaction_id") == prev.get("interaction_id")
+            if same_actor and (gap <= EVENT_CONTINUITY_GAP_MS or same_iid):
+                groups[-1].append(e)
+                continue
+        groups.append([e])
+    merged: List[dict] = []
+    for g in groups:
+        a = min(int(e.get("start_ms", 0)) for e in g)
+        b = max(int(e.get("end_ms", 0)) for e in g)
+        desc = " \u2192 ".join((e.get("description") or "").strip()
+                               for e in g if (e.get("description") or "").strip())
+        merged.append({
+            "start_ms": a, "end_ms": b, "actor": g[0].get("actor"),
+            "description": (desc or g[0].get("description") or "behavior")[:200],
+            "region": g[0].get("region"),
+            "id": str(g[0].get("id", "")),
+        })
+    return merged
+
+
+def _behavior_anchors(perception: dict, motion: dict) -> List[Anchor]:
+    """On-camera physical BEHAVIOR from the VLM event timeline -- the business the
+    subject does (gesture, sip, lean, handle an object) that is neither a spoken
+    line nor a sustained action/performance. Continuity-grouped per actor; salience
+    rises with motion under the span so a still pose ranks below an active beat.
+    The duration floor + the on-camera actor requirement are the usability gate
+    that keeps this coverage, not a flood of micro-twitches."""
+    hop = max(1, int((motion or {}).get("hop_ms", 100)))
+    energy = (motion or {}).get("action_energy") or []
+    out: List[Anchor] = []
+    for ev in _merge_events(perception.get("events") or []):
+        a, b = int(ev["start_ms"]), int(ev["end_ms"])
+        if b - a < BEHAVIOR_MIN_MS:
+            continue
+        mo = _mean(energy, a // hop, b // hop) if energy else 0.0
+        sal = _clamp01(0.45 + 0.55 * mo)
+        out.append(Anchor(
+            ts_ms=(a + b) // 2, start_ms=a, end_ms=b, kind="behavior",
+            affordance=AFF_BEHAVIOR, salience=sal, actor=ev.get("actor"),
+            region=ev.get("region"), text=ev.get("description") or "behavior",
+            source_id=str(ev.get("id", "")),
+        ))
+    return out
+
+
 # --- Reaction warrant: a reaction earns a card only when it is reacting TO
 # something -- a physical action beat, a strong expression, or another person's
 # long preceding turn. We fold these into the reaction's salience so the flat
@@ -272,6 +345,67 @@ def _apply_reaction_warrant(anchors: List[Anchor], perception: dict) -> None:
     actions = _action_spans(perception)
     for a in reacts:
         a.salience = _reaction_warrant(a.start_ms, a.end_ms, a.actor, a.salience, turns, actions)
+
+
+# --- Listening: the held attention shot, derived from the speaking-turn inverse.
+# While one person delivers a sustained turn, the OTHER on-camera person(s) are
+# listening -- a long, deliberate reaction the VLM rarely logs as its own cutaway
+# (it is the absence of an event). We synthesize it from the speaking track so a
+# deep-listening shot is available coverage, not something the editor has to dig
+# for in raw. This is the cure for "no long reaction shots."
+LISTEN_MIN_TURN_MS = 2500    # a turn shorter than this doesn't earn a listening shot
+LISTEN_MAX_MS = 8000         # cap the held slice (a long turn yields a usable handle)
+
+
+def _listening_anchors(perception: dict, duration_ms: int) -> List[Anchor]:
+    """A held listening/attention reaction for each on-camera person who is NOT
+    speaking during another person's sustained turn. Salience = the turn-length
+    warrant (the same scale ``_apply_reaction_warrant`` uses), so a long turn
+    earns a full-strength listening shot and a glance does not."""
+    speaking = perception.get("speaking") or []
+    if not speaking:
+        return []
+    persons = {p.get("local_id"): p for p in (perception.get("persons") or [])
+               if p.get("local_id")}
+    on_cam = {s.get("subject") for s in speaking if s.get("subject")}
+    for lid, p in persons.items():
+        if p.get("frame_region"):
+            on_cam.add(lid)
+    out: List[Anchor] = []
+    for subj, ta, tb in _speech_turns(speaking):
+        if tb - ta < LISTEN_MIN_TURN_MS:
+            continue
+        for lid in sorted(x for x in on_cam if x and x != subj):
+            p = persons.get(lid) or {}
+            enters, exits = p.get("enters_ms"), p.get("exits_ms")
+            if enters is not None and int(enters) > ta:   # not yet on camera
+                continue
+            if exits is not None and int(exits) < tb:      # already gone
+                continue
+            a, b = _hold_core(ta, tb, cap=LISTEN_MAX_MS)
+            warrant = _clamp01((tb - ta) / _REACTION_LISTEN_FULL_MS)
+            out.append(Anchor(
+                ts_ms=(a + b) // 2, start_ms=a, end_ms=b, kind="listening",
+                affordance=AFF_REACTION, salience=warrant, actor=lid,
+                region=p.get("frame_region"), text="listening", flags=["listening"],
+            ))
+    return out
+
+
+def _dedup_listening(anchors: List[Anchor]) -> List[Anchor]:
+    """Drop a synthesized listening shot when the VLM already logged a reaction
+    for the SAME actor over the SAME stretch (its explicit cutaway wins)."""
+    logged = [a for a in anchors
+              if a.affordance == AFF_REACTION and "listening" not in a.flags]
+    kept: List[Anchor] = []
+    for a in anchors:
+        if "listening" in a.flags:
+            span = max(1, a.end_ms - a.start_ms)
+            if any(r.actor == a.actor and _overlap(a.start_ms, a.end_ms, r.start_ms, r.end_ms)
+                   >= 0.5 * span for r in logged):
+                continue
+        kept.append(a)
+    return kept
 
 
 def _primary_subjects(perception: dict) -> set:
@@ -474,12 +608,17 @@ def gather_anchors(
     anchors: List[Anchor] = []
     anchors += _speech_anchors(sentences, quality)
     anchors += _action_anchors(perception, motion, quality)
+    anchors += _behavior_anchors(perception, motion)
     cutaways = _filter_redundant_broll(perception.get("cutaways") or [], perception)
     anchors += _cutaway_anchors(cutaways)
     anchors += _audio_event_anchors(audio, sentences, duration_ms)
+    # Held listening shots, synthesized from the speaking-turn inverse (deduped
+    # against any reaction the VLM already logged for the same actor/stretch).
+    anchors += _listening_anchors(perception, duration_ms)
+    anchors = _dedup_listening(anchors)
 
-    # Reactions (from the cutaways track + non-speech audio) earn their salience
-    # from context (action / intensity / listening).
+    # Reactions (from the cutaways track + non-speech audio + listening) earn
+    # their salience from context (action / intensity / listening).
     _apply_reaction_warrant(anchors, perception)
 
     # Clamp to the clip and drop degenerate spans.

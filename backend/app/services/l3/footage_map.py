@@ -44,7 +44,11 @@ logger = logging.getLogger(__name__)
 # v3: cuts OWN their ladder -- variants read straight off each cut's rungs from
 # one anchor band; no geometric re-matching, no atoms (a split is a multi-span
 # rung). Moments also carry the people/framing/quality facets.
-TREE_VERSION = 3
+# v4: the synthetic "moment" entity is retired. A moment IS its spine cut (the
+# line / the beat), tagged with every affordance it serves and carrying COVERAGE
+# (alternate framings of the same instant). The default placement span is the
+# spine's own span; coverage is optional extra angles the brain can reach for.
+TREE_VERSION = 4
 
 # Band index -> energy-level name. Band 2 (energy 0.5) is the anchor: one
 # complete thought per cut. Lower = wider (whole answer), higher = tighter.
@@ -156,6 +160,10 @@ def build_clip_tree(
             "people": cut.get("people") or [],
             "framing": cut.get("framing"),
             "quality": cut.get("quality"),
+            # Alternate framings of this same instant (listener reaction, wide
+            # angle, insert) carried by other cuts -- optional extra coverage the
+            # arranger can lay over the spine; the default span stays the spine's.
+            "coverage": cut.get("coverage") or [],
             "variants": variants,
             "atoms": [],
         })
@@ -308,6 +316,16 @@ def _people_tag(m: Dict[str, Any]) -> str:
     return ""
 
 
+def _coverage_tag(m: Dict[str, Any]) -> str:
+    """Compact note that alternate framings of this instant exist (a listener
+    reaction, a wide angle) -- the brain can lay one over the spine if it wants."""
+    cov = m.get("coverage") or []
+    if not cov:
+        return ""
+    affs = sorted({(c.get("affordance") or "") for c in cov if c.get("affordance")})
+    return f" · cover:{','.join(a for a in affs if a)}"
+
+
 def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     levels = list(m["variants"].keys())
     nrg = "|".join(L for L in _LEVEL_NAMES if L in levels)
@@ -324,7 +342,7 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     return (f"  {m['moment_id'].split(':')[-1]} {_affordance_tag(m)}{spk}{cam} "
             f".{int(round(m['score'] * 100)):02d} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])}] "
-            f"\"{gist}\" · nrg:{nrg}{dup}")
+            f"\"{gist}\" · nrg:{nrg}{dup}{_coverage_tag(m)}")
 
 
 def _clip_block(tree: Dict[str, Any], *, compact: bool = False) -> str:

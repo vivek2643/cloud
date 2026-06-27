@@ -157,11 +157,22 @@ export function getDialogues(fileId: string, token: string) {
 export type HeroModality =
   | "speech"
   | "action"
+  | "behavior"
   | "visual"
   | "moment"
   | "reaction"
   | "broll"
   | "insert";
+
+export interface HeroCoverage {
+  hero_id: string;
+  file_id: string;
+  affordance: string;
+  label: string;
+  src_in_ms: number;
+  src_out_ms: number;
+  score: number;
+}
 
 export interface HeroTake {
   file_id: string;
@@ -187,7 +198,15 @@ export interface HeroCut {
   score: number;
   speaker: string | null;
   flags: string[];
+  // All editorial uses this cut serves (filter keys). A set of >1 means the cut
+  // is a "moment" -- it works as speech AND action/behavior, etc.
   affordances: string[];
+  // Alternate framings of this same instant carried by other cuts (a listener
+  // reaction over the line, a wide angle). The other cut keeps its own card.
+  coverage?: HeroCoverage[] | null;
+  // True when this cut serves >1 affordance or has alternate coverage -- the
+  // Moments tab is exactly this view (not a separate, duplicated card).
+  is_moment?: boolean;
   take_count: number;
   alt_takes: HeroTake[];
 }
