@@ -98,6 +98,33 @@ TAKE SELECTION (so an editor can later pick the best version of a moment):
       - technical:   5 sharp, well-framed | 3 minor issues | 1 soft focus / bad framing / obscured
     Do NOT collapse quality to one number for the whole clip; localize it.
 
+INTENT & GROUNDING (so the editor knows what each beat is FOR):
+  * Give cut-bearing beats a `role` when one is clear -- the narrative job of the
+    beat, from this closed set ONLY: hook, answer, cta, establishing, climax,
+    listener. Leave null when it is just ordinary middle content; do not force it.
+  * On `content_units` and `cutaways`, add `topic` (what it is about) and, when
+    there is a concrete one, `entity` (the noun shown/discussed: 'coffee cup',
+    'the logo', 'the mountain'). These ground the relations below.
+  * Give `reactions` and `cutaways` a stable clip-local `id` (e.g. 'rx1', 'cx1')
+    so relations can point at them, exactly like event ids and unit_ids.
+
+RELATIONS (how the beats connect -- the most useful signal for assembly):
+  Populate `relations` with the real connections between beats. Each edge has a
+  `type`, a `from_id`, and a `to_id`, where the ids are any you emitted (event
+  id, content_unit unit_id, cutaway id, reaction id). Use only these types:
+    - responds_to : a reaction/answer  ->  the line or action that triggered it
+                    (the listener reaction rx2 -> the speech unit u5 it answers).
+    - answers     : an answer line     ->  the question line it answers.
+    - illustrates : a b-roll/insert    ->  the topic/line/noun it depicts
+                    (the coffee b-roll cx3 -> the unit u4 where coffee is discussed).
+    - leads_into  : a setup/windup     ->  its payoff/impact (u7 -> u8).
+    - continues   : a beat             ->  the next beat of the same continuous scene.
+    - same_instant: two simultaneous coverages/angles of ONE beat (symmetric).
+    - take_of     : two deliveries of the SAME content -- a retry or alternate
+                    take (symmetric; the editor will keep only one).
+  State relationships you can actually justify; do not connect everything. An
+  empty list is correct when beats are independent.
+
 Rules:
   * All timestamps are integer milliseconds from the start of the clip.
   * Prefer enum values where offered; use "unsure" / null rather than guessing.

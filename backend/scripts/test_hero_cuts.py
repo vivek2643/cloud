@@ -629,90 +629,103 @@ def test_offcamera_speech_flagged_not_dropped():
     print("ok  test_offcamera_speech_flagged_not_dropped")
 
 
-def test_coverage_folds_same_subject_companion():
-    """A speaker who GESTURES while delivering is ONE cut tagged with both uses --
-    the behavior card is folded into the speech spine, not duplicated."""
-    s = hc.HeroCut("z:sp0", "zzzz", "speech", "that was incredible", 1000, 3000, score=0.7,
-                   speaker="host", affordances=["speech"],
-                   people=[{"person_id": "p1", "on_camera": True}])
-    beh = hc.HeroCut("z:beh0", "zzzz", "behavior", "p1 gestures", 1500, 2800, score=0.4,
-                     affordances=["behavior"], people=[{"person_id": "p1", "on_camera": True}])
-    clip = hc._ClipInputs(file_id="zzzzzzzz-1", duration_ms=40000,
-                          dialogue={"topic": [], "sentence": []}, perception={}, motion=None)
-    out = hc._attach_coverage(clip, [s, beh])
-    assert len(out) == 1, [(h.hero_id, h.modality) for h in out]    # behavior folded away
-    spine = out[0]
-    assert spine.modality == "speech"
-    assert set(spine.affordances) == {"speech", "behavior"}, spine.affordances
-    assert spine.is_moment()
-    print("ok  test_coverage_folds_same_subject_companion")
-
-
-def test_coverage_links_alternate_framing():
-    """A DIFFERENT person's reaction over the line is a separate shot: it KEEPS
-    its own card (for the Reactions tab) and is cross-linked as coverage on the
-    speech spine, which becomes a moment. Sequential lines never merge."""
+def test_relation_links_reaction_to_line():
+    """The VLM's typed `responds_to` edge (a listener reaction -> the line it
+    answers) is mapped onto the two cuts by time: both stay first-class cards, get
+    the directional edge, and share a moment cluster."""
     s = hc.HeroCut("z:sp0", "zzzz", "speech", "that was incredible", 1000, 3000, score=0.7,
                    speaker="host", affordances=["speech"],
                    people=[{"person_id": "p1", "on_camera": True}])
     r = hc.HeroCut("z:rea0", "zzzz", "reaction", "p2 grins", 2500, 3500, score=0.5,
                    affordances=["reaction"], people=[{"person_id": "p2", "on_camera": True}])
-    later = hc.HeroCut("z:sp1", "zzzz", "speech", "a separate later line", 9000, 11000,
-                       score=0.6, speaker="host", affordances=["speech"],
-                       people=[{"person_id": "p1", "on_camera": True}])
+    perception = {
+        "content_units": [{"unit_id": "u1", "start_ms": 1000, "end_ms": 3000, "kind": "speech"}],
+        "reactions": [{"id": "rx1", "start_ms": 2500, "end_ms": 3500, "subject": "p2"}],
+        "relations": [{"type": "responds_to", "from_id": "rx1", "to_id": "u1",
+                       "note": "grins at the line"}],
+    }
     clip = hc._ClipInputs(file_id="zzzzzzzz-1", duration_ms=40000,
-                          dialogue={"topic": [], "sentence": []}, perception={}, motion=None)
-    out = hc._attach_coverage(clip, [s, r, later])
-    assert len(out) == 3, [(h.hero_id, h.modality) for h in out]   # nothing dropped
-    spine = next(h for h in out if h.hero_id == "z:sp0")
-    assert len(spine.coverage) == 1 and spine.coverage[0]["hero_id"] == "z:rea0"
-    assert set(spine.affordances) == {"speech"}                    # coverage != own use
-    # A REACTION-only overlap is passive texture -> it links as coverage but does
-    # NOT make the line a moment (a podcast line + a listener is not a moment).
-    assert not spine.is_moment()
-    assert not next(h for h in out if h.hero_id == "z:sp1").is_moment()
-    print("ok  test_coverage_links_alternate_framing")
-
-
-def test_behavior_coverage_promotes_to_moment():
-    """A line with a distinct PHYSICAL beat over it (the speaker holds up an
-    object -> behavior/insert coverage) IS a moment, even by a different subject."""
-    s = hc.HeroCut("z:sp0", "zzzz", "speech", "look at this", 1000, 3000, score=0.7,
-                   speaker="host", affordances=["speech"],
-                   people=[{"person_id": "p1", "on_camera": True}])
-    ins = hc.HeroCut("z:ins0", "zzzz", "insert", "phone screen", 1500, 2800, score=0.5,
-                     affordances=["insert"], people=[{"person_id": "p2", "on_camera": True}])
-    clip = hc._ClipInputs(file_id="zzzzzzzz-3", duration_ms=10000,
-                          dialogue={"topic": [], "sentence": []}, perception={}, motion=None)
-    out = hc._attach_coverage(clip, [s, ins])
-    spine = next(h for h in out if h.hero_id == "z:sp0")
-    assert spine.is_moment()                       # insert coverage = a real beat
-    print("ok  test_behavior_coverage_promotes_to_moment")
-
-
-def test_coverage_uses_interaction_window():
-    """Two cuts that don't overlap still link when the VLM says they're one
-    interaction (shared interaction_id window) -> coverage across the gap."""
-    a = hc.HeroCut("z:act0", "zzzz", "action", "p1 offers hand", 1000, 2000, score=0.6,
-                   affordances=["action"], people=[{"person_id": "p1", "on_camera": True}])
-    b = hc.HeroCut("z:rea0", "zzzz", "reaction", "p2 shakes", 6000, 7000, score=0.5,
-                   affordances=["reaction"], people=[{"person_id": "p2", "on_camera": True}])
-    perception = {"events": [
-        {"id": "e1", "start_ms": 1000, "end_ms": 2000, "actor": "p1", "interaction_id": "x1"},
-        {"id": "e2", "start_ms": 6000, "end_ms": 7000, "actor": "p2", "interaction_id": "x1"},
-    ]}
-    clip = hc._ClipInputs(file_id="zzzzzzzz-2", duration_ms=10000,
                           dialogue={"topic": [], "sentence": []}, perception=perception, motion=None)
-    out = hc._attach_coverage(clip, [a, b])
-    assert len(out) == 2, out               # both kept (different subjects)
-    spine = next(h for h in out if h.hero_id == "z:act0")   # action spine
-    assert len(spine.coverage) == 1 and spine.coverage[0]["hero_id"] == "z:rea0"
-    print("ok  test_coverage_uses_interaction_window")
+    out = hc._annotate_moments(clip, [s, r])
+    assert len(out) == 2, [(h.hero_id, h.modality) for h in out]    # nothing dropped
+    assert s.moment_id is not None and s.moment_id == r.moment_id    # one cluster
+    # directional edge recorded on both ends
+    assert any(e["type"] == "responds_to" and e["dir"] == "out" and e["other"] == "z:sp0"
+               for e in r.relations), r.relations
+    assert any(e["type"] == "responds_to" and e["dir"] == "in" and e["other"] == "z:rea0"
+               for e in s.relations), s.relations
+    assert s.is_moment() and r.is_moment()
+    print("ok  test_relation_links_reaction_to_line")
+
+
+def test_relation_take_of_does_not_form_moment():
+    """A `take_of` edge (two deliveries of the same line) is recorded as an edge
+    but does NOT bundle the cuts into a moment -- alternates are one slot."""
+    a = hc.HeroCut("z:sp0", "zzzz", "speech", "take one", 1000, 3000, score=0.7,
+                   speaker="host", affordances=["speech"])
+    b = hc.HeroCut("z:sp1", "zzzz", "speech", "take two", 9000, 11000, score=0.6,
+                   speaker="host", affordances=["speech"])
+    perception = {
+        "content_units": [
+            {"unit_id": "u1", "start_ms": 1000, "end_ms": 3000, "kind": "speech"},
+            {"unit_id": "u2", "start_ms": 9000, "end_ms": 11000, "kind": "speech"},
+        ],
+        "relations": [{"type": "take_of", "from_id": "u1", "to_id": "u2"}],
+    }
+    clip = hc._ClipInputs(file_id="zzzzzzzz-4", duration_ms=20000,
+                          dialogue={"topic": [], "sentence": []}, perception=perception, motion=None)
+    out = hc._annotate_moments(clip, [a, b])
+    assert len(out) == 2
+    assert a.relations and a.relations[0]["type"] == "take_of"     # edge recorded
+    assert a.moment_id is None and b.moment_id is None             # but no cluster
+    print("ok  test_relation_take_of_does_not_form_moment")
+
+
+def test_no_relations_no_moments():
+    """With no relation graph (old cache / independent lines) nothing is a moment
+    -- the flat default. A podcast of plain lines yields zero clusters."""
+    a = hc.HeroCut("z:sp0", "zzzz", "speech", "line a", 1000, 3000, score=0.7, speaker="host")
+    b = hc.HeroCut("z:sp1", "zzzz", "speech", "line b", 9000, 11000, score=0.6, speaker="host")
+    clip = hc._ClipInputs(file_id="zzzzzzzz-5", duration_ms=20000,
+                          dialogue={"topic": [], "sentence": []}, perception={}, motion=None)
+    out = hc._annotate_moments(clip, [a, b])
+    assert len(out) == 2 and a.moment_id is None and b.moment_id is None
+    assert not a.is_moment()
+    print("ok  test_no_relations_no_moments")
+
+
+def test_relation_illustrates_chains_into_one_moment():
+    """A line, its reaction, and the b-roll that illustrates it chain (via
+    moment-forming edges) into ONE connected cluster -- a rich reel moment."""
+    sp = hc.HeroCut("z:sp0", "zzzz", "speech", "look at this view", 1000, 3000, score=0.7,
+                    speaker="host", affordances=["speech"])
+    rea = hc.HeroCut("z:rea0", "zzzz", "reaction", "p2 gasps", 2500, 3500, score=0.5,
+                     affordances=["reaction"])
+    bro = hc.HeroCut("z:bro0", "zzzz", "broll", "the mountain", 1200, 2800, score=0.5,
+                     affordances=["broll"])
+    perception = {
+        "content_units": [{"unit_id": "u1", "start_ms": 1000, "end_ms": 3000, "kind": "speech"}],
+        "reactions": [{"id": "rx1", "start_ms": 2500, "end_ms": 3500, "subject": "p2"}],
+        "cutaways": [{"id": "cx1", "start_ms": 1200, "end_ms": 2800, "kind": "broll_hold",
+                      "affordance": "broll", "label": "mountain"}],
+        "relations": [
+            {"type": "responds_to", "from_id": "rx1", "to_id": "u1"},
+            {"type": "illustrates", "from_id": "cx1", "to_id": "u1"},
+        ],
+    }
+    clip = hc._ClipInputs(file_id="zzzzzzzz-6", duration_ms=10000,
+                          dialogue={"topic": [], "sentence": []}, perception=perception, motion=None)
+    out = hc._annotate_moments(clip, [sp, rea, bro])
+    assert len(out) == 3
+    mids = {sp.moment_id, rea.moment_id, bro.moment_id}
+    assert len(mids) == 1 and None not in mids, (sp.moment_id, rea.moment_id, bro.moment_id)
+    print("ok  test_relation_illustrates_chains_into_one_moment")
 
 
 def test_behavior_anchors_from_event_timeline():
-    """The VLM event timeline (incidental physical business) now becomes BEHAVIOR
-    anchors -- the thing that was previously dropped entirely."""
+    """The VLM event timeline (incidental physical business) becomes ACTION
+    anchors (kind='behavior') -- the thing that was previously dropped. There is
+    no separate 'behavior' affordance: a coffee sip IS action."""
     perception = {"events": [
         {"id": "e1", "start_ms": 1000, "end_ms": 2500, "actor": "p1",
          "description": "p1 sips coffee"},
@@ -720,8 +733,9 @@ def test_behavior_anchors_from_event_timeline():
          "description": "p1 blinks"},   # too short -> gated out
     ]}
     anchors = hc.anc.gather_anchors(duration_ms=12000, perception=perception, motion=None)
-    beh = [a for a in anchors if a.affordance == hc.anc.AFF_BEHAVIOR]
+    beh = [a for a in anchors if a.kind == "behavior"]
     assert len(beh) == 1, [(a.text, a.start_ms, a.end_ms) for a in beh]
+    assert beh[0].affordance == hc.anc.AFF_ACTION       # folded into action
     assert beh[0].actor == "p1" and "coffee" in beh[0].text
     assert (beh[0].start_ms, beh[0].end_ms) == (1000, 2500)
     print("ok  test_behavior_anchors_from_event_timeline")
@@ -738,7 +752,7 @@ def test_behavior_continuity_grouping():
         {"id": "e5", "start_ms": 20000, "end_ms": 21000, "actor": "p1", "description": "p1 sits"},
     ]}
     anchors = hc.anc.gather_anchors(duration_ms=30000, perception=perception, motion=None)
-    beh = sorted((a for a in anchors if a.affordance == hc.anc.AFF_BEHAVIOR),
+    beh = sorted((a for a in anchors if a.kind == "behavior"),
                  key=lambda a: a.start_ms)
     # p1's three adjacent beats -> one span (1000-4200); p2 separate; p1 late separate.
     assert len(beh) == 3, [(a.actor, a.start_ms, a.end_ms, a.text) for a in beh]
@@ -749,8 +763,9 @@ def test_behavior_continuity_grouping():
     print("ok  test_behavior_continuity_grouping")
 
 
-def test_behavior_surfaces_as_hero_cut():
-    """A behavior anchor flows through the beat engine into a behavior hero cut."""
+def test_behavior_surfaces_as_action_cut():
+    """A behavior anchor flows through the beat engine into an ACTION hero cut
+    (the closed vocabulary -- behavior is not its own bucket)."""
     clip = _clip_multi()
     clip.perception["events"] = [
         {"id": "e1", "start_ms": 4000, "end_ms": 5500, "actor": "p1",
@@ -760,11 +775,10 @@ def test_behavior_surfaces_as_hero_cut():
     anchors = hc.anc.gather_anchors(duration_ms=clip.duration_ms, dialogue=clip.dialogue,
                                     perception=clip.perception, motion=clip.motion)
     beats = hc._beat_segments(clip, field, hc.energy_to_params(0.5), anchors)
-    beh = [b for b in beats if b.modality == hc.anc.AFF_BEHAVIOR]
-    assert beh, [b.modality for b in beats]
-    assert beh[0].affordances == [hc.anc.AFF_BEHAVIOR]
-    assert "gestures" in beh[0].label
-    print("ok  test_behavior_surfaces_as_hero_cut")
+    gestures = [b for b in beats if b.modality == hc.anc.AFF_ACTION and "gestures" in b.label]
+    assert gestures, [(b.modality, b.label) for b in beats]
+    assert gestures[0].affordances == [hc.anc.AFF_ACTION]
+    print("ok  test_behavior_surfaces_as_action_cut")
 
 
 def test_listening_anchor_from_speaking_inverse():
@@ -851,14 +865,14 @@ def test_facet_record_round_trips():
 def main():
     test_behavior_anchors_from_event_timeline()
     test_behavior_continuity_grouping()
-    test_behavior_surfaces_as_hero_cut()
+    test_behavior_surfaces_as_action_cut()
     test_listening_anchor_from_speaking_inverse()
     test_listening_deduped_against_logged_reaction()
     test_facet_record_round_trips()
-    test_coverage_folds_same_subject_companion()
-    test_coverage_links_alternate_framing()
-    test_behavior_coverage_promotes_to_moment()
-    test_coverage_uses_interaction_window()
+    test_relation_links_reaction_to_line()
+    test_relation_take_of_does_not_form_moment()
+    test_no_relations_no_moments()
+    test_relation_illustrates_chains_into_one_moment()
     test_speech_cut_owns_ladder_and_resolves_speaker()
     test_offcamera_speech_flagged_not_dropped()
     test_speech_drops_offcamera_and_short()

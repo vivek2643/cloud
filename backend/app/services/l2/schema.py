@@ -30,6 +30,8 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.services.l3 import vocab
+
 
 def _to_unit(v):
     """Coerce a model-supplied score into 0..1.
@@ -52,7 +54,17 @@ def _to_unit(v):
 # v2 adds coarse spatial framing signals (subject `region`s + clip
 # `frame_orientation`) used by the editor's auto-reframe/crop. Older v1 rows
 # simply lack them and fall back to centered framing.
-SCHEMA_VERSION = 3
+# v4 adds the typed relation graph (`relations`) plus node-level intent
+# (`role`) and grounding (`topic`/`entity`) on the cut-bearing tracks, and gives
+# `reactions`/`cutaways` stable local ids so they can be relation endpoints.
+SCHEMA_VERSION = 4
+
+
+# The editing vocabulary (vocab.py) is the single source of truth. Render the
+# closed relation/role sets as enums so they constrain the model's JSON and
+# self-document in the prompt schema, without re-typing the strings here.
+RelationType = Enum("RelationType", [(r, r) for r in vocab.RELATIONS], type=str)
+Role = Enum("Role", [(r, r) for r in vocab.ROLES], type=str)
 
 
 # --------------------------------------------------------------------------
@@ -358,6 +370,7 @@ class Event(BaseModel):
     region: Optional[Region] = Field(
         None, description="where in the frame this beat happens (coarse box); used to reframe onto the action"
     )
+    role: Optional[Role] = Field(None, description="narrative intent of this beat, when clear (e.g. 'establishing', 'climax')")
 
 
 class Interaction(BaseModel):
@@ -370,12 +383,14 @@ class Interaction(BaseModel):
 
 
 class Reaction(BaseModel):
+    id: Optional[str] = Field(None, description="clip-local id ('rx1', ...) so a relation can point at this reaction")
     start_ms: int
     end_ms: int
     subject: str = Field(description="person local_id reacting")
     type: Optional[ReactionType] = None
     intensity: Optional[float] = Field(None, description="0..1")
     trigger: Optional[str] = Field(None, description="what prompted it, e.g. 'p2's joke', 'the reveal'")
+    role: Optional[Role] = Field(None, description="narrative intent of this beat, when clear (e.g. 'listener', 'climax')")
 
     @field_validator("intensity", mode="before")
     @classmethod
@@ -450,6 +465,7 @@ class CutawayKind(str, Enum):
 
 class CutawayMoment(BaseModel):
     """One overlay moment an editor would cut TO -- not every visible change."""
+    id: Optional[str] = Field(None, description="clip-local id ('cx1', ...) so a relation can point at this cutaway")
     start_ms: int
     end_ms: int
     kind: CutawayKind
@@ -462,6 +478,9 @@ class CutawayMoment(BaseModel):
         None,
         description="e.g. listener_reaction, establishing, product_reveal",
     )
+    role: Optional[Role] = Field(None, description="narrative intent of this beat, when clear (e.g. 'establishing', 'cta')")
+    topic: Optional[str] = Field(None, description="the subject/topic this beat is about, for grounding 'illustrates' links")
+    entity: Optional[str] = Field(None, description="the concrete thing shown (a noun: 'coffee cup', 'logo', 'mountain')")
     salience_hint: Optional[float] = Field(
         None, description="how cut-worthy (higher = stronger), 0..1"
     )
@@ -508,6 +527,9 @@ class ContentUnit(BaseModel):
         ),
     )
     label: Optional[str] = Field(None, description="short human-facing label")
+    role: Optional[Role] = Field(None, description="narrative intent of this unit, when clear (e.g. 'hook', 'answer', 'cta')")
+    topic: Optional[str] = Field(None, description="the subject/topic this unit is about, for grouping and 'illustrates' links")
+    entity: Optional[str] = Field(None, description="the concrete thing/person this unit centers on, when there is a clear one")
 
 
 class QualityDimension(str, Enum):
@@ -549,6 +571,33 @@ class RestartMarker(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# Typed relation graph (how the logged beats connect)
+# --------------------------------------------------------------------------
+
+class Relation(BaseModel):
+    """One typed edge between two logged beats. Endpoints reference any id you
+    emitted: an event `id`, a `content_units` unit_id, a `cutaways` id, or a
+    `reactions` id. This is how downstream editing reasons about real
+    relationships (a reaction to a line, b-roll that illustrates a topic, a
+    setup that leads into a payoff) instead of guessing from time overlap.
+
+    Directed edges read from_id -> to_id:
+      * responds_to  : reaction/answer  ->  the line or action that triggered it
+      * illustrates  : a visual/insert  ->  the topic/line/noun it shows
+      * leads_into   : a setup/windup   ->  its payoff/impact
+      * answers      : an answer line   ->  the question it answers
+      * continues    : a beat           ->  the next beat in the same scene
+    Symmetric edges (order carries no meaning):
+      * take_of      : two deliveries of the SAME content (place at most one)
+      * same_instant : two simultaneous coverages/angles of one beat
+    """
+    type: RelationType
+    from_id: str = Field(description="id this edge points FROM (event/unit/cutaway/reaction id)")
+    to_id: str = Field(description="id this edge points TO")
+    note: Optional[str] = Field(None, description="optional short reason, e.g. 'laughs at the punchline'")
+
+
+# --------------------------------------------------------------------------
 # Root artifact
 # --------------------------------------------------------------------------
 
@@ -585,5 +634,9 @@ class ClipPerception(BaseModel):
     content_units: List[ContentUnit] = Field(default_factory=list)
     take_quality_events: List[TakeQualityEvent] = Field(default_factory=list)
     restart_markers: List[RestartMarker] = Field(default_factory=list)
+
+    # Typed graph over the logged beats (events / units / cutaways / reactions).
+    # Empty when nothing connects (a single static b-roll clip).
+    relations: List[Relation] = Field(default_factory=list)
 
     notes: Optional[str] = Field(None, description="caveats, low-confidence calls, anything ambiguous")

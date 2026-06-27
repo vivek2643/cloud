@@ -29,14 +29,19 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from app.services.l3 import vocab
+
 # Affordance buckets (what an editor reaches for). Modality in the feed is just
 # the dominant affordance of a segment -- these are filters, not pipelines.
-AFF_SPEECH = "speech"      # a spoken line / answer (sync)
-AFF_ACTION = "action"      # a physical action beat / impact (sync)
-AFF_BEHAVIOR = "behavior"  # incidental on-camera physical business (event timeline)
-AFF_REACTION = "reaction"  # a facial reaction / expression (overlay cutaway)
-AFF_BROLL = "broll"        # a held, stable composition (overlay)
-AFF_INSERT = "insert"      # a beat worth an insert: reveal/entrance/graphic (overlay)
+# The closed set lives in vocab.py (single source of truth); we alias the names
+# here so the rest of this module reads naturally. There is NO separate
+# "behavior" or "listening" affordance: incidental physical business IS action,
+# held attention IS a reaction (distinguished by a `kind`/flag, not a bucket).
+AFF_SPEECH = vocab.AFF_SPEECH      # a spoken line / answer (sync)
+AFF_ACTION = vocab.AFF_ACTION      # see something done/happen (incl. incidental business)
+AFF_REACTION = vocab.AFF_REACTION  # see someone respond/attend (incl. listening)
+AFF_BROLL = vocab.AFF_BROLL        # see a place/thing/texture (held composition)
+AFF_INSERT = vocab.AFF_INSERT      # register a reveal/entrance/graphic
 
 # Hidden-by-default dialogue lexicon flags (off-camera audio).
 _OFFCAMERA_FLAGS = ("offscreen", "production_cue")
@@ -213,8 +218,9 @@ def _action_anchors(perception: dict, motion: dict, quality: List[dict]) -> List
 # "p1 leans in"). These are NOT speech (no line) and NOT the sustained
 # performance the action content_units capture -- they're the on-camera subject's
 # physical business. They were previously DROPPED (events never became cuts). We
-# promote them to their own affordance so a coffee sip / a lean-in / an emphatic
-# gesture becomes a cuttable shot. Because the VLM emits events sequentially (they
+# promote them into the ACTION affordance (kept distinct only by kind="behavior")
+# so a coffee sip / a lean-in / an emphatic gesture becomes a cuttable action
+# shot -- not a separate bucket. Because the VLM emits events sequentially (they
 # never overlap), consecutive same-actor beats are stitched into ONE continuous
 # behavior (walk -> open -> step out) -- the deterministic continuity grouping
 # that replaces a fragile per-event before/after flag.
@@ -273,7 +279,7 @@ def _behavior_anchors(perception: dict, motion: dict) -> List[Anchor]:
         sal = _clamp01(0.45 + 0.55 * mo)
         out.append(Anchor(
             ts_ms=(a + b) // 2, start_ms=a, end_ms=b, kind="behavior",
-            affordance=AFF_BEHAVIOR, salience=sal, actor=ev.get("actor"),
+            affordance=AFF_ACTION, salience=sal, actor=ev.get("actor"),
             region=ev.get("region"), text=ev.get("description") or "behavior",
             source_id=str(ev.get("id", "")),
         ))

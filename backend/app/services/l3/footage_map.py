@@ -48,7 +48,11 @@ logger = logging.getLogger(__name__)
 # line / the beat), tagged with every affordance it serves and carrying COVERAGE
 # (alternate framings of the same instant). The default placement span is the
 # spine's own span; coverage is optional extra angles the brain can reach for.
-TREE_VERSION = 4
+# v5: FLAT candidates + typed edges. Each cut is an independent moment carrying
+# its OUTGOING `relations` (typed, directional) to other moments and a
+# `cluster_id` for the connected bundle it belongs to. No forced default
+# arrangement -- the brain reads the graph and decides.
+TREE_VERSION = 5
 
 # Band index -> energy-level name. Band 2 (energy 0.5) is the anchor: one
 # complete thought per cut. Lower = wider (whole answer), higher = tighter.
@@ -133,7 +137,12 @@ def build_clip_tree(
     """
     fid8 = file_id[:8]
     moments: List[Dict[str, Any]] = []
-    for idx, cut in enumerate(sorted(cuts, key=_in)):
+    ordered = sorted(cuts, key=_in)
+    # Map each cut's hero_id to the tree-local moment id so relation endpoints
+    # (which reference other cuts by hero_id) can be expressed in the same id
+    # space the brain reads in the index.
+    hero_to_mid = {c.get("hero_id"): f"{fid8}:m{i:02d}" for i, c in enumerate(ordered)}
+    for idx, cut in enumerate(ordered):
         hero_id = cut.get("hero_id")
         variants: Dict[str, Dict[str, Any]] = {}
         for rung in (cut.get("ladder") or []):
@@ -160,10 +169,19 @@ def build_clip_tree(
             "people": cut.get("people") or [],
             "framing": cut.get("framing"),
             "quality": cut.get("quality"),
-            # Alternate framings of this same instant (listener reaction, wide
-            # angle, insert) carried by other cuts -- optional extra coverage the
-            # arranger can lay over the spine; the default span stays the spine's.
-            "coverage": cut.get("coverage") or [],
+            # Typed edges to OTHER moments (responds_to / illustrates / ...),
+            # expressed in tree moment-id space. Flat candidates + edges: the
+            # brain reads real connections, with NO forced default arrangement.
+            "relations": [
+                {"type": r.get("type"), "dir": r.get("dir"),
+                 "other": hero_to_mid.get(r.get("other")), "note": r.get("note")}
+                for r in (cut.get("relations") or [])
+                if hero_to_mid.get(r.get("other"))
+            ],
+            # The connected-cluster id this cut shares with the cuts it forms a
+            # moment with (a line + its reaction + illustrating b-roll). None for
+            # a standalone cut. The "Moments" view groups by this.
+            "cluster_id": cut.get("moment_id"),
             "variants": variants,
             "atoms": [],
         })
@@ -316,14 +334,27 @@ def _people_tag(m: Dict[str, Any]) -> str:
     return ""
 
 
-def _coverage_tag(m: Dict[str, Any]) -> str:
-    """Compact note that alternate framings of this instant exist (a listener
-    reaction, a wide angle) -- the brain can lay one over the spine if it wants."""
-    cov = m.get("coverage") or []
-    if not cov:
-        return ""
-    affs = sorted({(c.get("affordance") or "") for c in cov if c.get("affordance")})
-    return f" · cover:{','.join(a for a in affs if a)}"
+def _relation_tag(m: Dict[str, Any]) -> str:
+    """Compact view of this cut's OUTGOING typed edges + its moment cluster, so
+    the brain sees real connections (a reaction -> the line it answers, b-roll ->
+    the topic it shows) instead of guessing from adjacency. Incoming edges are
+    omitted here -- they show as outgoing on the other moment's line."""
+    out = []
+    seen = set()
+    for r in (m.get("relations") or []):
+        if r.get("dir") != "out" or not r.get("other"):
+            continue
+        key = (r.get("type"), r.get("other"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(f"{r.get('type')}>{str(r['other']).split(':')[-1]}")
+    tag = ""
+    if m.get("cluster_id"):
+        tag += f" · moment:{str(m['cluster_id']).split(':')[-1]}"
+    if out:
+        tag += " · rel:" + ",".join(out)
+    return tag
 
 
 def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
@@ -342,7 +373,7 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     return (f"  {m['moment_id'].split(':')[-1]} {_affordance_tag(m)}{spk}{cam} "
             f".{int(round(m['score'] * 100)):02d} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])}] "
-            f"\"{gist}\" · nrg:{nrg}{dup}{_coverage_tag(m)}")
+            f"\"{gist}\" · nrg:{nrg}{dup}{_relation_tag(m)}")
 
 
 def _clip_block(tree: Dict[str, Any], *, compact: bool = False) -> str:

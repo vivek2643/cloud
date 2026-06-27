@@ -48,6 +48,7 @@ from app.config import get_settings
 from app.services.l1 import fused_seams as fseams
 from app.services.l3 import anchors as anc
 from app.services.l3 import cast as cst
+from app.services.l3 import vocab
 from app.services.l3 import score_span as ss
 from app.services.l3 import territory as terr
 from app.services.l3.energy import EnergyParams, energy_to_params
@@ -74,7 +75,11 @@ _MERGE_LEN_RATIO = 0.7
 # grouped; held listening shots synthesized from the speaking-turn inverse) and
 # new REPRESENTATION (the synthetic "moment" entity is retired -- a cut carries
 # every affordance it serves and links alternate framings as `coverage`).
-PARAMS_VERSION = 5
+# v6: closed 5-affordance vocabulary (behavior->action, listening->reaction; see
+# vocab.py). FLAT model -- the spine/fold/coverage hierarchy is gone; every cut
+# is first-class. Connections come from the VLM's TYPED relation graph mapped
+# onto cuts (`relations`); a "moment" is a connected cluster (`moment_id`).
+PARAMS_VERSION = 6
 
 # The five canonical product energy LEVELS = the band centers (Broad .. Sharp).
 # Hero cuts are precomputed at exactly these after L2; any requested energy
@@ -120,17 +125,9 @@ _OFFCAMERA_FLAGS = ("offscreen", "production_cue")
 _AFFORDANCE_WEIGHT = {
     anc.AFF_SPEECH: 1.00,
     anc.AFF_ACTION: 1.00,
-    anc.AFF_BEHAVIOR: 0.74,
-    anc.AFF_REACTION: 0.82,
+    anc.AFF_REACTION: 0.88,   # reactions are first-class story beats, not filler
     anc.AFF_BROLL: 0.72,
     anc.AFF_INSERT: 0.70,
-}
-# Coverage affordances that make a line a real MOMENT (a visible/physical beat
-# happens during it). Reaction coverage (listening, ambient audio) is the passive
-# texture of a conversation and deliberately NOT here, so it never promotes a
-# plain line to a moment.
-_MOMENT_COVERAGE_AFFS = {
-    anc.AFF_ACTION, anc.AFF_BEHAVIOR, anc.AFF_BROLL, anc.AFF_INSERT,
 }
 
 # A beat segment needs at least this salience to be worth surfacing as a card
@@ -243,28 +240,25 @@ class HeroCut:
     framing: Optional[dict] = None
     # Quality facet: {delivery, vlm, ...} -- deterministic + subjective scores.
     quality: Optional[dict] = None
-    # Coverage: alternate FRAMINGS of this same instant carried by OTHER cuts (a
-    # cutaway to the listener over the line, a wider angle, the reaction). Each is
-    # a light ref {hero_id, file_id, affordance, label, src_in_ms, src_out_ms,
-    # score} -- the other cut stays its own card (for its tab); this just records
-    # that they cover one moment. A cut with coverage (or >1 affordance) IS a
-    # "moment" -- the Moments tab is that view, not a duplicate card.
-    coverage: List[dict] = field(default_factory=list)
+    # Typed relation edges that touch this cut, mapped from the VLM relation
+    # graph onto the built cuts. Each is {type, dir: 'out'|'in', other: hero_id,
+    # note} where `type` is a vocab relation. The cut stays a first-class card on
+    # its own tab; this is just how it CONNECTS to other cuts (a reaction
+    # responds_to a line, b-roll illustrates a topic). Flat model -- nothing is
+    # folded or dropped.
+    relations: List[dict] = field(default_factory=list)
+    # The connected-cluster this cut belongs to, when it is linked to other cuts
+    # by a moment-forming relation. None for a standalone cut. The "Moments" view
+    # is just the set of clusters -- a moment is a BUNDLE of first-class cuts, not
+    # a separate entity. A podcast (mostly independent lines) yields few moments;
+    # a reel (reaction <- line <- b-roll chains) yields rich ones.
+    moment_id: Optional[str] = None
 
     def is_moment(self) -> bool:
-        """A real MOMENT: more than a plain talking head / single beat. Either the
-        cut's OWN footage serves >1 affordance (the speaker gestures / demonstrates
-        while talking -> speech+behavior), OR it has coverage that is a distinct
-        PHYSICAL/VISUAL beat (an action, behavior, b-roll, or insert).
-
-        Passive coverage -- a listener simply LISTENING, an ambient non-speech
-        sound -- is the baseline texture of a conversation, not a moment, so a
-        reaction-only overlap never promotes a line. This is why a podcast yields
-        FEW moments (only the lines where something is actually done/shown) while a
-        reel's action beats stay moments."""
-        if len(set(self.affordances or [self.modality])) > 1:
-            return True
-        return any(c.get("affordance") in _MOMENT_COVERAGE_AFFS for c in self.coverage)
+        """True when this cut is part of a multi-cut moment cluster (it has a
+        moment_id), i.e. the VLM stated a real relationship between it and other
+        cuts. A lone talking-head line with no relations is not a moment."""
+        return self.moment_id is not None
 
     def play_ms(self) -> int:
         """On-screen duration once breaths are excised (kept spans only)."""
@@ -296,7 +290,8 @@ class HeroCut:
             "people": self.people or None,
             "framing": self.framing,
             "quality": self.quality,
-            "coverage": self.coverage or None,
+            "relations": self.relations or None,
+            "moment_id": self.moment_id,
             "is_moment": self.is_moment(),
         }
 
@@ -322,7 +317,8 @@ class HeroCut:
             people=list(d.get("people") or []),
             framing=d.get("framing"),
             quality=d.get("quality"),
-            coverage=list(d.get("coverage") or []),
+            relations=list(d.get("relations") or []),
+            moment_id=d.get("moment_id"),
         )
 
 
@@ -1064,160 +1060,111 @@ def _reconcile_selected_rung(
             return
 
 
-def _interaction_windows(perception: Optional[dict]) -> List[Tuple[int, int]]:
-    """Union span per VLM ``interaction_id`` -- the model's own statement that a
-    set of per-actor events is ONE shared moment (a handshake, a reaction to a
-    line). The cohesion signal that replaces blind time-gap pairing."""
-    by_id: Dict[str, Tuple[int, int]] = {}
-    for e in (perception or {}).get("events") or []:
-        iid = e.get("interaction_id")
-        if not iid:
+def _l2_id_spans(perception: Optional[dict]) -> Dict[str, Tuple[int, int]]:
+    """Index every addressable L2 beat by its local id -> (start_ms, end_ms), so
+    the VLM relation graph (which references those ids) can be mapped onto the
+    built cuts purely by time. Covers events, content_units, cutaways, reactions
+    -- the four id-bearing tracks a relation endpoint can name."""
+    spans: Dict[str, Tuple[int, int]] = {}
+
+    def put(_id, a, b):
+        if _id and int(b) > int(a):
+            spans[str(_id)] = (int(a), int(b))
+
+    p = perception or {}
+    for e in p.get("events") or []:
+        put(e.get("id"), e.get("start_ms", 0), e.get("end_ms", 0))
+    for u in p.get("content_units") or []:
+        put(u.get("unit_id"), u.get("start_ms", 0), u.get("end_ms", 0))
+    for c in p.get("cutaways") or []:
+        put(c.get("id"), c.get("start_ms", 0), c.get("end_ms", 0))
+    for r in p.get("reactions") or []:
+        put(r.get("id"), r.get("start_ms", 0), r.get("end_ms", 0))
+    return spans
+
+
+def _cut_for_span(cuts: List[HeroCut], a: int, b: int) -> Optional[HeroCut]:
+    """The built cut that best CORRESPONDS to the L2 span [a, b], by intersection
+    over union -- so a tight b-roll cut wins its own cutaway over a long speech
+    cut that merely contains it (raw overlap would tie and pick by order)."""
+    best, best_iou = None, 0.0
+    for h in cuts:
+        inter = _overlap_ms(h.src_in_ms, h.src_out_ms, a, b)
+        if inter <= 0:
             continue
-        a, b = int(e.get("start_ms", 0)), int(e.get("end_ms", 0))
-        if b <= a:
-            continue
-        cur = by_id.get(iid)
-        by_id[iid] = (min(cur[0], a), max(cur[1], b)) if cur else (a, b)
-    return list(by_id.values())
+        union = max(h.src_out_ms, b) - min(h.src_in_ms, a)
+        iou = inter / union if union > 0 else 0.0
+        if iou > best_iou:
+            best, best_iou = h, iou
+    return best
 
 
-# Editorial priority for the SPINE of an instant (the cut a moment is "about").
-# Speech anchors a moment when present; otherwise the strongest physical beat.
-_SPINE_PRIORITY = {
-    anc.AFF_SPEECH: 0, anc.AFF_ACTION: 1, anc.AFF_BEHAVIOR: 2,
-    anc.AFF_REACTION: 3, anc.AFF_BROLL: 4, anc.AFF_INSERT: 5,
-}
-# Affordances that are the SAME shot of the spine's own subject when they coincide
-# -- a speaker who gestures / demonstrates while delivering is ONE cut tagged with
-# both uses, never a duplicate card. Overlay framings (reaction/broll/insert) are
-# a DIFFERENT shot -> attached as coverage, kept as their own card.
-_COMPANION_AFFS = {anc.AFF_ACTION, anc.AFF_BEHAVIOR}
+def _annotate_moments(clip: _ClipInputs, cuts: List[HeroCut]) -> List[HeroCut]:
+    """Wire the VLM's typed relation graph onto the built cuts -- the flat model
+    that replaces the old spine/fold/coverage hierarchy.
 
+    Every cut stays a FIRST-CLASS card: nothing is dropped or folded. We resolve
+    each L2 relation's endpoints (event/unit/cutaway/reaction ids) to the cut
+    that best covers them in time, then:
+      * record the typed edge on BOTH cuts (directional: 'out' on the source,
+        'in' on the target) so the brain reads real connections, not time guesses;
+      * union cuts joined by a MOMENT-forming relation (responds_to / illustrates
+        / leads_into / same_instant / answers) into a connected cluster and stamp
+        each member with a shared ``moment_id``.
+    A 'moment' is therefore just a connected bundle of independent cuts (a line +
+    its reaction + the b-roll that illustrates it). ``take_of`` edges are recorded
+    but do NOT form a moment -- alternates are one slot, handled by take-stacking.
+    Degrades to a no-op when the perception predates the relation schema."""
+    rels = (clip.perception or {}).get("relations") or []
+    if not rels or len(cuts) < 2:
+        return cuts
+    spans = _l2_id_spans(clip.perception)
+    by_id = {c.hero_id: c for c in cuts}
 
-def _primary_person(h: HeroCut) -> Optional[str]:
-    """The person_id this cut is OF (for same-shot detection)."""
-    for p in (h.people or []):
-        pid = p.get("person_id")
-        if pid:
-            return pid
-    return None
+    # Union-find over moment-forming edges.
+    parent = {c.hero_id: c.hero_id for c in cuts}
 
-
-def _spine_of(group: List[HeroCut]) -> HeroCut:
-    """The cut an instant is 'about': by editorial priority, then score."""
-    return min(group, key=lambda c: (_SPINE_PRIORITY.get(c.modality, 9), -c.score))
-
-
-def _coverage_ref(c: HeroCut) -> dict:
-    return {
-        "hero_id": c.hero_id, "file_id": c.file_id, "affordance": c.modality,
-        "label": c.label, "src_in_ms": c.src_in_ms, "src_out_ms": c.src_out_ms,
-        "score": round(c.score, 3),
-    }
-
-
-def _fold_or_cover(spine: HeroCut, c: HeroCut, folded: set) -> None:
-    """Attach companion/overlay cut ``c`` to its ``spine``: a same-subject sync
-    companion (the speaker gesturing while they talk) FOLDS in (its affordance
-    joins the spine, its duplicate card is dropped); any other framing is added
-    as coverage (kept as its own card, cross-linked)."""
-    spine_pid = _primary_person(spine) or spine.speaker
-    same_subject = bool(spine_pid) and (_primary_person(c) or c.speaker) == spine_pid
-    if c.modality in _COMPANION_AFFS and same_subject:
-        spine.affordances = sorted(set(spine.affordances or [spine.modality])
-                                   | set(c.affordances or [c.modality]))
-        folded.add(c.hero_id)
-    elif c.hero_id not in {r["hero_id"] for r in spine.coverage}:
-        spine.coverage = sorted(spine.coverage + [_coverage_ref(c)],
-                                key=lambda r: r["src_in_ms"])
-
-
-def _cluster_by_cohesion(clip: _ClipInputs, cuts: List[HeroCut]) -> List[List[HeroCut]]:
-    """Union cuts that share an instant: time-overlap OR one VLM interaction
-    window. Used only for the leftover (no-speech) beats, so there is no speech
-    spine to chain through."""
-    n = len(cuts)
-    parent = list(range(n))
-
-    def find(x: int) -> int:
+    def find(x: str) -> str:
         while parent[x] != x:
             parent[x] = parent[parent[x]]
             x = parent[x]
         return x
 
-    def union(a: int, b: int) -> None:
+    def union(a: str, b: str) -> None:
         ra, rb = find(a), find(b)
         if ra != rb:
             parent[rb] = ra
 
-    for i in range(n):
-        for j in range(i + 1, n):
-            if _overlap_ms(cuts[i].src_in_ms, cuts[i].src_out_ms,
-                           cuts[j].src_in_ms, cuts[j].src_out_ms) > 0:
-                union(i, j)
-    for w in _interaction_windows(clip.perception):
-        idxs = [k for k in range(n)
-                if _overlap_ms(cuts[k].src_in_ms, cuts[k].src_out_ms, w[0], w[1]) > 0]
-        for k in idxs[1:]:
-            union(idxs[0], k)
-    clusters: Dict[int, List[HeroCut]] = {}
-    for k in range(n):
-        clusters.setdefault(find(k), []).append(cuts[k])
-    return list(clusters.values())
+    for r in rels:
+        t = (r.get("type") or "").lower()
+        if t not in vocab.RELATION_SET:
+            continue
+        fa = spans.get(str(r.get("from_id")))
+        ta = spans.get(str(r.get("to_id")))
+        if not fa or not ta:
+            continue
+        fc = _cut_for_span(cuts, *fa)
+        tc = _cut_for_span(cuts, *ta)
+        if fc is None or tc is None or fc.hero_id == tc.hero_id:
+            continue
+        note = (r.get("note") or "").strip() or None
+        fc.relations.append({"type": t, "dir": "out", "other": tc.hero_id, "note": note})
+        tc.relations.append({"type": t, "dir": "in", "other": fc.hero_id, "note": note})
+        if t in vocab.MOMENT_RELATIONS:
+            union(fc.hero_id, tc.hero_id)
 
-
-def _attach_coverage(clip: _ClipInputs, cuts: List[HeroCut]) -> List[HeroCut]:
-    """Turn co-occurring cuts into ONE rich record per instant -- the model that
-    replaces the synthetic 'moment' card.
-
-    SPINE-centric so sequential lines never chain: every SPEECH cut is its own
-    spine, and each non-speech beat attaches to the SINGLE speech spine it
-    overlaps most (or that a VLM interaction window links it to). A same-subject
-    companion (the speaker gesturing / demonstrating as they talk) FOLDS into the
-    spine -- its affordance joins, its duplicate card is dropped. Any other
-    framing (a listener reaction, a wide b-roll, an insert) attaches as COVERAGE:
-    it keeps its own card (still serving the Reactions / B-roll tab) but is
-    cross-linked, and the spine becomes a multi-affordance 'moment'. Beats with
-    no speech spine (an action reel) cluster among themselves around the
-    strongest beat. No card ever duplicates the line."""
-    if len(cuts) < 2:
-        return cuts
-    speeches = [c for c in cuts if c.modality == anc.AFF_SPEECH]
-    others = [c for c in cuts if c.modality != anc.AFF_SPEECH]
-    folded: set = set()
-
-    def linked_window(c: HeroCut, s: HeroCut) -> bool:
-        for w in _interaction_windows(clip.perception):
-            if (_overlap_ms(c.src_in_ms, c.src_out_ms, w[0], w[1]) > 0
-                    and _overlap_ms(s.src_in_ms, s.src_out_ms, w[0], w[1]) > 0):
-                return True
-        return False
-
-    leftover: List[HeroCut] = []
-    for c in others:
-        best, best_ov = None, 0
-        for s in speeches:
-            ov = _overlap_ms(c.src_in_ms, c.src_out_ms, s.src_in_ms, s.src_out_ms)
-            if ov > best_ov:
-                best, best_ov = s, ov
-        if best is None:
-            best = next((s for s in speeches if linked_window(c, s)), None)
-        if best is not None:
-            _fold_or_cover(best, c, folded)
-        else:
-            leftover.append(c)
-
-    # Beats with no speech spine -> cluster among themselves (action-reel moments).
-    if len(leftover) > 1:
-        for group in _cluster_by_cohesion(clip, leftover):
-            if len(group) < 2:
-                continue
-            spine = _spine_of(group)
-            for c in group:
-                if c is not spine:
-                    _fold_or_cover(spine, c, folded)
-
-    return [h for h in cuts if h.hero_id not in folded]
+    # Stamp a moment_id on every cut that ended up in a cluster of >1.
+    members: Dict[str, List[str]] = {}
+    for hid in parent:
+        members.setdefault(find(hid), []).append(hid)
+    fid8 = clip.file_id[:8]
+    for i, (root, group) in enumerate(sorted(members.items())):
+        if len(group) < 2:
+            continue
+        mid = f"{fid8}:mo{i:02d}"
+        for hid in group:
+            by_id[hid].moment_id = mid
+    return cuts
 
 
 def _merge_gap_for_aff(params: EnergyParams, aff: str) -> int:
@@ -1226,10 +1173,6 @@ def _merge_gap_for_aff(params: EnergyParams, aff: str) -> int:
     if aff == anc.AFF_REACTION:
         return params.reaction_merge_gap_ms
     if aff == anc.AFF_BROLL:
-        return params.broll_merge_gap_ms
-    if aff == anc.AFF_BEHAVIOR:
-        # Behavior is already continuity-grouped at the anchor layer; the energy
-        # dial may still merge adjacent beats (reuse the b-roll cadence).
         return params.broll_merge_gap_ms
     if aff == anc.AFF_INSERT:
         return 0
@@ -1335,11 +1278,6 @@ def _prep_overlay_group(
                 occ = terr.speech_occupation(a.start_ms, a.end_ms, speaking)
                 if occ >= 0.5 and a.salience < 0.65:
                     continue
-        elif aff == anc.AFF_BEHAVIOR:
-            # Usability gate: a behavior earns a card on the same salience floor as
-            # b-roll (duration + on-camera actor are already enforced at the anchor).
-            if a.salience < params.broll_min_salience:
-                continue
         elif aff == anc.AFF_INSERT:
             if a.salience < params.insert_min_salience:
                 continue
@@ -1690,10 +1628,10 @@ def _stack_takes(heroes: List[HeroCut], file_ids: List[str]) -> List[HeroCut]:
     purpose: it avoids the fuzzy-text over-merging that previously hid dozens of
     distinct sentences behind a single card.
 
-    A multi-affordance speech moment (a line that also carries action/behavior +
-    coverage) take-groups on its SPEECH, exactly like a plain line -- the spine
-    IS a speech cut, so it folds with the other deliveries here. Pure
-    action/visual/reaction heroes carry no groupable text, so they pass through.
+    Take-stacking is orthogonal to the relation graph: a speech cut that is part
+    of a moment cluster still take-groups on its SPEECH here, exactly like a plain
+    line. Pure action/visual/reaction heroes carry no groupable text, so they pass
+    through untouched (their `take_of` relations, if any, stay as edges).
     """
     speech = [h for h in heroes if h.modality == "speech"]
     others = [h for h in heroes if h.modality != "speech"]
@@ -1855,10 +1793,10 @@ def _file_heroes(
     sp = _speech_candidates(clip, source, field, params)
     beats = _beat_segments(clip, field, params, anchors)
     heroes: List[HeroCut] = list(sp) + list(beats)
-    if params.fuse_moments:
-        # One rich record per instant: fold same-subject companion beats into the
-        # spine and cross-link alternate framings as coverage (no duplicate card).
-        heroes = _attach_coverage(clip, heroes)
+    # Flat model: every cut is first-class. We only ANNOTATE connections -- wire
+    # the VLM's typed relation graph onto the cuts and stamp connected bundles
+    # with a shared moment_id. Energy-independent metadata, so it runs always.
+    heroes = _annotate_moments(clip, heroes)
     return heroes
 
 
