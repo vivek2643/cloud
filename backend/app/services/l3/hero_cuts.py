@@ -79,7 +79,10 @@ _MERGE_LEN_RATIO = 0.7
 # vocab.py). FLAT model -- the spine/fold/coverage hierarchy is gone; every cut
 # is first-class. Connections come from the VLM's TYPED relation graph mapped
 # onto cuts (`relations`); a "moment" is a connected cluster (`moment_id`).
-PARAMS_VERSION = 6
+# v7: SYMMETRIC padding -- positive breathing room below the Balanced pivot
+# (now for every affordance, incl. action), the negative core inset only above
+# it; reactions/b-roll/inserts keep their full natural span through Balanced.
+PARAMS_VERSION = 7
 
 # The five canonical product energy LEVELS = the band centers (Broad .. Sharp).
 # Hero cuts are precomputed at exactly these after L2; any requested energy
@@ -1264,9 +1267,12 @@ def _snap_segment(
         in_ms, out_ms = fseams.snap_around_core(
             field, core_in, core_out,
             win_ms=params.snap_window_ms, duration_ms=clip.duration_ms)
-        if aff != anc.AFF_ACTION:
-            in_ms = _pad_safe(field, in_ms, params.pad_in_ms, -1, clip.duration_ms)
-            out_ms = _pad_safe(field, out_ms, params.pad_out_ms, +1, clip.duration_ms)
+        # Symmetric breathing room for EVERY affordance below the Balanced pivot
+        # (pad is 0 at Balanced+, so this only adds air at Broad/Calm). For action
+        # the pad is veto-bounded, so it can only fill calm footage around the
+        # beat -- it stops dead at the next motion impact / camera move.
+        in_ms = _pad_safe(field, in_ms, params.pad_in_ms, -1, clip.duration_ms)
+        out_ms = _pad_safe(field, out_ms, params.pad_out_ms, +1, clip.duration_ms)
         return in_ms, out_ms
     if clip.motion and aff == anc.AFF_ACTION:
         return _snap_action_bounds(clip.motion, core_in, core_out,

@@ -10,7 +10,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.services.l3.energy import (  # noqa: E402
-    energy_to_params, PURE_SENTENCE_ENERGY,
+    energy_to_params, PAD_PIVOT_ENERGY,
     SPEECH_BREATH_HI_MS, SPEECH_BREATH_LO_MS,
 )
 
@@ -62,6 +62,9 @@ def test_tightness_monotonic():
     assert wins == sorted(wins, reverse=True), wins
     assert pads == sorted(pads, reverse=True), pads
     assert energy_to_params(0.0).pad_out_ms > 0
+    # Symmetric pivot: positive padding fades to zero by the Balanced pivot, not
+    # only at full energy (above the pivot the negative core inset takes over).
+    assert energy_to_params(PAD_PIVOT_ENERGY).pad_out_ms == 0
     assert energy_to_params(1.0).pad_out_ms == 0
     assert energy_to_params(1.0).snap_window_ms < energy_to_params(0.0).snap_window_ms
     print("ok  tightness monotonic")
@@ -86,16 +89,20 @@ def test_bands_and_action_modes():
     assert sharp.action_split_at_impact is True
     assert energy_to_params(0.8).action_split_at_impact is True
     assert energy_to_params(0.79).action_split_at_impact is False
-    # Action: smooth merge ramp (Balanced still lightly groups) + impact core
-    # tightens with energy (Broad/Calm = full unit).
+    # Action: smooth merge ramp (Balanced still lightly groups) + impact core.
+    # Symmetric pivot: Broad..Balanced keep the full action (core None); only
+    # Tight/Sharp cap impact-forward.
     assert broad.action_merge_gap_ms > calm.action_merge_gap_ms > balanced.action_merge_gap_ms
     assert balanced.action_merge_gap_ms > 0 and sharp.action_merge_gap_ms == 0
     assert broad.action_core_ms is None and calm.action_core_ms is None
-    assert balanced.action_core_ms > tight.action_core_ms > sharp.action_core_ms > 0
+    assert balanced.action_core_ms is None
+    assert tight.action_core_ms > sharp.action_core_ms > 0
     # Reaction COUNT is energy-independent (flat warrant floor); only the CUT
-    # tightens: Broad keeps the full span, Sharp trims to a punchy core.
+    # tightens: Broad..Balanced keep the full span (a long held / listening
+    # shot), Tight/Sharp trim to a punchy core.
     assert broad.reaction_min_warrant == sharp.reaction_min_warrant
-    assert broad.reaction_core_ms is None and sharp.reaction_core_ms is not None
+    assert broad.reaction_core_ms is None and balanced.reaction_core_ms is None
+    assert sharp.reaction_core_ms is not None
     assert broad.territory_strict and not sharp.territory_strict
     print("ok  bands and action modes")
 

@@ -41,7 +41,13 @@ _SPEECH_MERGE_MS = (4000, 0, 0, 0, 0)
 SPEECH_BREATH_HI_MS = 700      # at Sharp onset (0.8): only long pauses go
 SPEECH_BREATH_LO_MS = 220      # at max energy (1.0): tight, snappy jump-cuts
 
-PURE_SENTENCE_ENERGY = 0.8     # padding fades to zero by here (kept for tightness)
+# Padding is SYMMETRIC around the Balanced pivot (band 2): below it the cut is
+# extended outward (positive padding = breathing room); at Balanced it sits on
+# its natural span (pad 0); above it the core inset trims inward toward the peak
+# (negative padding). So `pad_factor` ramps 1 -> 0 from energy 0 up to Balanced
+# and the per-affordance `*_core_ms` tuples only bite at Tight/Sharp -- the two
+# halves of one signed ladder, never overlapping.
+PAD_PIVOT_ENERGY = 0.6         # = BAND_EDGES[2]; positive padding fades to zero here
 
 SNAP_WINDOW_LOOSE_MS = 1300
 SNAP_WINDOW_TIGHT_MS = 350
@@ -59,9 +65,11 @@ _ACTION_MERGE = (2500, 1500, 800, 0, 0)
 # unit | onset | impact
 _ACTION_ANCHOR = ("unit", "unit", "onset", "impact", "impact")
 # Target handle length per band, inset around the IMPACT at cut time (negative
-# padding, impact-forward via lead_frac=0). Broad/Calm = None = full unit extent;
-# performances are exempt (a song/dance keeps its full duration).
-_ACTION_CORE_MS = (None, None, 3500, 2500, 1800)
+# padding, impact-forward via lead_frac=0). Broad..Balanced = None = the full
+# action (Broad/Calm keep the whole unit; Balanced drops the windup via the
+# onset anchor but stays uncapped); only Tight/Sharp cap toward the impact.
+# Performances are exempt (a song/dance keeps its full duration).
+_ACTION_CORE_MS = (None, None, None, 2500, 1800)
 
 # Reaction
 # Energy does NOT change HOW MANY reactions surface -- relevance (the "warrant":
@@ -72,18 +80,20 @@ _REACTION_MERGE = (2000, 1200, 600, 0, 0)
 _REACTION_MIN_WARRANT = (0.55, 0.55, 0.55, 0.55, 0.55)
 _REACTION_MIN_DURATION = (1200, 1000, 800, 600, 500)
 # Target handle length per band, inset around the expression peak at CUT time
-# (negative padding). Broad = None = keep the full VLM span; higher energy trims
-# to a punchy core, the same mechanism as b-roll.
-_REACTION_CORE_MS = (None, 2200, 1600, 1100, 800)
+# (negative padding). Broad..Balanced = None = keep the full VLM span (a long,
+# held reaction / deep-listening shot lives here); only Tight/Sharp trim to a
+# punchy core. Symmetric with the positive padding that pivots at Balanced.
+_REACTION_CORE_MS = (None, None, None, 1100, 800)
 
 # B-roll
 _BROLL_MERGE = (4000, 2500, 0, 0, 0)
 _BROLL_MIN_SALIENCE = (0.55, 0.45, 0.35, 0.25, 0.20)
 _BROLL_LOW_SPEECH = (True, True, False, False, False)
 # Target handle length per band, inset around the shot's peak/middle at CUT time
-# (the VLM hands us the full end-to-end shot). Broad = None = keep the full shot
-# (capped only by the anchor safety guard); higher energy trims to a punchy core.
-_BROLL_CORE_MS = (None, 4000, 3000, 2000, 1500)
+# (the VLM hands us the full end-to-end shot). Broad..Balanced = None = keep the
+# full shot (capped only by the anchor safety guard); only Tight/Sharp trim to a
+# punchy core. Symmetric with the positive padding that pivots at Balanced.
+_BROLL_CORE_MS = (None, None, None, 2000, 1500)
 
 # Insert
 # Inserts are sparse and already meaningful (a reveal / title / interaction the
@@ -92,8 +102,9 @@ _BROLL_CORE_MS = (None, 4000, 3000, 2000, 1500)
 _INSERT_COLLAPSE = (True, True, False, False, False)
 _INSERT_MIN_SALIENCE = (0.30, 0.30, 0.30, 0.30, 0.30)
 # Target handle length per band, inset from the onset at CUT time (the insert is
-# start-anchored, so this trims the tail). Broad = None = full onset handle.
-_INSERT_CORE_MS = (None, 4000, 3000, 2000, 1500)
+# start-anchored, so this trims the tail). Broad..Balanced = None = full onset
+# handle; only Tight/Sharp trim. Symmetric with the positive padding pivot.
+_INSERT_CORE_MS = (None, None, None, 2000, 1500)
 
 # Audible non-speech
 _AUDIO_MIN_SALIENCE = (0.75, 0.65, 0.55, 0.45, 0.35)
@@ -168,7 +179,7 @@ def energy_to_params(energy: float) -> EnergyParams:
     band = energy_band(e)
 
     snap = round(_lerp(e, SNAP_WINDOW_LOOSE_MS, SNAP_WINDOW_TIGHT_MS))
-    pad_factor = max(0.0, 1.0 - e / PURE_SENTENCE_ENERGY)
+    pad_factor = max(0.0, 1.0 - e / PAD_PIVOT_ENERGY)
 
     # Breath removal ramps in only across the Sharp band (energy >= top edge).
     if e >= BAND_EDGES[3]:
