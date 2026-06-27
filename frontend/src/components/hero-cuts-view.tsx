@@ -53,6 +53,10 @@ export function HeroCutsView() {
   const files = useDriveStore((s) => s.files);
   const [energy, setEnergy] = useState(0.5);
   const [filter, setFilter] = useState<FilterKey>("all");
+  // Display framing of the tiles (pure preview reframing, no backend change):
+  // orientation picks the tile aspect, fit decides reframe-to-fill vs full frame.
+  const [orientation, setOrientation] = useState<"landscape" | "portrait">("landscape");
+  const [fit, setFit] = useState<"adjusted" | "original">("adjusted");
   const [heroes, setHeroes] = useState<HeroCut[]>([]);
   const [loading, setLoading] = useState(false);
   const [activeHeroId, setActiveHeroId] = useState<string | null>(null);
@@ -131,8 +135,16 @@ export function HeroCutsView() {
       {/* Takes / framing / format dropdowns */}
       <div className="mb-6 flex flex-wrap items-center gap-2.5">
         <PillDropdown options={["Best Takes", "All takes"]} />
-        <PillDropdown options={["Landscape", "Portrait"]} />
-        <PillDropdown options={["Frame Adjusted", "Original"]} />
+        <PillDropdown
+          options={["Landscape", "Portrait"]}
+          value={orientation === "landscape" ? "Landscape" : "Portrait"}
+          onChange={(v) => setOrientation(v === "Portrait" ? "portrait" : "landscape")}
+        />
+        <PillDropdown
+          options={["Frame Adjusted", "Original"]}
+          value={fit === "adjusted" ? "Frame Adjusted" : "Original"}
+          onChange={(v) => setFit(v === "Original" ? "original" : "adjusted")}
+        />
       </div>
 
       {/* Energy bar — narrower, centered, thin track with a draggable scroller. */}
@@ -192,6 +204,8 @@ export function HeroCutsView() {
               file={filesById[h.file_id]!}
               hero={h}
               getUrl={getUrl}
+              orientation={orientation}
+              fit={fit}
               isActive={activeHeroId === h.hero_id}
               onActivate={() => setActiveHeroId(h.hero_id)}
               onDeactivate={() =>
@@ -205,9 +219,23 @@ export function HeroCutsView() {
   );
 }
 
-function PillDropdown({ options }: { options: string[] }) {
+function PillDropdown({
+  options,
+  value,
+  onChange,
+}: {
+  options: string[];
+  value?: string;
+  onChange?: (v: string) => void;
+}) {
   const [open, setOpen] = useState(false);
-  const [selected, setSelected] = useState(options[0]);
+  const [internal, setInternal] = useState(options[0]);
+  // Controlled when `value`/`onChange` are supplied; otherwise self-managed.
+  const selected = value ?? internal;
+  const select = (opt: string) => {
+    setInternal(opt);
+    onChange?.(opt);
+  };
 
   return (
     <div className="relative">
@@ -230,7 +258,7 @@ function PillDropdown({ options }: { options: string[] }) {
               <button
                 key={opt}
                 onClick={() => {
-                  setSelected(opt);
+                  select(opt);
                   setOpen(false);
                 }}
                 className="flex w-full items-center justify-between px-3.5 py-2 text-sm transition-colors hover:bg-[var(--sidebar)]"
@@ -339,6 +367,8 @@ function HeroClipCard({
   file,
   hero,
   getUrl,
+  orientation,
+  fit,
   isActive,
   onActivate,
   onDeactivate,
@@ -346,6 +376,8 @@ function HeroClipCard({
   file: FileRecord;
   hero: HeroCut;
   getUrl: (fileId: string) => Promise<string | null>;
+  orientation: "landscape" | "portrait";
+  fit: "adjusted" | "original";
   isActive: boolean;
   onActivate: () => void;
   onDeactivate: () => void;
@@ -368,6 +400,11 @@ function HeroClipCard({
   const outSec = segs[segs.length - 1][1];
   const isVideo = file.file_type === "video";
   const modality = MODALITY_STYLE[hero.modality] ?? MODALITY_STYLE.speech;
+
+  // "Frame Adjusted" reframes the clip to fill the chosen tile (center-crop);
+  // "Original" letterboxes the full source frame. The proxy is already baked
+  // upright at ingest, so no client-side rotation is needed.
+  const objectFit = fit === "adjusted" ? "cover" : "contain";
 
   async function ensureUrl() {
     if (playUrl) return;
@@ -490,7 +527,9 @@ function HeroClipCard({
         onMouseLeave={handleLeave}
         draggable
         onDragStart={onDragStart}
-        className="relative flex aspect-video cursor-pointer items-center justify-center overflow-hidden"
+        className={`relative flex cursor-pointer items-center justify-center overflow-hidden ${
+          orientation === "portrait" ? "aspect-[9/16]" : "aspect-video"
+        }`}
         style={{ background: "#000" }}
         title={hero.label}
       >
@@ -504,7 +543,8 @@ function HeroClipCard({
             draggable={false}
             onLoadedMetadata={onLoadedMetadata}
             onTimeUpdate={onTimeUpdate}
-            className="h-full w-full bg-black object-contain"
+            className="h-full w-full bg-black"
+            style={{ objectFit }}
           />
         )}
         {!playUrl && <FileIcon type={(isVideo ? "video" : "audio") as "video"} size={32} />}
