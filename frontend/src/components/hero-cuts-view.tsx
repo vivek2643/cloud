@@ -30,6 +30,7 @@ type FilterKey = HeroModality | "all";
 // action beats, cutaways) is served without a separate pipeline.
 const FILTERS: { key: FilterKey; label: string }[] = [
   { key: "all", label: "All" },
+  { key: "moment", label: "Moments" },
   { key: "speech", label: "Speech" },
   { key: "reaction", label: "Reactions" },
   { key: "broll", label: "B-roll" },

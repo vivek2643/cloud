@@ -68,7 +68,9 @@ _MERGE_LEN_RATIO = 0.7
 # v3: cuts are facet records -- each carries its owned zoom ladder + people
 # (cast-resolved speaker / on-camera / region) + delivery-quality facet; the
 # off-frame interviewer is flagged, not dropped.
-PARAMS_VERSION = 3
+# v4: moments form ONLY from VLM interaction windows (the blind 1.5s proximity
+# union is gone) and are take-grouped by the speech they involve.
+PARAMS_VERSION = 4
 
 # The five canonical product energy LEVELS = the band centers (Broad .. Sharp).
 # Hero cuts are precomputed at exactly these after L2; any requested energy
@@ -1044,8 +1046,8 @@ def _interaction_windows(perception: Optional[dict]) -> List[Tuple[int, int]]:
 def _cohesion_moments(clip: _ClipInputs, cuts: List[HeroCut]) -> List[HeroCut]:
     """Multi-affordance MOMENTS driven by cohesion, not a fixed time gap.
 
-    Two cuts belong to the same moment when they overlap (or sit within
-    ``COMBINE_GAP_MS``) OR both fall inside one VLM interaction window. Each
+    Two cuts belong to the same moment ONLY when both fall inside one VLM
+    interaction window (the model's explicit cohesion signal). Each
     multi-modality cluster becomes ONE union cut whose owned ladder is
     union(broad) -> the dominant member's finer rungs, carrying the union of
     affordances + people. Emitted IN ADDITION to the individual cuts, so the
@@ -1069,14 +1071,10 @@ def _cohesion_moments(clip: _ClipInputs, cuts: List[HeroCut]) -> List[HeroCut]:
         if ra != rb:
             parent[rb] = ra
 
-    # Link by overlap / proximity.
-    for i in range(n):
-        for j in range(i + 1, n):
-            gap = (max(members[i].src_in_ms, members[j].src_in_ms)
-                   - min(members[i].src_out_ms, members[j].src_out_ms))
-            if gap <= COMBINE_GAP_MS:
-                union(i, j)
-    # Link by shared VLM interaction window (trusted cohesion).
+    # Cohesion comes ONLY from the VLM's own interaction windows -- its explicit
+    # "these per-actor events are one shared moment" signal. The old blind
+    # time-proximity union (any two modalities within COMBINE_GAP_MS) was dropped:
+    # in dense footage it fused unrelated adjacent cuts into a flood of moments.
     for w in _interaction_windows(clip.perception):
         idxs = [k for k in range(n)
                 if _overlap_ms(members[k].src_in_ms, members[k].src_out_ms, w[0], w[1]) > 0]
@@ -1581,6 +1579,46 @@ def _take_rank(h: HeroCut) -> Tuple[float, float, float]:
     )
 
 
+def _stack_moments(moments: List[HeroCut], groups) -> List[HeroCut]:
+    """Collapse re-shot moments into one card, grouped by the SPEECH they involve.
+
+    A moment maps to the take group whose attempts its span overlaps most (the
+    line at the heart of the moment). Moments sharing a take group are the same
+    beat delivered as different takes / camera angles -> one card, best in front,
+    the rest folded into ``alt_takes`` (identical to speech stacking -- nothing is
+    dropped, the alternates stay reachable). A moment that matches no multi-take
+    group passes through solo; so does a pure-visual moment carrying no groupable
+    speech. This is the dedup that was missing -- moments used to never group."""
+    if not moments:
+        return []
+    by_group: Dict[str, List[HeroCut]] = {}
+    solo: List[HeroCut] = []
+    for m in moments:
+        best_gid, best_ov = None, 0
+        for g in groups:
+            ov = sum(_overlap_ms(m.src_in_ms, m.src_out_ms, a.start_ms, a.end_ms)
+                     for a in g.attempts if a.file_id == m.file_id)
+            if ov > best_ov:
+                best_gid, best_ov = g.group_id, ov
+        if best_gid is None:
+            solo.append(m)
+        else:
+            by_group.setdefault(best_gid, []).append(m)
+
+    out: List[HeroCut] = list(solo)
+    for ms in by_group.values():
+        if len(ms) == 1:
+            out.append(ms[0])
+            continue
+        front = max(ms, key=_take_rank)
+        alts = [HeroTake(x.file_id, x.src_in_ms, x.src_out_ms, x.score)
+                for x in ms if x is not front]
+        front.alt_takes = sorted(alts, key=lambda t: t.score, reverse=True)
+        front.take_count = 1 + len(alts)
+        out.append(front)
+    return out
+
+
 def _stack_takes(heroes: List[HeroCut], file_ids: List[str]) -> List[HeroCut]:
     """Collapse re-delivered content into one hero carrying its alternates.
 
@@ -1593,12 +1631,20 @@ def _stack_takes(heroes: List[HeroCut], file_ids: List[str]) -> List[HeroCut]:
     purpose: it avoids the fuzzy-text over-merging that previously hid dozens of
     distinct sentences behind a single card.
 
-    Action/visual heroes are not take-comparable, so they pass through.
+    Moments are take-grouped by the SPEECH they involve (see `_stack_moments`).
+    Pure action/visual heroes carry no groupable text, so they pass through.
     """
     speech = [h for h in heroes if h.modality == "speech"]
-    others = [h for h in heroes if h.modality != "speech"]
+    moments = [h for h in heroes if h.modality == "moment"]
+    others = [h for h in heroes if h.modality not in ("speech", "moment")]
+
+    # One authoritative grouping of the same content's deliveries, shared by the
+    # speech and moment stacking passes (so a moment dedups on the SAME take
+    # groups its speech does).
+    groups = build_take_groups(file_ids)
+    moment_out = _stack_moments(moments, groups)
     if not speech:
-        return heroes
+        return moment_out + others
 
     by_file: Dict[str, List[HeroCut]] = {}
     for h in speech:
@@ -1614,7 +1660,7 @@ def _stack_takes(heroes: List[HeroCut], file_ids: List[str]) -> List[HeroCut]:
 
     consumed: set[str] = set()
     stacked: List[HeroCut] = []
-    for group in build_take_groups(file_ids):
+    for group in groups:
         # Pair every attempt with the hero it overlaps (or None -> raw span).
         members = [(hero_for(a), a) for a in group.attempts]
         # The front of the stack is the best-scored hero among the deliveries.
@@ -1646,7 +1692,7 @@ def _stack_takes(heroes: List[HeroCut], file_ids: List[str]) -> List[HeroCut]:
     # Second pass: collapse remaining heroes that show the *same line* (scripted
     # repeats across takes/files) which content-key grouping missed.
     speech_out = _consolidate_speech(stacked + solo)
-    return speech_out + others
+    return speech_out + moment_out + others
 
 
 def _strict_same_line(a: str, b: str) -> bool:
