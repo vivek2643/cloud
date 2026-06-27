@@ -154,24 +154,21 @@ export function getDialogues(fileId: string, token: string) {
 
 // --- Hero Cuts lens ---
 
+// The closed editing vocabulary (backend l3/vocab.py). Exactly five affordances.
 export type HeroModality =
   | "speech"
   | "action"
-  | "behavior"
-  | "visual"
-  | "moment"
   | "reaction"
   | "broll"
   | "insert";
 
-export interface HeroCoverage {
-  hero_id: string;
-  file_id: string;
-  affordance: string;
-  label: string;
-  src_in_ms: number;
-  src_out_ms: number;
-  score: number;
+// One typed, directional edge from this cut to another (mapped from the VLM's
+// relation graph). `dir` is 'out' when this cut is the source, 'in' when target.
+export interface HeroRelation {
+  type: string;       // responds_to | illustrates | leads_into | answers | ...
+  dir: "out" | "in";
+  other: string;      // hero_id of the connected cut
+  note?: string | null;
 }
 
 export interface HeroTake {
@@ -198,14 +195,19 @@ export interface HeroCut {
   score: number;
   speaker: string | null;
   flags: string[];
-  // All editorial uses this cut serves (filter keys). A set of >1 means the cut
-  // is a "moment" -- it works as speech AND action/behavior, etc.
+  // All editorial uses this cut serves (filter keys / tabs).
   affordances: string[];
-  // Alternate framings of this same instant carried by other cuts (a listener
-  // reaction over the line, a wide angle). The other cut keeps its own card.
-  coverage?: HeroCoverage[] | null;
-  // True when this cut serves >1 affordance or has alternate coverage -- the
-  // Moments tab is exactly this view (not a separate, duplicated card).
+  // Typed edges to other cuts (a reaction responds_to a line, b-roll
+  // illustrates a topic). Flat model -- the cut stays its own card; this is how
+  // it CONNECTS to others.
+  relations?: HeroRelation[] | null;
+  // The connected-cluster id this cut shares with the cuts it forms a moment
+  // with. null for a standalone cut. The Moments view groups by this.
+  moment_id?: string | null;
+  // Narrative intent (hook/answer/cta/establishing/climax/listener), when the
+  // VLM marked one. null for ordinary middle content.
+  role?: string | null;
+  // True when this cut belongs to a multi-cut moment cluster (has a moment_id).
   is_moment?: boolean;
   take_count: number;
   alt_takes: HeroTake[];

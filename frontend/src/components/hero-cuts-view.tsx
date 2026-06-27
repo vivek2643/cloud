@@ -17,21 +17,18 @@ import { EditButton } from "./search-edit-bar";
 const MODALITY_STYLE: Record<HeroModality, { color: string; label: string }> = {
   speech: { color: "#6366f1", label: "speech" },
   action: { color: "#f59e0b", label: "action" },
-  behavior: { color: "#f97316", label: "behavior" },
-  visual: { color: "#06b6d4", label: "visual" },
-  moment: { color: "#10b981", label: "moment" },
   reaction: { color: "#ec4899", label: "reaction" },
   broll: { color: "#06b6d4", label: "b-roll" },
   insert: { color: "#a78bfa", label: "insert" },
 };
 
-// A tab is either the special "all" / "moment" view or an affordance filter.
-type FilterKey = "all" | "moment" | "speech" | "action" | "reaction" | "broll";
+// A tab is the special "all" / "moment" view or one of the five affordances.
+type FilterKey = "all" | "moment" | "speech" | "action" | "reaction" | "broll" | "insert";
 
-// Filter chips over the ONE feed -- this is how every edit style (soundbites,
-// action beats, cutaways) is served without a separate pipeline. "Moments" is a
-// VIEW (multi-affordance cuts), not a duplicate card; every other tab matches an
-// affordance the cut serves, so one rich cut can appear under several tabs.
+// Filter chips over the ONE feed -- every edit style (soundbites, action beats,
+// cutaways) is served without a separate pipeline. "Moments" is a VIEW of the
+// connected clusters (a line + its reaction + illustrating b-roll); every other
+// tab matches an affordance the cut serves, so a cut can appear under several.
 const FILTERS: { key: FilterKey; label: string }[] = [
   { key: "all", label: "All" },
   { key: "moment", label: "Moments" },
@@ -39,9 +36,10 @@ const FILTERS: { key: FilterKey; label: string }[] = [
   { key: "action", label: "Action" },
   { key: "reaction", label: "Reactions" },
   { key: "broll", label: "B-roll" },
+  { key: "insert", label: "Inserts" },
 ];
 
-// Does a cut serve a given tab? Moments = multi-affordance/has-coverage; an
+// Does a cut serve a given tab? Moments = belongs to a connected cluster; an
 // affordance tab matches when the cut lists that affordance (modality fallback).
 function matchesFilter(h: HeroCut, key: FilterKey): boolean {
   if (key === "all") return true;
@@ -49,6 +47,15 @@ function matchesFilter(h: HeroCut, key: FilterKey): boolean {
   const affs = h.affordances && h.affordances.length > 0 ? h.affordances : [h.modality];
   return affs.includes(key);
 }
+
+const ROLE_LABEL: Record<string, string> = {
+  hook: "Hook",
+  answer: "Answer",
+  cta: "CTA",
+  establishing: "Establishing",
+  climax: "Climax",
+  listener: "Listening",
+};
 
 function fmtDur(ms: number): string {
   const s = ms / 1000;
@@ -148,6 +155,23 @@ export function HeroCutsView() {
     () => (filter === "all" ? present : present.filter((h) => matchesFilter(h, filter))),
     [present, filter]
   );
+  // Moments tab: group the cluster members by their shared moment_id so each
+  // moment renders as ONE expandable bundle (a line + its reaction + b-roll),
+  // best-scored cut first. Other tabs render the flat grid.
+  const clusters = useMemo(() => {
+    if (filter !== "moment") return [];
+    const by: Record<string, HeroCut[]> = {};
+    for (const h of visible) {
+      const id = h.moment_id ?? h.hero_id;
+      (by[id] ??= []).push(h);
+    }
+    return Object.entries(by)
+      .map(([id, members]) => ({
+        id,
+        members: [...members].sort((a, b) => b.score - a.score),
+      }))
+      .sort((a, b) => b.members[0].score - a.members[0].score);
+  }, [filter, visible]);
   const totalClips = visible.length;
 
   return (
@@ -216,7 +240,24 @@ export function HeroCutsView() {
         </div>
       )}
 
-      {!loading && totalClips > 0 && (
+      {!loading && totalClips > 0 && filter === "moment" && (
+        <div className="flex flex-col gap-5">
+          {clusters.map((c) => (
+            <MomentBundle
+              key={c.id}
+              members={c.members}
+              filesById={filesById}
+              getUrl={getUrl}
+              orientation={orientation}
+              fit={fit}
+              activeHeroId={activeHeroId}
+              setActiveHeroId={setActiveHeroId}
+            />
+          ))}
+        </div>
+      )}
+
+      {!loading && totalClips > 0 && filter !== "moment" && (
         <div className="grid grid-cols-2 gap-4 md:grid-cols-3 2xl:grid-cols-4">
           {visible.map((h) => (
             <HeroClipCard
@@ -235,6 +276,76 @@ export function HeroCutsView() {
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+// One moment = a connected bundle of first-class cuts. The header summarizes the
+// beat (its lead cut's gist + the relation mix); the members render as a small
+// grid so the editor sees the whole moment together and can grab any piece.
+function MomentBundle({
+  members,
+  filesById,
+  getUrl,
+  orientation,
+  fit,
+  activeHeroId,
+  setActiveHeroId,
+}: {
+  members: HeroCut[];
+  filesById: Record<string, FileRecord>;
+  getUrl: (fileId: string) => Promise<string | null>;
+  orientation: "landscape" | "portrait";
+  fit: "adjusted" | "original";
+  activeHeroId: string | null;
+  setActiveHeroId: React.Dispatch<React.SetStateAction<string | null>>;
+}) {
+  const lead = members[0];
+  const relTypes = useMemo(() => {
+    const s = new Set<string>();
+    for (const m of members)
+      for (const r of m.relations ?? []) if (r.dir === "out") s.add(r.type);
+    return Array.from(s);
+  }, [members]);
+  const affMix = useMemo(() => {
+    const s = new Set<string>();
+    for (const m of members) s.add(m.modality);
+    return Array.from(s);
+  }, [members]);
+
+  return (
+    <div
+      className="rounded-xl border p-3"
+      style={{ borderColor: "var(--border)", background: "var(--sidebar)" }}
+    >
+      <div className="mb-3 flex flex-wrap items-center gap-2 px-1">
+        <span
+          className="flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold"
+          style={{ background: "#10b981", color: "#04110b" }}
+        >
+          <Layers size={12} /> Moment
+        </span>
+        <span className="text-sm font-medium">{lead.label || "(untitled moment)"}</span>
+        <span className="text-xs" style={{ color: "var(--muted)" }}>
+          {affMix.join(" · ")}
+          {relTypes.length > 0 && ` — ${relTypes.join(", ").replace(/_/g, " ")}`}
+        </span>
+      </div>
+      <div className="grid grid-cols-2 gap-4 md:grid-cols-3 2xl:grid-cols-4">
+        {members.map((h) => (
+          <HeroClipCard
+            key={h.hero_id}
+            file={filesById[h.file_id]!}
+            hero={h}
+            getUrl={getUrl}
+            orientation={orientation}
+            fit={fit}
+            isActive={activeHeroId === h.hero_id}
+            onActivate={() => setActiveHeroId(() => h.hero_id)}
+            onDeactivate={() => setActiveHeroId((id) => (id === h.hero_id ? null : id))}
+          />
+        ))}
+      </div>
     </div>
   );
 }
@@ -586,6 +697,18 @@ function HeroClipCard({
             <span style={{ opacity: 0.85 }}>+ {extraAffordances.join(" + ")}</span>
           )}
         </span>
+
+        {/* Narrative role (hook / answer / cta / listening ...) when the VLM
+            marked one -- the structural beats the editor builds around. */}
+        {hero.role && (
+          <span
+            className="absolute right-2 bottom-9 z-20 rounded px-1.5 py-0.5 text-[11px] font-semibold text-white"
+            style={{ background: "rgba(16,185,129,0.92)" }}
+            title={`Role: ${hero.role}`}
+          >
+            {ROLE_LABEL[hero.role] ?? hero.role}
+          </span>
+        )}
 
         {/* Take-stack badge (top-left, below the modality badge) when repeats exist. */}
         {hero.take_count > 1 && (
