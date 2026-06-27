@@ -253,6 +253,11 @@ class HeroCut:
     # a separate entity. A podcast (mostly independent lines) yields few moments;
     # a reel (reaction <- line <- b-roll chains) yields rich ones.
     moment_id: Optional[str] = None
+    # Narrative intent of this cut (vocab role: hook/answer/cta/establishing/
+    # climax/listener), read from the VLM's per-beat role or synthesized for a
+    # held listening shot. None for ordinary middle content. The brain uses it to
+    # build structure (open on the hook, land on the answer), not just adjacency.
+    role: Optional[str] = None
 
     def is_moment(self) -> bool:
         """True when this cut is part of a multi-cut moment cluster (it has a
@@ -292,6 +297,7 @@ class HeroCut:
             "quality": self.quality,
             "relations": self.relations or None,
             "moment_id": self.moment_id,
+            "role": self.role,
             "is_moment": self.is_moment(),
         }
 
@@ -319,6 +325,7 @@ class HeroCut:
             quality=d.get("quality"),
             relations=list(d.get("relations") or []),
             moment_id=d.get("moment_id"),
+            role=d.get("role"),
         )
 
 
@@ -1083,6 +1090,39 @@ def _l2_id_spans(perception: Optional[dict]) -> Dict[str, Tuple[int, int]]:
     return spans
 
 
+def _role_spans(perception: Optional[dict]) -> List[Tuple[int, int, str]]:
+    """Every (start, end, role) the VLM stated, across the tracks that carry a
+    role. Only vocab roles are kept, so a stray free-text value is ignored."""
+    out: List[Tuple[int, int, str]] = []
+    p = perception or {}
+    for track in ("events", "content_units", "cutaways", "reactions"):
+        for x in p.get(track) or []:
+            role = (x.get("role") or "").lower()
+            if role in vocab.ROLE_SET:
+                a, b = int(x.get("start_ms", 0)), int(x.get("end_ms", 0))
+                if b > a:
+                    out.append((a, b, role))
+    return out
+
+
+def _assign_roles(clip: _ClipInputs, cuts: List[HeroCut]) -> None:
+    """Stamp each cut with its narrative role from the VLM's per-beat role,
+    mapped by best time-overlap. A synthesized held-listening shot has no L2 row,
+    so it gets the 'listener' role from its flag. Leaves role None for ordinary
+    middle content (most lines) -- the brain only needs the structural beats."""
+    spans = _role_spans(clip.perception)
+    for h in cuts:
+        best, best_ov = None, 0
+        for a, b, role in spans:
+            ov = _overlap_ms(h.src_in_ms, h.src_out_ms, a, b)
+            if ov > best_ov:
+                best, best_ov = role, ov
+        if best is not None:
+            h.role = best
+        elif "listening" in (h.flags or []):
+            h.role = vocab.ROLE_LISTENER
+
+
 def _cut_for_span(cuts: List[HeroCut], a: int, b: int) -> Optional[HeroCut]:
     """The built cut that best CORRESPONDS to the L2 span [a, b], by intersection
     over union -- so a tight b-roll cut wins its own cutaway over a long speech
@@ -1793,9 +1833,10 @@ def _file_heroes(
     sp = _speech_candidates(clip, source, field, params)
     beats = _beat_segments(clip, field, params, anchors)
     heroes: List[HeroCut] = list(sp) + list(beats)
-    # Flat model: every cut is first-class. We only ANNOTATE connections -- wire
-    # the VLM's typed relation graph onto the cuts and stamp connected bundles
-    # with a shared moment_id. Energy-independent metadata, so it runs always.
+    # Flat model: every cut is first-class. We only ANNOTATE -- stamp each cut's
+    # narrative role, then wire the VLM's typed relation graph onto the cuts and
+    # mark connected bundles with a shared moment_id. Energy-independent metadata.
+    _assign_roles(clip, heroes)
     heroes = _annotate_moments(clip, heroes)
     return heroes
 

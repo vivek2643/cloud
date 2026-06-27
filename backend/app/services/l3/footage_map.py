@@ -160,6 +160,7 @@ def build_clip_tree(
             "modality": cut.get("modality"),
             "affordances": cut.get("affordances") or ([cut.get("modality")] if cut.get("modality") else []),
             "speaker": cut.get("speaker"),
+            "role": cut.get("role"),
             "gist": cut.get("label") or "",
             "flags": cut.get("flags") or [],
             "score": float(cut.get("score", 0.0)),
@@ -362,6 +363,7 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     nrg = "|".join(L for L in _LEVEL_NAMES if L in levels)
     spk = f" {m['speaker']}" if m.get("speaker") else ""
     cam = _people_tag(m)
+    role = f" *{m['role']}*" if m.get("role") else ""
     gist = (m.get("gist") or "").strip().replace("\n", " ")
     # Resident mode gives the model the FULL line so it picks by reading, not
     # guessing; compact (paged) mode truncates and relies on inspect_moment.
@@ -370,7 +372,7 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     dup = ""
     if m.get("dup_group"):
         dup = f" · dup:{m['dup_group']}{'*' if m.get('dup_best') else ''}"
-    return (f"  {m['moment_id'].split(':')[-1]} {_affordance_tag(m)}{spk}{cam} "
+    return (f"  {m['moment_id'].split(':')[-1]} {_affordance_tag(m)}{spk}{cam}{role} "
             f".{int(round(m['score'] * 100)):02d} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])}] "
             f"\"{gist}\" · nrg:{nrg}{dup}{_relation_tag(m)}")

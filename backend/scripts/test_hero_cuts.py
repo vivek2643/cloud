@@ -681,6 +681,28 @@ def test_relation_take_of_does_not_form_moment():
     print("ok  test_relation_take_of_does_not_form_moment")
 
 
+def test_roles_assigned_from_l2_and_listening_flag():
+    """Each cut takes its narrative role from the best-overlapping VLM role; a
+    synthesized listening shot (no L2 row) gets 'listener' from its flag."""
+    hook = hc.HeroCut("z:sp0", "zzzz", "speech", "the wild opener", 1000, 3000,
+                      score=0.7, speaker="host", affordances=["speech"])
+    mid = hc.HeroCut("z:sp1", "zzzz", "speech", "ordinary middle", 5000, 7000,
+                     score=0.6, speaker="host", affordances=["speech"])
+    listen = hc.HeroCut("z:rea0", "zzzz", "reaction", "p2 listens", 5200, 6800,
+                        score=0.5, affordances=["reaction"], flags=["listening"])
+    perception = {"content_units": [
+        {"unit_id": "u1", "start_ms": 1000, "end_ms": 3000, "kind": "speech", "role": "hook"},
+        {"unit_id": "u2", "start_ms": 5000, "end_ms": 7000, "kind": "speech"},  # no role
+    ]}
+    clip = hc._ClipInputs(file_id="zzzzzzzz-7", duration_ms=10000,
+                          dialogue={"topic": [], "sentence": []}, perception=perception, motion=None)
+    hc._assign_roles(clip, [hook, mid, listen])
+    assert hook.role == "hook", hook.role
+    assert mid.role is None                       # ordinary middle stays unmarked
+    assert listen.role == "listener", listen.role  # from the listening flag
+    print("ok  test_roles_assigned_from_l2_and_listening_flag")
+
+
 def test_no_relations_no_moments():
     """With no relation graph (old cache / independent lines) nothing is a moment
     -- the flat default. A podcast of plain lines yields zero clusters."""
@@ -871,6 +893,7 @@ def main():
     test_facet_record_round_trips()
     test_relation_links_reaction_to_line()
     test_relation_take_of_does_not_form_moment()
+    test_roles_assigned_from_l2_and_listening_flag()
     test_no_relations_no_moments()
     test_relation_illustrates_chains_into_one_moment()
     test_speech_cut_owns_ladder_and_resolves_speaker()
