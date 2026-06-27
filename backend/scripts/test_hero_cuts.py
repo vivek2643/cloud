@@ -666,10 +666,28 @@ def test_coverage_links_alternate_framing():
     assert len(out) == 3, [(h.hero_id, h.modality) for h in out]   # nothing dropped
     spine = next(h for h in out if h.hero_id == "z:sp0")
     assert len(spine.coverage) == 1 and spine.coverage[0]["hero_id"] == "z:rea0"
-    assert spine.is_moment()
     assert set(spine.affordances) == {"speech"}                    # coverage != own use
+    # A REACTION-only overlap is passive texture -> it links as coverage but does
+    # NOT make the line a moment (a podcast line + a listener is not a moment).
+    assert not spine.is_moment()
     assert not next(h for h in out if h.hero_id == "z:sp1").is_moment()
     print("ok  test_coverage_links_alternate_framing")
+
+
+def test_behavior_coverage_promotes_to_moment():
+    """A line with a distinct PHYSICAL beat over it (the speaker holds up an
+    object -> behavior/insert coverage) IS a moment, even by a different subject."""
+    s = hc.HeroCut("z:sp0", "zzzz", "speech", "look at this", 1000, 3000, score=0.7,
+                   speaker="host", affordances=["speech"],
+                   people=[{"person_id": "p1", "on_camera": True}])
+    ins = hc.HeroCut("z:ins0", "zzzz", "insert", "phone screen", 1500, 2800, score=0.5,
+                     affordances=["insert"], people=[{"person_id": "p2", "on_camera": True}])
+    clip = hc._ClipInputs(file_id="zzzzzzzz-3", duration_ms=10000,
+                          dialogue={"topic": [], "sentence": []}, perception={}, motion=None)
+    out = hc._attach_coverage(clip, [s, ins])
+    spine = next(h for h in out if h.hero_id == "z:sp0")
+    assert spine.is_moment()                       # insert coverage = a real beat
+    print("ok  test_behavior_coverage_promotes_to_moment")
 
 
 def test_coverage_uses_interaction_window():
@@ -839,6 +857,7 @@ def main():
     test_facet_record_round_trips()
     test_coverage_folds_same_subject_companion()
     test_coverage_links_alternate_framing()
+    test_behavior_coverage_promotes_to_moment()
     test_coverage_uses_interaction_window()
     test_speech_cut_owns_ladder_and_resolves_speaker()
     test_offcamera_speech_flagged_not_dropped()

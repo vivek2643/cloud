@@ -125,6 +125,14 @@ _AFFORDANCE_WEIGHT = {
     anc.AFF_BROLL: 0.72,
     anc.AFF_INSERT: 0.70,
 }
+# Coverage affordances that make a line a real MOMENT (a visible/physical beat
+# happens during it). Reaction coverage (listening, ambient audio) is the passive
+# texture of a conversation and deliberately NOT here, so it never promotes a
+# plain line to a moment.
+_MOMENT_COVERAGE_AFFS = {
+    anc.AFF_ACTION, anc.AFF_BEHAVIOR, anc.AFF_BROLL, anc.AFF_INSERT,
+}
+
 # A beat segment needs at least this salience to be worth surfacing as a card
 # (everything is still reachable in raw via the timeline; this just declutters).
 _MIN_BEAT_SALIENCE = 0.15
@@ -244,8 +252,19 @@ class HeroCut:
     coverage: List[dict] = field(default_factory=list)
 
     def is_moment(self) -> bool:
-        """A rich record: serves >1 editorial affordance or has alternate coverage."""
-        return len(set(self.affordances or [self.modality])) > 1 or bool(self.coverage)
+        """A real MOMENT: more than a plain talking head / single beat. Either the
+        cut's OWN footage serves >1 affordance (the speaker gestures / demonstrates
+        while talking -> speech+behavior), OR it has coverage that is a distinct
+        PHYSICAL/VISUAL beat (an action, behavior, b-roll, or insert).
+
+        Passive coverage -- a listener simply LISTENING, an ambient non-speech
+        sound -- is the baseline texture of a conversation, not a moment, so a
+        reaction-only overlap never promotes a line. This is why a podcast yields
+        FEW moments (only the lines where something is actually done/shown) while a
+        reel's action beats stay moments."""
+        if len(set(self.affordances or [self.modality])) > 1:
+            return True
+        return any(c.get("affordance") in _MOMENT_COVERAGE_AFFS for c in self.coverage)
 
     def play_ms(self) -> int:
         """On-screen duration once breaths are excised (kept spans only)."""
