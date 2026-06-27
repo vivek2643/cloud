@@ -97,11 +97,11 @@ def create_thread(body: CreateThreadBody, user_id: str = Depends(get_current_use
 def post_message(
     thread_id: str, body: MessageBody, user_id: str = Depends(get_current_user_id)
 ):
-    """A conversational turn. Appends the user's message, lets the assistant
-    reply, and -- only when the user has confirmed an edit -- kicks off the
-    arranger run on the worker (the client polls the thread for the new version).
-
-    Returns the assistant's reply and whether an edit is now being applied."""
+    """A conversational turn. Appends the user's message and lets the assistant
+    reply. Nothing is applied here: if the assistant PROPOSED a cut, we harvest
+    its cut list deterministically and surface ``proposal`` so the client can show
+    a Confirm button. The actual apply happens on POST /{id}/apply once the user
+    says yes."""
     _owned_thread(thread_id, user_id)
     from app.services.l3 import converse
 
@@ -113,33 +113,55 @@ def post_message(
     result = converse.respond(thread_id)
     store.append_turn(thread_id, "assistant", result.reply)
 
-    if result.intent == "edit" and result.brief:
-        thread = store.get_thread(thread_id)
-        file_ids = (thread or {}).get("file_ids") or []
+    proposal = bool(result.proposal)
+    if proposal and result.brief:
         store.update_brief(thread_id, result.brief)
+    return {
+        "reply": result.reply,
+        "proposal": proposal,
+        "proposal_count": len(result.proposal),
+    }
 
-        # The chat brain IS the editor: when it returned its picked cut list,
-        # compile THAT directly (deterministic, no second LLM) so what the user
-        # saw it reason about is exactly what gets cut. Fall back to the arranger
-        # only when no usable cut list came back.
-        if result.timeline:
-            try:
-                document = auto_edit.compile_chat_edit(
-                    file_ids, result.brief, result.timeline,
-                    aspect=result.aspect, target_s=result.target_s)
-            except Exception:  # noqa: BLE001 - never hard-fail an edit turn
-                document = None
-            if document is not None:
-                store.save_document(thread_id, document, created_by="auto")
-                store.set_thread_status(thread_id, "ready")
-                return {"reply": result.reply, "intent": "edit", "applying": True}
 
-        # Fallback: a confirmed edit with no usable cut list -> arranger run.
-        store.set_thread_status(thread_id, "drafting")
-        auto_edit._defer_run(thread_id)
-        return {"reply": result.reply, "intent": "edit", "applying": True}
+@router.post("/{thread_id}/apply")
+def apply_edit(thread_id: str, user_id: str = Depends(get_current_user_id)):
+    """Apply the cut the assistant just proposed (user said yes to the Confirm
+    button). Deterministic + LLM-free: we re-harvest the cut list straight out of
+    the latest assistant reply -- exactly what the user saw -- then compile + save
+    it as a new document version. No arranger re-guess."""
+    thread = _owned_thread(thread_id, user_id)
+    from app.services.l3 import converse
 
-    return {"reply": result.reply, "intent": "chat", "applying": False}
+    file_ids = thread.get("file_ids") or []
+    reply = _latest_assistant_reply(thread_id)
+    if not reply:
+        raise HTTPException(status_code=409, detail="Nothing to apply")
+
+    timeline = converse.harvest_cut_list(reply, file_ids)
+    if not timeline:
+        raise HTTPException(status_code=409, detail="No usable cut list to apply")
+
+    brief = thread.get("brief") or "applied edit"
+    try:
+        document = auto_edit.compile_chat_edit(file_ids, brief, timeline)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail="Could not compile the edit") from exc
+    if document is None:
+        raise HTTPException(status_code=409, detail="No usable cut list to apply")
+
+    version = store.save_document(thread_id, document, created_by="auto")
+    store.set_thread_status(thread_id, "ready")
+    return {"applied": True, "version": version, "cuts": len(timeline)}
+
+
+def _latest_assistant_reply(thread_id: str) -> str:
+    """The text of the most recent assistant turn (the proposal we re-harvest)."""
+    for m in reversed(store.load_messages(thread_id)):
+        if m.get("role") == "assistant":
+            content = m.get("content")
+            if isinstance(content, str) and content.strip():
+                return content
+    return ""
 
 
 @router.get("")

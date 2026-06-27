@@ -602,14 +602,29 @@ export function createEditThread(
 
 export interface ThreadMessageResult {
   reply: string;
-  intent: "chat" | "edit";
-  applying: boolean;
+  // The assistant proposed a cut (its cut list was harvested deterministically).
+  // The client shows a Confirm button; nothing is applied until the user says yes.
+  proposal: boolean;
+  proposal_count: number;
 }
 
 export function sendThreadMessage(id: string, text: string, token: string) {
   return request<ThreadMessageResult>(`/api/edit/threads/${id}/messages`, {
     method: "POST",
     body: JSON.stringify({ text }),
+    token,
+  });
+}
+
+export interface ApplyEditResult {
+  applied: boolean;
+  version: number;
+  cuts: number;
+}
+
+export function applyThreadEdit(id: string, token: string) {
+  return request<ApplyEditResult>(`/api/edit/threads/${id}/apply`, {
+    method: "POST",
     token,
   });
 }

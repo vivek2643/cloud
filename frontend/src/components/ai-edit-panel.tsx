@@ -14,6 +14,7 @@ import {
   Music,
   Scissors,
   SlidersHorizontal,
+  Check,
 } from "lucide-react";
 import { useDriveStore } from "@/stores/drive-store";
 import { RenderBar } from "@/components/render-bar";
@@ -26,6 +27,7 @@ import {
   createEditThread,
   getEditThread,
   sendThreadMessage,
+  applyThreadEdit,
   type EditThread,
   type EditThreadStatus,
   type EditOperation,
@@ -114,6 +116,10 @@ export function AiEditPanel() {
   const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  // The assistant proposed a cut on its latest turn -> show a Confirm button.
+  // Only the most recent assistant turn can carry a live proposal.
+  const [pendingProposal, setPendingProposal] = useState(false);
+  const [applying, setApplying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Portal target for the bottom editor dock (program monitor + timeline) that
   // lives in the main area, pro-editor style.
@@ -160,6 +166,7 @@ export function AiEditPanel() {
   useEffect(() => {
     if (!aiPanelOpen) return;
     setError(null);
+    setPendingProposal(false);
     const existing = loadThreadId(scope);
     setThreadId(existing);
     setThread(null);
@@ -212,6 +219,7 @@ export function AiEditPanel() {
     setInput("");
     setError(null);
     setBusy(true);
+    setPendingProposal(false);
 
     // Optimistically show the user's message right away.
     const withUser: ChatMsg[] = [...messages, { role: "user", text }];
@@ -232,18 +240,39 @@ export function AiEditPanel() {
       const withReply: ChatMsg[] = [...withUser, { role: "assistant", text: res.reply }];
       setMessages(withReply);
       saveMsgs(id, withReply);
-
-      if (res.applying) {
-        // The assistant confirmed an edit; the arranger runs on the worker.
-        startPolling(id);
-        await refresh(id);
-      } else {
-        setBusy(false);
-      }
+      // Nothing is applied yet: if the assistant proposed a cut, surface the
+      // Confirm button. The user decides whether it lands on the timeline.
+      setPendingProposal(res.proposal);
+      setBusy(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Message failed.");
       setBusy(false);
     }
+  }
+
+  async function handleApplyProposal() {
+    if (!token || !threadId || busy) return;
+    setError(null);
+    setBusy(true);
+    setApplying(true);
+    setPendingProposal(false);
+    try {
+      // Deterministic apply: the backend re-harvests the proposed cut list from
+      // the assistant's last reply and compiles it -- exactly what the user saw.
+      await applyThreadEdit(threadId, token);
+      await refresh(threadId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not apply the edit.");
+      // Let the user try again.
+      setPendingProposal(true);
+    } finally {
+      setApplying(false);
+      setBusy(false);
+    }
+  }
+
+  function handleDeclineProposal() {
+    setPendingProposal(false);
   }
 
   // Ensure an edit session exists WITHOUT seeding the working doc (so manually
@@ -276,6 +305,7 @@ export function AiEditPanel() {
     setInput("");
     setError(null);
     setBusy(false);
+    setPendingProposal(false);
   }
 
   function handleSavedEdit(newVersion: number, newDoc: NonNullable<EditThread["document"]>) {
@@ -353,6 +383,10 @@ export function AiEditPanel() {
           </Bubble>
         ))}
 
+        {pendingProposal && !busy && (
+          <ProposalConfirm onYes={handleApplyProposal} onNo={handleDeclineProposal} />
+        )}
+
         {doc && <DocumentView doc={doc} version={thread?.document_version ?? null} />}
 
         {busy && (
@@ -361,7 +395,7 @@ export function AiEditPanel() {
             style={{ color: "var(--muted)" }}
           >
             <Loader2 size={14} className="animate-spin" />
-            {status === "drafting" ? "Applying the edit…" : "Thinking…"}
+            {applying || status === "drafting" ? "Applying the edit…" : "Thinking…"}
           </div>
         )}
 
@@ -440,6 +474,33 @@ function EmptyState() {
         Ask about your clips, talk through ideas, or describe an edit. EDSO only
         changes the timeline after it proposes a cut and you say go.
       </p>
+    </div>
+  );
+}
+
+function ProposalConfirm({ onYes, onNo }: { onYes: () => void; onNo: () => void }) {
+  return (
+    <div
+      className="flex flex-col gap-2 rounded-2xl border px-3 py-3"
+      style={{ borderColor: "var(--accent)", background: "var(--accent-soft)" }}
+    >
+      <p className="text-sm font-medium">Apply this cut to the timeline?</p>
+      <div className="flex gap-2">
+        <button
+          onClick={onYes}
+          className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-semibold transition-opacity hover:opacity-90"
+          style={{ background: "var(--accent)", color: "var(--background)" }}
+        >
+          <Check size={14} /> Yes, apply
+        </button>
+        <button
+          onClick={onNo}
+          className="rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--background)]"
+          style={{ borderColor: "var(--border)" }}
+        >
+          No
+        </button>
+      </div>
     </div>
   );
 }
