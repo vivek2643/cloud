@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAuthStore } from "@/stores/auth-store";
 import { useDriveStore } from "@/stores/drive-store";
 import { FileIcon } from "./file-icon";
@@ -73,6 +73,37 @@ function matchesFilter(h: HeroCut, key: FilterKey): boolean {
   return cutPrimitives(h).includes(key);
 }
 
+// The distinct capture primitives across a moment's member cuts.
+function momentPrimitives(members: HeroCut[]): string[] {
+  const s = new Set<string>();
+  for (const m of members) for (const p of cutPrimitives(m)) s.add(p);
+  return Array.from(s);
+}
+
+// A moment as ONE combined unit: plays the whole run by chaining each member's
+// span (a cluster is always within one file). keep_spans drives the jump-cut
+// preview; dragging takes the whole loose run. Members stay reachable on expand.
+function combinedHero(members: HeroCut[]): HeroCut {
+  const ordered = [...members].sort((a, b) => a.src_in_ms - b.src_in_ms);
+  const lead = ordered[0];
+  const inMs = Math.min(...ordered.map((m) => m.src_in_ms));
+  const outMs = Math.max(...ordered.map((m) => m.src_out_ms));
+  const playMs = ordered.reduce((s, m) => s + (m.src_out_ms - m.src_in_ms), 0);
+  return {
+    ...lead,
+    hero_id: lead.moment_id ?? `moment:${lead.hero_id}`,
+    src_in_ms: inMs,
+    src_out_ms: outMs,
+    duration_ms: outMs - inMs,
+    play_ms: playMs,
+    keep_spans: ordered.map((m) => ({ in_ms: m.src_in_ms, out_ms: m.src_out_ms })),
+    primitives: momentPrimitives(ordered),
+    score: Math.max(...ordered.map((m) => m.score)),
+    take_count: 1,
+    alt_takes: [],
+  };
+}
+
 function fmtDur(ms: number): string {
   const s = ms / 1000;
   if (s < 60) return `${s.toFixed(1)}s`;
@@ -98,6 +129,8 @@ export function HeroCutsView() {
   const [heroes, setHeroes] = useState<HeroCut[]>([]);
   const [loading, setLoading] = useState(false);
   const [activeHeroId, setActiveHeroId] = useState<string | null>(null);
+  // Which moment cards are expanded to show their member cuts (Moments tab).
+  const [expandedMoments, setExpandedMoments] = useState<Record<string, boolean>>({});
   const urlCache = useRef<Record<string, Promise<string | null>>>({});
 
   const candidates = useMemo(
@@ -257,19 +290,51 @@ export function HeroCutsView() {
       )}
 
       {!loading && totalClips > 0 && filter === "moment" && (
-        <div className="flex flex-col gap-5">
-          {clusters.map((c) => (
-            <MomentBundle
-              key={c.id}
-              members={c.members}
-              filesById={filesById}
-              getUrl={getUrl}
-              orientation={orientation}
-              fit={fit}
-              activeHeroId={activeHeroId}
-              setActiveHeroId={setActiveHeroId}
-            />
-          ))}
+        <div className="grid grid-cols-2 gap-4 md:grid-cols-3 2xl:grid-cols-4">
+          {clusters.map((c) => {
+            const combined = combinedHero(c.members);
+            const expanded = Boolean(expandedMoments[c.id]);
+            const ordered = [...c.members].sort((a, b) => a.src_in_ms - b.src_in_ms);
+            return (
+              <Fragment key={c.id}>
+                <HeroClipCard
+                  file={filesById[combined.file_id]!}
+                  hero={combined}
+                  getUrl={getUrl}
+                  orientation={orientation}
+                  fit={fit}
+                  isActive={activeHeroId === combined.hero_id}
+                  onActivate={() => setActiveHeroId(() => combined.hero_id)}
+                  onDeactivate={() =>
+                    setActiveHeroId((id) => (id === combined.hero_id ? null : id))
+                  }
+                  momentToggle={{
+                    count: ordered.length,
+                    expanded,
+                    onToggle: () =>
+                      setExpandedMoments((m) => ({ ...m, [c.id]: !expanded })),
+                  }}
+                />
+                {expanded &&
+                  ordered.map((h) => (
+                    <HeroClipCard
+                      key={h.hero_id}
+                      file={filesById[h.file_id]!}
+                      hero={h}
+                      getUrl={getUrl}
+                      orientation={orientation}
+                      fit={fit}
+                      memberOfMoment
+                      isActive={activeHeroId === h.hero_id}
+                      onActivate={() => setActiveHeroId(() => h.hero_id)}
+                      onDeactivate={() =>
+                        setActiveHeroId((id) => (id === h.hero_id ? null : id))
+                      }
+                    />
+                  ))}
+              </Fragment>
+            );
+          })}
         </div>
       )}
 
@@ -288,136 +353,6 @@ export function HeroCutsView() {
               onDeactivate={() =>
                 setActiveHeroId((id) => (id === h.hero_id ? null : id))
               }
-            />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// One moment = a connected bundle of first-class cuts. The header summarizes the
-// beat (its lead cut's gist + the relation mix); the members render as a small
-// grid so the editor sees the whole moment together and can grab any piece.
-function MomentBundle({
-  members,
-  filesById,
-  getUrl,
-  orientation,
-  fit,
-  activeHeroId,
-  setActiveHeroId,
-}: {
-  members: HeroCut[];
-  filesById: Record<string, FileRecord>;
-  getUrl: (fileId: string) => Promise<string | null>;
-  orientation: "landscape" | "portrait";
-  fit: "adjusted" | "original";
-  activeHeroId: string | null;
-  setActiveHeroId: React.Dispatch<React.SetStateAction<string | null>>;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const ordered = useMemo(
-    () => [...members].sort((a, b) => a.src_in_ms - b.src_in_ms),
-    [members]
-  );
-  const lead = ordered[0];
-  const relTypes = useMemo(() => {
-    const s = new Set<string>();
-    for (const m of members)
-      for (const r of m.relations ?? []) if (r.dir === "out") s.add(r.type);
-    return Array.from(s);
-  }, [members]);
-  const primMix = useMemo(() => {
-    const s = new Set<string>();
-    for (const m of members) for (const p of cutPrimitives(m)) s.add(p);
-    return Array.from(s);
-  }, [members]);
-
-  // The moment as ONE combined unit: play the whole run by chaining each
-  // member's span (a cluster is always within one file). keep_spans drives the
-  // jump-cut preview; dragging takes the whole loose run. Members stay reachable
-  // via "expand" -- combined by default, never collapsed away.
-  const combined = useMemo<HeroCut>(() => {
-    const inMs = Math.min(...ordered.map((m) => m.src_in_ms));
-    const outMs = Math.max(...ordered.map((m) => m.src_out_ms));
-    const playMs = ordered.reduce((s, m) => s + (m.src_out_ms - m.src_in_ms), 0);
-    return {
-      ...lead,
-      hero_id: lead.moment_id ?? `moment:${lead.hero_id}`,
-      src_in_ms: inMs,
-      src_out_ms: outMs,
-      duration_ms: outMs - inMs,
-      play_ms: playMs,
-      keep_spans: ordered.map((m) => ({ in_ms: m.src_in_ms, out_ms: m.src_out_ms })),
-      primitives: primMix,
-      score: Math.max(...ordered.map((m) => m.score)),
-      take_count: 1,
-      alt_takes: [],
-    };
-  }, [ordered, lead, primMix]);
-
-  return (
-    <div
-      className="rounded-xl border p-3"
-      style={{ borderColor: "var(--border)", background: "var(--sidebar)" }}
-    >
-      <div className="mb-3 flex flex-wrap items-center gap-2 px-1">
-        <span
-          className="flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold"
-          style={{ background: "#10b981", color: "#04110b" }}
-        >
-          <Layers size={12} /> Moment
-        </span>
-        <span className="text-sm font-medium">{lead.label || "(untitled moment)"}</span>
-        <span className="text-xs" style={{ color: "var(--muted)" }}>
-          {primMix.join(" · ")}
-          {relTypes.length > 0 && ` — ${relTypes.join(", ").replace(/_/g, " ")}`}
-        </span>
-        {/* Decompose the combined unit into its member cuts (and back). */}
-        <button
-          onClick={() => setExpanded((v) => !v)}
-          className="ml-auto flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium transition-colors hover:bg-[var(--background)]"
-          style={{ color: "var(--muted)" }}
-        >
-          {expanded ? "Hide cuts" : `Show ${ordered.length} cuts`}
-          <ChevronDown
-            size={13}
-            style={{ transform: expanded ? "rotate(180deg)" : "none", transition: "transform 0.2s" }}
-          />
-        </button>
-      </div>
-
-      {/* The combined moment preview (one unit, plays the whole run). */}
-      <div className="grid grid-cols-2 gap-4 md:grid-cols-3 2xl:grid-cols-4">
-        <HeroClipCard
-          file={filesById[lead.file_id]!}
-          hero={combined}
-          getUrl={getUrl}
-          orientation={orientation}
-          fit={fit}
-          isActive={activeHeroId === combined.hero_id}
-          onActivate={() => setActiveHeroId(() => combined.hero_id)}
-          onDeactivate={() => setActiveHeroId((id) => (id === combined.hero_id ? null : id))}
-        />
-      </div>
-
-      {/* Members, on demand -- nothing is hidden, just rolled up by default. */}
-      {expanded && (
-        <div className="mt-4 grid grid-cols-2 gap-4 border-t pt-4 md:grid-cols-3 2xl:grid-cols-4"
-          style={{ borderColor: "var(--border)" }}
-        >
-          {ordered.map((h) => (
-            <HeroClipCard
-              key={h.hero_id}
-              file={filesById[h.file_id]!}
-              hero={h}
-              getUrl={getUrl}
-              orientation={orientation}
-              fit={fit}
-              isActive={activeHeroId === h.hero_id}
-              onActivate={() => setActiveHeroId(() => h.hero_id)}
-              onDeactivate={() => setActiveHeroId((id) => (id === h.hero_id ? null : id))}
             />
           ))}
         </div>
@@ -579,6 +514,8 @@ function HeroClipCard({
   isActive,
   onActivate,
   onDeactivate,
+  momentToggle,
+  memberOfMoment,
 }: {
   file: FileRecord;
   hero: HeroCut;
@@ -588,6 +525,12 @@ function HeroClipCard({
   isActive: boolean;
   onActivate: () => void;
   onDeactivate: () => void;
+  // When set, this card is a COMBINED moment unit: show a green "Moment · N"
+  // pill that toggles its member cuts in/out of the grid below it.
+  momentToggle?: { count: number; expanded: boolean; onToggle: () => void };
+  // A member cut shown under an expanded moment -- subtly accented so the
+  // grouping reads at a glance within the flat grid.
+  memberOfMoment?: boolean;
 }) {
   const [playUrl, setPlayUrl] = useState<string | null>(null);
   const [muted, setMuted] = useState(false);
@@ -733,7 +676,10 @@ function HeroClipCard({
       )}
       <div
         className="group relative z-[1] flex flex-col overflow-hidden rounded-xl border transition-colors hover:border-[var(--accent)]"
-        style={{ borderColor: "var(--border)", background: "var(--background)" }}
+        style={{
+          borderColor: memberOfMoment ? "rgba(16,185,129,0.5)" : "var(--border)",
+          background: "var(--background)",
+        }}
       >
       <div
         onMouseEnter={handleEnter}
@@ -773,6 +719,29 @@ function HeroClipCard({
             <span style={{ opacity: 0.85 }}>+ {extraPrims.join(" + ")}</span>
           )}
         </span>
+
+        {/* Moment pill (top-left, below the primitive badge): this card is the
+            combined moment; clicking it folds its member cuts in/out. */}
+        {momentToggle && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              momentToggle.onToggle();
+            }}
+            className="absolute left-2 top-9 z-30 flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-semibold"
+            style={{ background: "#10b981", color: "#04110b" }}
+            title={`${momentToggle.count} cuts in this moment`}
+          >
+            <Layers size={11} /> Moment · {momentToggle.count}
+            <ChevronDown
+              size={11}
+              style={{
+                transform: momentToggle.expanded ? "rotate(180deg)" : "none",
+                transition: "transform 0.2s",
+              }}
+            />
+          </button>
+        )}
 
         {/* Take-stack badge (top-left, below the modality badge) when repeats exist. */}
         {hero.take_count > 1 && (
