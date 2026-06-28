@@ -62,7 +62,13 @@ FUSE_MOMENTS_BELOW = 0.6
 # (gap 0 -> only literally-overlapping complementary beats group, everything
 # else stands as its own punchy cut). Pairs with the relatedness GATE in
 # hero_cuts (shared actor/region still required -- this only sets the reach).
-_FUSE_GAP_MS = (1500, 1000, 600, 250, 0)
+#
+# Re-centered onto the 2-4 WORKING range: bands 1 (Broad) and 5 (Sharp) are
+# rarely-used extremes, so the whole fuse->atomize transition is packed into
+# Calm/Balanced/Tight. Atomize (gap 0) now arrives at TIGHT (band 4); Sharp adds
+# only the breath-removal punch on top. A typical small moment thus exposes its
+# peak member within the working range, not only at the extreme.
+_FUSE_GAP_MS = (1500, 800, 350, 0, 0)
 
 # --- Five bands (match UI: Broad, Calm, Balanced, Tight, Sharp) ---------------
 BAND_EDGES = (0.2, 0.4, 0.6, 0.8)   # band i covers [edge[i-1], edge[i]) with 0 at start

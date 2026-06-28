@@ -60,7 +60,12 @@ logger = logging.getLogger(__name__)
 # v7: per-clip `default_energy` (genre opens the slider calm/punchy) + each
 # cluster carries collapsed `rungs` -- only the meaningfully-distinct zoom steps
 # (look-alike ladder rungs merged), so the UI shows real choices not duplicates.
-TREE_VERSION = 7
+# v8: leaner, less-opinionated resident line -- the brain reads the capture
+# PRIMITIVE (what was captured), not the editorial affordance; the narrative
+# `role` tag is dropped (no baked intent -> the brain decides at placement); a
+# graphic's gist is a short tag shown only when speech doesn't already narrate
+# it. Clusters carry the primitive mix too.
+TREE_VERSION = 8
 
 # Band index -> energy-level name. Band 2 (energy 0.5) is the anchor: one
 # complete thought per cut. Lower = wider (whole answer), higher = tighter.
@@ -90,6 +95,10 @@ def _out(cut: Dict[str, Any]) -> int:
 
 def _overlap_ms(a0: int, a1: int, b0: int, b1: int) -> int:
     return max(0, min(a1, b1) - max(a0, b0))
+
+
+def _overlaps_any(a0: int, a1: int, spans: List[Tuple[int, int]]) -> bool:
+    return any(_overlap_ms(a0, a1, b0, b1) > 0 for b0, b1 in spans)
 
 
 def _variant_from_rung(rung: Dict[str, Any], hero_id: Optional[str]) -> Dict[str, Any]:
@@ -198,15 +207,22 @@ def _build_clusters(moments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         ladder, peak = _cluster_ladder(members)
         ordered = sorted(members, key=lambda m: int(m["in_ms"]))
         affs = []
+        prims = []
         for m in ordered:
             for a in (m.get("affordances") or []):
                 if a and a not in affs:
                     affs.append(a)
+            for p in (m.get("primitives") or []):
+                if p and p not in prims:
+                    prims.append(p)
         clusters.append({
             "cluster_id": cid,
             "members": [m["moment_id"] for m in ordered],
             "peak": peak,
             "affordances": affs,
+            # The capture mix across members (person+speech+graphic ...) -- what
+            # the whole moment is made of, primitive-led like the per-cut line.
+            "primitives": prims,
             "in_ms": min(int(m["in_ms"]) for m in ordered),
             "out_ms": max(int(m["out_ms"]) for m in ordered),
             "ladder": ladder,
@@ -234,6 +250,13 @@ def build_clip_tree(
     fid8 = file_id[:8]
     moments: List[Dict[str, Any]] = []
     ordered = sorted(cuts, key=_in)
+    # Spans where SPEECH is on the track. A graphic's gist is redundant when the
+    # voiceover already narrates it (the screen-recording case), so we suppress
+    # the gist from the resident line whenever speech overlaps the graphic span.
+    speech_spans = [
+        (_in(c), _out(c)) for c in ordered
+        if "speech" in (c.get("primitives") or []) or "speech" in (c.get("affordances") or [])
+    ]
     # Map each cut's hero_id to the tree-local moment id so relation endpoints
     # (which reference other cuts by hero_id) can be expressed in the same id
     # space the brain reads in the index.
@@ -259,8 +282,13 @@ def build_clip_tree(
             "primitives": cut.get("primitives") or [],
             # Gist of an information-dense graphic (what it conveys), when present.
             "summary": cut.get("summary"),
+            # True when speech overlaps this span -- the gist is redundant in the
+            # resident line (the brain hears it); still kept for Tier-1.
+            "summary_covered_by_speech": bool(
+                cut.get("summary")
+                and _overlaps_any(anchor["in_ms"], anchor["out_ms"], speech_spans)
+            ),
             "speaker": cut.get("speaker"),
-            "role": cut.get("role"),
             "gist": cut.get("label") or "",
             "flags": cut.get("flags") or [],
             "score": float(cut.get("score", 0.0)),
@@ -422,14 +450,28 @@ def _fmt_ts(ms: int) -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
-def _affordance_tag(m: Dict[str, Any]) -> str:
-    """Show the full modality mix for multi-affordance moments (speech+reaction),
-    else the single modality -- so the brain sees a cut carries more than one
-    thing to land on."""
+def _capture_tag(m: Dict[str, Any]) -> str:
+    """WHAT this cut captured -- the intrinsic primitive(s) (person / action /
+    place / object / graphic / speech). The honest atom the brain reads, instead
+    of the editorial affordance (which is a derived USE, and biases). Multi-
+    primitive cuts show the mix (person+speech). Falls back to the affordance mix
+    only when a cut carries no primitives."""
+    prims = [p for p in (m.get("primitives") or []) if p]
+    if prims:
+        return "+".join(prims)
     affs = [a for a in (m.get("affordances") or []) if a]
     if len(affs) > 1:
         return "+".join(affs)
     return m.get("modality") or (affs[0] if affs else "")
+
+
+def _short_gist(s: str, max_words: int = 6) -> str:
+    """A graphic's gist, capped to a few words -- enough to register what the
+    frame conveys without bloating the resident line (the full text is Tier-1)."""
+    words = s.strip().split()
+    if len(words) <= max_words:
+        return s.strip()
+    return " ".join(words[:max_words]) + "\u2026"
 
 
 def _people_tag(m: Dict[str, Any]) -> str:
@@ -470,19 +512,24 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     nrg = "|".join(L for L in _LEVEL_NAMES if L in levels)
     spk = f" {m['speaker']}" if m.get("speaker") else ""
     cam = _people_tag(m)
-    role = f" *{m['role']}*" if m.get("role") else ""
     gist = (m.get("gist") or "").strip().replace("\n", " ")
     # Resident mode gives the model the FULL line so it picks by reading, not
     # guessing; compact (paged) mode truncates and relies on inspect_moment.
     if compact and len(gist) > 80:
         gist = gist[:77] + "..."
+    # A graphic's gist, only when speech doesn't already narrate it (else it's
+    # redundant -- the brain hears it). Short tag; full text via inspect_moment.
+    gloss = ""
+    summ = (m.get("summary") or "").strip().replace("\n", " ")
+    if summ and not m.get("summary_covered_by_speech"):
+        gloss = f" shows:\"{_short_gist(summ)}\""
     dup = ""
     if m.get("dup_group"):
         dup = f" · dup:{m['dup_group']}{'*' if m.get('dup_best') else ''}"
-    return (f"  {m['moment_id'].split(':')[-1]} {_affordance_tag(m)}{spk}{cam}{role} "
+    return (f"  {m['moment_id'].split(':')[-1]} {_capture_tag(m)}{spk}{cam} "
             f".{int(round(m['score'] * 100)):02d} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])}] "
-            f"\"{gist}\" · nrg:{nrg}{dup}{_relation_tag(m)}")
+            f"\"{gist}\"{gloss} · nrg:{nrg}{dup}{_relation_tag(m)}")
 
 
 def _short_mid(mid: str) -> str:
@@ -490,16 +537,18 @@ def _short_mid(mid: str) -> str:
 
 
 def _cluster_line(c: Dict[str, Any]) -> str:
-    """One line for a connected bundle (moment-as-unit): its peak, the affordance
-    mix, the run span, and the whole-run -> peak zoom ladder so the brain can
-    take the whole moment loose or just its peak when tight."""
-    affs = "+".join(a for a in (c.get("affordances") or []) if a)
+    """One line for a connected bundle (moment-as-unit): its capture mix, the run
+    span, the peak member, and the whole-run -> peak zoom ladder so the brain can
+    place the moment as ONE thing -- the whole run loose, or just its peak when
+    tight. Members are still listed above (each tagged with this cluster id), so
+    nothing is hidden; this is the rolled-up unit on top of them."""
+    mix = "+".join(p for p in (c.get("primitives") or c.get("affordances") or []) if p)
     rungs = []
     for L in _LEVEL_NAMES:
         ids = c["ladder"].get(L) or []
         if ids:
             rungs.append(f"{L}:{','.join(_short_mid(i) for i in ids)}")
-    return (f"  moment {_short_mid(c['cluster_id'])} {affs} "
+    return (f"  moment {_short_mid(c['cluster_id'])} {mix} "
             f"[{_fmt_ts(c['in_ms'])}-{_fmt_ts(c['out_ms'])}] "
             f"peak={_short_mid(c['peak'])} · zoom {' -> '.join(rungs)}")
 
@@ -656,9 +705,88 @@ def assemble_map(file_ids: List[str], *, compact: bool = False) -> Dict[str, Any
 # Tier-1 retrieval (full record for one moment, on demand)
 # --------------------------------------------------------------------------
 
+def _as_doc(v: Any) -> Dict[str, Any]:
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str) and v:
+        try:
+            return json.loads(v)
+        except Exception:
+            return {}
+    return {}
+
+
+# Context window padding when retrieving raw detail for a span -- a little before
+# and after the moment so the brain reads it in situ, not abruptly clipped.
+_DETAIL_PAD_MS = 1200
+
+
+def _span_detail(file_id: str, in_ms: int, out_ms: int) -> Dict[str, Any]:
+    """The RAW source detail overlapping a moment's span -- the brain's Tier-1
+    'open the file and read' depth: the VLM event timeline, the content-unit /
+    cutaway records, and the verbatim transcript window. Kept OUT of the resident
+    prompt; loaded on demand only when the brain inspects a candidate. Best-effort
+    -- a missing artifact simply yields fewer fields."""
+    lo, hi = in_ms - _DETAIL_PAD_MS, out_ms + _DETAIL_PAD_MS
+
+    def _ov(a0: Any, a1: Any) -> bool:
+        try:
+            return _overlap_ms(int(a0), int(a1), lo, hi) > 0
+        except Exception:
+            return False
+
+    out: Dict[str, Any] = {"events": [], "content_units": [], "cutaways": [], "transcript": []}
+    try:
+        with _pg_conn() as conn:
+            row = conn.execute(
+                "select cp.perception, ds.segments "
+                "from files f "
+                "left join clip_perception cp on cp.file_id = f.id "
+                "left join dialogue_segments ds on ds.file_id = f.id "
+                "where f.id = %s",
+                (file_id,),
+            ).fetchone()
+    except Exception:
+        logger.exception("moment_detail: span detail load failed for %s", file_id)
+        return out
+    if not row:
+        return out
+    perception, segments = _as_doc(row[0]), _as_doc(row[1])
+
+    out["events"] = [
+        {"start_ms": e.get("start_ms"), "end_ms": e.get("end_ms"),
+         "actor": e.get("actor"), "description": e.get("description")}
+        for e in (perception.get("events") or [])
+        if _ov(e.get("start_ms", 0), e.get("end_ms", 0))
+    ]
+    out["content_units"] = [
+        {"start_ms": u.get("start_ms"), "end_ms": u.get("end_ms"), "kind": u.get("kind"),
+         "primitive": u.get("primitive"), "label": u.get("label") or u.get("content_key")}
+        for u in (perception.get("content_units") or [])
+        if _ov(u.get("start_ms", 0), u.get("end_ms", 0))
+    ]
+    out["cutaways"] = [
+        {"start_ms": c.get("start_ms"), "end_ms": c.get("end_ms"), "kind": c.get("kind"),
+         "primitive": c.get("primitive"), "label": c.get("label"), "summary": c.get("summary")}
+        for c in (perception.get("cutaways") or [])
+        if _ov(c.get("start_ms", 0), c.get("end_ms", 0))
+    ]
+    # Verbatim transcript window (sentence granularity) -- the words actually
+    # spoken across the span, so the brain reads the line, not just the gist.
+    out["transcript"] = [
+        {"speaker": s.get("speaker"), "text": s.get("text"),
+         "in_ms": s.get("src_in_ms", s.get("in_ms")), "out_ms": s.get("src_out_ms", s.get("out_ms"))}
+        for s in (segments.get("sentence") or [])
+        if _ov(s.get("src_in_ms", s.get("in_ms", 0)), s.get("src_out_ms", s.get("out_ms", 0)))
+    ]
+    return out
+
+
 def moment_detail(file_id: str, moment_id: str) -> Optional[Dict[str, Any]]:
-    """The full record for one moment -- every variant span, every atom, and the
-    parent clip's context. What the model retrieves to inspect a candidate."""
+    """The full record for one moment -- every variant span, the parent clip's
+    context, AND the raw source detail over its span (VLM events, content units /
+    cutaways, transcript window). What the model retrieves to inspect a candidate
+    deeply, without any of it living in the resident prompt."""
     tree = get_trees([file_id]).get(file_id)
     if not tree:
         return None
@@ -678,4 +806,6 @@ def moment_detail(file_id: str, moment_id: str) -> Optional[Dict[str, Any]]:
             "logline": tree.get("logline"),
         },
         "moment": m,
+        # Tier-1 raw detail over the moment's span (events / units / transcript).
+        "source": _span_detail(file_id, int(m["in_ms"]), int(m["out_ms"])),
     }

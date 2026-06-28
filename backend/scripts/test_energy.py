@@ -77,12 +77,18 @@ def test_moments_fuse_low_split_high():
 
 
 def test_fuse_gap_ladder_widens_low_atomizes_high():
-    """The relatedness reach is the fuse<->atomize dial: widest at Broad,
-    monotonically shrinking, exactly 0 at Sharp (atomize)."""
-    gaps = [energy_to_params(e).fuse_gap_ms for e in (0.0, 0.3, 0.5, 0.7, 1.0)]
-    assert gaps[0] > gaps[1] > gaps[2] > gaps[3] > gaps[4], gaps
-    assert gaps[-1] == 0, gaps
-    print("ok  fuse-gap ladder widens low / atomizes high")
+    """The relatedness reach is the fuse<->atomize dial, RE-CENTERED onto the
+    2-4 working range: widest at Broad, shrinking through Calm/Balanced, and
+    atomized (gap 0) by TIGHT -- Sharp stays 0 (it only adds breath-removal).
+    Bands 1 (Broad) and 5 (Sharp) are saturated extremes, not where the
+    transition lives."""
+    broad, calm, balanced, tight, sharp = (
+        energy_to_params(e).fuse_gap_ms for e in (0.0, 0.3, 0.5, 0.7, 1.0)
+    )
+    assert broad > calm > balanced > 0, (broad, calm, balanced)
+    assert tight == 0, tight          # atomize arrives in the working range
+    assert sharp == 0, sharp          # and stays atomized at the extreme
+    print("ok  fuse-gap ladder re-centered (atomizes by Tight)")
 
 
 def test_bands_and_action_modes():

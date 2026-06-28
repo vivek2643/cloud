@@ -94,7 +94,10 @@ _MERGE_LEN_RATIO = 0.7
 # v11: cuts carry the VLM's STATED capture `primitive` (overriding the coarse
 # affordance derivation), so a screen UI logged as b-roll is honestly a graphic,
 # a face is a person, etc. -- and relatedness weaving sees the true kinds.
-PARAMS_VERSION = 11
+# v12: fuse<->atomize ladder re-centered onto the 2-4 working range (atomize
+# arrives at Tight, not only Sharp), so a fused moment exposes its peak member
+# within the commonly-used energy range.
+PARAMS_VERSION = 12
 
 # The five canonical product energy LEVELS = the band centers (Broad .. Sharp).
 # Hero cuts are precomputed at exactly these after L2; any requested energy
