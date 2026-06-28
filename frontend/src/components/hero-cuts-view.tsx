@@ -732,7 +732,7 @@ function HeroClipCard({
             style={{ background: "#10b981", color: "#04110b" }}
             title={`${momentToggle.count} cuts in this moment`}
           >
-            <Layers size={11} /> Moment · {momentToggle.count} cuts
+            <Layers size={11} /> Moment
             <ChevronDown
               size={11}
               style={{
