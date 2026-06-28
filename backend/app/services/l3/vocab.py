@@ -2,29 +2,78 @@
 The locked editing vocabulary -- the single source of truth for the whole cut
 pipeline (L2 perception, L3 assembly, the brain-facing map, the frontend).
 
-Three closed sets, defined by EDITORIAL MEANING, never by detection method:
+The model is LAYERED: the substrate is intrinsic (what the camera/mic captured,
+true regardless of what you're making); everything editorial is DERIVED on top.
 
-  * AFFORDANCES -- *why an editor reaches for a shot*. Frozen at five. A new
-    detector (motion, the event timeline, the cutaway track, audio) never adds an
-    affordance; it MAPS into one of these (see ``SOURCE_AFFORDANCE``). This is the
-    permanent guard against the bucket list ever growing.
+  * CAPTURE PRIMITIVES -- *what was captured*. The intrinsic, intent-free
+    substrate: visual (person / action / place / object / graphic) + audio
+    (speech; music/sfx deferred). These describe the frame/track content and
+    never depend on the target edit. This is the honest atom of a cut.
+
+  * AFFORDANCES -- *why an editor reaches for a shot* (speech/action/reaction/
+    broll/insert). The editor-facing VIEW layer (the UI's filter tabs). Frozen
+    at five; a new detector MAPS into one (see ``SOURCE_AFFORDANCE``), never adds
+    one. Each affordance maps DOWN to a capture primitive (``AFFORDANCE_PRIMITIVE``)
+    -- and two of them (reaction, broll) are *derived views*, not primitives:
+    a reaction is a PERSON shot + a `responds_to` relation; b-roll is a
+    place/object USED as supplementary footage. Their meaning lives in relations
+    and use, not in the capture.
 
   * RELATIONS -- *how two cuts connect*. A typed, (mostly) directed graph over
-    cuts. These are extracted at the source (the VLM states them) rather than
-    guessed from time overlap, so the brain reasons about real relationships.
+    cuts. Extracted at the source (the VLM states them) rather than guessed from
+    time overlap, so the brain reasons about real relationships.
 
   * ROLES -- *what a cut is FOR* in a narrative (hook, answer, ...). Node-level
-    intent the brain needs to build structure, not just adjacency.
+    intent -- assigned at PLACEMENT (the brain), not baked into the capture.
 
 Everything downstream imports these names; nothing redefines them. Pure module
 (no deps) so both L2 and L3 can import it freely.
 """
 from __future__ import annotations
 
-from typing import Dict, FrozenSet, Tuple
+from typing import Dict, FrozenSet, List, Tuple
 
 # --------------------------------------------------------------------------
-# Affordances (closed set of FIVE -- the only editorial buckets that exist)
+# Capture primitives -- WHAT was captured (the intrinsic, intent-free substrate)
+# --------------------------------------------------------------------------
+# Visual: what the frame is *about*.
+PRIM_PERSON = "person"     # a human in frame (the subject), whether speaking or not
+PRIM_ACTION = "action"     # a physical event / motion / business (something done)
+PRIM_PLACE = "place"       # an environment / establishing / scenery
+PRIM_OBJECT = "object"     # a thing / detail / close-up
+PRIM_GRAPHIC = "graphic"   # on-screen text / title / chart / info (carries a gist)
+# Audio: what the track carries. (music / sfx are a deferred pipeline.)
+PRIM_SPEECH = "speech"     # dialogue / voiceover
+
+VISUAL_PRIMITIVES: Tuple[str, ...] = (
+    PRIM_PERSON, PRIM_ACTION, PRIM_PLACE, PRIM_OBJECT, PRIM_GRAPHIC,
+)
+AUDIO_PRIMITIVES: Tuple[str, ...] = (PRIM_SPEECH,)
+CAPTURE_PRIMITIVES: Tuple[str, ...] = VISUAL_PRIMITIVES + AUDIO_PRIMITIVES
+CAPTURE_PRIMITIVE_SET: FrozenSet[str] = frozenset(CAPTURE_PRIMITIVES)
+
+# Derived VIEWS -- not captured things; editor-facing lenses computed from a
+# primitive plus a relation/use. Kept for the UI's filter tabs; NEVER primitives.
+#   reaction = a PERSON shot + a `responds_to` relation (meaning is relational)
+#   broll    = a place/object/person USED as supplementary footage (use, not capture)
+#   moment   = a COMPOSITE (a connected cluster of cuts)
+VIEW_REACTION = "reaction"
+VIEW_BROLL = "broll"
+VIEW_MOMENT = "moment"
+DERIVED_VIEWS: Tuple[str, ...] = (VIEW_REACTION, VIEW_BROLL, VIEW_MOMENT)
+DERIVED_VIEW_SET: FrozenSet[str] = frozenset(DERIVED_VIEWS)
+
+
+def is_capture_primitive(x: str) -> bool:
+    return x in CAPTURE_PRIMITIVE_SET
+
+
+def is_derived_view(x: str) -> bool:
+    return x in DERIVED_VIEW_SET
+
+
+# --------------------------------------------------------------------------
+# Affordances (closed set of FIVE -- the editor-facing VIEW layer)
 # --------------------------------------------------------------------------
 AFF_SPEECH = "speech"      # hear what is said (sync audio is the point)
 AFF_ACTION = "action"      # see something done / happen (incl. gestures, business)
@@ -73,6 +122,35 @@ def affordance_for(kind: str) -> str:
     """Map a detection ``kind`` to its (closed-set) affordance. Unknown kinds
     fall back to b-roll (a neutral visual), never a new bucket."""
     return SOURCE_AFFORDANCE.get((kind or "").lower(), AFF_BROLL)
+
+
+# Each editor-facing affordance maps DOWN to the capture primitive beneath it.
+# reaction -> person (the reaction-ness is the `responds_to` relation, not the
+# capture); broll -> place (coarse; refined to place/object once L2 emits the
+# subject); insert -> graphic.
+AFFORDANCE_PRIMITIVE: Dict[str, str] = {
+    AFF_SPEECH: PRIM_SPEECH,
+    AFF_ACTION: PRIM_ACTION,
+    AFF_REACTION: PRIM_PERSON,
+    AFF_BROLL: PRIM_PLACE,
+    AFF_INSERT: PRIM_GRAPHIC,
+}
+
+
+def primitive_for_affordance(aff: str) -> str:
+    """The capture primitive beneath an editor-facing affordance."""
+    return AFFORDANCE_PRIMITIVE.get((aff or "").lower(), PRIM_PLACE)
+
+
+def primitives_for(affordances: List[str]) -> List[str]:
+    """The distinct capture primitive(s) a cut delivers, from its affordance(s).
+    The intrinsic 'what was captured' layer beneath the editorial view(s)."""
+    out: List[str] = []
+    for a in affordances or ():
+        p = primitive_for_affordance(a)
+        if p not in out:
+            out.append(p)
+    return out
 
 
 # A physical/visual beat (vs. passive texture). Used to decide what counts as a

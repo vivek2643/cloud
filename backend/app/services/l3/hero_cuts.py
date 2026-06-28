@@ -274,6 +274,12 @@ class HeroCut:
             return self.src_out_ms - self.src_in_ms
         return sum(max(0, b - a) for a, b in self.keep_spans)
 
+    def primitives(self) -> List[str]:
+        """The capture primitive(s) this cut delivers (person/action/place/
+        object/graphic/speech), derived from its affordance(s). The intrinsic
+        'what was captured' substrate beneath the editor-facing affordance."""
+        return vocab.primitives_for(self.affordances or [self.modality])
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "hero_id": self.hero_id,
@@ -290,6 +296,8 @@ class HeroCut:
             "speaker": self.speaker,
             "flags": self.flags,
             "affordances": self.affordances or [self.modality],
+            # Intrinsic capture substrate beneath the editor-facing affordances.
+            "primitives": self.primitives(),
             "take_count": self.take_count,
             "alt_takes": [t.to_dict() for t in self.alt_takes],
             # Facets (additive; UI-safe). Only emitted when populated so the

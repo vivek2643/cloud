@@ -233,6 +233,8 @@ def build_clip_tree(
             "file_id": file_id,
             "modality": cut.get("modality"),
             "affordances": cut.get("affordances") or ([cut.get("modality")] if cut.get("modality") else []),
+            # Intrinsic capture substrate (person/action/place/object/graphic/speech).
+            "primitives": cut.get("primitives") or [],
             "speaker": cut.get("speaker"),
             "role": cut.get("role"),
             "gist": cut.get("label") or "",
