@@ -235,6 +235,8 @@ def build_clip_tree(
             "affordances": cut.get("affordances") or ([cut.get("modality")] if cut.get("modality") else []),
             # Intrinsic capture substrate (person/action/place/object/graphic/speech).
             "primitives": cut.get("primitives") or [],
+            # Gist of an information-dense graphic (what it conveys), when present.
+            "summary": cut.get("summary"),
             "speaker": cut.get("speaker"),
             "role": cut.get("role"),
             "gist": cut.get("label") or "",

@@ -75,6 +75,7 @@ class Anchor:
     actor: Optional[str] = None      # person local_id when known
     region: Optional[dict] = None    # coarse frame box for reframing
     text: Optional[str] = None       # label / spoken text / description
+    summary: Optional[str] = None    # gist of an information-dense graphic (what it conveys)
     speaker: Optional[str] = None    # diarized speaker (speech)
     flags: List[str] = field(default_factory=list)
     source_id: Optional[str] = None  # originating artifact id (seg_id/unit_id/event id)
@@ -84,7 +85,8 @@ class Anchor:
             "ts_ms": self.ts_ms, "start_ms": self.start_ms, "end_ms": self.end_ms,
             "kind": self.kind, "affordance": self.affordance,
             "salience": round(self.salience, 3), "actor": self.actor,
-            "text": self.text, "speaker": self.speaker, "flags": self.flags,
+            "text": self.text, "summary": self.summary,
+            "speaker": self.speaker, "flags": self.flags,
             "source_id": self.source_id,
         }
 
@@ -497,9 +499,11 @@ def _cutaway_anchors(cutaways: List[dict]) -> List[Anchor]:
         if sal is None:
             sal = 0.55 if affordance == AFF_INSERT else 0.5
         label = (c.get("label") or kind).strip()
+        summary = (c.get("summary") or "").strip() or None
         out.append(Anchor(
             ts_ms=ts, start_ms=ha, end_ms=hb, kind=anchor_kind, affordance=affordance,
             salience=_clamp01(float(sal)), actor=c.get("subject"), text=label[:200],
+            summary=summary[:400] if summary else None,
         ))
     return out
 

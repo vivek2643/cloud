@@ -933,6 +933,7 @@ def test_facet_record_round_trips():
                  "av_link_confidence": 1.0}],
         framing={"shot_size": "medium", "angle": "eye_level", "movement": "static"},
         quality={"delivery": 0.82, "vlm": 0.6},
+        summary="revenue up 40% in Q3",
     )
     # Rung helpers
     sharp = ladder[1]
@@ -946,6 +947,7 @@ def test_facet_record_round_trips():
     assert back.people[0]["person_id"] == "p1" and back.people[0]["on_camera"] is True
     assert back.framing["shot_size"] == "medium"
     assert back.quality["delivery"] == 0.82
+    assert back.summary == "revenue up 40% in Q3"
     # A cut with no facets emits null (compact) and rehydrates empty.
     plain = hc.HeroCut("z:sp1", "zzzz", "speech", "x", 0, 100, score=0.1)
     d = plain.to_dict()

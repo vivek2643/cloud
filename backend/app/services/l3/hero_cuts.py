@@ -89,7 +89,9 @@ _MERGE_LEN_RATIO = 0.7
 # one beat when it co-occurs, weaves different kinds, or is a continuous same-
 # kind run; mere succession of the same kind across a gap stays apart. So
 # action+action fuses when continuous and not when it's just successive beats.
-PARAMS_VERSION = 9
+# v10: graphic/insert cuts carry a `summary` (the VLM's gist of an info-dense
+# graphic) end-to-end, so the brain places a graphic by what it CONVEYS.
+PARAMS_VERSION = 10
 
 # The five canonical product energy LEVELS = the band centers (Broad .. Sharp).
 # Hero cuts are precomputed at exactly these after L2; any requested energy
@@ -268,6 +270,11 @@ class HeroCut:
     # held listening shot. None for ordinary middle content. The brain uses it to
     # build structure (open on the hook, land on the answer), not just adjacency.
     role: Optional[str] = None
+    # For an information-dense graphic / insert cut, the gist of what it CONVEYS
+    # (from the VLM's `summary`, not OCR) -- e.g. "revenue up 40% in Q3". None for
+    # ordinary footage. Lets the brain place a graphic by its meaning + reason
+    # about a claim it backs, without re-reading the frame.
+    summary: Optional[str] = None
 
     def is_moment(self) -> bool:
         """True when this cut is part of a multi-cut moment cluster (it has a
@@ -316,6 +323,7 @@ class HeroCut:
             "relations": self.relations or None,
             "moment_id": self.moment_id,
             "role": self.role,
+            "summary": self.summary,
             "is_moment": self.is_moment(),
         }
 
@@ -344,6 +352,7 @@ class HeroCut:
             relations=list(d.get("relations") or []),
             moment_id=d.get("moment_id"),
             role=d.get("role"),
+            summary=d.get("summary"),
         )
 
 
@@ -1443,7 +1452,8 @@ def _collapse_insert_anchors(items: List[anc.Anchor], gap_ms: int) -> List[anc.A
                     ts_ms=prev.ts_ms, start_ms=prev.start_ms, end_ms=max(prev.end_ms, a.end_ms),
                     kind=prev.kind, affordance=prev.affordance,
                     salience=max(prev.salience, a.salience), actor=prev.actor or a.actor,
-                    text=prev.text, source_id=prev.source_id,
+                    text=prev.text, summary=prev.summary or a.summary,
+                    source_id=prev.source_id,
                 )
                 continue
         out.append(a)
@@ -1782,6 +1792,7 @@ def _beat_segments(clip: _ClipInputs, field: Optional[fseams.FusedField],
                 ladder=ladder,
                 people=_beat_people(best),
                 framing=_framing_facet(clip, in_ms, out_ms, best.region),
+                summary=best.summary,
             ))
     return out
 
