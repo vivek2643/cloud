@@ -284,13 +284,17 @@ export function HeroCutsView() {
     const winners: Record<string, HeroCut[]> = {};
     for (const h of collapsed) (winners[h.file_id] ??= []).push(h);
     for (const list of Object.values(winners)) list.sort((a, b) => b.score - a.score);
+    // Every losing take (the whole point of "All": show it all). Each take is
+    // appended -- greyed -- to the file group it physically lives in, tagged
+    // with where its better version won. Cross-file or same-file, all surface.
     const losers: Record<string, LoserTake[]> = {};
     for (const h of present) {
       for (const t of h.alt_takes ?? []) {
-        if (!t.file_id || t.file_id === h.file_id || !filesById[t.file_id]) continue;
-        (losers[t.file_id] ??= []).push({
-          key: `${h.hero_id}~${t.file_id}~${t.src_in_ms}`,
-          file_id: t.file_id,
+        const fid = t.file_id || h.file_id;
+        if (!filesById[fid]) continue;
+        (losers[fid] ??= []).push({
+          key: `${h.hero_id}~${fid}~${t.src_in_ms}`,
+          file_id: fid,
           src_in_ms: t.src_in_ms,
           src_out_ms: t.src_out_ms,
           score: t.score,
@@ -430,29 +434,37 @@ export function HeroCutsView() {
                     onDeactivate={() => setActiveHeroId((id) => (id === h.hero_id ? null : id))}
                   />
                 ))}
-                {g.losers.map((l) => (
-                  <div
-                    key={l.key}
-                    className="relative opacity-45 transition-opacity hover:opacity-90"
-                    title={`Best take is in ${filesById[l.bestFileId]?.name ?? "another clip"}`}
-                  >
-                    <div className="grayscale">
-                      <HeroClipCard
-                        file={filesById[l.file_id]!}
-                        hero={loserHero(l)}
-                        getUrl={getUrl}
-                        orientation={orientation}
-                        fit={fit}
-                        isActive={activeHeroId === l.key}
-                        onActivate={() => setActiveHeroId(l.key)}
-                        onDeactivate={() => setActiveHeroId((id) => (id === l.key ? null : id))}
-                      />
+                {g.losers.map((l) => {
+                  const crossFile = l.bestFileId !== l.file_id;
+                  const bestName = filesById[l.bestFileId]?.name;
+                  return (
+                    <div
+                      key={l.key}
+                      className="relative opacity-45 transition-opacity hover:opacity-90"
+                      title={
+                        crossFile && bestName
+                          ? `A better take exists in ${bestName}`
+                          : "A better take of this exists"
+                      }
+                    >
+                      <div className="grayscale">
+                        <HeroClipCard
+                          file={filesById[l.file_id]!}
+                          hero={loserHero(l)}
+                          getUrl={getUrl}
+                          orientation={orientation}
+                          fit={fit}
+                          isActive={activeHeroId === l.key}
+                          onActivate={() => setActiveHeroId(l.key)}
+                          onDeactivate={() => setActiveHeroId((id) => (id === l.key ? null : id))}
+                        />
+                      </div>
+                      <span className="pointer-events-none absolute left-1/2 top-2 z-30 -translate-x-1/2 rounded bg-black/75 px-1.5 py-0.5 text-[10px] font-medium text-white">
+                        better take exists{crossFile && bestName ? ` ↗ ${bestName}` : ""}
+                      </span>
                     </div>
-                    <span className="pointer-events-none absolute left-1/2 top-2 z-30 -translate-x-1/2 rounded bg-black/75 px-1.5 py-0.5 text-[10px] font-medium text-white">
-                      best take ↗ {filesById[l.bestFileId]?.name ?? "other clip"}
-                    </span>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           ))}
