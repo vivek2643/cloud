@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import get_settings
 from app.services.l3 import hero_cuts as hc
+from app.services.l3.energy import default_energy_for
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,10 @@ logger = logging.getLogger(__name__)
 # selectable unit that zooms from the whole run of its member cuts (Broad) down
 # to just the peak member (Sharp), by neighbour-atom inclusion expanding in time
 # out from the peak. Mirrors the per-cut ladder one level up.
-TREE_VERSION = 6
+# v7: per-clip `default_energy` (genre opens the slider calm/punchy) + each
+# cluster carries collapsed `rungs` -- only the meaningfully-distinct zoom steps
+# (look-alike ladder rungs merged), so the UI shows real choices not duplicates.
+TREE_VERSION = 7
 
 # Band index -> energy-level name. Band 2 (energy 0.5) is the anchor: one
 # complete thought per cut. Lower = wider (whole answer), higher = tighter.
@@ -161,6 +165,22 @@ def _cluster_ladder(members: List[Dict[str, Any]]) -> Tuple[Dict[str, List[str]]
     return ladder, peak["moment_id"]
 
 
+def _distinct_ladder(ladder: Dict[str, List[str]]) -> List[Dict[str, Any]]:
+    """Collapse consecutive levels with an IDENTICAL member set into one rung, so
+    only meaningfully-distinct zoom steps materialize. A moment that reads the
+    same from Broad through Balanced is ONE rung spanning those levels, not three
+    duplicates -- the antidote to a ladder of look-alike rungs. Additive: the
+    full per-level ``ladder`` stays for callers that index by level."""
+    rungs: List[Dict[str, Any]] = []
+    for level in _LEVEL_NAMES:
+        members = list(ladder.get(level) or [])
+        if rungs and rungs[-1]["members"] == members:
+            rungs[-1]["levels"].append(level)
+        else:
+            rungs.append({"levels": [level], "members": members})
+    return rungs
+
+
 def _build_clusters(moments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Roll the flat moments up into their connected bundles (shared
     ``cluster_id``). Each cluster is a moment-as-unit: its member run, the peak
@@ -190,6 +210,8 @@ def _build_clusters(moments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "in_ms": min(int(m["in_ms"]) for m in ordered),
             "out_ms": max(int(m["out_ms"]) for m in ordered),
             "ladder": ladder,
+            # Only the meaningfully-distinct zoom steps (look-alike rungs merged).
+            "rungs": _distinct_ladder(ladder),
         })
     return clusters
 
@@ -272,6 +294,9 @@ def build_clip_tree(
         "duration_ms": int(header.get("duration_ms") or 0),
         "content_type": header.get("content_type"),
         "primary_axis": header.get("primary_axis"),
+        # Where the energy slider should OPEN for this genre (long-form calmer,
+        # short-form punchier); the editor still controls the full range.
+        "default_energy": default_energy_for(header.get("content_type")),
         "mood": header.get("mood"),
         "people": header.get("people") or [],
         "topics": header.get("topics") or [],

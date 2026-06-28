@@ -212,6 +212,39 @@ def test_lone_cut_forms_no_cluster():
     print("ok  test_lone_cut_forms_no_cluster")
 
 
+def test_cluster_rungs_collapse_lookalike_levels():
+    """A cluster exposes only the meaningfully-distinct zoom steps: consecutive
+    levels with the same member set collapse into one rung spanning them, while
+    the full per-level ladder is still present for level-indexed callers."""
+    tree = fm.build_clip_tree("ffffffff-1111",
+                              {"name": "Reel", "duration_ms": 8000}, _cluster_cuts())
+    c = tree["clusters"][0]
+    rungs = c["rungs"]
+    # Distinct rungs partition the 5 levels with no duplicate adjacent member-set.
+    assert sum(len(r["levels"]) for r in rungs) == 5, rungs
+    for r in rungs:
+        assert r["members"] == c["ladder"][r["levels"][0]], r
+    for a, b in zip(rungs, rungs[1:]):
+        assert a["members"] != b["members"], rungs
+    # The 3-member run (broad) and the 1-member peak (sharp) are different rungs.
+    assert rungs[0]["members"] == ["ffffffff:m00", "ffffffff:m01", "ffffffff:m02"]
+    assert rungs[-1]["members"] == ["ffffffff:m01"]
+    print("ok  test_cluster_rungs_collapse_lookalike_levels")
+
+
+def test_default_energy_from_genre():
+    """The tree opens the slider per genre: long-form calm, short-form punchy."""
+    calm = fm.build_clip_tree("ffffffff-2222",
+                              {"name": "Pod", "duration_ms": 8000, "content_type": "interview"},
+                              _cluster_cuts())
+    punchy = fm.build_clip_tree("ffffffff-3333",
+                                {"name": "Ad", "duration_ms": 8000, "content_type": "product"},
+                                _cluster_cuts())
+    assert calm["default_energy"] < 0.5 < punchy["default_energy"], (
+        calm["default_energy"], punchy["default_energy"])
+    print("ok  test_default_energy_from_genre")
+
+
 def main():
     test_thought_levels_become_variants()
     test_moment_line_shows_multi_affordance_and_offcam()
@@ -222,6 +255,8 @@ def main():
     test_cluster_ladder_whole_run_to_peak()
     test_cluster_block_rendered_in_map()
     test_lone_cut_forms_no_cluster()
+    test_cluster_rungs_collapse_lookalike_levels()
+    test_default_energy_from_genre()
     print("\nall footage-map tests passed")
 
 
