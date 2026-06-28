@@ -98,6 +98,25 @@ TAKE SELECTION (so an editor can later pick the best version of a moment):
       - technical:   5 sharp, well-framed | 3 minor issues | 1 soft focus / bad framing / obscured
     Do NOT collapse quality to one number for the whole clip; localize it.
 
+CAPTURE PRIMITIVE & CONFIDENCE (what each beat fundamentally IS):
+  * On `content_units` and `cutaways`, set `primitive` -- the intrinsic thing
+    that was captured, INDEPENDENT of how it might be used, from this closed set:
+      - speech  : a spoken line / voiceover (audio is the point)
+      - action  : a physical event / motion / business (something done)
+      - person  : a held shot of a human (a reaction is a PERSON shot -- its
+                  reaction-ness is the `responds_to` relation, not the capture)
+      - place   : an environment / establishing / scenery
+      - object  : a thing / detail / close-up
+      - graphic : on-screen text / title / chart / UI / reveal
+    Distinguish place vs object vs person for b-roll instead of leaving it
+    generic -- this is the honest description of the frame.
+  * For an information-dense graphic (a slide, chart, list, app UI), fill
+    `summary` on the cutaway (and on `graphic_text`) with what it CONVEYS in one
+    line -- the gist, NOT a verbatim transcription of every word.
+  * Give each cut-bearing beat a `confidence` (0..1): how sure you are it is a
+    real, usable beat. Keep RECALL high -- include moderately-confident beats
+    (~0.3+) rather than dropping them; downstream ranking handles the rest.
+
 INTENT & GROUNDING (so the editor knows what each beat is FOR):
   * Give cut-bearing beats a `role` when one is clear -- the narrative job of the
     beat, from this closed set ONLY: hook, answer, cta, establishing, climax,

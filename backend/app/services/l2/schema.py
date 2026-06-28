@@ -57,7 +57,11 @@ def _to_unit(v):
 # v4 adds the typed relation graph (`relations`) plus node-level intent
 # (`role`) and grounding (`topic`/`entity`) on the cut-bearing tracks, and gives
 # `reactions`/`cutaways` stable local ids so they can be relation endpoints.
-SCHEMA_VERSION = 4
+# v5 adds the intrinsic CAPTURE PRIMITIVE (`primitive`: person/action/place/
+# object/graphic/speech) + a `confidence` on each cut-bearing beat, and a
+# `summary` (semantic gist) for information-dense graphics (don't OCR a slide --
+# say what it conveys).
+SCHEMA_VERSION = 5
 
 
 # The editing vocabulary (vocab.py) is the single source of truth. Render the
@@ -65,6 +69,20 @@ SCHEMA_VERSION = 4
 # self-document in the prompt schema, without re-typing the strings here.
 RelationType = Enum("RelationType", [(r, r) for r in vocab.RELATIONS], type=str)
 Role = Enum("Role", [(r, r) for r in vocab.ROLES], type=str)
+# The intrinsic capture substrate the VLM states per cut-bearing beat: what the
+# frame/track is about, independent of how it's later used (see vocab.py).
+CapturePrimitive = Enum(
+    "CapturePrimitive", [(p, p) for p in vocab.CAPTURE_PRIMITIVES], type=str
+)
+
+
+def _coerce_primitive(v):
+    """Lenient capture primitive: drop an out-of-vocab value to None rather than
+    failing the whole clip's parse (the schema is prompt-guided, not constrained)."""
+    if v is None:
+        return None
+    s = str(getattr(v, "value", v)).strip().lower()
+    return s if s in vocab.CAPTURE_PRIMITIVE_SET else None
 
 
 def _coerce_role(v):
@@ -381,6 +399,14 @@ class Event(BaseModel):
         None, description="where in the frame this beat happens (coarse box); used to reframe onto the action"
     )
     role: Optional[Role] = Field(None, description="narrative intent of this beat, when clear (e.g. 'establishing', 'climax')")
+    confidence: Optional[float] = Field(
+        None, description="0..1 how sure you are this is a real, usable beat (keep recall high)"
+    )
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _norm_conf(cls, v):
+        return _to_unit(v)
 
     @field_validator("role", mode="before")
     @classmethod
@@ -459,6 +485,13 @@ class GraphicTextEvent(BaseModel):
     end_ms: int
     kind: Optional[GraphicKind] = None
     text: Optional[str] = Field(None, description="verbatim text if legible")
+    summary: Optional[str] = Field(
+        None,
+        description=(
+            "for an information-dense graphic (slide/chart/list/UI), what it "
+            "CONVEYS in one line -- the gist, not a transcription of every word."
+        ),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -490,8 +523,25 @@ class CutawayMoment(BaseModel):
     end_ms: int
     kind: CutawayKind
     affordance: CutawayAffordance
+    primitive: Optional[CapturePrimitive] = Field(
+        None,
+        description=(
+            "what is captured here, independent of the affordance: 'person' (a "
+            "human shot -- a reaction is a person shot), 'place' (scenery/"
+            "establishing), 'object' (a thing/detail), 'graphic' (on-screen text/"
+            "chart/reveal), or 'action'. Distinguish place vs object vs person "
+            "for b-roll instead of leaving it generic."
+        ),
+    )
     subject: Optional[str] = Field(None, description="person local_id when relevant")
     label: str = Field(description="short human-facing label for the card")
+    summary: Optional[str] = Field(
+        None,
+        description=(
+            "for an information-dense graphic (a slide, chart, list, UI), a short "
+            "summary of what it CONVEYS -- not verbatim OCR. Null for plain shots."
+        ),
+    )
     trigger: Optional[str] = Field(None, description="what prompted a reaction")
     intensity: Optional[float] = Field(None, description="0..1")
     editorial_role: Optional[str] = Field(
@@ -504,12 +554,20 @@ class CutawayMoment(BaseModel):
     salience_hint: Optional[float] = Field(
         None, description="how cut-worthy (higher = stronger), 0..1"
     )
+    confidence: Optional[float] = Field(
+        None, description="0..1 how sure you are this is a real, usable cutaway (keep recall high)"
+    )
     peak_ms: Optional[int] = Field(None, description="peak frame for reactions")
 
-    @field_validator("intensity", "salience_hint", mode="before")
+    @field_validator("intensity", "salience_hint", "confidence", mode="before")
     @classmethod
     def _norm_unit(cls, v):
         return _to_unit(v)
+
+    @field_validator("primitive", mode="before")
+    @classmethod
+    def _norm_primitive(cls, v):
+        return _coerce_primitive(v)
 
     @field_validator("role", mode="before")
     @classmethod
@@ -552,9 +610,31 @@ class ContentUnit(BaseModel):
         ),
     )
     label: Optional[str] = Field(None, description="short human-facing label")
+    primitive: Optional[CapturePrimitive] = Field(
+        None,
+        description=(
+            "what this unit fundamentally IS, captured: 'speech' (a spoken line), "
+            "'action' (a physical beat), 'person' (a held person shot), 'place' "
+            "(scenery/environment), 'object' (a thing/detail), or 'graphic' "
+            "(on-screen text/chart). Independent of how it might later be used."
+        ),
+    )
     role: Optional[Role] = Field(None, description="narrative intent of this unit, when clear (e.g. 'hook', 'answer', 'cta')")
     topic: Optional[str] = Field(None, description="the subject/topic this unit is about, for grouping and 'illustrates' links")
     entity: Optional[str] = Field(None, description="the concrete thing/person this unit centers on, when there is a clear one")
+    confidence: Optional[float] = Field(
+        None, description="0..1 how sure you are this is a real, usable beat (keep recall high -- include moderate ones)"
+    )
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _norm_conf(cls, v):
+        return _to_unit(v)
+
+    @field_validator("primitive", mode="before")
+    @classmethod
+    def _norm_primitive(cls, v):
+        return _coerce_primitive(v)
 
     @field_validator("role", mode="before")
     @classmethod
