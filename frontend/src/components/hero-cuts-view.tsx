@@ -8,54 +8,70 @@ import {
   getHeroCutsFeed,
   getFilePlaybackUrl,
   type HeroCut,
-  type HeroModality,
   type FileRecord,
 } from "@/lib/api";
 import { Star, Play, Volume2, VolumeX, Layers, Scissors, ChevronDown, Check } from "lucide-react";
 import { EditButton } from "./search-edit-bar";
 
-const MODALITY_STYLE: Record<HeroModality, { color: string; label: string }> = {
-  speech: { color: "#6366f1", label: "speech" },
+// Colour/label per CAPTURE PRIMITIVE -- the intrinsic "what was captured"
+// substrate the tabs now sort on (a screen UI is a graphic, a face a person).
+const PRIMITIVE_STYLE: Record<string, { color: string; label: string }> = {
+  person: { color: "#ec4899", label: "person" },
   action: { color: "#f59e0b", label: "action" },
-  reaction: { color: "#ec4899", label: "reaction" },
-  broll: { color: "#06b6d4", label: "b-roll" },
-  insert: { color: "#a78bfa", label: "insert" },
+  place: { color: "#06b6d4", label: "place" },
+  object: { color: "#10b981", label: "object" },
+  graphic: { color: "#a78bfa", label: "graphic" },
+  speech: { color: "#6366f1", label: "speech" },
 };
 
-// A tab is the special "all" / "moment" view or one of the five affordances.
-type FilterKey = "all" | "moment" | "speech" | "action" | "reaction" | "broll" | "insert";
+// Affordance -> primitive fallback, used only when the backend didn't stamp
+// `primitives` on a cut (it normally always does). Mirrors l3/vocab.py.
+const AFFORDANCE_PRIMITIVE: Record<string, string> = {
+  speech: "speech",
+  action: "action",
+  reaction: "person",
+  broll: "place",
+  insert: "graphic",
+};
 
-// Filter chips over the ONE feed -- every edit style (soundbites, action beats,
-// cutaways) is served without a separate pipeline. "Moments" is a VIEW of the
-// connected clusters (a line + its reaction + illustrating b-roll); every other
-// tab matches an affordance the cut serves, so a cut can appear under several.
+// The capture primitives a cut delivers -- the VLM's stated ones when present,
+// else derived from its affordances (so the tabs always have something to sort).
+function cutPrimitives(h: HeroCut): string[] {
+  if (h.primitives && h.primitives.length > 0) return h.primitives;
+  const affs = h.affordances && h.affordances.length > 0 ? h.affordances : [h.modality];
+  const out: string[] = [];
+  for (const a of affs) {
+    const p = AFFORDANCE_PRIMITIVE[a] ?? "place";
+    if (!out.includes(p)) out.push(p);
+  }
+  return out;
+}
+
+// A tab is the special "all" / "moment" view or one of the six capture
+// primitives. Sorting by primitive shows WHAT each cut is (the honest atom),
+// not just the editorial use -- a reaction lands under Person, a chart/UI under
+// Graphic, a cutaway under Place/Object.
+type FilterKey = "all" | "moment" | "person" | "action" | "place" | "object" | "graphic" | "speech";
+
 const FILTERS: { key: FilterKey; label: string }[] = [
   { key: "all", label: "All" },
   { key: "moment", label: "Moments" },
-  { key: "speech", label: "Speech" },
+  { key: "person", label: "Person" },
   { key: "action", label: "Action" },
-  { key: "reaction", label: "Reactions" },
-  { key: "broll", label: "B-roll" },
-  { key: "insert", label: "Inserts" },
+  { key: "place", label: "Place" },
+  { key: "object", label: "Object" },
+  { key: "graphic", label: "Graphic" },
+  { key: "speech", label: "Speech" },
 ];
 
-// Does a cut serve a given tab? Moments = belongs to a connected cluster; an
-// affordance tab matches when the cut lists that affordance (modality fallback).
+// Does a cut serve a given tab? Moments = belongs to a connected cluster; a
+// primitive tab matches when the cut delivers that primitive (so a cut with
+// several primitives appears under each).
 function matchesFilter(h: HeroCut, key: FilterKey): boolean {
   if (key === "all") return true;
   if (key === "moment") return Boolean(h.is_moment);
-  const affs = h.affordances && h.affordances.length > 0 ? h.affordances : [h.modality];
-  return affs.includes(key);
+  return cutPrimitives(h).includes(key);
 }
-
-const ROLE_LABEL: Record<string, string> = {
-  hook: "Hook",
-  answer: "Answer",
-  cta: "CTA",
-  establishing: "Establishing",
-  climax: "Climax",
-  listener: "Listening",
-};
 
 function fmtDur(ms: number): string {
   const s = ms / 1000;
@@ -300,18 +316,46 @@ function MomentBundle({
   activeHeroId: string | null;
   setActiveHeroId: React.Dispatch<React.SetStateAction<string | null>>;
 }) {
-  const lead = members[0];
+  const [expanded, setExpanded] = useState(false);
+  const ordered = useMemo(
+    () => [...members].sort((a, b) => a.src_in_ms - b.src_in_ms),
+    [members]
+  );
+  const lead = ordered[0];
   const relTypes = useMemo(() => {
     const s = new Set<string>();
     for (const m of members)
       for (const r of m.relations ?? []) if (r.dir === "out") s.add(r.type);
     return Array.from(s);
   }, [members]);
-  const affMix = useMemo(() => {
+  const primMix = useMemo(() => {
     const s = new Set<string>();
-    for (const m of members) s.add(m.modality);
+    for (const m of members) for (const p of cutPrimitives(m)) s.add(p);
     return Array.from(s);
   }, [members]);
+
+  // The moment as ONE combined unit: play the whole run by chaining each
+  // member's span (a cluster is always within one file). keep_spans drives the
+  // jump-cut preview; dragging takes the whole loose run. Members stay reachable
+  // via "expand" -- combined by default, never collapsed away.
+  const combined = useMemo<HeroCut>(() => {
+    const inMs = Math.min(...ordered.map((m) => m.src_in_ms));
+    const outMs = Math.max(...ordered.map((m) => m.src_out_ms));
+    const playMs = ordered.reduce((s, m) => s + (m.src_out_ms - m.src_in_ms), 0);
+    return {
+      ...lead,
+      hero_id: lead.moment_id ?? `moment:${lead.hero_id}`,
+      src_in_ms: inMs,
+      src_out_ms: outMs,
+      duration_ms: outMs - inMs,
+      play_ms: playMs,
+      keep_spans: ordered.map((m) => ({ in_ms: m.src_in_ms, out_ms: m.src_out_ms })),
+      primitives: primMix,
+      score: Math.max(...ordered.map((m) => m.score)),
+      take_count: 1,
+      alt_takes: [],
+    };
+  }, [ordered, lead, primMix]);
 
   return (
     <div
@@ -327,25 +371,57 @@ function MomentBundle({
         </span>
         <span className="text-sm font-medium">{lead.label || "(untitled moment)"}</span>
         <span className="text-xs" style={{ color: "var(--muted)" }}>
-          {affMix.join(" · ")}
+          {primMix.join(" · ")}
           {relTypes.length > 0 && ` — ${relTypes.join(", ").replace(/_/g, " ")}`}
         </span>
-      </div>
-      <div className="grid grid-cols-2 gap-4 md:grid-cols-3 2xl:grid-cols-4">
-        {members.map((h) => (
-          <HeroClipCard
-            key={h.hero_id}
-            file={filesById[h.file_id]!}
-            hero={h}
-            getUrl={getUrl}
-            orientation={orientation}
-            fit={fit}
-            isActive={activeHeroId === h.hero_id}
-            onActivate={() => setActiveHeroId(() => h.hero_id)}
-            onDeactivate={() => setActiveHeroId((id) => (id === h.hero_id ? null : id))}
+        {/* Decompose the combined unit into its member cuts (and back). */}
+        <button
+          onClick={() => setExpanded((v) => !v)}
+          className="ml-auto flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium transition-colors hover:bg-[var(--background)]"
+          style={{ color: "var(--muted)" }}
+        >
+          {expanded ? "Hide cuts" : `Show ${ordered.length} cuts`}
+          <ChevronDown
+            size={13}
+            style={{ transform: expanded ? "rotate(180deg)" : "none", transition: "transform 0.2s" }}
           />
-        ))}
+        </button>
       </div>
+
+      {/* The combined moment preview (one unit, plays the whole run). */}
+      <div className="grid grid-cols-2 gap-4 md:grid-cols-3 2xl:grid-cols-4">
+        <HeroClipCard
+          file={filesById[lead.file_id]!}
+          hero={combined}
+          getUrl={getUrl}
+          orientation={orientation}
+          fit={fit}
+          isActive={activeHeroId === combined.hero_id}
+          onActivate={() => setActiveHeroId(() => combined.hero_id)}
+          onDeactivate={() => setActiveHeroId((id) => (id === combined.hero_id ? null : id))}
+        />
+      </div>
+
+      {/* Members, on demand -- nothing is hidden, just rolled up by default. */}
+      {expanded && (
+        <div className="mt-4 grid grid-cols-2 gap-4 border-t pt-4 md:grid-cols-3 2xl:grid-cols-4"
+          style={{ borderColor: "var(--border)" }}
+        >
+          {ordered.map((h) => (
+            <HeroClipCard
+              key={h.hero_id}
+              file={filesById[h.file_id]!}
+              hero={h}
+              getUrl={getUrl}
+              orientation={orientation}
+              fit={fit}
+              isActive={activeHeroId === h.hero_id}
+              onActivate={() => setActiveHeroId(() => h.hero_id)}
+              onDeactivate={() => setActiveHeroId((id) => (id === h.hero_id ? null : id))}
+            />
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -530,13 +606,12 @@ function HeroClipCard({
   const inSec = segs[0][0];
   const outSec = segs[segs.length - 1][1];
   const isVideo = file.file_type === "video";
-  const modality = MODALITY_STYLE[hero.modality] ?? MODALITY_STYLE.speech;
-  // Secondary affordances this cut also serves (beyond its dominant modality) --
-  // what makes it a "moment". Coverage (alternate framings) is reachable too.
-  const extraAffordances = useMemo(
-    () => (hero.affordances ?? []).filter((a) => a !== hero.modality),
-    [hero.affordances, hero.modality]
-  );
+  // Capture primitives this cut delivers -- the tabs sort on these, so the badge
+  // shows them too. First is the dominant primitive (drives the badge colour);
+  // the rest (a cut that's both person+action, say) trail as "+ ...".
+  const prims = useMemo(() => cutPrimitives(hero), [hero]);
+  const primStyle = PRIMITIVE_STYLE[prims[0]] ?? { color: "#6366f1", label: prims[0] ?? "cut" };
+  const extraPrims = prims.slice(1);
 
   // "Frame Adjusted" reframes the clip to fill the chosen tile (center-crop);
   // "Original" letterboxes the full source frame. The proxy is already baked
@@ -687,29 +762,17 @@ function HeroClipCard({
         )}
         {!playUrl && <FileIcon type={(isVideo ? "video" : "audio") as "video"} size={32} />}
 
-        {/* Modality badge (top-left). A multi-affordance cut (a "moment") shows
-            the secondary uses it also serves -- one rich card, not duplicates. */}
+        {/* Primitive badge (top-left): WHAT this cut captured. A cut that
+            delivers more than one primitive trails the rest -- one rich card. */}
         <span
           className="absolute left-2 top-2 z-20 flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-semibold capitalize text-white"
-          style={{ background: modality.color }}
+          style={{ background: primStyle.color }}
         >
-          {modality.label}
-          {extraAffordances.length > 0 && (
-            <span style={{ opacity: 0.85 }}>+ {extraAffordances.join(" + ")}</span>
+          {primStyle.label}
+          {extraPrims.length > 0 && (
+            <span style={{ opacity: 0.85 }}>+ {extraPrims.join(" + ")}</span>
           )}
         </span>
-
-        {/* Narrative role (hook / answer / cta / listening ...) when the VLM
-            marked one -- the structural beats the editor builds around. */}
-        {hero.role && (
-          <span
-            className="absolute right-2 bottom-9 z-20 rounded px-1.5 py-0.5 text-[11px] font-semibold text-white"
-            style={{ background: "rgba(16,185,129,0.92)" }}
-            title={`Role: ${hero.role}`}
-          >
-            {ROLE_LABEL[hero.role] ?? hero.role}
-          </span>
-        )}
 
         {/* Take-stack badge (top-left, below the modality badge) when repeats exist. */}
         {hero.take_count > 1 && (
