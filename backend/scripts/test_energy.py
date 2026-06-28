@@ -76,6 +76,15 @@ def test_moments_fuse_low_split_high():
     print("ok  moments fuse low / split high")
 
 
+def test_fuse_gap_ladder_widens_low_atomizes_high():
+    """The relatedness reach is the fuse<->atomize dial: widest at Broad,
+    monotonically shrinking, exactly 0 at Sharp (atomize)."""
+    gaps = [energy_to_params(e).fuse_gap_ms for e in (0.0, 0.3, 0.5, 0.7, 1.0)]
+    assert gaps[0] > gaps[1] > gaps[2] > gaps[3] > gaps[4], gaps
+    assert gaps[-1] == 0, gaps
+    print("ok  fuse-gap ladder widens low / atomizes high")
+
+
 def test_bands_and_action_modes():
     broad = energy_to_params(0.0)
     calm = energy_to_params(0.3)

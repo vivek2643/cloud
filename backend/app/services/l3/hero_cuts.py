@@ -1325,9 +1325,10 @@ def _annotate_moments(clip: _ClipInputs, cuts: List[HeroCut],
     # VLM didn't explicitly link. Record the basis as a derived `grouped` edge
     # (NOT a vocab relation -- consumers gating on RELATION_SET ignore it) so the
     # brain groups WITH the signal while still reading each atom's full meaning.
-    fuse_gap = getattr(params, "fuse_gap_ms", None)
-    if not fuse_gap or fuse_gap <= 0:
-        fuse_gap = _REL_FUSE_GAP_MS
+    # Energy sets the reach (P4): Broad fuses wide, Sharp = 0 (atomize -> only
+    # overlapping beats group). 0 is meaningful, so only fall back to the default
+    # when no params were threaded in (e.g. tests / legacy callers).
+    fuse_gap = params.fuse_gap_ms if params is not None else _REL_FUSE_GAP_MS
     for a_id, b_id, basis in _relatedness_links(cuts, fuse_gap):
         ac, bc = by_id.get(a_id), by_id.get(b_id)
         if ac is None or bc is None:

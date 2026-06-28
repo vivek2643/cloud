@@ -56,6 +56,14 @@ PAD_OUT_LOOSE_MS = 700
 
 FUSE_MOMENTS_BELOW = 0.6
 
+# Deterministic relatedness FUSE↔ATOMIZE ladder (P4). The max time gap for two
+# complementary cuts to read as ONE moment, per band. Energy is the dial: at
+# Broad we fuse widely (a whole demo run is one moment); at Sharp we atomize
+# (gap 0 -> only literally-overlapping complementary beats group, everything
+# else stands as its own punchy cut). Pairs with the relatedness GATE in
+# hero_cuts (shared actor/region still required -- this only sets the reach).
+_FUSE_GAP_MS = (1500, 1000, 600, 250, 0)
+
 # --- Five bands (match UI: Broad, Calm, Balanced, Tight, Sharp) ---------------
 BAND_EDGES = (0.2, 0.4, 0.6, 0.8)   # band i covers [edge[i-1], edge[i]) with 0 at start
 
@@ -125,6 +133,7 @@ class EnergyParams:
     pad_in_ms: int
     pad_out_ms: int
     fuse_moments: bool
+    fuse_gap_ms: int                # relatedness reach: Broad fuses wide, Sharp = 0 (atomize)
     # action / performance
     action_merge_gap_ms: int
     action_anchor_mode: str         # unit | onset | impact
@@ -198,6 +207,7 @@ def energy_to_params(energy: float) -> EnergyParams:
         pad_in_ms=round(PAD_IN_LOOSE_MS * pad_factor),
         pad_out_ms=round(PAD_OUT_LOOSE_MS * pad_factor),
         fuse_moments=e < FUSE_MOMENTS_BELOW,
+        fuse_gap_ms=_FUSE_GAP_MS[band],
         action_merge_gap_ms=_ACTION_MERGE[band],
         action_anchor_mode=_ACTION_ANCHOR[band],
         action_split_at_impact=e >= BAND_EDGES[3],
