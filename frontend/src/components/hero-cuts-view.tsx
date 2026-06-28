@@ -8,6 +8,7 @@ import {
   getHeroCutsFeed,
   getFilePlaybackUrl,
   type HeroCut,
+  type HeroModality,
   type FileRecord,
 } from "@/lib/api";
 import { Star, Play, Volume2, VolumeX, Layers, Scissors, ChevronDown, Check } from "lucide-react";
@@ -78,6 +79,47 @@ function momentPrimitives(members: HeroCut[]): string[] {
   const s = new Set<string>();
   for (const m of members) for (const p of cutPrimitives(m)) s.add(p);
   return Array.from(s);
+}
+
+// A take of some content that THIS file shot but LOST to a better take in
+// another file -- shown greyed at the end of the file's group ("best take ↗").
+interface LoserTake {
+  key: string;
+  file_id: string;
+  src_in_ms: number;
+  src_out_ms: number;
+  score: number;
+  label: string;
+  modality: HeroModality;
+  primitives: string[];
+  bestFileId: string;
+}
+
+// Synthesize a HeroCut for a greyed loser take so it renders as an ordinary
+// (dimmed) card -- the winner's label, this file's span.
+function loserHero(l: LoserTake): HeroCut {
+  return {
+    hero_id: l.key,
+    file_id: l.file_id,
+    modality: l.modality,
+    label: l.label,
+    src_in_ms: l.src_in_ms,
+    src_out_ms: l.src_out_ms,
+    duration_ms: l.src_out_ms - l.src_in_ms,
+    play_ms: l.src_out_ms - l.src_in_ms,
+    keep_spans: null,
+    score: l.score,
+    speaker: null,
+    flags: [],
+    affordances: [l.modality],
+    primitives: l.primitives,
+    relations: null,
+    moment_id: null,
+    role: null,
+    is_moment: false,
+    take_count: 1,
+    alt_takes: [],
+  };
 }
 
 // A moment as ONE combined unit: plays the whole run by chaining each member's
@@ -219,6 +261,44 @@ export function HeroCutsView() {
       }))
       .sort((a, b) => b.members[0].score - a.members[0].score);
   }, [filter, visible]);
+
+  // "All" tab ONLY: group the cuts by the file they belong to. The feed is
+  // already de-duped to the BEST take, so each file shows the cuts it WON;
+  // a take it LOST to a better version elsewhere is appended greyed (from the
+  // winner's alt_takes) so the file stays honest while steering to the best.
+  const fileGroups = useMemo(() => {
+    if (filter !== "all") return [];
+    const winners: Record<string, HeroCut[]> = {};
+    for (const h of present) (winners[h.file_id] ??= []).push(h);
+    const losers: Record<string, LoserTake[]> = {};
+    for (const h of present) {
+      for (const t of h.alt_takes ?? []) {
+        if (!t.file_id || t.file_id === h.file_id || !filesById[t.file_id]) continue;
+        (losers[t.file_id] ??= []).push({
+          key: `${h.hero_id}~${t.file_id}~${t.src_in_ms}`,
+          file_id: t.file_id,
+          src_in_ms: t.src_in_ms,
+          src_out_ms: t.src_out_ms,
+          score: t.score,
+          label: h.label,
+          modality: h.modality,
+          primitives: cutPrimitives(h),
+          bestFileId: h.file_id,
+        });
+      }
+    }
+    const ids = new Set<string>([...Object.keys(winners), ...Object.keys(losers)]);
+    const bestScore = (id: string) =>
+      (winners[id] ?? []).reduce((m, h) => Math.max(m, h.score), 0);
+    return [...ids]
+      .map((fileId) => ({
+        fileId,
+        fileName: filesById[fileId]?.name ?? fileId,
+        winners: winners[fileId] ?? [],
+        losers: losers[fileId] ?? [],
+      }))
+      .sort((a, b) => bestScore(b.fileId) - bestScore(a.fileId));
+  }, [filter, present, filesById]);
   const totalClips = visible.length;
 
   return (
@@ -310,7 +390,63 @@ export function HeroCutsView() {
         </div>
       )}
 
-      {!loading && totalClips > 0 && filter !== "moment" && (
+      {/* All tab: grouped by file (grey filename + divider, then its cuts;
+          takes that lost to a better file are appended greyed). */}
+      {!loading && totalClips > 0 && filter === "all" && (
+        <div className="flex flex-col gap-9">
+          {fileGroups.map((g) => (
+            <div key={g.fileId}>
+              <div className="mb-3 flex items-center gap-3">
+                <span className="shrink-0 text-sm font-medium" style={{ color: "var(--muted)" }}>
+                  {g.fileName}
+                </span>
+                <div className="h-px flex-1" style={{ background: "var(--border)" }} />
+              </div>
+              <div className="grid grid-cols-2 gap-4 md:grid-cols-3 2xl:grid-cols-4">
+                {g.winners.map((h) => (
+                  <HeroClipCard
+                    key={h.hero_id}
+                    file={filesById[h.file_id]!}
+                    hero={h}
+                    getUrl={getUrl}
+                    orientation={orientation}
+                    fit={fit}
+                    isActive={activeHeroId === h.hero_id}
+                    onActivate={() => setActiveHeroId(h.hero_id)}
+                    onDeactivate={() => setActiveHeroId((id) => (id === h.hero_id ? null : id))}
+                  />
+                ))}
+                {g.losers.map((l) => (
+                  <div
+                    key={l.key}
+                    className="relative opacity-45 transition-opacity hover:opacity-90"
+                    title={`Best take is in ${filesById[l.bestFileId]?.name ?? "another clip"}`}
+                  >
+                    <div className="grayscale">
+                      <HeroClipCard
+                        file={filesById[l.file_id]!}
+                        hero={loserHero(l)}
+                        getUrl={getUrl}
+                        orientation={orientation}
+                        fit={fit}
+                        isActive={activeHeroId === l.key}
+                        onActivate={() => setActiveHeroId(l.key)}
+                        onDeactivate={() => setActiveHeroId((id) => (id === l.key ? null : id))}
+                      />
+                    </div>
+                    <span className="pointer-events-none absolute left-1/2 top-2 z-30 -translate-x-1/2 rounded bg-black/75 px-1.5 py-0.5 text-[10px] font-medium text-white">
+                      best take ↗ {filesById[l.bestFileId]?.name ?? "other clip"}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Primitive tabs: flat grid (no file grouping). */}
+      {!loading && totalClips > 0 && filter !== "moment" && filter !== "all" && (
         <div className="grid grid-cols-2 gap-4 md:grid-cols-3 2xl:grid-cols-4">
           {visible.map((h) => (
             <HeroClipCard
