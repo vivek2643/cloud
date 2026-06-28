@@ -751,10 +751,10 @@ def _rel_cut(hid, aff, a, b, actor=None, region=None):
                       people=([{"person_id": actor, "region": region}] if actor else []))
 
 
-def test_relatedness_groups_complementary_adjacent():
-    """P3: even with NO explicit VLM relation, a doer's action + their line that
-    are adjacent and share the actor fuse into one moment, with the basis on a
-    derived `grouped` edge (so the brain reads WHY). The reel-trail gap closed."""
+def test_relatedness_groups_crossmodal_weave():
+    """P3: even with NO explicit VLM relation, a doer's action woven with their
+    line (different kinds, adjacent, shared actor) fuse into one moment, with the
+    basis on a derived `grouped` edge (so the brain reads WHY)."""
     sp = _rel_cut("z:sp0", "speech", 1000, 2000, actor="p1")
     ac = _rel_cut("z:ac0", "action", 2050, 2600, actor="p1")
     clip = hc._ClipInputs(file_id="zzzzzzzz-7", duration_ms=10000,
@@ -764,19 +764,39 @@ def test_relatedness_groups_complementary_adjacent():
     edge = [r for r in sp.relations if r["type"] == "grouped"]
     assert len(edge) == 1 and edge[0]["other"] == "z:ac0"
     assert "action+speech" in edge[0]["basis"] and "shared p1" in edge[0]["basis"]
-    print("ok  test_relatedness_groups_complementary_adjacent")
+    print("ok  test_relatedness_groups_crossmodal_weave")
 
 
-def test_relatedness_skips_sequential_same_primitive():
-    """Two adjacent speech lines (SAME primitive) never fuse -- that is
-    continuation, not a moment; fusing it would collapse a whole podcast turn."""
-    a = _rel_cut("z:sp0", "speech", 1000, 2000, actor="p1")
-    b = _rel_cut("z:sp1", "speech", 2050, 3000, actor="p1")
+def test_relatedness_skips_same_kind_succession():
+    """Same-kind beats across a real gap are SUCCESSION, not a moment -- two
+    spoken lines a breath apart, or two volleys a reset apart, stay separate.
+    This is the one rule that keeps a podcast flat AND a rally un-fused."""
     clip = hc._ClipInputs(file_id="zzzzzzzz-8", duration_ms=10000,
                           dialogue={"topic": [], "sentence": []}, perception={}, motion=None)
+    # A podcast turn: line, then a breath, then the next line.
+    a = _rel_cut("z:sp0", "speech", 1000, 2000, actor="p1")
+    b = _rel_cut("z:sp1", "speech", 2600, 3500, actor="p1")
     hc._annotate_moments(clip, [a, b])
     assert a.moment_id is None and b.moment_id is None
-    print("ok  test_relatedness_skips_sequential_same_primitive")
+    # A rally: a volley, a reset, then the next volley.
+    v1 = _rel_cut("z:ac0", "action", 1000, 1400, actor="p1")
+    v2 = _rel_cut("z:ac1", "action", 2000, 2400, actor="p1")
+    hc._annotate_moments(clip, [v1, v2])
+    assert v1.moment_id is None and v2.moment_id is None
+    print("ok  test_relatedness_skips_same_kind_succession")
+
+
+def test_relatedness_fuses_continuous_same_kind():
+    """Same-kind action that is genuinely CONTINUOUS (a handshake flowing into a
+    hug -- near-contiguous, shared actors) fuses into one moment. Nothing is
+    type-specific: action+action cuts when it makes sense, by the same rule."""
+    shake = _rel_cut("z:ac0", "action", 1000, 1800, actor="p1")
+    hug = _rel_cut("z:ac1", "action", 1850, 2700, actor="p1")  # 50ms -> continuous
+    clip = hc._ClipInputs(file_id="zzzzzzzz-8b", duration_ms=10000,
+                          dialogue={"topic": [], "sentence": []}, perception={}, motion=None)
+    hc._annotate_moments(clip, [shake, hug])
+    assert shake.moment_id is not None and shake.moment_id == hug.moment_id
+    print("ok  test_relatedness_fuses_continuous_same_kind")
 
 
 def test_relatedness_needs_relation_not_just_proximity():
@@ -946,8 +966,9 @@ def main():
     test_roles_assigned_from_l2_and_listening_flag()
     test_no_relations_no_moments()
     test_relation_illustrates_chains_into_one_moment()
-    test_relatedness_groups_complementary_adjacent()
-    test_relatedness_skips_sequential_same_primitive()
+    test_relatedness_groups_crossmodal_weave()
+    test_relatedness_skips_same_kind_succession()
+    test_relatedness_fuses_continuous_same_kind()
     test_relatedness_needs_relation_not_just_proximity()
     test_speech_cut_owns_ladder_and_resolves_speaker()
     test_offcamera_speech_flagged_not_dropped()

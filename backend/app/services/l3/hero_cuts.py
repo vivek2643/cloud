@@ -83,12 +83,13 @@ _MERGE_LEN_RATIO = 0.7
 # (now for every affordance, incl. action), the negative core inset only above
 # it; reactions/b-roll/inserts keep their full natural span through Balanced.
 # v8: DETERMINISTIC relatedness grouping (P3). Beyond the VLM's explicit
-# relation graph, adjacent cuts whose CAPTURE PRIMITIVES are complementary
-# (a doer + their line, a line + the listener's reaction, a claim + its graphic)
-# and that share an actor / region / overlap are fused into one moment, with the
-# basis recorded as a derived `grouped` edge so the brain reads WHY. Same-
-# primitive adjacency (line-after-line) is never fused -- that is continuation.
-PARAMS_VERSION = 8
+# relation graph, cuts bound to ONE beat are fused into a moment, with the basis
+# recorded as a derived `grouped` edge so the brain reads WHY.
+# v9: relatedness is now PRINCIPLE-driven, not a primitive whitelist. A pair is
+# one beat when it co-occurs, weaves different kinds, or is a continuous same-
+# kind run; mere succession of the same kind across a gap stays apart. So
+# action+action fuses when continuous and not when it's just successive beats.
+PARAMS_VERSION = 9
 
 # The five canonical product energy LEVELS = the band centers (Broad .. Sharp).
 # Hero cuts are precomputed at exactly these after L2; any requested energy
@@ -1159,25 +1160,27 @@ def _cut_for_span(cuts: List[HeroCut], a: int, b: int) -> Optional[HeroCut]:
 # --------------------------------------------------------------------------
 # Deterministic relatedness (P3) -- the signal-prep the brain groups WITH
 # --------------------------------------------------------------------------
-# Complementary capture-primitive pairs that read as ONE captured moment when
-# they co-occur: a doer + their line, a line + the listener's reaction, a claim
-# + the graphic that backs it, someone handling a thing. SAME-primitive
-# adjacency (line after line, beat after beat) is deliberately absent -- that is
-# continuation, not a moment, and fusing it would collapse a whole podcast turn.
-_COMPLEMENTARY_PRIMS = frozenset({
-    frozenset({vocab.PRIM_ACTION, vocab.PRIM_SPEECH}),
-    frozenset({vocab.PRIM_ACTION, vocab.PRIM_PERSON}),
-    frozenset({vocab.PRIM_SPEECH, vocab.PRIM_PERSON}),
-    frozenset({vocab.PRIM_SPEECH, vocab.PRIM_GRAPHIC}),
-    frozenset({vocab.PRIM_SPEECH, vocab.PRIM_OBJECT}),
-    frozenset({vocab.PRIM_SPEECH, vocab.PRIM_PLACE}),
-    frozenset({vocab.PRIM_ACTION, vocab.PRIM_OBJECT}),
-})
+# A "moment" is two+ cuts bound to ONE beat. We decide that from signals, never
+# from a list of allowed primitive pairs -- nothing here is type-specific. A
+# pair reads as one beat when it is one of:
+#   * CO-OCCURRING   -- the spans overlap (same wall-clock instant in the take);
+#   * a cross-kind WEAVE -- different primitives, tightly adjacent + same subject
+#     (a doer + their line, a line + the listener's reaction, a claim + its graphic);
+#   * a CONTINUOUS same-kind run -- same primitive, same subject, near-contiguous
+#     (a handshake flowing into a hug; an unbroken utterance).
+# What is NOT a moment is mere SUCCESSION: same-kind beats separated by a real
+# gap (line, then the next line; one volley, then the next volley). So
+# action+action DOES fuse when it is actually continuous, and DOESN'T when the
+# beats are just sequential -- by the same rule that keeps a podcast flat.
 
-# Default max gap for two complementary cuts to read as one moment. A NECESSARY
-# (not sufficient) condition -- relatedness must also hold. P4 will let energy
-# scale this (low energy fuses wider, high energy atomizes).
+# Default reach when no energy params are threaded in (tests / legacy callers).
 _REL_FUSE_GAP_MS = 800
+
+# A same-kind pair counts as one CONTINUOUS beat only within this gap; beyond it
+# successive same-kind beats are a sequence, not a moment. Perceptual continuity
+# (is this physically one motion / one utterance), so it is a constant -- the
+# editorial reach is the energy-scaled fuse gap above, applied on top.
+_CONTINUITY_GAP_MS = 200
 
 
 def _cut_actors(c: HeroCut) -> set:
@@ -1223,12 +1226,16 @@ def _time_gap_ms(a: HeroCut, b: HeroCut) -> int:
 def _relatedness_links(cuts: List[HeroCut], fuse_gap_ms: int) -> List[Tuple[str, str, str]]:
     """Propose (a_id, b_id, basis) moment links from deterministic signals.
 
-    A pair links only when ALL hold: their capture primitives are complementary
-    (cross-kind -- never line+line), they are within ``fuse_gap_ms`` in time, and
-    they are actually related (share an actor, OR their subject regions overlap,
-    OR their spans overlap). Proximity alone never groups -- that was the old
-    over-merge. The basis string is recorded on the edge so the brain sees WHY."""
+    A pair links when it reads as ONE beat (see the rule above): the two cuts are
+    about the same subject (share an actor, OR subject regions overlap, OR their
+    spans overlap in time) AND they are temporally bound -- either a cross-kind
+    weave / a co-occurrence within ``fuse_gap_ms``, or a near-contiguous run of
+    the same kind. Mere succession of the same kind across a real gap (the next
+    line, the next volley) is left apart. No primitive pair is privileged; the
+    basis string records WHY so the brain reads the signal."""
     links: List[Tuple[str, str, str]] = []
+    if fuse_gap_ms <= 0:
+        return links  # atomize (Sharp): no heuristic fusion, only explicit relations
     ordered = sorted(cuts, key=lambda c: (c.src_in_ms, c.src_out_ms))
     for i, a in enumerate(ordered):
         ap = set(a.primitives())
@@ -1240,16 +1247,17 @@ def _relatedness_links(cuts: List[HeroCut], fuse_gap_ms: int) -> List[Tuple[str,
             gap = _time_gap_ms(a, b)
             if gap > fuse_gap_ms:
                 continue
-            bp = set(b.primitives())
-            if not any(pair <= (ap | bp) and len(pair & ap) and len(pair & bp)
-                       for pair in _COMPLEMENTARY_PRIMS):
-                continue  # not a complementary cross-kind pair
             shared = a_actors & _cut_actors(b)
             iou = _region_iou(a_region, _cut_region(b))
             overlaps = gap == 0
             if not (shared or iou >= 0.2 or overlaps):
-                continue  # complementary but unrelated -- leave them apart
-            why = "+".join(sorted(ap | bp))
+                continue  # not about the same subject -- leave them apart
+            # Same single kind across a real gap is SUCCESSION (line->line,
+            # volley->volley), not one beat -- only a continuous run fuses.
+            same_single_kind = len(ap) == 1 and ap == set(b.primitives())
+            if same_single_kind and not overlaps and gap > _CONTINUITY_GAP_MS:
+                continue
+            why = "+".join(sorted(ap | set(b.primitives())))
             if shared:
                 tie = "shared " + ",".join(sorted(shared))
             elif overlaps:
@@ -1278,11 +1286,11 @@ def _annotate_moments(clip: _ClipInputs, cuts: List[HeroCut],
     but do NOT form a moment -- alternates are one slot, handled by take-stacking.
 
     Two sources feed the clustering: (1) the VLM's explicit MOMENT_RELATIONS, and
-    (2) deterministic RELATEDNESS (P3) -- adjacent cuts with complementary capture
-    primitives that share an actor/region/overlap. (2) fills the common gap where
-    the VLM under-states relations (the reel-trail action+speech moment), recorded
-    as a derived ``grouped`` edge so the brain reads the basis. Same-primitive
-    adjacency is never fused. Degrades cleanly when there are no signals at all."""
+    (2) deterministic RELATEDNESS (P3) -- cuts bound to ONE beat (co-occurring, a
+    cross-kind weave, or a continuous same-kind run; never mere succession). (2)
+    fills the common gap where the VLM under-states relations (the reel-trail
+    action+speech moment), recorded as a derived ``grouped`` edge so the brain
+    reads the basis. Degrades cleanly when there are no signals at all."""
     if len(cuts) < 2:
         return cuts
     rels = (clip.perception or {}).get("relations") or []
