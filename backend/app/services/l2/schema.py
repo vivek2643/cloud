@@ -516,6 +516,30 @@ class CutawayKind(str, Enum):
     interaction = "interaction"
 
 
+# Map common model drift onto a real cutaway kind so one mislabeled cutaway
+# (e.g. kind='action', bleeding from the new `primitive` field) degrades to a
+# neutral hold instead of failing the WHOLE clip's parse (recall-first).
+_CUTAWAY_KIND_SYNONYM = {
+    "action": "broll_move",
+    "motion": "broll_move",
+    "person": "reaction",
+    "place": "broll_hold",
+    "object": "broll_hold",
+    "broll": "broll_hold",
+    "insert": "reveal",
+    "speech": "broll_hold",
+}
+
+
+def _coerce_cutaway_kind(v):
+    if v is None:
+        return v
+    s = str(getattr(v, "value", v)).strip().lower()
+    if s in {k.value for k in CutawayKind}:
+        return s
+    return _CUTAWAY_KIND_SYNONYM.get(s, CutawayKind.broll_hold.value)
+
+
 class CutawayMoment(BaseModel):
     """One overlay moment an editor would cut TO -- not every visible change."""
     id: Optional[str] = Field(None, description="clip-local id ('cx1', ...) so a relation can point at this cutaway")
@@ -563,6 +587,11 @@ class CutawayMoment(BaseModel):
     @classmethod
     def _norm_unit(cls, v):
         return _to_unit(v)
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def _norm_kind(cls, v):
+        return _coerce_cutaway_kind(v)
 
     @field_validator("primitive", mode="before")
     @classmethod
