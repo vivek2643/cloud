@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAuthStore } from "@/stores/auth-store";
 import { useDriveStore } from "@/stores/drive-store";
 import { FileIcon } from "./file-icon";
@@ -129,8 +129,6 @@ export function HeroCutsView() {
   const [heroes, setHeroes] = useState<HeroCut[]>([]);
   const [loading, setLoading] = useState(false);
   const [activeHeroId, setActiveHeroId] = useState<string | null>(null);
-  // Which moment cards are expanded to show their member cuts (Moments tab).
-  const [expandedMoments, setExpandedMoments] = useState<Record<string, boolean>>({});
   const urlCache = useRef<Record<string, Promise<string | null>>>({});
 
   const candidates = useMemo(
@@ -293,46 +291,20 @@ export function HeroCutsView() {
         <div className="grid grid-cols-2 gap-4 md:grid-cols-3 2xl:grid-cols-4">
           {clusters.map((c) => {
             const combined = combinedHero(c.members);
-            const expanded = Boolean(expandedMoments[c.id]);
-            const ordered = [...c.members].sort((a, b) => a.src_in_ms - b.src_in_ms);
             return (
-              <Fragment key={c.id}>
-                <HeroClipCard
-                  file={filesById[combined.file_id]!}
-                  hero={combined}
-                  getUrl={getUrl}
-                  orientation={orientation}
-                  fit={fit}
-                  isActive={activeHeroId === combined.hero_id}
-                  onActivate={() => setActiveHeroId(() => combined.hero_id)}
-                  onDeactivate={() =>
-                    setActiveHeroId((id) => (id === combined.hero_id ? null : id))
-                  }
-                  momentToggle={{
-                    count: ordered.length,
-                    expanded,
-                    onToggle: () =>
-                      setExpandedMoments((m) => ({ ...m, [c.id]: !expanded })),
-                  }}
-                />
-                {expanded &&
-                  ordered.map((h) => (
-                    <HeroClipCard
-                      key={h.hero_id}
-                      file={filesById[h.file_id]!}
-                      hero={h}
-                      getUrl={getUrl}
-                      orientation={orientation}
-                      fit={fit}
-                      memberOfMoment
-                      isActive={activeHeroId === h.hero_id}
-                      onActivate={() => setActiveHeroId(() => h.hero_id)}
-                      onDeactivate={() =>
-                        setActiveHeroId((id) => (id === h.hero_id ? null : id))
-                      }
-                    />
-                  ))}
-              </Fragment>
+              <HeroClipCard
+                key={c.id}
+                file={filesById[combined.file_id]!}
+                hero={combined}
+                getUrl={getUrl}
+                orientation={orientation}
+                fit={fit}
+                isActive={activeHeroId === combined.hero_id}
+                onActivate={() => setActiveHeroId(() => combined.hero_id)}
+                onDeactivate={() =>
+                  setActiveHeroId((id) => (id === combined.hero_id ? null : id))
+                }
+              />
             );
           })}
         </div>
@@ -514,8 +486,6 @@ function HeroClipCard({
   isActive,
   onActivate,
   onDeactivate,
-  momentToggle,
-  memberOfMoment,
 }: {
   file: FileRecord;
   hero: HeroCut;
@@ -525,12 +495,6 @@ function HeroClipCard({
   isActive: boolean;
   onActivate: () => void;
   onDeactivate: () => void;
-  // When set, this card is a COMBINED moment unit: show a green "Moment · N"
-  // pill that toggles its member cuts in/out of the grid below it.
-  momentToggle?: { count: number; expanded: boolean; onToggle: () => void };
-  // A member cut shown under an expanded moment -- subtly accented so the
-  // grouping reads at a glance within the flat grid.
-  memberOfMoment?: boolean;
 }) {
   const [playUrl, setPlayUrl] = useState<string | null>(null);
   const [muted, setMuted] = useState(false);
@@ -676,10 +640,7 @@ function HeroClipCard({
       )}
       <div
         className="group relative z-[1] flex flex-col overflow-hidden rounded-xl border transition-colors hover:border-[var(--accent)]"
-        style={{
-          borderColor: memberOfMoment ? "rgba(16,185,129,0.5)" : "var(--border)",
-          background: "var(--background)",
-        }}
+        style={{ borderColor: "var(--border)", background: "var(--background)" }}
       >
       <div
         onMouseEnter={handleEnter}
@@ -719,29 +680,6 @@ function HeroClipCard({
             <span style={{ opacity: 0.85 }}>+ {extraPrims.join(" + ")}</span>
           )}
         </span>
-
-        {/* Moment pill (top-left, below the primitive badge): this card is the
-            combined moment; clicking it folds its member cuts in/out. */}
-        {momentToggle && (
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              momentToggle.onToggle();
-            }}
-            className="absolute left-2 top-9 z-30 flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-semibold"
-            style={{ background: "#10b981", color: "#04110b" }}
-            title={`${momentToggle.count} cuts in this moment`}
-          >
-            <Layers size={11} /> Moment
-            <ChevronDown
-              size={11}
-              style={{
-                transform: momentToggle.expanded ? "rotate(180deg)" : "none",
-                transition: "transform 0.2s",
-              }}
-            />
-          </button>
-        )}
 
         {/* Take-stack badge (top-left, below the modality badge) when repeats exist. */}
         {hero.take_count > 1 && (
