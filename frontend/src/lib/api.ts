@@ -197,6 +197,12 @@ export interface HeroCut {
   flags: string[];
   // All editorial uses this cut serves (filter keys / tabs).
   affordances: string[];
+  // The intrinsic capture substrate (person/action/place/object/graphic/speech)
+  // -- what the camera/mic actually caught, beneath the editorial affordance.
+  primitives?: string[];
+  // For an information-dense graphic / insert cut, the gist of what it CONVEYS
+  // (the VLM's read, not OCR) -- e.g. "User selects video files for upload".
+  summary?: string | null;
   // Typed edges to other cuts (a reaction responds_to a line, b-roll
   // illustrates a topic). Flat model -- the cut stays its own card; this is how
   // it CONNECTS to others.

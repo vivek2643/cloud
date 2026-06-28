@@ -629,6 +629,7 @@ function HeroClipCard({
       in_ms: hero.src_in_ms,
       out_ms: hero.src_out_ms,
       content: hero.label,
+      summary: hero.summary ?? null,
       speaker: hero.speaker,
     });
     e.dataTransfer.setData("application/x-hero-cut", payload);
@@ -777,6 +778,17 @@ function HeroClipCard({
           <p className="line-clamp-2 text-sm leading-snug" style={{ minHeight: "2.5em" }}>
             {hero.label || <em style={{ color: "var(--muted)" }}>(no label)</em>}
           </p>
+          {/* Graphic/insert gist: what an info-dense frame CONVEYS (the VLM's
+              read), so a screen UI or chart card is legible without playback. */}
+          {hero.summary && (
+            <p
+              className="mt-1 line-clamp-2 text-[11px] italic leading-snug"
+              style={{ color: "var(--accent)" }}
+              title={hero.summary}
+            >
+              {hero.summary}
+            </p>
+          )}
           <p className="mt-1 truncate text-[11px]" style={{ color: "var(--muted)" }}>
             {file.name}
           </p>
