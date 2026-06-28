@@ -799,6 +799,24 @@ def test_relatedness_fuses_continuous_same_kind():
     print("ok  test_relatedness_fuses_continuous_same_kind")
 
 
+def test_explicit_primitive_overrides_affordance():
+    """The VLM's stated capture primitive wins over the coarse affordance
+    derivation: a screen UI logged as b-roll is honestly a `graphic`, not the
+    `place` that b-roll would default to. Speech (no stated primitive) still
+    derives `speech` from its affordance."""
+    g = hc.HeroCut("z:bro0", "zzzz", "broll", "app UI", 0, 2000, score=0.5,
+                   affordances=["broll"], primitive="graphic", summary="upload screen")
+    assert g.primitives() == ["graphic"], g.primitives()
+    assert hc.HeroCut.from_cache(g.to_dict()).primitives() == ["graphic"]
+    plain = hc.HeroCut("z:bro1", "zzzz", "broll", "a hill", 0, 2000, score=0.5,
+                       affordances=["broll"])
+    assert plain.primitives() == ["place"], plain.primitives()
+    sp = hc.HeroCut("z:sp0", "zzzz", "speech", "line", 0, 2000, score=0.5,
+                    affordances=["speech"])
+    assert sp.primitives() == ["speech"], sp.primitives()
+    print("ok  test_explicit_primitive_overrides_affordance")
+
+
 def test_relatedness_needs_relation_not_just_proximity():
     """Complementary + adjacent is NOT enough: with different actors, no region
     overlap and disjoint spans, the pair stays apart (proximity alone never
@@ -971,6 +989,7 @@ def main():
     test_relatedness_groups_crossmodal_weave()
     test_relatedness_skips_same_kind_succession()
     test_relatedness_fuses_continuous_same_kind()
+    test_explicit_primitive_overrides_affordance()
     test_relatedness_needs_relation_not_just_proximity()
     test_speech_cut_owns_ladder_and_resolves_speaker()
     test_offcamera_speech_flagged_not_dropped()

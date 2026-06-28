@@ -91,7 +91,10 @@ _MERGE_LEN_RATIO = 0.7
 # action+action fuses when continuous and not when it's just successive beats.
 # v10: graphic/insert cuts carry a `summary` (the VLM's gist of an info-dense
 # graphic) end-to-end, so the brain places a graphic by what it CONVEYS.
-PARAMS_VERSION = 10
+# v11: cuts carry the VLM's STATED capture `primitive` (overriding the coarse
+# affordance derivation), so a screen UI logged as b-roll is honestly a graphic,
+# a face is a person, etc. -- and relatedness weaving sees the true kinds.
+PARAMS_VERSION = 11
 
 # The five canonical product energy LEVELS = the band centers (Broad .. Sharp).
 # Hero cuts are precomputed at exactly these after L2; any requested energy
@@ -275,6 +278,10 @@ class HeroCut:
     # ordinary footage. Lets the brain place a graphic by its meaning + reason
     # about a claim it backs, without re-reading the frame.
     summary: Optional[str] = None
+    # The VLM-stated capture primitive for this cut, when known (person/place/
+    # object/graphic/...). Overrides the coarse affordance derivation, so a screen
+    # UI logged as b-roll is honestly a `graphic`, a face is a `person`, etc.
+    primitive: Optional[str] = None
 
     def is_moment(self) -> bool:
         """True when this cut is part of a multi-cut moment cluster (it has a
@@ -290,8 +297,11 @@ class HeroCut:
 
     def primitives(self) -> List[str]:
         """The capture primitive(s) this cut delivers (person/action/place/
-        object/graphic/speech), derived from its affordance(s). The intrinsic
-        'what was captured' substrate beneath the editor-facing affordance."""
+        object/graphic/speech) -- the intrinsic 'what was captured' substrate.
+        Prefer the VLM's stated primitive (honest: a screen UI stays a graphic);
+        fall back to deriving it from the affordance when the VLM didn't state one."""
+        if self.primitive:
+            return [self.primitive]
         return vocab.primitives_for(self.affordances or [self.modality])
 
     def to_dict(self) -> Dict[str, Any]:
@@ -324,6 +334,7 @@ class HeroCut:
             "moment_id": self.moment_id,
             "role": self.role,
             "summary": self.summary,
+            "primitive": self.primitive,
             "is_moment": self.is_moment(),
         }
 
@@ -353,6 +364,7 @@ class HeroCut:
             moment_id=d.get("moment_id"),
             role=d.get("role"),
             summary=d.get("summary"),
+            primitive=d.get("primitive"),
         )
 
 
@@ -1453,6 +1465,7 @@ def _collapse_insert_anchors(items: List[anc.Anchor], gap_ms: int) -> List[anc.A
                     kind=prev.kind, affordance=prev.affordance,
                     salience=max(prev.salience, a.salience), actor=prev.actor or a.actor,
                     text=prev.text, summary=prev.summary or a.summary,
+                    primitive=prev.primitive or a.primitive,
                     source_id=prev.source_id,
                 )
                 continue
@@ -1575,6 +1588,7 @@ def _action_segments(
                 ladder=ladder,
                 people=_beat_people(anchor),
                 framing=_framing_facet(clip, in_ms, out_ms, anchor.region),
+                primitive=anchor.primitive,
             ))
     return out
 
@@ -1793,6 +1807,7 @@ def _beat_segments(clip: _ClipInputs, field: Optional[fseams.FusedField],
                 people=_beat_people(best),
                 framing=_framing_facet(clip, in_ms, out_ms, best.region),
                 summary=best.summary,
+                primitive=best.primitive,
             ))
     return out
 

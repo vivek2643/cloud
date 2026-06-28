@@ -76,6 +76,7 @@ class Anchor:
     region: Optional[dict] = None    # coarse frame box for reframing
     text: Optional[str] = None       # label / spoken text / description
     summary: Optional[str] = None    # gist of an information-dense graphic (what it conveys)
+    primitive: Optional[str] = None  # VLM-stated capture primitive, when known (overrides affordance derivation)
     speaker: Optional[str] = None    # diarized speaker (speech)
     flags: List[str] = field(default_factory=list)
     source_id: Optional[str] = None  # originating artifact id (seg_id/unit_id/event id)
@@ -85,7 +86,7 @@ class Anchor:
             "ts_ms": self.ts_ms, "start_ms": self.start_ms, "end_ms": self.end_ms,
             "kind": self.kind, "affordance": self.affordance,
             "salience": round(self.salience, 3), "actor": self.actor,
-            "text": self.text, "summary": self.summary,
+            "text": self.text, "summary": self.summary, "primitive": self.primitive,
             "speaker": self.speaker, "flags": self.flags,
             "source_id": self.source_id,
         }
@@ -93,6 +94,14 @@ class Anchor:
 
 def _clamp01(x: float) -> float:
     return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
+
+
+def _norm_primitive(v) -> Optional[str]:
+    """A VLM-stated capture primitive, normalized to the closed vocab set or None
+    -- the honest 'what was captured', used to override the coarse affordance
+    derivation downstream (a graphic UI stays a graphic, not a generic b-roll)."""
+    s = str(v or "").strip().lower()
+    return s if s in vocab.CAPTURE_PRIMITIVE_SET else None
 
 
 def _overlap(a0: int, a1: int, b0: int, b1: int) -> int:
@@ -182,6 +191,7 @@ def _action_anchors(perception: dict, motion: dict, quality: List[dict]) -> List
         if b <= a:
             continue
         text = (u.get("label") or u.get("content_key") or kind)
+        prim = _norm_primitive(u.get("primitive"))
         if kind in ("action", "performance"):
             # A performance (song/dance/bit) is a sustained delivery: same sync
             # bucket as an action beat, but the *kind* is preserved so cut-time
@@ -189,16 +199,16 @@ def _action_anchors(perception: dict, motion: dict, quality: List[dict]) -> List
             parts = u.get("participants") or []
             actor = u.get("subject") or u.get("actor") or (parts[0] if parts else None)
             action_spans.append((a, b, text, u.get("region"),
-                                 str(u.get("unit_id", "")), kind == "performance", actor))
+                                 str(u.get("unit_id", "")), kind == "performance", actor, prim))
         elif kind == "visual":
             ha, hb = _hold_core(a, b)
             out.append(Anchor(
                 ts_ms=(ha + hb) // 2, start_ms=ha, end_ms=hb, kind="hold",
                 affordance=AFF_BROLL, salience=_clamp01((b - a) / 6000.0),
-                text=text[:200], source_id=str(u.get("unit_id", "")),
+                text=text[:200], primitive=prim, source_id=str(u.get("unit_id", "")),
             ))
 
-    for (a, b, text, region, sid, is_perf, actor) in action_spans:
+    for (a, b, text, region, sid, is_perf, actor, prim) in action_spans:
         inside = _impact_in(a, b)
         ts = max(inside, key=lambda t: t[1])[0] if inside else (a + b) // 2
         sal = _mean(energy, a // hop, b // hop) if energy else 0.4
@@ -210,7 +220,8 @@ def _action_anchors(perception: dict, motion: dict, quality: List[dict]) -> List
         out.append(Anchor(
             ts_ms=ts, start_ms=a, end_ms=b,
             kind="performance" if is_perf else "action_beat", affordance=AFF_ACTION,
-            salience=_clamp01(sal), actor=actor, region=region, text=text[:200], source_id=sid,
+            salience=_clamp01(sal), actor=actor, region=region, text=text[:200],
+            primitive=prim, source_id=sid,
         ))
     return out
 
@@ -504,6 +515,7 @@ def _cutaway_anchors(cutaways: List[dict]) -> List[Anchor]:
             ts_ms=ts, start_ms=ha, end_ms=hb, kind=anchor_kind, affordance=affordance,
             salience=_clamp01(float(sal)), actor=c.get("subject"), text=label[:200],
             summary=summary[:400] if summary else None,
+            primitive=_norm_primitive(c.get("primitive")),
         ))
     return out
 
