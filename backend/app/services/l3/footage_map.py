@@ -251,7 +251,8 @@ def build_clip_tree(
             # brain reads real connections, with NO forced default arrangement.
             "relations": [
                 {"type": r.get("type"), "dir": r.get("dir"),
-                 "other": hero_to_mid.get(r.get("other")), "note": r.get("note")}
+                 "other": hero_to_mid.get(r.get("other")),
+                 "note": r.get("note") or r.get("basis")}
                 for r in (cut.get("relations") or [])
                 if hero_to_mid.get(r.get("other"))
             ],

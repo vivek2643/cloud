@@ -82,7 +82,13 @@ _MERGE_LEN_RATIO = 0.7
 # v7: SYMMETRIC padding -- positive breathing room below the Balanced pivot
 # (now for every affordance, incl. action), the negative core inset only above
 # it; reactions/b-roll/inserts keep their full natural span through Balanced.
-PARAMS_VERSION = 7
+# v8: DETERMINISTIC relatedness grouping (P3). Beyond the VLM's explicit
+# relation graph, adjacent cuts whose CAPTURE PRIMITIVES are complementary
+# (a doer + their line, a line + the listener's reaction, a claim + its graphic)
+# and that share an actor / region / overlap are fused into one moment, with the
+# basis recorded as a derived `grouped` edge so the brain reads WHY. Same-
+# primitive adjacency (line-after-line) is never fused -- that is continuation.
+PARAMS_VERSION = 8
 
 # The five canonical product energy LEVELS = the band centers (Broad .. Sharp).
 # Hero cuts are precomputed at exactly these after L2; any requested energy
@@ -1150,7 +1156,112 @@ def _cut_for_span(cuts: List[HeroCut], a: int, b: int) -> Optional[HeroCut]:
     return best
 
 
-def _annotate_moments(clip: _ClipInputs, cuts: List[HeroCut]) -> List[HeroCut]:
+# --------------------------------------------------------------------------
+# Deterministic relatedness (P3) -- the signal-prep the brain groups WITH
+# --------------------------------------------------------------------------
+# Complementary capture-primitive pairs that read as ONE captured moment when
+# they co-occur: a doer + their line, a line + the listener's reaction, a claim
+# + the graphic that backs it, someone handling a thing. SAME-primitive
+# adjacency (line after line, beat after beat) is deliberately absent -- that is
+# continuation, not a moment, and fusing it would collapse a whole podcast turn.
+_COMPLEMENTARY_PRIMS = frozenset({
+    frozenset({vocab.PRIM_ACTION, vocab.PRIM_SPEECH}),
+    frozenset({vocab.PRIM_ACTION, vocab.PRIM_PERSON}),
+    frozenset({vocab.PRIM_SPEECH, vocab.PRIM_PERSON}),
+    frozenset({vocab.PRIM_SPEECH, vocab.PRIM_GRAPHIC}),
+    frozenset({vocab.PRIM_SPEECH, vocab.PRIM_OBJECT}),
+    frozenset({vocab.PRIM_SPEECH, vocab.PRIM_PLACE}),
+    frozenset({vocab.PRIM_ACTION, vocab.PRIM_OBJECT}),
+})
+
+# Default max gap for two complementary cuts to read as one moment. A NECESSARY
+# (not sufficient) condition -- relatedness must also hold. P4 will let energy
+# scale this (low energy fuses wider, high energy atomizes).
+_REL_FUSE_GAP_MS = 800
+
+
+def _cut_actors(c: HeroCut) -> set:
+    """Person ids visible in / speaking this cut (for the shared-actor signal)."""
+    out: set = set()
+    if c.speaker:
+        out.add(c.speaker)
+    for p in (c.people or ()):
+        pid = p.get("person_id")
+        if pid:
+            out.add(pid)
+    return out
+
+
+def _cut_region(c: HeroCut) -> Optional[dict]:
+    if c.framing and c.framing.get("region"):
+        return c.framing["region"]
+    for p in (c.people or ()):
+        if p.get("region"):
+            return p["region"]
+    return None
+
+
+def _region_iou(a: Optional[dict], b: Optional[dict]) -> float:
+    if not a or not b:
+        return 0.0
+    ax2, ay2 = a["x"] + a["w"], a["y"] + a["h"]
+    bx2, by2 = b["x"] + b["w"], b["y"] + b["h"]
+    ix = max(0.0, min(ax2, bx2) - max(a["x"], b["x"]))
+    iy = max(0.0, min(ay2, by2) - max(a["y"], b["y"]))
+    inter = ix * iy
+    if inter <= 0.0:
+        return 0.0
+    union = a["w"] * a["h"] + b["w"] * b["h"] - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _time_gap_ms(a: HeroCut, b: HeroCut) -> int:
+    """0 when the two spans overlap; otherwise the silent gap between them."""
+    return max(0, max(a.src_in_ms, b.src_in_ms) - min(a.src_out_ms, b.src_out_ms))
+
+
+def _relatedness_links(cuts: List[HeroCut], fuse_gap_ms: int) -> List[Tuple[str, str, str]]:
+    """Propose (a_id, b_id, basis) moment links from deterministic signals.
+
+    A pair links only when ALL hold: their capture primitives are complementary
+    (cross-kind -- never line+line), they are within ``fuse_gap_ms`` in time, and
+    they are actually related (share an actor, OR their subject regions overlap,
+    OR their spans overlap). Proximity alone never groups -- that was the old
+    over-merge. The basis string is recorded on the edge so the brain sees WHY."""
+    links: List[Tuple[str, str, str]] = []
+    ordered = sorted(cuts, key=lambda c: (c.src_in_ms, c.src_out_ms))
+    for i, a in enumerate(ordered):
+        ap = set(a.primitives())
+        a_actors = _cut_actors(a)
+        a_region = _cut_region(a)
+        for b in ordered[i + 1:]:
+            if b.src_in_ms - a.src_out_ms > fuse_gap_ms:
+                break  # sorted by start: nothing further is close enough
+            gap = _time_gap_ms(a, b)
+            if gap > fuse_gap_ms:
+                continue
+            bp = set(b.primitives())
+            if not any(pair <= (ap | bp) and len(pair & ap) and len(pair & bp)
+                       for pair in _COMPLEMENTARY_PRIMS):
+                continue  # not a complementary cross-kind pair
+            shared = a_actors & _cut_actors(b)
+            iou = _region_iou(a_region, _cut_region(b))
+            overlaps = gap == 0
+            if not (shared or iou >= 0.2 or overlaps):
+                continue  # complementary but unrelated -- leave them apart
+            why = "+".join(sorted(ap | bp))
+            if shared:
+                tie = "shared " + ",".join(sorted(shared))
+            elif overlaps:
+                tie = "overlap"
+            else:
+                tie = f"region iou {iou:.2f}"
+            links.append((a.hero_id, b.hero_id, f"{why} \u00b7 {tie} \u00b7 gap {gap}ms"))
+    return links
+
+
+def _annotate_moments(clip: _ClipInputs, cuts: List[HeroCut],
+                      params: Optional[EnergyParams] = None) -> List[HeroCut]:
     """Wire the VLM's typed relation graph onto the built cuts -- the flat model
     that replaces the old spine/fold/coverage hierarchy.
 
@@ -1165,11 +1276,17 @@ def _annotate_moments(clip: _ClipInputs, cuts: List[HeroCut]) -> List[HeroCut]:
     A 'moment' is therefore just a connected bundle of independent cuts (a line +
     its reaction + the b-roll that illustrates it). ``take_of`` edges are recorded
     but do NOT form a moment -- alternates are one slot, handled by take-stacking.
-    Degrades to a no-op when the perception predates the relation schema."""
-    rels = (clip.perception or {}).get("relations") or []
-    if not rels or len(cuts) < 2:
+
+    Two sources feed the clustering: (1) the VLM's explicit MOMENT_RELATIONS, and
+    (2) deterministic RELATEDNESS (P3) -- adjacent cuts with complementary capture
+    primitives that share an actor/region/overlap. (2) fills the common gap where
+    the VLM under-states relations (the reel-trail action+speech moment), recorded
+    as a derived ``grouped`` edge so the brain reads the basis. Same-primitive
+    adjacency is never fused. Degrades cleanly when there are no signals at all."""
+    if len(cuts) < 2:
         return cuts
-    spans = _l2_id_spans(clip.perception)
+    rels = (clip.perception or {}).get("relations") or []
+    spans = _l2_id_spans(clip.perception) if rels else {}
     by_id = {c.hero_id: c for c in cuts}
 
     # Union-find over moment-forming edges.
@@ -1203,6 +1320,21 @@ def _annotate_moments(clip: _ClipInputs, cuts: List[HeroCut]) -> List[HeroCut]:
         tc.relations.append({"type": t, "dir": "in", "other": fc.hero_id, "note": note})
         if t in vocab.MOMENT_RELATIONS:
             union(fc.hero_id, tc.hero_id)
+
+    # (2) Deterministic relatedness: complementary, proximate, related cuts the
+    # VLM didn't explicitly link. Record the basis as a derived `grouped` edge
+    # (NOT a vocab relation -- consumers gating on RELATION_SET ignore it) so the
+    # brain groups WITH the signal while still reading each atom's full meaning.
+    fuse_gap = getattr(params, "fuse_gap_ms", None)
+    if not fuse_gap or fuse_gap <= 0:
+        fuse_gap = _REL_FUSE_GAP_MS
+    for a_id, b_id, basis in _relatedness_links(cuts, fuse_gap):
+        ac, bc = by_id.get(a_id), by_id.get(b_id)
+        if ac is None or bc is None:
+            continue
+        ac.relations.append({"type": "grouped", "dir": "out", "other": b_id, "basis": basis})
+        bc.relations.append({"type": "grouped", "dir": "in", "other": a_id, "basis": basis})
+        union(a_id, b_id)
 
     # Stamp a moment_id on every cut that ended up in a cluster of >1.
     members: Dict[str, List[str]] = {}
@@ -1851,7 +1983,7 @@ def _file_heroes(
     # narrative role, then wire the VLM's typed relation graph onto the cuts and
     # mark connected bundles with a shared moment_id. Energy-independent metadata.
     _assign_roles(clip, heroes)
-    heroes = _annotate_moments(clip, heroes)
+    heroes = _annotate_moments(clip, heroes, params)
     return heroes
 
 

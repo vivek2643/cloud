@@ -744,6 +744,56 @@ def test_relation_illustrates_chains_into_one_moment():
     print("ok  test_relation_illustrates_chains_into_one_moment")
 
 
+def _rel_cut(hid, aff, a, b, actor=None, region=None):
+    return hc.HeroCut(hid, "zzzz", aff, hid, a, b, score=1.0, affordances=[aff],
+                      speaker=actor,
+                      framing=({"region": region} if region else None),
+                      people=([{"person_id": actor, "region": region}] if actor else []))
+
+
+def test_relatedness_groups_complementary_adjacent():
+    """P3: even with NO explicit VLM relation, a doer's action + their line that
+    are adjacent and share the actor fuse into one moment, with the basis on a
+    derived `grouped` edge (so the brain reads WHY). The reel-trail gap closed."""
+    sp = _rel_cut("z:sp0", "speech", 1000, 2000, actor="p1")
+    ac = _rel_cut("z:ac0", "action", 2050, 2600, actor="p1")
+    clip = hc._ClipInputs(file_id="zzzzzzzz-7", duration_ms=10000,
+                          dialogue={"topic": [], "sentence": []}, perception={}, motion=None)
+    hc._annotate_moments(clip, [sp, ac])
+    assert sp.moment_id is not None and sp.moment_id == ac.moment_id
+    edge = [r for r in sp.relations if r["type"] == "grouped"]
+    assert len(edge) == 1 and edge[0]["other"] == "z:ac0"
+    assert "action+speech" in edge[0]["basis"] and "shared p1" in edge[0]["basis"]
+    print("ok  test_relatedness_groups_complementary_adjacent")
+
+
+def test_relatedness_skips_sequential_same_primitive():
+    """Two adjacent speech lines (SAME primitive) never fuse -- that is
+    continuation, not a moment; fusing it would collapse a whole podcast turn."""
+    a = _rel_cut("z:sp0", "speech", 1000, 2000, actor="p1")
+    b = _rel_cut("z:sp1", "speech", 2050, 3000, actor="p1")
+    clip = hc._ClipInputs(file_id="zzzzzzzz-8", duration_ms=10000,
+                          dialogue={"topic": [], "sentence": []}, perception={}, motion=None)
+    hc._annotate_moments(clip, [a, b])
+    assert a.moment_id is None and b.moment_id is None
+    print("ok  test_relatedness_skips_sequential_same_primitive")
+
+
+def test_relatedness_needs_relation_not_just_proximity():
+    """Complementary + adjacent is NOT enough: with different actors, no region
+    overlap and disjoint spans, the pair stays apart (proximity alone never
+    groups -- that was the old over-merge)."""
+    sp = _rel_cut("z:sp0", "speech", 1000, 2000, actor="p1",
+                  region={"x": 0.0, "y": 0.0, "w": 0.2, "h": 0.2})
+    ac = _rel_cut("z:ac0", "action", 2100, 2600, actor="p2",
+                  region={"x": 0.8, "y": 0.8, "w": 0.2, "h": 0.2})
+    clip = hc._ClipInputs(file_id="zzzzzzzz-9", duration_ms=10000,
+                          dialogue={"topic": [], "sentence": []}, perception={}, motion=None)
+    hc._annotate_moments(clip, [sp, ac])
+    assert sp.moment_id is None and ac.moment_id is None
+    print("ok  test_relatedness_needs_relation_not_just_proximity")
+
+
 def test_behavior_anchors_from_event_timeline():
     """The VLM event timeline (incidental physical business) becomes ACTION
     anchors (kind='behavior') -- the thing that was previously dropped. There is
@@ -896,6 +946,9 @@ def main():
     test_roles_assigned_from_l2_and_listening_flag()
     test_no_relations_no_moments()
     test_relation_illustrates_chains_into_one_moment()
+    test_relatedness_groups_complementary_adjacent()
+    test_relatedness_skips_sequential_same_primitive()
+    test_relatedness_needs_relation_not_just_proximity()
     test_speech_cut_owns_ladder_and_resolves_speaker()
     test_offcamera_speech_flagged_not_dropped()
     test_speech_drops_offcamera_and_short()
