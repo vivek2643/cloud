@@ -268,8 +268,22 @@ export function HeroCutsView() {
   // winner's alt_takes) so the file stays honest while steering to the best.
   const fileGroups = useMemo(() => {
     if (filter !== "all") return [];
+    // Collapse moment members into ONE combined card per moment (a cluster is
+    // always within one file), so the All tab shows moment cards too -- not
+    // each member loose. Non-moment cuts stay as themselves.
+    const momentMembers: Record<string, HeroCut[]> = {};
+    const singles: HeroCut[] = [];
+    for (const h of present) {
+      if (h.is_moment && h.moment_id) (momentMembers[h.moment_id] ??= []).push(h);
+      else singles.push(h);
+    }
+    const collapsed: HeroCut[] = [...singles];
+    for (const members of Object.values(momentMembers)) {
+      collapsed.push(members.length > 1 ? combinedHero(members) : members[0]);
+    }
     const winners: Record<string, HeroCut[]> = {};
-    for (const h of present) (winners[h.file_id] ??= []).push(h);
+    for (const h of collapsed) (winners[h.file_id] ??= []).push(h);
+    for (const list of Object.values(winners)) list.sort((a, b) => b.score - a.score);
     const losers: Record<string, LoserTake[]> = {};
     for (const h of present) {
       for (const t of h.alt_takes ?? []) {
