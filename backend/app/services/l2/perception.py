@@ -28,7 +28,6 @@ from procrastinate import RetryStrategy
 from app.config import get_settings
 from app.services.jobs import app
 from app.services.l2 import gemini_video, prompt as l2_prompt
-from app.services.l2.cutaways import thin_cutaways
 from app.services.l2.schema import ClipPerception, SCHEMA_VERSION
 from app.services.processing import _download_from_r2
 from app.services.supabase_client import get_supabase
@@ -365,7 +364,6 @@ def l2_perception(file_id: str) -> None:
         perception = result.parsed
         usage = dict(result.usage or {})
         _fuse_speakers(perception, speaker_turns)
-        thin_cutaways(perception)
         _persist(file_id, perception, usage, result.model)
 
         # Refine the Dialogues lens now that we know who is actually on camera:
@@ -398,11 +396,10 @@ def l2_perception(file_id: str) -> None:
         except Exception:
             logger.exception("L2: failed to enqueue hero-cuts precompute for %s", file_id)
         logger.info(
-            "L2 complete for %s (%d persons, %d events, %d cutaways, %d tok out)",
+            "L2 complete for %s (%d persons, %d atoms, %d tok out)",
             file_id,
             len(perception.persons),
-            len(perception.events),
-            len(perception.cutaways),
+            len(perception.atoms),
             usage.get("output_tokens", 0),
         )
     except psycopg.errors.ForeignKeyViolation:

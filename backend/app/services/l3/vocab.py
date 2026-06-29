@@ -10,21 +10,15 @@ true regardless of what you're making); everything editorial is DERIVED on top.
     (speech; music/sfx deferred). These describe the frame/track content and
     never depend on the target edit. This is the honest atom of a cut.
 
+  * CAPTURE CHANNELS (cuts v2) -- the honest substrate the active pipeline reads:
+    SAID / DONE / SHOWN / HEARD, with an orthogonal SUBJECT tag on the video
+    channels. Detection only; the editor and a downstream engine decide use.
+
   * AFFORDANCES -- *why an editor reaches for a shot* (speech/action/reaction/
     broll/insert). The editor-facing VIEW layer (the UI's filter tabs). Frozen
     at five; a new detector MAPS into one (see ``SOURCE_AFFORDANCE``), never adds
     one. Each affordance maps DOWN to a capture primitive (``AFFORDANCE_PRIMITIVE``)
-    -- and two of them (reaction, broll) are *derived views*, not primitives:
-    a reaction is a PERSON shot + a `responds_to` relation; b-roll is a
-    place/object USED as supplementary footage. Their meaning lives in relations
-    and use, not in the capture.
-
-  * RELATIONS -- *how two cuts connect*. A typed, (mostly) directed graph over
-    cuts. Extracted at the source (the VLM states them) rather than guessed from
-    time overlap, so the brain reasons about real relationships.
-
-  * ROLES -- *what a cut is FOR* in a narrative (hook, answer, ...). Node-level
-    intent -- assigned at PLACEMENT (the brain), not baked into the capture.
+    and onto a v2 channel (``LEGACY_AFFORDANCE_CHANNEL``).
 
 Everything downstream imports these names; nothing redefines them. Pure module
 (no deps) so both L2 and L3 can import it freely.
@@ -237,66 +231,5 @@ PHYSICAL_AFFORDANCES: FrozenSet[str] = frozenset(
     {AFF_ACTION, AFF_BROLL, AFF_INSERT}
 )
 
-# --------------------------------------------------------------------------
-# Relations (closed set of SEVEN typed edges between cuts)
-# --------------------------------------------------------------------------
-REL_TAKE_OF = "take_of"           # same content, alternate take / angle (pick one)
-REL_RESPONDS_TO = "responds_to"   # a reaction <- the line/action that triggered it
-REL_ILLUSTRATES = "illustrates"   # a b-roll/insert <- the topic/noun it shows
-REL_LEADS_INTO = "leads_into"     # setup -> payoff, windup -> impact
-REL_SAME_INSTANT = "same_instant" # simultaneous coverage / angles of one beat
-REL_ANSWERS = "answers"           # an answer line <- the question it answers
-REL_CONTINUES = "continues"       # next-in-time within one continuous scene
-
-RELATIONS: Tuple[str, ...] = (
-    REL_TAKE_OF, REL_RESPONDS_TO, REL_ILLUSTRATES, REL_LEADS_INTO,
-    REL_SAME_INSTANT, REL_ANSWERS, REL_CONTINUES,
-)
-RELATION_SET: FrozenSet[str] = frozenset(RELATIONS)
-
-# Directed edges read "from_id -> to_id" with the meaning below; the rest are
-# symmetric (order carries no meaning).
-DIRECTED_RELATIONS: FrozenSet[str] = frozenset(
-    {REL_RESPONDS_TO, REL_ILLUSTRATES, REL_LEADS_INTO, REL_ANSWERS, REL_CONTINUES}
-)
-SYMMETRIC_RELATIONS: FrozenSet[str] = frozenset(
-    {REL_TAKE_OF, REL_SAME_INSTANT}
-)
-
-# Relations whose two endpoints are ALTERNATIVES (place at most one). Everything
-# else may legitimately co-exist on the timeline.
-ALTERNATIVE_RELATIONS: FrozenSet[str] = frozenset({REL_TAKE_OF})
-
-# Relations that bind cuts into ONE moment cluster (a connected beat the editor
-# would treat as a unit). take_of is NOT here -- alternates are one slot, not a
-# multi-shot beat.
-MOMENT_RELATIONS: FrozenSet[str] = frozenset(
-    {REL_RESPONDS_TO, REL_ILLUSTRATES, REL_LEADS_INTO, REL_SAME_INSTANT, REL_ANSWERS}
-)
-
-# --------------------------------------------------------------------------
-# Roles (node-level narrative intent -- what a cut is FOR)
-# --------------------------------------------------------------------------
-ROLE_HOOK = "hook"               # the opener that earns the watch
-ROLE_ANSWER = "answer"           # the payoff line to a question
-ROLE_CTA = "cta"                 # a call to action (ad / promo)
-ROLE_ESTABLISHING = "establishing"  # sets place / context
-ROLE_CLIMAX = "climax"           # the emotional / narrative peak
-ROLE_LISTENER = "listener"       # a held listening / attention shot
-
-ROLES: Tuple[str, ...] = (
-    ROLE_HOOK, ROLE_ANSWER, ROLE_CTA, ROLE_ESTABLISHING, ROLE_CLIMAX, ROLE_LISTENER,
-)
-ROLE_SET: FrozenSet[str] = frozenset(ROLES)
-
-
 def is_affordance(x: str) -> bool:
     return x in AFFORDANCE_SET
-
-
-def is_relation(x: str) -> bool:
-    return x in RELATION_SET
-
-
-def is_role(x: str) -> bool:
-    return x in ROLE_SET

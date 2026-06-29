@@ -195,11 +195,11 @@ def focus_for_range(
         return {"cx": round(cx, 4), "cy": round(cy, 4), "source": "speaking",
                 "evidence": f"speaker {span.get('subject', '?')}"}
 
-    hit = _dominant_region_center(perc.get("events") or [], src_in, src_out)
+    hit = _dominant_region_center(perc.get("atoms") or [], src_in, src_out)
     if hit:
-        (cx, cy), ev = hit
-        return {"cx": round(cx, 4), "cy": round(cy, 4), "source": "event",
-                "evidence": (str(ev.get("description") or "action"))[:60]}
+        (cx, cy), at = hit
+        return {"cx": round(cx, 4), "cy": round(cy, 4), "source": "atom",
+                "evidence": (str(at.get("label") or "action"))[:60]}
 
     cm = _motion_centroid(action_points, src_in, src_out)
     if cm:

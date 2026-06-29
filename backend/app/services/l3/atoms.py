@@ -199,70 +199,6 @@ def _vlm_atoms(perception: dict, motion: Optional[dict]) -> List[Atom]:
     return out
 
 
-# --- v1 -> atoms fallback ------------------------------------------------------
-# Until L2 is re-run under SCHEMA_VERSION 6, clips carry the OLD content_units /
-# cutaways tracks instead of `atoms`. Map them onto v2 atoms so the v2 pipeline
-# produces cuts on the existing corpus immediately (validate before re-running).
-_V1_KIND_CHANNEL = {
-    "action": vocab.CHANNEL_DONE,
-    "performance": vocab.CHANNEL_DONE,
-}
-_V1_PRIMITIVE_SUBJECT = {
-    "person": vocab.SUBJECT_PERSON,
-    "place": vocab.SUBJECT_PLACE,
-    "object": vocab.SUBJECT_OBJECT,
-    "graphic": vocab.SUBJECT_GRAPHIC,
-    "action": None,
-}
-
-
-def _atoms_from_v1(perception: dict, motion: Optional[dict]) -> List[Atom]:
-    out: List[Atom] = []
-    for u in (perception.get("content_units") or []):
-        kind = (u.get("kind") or "").lower()
-        s, e = int(u.get("start_ms", 0)), int(u.get("end_ms", 0))
-        if e <= s or kind == "speech":  # speech comes from the dialogue lens
-            continue
-        ch = _V1_KIND_CHANNEL.get(kind, vocab.CHANNEL_SHOWN)
-        conf = u.get("confidence")
-        out.append(Atom(
-            channel=ch, start_ms=s, end_ms=e,
-            peak_ms=_snap_peak(s, e, motion) if ch == vocab.CHANNEL_DONE else (s + e) // 2,
-            confidence=_clamp01(float(conf)) if conf is not None else 0.5,
-            subject=_V1_PRIMITIVE_SUBJECT.get((u.get("primitive") or "").lower()),
-            actor=u.get("subject") or u.get("actor"),
-            label=str(u.get("label") or u.get("content_key") or kind)[:200],
-            content_key=u.get("content_key"), source_id=str(u.get("unit_id", "")),
-        ))
-    for c in (perception.get("cutaways") or []):
-        s, e = int(c.get("start_ms", 0)), int(c.get("end_ms", 0))
-        if e <= s:
-            continue
-        prim = (c.get("primitive") or "").lower()
-        subject = _V1_PRIMITIVE_SUBJECT.get(prim)
-        aff = (c.get("affordance") or "").lower()
-        if subject is None:
-            subject = {"reaction": vocab.SUBJECT_PERSON, "insert": vocab.SUBJECT_GRAPHIC}.get(
-                aff, vocab.SUBJECT_PLACE)
-        # A changing graphic (screen-rec) is Done; everything else held = Shown.
-        ch = vocab.CHANNEL_DONE if (subject == vocab.SUBJECT_GRAPHIC and prim == "action") \
-            else vocab.CHANNEL_SHOWN
-        sal = c.get("salience_hint")
-        conf = c.get("confidence")
-        peak = c.get("peak_ms")
-        out.append(Atom(
-            channel=ch, start_ms=s, end_ms=e,
-            peak_ms=max(s, min(int(peak), e)) if peak is not None else (s + e) // 2,
-            confidence=_clamp01(float(conf)) if conf is not None
-            else (_clamp01(float(sal)) if sal is not None else 0.5),
-            subject=subject, actor=c.get("subject"),
-            label=str(c.get("label") or "")[:200],
-            summary=(str(c.get("summary")).strip()[:400] or None) if c.get("summary") else None,
-            source_id=str(c.get("id", "")),
-        ))
-    return out
-
-
 def _heard_atoms(audio: Optional[dict], sentences: List[dict]) -> List[Atom]:
     """Strict non-speech sound from the RMS envelope minus the speech mask. Built
     for completeness (and to keep noise OFF the person channel) but suppressed
@@ -372,9 +308,8 @@ def _fold_redundant(atoms: List[Atom]) -> List[Atom]:
 
 def build_atoms(clip) -> List[Atom]:
     """Every captured atom for one clip: Said (transcript), Done/Shown (VLM
-    `atoms`, or a v1 fallback from content_units/cutaways), Heard (RMS, strict).
-    Gated by per-channel confidence, then the dominant-channel fold removes
-    redundant framing. Time-sorted."""
+    detection `atoms`), Heard (RMS, strict). Gated by per-channel confidence,
+    then the dominant-channel fold removes redundant framing. Time-sorted."""
     perception = clip.perception or {}
     motion = clip.motion
     dialogue = clip.dialogue or {}
@@ -382,10 +317,7 @@ def build_atoms(clip) -> List[Atom]:
 
     atoms: List[Atom] = []
     atoms += _said_atoms(clip)
-    if perception.get("atoms"):
-        atoms += _vlm_atoms(perception, motion)
-    else:
-        atoms += _atoms_from_v1(perception, motion)   # legacy corpus, pre re-run
+    atoms += _vlm_atoms(perception, motion)
     atoms += _heard_atoms(clip.audio, sentences)
 
     # Clamp to the clip.

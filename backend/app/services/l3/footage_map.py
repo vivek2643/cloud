@@ -270,10 +270,6 @@ def build_clip_tree(
         if c.get("channel") == "said"
         or "speech" in (c.get("primitives") or []) or "speech" in (c.get("affordances") or [])
     ]
-    # Map each cut's hero_id to the tree-local moment id so relation endpoints
-    # (which reference other cuts by hero_id) can be expressed in the same id
-    # space the brain reads in the index.
-    hero_to_mid = {c.get("hero_id"): f"{fid8}:m{i:02d}" for i, c in enumerate(ordered)}
     for idx, cut in enumerate(ordered):
         hero_id = cut.get("hero_id")
         variants: Dict[str, Dict[str, Any]] = {}
@@ -316,16 +312,6 @@ def build_clip_tree(
             "people": cut.get("people") or [],
             "framing": cut.get("framing"),
             "quality": cut.get("quality"),
-            # Typed edges to OTHER moments (responds_to / illustrates / ...),
-            # expressed in tree moment-id space. Flat candidates + edges: the
-            # brain reads real connections, with NO forced default arrangement.
-            "relations": [
-                {"type": r.get("type"), "dir": r.get("dir"),
-                 "other": hero_to_mid.get(r.get("other")),
-                 "note": r.get("note") or r.get("basis")}
-                for r in (cut.get("relations") or [])
-                if hero_to_mid.get(r.get("other"))
-            ],
             # The connected-cluster id this cut shares with the cuts it forms a
             # moment with (a line + its reaction + illustrating b-roll). None for
             # a standalone cut. The "Moments" view groups by this.
@@ -506,26 +492,12 @@ def _people_tag(m: Dict[str, Any]) -> str:
 
 
 def _relation_tag(m: Dict[str, Any]) -> str:
-    """Compact view of this cut's OUTGOING typed edges + its moment cluster, so
-    the brain sees real connections (a reaction -> the line it answers, b-roll ->
-    the topic it shows) instead of guessing from adjacency. Incoming edges are
-    omitted here -- they show as outgoing on the other moment's line."""
-    out = []
-    seen = set()
-    for r in (m.get("relations") or []):
-        if r.get("dir") != "out" or not r.get("other"):
-            continue
-        key = (r.get("type"), r.get("other"))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(f"{r.get('type')}>{str(r['other']).split(':')[-1]}")
-    tag = ""
+    """Compact view of the cross-channel moment cluster this cut belongs to, so
+    the brain sees the deterministic capture-moment grouping (a line + its
+    reaction + illustrating b-roll) instead of guessing from adjacency."""
     if m.get("cluster_id"):
-        tag += f" · moment:{str(m['cluster_id']).split(':')[-1]}"
-    if out:
-        tag += " · rel:" + ",".join(out)
-    return tag
+        return f" · moment:{str(m['cluster_id']).split(':')[-1]}"
+    return ""
 
 
 def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
@@ -786,24 +758,6 @@ def _span_detail(file_id: str, in_ms: int, out_ms: int) -> Dict[str, Any]:
         if _ov(a.get("start_ms", 0), a.get("end_ms", 0))
     ]
 
-    out["events"] = [
-        {"start_ms": e.get("start_ms"), "end_ms": e.get("end_ms"),
-         "actor": e.get("actor"), "description": e.get("description")}
-        for e in (perception.get("events") or [])
-        if _ov(e.get("start_ms", 0), e.get("end_ms", 0))
-    ]
-    out["content_units"] = [
-        {"start_ms": u.get("start_ms"), "end_ms": u.get("end_ms"), "kind": u.get("kind"),
-         "primitive": u.get("primitive"), "label": u.get("label") or u.get("content_key")}
-        for u in (perception.get("content_units") or [])
-        if _ov(u.get("start_ms", 0), u.get("end_ms", 0))
-    ]
-    out["cutaways"] = [
-        {"start_ms": c.get("start_ms"), "end_ms": c.get("end_ms"), "kind": c.get("kind"),
-         "primitive": c.get("primitive"), "label": c.get("label"), "summary": c.get("summary")}
-        for c in (perception.get("cutaways") or [])
-        if _ov(c.get("start_ms", 0), c.get("end_ms", 0))
-    ]
     # Verbatim transcript window (sentence granularity) -- the words actually
     # spoken across the span, so the brain reads the line, not just the gist.
     out["transcript"] = [
@@ -817,9 +771,9 @@ def _span_detail(file_id: str, in_ms: int, out_ms: int) -> Dict[str, Any]:
 
 def moment_detail(file_id: str, moment_id: str) -> Optional[Dict[str, Any]]:
     """The full record for one moment -- every variant span, the parent clip's
-    context, AND the raw source detail over its span (VLM events, content units /
-    cutaways, transcript window). What the model retrieves to inspect a candidate
-    deeply, without any of it living in the resident prompt."""
+    context, AND the raw source detail over its span (VLM detection atoms +
+    transcript window). What the model retrieves to inspect a candidate deeply,
+    without any of it living in the resident prompt."""
     tree = get_trees([file_id]).get(file_id)
     if not tree:
         return None

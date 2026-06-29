@@ -8,15 +8,16 @@ prompt, constrains the model, and parses the result.
 
 Design rules baked into the shape (see the perception spec discussion):
   * Universal spine + optional modules. Every clip gets clip-level fields; the
-    `persons`/`events`/`reactions`/... tracks are lists that are simply empty
-    when they don't apply (a sunset clip has no persons, no speech, no events).
+    `persons`/`speaking`/`atoms`/... tracks are lists that are simply empty when
+    they don't apply (a sunset clip has no persons, no speech, just shown atoms).
   * Single take. There are no shots/scenes -- the whole clip is one continuous
-    camera take, so "structure" is a *timeline of events*, never a cut list.
-  * Sparse, timestamped events. Tracks emit events at the moments they happen
-    (ms, video-relative); downstream code rasterizes them into the dense 100 ms
-    cut-cost grid. The model never emits dense per-frame arrays.
-  * Stable local ids. People are `p1`, `p2`, ... within this clip; events and
-    interactions reference those ids so actors link to actions. The ids are
+    camera take, so "structure" is a *timeline of detection atoms*, never a cut list.
+  * Detection only (cuts v2). The video track is logged as `atoms`: per-beat
+    CHANNEL (done/shown) + SUBJECT (person/place/object/graphic) + peak +
+    confidence. No editorial buckets, roles, or relations -- a downstream engine
+    decides use. Said comes from L1 transcript, Heard from the audio envelope.
+  * Stable local ids. People are `p1`, `p2`, ... within this clip; atoms
+    reference those ids (`actor`) so subjects link to people. The ids are
     clip-local; cross-video identity is resolved later from the durable traits.
   * Controlled vocabularies (enums) wherever comparability matters, free text
     where nuance matters.
@@ -52,33 +53,16 @@ def _to_unit(v):
     return max(0.0, min(1.0, x))
 
 # v2 adds coarse spatial framing signals (subject `region`s + clip
-# `frame_orientation`) used by the editor's auto-reframe/crop. Older v1 rows
-# simply lack them and fall back to centered framing.
-# v4 adds the typed relation graph (`relations`) plus node-level intent
-# (`role`) and grounding (`topic`/`entity`) on the cut-bearing tracks, and gives
-# `reactions`/`cutaways` stable local ids so they can be relation endpoints.
-# v5 adds the intrinsic CAPTURE PRIMITIVE (`primitive`: person/action/place/
-# object/graphic/speech) + a `confidence` on each cut-bearing beat, and a
-# `summary` (semantic gist) for information-dense graphics (don't OCR a slide --
-# say what it conveys).
-# v6 (cuts v2) adds the detection-only `atoms` track: per-beat CHANNEL
-# (done/shown) + SUBJECT (person/place/object/graphic) + peak + confidence. This
-# is the substrate the v2 cut pipeline reads; the v1 tracks above (events/
-# reactions/cutaways/content_units/relations/role) are retained but no longer
-# read by the active path.
+# `frame_orientation`) used by the editor's auto-reframe/crop.
+# v6 (cuts v2) makes the detection-only `atoms` track the sole video-capture
+# substrate: per-beat CHANNEL (done/shown) + SUBJECT (person/place/object/
+# graphic) + peak + confidence. The old v1 editorial tracks (events / reactions
+# / cutaways / content_units / relations / role) have been REMOVED -- the cut
+# pipeline reads atoms (+ Said from L1, Heard from the audio envelope) only.
 SCHEMA_VERSION = 6
 
 
-# The editing vocabulary (vocab.py) is the single source of truth. Render the
-# closed relation/role sets as enums so they constrain the model's JSON and
-# self-document in the prompt schema, without re-typing the strings here.
-RelationType = Enum("RelationType", [(r, r) for r in vocab.RELATIONS], type=str)
-Role = Enum("Role", [(r, r) for r in vocab.ROLES], type=str)
-# The intrinsic capture substrate the VLM states per cut-bearing beat: what the
-# frame/track is about, independent of how it's later used (see vocab.py).
-CapturePrimitive = Enum(
-    "CapturePrimitive", [(p, p) for p in vocab.CAPTURE_PRIMITIVES], type=str
-)
+# The editing vocabulary (vocab.py) is the single source of truth.
 # v6 cuts-v2 substrate: the VLM detects video-channel beats as ATOMS. Channel is
 # only the two video channels here (audio Said comes from L1 transcript; Heard
 # from the RMS envelope -- the VLM never emits them). Subject is orthogonal.
@@ -103,15 +87,6 @@ def _coerce_subject(v):
     return s if s in vocab.SUBJECT_SET else None
 
 
-def _coerce_primitive(v):
-    """Lenient capture primitive: drop an out-of-vocab value to None rather than
-    failing the whole clip's parse (the schema is prompt-guided, not constrained)."""
-    if v is None:
-        return None
-    s = str(getattr(v, "value", v)).strip().lower()
-    return s if s in vocab.CAPTURE_PRIMITIVE_SET else None
-
-
 def _coerce_enum(enum_cls):
     """Build a lenient `mode='before'` coercer for a closed string Enum.
 
@@ -130,16 +105,6 @@ def _coerce_enum(enum_cls):
         return s if s in values else None
 
     return _coerce
-
-
-def _coerce_role(v):
-    """Lenient role: the schema is carried in-prompt (no constrained decoding),
-    so the model occasionally emits an out-of-vocab role (a relation name, a
-    'question'). Drop it to None rather than failing the WHOLE clip's parse."""
-    if v is None:
-        return None
-    s = str(getattr(v, "value", v)).strip().lower()
-    return s if s in vocab.ROLE_SET else None
 
 
 # --------------------------------------------------------------------------
@@ -226,33 +191,6 @@ class CameraMovement(str, Enum):
     unsure = "unsure"
 
 
-class EventChange(str, Enum):
-    """The editorial moment an event marks -- these are the points a cut wants
-    to respect (don't cut mid-reveal) or land on (cut on an exit)."""
-    enters_frame = "enters_frame"
-    exits_frame = "exits_frame"
-    action_starts = "action_starts"
-    action_peak = "action_peak"
-    action_ends = "action_ends"
-    holds = "holds"
-    reveal = "reveal"
-    setup = "setup"
-
-
-class ReactionType(str, Enum):
-    smile = "smile"
-    laugh = "laugh"
-    surprise = "surprise"
-    frown = "frown"
-    cry = "cry"
-    nod = "nod"
-    shake_head = "shake_head"
-    eye_widen = "eye_widen"
-    eyebrow_raise = "eyebrow_raise"
-    look_away = "look_away"
-    other = "other"
-
-
 class GazeDirection(str, Enum):
     to_camera = "to_camera"
     off_camera = "off_camera"
@@ -292,16 +230,6 @@ class Region(BaseModel):
             return max(0.0, min(1.0, float(v)))
         except (TypeError, ValueError):
             return 0.0
-
-
-class GraphicKind(str, Enum):
-    on_screen_text = "on_screen_text"
-    caption = "caption"
-    lower_third = "lower_third"
-    sign = "sign"
-    ui_element = "ui_element"
-    logo = "logo"
-    other = "other"
 
 
 # --------------------------------------------------------------------------
@@ -428,84 +356,6 @@ class Person(BaseModel):
 # Temporal tracks (sparse, timestamped events)
 # --------------------------------------------------------------------------
 
-def _lenient_event_change(v):
-    """Coerce an unknown ``change`` value to None instead of failing the whole
-    doc. Without constrained decoding the model sometimes puts a cutaway kind
-    ('reaction', 'gaze') here; drop it rather than reject the entire perception."""
-    if v is None or isinstance(v, EventChange):
-        return v
-    try:
-        return EventChange(v)
-    except ValueError:
-        return None
-
-
-class Event(BaseModel):
-    """One beat on the timeline. `actor` is optional so the timeline generalizes
-    beyond people (a door opening, a car passing). Multi-actor moments are split
-    into one event per actor and tied together by a shared `interaction_id`."""
-    id: str
-    start_ms: int
-    end_ms: int
-    description: str = Field(description="what happens, concretely: 'p1 opens the car door and steps out'")
-    actor: Optional[str] = Field(None, description="person local_id, or null for non-person events")
-    target: Optional[str] = Field(None, description="person local_id or object name the action is directed at")
-    change: Optional[EventChange] = None
-
-    @field_validator("change", mode="before")
-    @classmethod
-    def _coerce_change(cls, v):
-        return _lenient_event_change(v)
-    interaction_id: Optional[str] = Field(None, description="links the per-actor events of one shared moment")
-    region: Optional[Region] = Field(
-        None, description="where in the frame this beat happens (coarse box); used to reframe onto the action"
-    )
-    role: Optional[Role] = Field(None, description="narrative intent of this beat, when clear (e.g. 'establishing', 'climax')")
-    confidence: Optional[float] = Field(
-        None, description="0..1 how sure you are this is a real, usable beat (keep recall high)"
-    )
-
-    @field_validator("confidence", mode="before")
-    @classmethod
-    def _norm_conf(cls, v):
-        return _to_unit(v)
-
-    @field_validator("role", mode="before")
-    @classmethod
-    def _norm_role(cls, v):
-        return _coerce_role(v)
-
-
-class Interaction(BaseModel):
-    id: str
-    start_ms: int
-    end_ms: int
-    kind: Optional[str] = Field(None, description="e.g. 'conversation', 'handshake', 'hug', 'hand-off'")
-    participants: List[str] = Field(default_factory=list, description="person local_ids involved")
-    description: Optional[str] = None
-
-
-class Reaction(BaseModel):
-    id: Optional[str] = Field(None, description="clip-local id ('rx1', ...) so a relation can point at this reaction")
-    start_ms: int
-    end_ms: int
-    subject: str = Field(description="person local_id reacting")
-    type: Optional[ReactionType] = None
-    intensity: Optional[float] = Field(None, description="0..1")
-    trigger: Optional[str] = Field(None, description="what prompted it, e.g. 'p2's joke', 'the reveal'")
-    role: Optional[Role] = Field(None, description="narrative intent of this beat, when clear (e.g. 'listener', 'climax')")
-
-    @field_validator("intensity", mode="before")
-    @classmethod
-    def _norm_intensity(cls, v):
-        return _to_unit(v)
-
-    @field_validator("role", mode="before")
-    @classmethod
-    def _norm_role(cls, v):
-        return _coerce_role(v)
-
-
 class GazeSpan(BaseModel):
     start_ms: int
     end_ms: int
@@ -528,210 +378,14 @@ class SpeakingSpan(BaseModel):
     )
 
 
-class EnvironmentEvent(BaseModel):
-    """Non-person world changes worth a cut point: light shifts, weather,
-    something entering/leaving frame, a vehicle passing."""
-    start_ms: int
-    end_ms: int
-    description: str
-    change: Optional[EventChange] = None
-
-    @field_validator("change", mode="before")
-    @classmethod
-    def _coerce_change(cls, v):
-        return _lenient_event_change(v)
-
-
-class GraphicTextEvent(BaseModel):
-    start_ms: int
-    end_ms: int
-    kind: Optional[GraphicKind] = None
-    text: Optional[str] = Field(None, description="verbatim text if legible")
-    summary: Optional[str] = Field(
-        None,
-        description=(
-            "for an information-dense graphic (slide/chart/list/UI), what it "
-            "CONVEYS in one line -- the gist, not a transcription of every word."
-        ),
-    )
-
-
 # --------------------------------------------------------------------------
-# Editorial cutaways (sparse overlay layer -- the only feed source for
-# reactions / b-roll / inserts in the anchor pipeline when populated)
-# --------------------------------------------------------------------------
-
-class CutawayAffordance(str, Enum):
-    reaction = "reaction"
-    broll = "broll"
-    insert = "insert"
-
-
-class CutawayKind(str, Enum):
-    reaction = "reaction"
-    gaze = "gaze"
-    broll_hold = "broll_hold"
-    broll_move = "broll_move"
-    reveal = "reveal"
-    graphic = "graphic"
-    environment = "environment"
-    interaction = "interaction"
-
-
-# Map common model drift onto a real cutaway kind so one mislabeled cutaway
-# (e.g. kind='action', bleeding from the new `primitive` field) degrades to a
-# neutral hold instead of failing the WHOLE clip's parse (recall-first).
-_CUTAWAY_KIND_SYNONYM = {
-    "action": "broll_move",
-    "motion": "broll_move",
-    "person": "reaction",
-    "place": "broll_hold",
-    "object": "broll_hold",
-    "broll": "broll_hold",
-    "insert": "reveal",
-    "speech": "broll_hold",
-}
-
-
-def _coerce_cutaway_kind(v):
-    if v is None:
-        return v
-    s = str(getattr(v, "value", v)).strip().lower()
-    if s in {k.value for k in CutawayKind}:
-        return s
-    return _CUTAWAY_KIND_SYNONYM.get(s, CutawayKind.broll_hold.value)
-
-
-class CutawayMoment(BaseModel):
-    """One overlay moment an editor would cut TO -- not every visible change."""
-    id: Optional[str] = Field(None, description="clip-local id ('cx1', ...) so a relation can point at this cutaway")
-    start_ms: int
-    end_ms: int
-    kind: CutawayKind
-    affordance: CutawayAffordance
-    primitive: Optional[CapturePrimitive] = Field(
-        None,
-        description=(
-            "what is captured here, independent of the affordance: 'person' (a "
-            "human shot -- a reaction is a person shot), 'place' (scenery/"
-            "establishing), 'object' (a thing/detail), 'graphic' (on-screen text/"
-            "chart/reveal), or 'action'. Distinguish place vs object vs person "
-            "for b-roll instead of leaving it generic."
-        ),
-    )
-    subject: Optional[str] = Field(None, description="person local_id when relevant")
-    label: str = Field(description="short human-facing label for the card")
-    summary: Optional[str] = Field(
-        None,
-        description=(
-            "for an information-dense graphic (a slide, chart, list, UI), a short "
-            "summary of what it CONVEYS -- not verbatim OCR. Null for plain shots."
-        ),
-    )
-    trigger: Optional[str] = Field(None, description="what prompted a reaction")
-    intensity: Optional[float] = Field(None, description="0..1")
-    editorial_role: Optional[str] = Field(
-        None,
-        description="e.g. listener_reaction, establishing, product_reveal",
-    )
-    role: Optional[Role] = Field(None, description="narrative intent of this beat, when clear (e.g. 'establishing', 'cta')")
-    topic: Optional[str] = Field(None, description="the subject/topic this beat is about, for grounding 'illustrates' links")
-    entity: Optional[str] = Field(None, description="the concrete thing shown (a noun: 'coffee cup', 'logo', 'mountain')")
-    salience_hint: Optional[float] = Field(
-        None, description="how cut-worthy (higher = stronger), 0..1"
-    )
-    confidence: Optional[float] = Field(
-        None, description="0..1 how sure you are this is a real, usable cutaway (keep recall high)"
-    )
-    peak_ms: Optional[int] = Field(None, description="peak frame for reactions")
-
-    @field_validator("intensity", "salience_hint", "confidence", mode="before")
-    @classmethod
-    def _norm_unit(cls, v):
-        return _to_unit(v)
-
-    @field_validator("kind", mode="before")
-    @classmethod
-    def _norm_kind(cls, v):
-        return _coerce_cutaway_kind(v)
-
-    @field_validator("primitive", mode="before")
-    @classmethod
-    def _norm_primitive(cls, v):
-        return _coerce_primitive(v)
-
-    @field_validator("role", mode="before")
-    @classmethod
-    def _norm_role(cls, v):
-        return _coerce_role(v)
-
-
-# --------------------------------------------------------------------------
-# Take selection (span-level): content units + localized quality + retries
+# Take selection (span-level): localized quality + retries
 #
 # Quality is NEVER a clip-level scalar. It is a property of a SPAN of content.
 # The VLM localizes its quality judgements in time exactly like every other
 # track here, so downstream code can compare any part of one clip to any part
 # of another (across clips OR within one clip) without a second VLM pass.
 # --------------------------------------------------------------------------
-
-class ContentKind(str, Enum):
-    speech = "speech"        # a spoken line / sentence / utterance
-    action = "action"        # a physical action beat
-    visual = "visual"        # a held composition / b-roll moment
-    performance = "performance"
-
-
-class ContentUnit(BaseModel):
-    """One span that delivers ONE unit of content -- the atom of take
-    selection. For speech this is a sentence/line; for action, one beat. Two
-    deliveries of the SAME content (across clips, or a retry within this clip)
-    must share a comparable `content_key` so they can be grouped later."""
-    unit_id: str = Field(description="clip-local id: 'u1', 'u2', ...")
-    start_ms: int
-    end_ms: int
-    kind: Optional[ContentKind] = None
-    content_key: Optional[str] = Field(
-        None,
-        description=(
-            "Normalized identity of WHAT is delivered, so the same content "
-            "matches across takes. For speech: the spoken line, lower-cased, "
-            "stripped of fillers/false-starts. For action/visual: a short "
-            "canonical description ('p1 pours the coffee')."
-        ),
-    )
-    label: Optional[str] = Field(None, description="short human-facing label")
-    primitive: Optional[CapturePrimitive] = Field(
-        None,
-        description=(
-            "what this unit fundamentally IS, captured: 'speech' (a spoken line), "
-            "'action' (a physical beat), 'person' (a held person shot), 'place' "
-            "(scenery/environment), 'object' (a thing/detail), or 'graphic' "
-            "(on-screen text/chart). Independent of how it might later be used."
-        ),
-    )
-    role: Optional[Role] = Field(None, description="narrative intent of this unit, when clear (e.g. 'hook', 'answer', 'cta')")
-    topic: Optional[str] = Field(None, description="the subject/topic this unit is about, for grouping and 'illustrates' links")
-    entity: Optional[str] = Field(None, description="the concrete thing/person this unit centers on, when there is a clear one")
-    confidence: Optional[float] = Field(
-        None, description="0..1 how sure you are this is a real, usable beat (keep recall high -- include moderate ones)"
-    )
-
-    @field_validator("confidence", mode="before")
-    @classmethod
-    def _norm_conf(cls, v):
-        return _to_unit(v)
-
-    @field_validator("primitive", mode="before")
-    @classmethod
-    def _norm_primitive(cls, v):
-        return _coerce_primitive(v)
-
-    @field_validator("role", mode="before")
-    @classmethod
-    def _norm_role(cls, v):
-        return _coerce_role(v)
-
 
 class QualityDimension(str, Enum):
     energy = "energy"            # performance energy / engagement
@@ -769,33 +423,6 @@ class RestartMarker(BaseModel):
     restarts_unit: Optional[str] = Field(
         None, description="unit_id this is another attempt of, when identifiable"
     )
-
-
-# --------------------------------------------------------------------------
-# Typed relation graph (how the logged beats connect)
-# --------------------------------------------------------------------------
-
-class Relation(BaseModel):
-    """One typed edge between two logged beats. Endpoints reference any id you
-    emitted: an event `id`, a `content_units` unit_id, a `cutaways` id, or a
-    `reactions` id. This is how downstream editing reasons about real
-    relationships (a reaction to a line, b-roll that illustrates a topic, a
-    setup that leads into a payoff) instead of guessing from time overlap.
-
-    Directed edges read from_id -> to_id:
-      * responds_to  : reaction/answer  ->  the line or action that triggered it
-      * illustrates  : a visual/insert  ->  the topic/line/noun it shows
-      * leads_into   : a setup/windup   ->  its payoff/impact
-      * answers      : an answer line   ->  the question it answers
-      * continues    : a beat           ->  the next beat in the same scene
-    Symmetric edges (order carries no meaning):
-      * take_of      : two deliveries of the SAME content (place at most one)
-      * same_instant : two simultaneous coverages/angles of one beat
-    """
-    type: RelationType
-    from_id: str = Field(description="id this edge points FROM (event/unit/cutaway/reaction id)")
-    to_id: str = Field(description="id this edge points TO")
-    note: Optional[str] = Field(None, description="optional short reason, e.g. 'laughs at the punchline'")
 
 
 # --------------------------------------------------------------------------
@@ -896,21 +523,12 @@ class ClipPerception(BaseModel):
     camera_craft: List[CameraSpan] = Field(default_factory=list)
     persons: List[Person] = Field(default_factory=list)
 
-    events: List[Event] = Field(default_factory=list)
-    interactions: List[Interaction] = Field(default_factory=list)
-    reactions: List[Reaction] = Field(default_factory=list)
     gaze: List[GazeSpan] = Field(default_factory=list)
     speaking: List[SpeakingSpan] = Field(default_factory=list)
-    environment_events: List[EnvironmentEvent] = Field(default_factory=list)
-    graphic_text_events: List[GraphicTextEvent] = Field(default_factory=list)
-
-    # Sparse overlay catalog: reactions, b-roll handles, inserts worth cutting to.
-    # When non-empty, downstream overlay anchors read ONLY this list.
-    cutaways: List[CutawayMoment] = Field(default_factory=list)
 
     # v6 cuts-v2 substrate: detection-only video-channel atoms (done/shown) the
-    # active cut pipeline reads. When present, the v1 cutaways/content_units/
-    # events tracks above are ignored by the cut builder.
+    # active cut pipeline reads (alongside Said from L1 + Heard from the audio
+    # envelope). This is the single capture track the cut builder consumes.
     atoms: List[CaptureAtom] = Field(default_factory=list)
 
     @field_validator("atoms", mode="before")
@@ -922,30 +540,8 @@ class ClipPerception(BaseModel):
             return v
         return [a for a in v if isinstance(a, dict) and _coerce_channel(a.get("channel"))]
 
-    # Take selection (span-level). Empty for clips with no comparable content.
-    content_units: List[ContentUnit] = Field(default_factory=list)
+    # Take selection (span-level): localized quality + retry markers.
     take_quality_events: List[TakeQualityEvent] = Field(default_factory=list)
     restart_markers: List[RestartMarker] = Field(default_factory=list)
-
-    # Typed graph over the logged beats (events / units / cutaways / reactions).
-    # Empty when nothing connects (a single static b-roll clip).
-    relations: List[Relation] = Field(default_factory=list)
-
-    @field_validator("relations", mode="before")
-    @classmethod
-    def _drop_bad_relations(cls, v):
-        """Keep only well-formed, in-vocab edges -- a stray relation type (the
-        model is prompt-guided, not constrained) drops that one edge instead of
-        failing the whole clip's parse."""
-        if not isinstance(v, list):
-            return v
-        out = []
-        for r in v:
-            if not isinstance(r, dict):
-                continue
-            t = str(r.get("type", "")).strip().lower()
-            if t in vocab.RELATION_SET and r.get("from_id") and r.get("to_id"):
-                out.append({**r, "type": t})
-        return out
 
     notes: Optional[str] = Field(None, description="caveats, low-confidence calls, anything ambiguous")

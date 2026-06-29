@@ -4,8 +4,8 @@ The schema (response_schema) already pins the *shape* of the answer; the prompt
 job is to set the *stance*: this is a single continuous take, log it like a DIT
 logging footage (chronological, factual, comparable), not like a highlight reel.
 
-Overlay cutaways live in the sparse ``cutaways`` track only -- not scattered across
-``reactions`` / ``camera_craft`` / ``holds`` events.
+What the camera captured on the video track is logged as detection-only ``atoms``
+(channel done/shown + subject); the editor and a downstream engine decide use.
 """
 from __future__ import annotations
 
@@ -106,8 +106,8 @@ Rules:
     correct for things that don't apply (a silent scenery clip has no persons or
     speech, just one or a few shown.place atoms).
   * Do NOT assign narrative roles, editorial uses, or relationships between
-    beats -- detection only. Leave `events`, `reactions`, `gaze`, `cutaways`,
-    `content_units`, and `relations` EMPTY; the `atoms` track replaces them.
+    beats -- detection only. What was captured on the video track goes in
+    `atoms`; do not editorialize.
   * Do NOT set voice_speaker_id or av_link_confidence on persons -- those are
     filled in later by a separate audio step.
   * Keep descriptions concrete and concise."""
@@ -140,7 +140,7 @@ def build_user_prompt(
         lines.append(
             "Emit `atoms` sparingly relative to these beats -- one honest atom per "
             "real captured beat beats many weak ones. Detection only: no roles, no "
-            "relations, no cutaways. Leave events/reactions/cutaways/content_units empty."
+            "relations, no editorial buckets."
         )
         lines.append("=== END EDITORIAL CONTEXT ===")
 
@@ -149,7 +149,7 @@ def build_user_prompt(
         lines.append(
             "A speech transcript with precise timestamps is provided below for "
             "TIMING and WORDING reference only. Use it to align speaking spans "
-            "and events to the right moments; do not contradict what you see."
+            "and atoms to the right moments; do not contradict what you see."
         )
         if speaker_ids:
             lines.append(
