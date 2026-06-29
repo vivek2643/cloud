@@ -518,7 +518,7 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
         gloss = f" shows:\"{_short_gist(summ)}\""
     dup = ""
     if m.get("dup_group"):
-        dup = f" · dup:{m['dup_group']}{'*' if m.get('dup_best') else ''}"
+        dup = f" · dup:{m['dup_group']}{' retry' if m.get('dup_restart') else ''}"
     return (f"  {m['moment_id'].split(':')[-1]} {_capture_tag(m)}{spk}{cam} "
             f".{int(round(m['score'] * 100)):02d} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])}] "
@@ -571,43 +571,38 @@ def _clip_block(tree: Dict[str, Any], *, compact: bool = False) -> str:
 # Cross-clip duplicate linking (same line delivered as multiple takes/angles)
 # --------------------------------------------------------------------------
 
-def _take_key(m: Dict[str, Any], restart_ids: set) -> Tuple[bool, float, float, float]:
-    """Deterministic best-take order for a moment: not-a-retry, then speaker
-    on-camera, then delivery fluency, then score. Mirrors hero_cuts._take_rank so
-    the engine's pick is consistent whether read off heroes or the moment-tree."""
-    q = m.get("quality") or {}
-    on_cam = q.get("on_camera")
-    deliv = q.get("delivery")
-    return (
-        m["moment_id"] not in restart_ids,
-        float(on_cam) if on_cam is not None else 0.5,
-        float(deliv) if deliv is not None else 0.5,
-        float(m.get("score", 0.0)),
-    )
-
-
 def _best_overlap_moment(
     moments: List[Dict[str, Any]], start_ms: int, end_ms: int
 ) -> Optional[Dict[str, Any]]:
-    """The moment whose span overlaps [start_ms, end_ms] the most (or None)."""
+    """The moment that best CORRESPONDS to [start_ms, end_ms] by temporal IoU
+    (intersection over union), not raw overlap. IoU is what stops a whole-clip
+    establishing/b-roll moment (e.g. a 400s "person at desk" shown-atom) from
+    swallowing every speech attempt: it overlaps all of them but its IoU is tiny,
+    while the aligned speech moment scores ~1.0. Returns None if nothing overlaps."""
     best: Optional[Dict[str, Any]] = None
-    best_ov = 0
+    best_iou = 0.0
     for m in moments:
-        ov = _overlap_ms(int(m["in_ms"]), int(m["out_ms"]), start_ms, end_ms)
-        if ov > best_ov:
-            best_ov, best = ov, m
-    return best if best_ov > 0 else None
+        mi, mo = int(m["in_ms"]), int(m["out_ms"])
+        ov = _overlap_ms(mi, mo, start_ms, end_ms)
+        if ov <= 0:
+            continue
+        union = max(mo, end_ms) - min(mi, start_ms)
+        iou = ov / union if union > 0 else 0.0
+        if iou > best_iou:
+            best_iou, best = iou, m
+    return best
 
 
 def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Link moments that deliver the SAME content across clips/angles.
 
     Reconciles cross-clip take groups (``takes.build_take_groups``) onto the
-    moment-tree by time overlap, tags each linked moment in place with its
-    ``dup_group`` and whether it's the engine's pre-picked best take, and returns
-    a render-ready summary. This is cross-set dependent (it changes with the file
-    set), so it is computed per request and never baked into the per-file tree
-    cache. Fail-open: any error yields no links.
+    moment-tree by best temporal IoU, tags each linked moment in place with its
+    ``dup_group`` (and ``dup_restart`` for an abandoned take), and returns a
+    render-ready summary. No winner is crowned -- the brain compares the members
+    and decides. This is cross-set dependent (it changes with the file set), so
+    it is computed per request and never baked into the per-file tree cache.
+    Fail-open: any error yields no links.
     """
     file_ids = [t["file_id"] for t in trees]
     if len(file_ids) < 1:
@@ -635,15 +630,15 @@ def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         # take decision -- the engine already collapsed its own bands).
         if len(linked) < 2:
             continue
-        # Engine best take, deterministic: avoid abandoned (restart) takes, then
-        # prefer the speaker ON CAMERA, then the cleaner DELIVERY, then score.
-        best = max(linked.values(), key=lambda m: _take_key(m, restart_ids))
+        # No winner is crowned: members are tagged as the SAME beat and left for
+        # the brain to compare (by reading text + quality) and place. An abandoned
+        # (restart) take is flagged so the brain can see it, not auto-dropped.
         for mid, m in linked.items():
             m["dup_group"] = g.group_id
-            m["dup_best"] = (mid == best["moment_id"])
+            if mid in restart_ids:
+                m["dup_restart"] = True
         summary.append({
             "group_id": g.group_id,
-            "best": best["moment_id"],
             "members": list(linked.keys()),
             "text": (g.attempts[0].text or "").strip(),
         })
@@ -653,13 +648,13 @@ def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def _dups_block(summary: List[Dict[str, Any]]) -> str:
     if not summary:
         return ""
-    lines = ["DUPLICATE GROUPS (same line, multiple takes/angles -- place ONE "
-             "per group; the * is the engine's best take, override only if "
-             "another reads/looks better):"]
+    lines = ["SAME-BEAT GROUPS (the same spoken line captured more than once -- a "
+             "retake or another camera angle). Choose the member that reads/looks "
+             "best by its text and score; do not repeat the same line on the main "
+             "line, but you MAY place another member as a silent reaction/cutaway "
+             "over that line's audio:"]
     for d in summary:
-        members = " ".join(
-            (mid + "*" if mid == d["best"] else mid) for mid in d["members"]
-        )
+        members = " ".join(d["members"])
         gist = d["text"].replace("\n", " ")
         if len(gist) > 80:
             gist = gist[:77] + "..."

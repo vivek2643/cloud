@@ -45,8 +45,10 @@ _TOOLS = [
     ),
     tool_spec(
         "inspect_dup_group",
-        "List every take/angle in a duplicate group (same line delivered more "
-        "than once) with full text and score, so you can pick the best one.",
+        "List every member of a same-beat group (the same line delivered more "
+        "than once, as a retake or another angle) with full text, score, whether "
+        "the speaker is on camera, delivery, and whether it's an abandoned retry "
+        "-- so you can compare and choose which to use.",
         {
             "type": "object",
             "properties": {
@@ -88,12 +90,14 @@ _PAGED_SYSTEM = (
     "duplicate-group markers. The full text of any moment is one tool call away.\n\n"
     "Work like an editor skimming all the footage: scan the index, INSPECT the "
     "handful of moments you are seriously considering (and inspect_dup_group for "
-    "any 'dup:tgN' you might use, to pick the best take/angle), form a story, then "
-    "commit with submit_timeline.\n\n"
+    "any 'dup:tgN' you might use, to compare the takes/angles and choose), form a "
+    "story, then commit with submit_timeline.\n\n"
     "Index notation: '<clip8>:<m##> modality speaker .score [in-out] \"gist\" · "
-    "nrg:levels (+N atoms) · dup:tgN*'. Refer to moments by FULL id. 'dup:tgN' = "
-    "same content as others in group N; the '*' is the engine's best take. Place "
-    "exactly ONE moment per dup group.\n\n"
+    "nrg:levels (+N atoms) · dup:tgN'. Refer to moments by FULL id. 'dup:tgN' = "
+    "the same spoken beat as others in group N (a retake or angle; 'retry' = "
+    "abandoned). No take is pre-picked -- choose by text and score. Don't repeat "
+    "the same line on the main line, but you MAY use another member as a silent "
+    "reaction/cutaway over that line's audio.\n\n"
     "Editing taste: open with a hook, build, land; one coherent arc; cut filler, "
     "slates, banter, off-brief and anything repeated; choose energy level per cut "
     "for pacing; honor the target length. Track 0 is the main line (back-to-back, "
@@ -112,12 +116,15 @@ def _moments_in_group(map_struct: Dict[str, Any], dup_group: str) -> List[Dict[s
     for clip in (map_struct or {}).get("clips", []) or []:
         for m in clip.get("moments", []) or []:
             if m.get("dup_group") == dup_group:
+                q = m.get("quality") or {}
                 out.append({
                     "moment_id": m["moment_id"],
                     "file_id": m["file_id"],
                     "speaker": m.get("speaker"),
                     "score": float(m.get("score", 0.0)),
-                    "best": bool(m.get("dup_best")),
+                    "on_camera": q.get("on_camera"),
+                    "delivery": q.get("delivery"),
+                    "retry": bool(m.get("dup_restart")),
                     "text": (m.get("gist") or "").strip(),
                     "in_ms": m.get("in_ms"),
                     "out_ms": m.get("out_ms"),

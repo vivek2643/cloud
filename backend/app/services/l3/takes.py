@@ -7,25 +7,39 @@ All deterministic, all post-VLM (no model calls):
                 `content_units`, or transcript sentences as a fallback).
   attempt       one delivery of a content unit. A unit splits into multiple
                 attempts when the clip contains a retry (`restart_markers`).
-  take group    all attempts of the same content_key across every clip in
-                scope, matched by normalized-text near-duplicate.
+  take group    all attempts that deliver the same spoken beat, matched by
+                AUDIBLE SPEAKER + content-token OVERLAP across every clip in
+                scope.
 
-Only groups with >= 2 attempts are returned -- those are the actual choices an
-editor faces. Quality scoring lives in `score_span`; this module only finds
-*what competes with what*.
+Matching is on the diarized speaker plus the set of content words, NOT a
+whole-string ratio. Two cameras of the same line transcribe/segment it
+differently (one cut bleeds into the next sentence, a few words differ), so a
+full-string `SequenceMatcher` rejects genuine same-beat pairs. Token CONTAINMENT
+(shared / smaller side) survives that drift; the speaker gate stops two
+different people's "yeah exactly" from colliding.
+
+Only groups with >= 2 attempts are returned -- the same beat captured more than
+once. This module only finds *what is the same beat as what*; it does NOT crown
+a "best" or tell the brain to drop anything. Quality scoring lives in
+`score_span`, and the placement decision is the brain's.
 """
 from __future__ import annotations
 
 import json
 import re
 from dataclasses import dataclass, field
-from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional
 
 from app.config import get_settings
 
-# Two normalized content keys at/above this ratio are "the same content".
-MATCH_THRESHOLD = 0.82
+# Same-beat test: of the smaller cut's content tokens, this fraction must be
+# shared with the other cut (containment, not whole-string similarity). Survives
+# boundary drift -- a cut that bleeds into the next sentence still links to the
+# tighter cut of the same line, because their shared run dominates the smaller.
+CONTAINMENT_THRESHOLD = 0.6
+# A match also needs at least this many SHARED content tokens, so a couple of
+# common words ("the product", "you know") can't glue unrelated lines together.
+MIN_SHARED_TOKENS = 4
 # Below this many tokens a line is too generic to group on ("yeah", "thank
 # you") -- it would create spurious cross-clip "takes". Such fragments are not
 # meaningful take choices anyway.
@@ -47,8 +61,10 @@ class Attempt:
     start_ms: int
     end_ms: int
     kind: Optional[str]
-    content_key: str       # normalized, used for matching
+    content_key: str       # normalized text (human/debug + token source)
     text: str              # human-readable
+    speaker: Optional[str] = None       # dominant diarized (audible) speaker
+    tokens: frozenset = frozenset()     # content tokens, for overlap matching
     is_restart: bool = False
 
 
@@ -108,6 +124,19 @@ def _words_text(words: List[dict], start_ms: int, end_ms: int) -> str:
         and max(start_ms, int(w.get("start_ms", 0))) < min(end_ms, int(w.get("end_ms", 0)))
     ]
     return " ".join(t for t in out if t).strip()
+
+
+def _span_speaker(words: List[dict], start_ms: int, end_ms: int) -> Optional[str]:
+    """The diarized speaker who talks MOST inside the span (the audible speaker
+    -- whose voice is on the track, regardless of who is on camera). ``None``
+    when no diarized word falls in the span."""
+    counts: Dict[str, int] = {}
+    for w in words:
+        if max(start_ms, int(w.get("start_ms", 0))) < min(end_ms, int(w.get("end_ms", 0))):
+            spk = w.get("speaker")
+            if spk:
+                counts[spk] = counts.get(spk, 0) + 1
+    return max(counts, key=counts.get) if counts else None
 
 
 # --------------------------------------------------------------------------
@@ -175,6 +204,8 @@ def _attempts_for_clip(
                     kind=u.get("kind"),
                     content_key=key,
                     text=seg_text[:200],
+                    speaker=_span_speaker(words, a_start, a_end),
+                    tokens=frozenset(key.split()),
                     is_restart=k > 0,
                 )
             )
@@ -185,58 +216,55 @@ def _attempts_for_clip(
 # Cross-clip clustering
 # --------------------------------------------------------------------------
 
-def _match(a: str, b: str) -> float:
+def _speaker_ok(a: Optional[str], b: Optional[str]) -> bool:
+    """Speakers are compatible for grouping when they match, or when either is
+    unknown (don't reject a real same-beat pair just because diarization was
+    missing on one side)."""
+    return (not a) or (not b) or (a == b)
+
+
+def _containment(a: frozenset, b: frozenset) -> float:
+    """Shared content tokens as a fraction of the SMALLER token set. 1.0 when one
+    side's tokens are entirely inside the other -- which is exactly the boundary
+    -drift case (a cut that bleeds into the next sentence vs the tighter cut)."""
     if not a or not b:
         return 0.0
-    if a == b:
-        return 1.0
-    return SequenceMatcher(None, a, b).ratio()
+    return len(a & b) / min(len(a), len(b))
 
 
 def cluster_attempts(attempts: List[Attempt]) -> List[TakeGroup]:
-    """Greedy near-duplicate clustering on the normalized content key.
+    """Greedy same-beat clustering on AUDIBLE SPEAKER + content-token CONTAINMENT.
 
-    Most lines are distinct (a 300-attempt project clusters into ~300 groups),
-    so a naive O(n^2) full ``SequenceMatcher.ratio()`` over every (attempt,
-    group) pair dominates the whole feed (~40s). We keep the exact same result
-    but prune the comparison with two guaranteed UPPER BOUNDS on ratio that are
-    far cheaper than the real edit-distance:
-      * length bound  ratio <= 2*min(la,lb)/(la+lb): a single integer test.
-      * quick_ratio() the multiset-overlap bound difflib ships for this.
-    Only when both clear the threshold do we pay for the full ``.ratio()``.
+    For each attempt we find the existing group whose seed shares the most of the
+    smaller token set (>= CONTAINMENT_THRESHOLD and >= MIN_SHARED_TOKENS shared
+    tokens) and whose speaker is compatible; else it starts a new group. Token
+    containment (not whole-string ratio) is what links two cameras' differently
+    -cut transcripts of the same line. Most lines are distinct, so this stays
+    near-linear in practice (small token sets, early speaker/shared-count skips).
     """
     groups: List[TakeGroup] = []
-    keys: List[str] = []          # group content_key, index-aligned with groups
-    lens: List[int] = []          # len(key), for the length bound
-    # autojunk left at its default so .ratio() matches the original _match()
-    # exactly; quick_ratio()/the length bound stay valid upper bounds either way.
-    sm = SequenceMatcher()
+    seeds: List[frozenset] = []        # seed token set, index-aligned with groups
+    spk: List[Optional[str]] = []      # seed speaker, index-aligned with groups
     for att in attempts:
-        k = att.content_key
-        lk = len(k)
-        sm.set_seq1(k)
+        toks = att.tokens
+        if not toks:
+            continue
         best: Optional[TakeGroup] = None
-        best_score = MATCH_THRESHOLD
+        best_score = CONTAINMENT_THRESHOLD
         for gi in range(len(groups)):
-            lg = lens[gi]
-            # Length upper bound: skip pairs that can't reach the threshold.
-            if 2 * min(lk, lg) < MATCH_THRESHOLD * (lk + lg):
+            if not _speaker_ok(att.speaker, spk[gi]):
                 continue
-            gk = keys[gi]
-            if k == gk:
-                best, best_score = groups[gi], 1.0
-                break
-            sm.set_seq2(gk)
-            if sm.quick_ratio() < best_score:
+            seed = seeds[gi]
+            if len(toks & seed) < MIN_SHARED_TOKENS:
                 continue
-            s = sm.ratio()
-            if s >= best_score:
-                best, best_score = groups[gi], s
+            score = _containment(toks, seed)
+            if score >= best_score:
+                best, best_score = groups[gi], score
         if best is None:
             groups.append(TakeGroup(group_id=f"tg{len(groups) + 1}",
-                                    content_key=k, attempts=[att]))
-            keys.append(k)
-            lens.append(lk)
+                                    content_key=att.content_key, attempts=[att]))
+            seeds.append(toks)
+            spk.append(att.speaker)
         else:
             best.attempts.append(att)
     return groups
@@ -277,8 +305,9 @@ def render_take_groups_text(groups: List[TakeGroup]) -> str:
     if not groups:
         return ""
     blocks: List[str] = [
-        "TAKE GROUPS (same content delivered more than once -- pick the best per "
-        "group with compare_takes, or accept the engine's pick):"
+        "SAME-BEAT GROUPS (the same spoken content captured more than once, as a "
+        "retake or another camera angle -- judge each member by its text and "
+        "quality and pick what fits):"
     ]
     for g in groups:
         head = f'  {g.group_id} ({len(g.attempts)} takes): "{g.attempts[0].text[:80]}"'
