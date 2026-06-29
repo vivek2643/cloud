@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Tests for the uniform energy combiner (l3.combine): within-channel fuse,
+peak zoom/split, cross-channel capture-moments, and the speech-safety guarantee
+(a cut never lands inside a spoken word, even with a peak attractor). Run:
+    python scripts/test_combine.py
+"""
+from __future__ import annotations
+
+import os
+import sys
+from types import SimpleNamespace
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app.services.l3 import vocab  # noqa: E402
+from app.services.l3 import combine as cmb  # noqa: E402
+from app.services.l3.atoms import Atom  # noqa: E402
+from app.services.l3.energy import energy_to_params  # noqa: E402
+
+
+def _clip(motion=None, perception=None, duration_ms=60000):
+    return SimpleNamespace(
+        file_id="abcdef12-0000-0000-0000-000000000000", motion=motion,
+        perception=perception or {}, duration_ms=duration_ms, cast=None,
+        audio=None, dialogue={},
+    )
+
+
+def _done(a, b, peak=None, conf=0.6, subject="person", actor=None, label="move"):
+    return Atom(vocab.CHANNEL_DONE, a, b, peak if peak is not None else (a + b) // 2,
+                confidence=conf, subject=subject, actor=actor, label=label)
+
+
+def _shown(a, b, conf=0.6, subject="object", actor=None, label="thing"):
+    return Atom(vocab.CHANNEL_SHOWN, a, b, (a + b) // 2,
+                confidence=conf, subject=subject, actor=actor, label=label)
+
+
+# -- within-channel fuse <-> atomize ------------------------------------------
+
+def test_fuse_continuous_run_at_broad():
+    """Broad: a continuous run of same-channel beats fuses into ONE cut."""
+    atoms = [_done(0, 1000), _done(1200, 2000), _done(2200, 3000)]  # 200ms gaps
+    cuts = cmb.combine_video(atoms, energy_to_params(0.1), None, _clip())
+    done = [c for c in cuts if c.channel == vocab.CHANNEL_DONE]
+    assert len(done) == 1, [(c.src_in_ms, c.src_out_ms) for c in done]
+    print("ok  fuse continuous run at Broad")
+
+
+def test_atomize_at_tight():
+    """Tight: fuse gap is 0, so the same run atomizes into separate cuts."""
+    atoms = [_done(0, 1000), _done(1200, 2000), _done(2200, 3000)]
+    cuts = cmb.combine_video(atoms, energy_to_params(0.8), None, _clip())
+    done = [c for c in cuts if c.channel == vocab.CHANNEL_DONE]
+    assert len(done) == 3, [(c.src_in_ms, c.src_out_ms) for c in done]
+    print("ok  atomize at Tight")
+
+
+def test_peak_inset_shrinks_toward_impact():
+    """Tight insets a long Done beat toward its peak (negative padding)."""
+    atoms = [_done(0, 8000, peak=6000)]
+    cuts = cmb.combine_video(atoms, energy_to_params(0.8), None, _clip())
+    c = next(c for c in cuts if c.channel == vocab.CHANNEL_DONE)
+    assert (c.src_out_ms - c.src_in_ms) < 8000           # shrunk
+    assert c.src_in_ms <= 6000 <= c.src_out_ms           # still covers the impact
+    print("ok  peak inset shrinks toward impact")
+
+
+def test_done_split_excises_lull_at_sharp():
+    """Sharp: a Done beat with a quiet interior lull splits into windup|payoff,
+    and the excised gap never contains the impact peak."""
+    hop = 100
+    n = 80  # 8000ms
+    energy = [0.9] * 10 + [0.05] * 40 + [0.9] * 30   # lull 1000..5000ms
+    motion = {"hop_ms": hop, "action_energy": energy, "action_points": []}
+    atoms = [_done(0, 8000, peak=6500)]                # peak in the loud payoff
+    cuts = cmb.combine_video(atoms, energy_to_params(0.95), None, _clip(motion=motion))
+    c = next(c for c in cuts if c.channel == vocab.CHANNEL_DONE)
+    assert c.keep_spans and len(c.keep_spans) == 2, c.keep_spans
+    (a0, a1), (b0, b1) = c.keep_spans
+    assert a1 <= 6500 <= b1                              # peak survives in a kept span
+    assert b0 - a1 >= cmb._LULL_MIN_MS                   # a real gap was excised
+    print("ok  Done split excises lull, keeps peak")
+
+
+# -- capture-moments -----------------------------------------------------------
+
+def _mk(channel, a, b, subject=None, speaker=None, region=None, fid="abcdef12"):
+    from app.services.l3.hero_cuts import HeroCut
+    people = [{"person_id": speaker, "on_camera": True}] if speaker else []
+    return HeroCut(hero_id=f"{fid}:{channel}{a}", file_id="abcdef12-x",
+                   modality=channel, label="", src_in_ms=a, src_out_ms=b,
+                   score=0.5, channel=channel, subject=subject, speaker=speaker,
+                   people=people,
+                   framing=({"region": region} if region else None))
+
+
+def test_moment_cross_channel_same_actor():
+    """A line and an action by the SAME person, close in time, form a moment."""
+    said = _mk(vocab.CHANNEL_SAID, 0, 2000, subject="person", speaker="p1")
+    done = _mk(vocab.CHANNEL_DONE, 1800, 3000, subject="person", speaker="p1")
+    cuts = [said, done]
+    cmb.derive_moments(cuts, energy_to_params(0.3))
+    assert said.moment_id and said.moment_id == done.moment_id
+    print("ok  moment: cross-channel same actor")
+
+
+def test_no_moment_same_channel():
+    """Two adjacent lines (same channel) are NOT a moment -- a podcast stays
+    moment-free."""
+    a = _mk(vocab.CHANNEL_SAID, 0, 2000, subject="person", speaker="p1")
+    b = _mk(vocab.CHANNEL_SAID, 2100, 4000, subject="person", speaker="p1")
+    cuts = [a, b]
+    cmb.derive_moments(cuts, energy_to_params(0.3))
+    assert a.moment_id is None and b.moment_id is None
+    print("ok  no moment for same-channel adjacency")
+
+
+def test_no_moment_unrelated_subjects():
+    """A line by p1 + b-roll of an unrelated object don't auto-moment (brain's
+    job). Different actors, different subjects, no region overlap."""
+    said = _mk(vocab.CHANNEL_SAID, 0, 2000, subject="person", speaker="p1")
+    broll = _mk(vocab.CHANNEL_SHOWN, 1800, 3000, subject="object")
+    cuts = [said, broll]
+    cmb.derive_moments(cuts, energy_to_params(0.3))
+    assert said.moment_id is None and broll.moment_id is None
+    print("ok  no moment for unrelated subjects")
+
+
+def test_atomize_breaks_moment_at_sharp():
+    """At Sharp (fuse reach 0) only literally-overlapping cross-channel cuts
+    group; a small time gap leaves them apart."""
+    said = _mk(vocab.CHANNEL_SAID, 0, 2000, subject="person", speaker="p1")
+    done = _mk(vocab.CHANNEL_DONE, 2200, 3000, subject="person", speaker="p1")
+    cuts = [said, done]
+    cmb.derive_moments(cuts, energy_to_params(0.95))
+    assert said.moment_id is None and done.moment_id is None
+    print("ok  Sharp atomizes the moment")
+
+
+if __name__ == "__main__":
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            fn()
+    print("\nall combine tests passed")

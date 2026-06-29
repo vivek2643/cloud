@@ -82,7 +82,7 @@ GRID_HOP_MS = 100
 class FusedSeam:
     ts_ms: int
     q: float                 # seam quality 0..1 (higher = cleaner/better cut)
-    kind: str                # word_gap | sentence_end | speaker_change | beat | action_impact | rest
+    kind: str                # word_gap | sentence_end | speaker_change | beat | action_impact | peak | rest
     sources: List[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -154,6 +154,30 @@ def _point_ts(points: Optional[Sequence]) -> List[Tuple[int, str]]:
     return out
 
 
+def _peak_ts(peaks: Optional[Sequence]) -> List[int]:
+    """Pull peak instants (ms) from a plain int list or {ts_ms}/{peak_ms} dicts."""
+    out: List[int] = []
+    for p in peaks or []:
+        if isinstance(p, dict):
+            v = p.get("ts_ms", p.get("peak_ms"))
+        else:
+            v = p
+        if v is not None:
+            out.append(int(v))
+    return out
+
+
+def _peak_reward_grid(peaks: List[int], n: int, hop_ms: int) -> List[float]:
+    """A discrete-attractor reward grid (0 = no peak .. 1 = on an atom peak),
+    one hop of width either side so a near-miss snap still earns the bonus."""
+    grid = [0.0] * n
+    for ts in peaks:
+        c = int(round(ts / hop_ms))
+        for i in range(max(0, c - 1), min(n - 1, c + 1) + 1):
+            grid[i] = 1.0
+    return grid
+
+
 def _build_seams(cost: List[float], hop_ms: int,
                  candidates: List[Tuple[int, str, str]]) -> List[FusedSeam]:
     """Re-score every channel's discrete candidate by the FUSED quality at its
@@ -204,9 +228,16 @@ def compute_fused_field(
     dialogue_points: Optional[Sequence] = None,
     beat_points: Optional[Sequence] = None,
     action_points: Optional[Sequence] = None,
+    atom_peaks: Optional[Sequence] = None,
     attractor_room_ms: int = ATTRACTOR_ROOM_MS,
 ) -> FusedField:
-    """Compose the per-channel grids into one fused seam field. See module docstring."""
+    """Compose the per-channel grids into one fused seam field. See module docstring.
+
+    `atom_peaks` (cuts-v2): the impact/reveal/punch instants of every capture
+    atom, fed in as discrete ATTRACTORS exactly like motion impacts/beats -- a
+    seam on an atom's peak is an especially good cut target. The peak-CORES
+    themselves are protected via `protected_spans` (a Said atom's word span is
+    the primary mid-word-cut guarantee, independent of `dialogue_cost`)."""
     n = n_hops(duration_ms, hop_ms)
     if n == 0:
         return FusedField(hop_ms=hop_ms, cost=[], seams=[])
@@ -218,6 +249,8 @@ def compute_fused_field(
     act = _resample(action_cost, motion_hop, n, hop_ms, 1.0)
     beat = _resample(beat_cost, beat_hop, n, hop_ms, 1.0)
     protect = _protect_mask(protected_spans, n, hop_ms)
+    peaks = _peak_ts(atom_peaks)
+    pk_reward = _peak_reward_grid(peaks, n, hop_ms)
 
     lam = LAMBDA_MIN + (LAMBDA_MAX - LAMBDA_MIN) * clamp01(energy)
 
@@ -228,7 +261,7 @@ def compute_fused_field(
 
     cost: List[float] = []
     for i in range(n):
-        reward = max(1.0 - act[i], 1.0 - beat[i]) * room[i]
+        reward = max(1.0 - act[i], 1.0 - beat[i], pk_reward[i]) * room[i]
         q = clamp01(safety[i] * (1.0 + lam * reward))
         cost.append(round(1.0 - q, 4))
 
@@ -239,6 +272,8 @@ def compute_fused_field(
         candidates.append((ts, "beat", "beat"))
     for ts, kind in _point_ts(action_points):
         candidates.append((ts, "action_impact", "action"))
+    for ts in peaks:
+        candidates.append((ts, "peak", "atom"))
 
     return FusedField(hop_ms=hop_ms, cost=cost,
                       seams=_build_seams(cost, hop_ms, candidates))

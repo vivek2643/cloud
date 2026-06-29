@@ -162,6 +162,13 @@ export type HeroModality =
   | "broll"
   | "insert";
 
+// cuts-v2 capture CHANNEL (backend l3/vocab.py): the honest substrate the tabs
+// key on. Heard is detected but never surfaced.
+export type HeroChannel = "said" | "done" | "shown" | "heard";
+
+// Orthogonal SUBJECT tag riding on the video channels.
+export type HeroSubject = "person" | "place" | "object" | "graphic";
+
 // One typed, directional edge from this cut to another (mapped from the VLM's
 // relation graph). `dir` is 'out' when this cut is the source, 'in' when target.
 export interface HeroRelation {
@@ -200,6 +207,11 @@ export interface HeroCut {
   // The intrinsic capture substrate (person/action/place/object/graphic/speech)
   // -- what the camera/mic actually caught, beneath the editorial affordance.
   primitives?: string[];
+  // cuts-v2: the capture CHANNEL this cut delivers on (said|done|shown) -- what
+  // the tabs filter by -- and the orthogonal SUBJECT tag (person|place|object|
+  // graphic). For legacy cuts the channel is derived from the affordance.
+  channel?: HeroChannel;
+  subject?: HeroSubject | null;
   // For an information-dense graphic / insert cut, the gist of what it CONVEYS
   // (the VLM's read, not OCR) -- e.g. "User selects video files for upload".
   summary?: string | null;

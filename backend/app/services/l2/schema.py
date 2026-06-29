@@ -61,7 +61,12 @@ def _to_unit(v):
 # object/graphic/speech) + a `confidence` on each cut-bearing beat, and a
 # `summary` (semantic gist) for information-dense graphics (don't OCR a slide --
 # say what it conveys).
-SCHEMA_VERSION = 5
+# v6 (cuts v2) adds the detection-only `atoms` track: per-beat CHANNEL
+# (done/shown) + SUBJECT (person/place/object/graphic) + peak + confidence. This
+# is the substrate the v2 cut pipeline reads; the v1 tracks above (events/
+# reactions/cutaways/content_units/relations/role) are retained but no longer
+# read by the active path.
+SCHEMA_VERSION = 6
 
 
 # The editing vocabulary (vocab.py) is the single source of truth. Render the
@@ -74,6 +79,28 @@ Role = Enum("Role", [(r, r) for r in vocab.ROLES], type=str)
 CapturePrimitive = Enum(
     "CapturePrimitive", [(p, p) for p in vocab.CAPTURE_PRIMITIVES], type=str
 )
+# v6 cuts-v2 substrate: the VLM detects video-channel beats as ATOMS. Channel is
+# only the two video channels here (audio Said comes from L1 transcript; Heard
+# from the RMS envelope -- the VLM never emits them). Subject is orthogonal.
+Channel = Enum("Channel", [(c, c) for c in (vocab.CHANNEL_DONE, vocab.CHANNEL_SHOWN)], type=str)
+Subject = Enum("Subject", [(s, s) for s in vocab.SUBJECTS], type=str)
+
+
+def _coerce_channel(v):
+    """Lenient atom channel: only the two VIDEO channels are valid here; an
+    out-of-vocab or audio value (said/heard) is dropped to None rather than
+    failing the whole clip's parse."""
+    if v is None:
+        return None
+    s = str(getattr(v, "value", v)).strip().lower()
+    return s if s in (vocab.CHANNEL_DONE, vocab.CHANNEL_SHOWN) else None
+
+
+def _coerce_subject(v):
+    if v is None:
+        return None
+    s = str(getattr(v, "value", v)).strip().lower()
+    return s if s in vocab.SUBJECT_SET else None
 
 
 def _coerce_primitive(v):
@@ -83,6 +110,26 @@ def _coerce_primitive(v):
         return None
     s = str(getattr(v, "value", v)).strip().lower()
     return s if s in vocab.CAPTURE_PRIMITIVE_SET else None
+
+
+def _coerce_enum(enum_cls):
+    """Build a lenient `mode='before'` coercer for a closed string Enum.
+
+    The schema is carried in-prompt (no constrained decoding), so the model
+    routinely emits near-misses -- a separator swap ('medium-wide' for
+    'medium_wide'), stray case/whitespace, or a value just out of vocab. Rather
+    than reject the WHOLE clip's perception on one cosmetic mismatch (recall-
+    first), normalize separators and drop a genuinely unknown value to None.
+    """
+    values = {e.value for e in enum_cls}
+
+    def _coerce(v):
+        if v is None or isinstance(v, enum_cls):
+            return v
+        s = str(getattr(v, "value", v)).strip().lower().replace("-", "_").replace(" ", "_")
+        return s if s in values else None
+
+    return _coerce
 
 
 def _coerce_role(v):
@@ -264,6 +311,11 @@ class GraphicKind(str, Enum):
 class Look(BaseModel):
     time_of_day: Optional[TimeOfDay] = None
     interior_exterior: Optional[InteriorExterior] = None
+
+    @field_validator("time_of_day", "interior_exterior", mode="before")
+    @classmethod
+    def _coerce_look_enums(cls, v, info):
+        return _coerce_enum({"time_of_day": TimeOfDay, "interior_exterior": InteriorExterior}[info.field_name])(v)
     light_quality: Optional[str] = Field(
         None, description="e.g. 'soft diffused', 'hard direct sun', 'mixed/practical', 'low-key'"
     )
@@ -289,6 +341,11 @@ class Setting(BaseModel):
 class Editability(BaseModel):
     primary_axis: Optional[PrimaryAxis] = None
     cut_sensitivity: Optional[CutSensitivity] = None
+
+    @field_validator("primary_axis", "cut_sensitivity", mode="before")
+    @classmethod
+    def _coerce_edit_enums(cls, v, info):
+        return _coerce_enum({"primary_axis": PrimaryAxis, "cut_sensitivity": CutSensitivity}[info.field_name])(v)
     best_use: List[str] = Field(
         default_factory=list,
         description="how an editor would reach for this clip, e.g. ['establishing', 'reaction insert', 'soundbite']",
@@ -309,6 +366,11 @@ class CameraSpan(BaseModel):
     is_deliberate: Optional[bool] = Field(
         None, description="True for an intentional move (push-in, planned pan); False for incidental wobble"
     )
+
+    @field_validator("shot_size", "angle", "movement", mode="before")
+    @classmethod
+    def _coerce_camera_enums(cls, v, info):
+        return _coerce_enum({"shot_size": ShotSize, "angle": CameraAngle, "movement": CameraMovement}[info.field_name])(v)
 
 
 # --------------------------------------------------------------------------
@@ -737,6 +799,78 @@ class Relation(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# v6 cuts-v2: capture ATOMS (detection only)
+# --------------------------------------------------------------------------
+
+class CaptureAtom(BaseModel):
+    """One thing the camera captured on a single video CHANNEL -- detection, not
+    judgment. No editorial bucket, no role, no relation. Emit a DONE atom for a
+    physical action / change over time (a kick, a pour, a screen-rec UI changing)
+    and a SHOWN atom for a held subject worth seeing (a face, the product, the
+    scenery, a static title card). Tag the SUBJECT (person/place/object/graphic).
+    Keep recall high; a `confidence` gate trims downstream.
+
+    Audio channels are NOT emitted here: Said comes from the transcript, Heard
+    from the audio envelope."""
+    id: Optional[str] = Field(None, description="clip-local id ('a1', ...)")
+    channel: Optional[Channel] = Field(
+        None,
+        description=(
+            "'done' = an action / change unfolding over time (peak = the impact "
+            "instant); 'shown' = a held subject to look at (peak = the clearest "
+            "representative frame). A screen-rec demo whose UI is changing is "
+            "'done'; a static chart/title is 'shown'."
+        ),
+    )
+    subject: Optional[Subject] = Field(
+        None,
+        description=(
+            "what it is ABOUT: 'person' (a human), 'place' (scenery/setting), "
+            "'object' (a thing/product/detail), or 'graphic' (on-screen text/"
+            "chart/UI). Orthogonal to the channel."
+        ),
+    )
+    start_ms: int
+    end_ms: int
+    peak_ms: Optional[int] = Field(
+        None, description="the impact (done) or clearest reveal (shown) instant within the span"
+    )
+    actor: Optional[str] = Field(None, description="person local_id when the subject is a known person")
+    label: str = Field(description="short human-facing label for the card, e.g. 'pours coffee', 'mountain vista'")
+    summary: Optional[str] = Field(
+        None,
+        description=(
+            "for an information-dense graphic only (slide/chart/list/UI), one "
+            "line on what it CONVEYS -- not verbatim OCR. Null otherwise."
+        ),
+    )
+    content_key: Optional[str] = Field(
+        None, description="canonical identity of WHAT is delivered, so retakes of the same beat group"
+    )
+    confidence: Optional[float] = Field(
+        None, description="0..1 how sure you are this footage was shot to deliver this (keep recall high)"
+    )
+    region: Optional[Region] = Field(
+        None, description="coarse box of the subject in frame; used to keep it in frame when reframing"
+    )
+
+    @field_validator("channel", mode="before")
+    @classmethod
+    def _norm_channel(cls, v):
+        return _coerce_channel(v)
+
+    @field_validator("subject", mode="before")
+    @classmethod
+    def _norm_subject(cls, v):
+        return _coerce_subject(v)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _norm_conf(cls, v):
+        return _to_unit(v)
+
+
+# --------------------------------------------------------------------------
 # Root artifact
 # --------------------------------------------------------------------------
 
@@ -746,6 +880,11 @@ class ClipPerception(BaseModel):
     frame_orientation: Optional[FrameOrientation] = Field(
         None, description="how the footage must be rotated to sit upright (almost always 'upright'); flag sideways/flipped footage so the editor can correct it"
     )
+
+    @field_validator("content_type", "frame_orientation", mode="before")
+    @classmethod
+    def _coerce_clip_enums(cls, v, info):
+        return _coerce_enum({"content_type": ContentType, "frame_orientation": FrameOrientation}[info.field_name])(v)
     logline: Optional[str] = Field(None, description="one sentence: what this clip is and what happens in it")
     synopsis: Optional[str] = Field(None, description="a short chronological paragraph describing the take start to finish")
     topics: List[str] = Field(default_factory=list)
@@ -768,6 +907,20 @@ class ClipPerception(BaseModel):
     # Sparse overlay catalog: reactions, b-roll handles, inserts worth cutting to.
     # When non-empty, downstream overlay anchors read ONLY this list.
     cutaways: List[CutawayMoment] = Field(default_factory=list)
+
+    # v6 cuts-v2 substrate: detection-only video-channel atoms (done/shown) the
+    # active cut pipeline reads. When present, the v1 cutaways/content_units/
+    # events tracks above are ignored by the cut builder.
+    atoms: List[CaptureAtom] = Field(default_factory=list)
+
+    @field_validator("atoms", mode="before")
+    @classmethod
+    def _drop_bad_atoms(cls, v):
+        """Drop atoms with no usable video channel (e.g. the model put 'said'
+        here) rather than failing the whole clip's parse."""
+        if not isinstance(v, list):
+            return v
+        return [a for a in v if isinstance(a, dict) and _coerce_channel(a.get("channel"))]
 
     # Take selection (span-level). Empty for clips with no comparable content.
     content_units: List[ContentUnit] = Field(default_factory=list)

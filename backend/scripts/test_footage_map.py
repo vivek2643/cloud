@@ -153,6 +153,19 @@ def test_moment_line_shows_multi_affordance_and_offcam():
     print("ok  test_moment_line_shows_multi_affordance_and_offcam")
 
 
+def test_moment_line_shows_channel_subject_v2():
+    """cuts-v2: the resident line keys on CHANNEL.SUBJECT, not the affordance."""
+    cut = _cut("f:v0", 1000, 4000, "kicks the ball", modality="done",
+               speaker="p1", score=0.6,
+               ladder=[_rung("balanced", 1000, 4000, "kicks the ball", 0.6)],
+               channel="done", subject="person", affordances=["done"])
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    m = tree["moments"][0]
+    assert m["channel"] == "done" and m["subject"] == "person"
+    assert fm._capture_tag(m) == "done.person", fm._capture_tag(m)
+    print("ok  test_moment_line_shows_channel_subject_v2")
+
+
 def _cluster_cuts():
     """Three cuts in one connected bundle: a line, its peak reaction, and a
     b-roll that illustrates it -- all sharing a cluster id (moment_id)."""

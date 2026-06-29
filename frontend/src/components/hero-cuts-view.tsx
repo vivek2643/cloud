@@ -14,70 +14,66 @@ import {
 import { Star, Play, Volume2, VolumeX, Layers, Scissors, ChevronDown, Check } from "lucide-react";
 import { EditButton } from "./search-edit-bar";
 
-// Colour/label per CAPTURE PRIMITIVE -- the intrinsic "what was captured"
-// substrate the tabs now sort on (a screen UI is a graphic, a face a person).
-const PRIMITIVE_STYLE: Record<string, { color: string; label: string }> = {
-  person: { color: "#ec4899", label: "person" },
-  action: { color: "#f59e0b", label: "action" },
-  place: { color: "#06b6d4", label: "place" },
-  object: { color: "#10b981", label: "object" },
-  graphic: { color: "#a78bfa", label: "graphic" },
-  speech: { color: "#6366f1", label: "speech" },
+// Colour/label per CAPTURE CHANNEL (cuts-v2) -- the honest substrate the tabs
+// sort on: SAID (a spoken line), DONE (an action/change), SHOWN (a held subject).
+const CHANNEL_STYLE: Record<string, { color: string; label: string }> = {
+  said: { color: "#6366f1", label: "said" },
+  done: { color: "#f59e0b", label: "done" },
+  shown: { color: "#06b6d4", label: "shown" },
+  heard: { color: "#64748b", label: "heard" },
 };
 
-// Affordance -> primitive fallback, used only when the backend didn't stamp
-// `primitives` on a cut (it normally always does). Mirrors l3/vocab.py.
-const AFFORDANCE_PRIMITIVE: Record<string, string> = {
-  speech: "speech",
-  action: "action",
-  reaction: "person",
-  broll: "place",
-  insert: "graphic",
+// Subject sub-badge label (the orthogonal what-it's-about tag).
+const SUBJECT_LABEL: Record<string, string> = {
+  person: "person",
+  place: "place",
+  object: "object",
+  graphic: "graphic",
 };
 
-// The capture primitives a cut delivers -- the VLM's stated ones when present,
-// else derived from its affordances (so the tabs always have something to sort).
-function cutPrimitives(h: HeroCut): string[] {
-  if (h.primitives && h.primitives.length > 0) return h.primitives;
-  const affs = h.affordances && h.affordances.length > 0 ? h.affordances : [h.modality];
-  const out: string[] = [];
-  for (const a of affs) {
-    const p = AFFORDANCE_PRIMITIVE[a] ?? "place";
-    if (!out.includes(p)) out.push(p);
-  }
-  return out;
+// Affordance -> channel fallback, used only for legacy cuts that didn't carry a
+// `channel` (the backend normally stamps it). Mirrors l3/vocab.py.
+const AFFORDANCE_CHANNEL: Record<string, string> = {
+  speech: "said",
+  action: "done",
+  reaction: "shown",
+  broll: "shown",
+  insert: "shown",
+};
+
+// The capture channel a cut delivers on -- v2-native when stamped, else derived
+// from its affordance/modality (so legacy cuts still tab correctly).
+function cutChannel(h: HeroCut): string {
+  if (h.channel) return h.channel;
+  const aff = (h.affordances && h.affordances[0]) || h.modality;
+  return AFFORDANCE_CHANNEL[aff] ?? "shown";
 }
 
-// A tab is the special "all" / "moment" view or one of the six capture
-// primitives. Sorting by primitive shows WHAT each cut is (the honest atom),
-// not just the editorial use -- a reaction lands under Person, a chart/UI under
-// Graphic, a cutaway under Place/Object.
-type FilterKey = "all" | "moment" | "person" | "action" | "place" | "object" | "graphic" | "speech";
+// A tab is the special "all" / "Moments" view or one of the three surfaced
+// capture channels. Showing WHAT each cut is (said/done/shown) is the honest
+// substrate -- no editorial affordance bias. Heard is detected but never shown.
+type FilterKey = "all" | "moment" | "said" | "done" | "shown";
 
 const FILTERS: { key: FilterKey; label: string }[] = [
   { key: "all", label: "All" },
   { key: "moment", label: "Moments" },
-  { key: "person", label: "Person" },
-  { key: "action", label: "Action" },
-  { key: "place", label: "Place" },
-  { key: "object", label: "Object" },
-  { key: "graphic", label: "Graphic" },
-  { key: "speech", label: "Speech" },
+  { key: "said", label: "Said" },
+  { key: "done", label: "Done" },
+  { key: "shown", label: "Shown" },
 ];
 
-// Does a cut serve a given tab? Moments = belongs to a connected cluster; a
-// primitive tab matches when the cut delivers that primitive (so a cut with
-// several primitives appears under each).
+// Does a cut serve a given tab? Moments = belongs to a cross-channel capture
+// cluster; a channel tab matches when the cut delivers on that channel.
 function matchesFilter(h: HeroCut, key: FilterKey): boolean {
   if (key === "all") return true;
   if (key === "moment") return Boolean(h.is_moment);
-  return cutPrimitives(h).includes(key);
+  return cutChannel(h) === key;
 }
 
-// The distinct capture primitives across a moment's member cuts.
-function momentPrimitives(members: HeroCut[]): string[] {
+// The distinct capture channels across a moment's member cuts.
+function momentChannels(members: HeroCut[]): string[] {
   const s = new Set<string>();
-  for (const m of members) for (const p of cutPrimitives(m)) s.add(p);
+  for (const m of members) s.add(cutChannel(m));
   return Array.from(s);
 }
 
@@ -91,7 +87,8 @@ interface LoserTake {
   score: number;
   label: string;
   modality: HeroModality;
-  primitives: string[];
+  channel?: string;
+  subject?: string | null;
   bestFileId: string;
 }
 
@@ -112,7 +109,8 @@ function loserHero(l: LoserTake): HeroCut {
     speaker: null,
     flags: [],
     affordances: [l.modality],
-    primitives: l.primitives,
+    channel: l.channel as HeroCut["channel"],
+    subject: (l.subject ?? null) as HeroCut["subject"],
     relations: null,
     moment_id: null,
     role: null,
@@ -139,7 +137,7 @@ function combinedHero(members: HeroCut[]): HeroCut {
     duration_ms: outMs - inMs,
     play_ms: playMs,
     keep_spans: ordered.map((m) => ({ in_ms: m.src_in_ms, out_ms: m.src_out_ms })),
-    primitives: momentPrimitives(ordered),
+    primitives: momentChannels(ordered),
     score: Math.max(...ordered.map((m) => m.score)),
     take_count: 1,
     alt_takes: [],
@@ -300,7 +298,8 @@ export function HeroCutsView() {
           score: t.score,
           label: h.label,
           modality: h.modality,
-          primitives: cutPrimitives(h),
+          channel: cutChannel(h),
+          subject: h.subject ?? null,
           bestFileId: h.file_id,
         });
       }
@@ -675,12 +674,11 @@ function HeroClipCard({
   const inSec = segs[0][0];
   const outSec = segs[segs.length - 1][1];
   const isVideo = file.file_type === "video";
-  // Capture primitives this cut delivers -- the tabs sort on these, so the badge
-  // shows them too. First is the dominant primitive (drives the badge colour);
-  // the rest (a cut that's both person+action, say) trail as "+ ...".
-  const prims = useMemo(() => cutPrimitives(hero), [hero]);
-  const primStyle = PRIMITIVE_STYLE[prims[0]] ?? { color: "#6366f1", label: prims[0] ?? "cut" };
-  const extraPrims = prims.slice(1);
+  // Capture CHANNEL this cut delivers on -- the tabs sort on it, so the badge
+  // shows it too; the SUBJECT (person/place/object/graphic) trails as a sub-tag.
+  const channel = useMemo(() => cutChannel(hero), [hero]);
+  const chStyle = CHANNEL_STYLE[channel] ?? { color: "#6366f1", label: channel };
+  const subjectLabel = hero.subject ? SUBJECT_LABEL[hero.subject] ?? hero.subject : null;
 
   // "Frame Adjusted" reframes the clip to fill the chosen tile (center-crop);
   // "Original" letterboxes the full source frame. The proxy is already baked
@@ -831,15 +829,15 @@ function HeroClipCard({
         )}
         {!playUrl && <FileIcon type={(isVideo ? "video" : "audio") as "video"} size={32} />}
 
-        {/* Primitive badge (top-left): WHAT this cut captured. A cut that
-            delivers more than one primitive trails the rest -- one rich card. */}
+        {/* Channel badge (top-left): WHICH channel this cut delivers on, with
+            the subject as a small trailing sub-tag (done · person, shown · graphic). */}
         <span
           className="absolute left-2 top-2 z-20 flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-semibold capitalize text-white"
-          style={{ background: primStyle.color }}
+          style={{ background: chStyle.color }}
         >
-          {primStyle.label}
-          {extraPrims.length > 0 && (
-            <span style={{ opacity: 0.85 }}>+ {extraPrims.join(" + ")}</span>
+          {chStyle.label}
+          {subjectLabel && (
+            <span style={{ opacity: 0.85 }}>· {subjectLabel}</span>
           )}
         </span>
 

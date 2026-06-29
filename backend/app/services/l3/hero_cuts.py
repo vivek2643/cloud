@@ -47,7 +47,9 @@ from difflib import SequenceMatcher
 from app.config import get_settings
 from app.services.l1 import fused_seams as fseams
 from app.services.l3 import anchors as anc
+from app.services.l3 import atoms as atoms_mod
 from app.services.l3 import cast as cst
+from app.services.l3 import combine as cmb
 from app.services.l3 import vocab
 from app.services.l3 import score_span as ss
 from app.services.l3 import territory as terr
@@ -97,7 +99,13 @@ _MERGE_LEN_RATIO = 0.7
 # v12: fuse<->atomize ladder re-centered onto the 2-4 working range (atomize
 # arrives at Tight, not only Sharp), so a fused moment exposes its peak member
 # within the commonly-used energy range.
-PARAMS_VERSION = 12
+# v13: CUTS-V2. The 6-affordance editorial model is replaced by the 4-channel
+# ATOM substrate (Said/Done/Shown/Heard) + Subject tag + confidence + peak
+# (l3.atoms). SAID keeps the thought-ladder; DONE/SHOWN come from one uniform
+# energy combiner (l3.combine); capture-MOMENTS are derived cross-channel. The
+# VLM detects atoms only -- no roles/relations/affordance buckets. Heard built
+# but suppressed.
+PARAMS_VERSION = 13
 
 # The five canonical product energy LEVELS = the band centers (Broad .. Sharp).
 # Hero cuts are precomputed at exactly these after L2; any requested energy
@@ -285,6 +293,19 @@ class HeroCut:
     # object/graphic/...). Overrides the coarse affordance derivation, so a screen
     # UI logged as b-roll is honestly a `graphic`, a face is a `person`, etc.
     primitive: Optional[str] = None
+    # v2 substrate (cuts-v2): the CAPTURE CHANNEL this cut delivers on
+    # (said|done|shown|heard) and the orthogonal SUBJECT tag (person|place|
+    # object|graphic). The frontend tabs + brain index key off `channel`; for v1
+    # cuts these are None and derived on read from the affordance/primitive.
+    channel: Optional[str] = None
+    subject: Optional[str] = None
+
+    def channel_of(self) -> str:
+        """The capture channel for this cut, v2-native when set, else bridged
+        from the v1 affordance/modality so legacy cuts still tab correctly."""
+        if self.channel:
+            return self.channel
+        return vocab.channel_for_affordance(self.modality)
 
     def is_moment(self) -> bool:
         """True when this cut is part of a multi-cut moment cluster (it has a
@@ -338,6 +359,8 @@ class HeroCut:
             "role": self.role,
             "summary": self.summary,
             "primitive": self.primitive,
+            "channel": self.channel_of(),
+            "subject": self.subject,
             "is_moment": self.is_moment(),
         }
 
@@ -368,6 +391,8 @@ class HeroCut:
             role=d.get("role"),
             summary=d.get("summary"),
             primitive=d.get("primitive"),
+            channel=d.get("channel"),
+            subject=d.get("subject"),
         )
 
 
@@ -579,6 +604,47 @@ def _build_field(clip: _ClipInputs, energy: float) -> Optional[fseams.FusedField
         beat_cost=a.get("beat_cut_cost"),
         beat_points=a.get("beat_cut_points"),
         beat_hop=a.get("beat_cut_hop_ms", 100),
+    )
+
+
+# cuts-v2: a Done/Shown atom's protected peak-core (the impact / reveal frame is
+# never clipped). A Said atom protects its WHOLE word span (the primary mid-word
+# guarantee); see _build_field_v2.
+_PEAK_CORE_PAD_MS = 150
+
+
+def _build_field_v2(
+    clip: _ClipInputs, energy: float, atoms: List["atoms_mod.Atom"],
+) -> Optional[fseams.FusedField]:
+    """The cuts-v2 fused field: the v1 channel grids PLUS every atom's peak as an
+    attractor and every atom's peak-core as a protected span. A Said atom
+    protects its full word span (so a cut can never land mid-word even when the
+    dialogue cost grid is absent); a Done/Shown atom protects a small core around
+    its impact/reveal so the key frame is never clipped."""
+    a, m = clip.audio or {}, clip.motion or {}
+    peaks = [at.peak_ms for at in atoms]
+    protected: List[Tuple[int, int]] = []
+    for at in atoms:
+        if at.channel == vocab.CHANNEL_SAID:
+            protected.append((at.start_ms, at.end_ms))
+        else:
+            protected.append((at.peak_ms - _PEAK_CORE_PAD_MS, at.peak_ms + _PEAK_CORE_PAD_MS))
+    if not a and not m and not peaks:
+        return None
+    return fseams.compute_fused_field(
+        duration_ms=clip.duration_ms, energy=energy,
+        dialogue_cost=a.get("dialogue_cut_cost"),
+        dialogue_hop=a.get("dialogue_cut_hop_ms", 100),
+        dialogue_points=a.get("dialogue_cut_points"),
+        camera_cost=m.get("camera_cut_cost"),
+        action_cost=m.get("action_cut_cost"),
+        action_points=m.get("action_points"),
+        motion_hop=m.get("hop_ms", 100),
+        beat_cost=a.get("beat_cut_cost"),
+        beat_points=a.get("beat_cut_points"),
+        beat_hop=a.get("beat_cut_hop_ms", 100),
+        atom_peaks=peaks,
+        protected_spans=protected,
     )
 
 
@@ -1010,6 +1076,8 @@ def _make_speech_hero(
         people=people,
         framing=_framing_facet(clip, in_ms, out_ms, region),
         quality=_speech_quality(metrics, vlm, on_cam),
+        channel=vocab.CHANNEL_SAID,
+        subject=vocab.SUBJECT_PERSON,
     )
 
 
@@ -2002,26 +2070,29 @@ def build_hero_cuts(
 def _file_heroes(
     clip: _ClipInputs, source: Optional[ss.SpanSource], params: EnergyParams,
 ) -> List[HeroCut]:
-    """All hero cuts for ONE clip at one energy -- the heavy, per-file work
-    (fused field, anchors, speech/beat/combined candidates). Pure given the
-    clip's stored artifacts, so its output is what the precompute cache stores
-    (one entry per file per energy band). No cross-file stacking here."""
-    field = _build_field(clip, params.energy)
-    # Resolve the cast (voice<->person, on/off camera, frame box) once per clip,
-    # so every speech cut carries the right speaker + framing facets.
+    """All hero cuts for ONE clip at one energy (cuts-v2). Pure given the clip's
+    stored artifacts, so its output is what the precompute cache stores (one
+    entry per file per energy band). No cross-file stacking here.
+
+    The v2 path:
+      1. build the 4-channel ATOMS (l3.atoms): detection-only beats, gated by
+         per-channel confidence and de-flooded by the dominant-channel fold;
+      2. build the fused field with every atom peak as an attractor + peak-core
+         protected (Said = word span -- the mid-word-cut guarantee);
+      3. SAID cuts keep the linguistic thought-ladder (_speech_candidates);
+         DONE/SHOWN cuts come from the uniform combiner (l3.combine);
+      4. derive cross-channel capture-MOMENTS deterministically.
+
+    The v1 builders (_beat_segments / _assign_roles / _annotate_moments) stay in
+    the tree but are no longer called -- the version bump invalidates their cache."""
     if clip.cast is None:
         clip.cast = cst.build_cast(clip.perception, source.words if source else [])
-    anchors = anc.gather_anchors(
-        duration_ms=clip.duration_ms, dialogue=clip.dialogue,
-        perception=clip.perception, motion=clip.motion, audio=clip.audio)
-    sp = _speech_candidates(clip, source, field, params)
-    beats = _beat_segments(clip, field, params, anchors)
-    heroes: List[HeroCut] = list(sp) + list(beats)
-    # Flat model: every cut is first-class. We only ANNOTATE -- stamp each cut's
-    # narrative role, then wire the VLM's typed relation graph onto the cuts and
-    # mark connected bundles with a shared moment_id. Energy-independent metadata.
-    _assign_roles(clip, heroes)
-    heroes = _annotate_moments(clip, heroes, params)
+    atoms = atoms_mod.build_atoms(clip)
+    field = _build_field_v2(clip, params.energy, atoms)
+    speech = _speech_candidates(clip, source, field, params)
+    video = cmb.combine_video(atoms, params, field, clip, source)
+    heroes: List[HeroCut] = list(speech) + list(video)
+    cmb.derive_moments(heroes, params)
     return heroes
 
 

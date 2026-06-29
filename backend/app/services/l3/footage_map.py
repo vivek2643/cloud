@@ -65,7 +65,12 @@ logger = logging.getLogger(__name__)
 # `role` tag is dropped (no baked intent -> the brain decides at placement); a
 # graphic's gist is a short tag shown only when speech doesn't already narrate
 # it. Clusters carry the primitive mix too.
-TREE_VERSION = 8
+# v9: CUTS-V2. The resident line is keyed on the capture CHANNEL.SUBJECT
+# (said.person / done.object / shown.graphic) -- the honest substrate, no
+# affordance/role. Moment clusters are the deterministic cross-channel
+# capture-moments (a shared moment_id from l3.combine). Tier-1 reads the VLM
+# `atoms` track (legacy events/cutaways kept as a fallback for un-migrated clips).
+TREE_VERSION = 9
 
 # Band index -> energy-level name. Band 2 (energy 0.5) is the anchor: one
 # complete thought per cut. Lower = wider (whole answer), higher = tighter.
@@ -208,6 +213,7 @@ def _build_clusters(moments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         ordered = sorted(members, key=lambda m: int(m["in_ms"]))
         affs = []
         prims = []
+        channels = []
         for m in ordered:
             for a in (m.get("affordances") or []):
                 if a and a not in affs:
@@ -215,6 +221,9 @@ def _build_clusters(moments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             for p in (m.get("primitives") or []):
                 if p and p not in prims:
                     prims.append(p)
+            ch = m.get("channel")
+            if ch and ch not in channels:
+                channels.append(ch)
         clusters.append({
             "cluster_id": cid,
             "members": [m["moment_id"] for m in ordered],
@@ -223,6 +232,9 @@ def _build_clusters(moments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             # The capture mix across members (person+speech+graphic ...) -- what
             # the whole moment is made of, primitive-led like the per-cut line.
             "primitives": prims,
+            # The channel mix (said+done+shown) -- a capture-moment is exactly a
+            # cross-channel bundle, so this is what defines it.
+            "channels": channels,
             "in_ms": min(int(m["in_ms"]) for m in ordered),
             "out_ms": max(int(m["out_ms"]) for m in ordered),
             "ladder": ladder,
@@ -255,7 +267,8 @@ def build_clip_tree(
     # the gist from the resident line whenever speech overlaps the graphic span.
     speech_spans = [
         (_in(c), _out(c)) for c in ordered
-        if "speech" in (c.get("primitives") or []) or "speech" in (c.get("affordances") or [])
+        if c.get("channel") == "said"
+        or "speech" in (c.get("primitives") or []) or "speech" in (c.get("affordances") or [])
     ]
     # Map each cut's hero_id to the tree-local moment id so relation endpoints
     # (which reference other cuts by hero_id) can be expressed in the same id
@@ -280,6 +293,11 @@ def build_clip_tree(
             "affordances": cut.get("affordances") or ([cut.get("modality")] if cut.get("modality") else []),
             # Intrinsic capture substrate (person/action/place/object/graphic/speech).
             "primitives": cut.get("primitives") or [],
+            # cuts-v2 substrate: the capture CHANNEL (said|done|shown) + the
+            # orthogonal SUBJECT tag (person|place|object|graphic). The honest
+            # what-was-captured the brain keys on.
+            "channel": cut.get("channel"),
+            "subject": cut.get("subject"),
             # Gist of an information-dense graphic (what it conveys), when present.
             "summary": cut.get("summary"),
             # True when speech overlaps this span -- the gist is redundant in the
@@ -451,11 +469,14 @@ def _fmt_ts(ms: int) -> str:
 
 
 def _capture_tag(m: Dict[str, Any]) -> str:
-    """WHAT this cut captured -- the intrinsic primitive(s) (person / action /
-    place / object / graphic / speech). The honest atom the brain reads, instead
-    of the editorial affordance (which is a derived USE, and biases). Multi-
-    primitive cuts show the mix (person+speech). Falls back to the affordance mix
-    only when a cut carries no primitives."""
+    """WHAT this cut captured (cuts-v2): the CHANNEL.SUBJECT -- said.person,
+    done.object, shown.graphic. The honest substrate the brain reads, with no
+    editorial affordance/role bias. Falls back to the legacy primitive/affordance
+    mix for un-migrated clips that carry no channel."""
+    ch = m.get("channel")
+    if ch:
+        sub = m.get("subject")
+        return f"{ch}.{sub}" if sub else ch
     prims = [p for p in (m.get("primitives") or []) if p]
     if prims:
         return "+".join(prims)
@@ -542,7 +563,7 @@ def _cluster_line(c: Dict[str, Any]) -> str:
     place the moment as ONE thing -- the whole run loose, or just its peak when
     tight. Members are still listed above (each tagged with this cluster id), so
     nothing is hidden; this is the rolled-up unit on top of them."""
-    mix = "+".join(p for p in (c.get("primitives") or c.get("affordances") or []) if p)
+    mix = "+".join(p for p in (c.get("channels") or c.get("primitives") or c.get("affordances") or []) if p)
     rungs = []
     for L in _LEVEL_NAMES:
         ids = c["ladder"].get(L) or []
@@ -735,7 +756,8 @@ def _span_detail(file_id: str, in_ms: int, out_ms: int) -> Dict[str, Any]:
         except Exception:
             return False
 
-    out: Dict[str, Any] = {"events": [], "content_units": [], "cutaways": [], "transcript": []}
+    out: Dict[str, Any] = {"atoms": [], "events": [], "content_units": [],
+                           "cutaways": [], "transcript": []}
     try:
         with _pg_conn() as conn:
             row = conn.execute(
@@ -752,6 +774,17 @@ def _span_detail(file_id: str, in_ms: int, out_ms: int) -> Dict[str, Any]:
     if not row:
         return out
     perception, segments = _as_doc(row[0]), _as_doc(row[1])
+
+    # cuts-v2 substrate: the VLM's detection atoms over the span (channel /
+    # subject / peak / confidence / gist). The brain's primary Tier-1 read.
+    out["atoms"] = [
+        {"channel": a.get("channel"), "subject": a.get("subject"),
+         "start_ms": a.get("start_ms"), "end_ms": a.get("end_ms"),
+         "peak_ms": a.get("peak_ms"), "confidence": a.get("confidence"),
+         "label": a.get("label"), "summary": a.get("summary")}
+        for a in (perception.get("atoms") or [])
+        if _ov(a.get("start_ms", 0), a.get("end_ms", 0))
+    ]
 
     out["events"] = [
         {"start_ms": e.get("start_ms"), "end_ms": e.get("end_ms"),

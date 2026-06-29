@@ -73,6 +73,65 @@ def is_derived_view(x: str) -> bool:
 
 
 # --------------------------------------------------------------------------
+# v2 CAPTURE CHANNELS -- the honest substrate (supersedes the primitives above).
+# --------------------------------------------------------------------------
+# A captured shot delivers meaning through exactly one of four channels, derived
+# from the two physical tracks (audio|video) x how each carries (event|held):
+#
+#                 event / language            held / continuous
+#   audio   SAID  (speech)                    HEARD (music / sfx / ambient)
+#   video   DONE  (action, change over time)  SHOWN (a held subject)
+#
+# SUBJECT (person/place/object/graphic) is an ORTHOGONAL tag that rides on the
+# video channels -- a screen-rec demo is Done.graphic (changing), a title card is
+# Shown.graphic (static). This is the single source of truth for v2; the
+# affordance/primitive sets above are kept only until the v1 path is deleted.
+CHANNEL_SAID = "said"      # audio . event   -- a spoken line / voiceover
+CHANNEL_DONE = "done"      # video . event   -- a physical action / change
+CHANNEL_SHOWN = "shown"    # video . held    -- a held subject to be seen
+CHANNEL_HEARD = "heard"    # audio . held    -- non-speech sound (built, suppressed)
+
+CHANNELS: Tuple[str, ...] = (CHANNEL_SAID, CHANNEL_DONE, CHANNEL_SHOWN, CHANNEL_HEARD)
+CHANNEL_SET: FrozenSet[str] = frozenset(CHANNELS)
+# What the editor UI and brain actually see. Heard is detected but withheld
+# (no real model yet); naming it gives non-speech audio an honest home instead
+# of leaking through as a bogus "person" cut.
+SURFACED_CHANNELS: Tuple[str, ...] = (CHANNEL_SAID, CHANNEL_DONE, CHANNEL_SHOWN)
+SURFACED_CHANNEL_SET: FrozenSet[str] = frozenset(SURFACED_CHANNELS)
+
+CHANNEL_LABEL: Dict[str, str] = {
+    CHANNEL_SAID: "said",
+    CHANNEL_DONE: "done",
+    CHANNEL_SHOWN: "shown",
+    CHANNEL_HEARD: "heard",
+}
+
+# Subjects -- WHAT a video channel is about (orthogonal tag, not a channel).
+SUBJECT_PERSON = "person"
+SUBJECT_PLACE = "place"
+SUBJECT_OBJECT = "object"
+SUBJECT_GRAPHIC = "graphic"
+SUBJECTS: Tuple[str, ...] = (SUBJECT_PERSON, SUBJECT_PLACE, SUBJECT_OBJECT, SUBJECT_GRAPHIC)
+SUBJECT_SET: FrozenSet[str] = frozenset(SUBJECTS)
+
+
+def is_channel(x: str) -> bool:
+    return x in CHANNEL_SET
+
+
+def is_surfaced_channel(x: str) -> bool:
+    return x in SURFACED_CHANNEL_SET
+
+
+def is_subject(x: str) -> bool:
+    return x in SUBJECT_SET
+
+
+def channel_label(x: str) -> str:
+    return CHANNEL_LABEL.get((x or "").lower(), x or "")
+
+
+# --------------------------------------------------------------------------
 # Affordances (closed set of FIVE -- the editor-facing VIEW layer)
 # --------------------------------------------------------------------------
 AFF_SPEECH = "speech"      # hear what is said (sync audio is the point)
@@ -151,6 +210,25 @@ def primitives_for(affordances: List[str]) -> List[str]:
         if p not in out:
             out.append(p)
     return out
+
+
+# Migration bridge (v1 -> v2): map an old editorial affordance onto its v2
+# channel so any cached/legacy cut can still be displayed under the new tabs.
+# reaction and b-roll were both "a held subject" (Shown); insert (a graphic) is
+# Shown by default. Defined here (after the AFF_* constants) to avoid a forward
+# reference.
+LEGACY_AFFORDANCE_CHANNEL: Dict[str, str] = {
+    AFF_SPEECH: CHANNEL_SAID,
+    AFF_ACTION: CHANNEL_DONE,
+    AFF_REACTION: CHANNEL_SHOWN,
+    AFF_BROLL: CHANNEL_SHOWN,
+    AFF_INSERT: CHANNEL_SHOWN,
+}
+
+
+def channel_for_affordance(aff: str) -> str:
+    """v1->v2 bridge: the channel an old affordance maps onto (Shown default)."""
+    return LEGACY_AFFORDANCE_CHANNEL.get((aff or "").lower(), CHANNEL_SHOWN)
 
 
 # A physical/visual beat (vs. passive texture). Used to decide what counts as a

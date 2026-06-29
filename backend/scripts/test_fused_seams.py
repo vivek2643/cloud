@@ -134,6 +134,29 @@ def test_protected_span_hard_veto():
     print("ok  protected span veto")
 
 
+def test_atom_peak_attracts():
+    """An atom peak fed in as an attractor boosts its instant over plain ground
+    (partial safety makes the boost visible) and surfaces as a 'peak' seam."""
+    camera = _const(0.5)                 # partial safety so the boost shows
+    field = fs.compute_fused_field(duration_ms=DUR, camera_cost=camera,
+                                   atom_peaks=[2000])
+    assert field.q_at(2000) > field.q_at(500), (field.q_at(2000), field.q_at(500))
+    assert any(s.kind == "peak" for s in field.seams)
+    print("ok  atom peak attracts")
+
+
+def test_said_word_core_protects_without_dialogue_cost():
+    """The Said safety guarantee: even with NO dialogue_cost grid, feeding the
+    word span as a protected core forbids a cut inside it -- so a cut can never
+    land mid-word regardless of whether the audio veto data exists."""
+    field = fs.compute_fused_field(duration_ms=DUR, protected_spans=[(1500, 2500)],
+                                   atom_peaks=[2000])   # peak inside the word core
+    assert field.q_at(2000) < 0.01, field.q_at(2000)    # protection beats the peak boost
+    in_ms, out_ms = fs.snap_around_core(field, 1500, 2500, win_ms=1200, duration_ms=DUR)
+    assert in_ms <= 1500 and out_ms >= 2500             # never inside the word
+    print("ok  said word-core protected even w/o dialogue cost")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
