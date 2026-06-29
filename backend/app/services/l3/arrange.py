@@ -63,7 +63,7 @@ class ResolvedCut:
     src_in_ms: int
     src_out_ms: int
     keep_spans: Optional[List[Dict[str, int]]]
-    modality: Optional[str]
+    channel: Optional[str]        # said | done | shown
     label: str
     track: int
     from_ms: Optional[int]
@@ -99,7 +99,8 @@ class _MapIndex:
             return ResolvedCut(
                 file_id=m["file_id"], src_in_ms=int(a["in_ms"]),
                 src_out_ms=int(a["out_ms"]), keep_spans=a.get("keep_spans"),
-                modality=m.get("modality"), label=a.get("gist") or m.get("gist") or "",
+                channel=a.get("channel") or m.get("channel"),
+                label=a.get("gist") or m.get("gist") or "",
                 track=p.track, from_ms=p.from_ms, reason=p.reason,
                 ref=p.ref, level="atom",
             )
@@ -114,7 +115,7 @@ class _MapIndex:
         return ResolvedCut(
             file_id=m["file_id"], src_in_ms=int(v["in_ms"]),
             src_out_ms=int(v["out_ms"]), keep_spans=v.get("keep_spans"),
-            modality=m.get("modality"), label=m.get("gist") or "",
+            channel=m.get("channel"), label=m.get("gist") or "",
             track=p.track, from_ms=p.from_ms, reason=p.reason,
             ref=p.ref, level=v.get("level", level),
         )
@@ -338,7 +339,7 @@ def _segments_from_main(cuts: List[ResolvedCut]) -> List[dict]:
                 "file_id": rc.file_id,
                 "in_ms": in_ms,
                 "out_ms": out_ms,
-                "axis": "speech" if rc.modality == "speech" else "any",
+                "axis": "speech" if rc.channel == "said" else "any",
                 "beat_id": None,
                 "content": rc.label,
                 "rationale": rc.reason or None,

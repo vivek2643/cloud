@@ -1,6 +1,6 @@
 """
-Tests for the editing vocabulary's layered model: capture primitives (intrinsic)
-vs editor-facing affordances/views (derived). Run:
+Tests for the cuts-v2 capture vocabulary: four CHANNELS (said/done/shown/heard)
++ an orthogonal SUBJECT tag. There is no affordance/primitive/view layer. Run:
     .venv/bin/python scripts/test_vocab.py
 """
 from __future__ import annotations
@@ -16,57 +16,45 @@ if BACKEND not in sys.path:
 from app.services.l3 import vocab as v  # noqa: E402
 
 
-def test_primitive_and_view_sets_are_disjoint_and_closed():
-    # The two visual-overlapping names (action) are intentionally shared in
-    # spelling but the SETS are distinct concepts; assert membership is exact.
-    assert v.is_capture_primitive(v.PRIM_PERSON)
-    assert v.is_capture_primitive(v.PRIM_SPEECH)
-    assert not v.is_capture_primitive(v.VIEW_REACTION)
-    assert v.is_derived_view(v.VIEW_REACTION)
-    assert v.is_derived_view(v.VIEW_BROLL)
-    assert v.is_derived_view(v.VIEW_MOMENT)
-    assert not v.is_derived_view(v.PRIM_PLACE)
-    # Audio vs visual split.
-    assert v.PRIM_SPEECH in v.AUDIO_PRIMITIVES
-    assert v.PRIM_SPEECH not in v.VISUAL_PRIMITIVES
-    assert set(v.CAPTURE_PRIMITIVES) == set(v.VISUAL_PRIMITIVES) | set(v.AUDIO_PRIMITIVES)
-    print("ok  primitive/view sets closed and split")
+def test_channels_closed_and_surfaced():
+    assert set(v.CHANNELS) == {v.CHANNEL_SAID, v.CHANNEL_DONE, v.CHANNEL_SHOWN, v.CHANNEL_HEARD}
+    for c in v.CHANNELS:
+        assert v.is_channel(c)
+    # Heard is built but withheld from the editor/brain surface.
+    assert set(v.SURFACED_CHANNELS) == {v.CHANNEL_SAID, v.CHANNEL_DONE, v.CHANNEL_SHOWN}
+    assert v.is_surfaced_channel(v.CHANNEL_DONE)
+    assert not v.is_surfaced_channel(v.CHANNEL_HEARD)
+    print("ok  channels closed + surfaced set")
 
 
-def test_every_affordance_maps_to_a_primitive():
-    for aff in v.AFFORDANCES:
-        p = v.primitive_for_affordance(aff)
-        assert v.is_capture_primitive(p), (aff, p)
-    print("ok  every affordance maps to a primitive")
+def test_subjects_closed():
+    assert set(v.SUBJECTS) == {v.SUBJECT_PERSON, v.SUBJECT_PLACE, v.SUBJECT_OBJECT, v.SUBJECT_GRAPHIC}
+    for s in v.SUBJECTS:
+        assert v.is_subject(s)
+    assert not v.is_subject(v.CHANNEL_DONE)   # a channel is not a subject
+    print("ok  subjects closed")
 
 
-def test_reaction_is_a_person_shot_broll_is_place_insert_is_graphic():
-    # The whole point of the re-grounding: reaction/b-roll are NOT capture
-    # primitives -- they're a person shot / a place used supplementary.
-    assert v.primitive_for_affordance(v.AFF_REACTION) == v.PRIM_PERSON
-    assert v.primitive_for_affordance(v.AFF_BROLL) == v.PRIM_PLACE
-    assert v.primitive_for_affordance(v.AFF_INSERT) == v.PRIM_GRAPHIC
-    assert v.primitive_for_affordance(v.AFF_SPEECH) == v.PRIM_SPEECH
-    assert v.primitive_for_affordance(v.AFF_ACTION) == v.PRIM_ACTION
-    print("ok  reaction=person, broll=place, insert=graphic")
+def test_labels():
+    assert v.channel_label(v.CHANNEL_SAID) == "said"
+    assert v.channel_label("SHOWN") == "shown"        # case-insensitive
+    assert v.channel_label("nonsense") == "nonsense"  # passthrough
+    print("ok  channel labels")
 
 
-def test_primitives_for_dedupes_and_preserves_order():
-    # A multi-affordance cut (speech + reaction) -> speech + person, deduped.
-    assert v.primitives_for([v.AFF_SPEECH, v.AFF_REACTION]) == [v.PRIM_SPEECH, v.PRIM_PERSON]
-    # reaction + action both present -> person + action.
-    assert v.primitives_for([v.AFF_REACTION, v.AFF_ACTION]) == [v.PRIM_PERSON, v.PRIM_ACTION]
-    # Duplicate primitive (broll twice) collapses.
-    assert v.primitives_for([v.AFF_BROLL, v.AFF_BROLL]) == [v.PRIM_PLACE]
-    assert v.primitives_for([]) == []
-    print("ok  primitives_for dedupes + ordered")
+def test_no_legacy_vocabulary():
+    # The v1 affordance/primitive/view layer is fully gone.
+    for gone in ("AFFORDANCES", "AFF_SPEECH", "PRIM_PERSON", "primitives_for",
+                 "channel_for_affordance", "DERIVED_VIEWS", "SOURCE_AFFORDANCE"):
+        assert not hasattr(v, gone), gone
+    print("ok  no legacy affordance/primitive vocabulary remains")
 
 
 def main():
-    test_primitive_and_view_sets_are_disjoint_and_closed()
-    test_every_affordance_maps_to_a_primitive()
-    test_reaction_is_a_person_shot_broll_is_place_insert_is_graphic()
-    test_primitives_for_dedupes_and_preserves_order()
+    test_channels_closed_and_surfaced()
+    test_subjects_closed()
+    test_labels()
+    test_no_legacy_vocabulary()
     print("\nall vocab tests passed")
 
 

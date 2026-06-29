@@ -68,9 +68,15 @@ def _cluster_by_gap(atoms: List[Atom], gap_ms: int) -> List[List[Atom]]:
     return out
 
 
-def _core_ms_for(channel: str, params: EnergyParams) -> Optional[int]:
-    """The band's handle length for a channel (None below Tight = keep full)."""
-    return params.action_core_ms if channel == vocab.CHANNEL_DONE else params.broll_core_ms
+def _core_ms_for(channel: str, params: EnergyParams, span_ms: int) -> Optional[int]:
+    """The band's negative-padding handle for a video beat, as a span-proportional
+    length (None below Tight = keep full). The handle scales with the beat's own
+    duration -- a long shot keeps proportionally more than a short one -- floored
+    so a tiny beat never insets below a usable handle."""
+    frac = params.done_core_frac if channel == vocab.CHANNEL_DONE else params.shown_core_frac
+    if frac is None:
+        return None
+    return max(params.core_floor_ms, int(round(frac * span_ms)))
 
 
 def _excise_lull(motion: Optional[dict], in_ms: int, out_ms: int,
@@ -144,34 +150,36 @@ def combine_video(atoms: List[Atom], params: EnergyParams, field, clip,
     peak-zoom + fused-field snap. Heard is suppressed (not surfaced); Said is
     handled by the caller's thought-ladder."""
     from app.services.l3 import hero_cuts as hc
-    from app.services.l3 import anchors as anc
 
     out: List[object] = []
     for channel in (vocab.CHANNEL_DONE, vocab.CHANNEL_SHOWN):
         group = [a for a in atoms if a.channel == channel]
         if not group:
             continue
-        aff = anc.AFF_ACTION if channel == vocab.CHANNEL_DONE else anc.AFF_BROLL
         lead = _DONE_LEAD if channel == vocab.CHANNEL_DONE else _SHOWN_LEAD
         for ci, members in enumerate(_cluster_by_gap(group, params.fuse_gap_ms)):
             core_in = min(m.start_ms for m in members)
             core_out = max(m.end_ms for m in members)
             best = max(members, key=lambda m: m.confidence)
 
-            # Peak SPLIT (Done, Sharp): windup|payoff around the impact -- excise
-            # the field-safe interior lull of the FULL beat (before any inset, so
-            # there's a lull left to find). Otherwise peak ZOOM: inset toward the
-            # impact to the band's handle length.
+            # Peak SPLIT (Sharp band, either video channel): windup|payoff around
+            # the peak -- excise the field-safe interior lull of the FULL beat
+            # (before any inset, so there's a lull left to find). A Done action
+            # splits around its impact; a moving Shown shot splits the slow travel
+            # from its arrival. A static hold has no lull -> falls back to the zoom
+            # inset below. Otherwise peak ZOOM: inset toward the peak to the band's
+            # span-proportional handle length.
             keep_spans = None
-            if channel == vocab.CHANNEL_DONE and params.action_split_at_impact and len(members) == 1:
+            if params.split_at_peak and len(members) == 1:
                 split = _excise_lull(clip.motion, core_in, core_out, best.peak_ms)
                 if split:
-                    keep_spans = [hc._snap_segment(field, a, b, params, clip, aff) for a, b in split]
+                    keep_spans = [hc._snap_segment(field, a, b, params, clip, channel) for a, b in split]
                     in_ms, out_ms = keep_spans[0][0], keep_spans[-1][1]
             if keep_spans is None:
                 cin, cout = hc._core_inset(core_in, core_out, best.peak_ms,
-                                           _core_ms_for(channel, params), lead_frac=lead)
-                in_ms, out_ms = hc._snap_segment(field, cin, cout, params, clip, aff)
+                                           _core_ms_for(channel, params, core_out - core_in),
+                                           lead_frac=lead)
+                in_ms, out_ms = hc._snap_segment(field, cin, cout, params, clip, channel)
             if out_ms <= in_ms:
                 continue
             score = _video_score(channel, members, clip, in_ms, out_ms)
@@ -183,21 +191,18 @@ def combine_video(atoms: List[Atom], params: EnergyParams, field, clip,
             out.append(hc.HeroCut(
                 hero_id=f"{clip.file_id[:8]}:{channel[:2]}{ci}",
                 file_id=clip.file_id,
-                modality=channel,
+                channel=channel,
                 label=label,
                 src_in_ms=in_ms,
                 src_out_ms=out_ms,
                 score=score,
                 speaker=best.actor,
                 flags=list(best.flags or []),
-                affordances=[channel],
                 keep_spans=keep_spans,
                 ladder=ladder,
                 people=_people_facet(best.actor, best.region),
                 framing=hc._framing_facet(clip, in_ms, out_ms, best.region),
                 summary=best.summary,
-                primitive=best.subject,
-                channel=channel,
                 subject=best.subject,
             ))
     return out

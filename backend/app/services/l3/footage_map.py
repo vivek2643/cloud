@@ -70,7 +70,10 @@ logger = logging.getLogger(__name__)
 # affordance/role. Moment clusters are the deterministic cross-channel
 # capture-moments (a shared moment_id from l3.combine). Tier-1 reads the VLM
 # `atoms` track (legacy events/cutaways kept as a fallback for un-migrated clips).
-TREE_VERSION = 9
+# v10: the v1 affordance/primitive/modality vocabulary is fully removed -- cuts
+# carry ONLY channel + subject; the map no longer reads or emits affordance/
+# primitive/modality. Clusters carry a channel mix + subject mix.
+TREE_VERSION = 10
 
 # Band index -> energy-level name. Band 2 (energy 0.5) is the anchor: one
 # complete thought per cut. Lower = wider (whole answer), higher = tighter.
@@ -211,30 +214,24 @@ def _build_clusters(moments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
         ladder, peak = _cluster_ladder(members)
         ordered = sorted(members, key=lambda m: int(m["in_ms"]))
-        affs = []
-        prims = []
         channels = []
+        subjects = []
         for m in ordered:
-            for a in (m.get("affordances") or []):
-                if a and a not in affs:
-                    affs.append(a)
-            for p in (m.get("primitives") or []):
-                if p and p not in prims:
-                    prims.append(p)
             ch = m.get("channel")
             if ch and ch not in channels:
                 channels.append(ch)
+            sub = m.get("subject")
+            if sub and sub not in subjects:
+                subjects.append(sub)
         clusters.append({
             "cluster_id": cid,
             "members": [m["moment_id"] for m in ordered],
             "peak": peak,
-            "affordances": affs,
-            # The capture mix across members (person+speech+graphic ...) -- what
-            # the whole moment is made of, primitive-led like the per-cut line.
-            "primitives": prims,
             # The channel mix (said+done+shown) -- a capture-moment is exactly a
             # cross-channel bundle, so this is what defines it.
             "channels": channels,
+            # The subject mix (person/place/object/graphic) across members.
+            "subjects": subjects,
             "in_ms": min(int(m["in_ms"]) for m in ordered),
             "out_ms": max(int(m["out_ms"]) for m in ordered),
             "ladder": ladder,
@@ -268,7 +265,6 @@ def build_clip_tree(
     speech_spans = [
         (_in(c), _out(c)) for c in ordered
         if c.get("channel") == "said"
-        or "speech" in (c.get("primitives") or []) or "speech" in (c.get("affordances") or [])
     ]
     for idx, cut in enumerate(ordered):
         hero_id = cut.get("hero_id")
@@ -285,10 +281,6 @@ def build_clip_tree(
         moments.append({
             "moment_id": f"{fid8}:m{idx:02d}",
             "file_id": file_id,
-            "modality": cut.get("modality"),
-            "affordances": cut.get("affordances") or ([cut.get("modality")] if cut.get("modality") else []),
-            # Intrinsic capture substrate (person/action/place/object/graphic/speech).
-            "primitives": cut.get("primitives") or [],
             # cuts-v2 substrate: the capture CHANNEL (said|done|shown) + the
             # orthogonal SUBJECT tag (person|place|object|graphic). The honest
             # what-was-captured the brain keys on.
@@ -457,19 +449,10 @@ def _fmt_ts(ms: int) -> str:
 def _capture_tag(m: Dict[str, Any]) -> str:
     """WHAT this cut captured (cuts-v2): the CHANNEL.SUBJECT -- said.person,
     done.object, shown.graphic. The honest substrate the brain reads, with no
-    editorial affordance/role bias. Falls back to the legacy primitive/affordance
-    mix for un-migrated clips that carry no channel."""
-    ch = m.get("channel")
-    if ch:
-        sub = m.get("subject")
-        return f"{ch}.{sub}" if sub else ch
-    prims = [p for p in (m.get("primitives") or []) if p]
-    if prims:
-        return "+".join(prims)
-    affs = [a for a in (m.get("affordances") or []) if a]
-    if len(affs) > 1:
-        return "+".join(affs)
-    return m.get("modality") or (affs[0] if affs else "")
+    editorial affordance/role bias."""
+    ch = m.get("channel") or ""
+    sub = m.get("subject")
+    return f"{ch}.{sub}" if (ch and sub) else ch
 
 
 def _short_gist(s: str, max_words: int = 6) -> str:
@@ -535,7 +518,7 @@ def _cluster_line(c: Dict[str, Any]) -> str:
     place the moment as ONE thing -- the whole run loose, or just its peak when
     tight. Members are still listed above (each tagged with this cluster id), so
     nothing is hidden; this is the rolled-up unit on top of them."""
-    mix = "+".join(p for p in (c.get("channels") or c.get("primitives") or c.get("affordances") or []) if p)
+    mix = "+".join(p for p in (c.get("channels") or []) if p)
     rungs = []
     for L in _LEVEL_NAMES:
         ids = c["ladder"].get(L) or []
@@ -711,10 +694,10 @@ _DETAIL_PAD_MS = 1200
 
 def _span_detail(file_id: str, in_ms: int, out_ms: int) -> Dict[str, Any]:
     """The RAW source detail overlapping a moment's span -- the brain's Tier-1
-    'open the file and read' depth: the VLM event timeline, the content-unit /
-    cutaway records, and the verbatim transcript window. Kept OUT of the resident
-    prompt; loaded on demand only when the brain inspects a candidate. Best-effort
-    -- a missing artifact simply yields fewer fields."""
+    'open the file and read' depth: the VLM detection atoms (channel/subject/peak)
+    and the verbatim transcript window. Kept OUT of the resident prompt; loaded on
+    demand only when the brain inspects a candidate. Best-effort -- a missing
+    artifact simply yields fewer fields."""
     lo, hi = in_ms - _DETAIL_PAD_MS, out_ms + _DETAIL_PAD_MS
 
     def _ov(a0: Any, a1: Any) -> bool:
@@ -723,8 +706,7 @@ def _span_detail(file_id: str, in_ms: int, out_ms: int) -> Dict[str, Any]:
         except Exception:
             return False
 
-    out: Dict[str, Any] = {"atoms": [], "events": [], "content_units": [],
-                           "cutaways": [], "transcript": []}
+    out: Dict[str, Any] = {"atoms": [], "transcript": []}
     try:
         with _pg_conn() as conn:
             row = conn.execute(
@@ -788,6 +770,6 @@ def moment_detail(file_id: str, moment_id: str) -> Optional[Dict[str, Any]]:
             "logline": tree.get("logline"),
         },
         "moment": m,
-        # Tier-1 raw detail over the moment's span (events / units / transcript).
+        # Tier-1 raw detail over the moment's span (detection atoms + transcript).
         "source": _span_detail(file_id, int(m["in_ms"]), int(m["out_ms"])),
     }

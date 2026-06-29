@@ -73,7 +73,7 @@ def _signatures(conn, file_ids: List[str]) -> Dict[str, Optional[str]]:
                coalesce(f.duration_seconds, 0),
                coalesce(jsonb_array_length(ds.segments->'sentence'), 0),
                coalesce(jsonb_array_length(ds.segments->'topic'), 0),
-               coalesce(jsonb_array_length(cp.perception->'content_units'), 0),
+               coalesce(jsonb_array_length(cp.perception->'atoms'), 0),
                (md.file_id is not null),
                (af.file_id is not null)
           from files f
@@ -86,14 +86,14 @@ def _signatures(conn, file_ids: List[str]) -> Dict[str, Optional[str]]:
         (file_ids,),
     ).fetchall()
     out: Dict[str, Optional[str]] = {fid: None for fid in file_ids}
-    for fid, dur_s, n_sent, n_topic, n_units, has_motion, has_audio in rows:
-        # A file with nothing usable (no dialogue and no perception units) has no
+    for fid, dur_s, n_sent, n_topic, n_atoms, has_motion, has_audio in rows:
+        # A file with nothing usable (no dialogue and no detection atoms) has no
         # hero cuts yet; leave its signature None so we don't cache an empty row.
-        if not n_sent and not n_units:
+        if not n_sent and not n_atoms:
             continue
         payload = json.dumps({
             "dur": int(float(dur_s) * 1000), "sent": int(n_sent),
-            "topic": int(n_topic), "units": int(n_units),
+            "topic": int(n_topic), "atoms": int(n_atoms),
             "motion": bool(has_motion), "audio": bool(has_audio),
             "pv": hc.PARAMS_VERSION,
         }, sort_keys=True)
@@ -180,7 +180,7 @@ def defer_precompute(file_id: str) -> None:
 
 def get_hero_feed(
     file_ids: List[str], energy: float = 0.5,
-    affordances: Optional[List[str]] = None,
+    channels: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """The ranked hero-cuts feed, served from the per-file precompute cache.
 
@@ -196,8 +196,8 @@ def get_hero_feed(
     except Exception:
         logger.exception("hero feed: cache path failed; live build")
         return hc.build_hero_cuts(file_ids, hc.band_energy(band),
-                                  affordances=affordances)
-    return hc.assemble_cached(cached_by_file, file_ids, affordances)
+                                  channels=channels)
+    return hc.assemble_cached(cached_by_file, file_ids, channels)
 
 
 def _cached_or_backfill(file_ids: List[str], band: int) -> Dict[str, List[Dict[str, Any]]]:

@@ -154,29 +154,12 @@ export function getDialogues(fileId: string, token: string) {
 
 // --- Hero Cuts lens ---
 
-// The closed editing vocabulary (backend l3/vocab.py). Exactly five affordances.
-export type HeroModality =
-  | "speech"
-  | "action"
-  | "reaction"
-  | "broll"
-  | "insert";
-
-// cuts-v2 capture CHANNEL (backend l3/vocab.py): the honest substrate the tabs
-// key on. Heard is detected but never surfaced.
+// The capture CHANNEL a cut delivers on (backend l3/vocab.py) -- the single
+// vocabulary cuts carry. `heard` is detected but never surfaced in the UI.
 export type HeroChannel = "said" | "done" | "shown" | "heard";
 
 // Orthogonal SUBJECT tag riding on the video channels.
 export type HeroSubject = "person" | "place" | "object" | "graphic";
-
-// One typed, directional edge from this cut to another (mapped from the VLM's
-// relation graph). `dir` is 'out' when this cut is the source, 'in' when target.
-export interface HeroRelation {
-  type: string;       // responds_to | illustrates | leads_into | answers | ...
-  dir: "out" | "in";
-  other: string;      // hero_id of the connected cut
-  note?: string | null;
-}
 
 export interface HeroTake {
   file_id: string;
@@ -188,7 +171,9 @@ export interface HeroTake {
 export interface HeroCut {
   hero_id: string;
   file_id: string;
-  modality: HeroModality;
+  // The capture CHANNEL this cut delivers on (said|done|shown) -- what the tabs
+  // filter by. The single substrate; there is no editorial affordance layer.
+  channel: HeroChannel;
   label: string;
   src_in_ms: number;
   src_out_ms: number;
@@ -202,29 +187,15 @@ export interface HeroCut {
   score: number;
   speaker: string | null;
   flags: string[];
-  // All editorial uses this cut serves (filter keys / tabs).
-  affordances: string[];
-  // The intrinsic capture substrate (person/action/place/object/graphic/speech)
-  // -- what the camera/mic actually caught, beneath the editorial affordance.
-  primitives?: string[];
-  // cuts-v2: the capture CHANNEL this cut delivers on (said|done|shown) -- what
-  // the tabs filter by -- and the orthogonal SUBJECT tag (person|place|object|
-  // graphic). For legacy cuts the channel is derived from the affordance.
-  channel?: HeroChannel;
+  // The orthogonal SUBJECT tag (person|place|object|graphic) riding on the
+  // video channels. null for a pure spoken (said) cut.
   subject?: HeroSubject | null;
   // For an information-dense graphic / insert cut, the gist of what it CONVEYS
   // (the VLM's read, not OCR) -- e.g. "User selects video files for upload".
   summary?: string | null;
-  // Typed edges to other cuts (a reaction responds_to a line, b-roll
-  // illustrates a topic). Flat model -- the cut stays its own card; this is how
-  // it CONNECTS to others.
-  relations?: HeroRelation[] | null;
   // The connected-cluster id this cut shares with the cuts it forms a moment
   // with. null for a standalone cut. The Moments view groups by this.
   moment_id?: string | null;
-  // Narrative intent (hook/answer/cta/establishing/climax/listener), when the
-  // VLM marked one. null for ordinary middle content.
-  role?: string | null;
   // True when this cut belongs to a multi-cut moment cluster (has a moment_id).
   is_moment?: boolean;
   take_count: number;

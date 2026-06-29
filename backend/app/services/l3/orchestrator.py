@@ -92,7 +92,7 @@ _PAGED_SYSTEM = (
     "handful of moments you are seriously considering (and inspect_dup_group for "
     "any 'dup:tgN' you might use, to compare the takes/angles and choose), form a "
     "story, then commit with submit_timeline.\n\n"
-    "Index notation: '<clip8>:<m##> modality speaker .score [in-out] \"gist\" · "
+    "Index notation: '<clip8>:<m##> channel.subject speaker .score [in-out] \"gist\" · "
     "nrg:levels (+N atoms) · dup:tgN'. Refer to moments by FULL id. 'dup:tgN' = "
     "the same spoken beat as others in group N (a retake or angle; 'retry' = "
     "abandoned). No take is pre-picked -- choose by text and score. Don't repeat "

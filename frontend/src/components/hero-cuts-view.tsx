@@ -8,7 +8,6 @@ import {
   getHeroCutsFeed,
   getFilePlaybackUrl,
   type HeroCut,
-  type HeroModality,
   type FileRecord,
 } from "@/lib/api";
 import { Star, Play, Volume2, VolumeX, Layers, Scissors, ChevronDown, Check } from "lucide-react";
@@ -31,22 +30,10 @@ const SUBJECT_LABEL: Record<string, string> = {
   graphic: "graphic",
 };
 
-// Affordance -> channel fallback, used only for legacy cuts that didn't carry a
-// `channel` (the backend normally stamps it). Mirrors l3/vocab.py.
-const AFFORDANCE_CHANNEL: Record<string, string> = {
-  speech: "said",
-  action: "done",
-  reaction: "shown",
-  broll: "shown",
-  insert: "shown",
-};
-
-// The capture channel a cut delivers on -- v2-native when stamped, else derived
-// from its affordance/modality (so legacy cuts still tab correctly).
+// The capture channel a cut delivers on -- the single substrate the tabs sort
+// on (said|done|shown). Falls back to `shown` only for a malformed cut.
 function cutChannel(h: HeroCut): string {
-  if (h.channel) return h.channel;
-  const aff = (h.affordances && h.affordances[0]) || h.modality;
-  return AFFORDANCE_CHANNEL[aff] ?? "shown";
+  return h.channel ?? "shown";
 }
 
 // A tab is the special "all" / "Moments" view or one of the three surfaced
@@ -70,13 +57,6 @@ function matchesFilter(h: HeroCut, key: FilterKey): boolean {
   return cutChannel(h) === key;
 }
 
-// The distinct capture channels across a moment's member cuts.
-function momentChannels(members: HeroCut[]): string[] {
-  const s = new Set<string>();
-  for (const m of members) s.add(cutChannel(m));
-  return Array.from(s);
-}
-
 // A take of some content that THIS file shot but LOST to a better take in
 // another file -- shown greyed at the end of the file's group ("best take ↗").
 interface LoserTake {
@@ -86,8 +66,7 @@ interface LoserTake {
   src_out_ms: number;
   score: number;
   label: string;
-  modality: HeroModality;
-  channel?: string;
+  channel: string;
   subject?: string | null;
   bestFileId: string;
 }
@@ -98,7 +77,7 @@ function loserHero(l: LoserTake): HeroCut {
   return {
     hero_id: l.key,
     file_id: l.file_id,
-    modality: l.modality,
+    channel: l.channel as HeroCut["channel"],
     label: l.label,
     src_in_ms: l.src_in_ms,
     src_out_ms: l.src_out_ms,
@@ -108,12 +87,8 @@ function loserHero(l: LoserTake): HeroCut {
     score: l.score,
     speaker: null,
     flags: [],
-    affordances: [l.modality],
-    channel: l.channel as HeroCut["channel"],
     subject: (l.subject ?? null) as HeroCut["subject"],
-    relations: null,
     moment_id: null,
-    role: null,
     is_moment: false,
     take_count: 1,
     alt_takes: [],
@@ -137,7 +112,6 @@ function combinedHero(members: HeroCut[]): HeroCut {
     duration_ms: outMs - inMs,
     play_ms: playMs,
     keep_spans: ordered.map((m) => ({ in_ms: m.src_in_ms, out_ms: m.src_out_ms })),
-    primitives: momentChannels(ordered),
     score: Math.max(...ordered.map((m) => m.score)),
     take_count: 1,
     alt_takes: [],
@@ -297,7 +271,6 @@ export function HeroCutsView() {
           src_out_ms: t.src_out_ms,
           score: t.score,
           label: h.label,
-          modality: h.modality,
           channel: cutChannel(h),
           subject: h.subject ?? null,
           bestFileId: h.file_id,
@@ -765,7 +738,7 @@ function HeroClipCard({
   function onDragStart(e: React.DragEvent) {
     const payload = JSON.stringify({
       kind: "hero",
-      modality: hero.modality,
+      channel: cutChannel(hero),
       file_id: file.id,
       file_name: file.name,
       in_ms: hero.src_in_ms,
@@ -841,7 +814,7 @@ function HeroClipCard({
           )}
         </span>
 
-        {/* Take-stack badge (top-left, below the modality badge) when repeats exist. */}
+        {/* Take-stack badge (top-left, below the channel badge) when repeats exist. */}
         {hero.take_count > 1 && (
           <span
             className="absolute left-2 top-9 z-20 flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-semibold text-white"

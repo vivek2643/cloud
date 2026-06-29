@@ -330,7 +330,8 @@ def _cut_row(c: dict) -> str:
     secs = round(c.get("play_ms", c.get("duration_ms", 0)) / 1000.0, 1)
     spk = c.get("speaker") or "-"
     label = (c.get("label") or "").replace("\n", " ").strip()
-    return (f'[{c["hero_id"]}] {c["modality"]} · {spk} · {secs}s · '
+    ch = c.get("channel") or c.get("modality") or "?"
+    return (f'[{c["hero_id"]}] {ch} · {spk} · {secs}s · '
             f'score {round(float(c.get("score", 0)), 2)} · "{label}"')
 
 
@@ -446,7 +447,7 @@ def _segments_from_picks(picks: List[dict], by_id: Dict[str, dict]) -> List[dict
                 "file_id": c["file_id"],
                 "in_ms": in_ms,
                 "out_ms": out_ms,
-                "axis": "speech" if c["modality"] == "speech" else "any",
+                "axis": "speech" if (c.get("channel") or c.get("modality")) == "said" else "any",
                 "beat_id": p.get("beat"),
                 "content": c.get("label"),
                 "rationale": p.get("reason"),

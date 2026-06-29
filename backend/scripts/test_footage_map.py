@@ -29,15 +29,14 @@ def _rung(level, in_ms, out_ms, text="", score=0.5, spans=None):
     }
 
 
-def _cut(hero_id, in_ms, out_ms, label="", modality="speech", speaker="S0",
-         score=0.5, play_ms=None, keep_spans=None, ladder=None, **extra):
+def _cut(hero_id, in_ms, out_ms, label="", channel="said", subject="person",
+         speaker="S0", score=0.5, play_ms=None, keep_spans=None, ladder=None, **extra):
     d = {
-        "hero_id": hero_id, "file_id": "ffffffff-1111", "modality": modality,
-        "label": label, "src_in_ms": in_ms, "src_out_ms": out_ms,
+        "hero_id": hero_id, "file_id": "ffffffff-1111", "channel": channel,
+        "subject": subject, "label": label, "src_in_ms": in_ms, "src_out_ms": out_ms,
         "play_ms": play_ms if play_ms is not None else (out_ms - in_ms),
         "keep_spans": keep_spans, "score": score, "speaker": speaker,
-        "affordances": [modality], "flags": [], "take_count": 1,
-        "ladder": ladder,
+        "flags": [], "take_count": 1, "ladder": ladder,
     }
     d.update(extra)
     return d
@@ -98,12 +97,12 @@ def test_split_rung_becomes_keep_spans():
 def test_no_ladder_uses_flat_span():
     """A legacy cut with no ladder still yields a moment (balanced variant from
     its flat span)."""
-    cut = _cut("f:legacy", 0, 3000, "held wide shot", modality="broll",
+    cut = _cut("f:legacy", 0, 3000, "held wide shot", channel="shown", subject="place",
                speaker=None, ladder=None)
     tree = fm.build_clip_tree("ffffffff-1111", {"name": "B", "duration_ms": 3000}, [cut])
     assert tree["moment_count"] == 1, tree["moment_count"]
     m = tree["moments"][0]
-    assert m["modality"] == "broll"
+    assert m["channel"] == "shown" and m["subject"] == "place"
     assert m["variants"]["balanced"]["out_ms"] == 3000
     print("ok  test_no_ladder_uses_flat_span")
 
@@ -138,27 +137,26 @@ def test_map_text_lists_variants_no_atoms():
     print("ok  test_map_text_lists_variants_no_atoms")
 
 
-def test_moment_line_shows_multi_affordance_and_offcam():
-    """The brain's one-line index shows a multi-affordance moment's full mix and
-    flags an off-camera voice."""
-    cut = _cut("f:mo", 1000, 4000, "what made you start this", modality="moment",
-               speaker="interviewer", score=0.7,
+def test_moment_line_flags_offcamera():
+    """The brain's one-line index keys on CHANNEL.SUBJECT and flags an off-camera
+    voice (an off-screen interviewer / voiceover)."""
+    cut = _cut("f:mo", 1000, 4000, "what made you start this", channel="said",
+               subject="person", speaker="interviewer", score=0.7,
                ladder=[_rung("balanced", 1000, 4000, "what made you start this", 0.7)],
-               affordances=["speech", "reaction"], flags=["offscreen"],
+               flags=["offscreen"],
                people=[{"voice_speaker_id": "S9", "person_id": None, "on_camera": False}])
     tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
     line = fm._moment_line(tree["moments"][0])
-    assert "speech+reaction" in line, line
+    assert "said.person" in line, line
     assert "interviewer off-cam" in line, line
-    print("ok  test_moment_line_shows_multi_affordance_and_offcam")
+    print("ok  test_moment_line_flags_offcamera")
 
 
 def test_moment_line_shows_channel_subject_v2():
-    """cuts-v2: the resident line keys on CHANNEL.SUBJECT, not the affordance."""
-    cut = _cut("f:v0", 1000, 4000, "kicks the ball", modality="done",
+    """cuts-v2: the resident line keys on CHANNEL.SUBJECT."""
+    cut = _cut("f:v0", 1000, 4000, "kicks the ball", channel="done", subject="person",
                speaker="p1", score=0.6,
-               ladder=[_rung("balanced", 1000, 4000, "kicks the ball", 0.6)],
-               channel="done", subject="person", affordances=["done"])
+               ladder=[_rung("balanced", 1000, 4000, "kicks the ball", 0.6)])
     tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
     m = tree["moments"][0]
     assert m["channel"] == "done" and m["subject"] == "person"
@@ -172,11 +170,11 @@ def _cluster_cuts():
     def lad(level, a, b, s):
         return [_rung(level, a, b, "", s)]
     return [
-        _cut("f:c0", 0, 1000, "the line", modality="speech", score=0.5,
+        _cut("f:c0", 0, 1000, "the line", channel="said", subject="person", score=0.5,
              moment_id="cl1", ladder=lad("balanced", 0, 1000, 0.5)),
-        _cut("f:c1", 2000, 3000, "the reaction", modality="reaction", score=0.9,
+        _cut("f:c1", 2000, 3000, "the reaction", channel="done", subject="person", score=0.9,
              moment_id="cl1", ladder=lad("balanced", 2000, 3000, 0.9)),
-        _cut("f:c2", 4000, 5000, "the b-roll", modality="broll", score=0.6,
+        _cut("f:c2", 4000, 5000, "the b-roll", channel="shown", subject="place", score=0.6,
              moment_id="cl1", ladder=lad("balanced", 4000, 5000, 0.6)),
     ]
 
@@ -192,7 +190,7 @@ def test_cluster_ladder_whole_run_to_peak():
     # All three cuts are members; peak = the highest-scoring (the reaction = m01).
     assert c["members"] == ["ffffffff:m00", "ffffffff:m01", "ffffffff:m02"], c["members"]
     assert c["peak"] == "ffffffff:m01", c["peak"]
-    assert set(c["affordances"]) == {"speech", "reaction", "broll"}, c["affordances"]
+    assert set(c["channels"]) == {"said", "done", "shown"}, c["channels"]
     lad = c["ladder"]
     # Broad = whole run; Sharp = peak alone; inclusion is monotonic non-increasing.
     assert lad["broad"] == ["ffffffff:m00", "ffffffff:m01", "ffffffff:m02"], lad["broad"]
@@ -260,7 +258,8 @@ def test_default_energy_from_genre():
 
 def main():
     test_thought_levels_become_variants()
-    test_moment_line_shows_multi_affordance_and_offcam()
+    test_moment_line_flags_offcamera()
+    test_moment_line_shows_channel_subject_v2()
     test_split_rung_becomes_keep_spans()
     test_no_ladder_uses_flat_span()
     test_facets_surface_on_moment()

@@ -2,8 +2,7 @@
 Inspect the actual hero cuts produced for the files in a folder, file by file.
 
 Reuses the production path (compute_file_cache) so what prints is exactly what
-the feed would serve, plus the raw anchors so we can see WHERE each cut came
-from (which anchor source minted it).
+the feed would serve -- the per-clip channel atoms turned into hero cuts.
 
 Usage:
     .venv/bin/python scripts/inspect_cuts.py --folder "Reel trail"
@@ -25,8 +24,8 @@ if BACKEND not in sys.path:
 import psycopg  # noqa: E402
 
 from app.config import get_settings  # noqa: E402
+from app.services.l3 import atoms as atoms_mod  # noqa: E402
 from app.services.l3 import hero_cuts as hc  # noqa: E402
-from app.services.l3 import anchors as anc  # noqa: E402
 from app.services.l3 import score_span as ss  # noqa: E402
 
 
@@ -64,15 +63,16 @@ def inspect_file(fid: str, name: str, dur_s: float, energy: float) -> None:
         print("  (no stored artifacts)")
         return
 
-    # Raw anchors -- the source signals before the beat engine.
-    anchors = anc.gather_anchors(
-        duration_ms=clip.duration_ms, dialogue=clip.dialogue,
-        perception=clip.perception, motion=clip.motion, audio=clip.audio)
-    by_aff = Counter(a.affordance for a in anchors)
-    by_kind = Counter(a.kind for a in anchors)
-    print(f"\n  ANCHORS ({len(anchors)}): "
-          + ", ".join(f"{k}={v}" for k, v in sorted(by_aff.items())))
-    print("    kinds: " + ", ".join(f"{k}={v}" for k, v in sorted(by_kind.items())))
+    # Raw atoms -- the channel substrate before the energy combiner.
+    if clip.cast is None:
+        from app.services.l3 import cast as cst
+        clip.cast = cst.build_cast(clip.perception, source.words if (source := ss.load_sources([fid]).get(fid)) else [])
+    atoms = atoms_mod.build_atoms(clip)
+    by_ch = Counter(a.channel for a in atoms)
+    by_sub = Counter((a.subject or "-") for a in atoms)
+    print(f"\n  ATOMS ({len(atoms)}): "
+          + ", ".join(f"{k}={v}" for k, v in sorted(by_ch.items())))
+    print("    subjects: " + ", ".join(f"{k}={v}" for k, v in sorted(by_sub.items())))
 
     # Produced cuts via the real per-file path.
     params = hc.energy_to_params(energy)

@@ -46,13 +46,11 @@ from difflib import SequenceMatcher
 
 from app.config import get_settings
 from app.services.l1 import fused_seams as fseams
-from app.services.l3 import anchors as anc
 from app.services.l3 import atoms as atoms_mod
 from app.services.l3 import cast as cst
 from app.services.l3 import combine as cmb
 from app.services.l3 import vocab
 from app.services.l3 import score_span as ss
-from app.services.l3 import territory as terr
 from app.services.l3.energy import EnergyParams, energy_to_params
 from app.services.l3.takes import build_take_groups, normalize_key
 
@@ -105,7 +103,10 @@ _MERGE_LEN_RATIO = 0.7
 # energy combiner (l3.combine); capture-MOMENTS are derived cross-channel. The
 # VLM detects atoms only -- no roles/relations/affordance buckets. Heard built
 # but suppressed.
-PARAMS_VERSION = 13
+# v14: the v1 affordance engines + anchors/territory are deleted; cuts carry
+# ONLY channel + subject (no modality/affordances/primitive). Video handles are
+# span-PROPORTIONAL (not fixed ms) and SHOWN may split at its peak (Sharp).
+PARAMS_VERSION = 14
 
 # The five canonical product energy LEVELS = the band centers (Broad .. Sharp).
 # Hero cuts are precomputed at exactly these after L2; any requested energy
@@ -144,22 +145,6 @@ EDGE_TRIM_TOL_MS = 150
 COMBINE_GAP_MS = 1_500
 # Hidden-by-default flags inherited from the dialogue lens.
 _OFFCAMERA_FLAGS = ("offscreen", "production_cue")
-
-# Primary content (speech/action) ranks above silent cutaways by default, so the
-# top of the feed is the substance; cutaways stay one filter-click away. A pure
-# rank nudge -- it never hides anything.
-_AFFORDANCE_WEIGHT = {
-    anc.AFF_SPEECH: 1.00,
-    anc.AFF_ACTION: 1.00,
-    anc.AFF_REACTION: 0.88,   # reactions are first-class story beats, not filler
-    anc.AFF_BROLL: 0.72,
-    anc.AFF_INSERT: 0.70,
-}
-
-# A beat segment needs at least this salience to be worth surfacing as a card
-# (everything is still reachable in raw via the timeline; this just declutters).
-_MIN_BEAT_SALIENCE = 0.15
-
 
 @dataclass
 class HeroTake:
@@ -239,14 +224,19 @@ class Rung:
 class HeroCut:
     hero_id: str
     file_id: str
-    modality: str                 # the DOMINANT affordance (speech|action|reaction|broll|insert)
+    # cuts-v2 substrate: the CAPTURE CHANNEL this cut delivers on (said|done|
+    # shown). The single source of truth for what the cut IS; the frontend tabs
+    # and the brain index key off it.
+    channel: str
     label: str                    # human-facing text / description
     src_in_ms: int
     src_out_ms: int
     score: float                  # 0..1 rank key
     speaker: Optional[str] = None
     flags: List[str] = field(default_factory=list)
-    affordances: List[str] = field(default_factory=list)  # all editorial uses (filter keys)
+    # `modality` mirrors `channel` -- kept as a back-compat alias for callers that
+    # still read it; always equal to `channel`.
+    modality: str = ""
     take_count: int = 1           # how many comparable takes exist (incl. this)
     alt_takes: List[HeroTake] = field(default_factory=list)  # the losers, best-first
     # Internal jump-cut edit-list: the spoken runs to KEEP after progressive
@@ -255,9 +245,8 @@ class HeroCut:
     # are the excised breaths.
     keep_spans: Optional[List[Tuple[int, int]]] = None
     # --- Facets (the rich cut record; brain-facing, additive -- the UI ignores
-    # what it doesn't read). Populated by the per-modality builders; empty here.
-    # The cut's intrinsic zoom ladder (broad..sharp of ITS OWN content). The
-    # flat src_in/out_ms above is the rung selected for the requested energy.
+    # what it doesn't read). The cut's intrinsic zoom ladder (broad..sharp of ITS
+    # OWN content); the flat src_in/out_ms is the rung selected for the energy.
     ladder: List[Rung] = field(default_factory=list)
     # Who is in this cut: [{voice_speaker_id, person_id, role, on_camera, region,
     # av_link_confidence}] from the cast map. Never empty for resolved speech.
@@ -266,46 +255,27 @@ class HeroCut:
     framing: Optional[dict] = None
     # Quality facet: {delivery, vlm, ...} -- deterministic + subjective scores.
     quality: Optional[dict] = None
-    # Typed relation edges that touch this cut, mapped from the VLM relation
-    # graph onto the built cuts. Each is {type, dir: 'out'|'in', other: hero_id,
-    # note} where `type` is a vocab relation. The cut stays a first-class card on
-    # its own tab; this is just how it CONNECTS to other cuts (a reaction
-    # responds_to a line, b-roll illustrates a topic). Flat model -- nothing is
-    # folded or dropped.
-    relations: List[dict] = field(default_factory=list)
     # The connected-cluster this cut belongs to, when it is linked to other cuts
-    # by a moment-forming relation. None for a standalone cut. The "Moments" view
-    # is just the set of clusters -- a moment is a BUNDLE of first-class cuts, not
-    # a separate entity. A podcast (mostly independent lines) yields few moments;
-    # a reel (reaction <- line <- b-roll chains) yields rich ones.
+    # by a cross-channel capture-moment. None for a standalone cut. The "Moments"
+    # view is just the set of clusters -- a moment is a BUNDLE of first-class
+    # cuts, not a separate entity.
     moment_id: Optional[str] = None
-    # Narrative intent of this cut (vocab role: hook/answer/cta/establishing/
-    # climax/listener), read from the VLM's per-beat role or synthesized for a
-    # held listening shot. None for ordinary middle content. The brain uses it to
-    # build structure (open on the hook, land on the answer), not just adjacency.
-    role: Optional[str] = None
-    # For an information-dense graphic / insert cut, the gist of what it CONVEYS
-    # (from the VLM's `summary`, not OCR) -- e.g. "revenue up 40% in Q3". None for
-    # ordinary footage. Lets the brain place a graphic by its meaning + reason
-    # about a claim it backs, without re-reading the frame.
+    # For an information-dense graphic, the gist of what it CONVEYS (from the
+    # VLM's `summary`, not OCR) -- e.g. "revenue up 40% in Q3". None for ordinary
+    # footage. Lets the brain place a graphic by meaning without re-reading it.
     summary: Optional[str] = None
-    # The VLM-stated capture primitive for this cut, when known (person/place/
-    # object/graphic/...). Overrides the coarse affordance derivation, so a screen
-    # UI logged as b-roll is honestly a `graphic`, a face is a `person`, etc.
-    primitive: Optional[str] = None
-    # v2 substrate (cuts-v2): the CAPTURE CHANNEL this cut delivers on
-    # (said|done|shown|heard) and the orthogonal SUBJECT tag (person|place|
-    # object|graphic). The frontend tabs + brain index key off `channel`; for v1
-    # cuts these are None and derived on read from the affordance/primitive.
-    channel: Optional[str] = None
+    # The orthogonal SUBJECT tag riding on the channel (person|place|object|
+    # graphic) -- WHAT the channel is about.
     subject: Optional[str] = None
 
+    def __post_init__(self):
+        # `modality` is a strict alias of `channel`.
+        self.modality = self.channel
+
     def channel_of(self) -> str:
-        """The capture channel for this cut, v2-native when set, else bridged
-        from the v1 affordance/modality so legacy cuts still tab correctly."""
-        if self.channel:
-            return self.channel
-        return vocab.channel_for_affordance(self.modality)
+        """The capture channel this cut delivers on (said|done|shown). Always set
+        by the builders; `modality` mirrors it for back-compat."""
+        return self.channel or self.modality
 
     def is_moment(self) -> bool:
         """True when this cut is part of a multi-cut moment cluster (it has a
@@ -319,20 +289,20 @@ class HeroCut:
             return self.src_out_ms - self.src_in_ms
         return sum(max(0, b - a) for a, b in self.keep_spans)
 
-    def primitives(self) -> List[str]:
-        """The capture primitive(s) this cut delivers (person/action/place/
-        object/graphic/speech) -- the intrinsic 'what was captured' substrate.
-        Prefer the VLM's stated primitive (honest: a screen UI stays a graphic);
-        fall back to deriving it from the affordance when the VLM didn't state one."""
-        if self.primitive:
-            return [self.primitive]
-        return vocab.primitives_for(self.affordances or [self.modality])
+    def subjects(self) -> List[str]:
+        """The orthogonal SUBJECT tag(s) on this cut's channel (person|place|
+        object|graphic) -- WHAT the channel is about. Empty when unknown."""
+        return [self.subject] if self.subject else []
 
     def to_dict(self) -> Dict[str, Any]:
+        channel = self.channel_of()
         return {
             "hero_id": self.hero_id,
             "file_id": self.file_id,
-            "modality": self.modality,
+            # cuts-v2 substrate: the CAPTURE CHANNEL (said|done|shown) + the
+            # orthogonal SUBJECT tag (person|place|object|graphic).
+            "channel": channel,
+            "subject": self.subject,
             "label": self.label,
             "src_in_ms": self.src_in_ms,
             "src_out_ms": self.src_out_ms,
@@ -343,9 +313,6 @@ class HeroCut:
             "score": round(self.score, 3),
             "speaker": self.speaker,
             "flags": self.flags,
-            "affordances": self.affordances or [self.modality],
-            # Intrinsic capture substrate beneath the editor-facing affordances.
-            "primitives": self.primitives(),
             "take_count": self.take_count,
             "alt_takes": [t.to_dict() for t in self.alt_takes],
             # Facets (additive; UI-safe). Only emitted when populated so the
@@ -354,13 +321,8 @@ class HeroCut:
             "people": self.people or None,
             "framing": self.framing,
             "quality": self.quality,
-            "relations": self.relations or None,
             "moment_id": self.moment_id,
-            "role": self.role,
             "summary": self.summary,
-            "primitive": self.primitive,
-            "channel": self.channel_of(),
-            "subject": self.subject,
             "is_moment": self.is_moment(),
         }
 
@@ -374,11 +336,11 @@ class HeroCut:
         ks = d.get("keep_spans")
         keep = [(int(s["in_ms"]), int(s["out_ms"])) for s in ks] if ks else None
         return cls(
-            hero_id=d["hero_id"], file_id=d["file_id"], modality=d["modality"],
+            hero_id=d["hero_id"], file_id=d["file_id"],
+            channel=d.get("channel") or d.get("modality") or "",
             label=d.get("label", ""), src_in_ms=int(d["src_in_ms"]),
             src_out_ms=int(d["src_out_ms"]), score=float(d.get("score", 0.0)),
             speaker=d.get("speaker"), flags=list(d.get("flags") or []),
-            affordances=list(d.get("affordances") or []),
             take_count=int(d.get("take_count", 1)),
             alt_takes=[HeroTake.from_dict(t) for t in (d.get("alt_takes") or [])],
             keep_spans=keep,
@@ -386,12 +348,8 @@ class HeroCut:
             people=list(d.get("people") or []),
             framing=d.get("framing"),
             quality=d.get("quality"),
-            relations=list(d.get("relations") or []),
             moment_id=d.get("moment_id"),
-            role=d.get("role"),
             summary=d.get("summary"),
-            primitive=d.get("primitive"),
-            channel=d.get("channel"),
             subject=d.get("subject"),
         )
 
@@ -1063,20 +1021,18 @@ def _make_speech_hero(
     return HeroCut(
         hero_id=f"{clip.file_id[:8]}:{uid}",
         file_id=clip.file_id,
-        modality=anc.AFF_SPEECH,
+        channel=vocab.CHANNEL_SAID,
         label=text.strip(),
         src_in_ms=in_ms,
         src_out_ms=out_ms,
         score=_speech_score(metrics, vlm),
         speaker=display_speaker,
         flags=extra_flags,
-        affordances=[anc.AFF_SPEECH],
         keep_spans=keep_spans,
         ladder=ladder or [],
         people=people,
         framing=_framing_facet(clip, in_ms, out_ms, region),
         quality=_speech_quality(metrics, vlm, on_cam),
-        channel=vocab.CHANNEL_SAID,
         subject=vocab.SUBJECT_PERSON,
     )
 
@@ -1177,258 +1133,25 @@ def _reconcile_selected_rung(
             return
 
 
-def _merge_gap_for_aff(params: EnergyParams, aff: str) -> int:
-    if aff == anc.AFF_ACTION:
-        return params.action_merge_gap_ms
-    if aff == anc.AFF_REACTION:
-        return params.reaction_merge_gap_ms
-    if aff == anc.AFF_BROLL:
-        return params.broll_merge_gap_ms
-    if aff == anc.AFF_INSERT:
-        return 0
-    return 0
-
-
-def _motion_onset_ms(motion: Optional[dict], unit_in: int, unit_out: int) -> int:
-    """First hop inside the unit where action energy rises above a local baseline."""
-    if not motion:
-        return unit_in
-    hop = max(1, int(motion.get("hop_ms", 100)))
-    energy = motion.get("action_energy") or []
-    if not energy:
-        return unit_in
-    i0 = max(0, unit_in // hop)
-    i1 = min(len(energy) - 1, unit_out // hop)
-    if i0 > i1:
-        return unit_in
-    seg = [energy[i] for i in range(i0, i1 + 1)]
-    lo = sorted(seg)[max(0, len(seg) // 4)]
-    hi = max(seg)
-    if hi - lo < 0.05:
-        return unit_in
-    thresh = lo + 0.4 * (hi - lo)
-    for i in range(i0, i1 + 1):
-        if energy[i] >= thresh:
-            return max(unit_in, i * hop)
-    return unit_in
-
-
-def _action_core(anchor: anc.Anchor, motion: Optional[dict], mode: str) -> Tuple[int, int]:
-    """Editorial core for an action/performance beat before snapping."""
-    unit_in, unit_out = anchor.start_ms, anchor.end_ms
-    impact = anchor.ts_ms
-    if mode == "unit":
-        return unit_in, unit_out
-    onset = _motion_onset_ms(motion, unit_in, unit_out)
-    if mode == "onset":
-        return onset, unit_out
-    # impact: mandatory region is contact through settle (preamble is droppable)
-    return min(max(onset, impact), unit_out), unit_out
-
-
 def _snap_segment(
     field: Optional[fseams.FusedField], core_in: int, core_out: int,
-    params: EnergyParams, clip: _ClipInputs, aff: str,
+    params: EnergyParams, clip: _ClipInputs, channel: str,
 ) -> Tuple[int, int]:
     if field is not None:
         in_ms, out_ms = fseams.snap_around_core(
             field, core_in, core_out,
             win_ms=params.snap_window_ms, duration_ms=clip.duration_ms)
-        # Symmetric breathing room for EVERY affordance below the Balanced pivot
-        # (pad is 0 at Balanced+, so this only adds air at Broad/Calm). For action
-        # the pad is veto-bounded, so it can only fill calm footage around the
-        # beat -- it stops dead at the next motion impact / camera move.
+        # Symmetric breathing room for EVERY channel below the Balanced pivot
+        # (pad is 0 at Balanced+, so this only adds air at Broad/Calm). The pad is
+        # veto-bounded, so it can only fill calm footage around the beat -- it
+        # stops dead at the next motion impact / camera move / spoken word.
         in_ms = _pad_safe(field, in_ms, params.pad_in_ms, -1, clip.duration_ms)
         out_ms = _pad_safe(field, out_ms, params.pad_out_ms, +1, clip.duration_ms)
         return in_ms, out_ms
-    if clip.motion and aff == anc.AFF_ACTION:
+    if clip.motion and channel == vocab.CHANNEL_DONE:
         return _snap_action_bounds(clip.motion, core_in, core_out,
                                    clip.duration_ms, params.energy)
     return core_in, core_out
-
-
-def _collapse_insert_anchors(items: List[anc.Anchor], gap_ms: int) -> List[anc.Anchor]:
-    """Merge repeated graphic/on-screen labels into one anchor (Broad/Calm)."""
-    if not items:
-        return items
-    out: List[anc.Anchor] = []
-    for a in sorted(items, key=lambda x: x.start_ms):
-        key = (a.text or a.kind or "").strip().lower()
-        if out and key and key == (out[-1].text or out[-1].kind or "").strip().lower():
-            prev = out[-1]
-            if a.start_ms - prev.end_ms <= gap_ms:
-                out[-1] = anc.Anchor(
-                    ts_ms=prev.ts_ms, start_ms=prev.start_ms, end_ms=max(prev.end_ms, a.end_ms),
-                    kind=prev.kind, affordance=prev.affordance,
-                    salience=max(prev.salience, a.salience), actor=prev.actor or a.actor,
-                    text=prev.text, summary=prev.summary or a.summary,
-                    primitive=prev.primitive or a.primitive,
-                    source_id=prev.source_id,
-                )
-                continue
-        out.append(a)
-    return out
-
-
-def _prep_overlay_group(
-    group: List[anc.Anchor], aff: str, params: EnergyParams,
-    speaking: List[dict],
-) -> List[anc.Anchor]:
-    """Filter + collapse overlay anchors for this energy band."""
-    kept: List[anc.Anchor] = []
-    for a in group:
-        if a.kind == "audio_event":
-            if a.salience < params.audio_min_salience:
-                continue
-        elif aff == anc.AFF_REACTION:
-            dur = a.end_ms - a.start_ms
-            if dur < params.reaction_min_duration_ms:
-                continue
-            if a.salience < params.reaction_min_warrant:
-                continue
-        elif aff == anc.AFF_BROLL:
-            if a.salience < params.broll_min_salience:
-                continue
-            if params.broll_prefer_low_speech:
-                occ = terr.speech_occupation(a.start_ms, a.end_ms, speaking)
-                if occ >= 0.5 and a.salience < 0.65:
-                    continue
-        elif aff == anc.AFF_INSERT:
-            if a.salience < params.insert_min_salience:
-                continue
-        kept.append(a)
-    if aff == anc.AFF_INSERT and params.insert_collapse_graphics:
-        kept = _collapse_insert_anchors(kept, gap_ms=30_000)
-    return kept
-
-
-# Sharp-band split: editorial hinge at impact; fused field snaps outer edges only.
-_ACTION_SPLIT_MIN_WINDUP_MS = 150
-_ACTION_SPLIT_MAX_WINDUP_MS = 400
-
-
-def _action_min_windup_ms(unit_len_ms: int) -> int:
-    """Scale windup floor with beat length (short actions need less runway)."""
-    if unit_len_ms <= 0:
-        return _ACTION_SPLIT_MIN_WINDUP_MS
-    scaled = unit_len_ms // 5
-    return max(_ACTION_SPLIT_MIN_WINDUP_MS, min(_ACTION_SPLIT_MAX_WINDUP_MS, scaled))
-
-
-def _action_pieces(
-    anchor: anc.Anchor, motion: Optional[dict], params: EnergyParams,
-    field: Optional[fseams.FusedField], clip: _ClipInputs,
-) -> List[Tuple[int, int, str]]:
-    """One or two (core_in, core_out, label_suffix) per action anchor."""
-    # A performance (song/dance/bit) keeps its full duration -- never trimmed.
-    if anchor.kind == "performance":
-        return [(anchor.start_ms, anchor.end_ms, "")]
-    impact = anchor.ts_ms
-    core = params.action_core_ms
-    if params.action_split_at_impact:
-        onset = _motion_onset_ms(motion, anchor.start_ms, anchor.end_ms)
-        min_windup = _action_min_windup_ms(anchor.end_ms - anchor.start_ms)
-        if impact >= onset + min_windup and onset < impact < anchor.end_ms:
-            # Payoff is impact-forward and core-capped; windup stays the run-up.
-            pin, pout = _core_inset(impact, anchor.end_ms, impact, core, lead_frac=_ACTION_LEAD)
-            return [
-                (onset, impact, " · windup"),
-                (pin, pout, " · payoff"),
-            ]
-    cin, cout = _action_core(anchor, motion, params.action_anchor_mode)
-    # Negative padding: impact-forward core cap (Broad/Calm core None = full).
-    cin, cout = _core_inset(cin, cout, impact, core, lead_frac=_ACTION_LEAD)
-    return [(cin, cout, "")]
-
-
-def _action_segments(
-    group: List[anc.Anchor], clip: _ClipInputs, field: Optional[fseams.FusedField],
-    params: EnergyParams, quality_events: List[dict],
-) -> List[HeroCut]:
-    out: List[HeroCut] = []
-    motion = clip.motion
-    for ci, members in enumerate(_cluster_anchors(group, params.action_merge_gap_ms)):
-        if params.action_merge_gap_ms > 0 and len(members) > 1:
-            # Broad/Calm: one card for merged beats
-            anchor = max(members, key=lambda m: m.salience)
-            cin, cout = min(m.start_ms for m in members), max(m.end_ms for m in members)
-            pieces = [(cin, cout, "")]
-            label_base = (anchor.text or "action").strip()
-            ladder_base = [Rung("broad", [(cin, cout)], text=label_base,
-                                score=float(anchor.salience))]
-        else:
-            anchor = members[0]
-            pieces = _action_pieces(anchor, motion, params, field, clip)
-            label_base = (anchor.text or "action").strip()
-            ladder_base = _beat_ladder(anchor, motion, anc.AFF_ACTION)
-        for pi, (cin, cout, suffix) in enumerate(pieces):
-            if cout <= cin:
-                continue
-            in_ms, out_ms = _snap_segment(field, cin, cout, params, clip, anc.AFF_ACTION)
-            vlm = _vlm_quality_score(quality_events, cin, cout)
-            score = _beat_score([anchor], vlm, territory_mult=1.0)
-            if score < _MIN_BEAT_SALIENCE:
-                continue
-            label = (label_base + suffix)[:200]
-            ladder = _copy_ladder(ladder_base)
-            _reconcile_selected_rung(ladder, params.band, in_ms, out_ms, None, label)
-            out.append(HeroCut(
-                hero_id=f"{clip.file_id[:8]}:act{ci}{pi}",
-                file_id=clip.file_id,
-                modality=anc.AFF_ACTION,
-                label=label,
-                src_in_ms=in_ms,
-                src_out_ms=out_ms,
-                speaker=anchor.actor,
-                affordances=[anc.AFF_ACTION],
-                score=score,
-                ladder=ladder,
-                people=_beat_people(anchor),
-                framing=_framing_facet(clip, in_ms, out_ms, anchor.region),
-                primitive=anchor.primitive,
-            ))
-    return out
-
-
-def _cluster_anchors(anchors: List[anc.Anchor], gap_ms: int) -> List[List[anc.Anchor]]:
-    """Cluster same-affordance, same-actor anchors whose inter-gap is shorter
-    than ``gap_ms`` -- the SAME granularity machine as speech, generalized to any
-    anchor. Low energy merges adjacent beats into one moment; ``gap_ms == 0``
-    keeps every beat separate."""
-    items = sorted(anchors, key=lambda a: a.start_ms)
-    clusters: List[List[anc.Anchor]] = []
-    for a in items:
-        if clusters:
-            prev = clusters[-1][-1]
-            gap = a.start_ms - prev.end_ms
-            if a.actor == prev.actor and gap < gap_ms:
-                clusters[-1].append(a)
-                continue
-        clusters.append([a])
-    return clusters
-
-
-def _beat_score(
-    members: List[anc.Anchor], vlm: Optional[float], *, territory_mult: float = 1.0,
-) -> float:
-    """Rank for a non-speech segment, with optional territory demotion."""
-    base = max(m.salience for m in members)
-    if vlm is not None:
-        base = 0.7 * base + 0.3 * vlm
-    w = _AFFORDANCE_WEIGHT.get(members[0].affordance, 0.7)
-    return max(0.0, min(1.0, base * w * territory_mult))
-
-
-# How much of the negative-padding window sits BEFORE the peak (the rest is the
-# payoff / settle after it). The peak is rarely centered, so each affordance
-# anchors its core differently: an onset insert keeps only the tail, an action
-# stays impact-forward, a reaction keeps the apex + settle, a b-roll move keeps
-# the run-in to its arrival.
-_INSERT_LEAD = 0.0        # peak = onset -> keep the reveal + tail
-_ACTION_LEAD = 0.0        # peak = impact -> impact-forward, drop the windup
-_REACTION_LEAD = 0.3      # peak = apex -> keep mostly the apex + settle
-_BROLL_HOLD_LEAD = 0.5    # uniform hold -> symmetric is fine
-_BROLL_MOVE_LEAD = 0.8    # peak = arrival -> keep the run-in to it
 
 
 def _core_inset(core_in: int, core_out: int, peak: int,
@@ -1479,136 +1202,6 @@ def _framing_facet(clip: _ClipInputs, in_ms: int, out_ms: int,
     return f or None
 
 
-def _beat_people(anchor: anc.Anchor) -> List[dict]:
-    """The actor facet for a non-speech cut (the person performing the beat)."""
-    if not anchor.actor:
-        return []
-    p: dict = {"person_id": anchor.actor, "on_camera": True}
-    if anchor.region:
-        p["region"] = anchor.region
-    return [p]
-
-
-def _overlay_core(aff: str, params: EnergyParams,
-                  kind: Optional[str] = None) -> Tuple[Optional[int], float]:
-    """(target handle length, lead fraction) for an overlay affordance at a band."""
-    if aff == anc.AFF_BROLL:
-        return params.broll_core_ms, (_BROLL_MOVE_LEAD if kind == "move" else _BROLL_HOLD_LEAD)
-    if aff == anc.AFF_REACTION:
-        return params.reaction_core_ms, _REACTION_LEAD
-    if aff == anc.AFF_INSERT:
-        return params.insert_core_ms, _INSERT_LEAD
-    return None, 0.5
-
-
-def _beat_ladder(anchor: anc.Anchor, motion: Optional[dict], aff: str) -> List[Rung]:
-    """The intrinsic zoom ladder a non-speech beat OWNS: broad/calm keep the full
-    beat, balanced..sharp inset toward the peak (impact / apex / arrival / onset)
-    to the per-band handle length -- the same negative-padding the flat cut uses,
-    computed once per rung. Raw (pre-snap); the selected rung is reconciled to
-    the snapped flat span at emit time."""
-    rungs: List[Rung] = []
-    for band in range(len(BAND_ENERGIES)):
-        p = energy_to_params(band_energy(band))
-        if aff == anc.AFF_ACTION:
-            cin, cout = _action_core(anchor, motion, p.action_anchor_mode)
-            cin, cout = _core_inset(cin, cout, anchor.ts_ms, p.action_core_ms, lead_frac=_ACTION_LEAD)
-        else:
-            core_ms, lead = _overlay_core(aff, p, anchor.kind)
-            cin, cout = _core_inset(anchor.start_ms, anchor.end_ms, anchor.ts_ms,
-                                    core_ms, lead_frac=lead)
-        if cout <= cin:
-            cin, cout = anchor.start_ms, anchor.end_ms
-        rungs.append(Rung(_SPEECH_LEVELS[band], [(int(cin), int(cout))],
-                          text=(anchor.text or aff), score=float(anchor.salience)))
-    return rungs
-
-
-def _copy_ladder(rungs: List[Rung]) -> List[Rung]:
-    return [Rung(r.level, list(r.spans), r.text, r.score) for r in rungs]
-
-
-def _beat_segments(clip: _ClipInputs, field: Optional[fseams.FusedField],
-                   params: EnergyParams, anchors: List[anc.Anchor]) -> List[HeroCut]:
-    """NON-speech anchors as segments -- per-affordance energy semantics."""
-    if field is None and not clip.motion:
-        return []
-    perception = clip.perception or {}
-    speaking = perception.get("speaking") or []
-    quality_events = perception.get("take_quality_events") or []
-    out: List[HeroCut] = []
-    by_aff: Dict[str, List[anc.Anchor]] = {}
-    for a in anchors:
-        if a.affordance == anc.AFF_SPEECH:
-            continue
-        by_aff.setdefault(a.affordance, []).append(a)
-
-    for aff, raw in by_aff.items():
-        if aff == anc.AFF_ACTION:
-            group = raw
-            out.extend(_action_segments(group, clip, field, params, quality_events))
-            continue
-        group = _prep_overlay_group(raw, aff, params, speaking)
-        merge_gap = _merge_gap_for_aff(params, aff)
-        if aff == anc.AFF_INSERT:
-            merge_gap = 2000 if params.insert_collapse_graphics else 0
-        elif aff == anc.AFF_REACTION and any(m.kind == "audio_event" for m in group):
-            merge_gap = params.audio_merge_gap_ms
-        for ci, members in enumerate(_cluster_anchors(group, merge_gap)):
-            core_in = min(m.start_ms for m in members)
-            core_out = max(m.end_ms for m in members)
-            best = max(members, key=lambda m: m.salience)
-            if aff == anc.AFF_BROLL:
-                # Energy-aware handle: the VLM hands us the full end-to-end shot.
-                # A held composition is uniform (center is fine); a MOVE pays off
-                # at its arrival, so keep the run-in to the peak instead.
-                lead = _BROLL_MOVE_LEAD if best.kind == "move" else _BROLL_HOLD_LEAD
-                core_in, core_out = _core_inset(
-                    core_in, core_out, best.ts_ms, params.broll_core_ms, lead_frac=lead)
-            elif aff == anc.AFF_REACTION:
-                # Trim toward the apex (peak_ms when the VLM gives one, else the
-                # midpoint biased late) so we keep the apex + settle, not build-up.
-                core_in, core_out = _core_inset(
-                    core_in, core_out, best.ts_ms, params.reaction_core_ms,
-                    lead_frac=_REACTION_LEAD)
-            elif aff == anc.AFF_INSERT:
-                # Onset-anchored (peak = start) -> trims the TAIL from the reveal.
-                core_in, core_out = _core_inset(
-                    core_in, core_out, best.ts_ms, params.insert_core_ms,
-                    lead_frac=_INSERT_LEAD)
-            in_ms, out_ms = _snap_segment(field, core_in, core_out, params, clip, aff)
-            t_mult = terr.territory_multiplier(
-                best, speaking=speaking, strict=params.territory_strict)
-            vlm = _vlm_quality_score(quality_events, core_in, core_out)
-            score = _beat_score(members, vlm, territory_mult=t_mult)
-            if score < _MIN_BEAT_SALIENCE:
-                continue
-            label = (best.text or aff).strip()[:200]
-            if len(members) > 1:
-                ladder = [Rung("broad", [(in_ms, out_ms)], text=label, score=float(best.salience))]
-            else:
-                ladder = _beat_ladder(best, clip.motion, aff)
-                _reconcile_selected_rung(ladder, params.band, in_ms, out_ms, None, label)
-            out.append(HeroCut(
-                hero_id=f"{clip.file_id[:8]}:{aff[:3]}{ci}",
-                file_id=clip.file_id,
-                modality=aff,
-                label=label,
-                src_in_ms=in_ms,
-                src_out_ms=out_ms,
-                speaker=best.actor,
-                flags=list(best.flags or []),
-                affordances=[aff],
-                score=score,
-                ladder=ladder,
-                people=_beat_people(best),
-                framing=_framing_facet(clip, in_ms, out_ms, best.region),
-                summary=best.summary,
-                primitive=best.primitive,
-            ))
-    return out
-
-
 # --------------------------------------------------------------------------
 # Take stacking: collapse repeats into one hero, best in front
 # --------------------------------------------------------------------------
@@ -1651,8 +1244,8 @@ def _stack_takes(heroes: List[HeroCut], file_ids: List[str]) -> List[HeroCut]:
     line. Pure action/visual/reaction heroes carry no groupable text, so they pass
     through untouched (their `take_of` relations, if any, stay as edges).
     """
-    speech = [h for h in heroes if h.modality == "speech"]
-    others = [h for h in heroes if h.modality != "speech"]
+    speech = [h for h in heroes if h.channel == vocab.CHANNEL_SAID]
+    others = [h for h in heroes if h.channel != vocab.CHANNEL_SAID]
 
     groups = build_take_groups(file_ids)
     if not speech:
@@ -1766,19 +1359,19 @@ def _consolidate_speech(heroes: List[HeroCut]) -> List[HeroCut]:
 
 def build_hero_cuts(
     file_ids: List[str], energy: float = 0.5,
-    affordances: Optional[List[str]] = None,
+    channels: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """The ranked, universal segment feed for a set of clips.
+    """The ranked, universal cut feed for a set of clips.
 
-    Every editable moment -- speech, action, reaction, b-roll hold, insert -- is
-    one ``segment`` built over the ANCHOR layer (``l3.anchors``): cluster anchors
-    by the energy dial, then snap boundaries through the fused seam field *around
-    the core* so the words / impact / expression are never clipped.
+    Every editable moment is one cut on a single channel -- ``said`` (the spoken
+    thought-ladder), ``done`` / ``shown`` (the uniform video combiner) -- with
+    boundaries snapped through the fused seam field *around the core* so the
+    words / action / subject are never clipped.
 
     `energy` (0..1) is the single deterministic dial (granularity + tightness).
-    `affordances` is an optional FILTER over the one feed -- the way every edit
-    style (action reel, podcast A-roll, B-roll cutaways) is served without a
-    separate pipeline. Returns hero dicts sorted best-first.
+    `channels` is an optional FILTER over the one feed (said|done|shown) -- the
+    way every edit style (A-roll, action, b-roll) is served without a separate
+    pipeline. Returns hero dicts sorted best-first.
     """
     if not file_ids:
         return []
@@ -1790,7 +1383,7 @@ def build_hero_cuts(
     for fid, clip in inputs.items():
         heroes.extend(_file_heroes(clip, sources.get(fid), params))
 
-    return _assemble(heroes, file_ids, affordances)
+    return _assemble(heroes, file_ids, channels)
 
 
 def _file_heroes(
@@ -1824,15 +1417,15 @@ def _file_heroes(
 
 def _assemble(
     heroes: List[HeroCut], file_ids: List[str],
-    affordances: Optional[List[str]] = None,
+    channels: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Cross-file finishing pass over per-file heroes: stack repeated takes,
-    optional affordance filter, rank best-first. Cheap relative to
+    optional CHANNEL filter (said|done|shown), rank best-first. Cheap relative to
     ``_file_heroes`` -- this is the only work done on a cache hit."""
     heroes = _stack_takes(heroes, file_ids)
-    if affordances:
-        want = set(affordances)
-        heroes = [h for h in heroes if want & set(h.affordances or [h.modality])]
+    if channels:
+        want = set(channels)
+        heroes = [h for h in heroes if h.channel in want]
     heroes.sort(key=lambda h: h.score, reverse=True)
     return [h.to_dict() for h in heroes]
 
@@ -1851,7 +1444,7 @@ def compute_file_cache(file_id: str, energy: float) -> List[Dict[str, Any]]:
 
 def assemble_cached(
     cached_by_file: Dict[str, List[Dict[str, Any]]], file_ids: List[str],
-    affordances: Optional[List[str]] = None,
+    channels: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Rehydrate per-file cached cuts and run the cross-file finishing pass --
     the read path that avoids recomputing the per-file work."""
@@ -1859,4 +1452,4 @@ def assemble_cached(
     for fid in file_ids:
         for d in cached_by_file.get(fid, []) or []:
             heroes.append(HeroCut.from_cache(d))
-    return _assemble(heroes, file_ids, affordances)
+    return _assemble(heroes, file_ids, channels)

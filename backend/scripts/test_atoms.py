@@ -128,27 +128,6 @@ def test_build_atoms_from_vlm():
     print("ok  build_atoms from VLM atoms (gate+fold+said)")
 
 
-def test_build_atoms_v1_fallback():
-    """No `atoms` track -> derive from legacy content_units/cutaways so v2 runs
-    on the existing corpus before L2 is re-run."""
-    perception = {
-        "content_units": [
-            {"unit_id": "u0", "kind": "action", "primitive": "action",
-             "start_ms": 1000, "end_ms": 3000, "confidence": 0.7, "label": "kick"},
-        ],
-        "cutaways": [
-            {"id": "c0", "primitive": "place", "affordance": "broll",
-             "start_ms": 5000, "end_ms": 8000, "salience_hint": 0.6},
-        ],
-    }
-    atoms = build_atoms(_clip(perception=perception))
-    by_ch = {a.channel for a in atoms}
-    assert vocab.CHANNEL_DONE in by_ch and vocab.CHANNEL_SHOWN in by_ch
-    place = next(a for a in atoms if a.channel == vocab.CHANNEL_SHOWN)
-    assert place.subject == vocab.SUBJECT_PLACE
-    print("ok  build_atoms v1 fallback")
-
-
 def test_build_atoms_sorted_and_clamped():
     perception = {"atoms": [
         {"channel": "shown", "subject": "object", "start_ms": 50000,
