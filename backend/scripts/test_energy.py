@@ -94,17 +94,20 @@ def test_fuse_gap_ladder_widens_low_atomizes_high():
 def test_bands_and_video_cores():
     """Video channels (done|shown) share one uniform knob: a span-PROPORTIONAL
     negative-padding handle that is None (keep full) through Balanced and only
-    bites at Tight/Sharp, plus a peak split at Sharp."""
+    bites at Tight/Sharp, plus a windup|payoff split at Tight (Sharp is the
+    pure banger -- no split)."""
     broad = energy_to_params(0.0)
     calm = energy_to_params(0.3)
     balanced = energy_to_params(0.5)
     tight = energy_to_params(0.7)
     sharp = energy_to_params(1.0)
     assert broad.band == 0 and balanced.band == 2 and tight.band == 3
-    # Peak split only on the Sharp band.
-    assert sharp.split_at_peak is True
-    assert energy_to_params(0.8).split_at_peak is True
-    assert energy_to_params(0.79).split_at_peak is False
+    # Windup|payoff split lives on the TIGHT band only; Sharp is a pure banger.
+    assert tight.split_at_peak is True
+    assert sharp.split_at_peak is False
+    assert energy_to_params(0.6).split_at_peak is True       # Tight onset
+    assert energy_to_params(0.59).split_at_peak is False     # Balanced
+    assert energy_to_params(0.8).split_at_peak is False      # Sharp onset (banger)
     # Done/Shown handle fractions: full (None) through Balanced; Tight > Sharp > 0.
     for core in ("done_core_frac", "shown_core_frac"):
         assert getattr(broad, core) is None and getattr(calm, core) is None

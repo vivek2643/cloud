@@ -10,8 +10,9 @@ One algorithm for every video channel (no bespoke per-affordance engines):
     beat is its own punchy cut). "action+action fuses when continuous, not when
     it's just successive beats."
   * PEAK zoom: at Tight/Sharp the cut insets toward the atom's peak (the impact /
-    reveal) to the band's handle length, and a Done beat may SPLIT at its impact
-    (excise the field-safe lull -> windup|payoff jump-cut).
+    reveal) to the band's handle length. At Tight a beat may instead SPLIT at its
+    impact (excise the field-safe lull -> windup|payoff jump-cut) when that lands
+    tighter; Sharp never splits -- it is the pure, tightest banger.
   * Every boundary flows through the fused seam field (`hero_cuts._snap_segment`),
     so a cut can never land inside a spoken word / camera move / impact.
 
@@ -46,8 +47,8 @@ _SHOWN_LEAD = 0.5
 # Below this composite salience a video cut isn't worth surfacing.
 _MIN_VIDEO_SCORE = 0.18
 
-# Done split (Sharp): excise an interior motion lull only if both kept pieces and
-# the lull itself clear these floors -- otherwise the beat plays contiguously.
+# Windup|payoff split (Tight): excise an interior motion lull only if both kept
+# pieces and the lull itself clear these floors -- otherwise the beat is contiguous.
 _LULL_MIN_MS = 500
 _SPLIT_MIN_KEEP_MS = 300
 
@@ -154,21 +155,25 @@ def _video_span_at(level_params: EnergyParams, channel: str, core_in: int,
                    *, can_split: bool) -> Tuple[int, int, Optional[List[Tuple[int, int]]]]:
     """Zoom ONE beat at ONE band -> (in_ms, out_ms, keep_spans|None).
 
-    Sharp (split_at_peak) on a single-member beat may excise the field-safe
-    interior lull (windup|payoff jump-cut); otherwise the beat insets toward its
-    peak to the band's span-proportional handle (None below Tight = keep full).
-    Every edge flows through the fused seam field. This is the per-rung primitive
-    the ladder loop calls for each band, and the single-cut path reuses."""
+    The beat insets toward its peak to the band's span-proportional handle (None
+    below Tight = keep the full beat). At TIGHT (split_at_peak) a single-member
+    beat may instead play a windup|payoff jump-cut -- excise the field-safe dead
+    interior lull from the full beat, keeping both ends -- but only when that
+    lands TIGHTER than the plain inset (a genuinely big dead middle). So a rung is
+    never looser than its own inset, and Sharp (which never splits) stays the pure
+    banger: the ladder is monotonic broad..sharp. Every edge flows through the
+    fused seam field. This is the per-rung primitive the ladder loop calls."""
     from app.services.l3 import hero_cuts as hc
-    if level_params.split_at_peak and can_split:
-        split = _excise_lull(clip.motion, core_in, core_out, peak_ms)
-        if split:
-            ks = [hc._snap_segment(field, a, b, level_params, clip, channel) for a, b in split]
-            return ks[0][0], ks[-1][1], ks
     cin, cout = hc._core_inset(core_in, core_out, peak_ms,
                                _core_ms_for(channel, level_params, core_out - core_in),
                                lead_frac=lead)
     in_ms, out_ms = hc._snap_segment(field, cin, cout, level_params, clip, channel)
+    if level_params.split_at_peak and can_split:
+        split = _excise_lull(clip.motion, core_in, core_out, peak_ms)
+        if split:
+            ks = [hc._snap_segment(field, a, b, level_params, clip, channel) for a, b in split]
+            if sum(b - a for a, b in ks) < (out_ms - in_ms):   # jump-cut only if tighter
+                return ks[0][0], ks[-1][1], ks
     return in_ms, out_ms, None
 
 
@@ -194,8 +199,9 @@ def combine_video(atoms: List[Atom], params: EnergyParams, field, clip,
 
             # Build the OWNED broad..sharp ladder by zooming this SAME beat at each
             # band (mirrors the speech thought-ladder): Broad/Calm/Balanced keep
-            # the full beat, Tight/Sharp inset toward the peak, Sharp may split.
-            # The cut's identity (the fused beat) is fixed; only the zoom varies.
+            # the full beat, Tight/Sharp inset toward the peak, Tight may jump-cut
+            # (windup|payoff). The cut's identity (the fused beat) is fixed; only
+            # the zoom varies.
             ladder = []
             flat: Optional[Tuple[int, int, Optional[List[Tuple[int, int]]], float]] = None
             for band in _LADDER_BANDS:

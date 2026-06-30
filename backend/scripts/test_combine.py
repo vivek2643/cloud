@@ -66,21 +66,41 @@ def test_peak_inset_shrinks_toward_impact():
     print("ok  peak inset shrinks toward impact")
 
 
-def test_done_split_excises_lull_at_sharp():
-    """Sharp: a Done beat with a quiet interior lull splits into windup|payoff,
-    and the excised gap never contains the impact peak."""
+def test_done_split_excises_lull_at_tight():
+    """TIGHT: a Done beat with a big dead interior lull plays a windup|payoff
+    jump-cut -- keep both ends, excise the lull, never the impact peak. The split
+    is taken only because it lands TIGHTER than the plain inset (dominant lull)."""
     hop = 100
-    n = 80  # 8000ms
-    energy = [0.9] * 10 + [0.05] * 40 + [0.9] * 30   # lull 1000..5000ms
+    n = 100  # 10000ms
+    energy = [0.9] * 8 + [0.05] * 72 + [0.9] * 20    # lull 800..8000ms (dominant)
     motion = {"hop_ms": hop, "action_energy": energy, "action_points": []}
-    atoms = [_done(0, 8000, peak=6500)]                # peak in the loud payoff
-    cuts = cmb.combine_video(atoms, energy_to_params(0.95), None, _clip(motion=motion))
+    atoms = [_done(0, 10000, peak=9000)]               # peak in the loud payoff
+    cuts = cmb.combine_video(atoms, energy_to_params(0.7), None, _clip(motion=motion))
     c = next(c for c in cuts if c.channel == vocab.CHANNEL_DONE)
     assert c.keep_spans and len(c.keep_spans) == 2, c.keep_spans
     (a0, a1), (b0, b1) = c.keep_spans
-    assert a1 <= 6500 <= b1                              # peak survives in a kept span
+    assert a1 <= 9000 <= b1                              # peak survives in a kept span
     assert b0 - a1 >= cmb._LULL_MIN_MS                   # a real gap was excised
-    print("ok  Done split excises lull, keeps peak")
+    print("ok  Done split excises lull at Tight, keeps peak")
+
+
+def test_sharp_is_pure_banger_no_split():
+    """SHARP never splits -- it is the single tightest peak-inset banger, even on
+    a beat whose Tight rung jump-cuts. Sharp's play is the shortest of the ladder."""
+    hop = 100
+    energy = [0.9] * 8 + [0.05] * 72 + [0.9] * 20    # same dominant lull as above
+    motion = {"hop_ms": hop, "action_energy": energy, "action_points": []}
+    atoms = [_done(0, 10000, peak=9000)]
+    cuts = cmb.combine_video(atoms, energy_to_params(0.95), None, _clip(motion=motion))
+    c = next(c for c in cuts if c.channel == vocab.CHANNEL_DONE)
+    assert c.keep_spans is None                          # the flat (Sharp) span never split
+    sharp = next(r for r in c.ladder if r.level == "sharp")
+    tight = next(r for r in c.ladder if r.level == "tight")
+    assert sharp.keep_spans() is None                    # Sharp plays one contiguous banger
+    assert sharp.play_ms() <= tight.play_ms()            # banger is the tightest
+    plays = [r.play_ms() for r in c.ladder]
+    assert plays == sorted(plays, reverse=True), plays   # whole ladder monotonic
+    print("ok  Sharp is a pure banger (no split), ladder monotonic")
 
 
 # -- owned broad..sharp ladder (video cuts are shrinkable) --------------------

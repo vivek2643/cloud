@@ -77,7 +77,9 @@ logger = logging.getLogger(__name__)
 # expose all five variants (not a single flat span) for the brain to zoom.
 # v12: video core fractions retuned (Tight 0.4 / Sharp 0.15) -- a wider, sharper
 # proportional ladder, so Sharp variants land as bangers.
-TREE_VERSION = 12
+# v13: windup|payoff split moved to TIGHT (Sharp is a pure banger), so video
+# moments' Sharp variant is always the tightest rung (monotonic ladder).
+TREE_VERSION = 13
 
 # Band index -> energy-level name. Band 2 (energy 0.5) is the anchor: one
 # complete thought per cut. Lower = wider (whole answer), higher = tighter.

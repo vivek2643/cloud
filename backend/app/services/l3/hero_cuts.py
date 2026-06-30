@@ -111,7 +111,10 @@ _MERGE_LEN_RATIO = 0.7
 # v16: video core fractions retuned for a wider proportional range -- Tight/Sharp
 # inset harder (0.4 / 0.15) so Sharp lands as a true banger; Broad..Balanced stay
 # full (the roomy, most-used middle). Still pure fractions, no absolute caps.
-PARAMS_VERSION = 16
+# v17: windup|payoff split moved to the TIGHT band (and used only when it lands
+# tighter than the inset); SHARP is now a pure peak-inset banger that never
+# splits -- so the broad..sharp ladder is monotonic for video cuts too.
+PARAMS_VERSION = 17
 
 # The five canonical product energy LEVELS = the band centers (Broad .. Sharp).
 # Hero cuts are precomputed at exactly these after L2; any requested energy

@@ -104,11 +104,11 @@ class EnergyParams:
     fuse_gap_ms: int                # relatedness reach: Broad fuses wide, Sharp = 0 (atomize)
     # video cuts (done | shown): negative-padding handle as a fraction of the
     # beat's own span (None below Tight = keep full), and whether a beat may
-    # SPLIT windup|payoff at its peak (Sharp band only).
+    # SPLIT windup|payoff at its peak (TIGHT band only -- Sharp is the pure banger).
     done_core_frac: Optional[float]
     shown_core_frac: Optional[float]
     core_floor_ms: int
-    split_at_peak: bool             # Sharp band (energy >= 0.8): windup|payoff at the peak
+    split_at_peak: bool             # Tight band [0.6, 0.8): windup|payoff jump-cut
 
 
 # Genre -> default energy CENTER (the slider's starting point, not a cap; the
@@ -203,5 +203,9 @@ def energy_to_params(energy: float) -> EnergyParams:
         done_core_frac=_DONE_CORE_FRAC[band],
         shown_core_frac=_SHOWN_CORE_FRAC[band],
         core_floor_ms=CORE_FLOOR_MS,
-        split_at_peak=e >= BAND_EDGES[3],
+        # The windup|payoff split lives at TIGHT (band 3): the 0.4 handle leaves
+        # room for a run-in + payoff with the dead lull excised. SHARP (band 4) is
+        # a pure peak-inset banger -- never splits -- so the ladder stays monotonic
+        # (Sharp is always tighter than Tight).
+        split_at_peak=BAND_EDGES[2] <= e < BAND_EDGES[3],
     )
