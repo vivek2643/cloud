@@ -83,7 +83,20 @@ logger = logging.getLogger(__name__)
 # `clusters` / per-cut `cluster_id`, and the resident line drops the "· moment:X"
 # tag. Grouping is the brain's job (it reads same-clip overlapping timestamps),
 # and adjacent same-clip cuts weld at compile time.
-TREE_VERSION = 14
+# v15: CONTINUITY RUNS -- moments that are back-to-back in source time (one
+# uninterrupted stretch of the clip atomized into beats) carry a shared clip-
+# local `run_id`. PURELY TEMPORAL + CHANNEL-AGNOSTIC (same clip + adjacent time,
+# exactly like the compile-time weld); the cut's category never enters it. The
+# resident line shows "· run:rN" so the brain sees continuous footage at DECISION
+# time and doesn't fragment it by accident -- a hint, not a rule (it stays free
+# to break/intercut a run on purpose).
+TREE_VERSION = 15
+
+# Two moments are one continuous source run when the next starts within this gap
+# of where the previous ended (back-to-back in the original footage). Loose
+# enough to bridge the small breath between consecutive beats; tight enough that
+# genuinely separate beats (a real gap) stay apart.
+_RUN_GAP_MS = 500
 
 # Band index -> energy-level name. Band 2 (energy 0.5) is the anchor: one
 # complete thought per cut. Lower = wider (whole answer), higher = tighter.
@@ -155,6 +168,47 @@ def _flat_variant(cut: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _assign_runs(moments: List[Dict[str, Any]]) -> None:
+    """Tag CONTINUOUS SOURCE RUNS in place.
+
+    A run is a maximal chain of moments that are back-to-back in source time --
+    each starts within ``_RUN_GAP_MS`` of where the previous one ended (or
+    overlaps it) -- i.e. one uninterrupted stretch of the original clip that got
+    atomized into several beats. This is a PURELY TEMPORAL fact about the source
+    (same clip + adjacent time); it is deliberately CHANNEL-AGNOSTIC -- said,
+    done and shown are weighed equally, exactly like the compile-time weld. The
+    cut's category never enters the decision.
+
+    Members of a run (>=2) get a shared clip-local ``run_id`` ("r0", "r1", ...)
+    plus their position, so the brain reads them as one continuous stretch at
+    DECISION time (the raw timestamps alone weren't salient enough) and doesn't
+    fragment continuous footage by accident. It stays free to break a run on
+    purpose. Lone moments get no tag.
+
+    ``moments`` must be in source (in_ms) order."""
+    runs: List[List[Dict[str, Any]]] = []
+    cur: Optional[List[Dict[str, Any]]] = None
+    cur_end = 0
+    for m in moments:
+        if cur is not None and int(m["in_ms"]) <= cur_end + _RUN_GAP_MS:
+            cur.append(m)
+            cur_end = max(cur_end, int(m["out_ms"]))
+        else:
+            cur = [m]
+            cur_end = int(m["out_ms"])
+            runs.append(cur)
+    ri = 0
+    for run in runs:
+        if len(run) < 2:
+            continue
+        rid = f"r{ri}"
+        ri += 1
+        for pos, m in enumerate(run):
+            m["run_id"] = rid
+            m["run_pos"] = pos
+            m["run_len"] = len(run)
+
+
 # --------------------------------------------------------------------------
 # Tree builder (pure: given a clip header + its anchor-band cut-set)
 # --------------------------------------------------------------------------
@@ -221,6 +275,9 @@ def build_clip_tree(
             "variants": variants,
             "atoms": [],
         })
+
+    # Tag same-channel back-to-back beats as continuous source runs (one shot).
+    _assign_runs(moments)
 
     return {
         "file_id": file_id,
@@ -397,13 +454,18 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     summ = (m.get("summary") or "").strip().replace("\n", " ")
     if summ and not m.get("summary_covered_by_speech"):
         gloss = f" shows:\"{_short_gist(summ)}\""
+    # Continuity run: this beat is part of one uninterrupted same-clip shot
+    # (members listed in source order); keep run members together + in order.
+    run = ""
+    if m.get("run_id"):
+        run = f" · run:{m['run_id']}"
     dup = ""
     if m.get("dup_group"):
         dup = f" · dup:{m['dup_group']}{' retry' if m.get('dup_restart') else ''}"
     return (f"  {m['moment_id'].split(':')[-1]} {_capture_tag(m)}{spk}{cam} "
             f".{int(round(m['score'] * 100)):02d} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])}] "
-            f"\"{gist}\"{gloss} · nrg:{nrg}{dup}")
+            f"\"{gist}\"{gloss} · nrg:{nrg}{run}{dup}")
 
 
 def _clip_block(tree: Dict[str, Any], *, compact: bool = False) -> str:

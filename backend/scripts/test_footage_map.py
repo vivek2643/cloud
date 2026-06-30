@@ -164,6 +164,38 @@ def test_moment_line_shows_channel_subject_v2():
     print("ok  test_moment_line_shows_channel_subject_v2")
 
 
+def test_source_contiguous_beats_form_a_run_channel_agnostic():
+    """Beats back-to-back in source time form one run REGARDLESS of channel --
+    the run is a purely temporal fact (same clip + adjacent time), like the weld.
+    A real gap starts a new run; a lone far-away beat gets no tag."""
+    cuts = [
+        _cut("c:0", 0, 2000, "kick", channel="done", subject="person", speaker=None,
+             ladder=[_rung("balanced", 0, 2000, "kick", 0.6)]),
+        _cut("c:1", 500, 2500, "go go go", channel="said", subject="person", speaker="S1",
+             ladder=[_rung("balanced", 500, 2500, "go go go", 0.6)]),
+        _cut("c:2", 2100, 4000, "the scoreboard", channel="shown", subject="graphic",
+             speaker=None, ladder=[_rung("balanced", 2100, 4000, "the scoreboard", 0.6)]),
+        _cut("c:3", 4200, 6000, "shoot", channel="done", subject="person", speaker=None,
+             ladder=[_rung("balanced", 4200, 6000, "shoot", 0.6)]),
+        _cut("c:4", 30000, 32000, "later", channel="done", subject="person", speaker=None,
+             ladder=[_rung("balanced", 30000, 32000, "later", 0.6)]),
+    ]
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "Match", "duration_ms": 40000}, cuts)
+    by_id = {m["moment_id"].split(":")[-1]: m for m in tree["moments"]}
+    # m00..m03 are adjacent in source time (mixed channels) -> ONE run of 4.
+    run0 = by_id["m00"].get("run_id")
+    assert run0 is not None
+    assert all(by_id[mid]["run_id"] == run0 for mid in ("m00", "m01", "m02", "m03")), by_id
+    assert by_id["m00"]["run_len"] == 4, by_id["m00"]["run_len"]
+    assert [by_id[mid]["run_pos"] for mid in ("m00", "m01", "m02", "m03")] == [0, 1, 2, 3]
+    # The far-away beat (big gap) is its own lone run -> no tag.
+    assert by_id["m04"].get("run_id") is None, "far-away beat starts no (multi) run"
+    # Channel never entered it: a said and a shown sit inside the run too.
+    assert by_id["m01"]["channel"] == "said" and by_id["m02"]["channel"] == "shown"
+    assert "· run:" in fm._moment_line(by_id["m01"]), fm._moment_line(by_id["m01"])
+    print("ok  test_source_contiguous_beats_form_a_run_channel_agnostic")
+
+
 def test_default_energy_from_genre():
     """The tree opens the slider per genre: long-form calm, short-form punchy."""
     calm = fm.build_clip_tree("ffffffff-2222",
@@ -185,6 +217,7 @@ def main():
     test_no_ladder_uses_flat_span()
     test_facets_surface_on_moment()
     test_map_text_lists_variants_no_atoms()
+    test_source_contiguous_beats_form_a_run_channel_agnostic()
     test_default_energy_from_genre()
     print("\nall footage-map tests passed")
 
