@@ -29,9 +29,14 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
+from app.services.l3 import energy as en
 from app.services.l3 import vocab
 from app.services.l3.atoms import Atom
 from app.services.l3.energy import EnergyParams
+
+# The five ladder bands a video cut is zoomed at (broad .. sharp).
+_LADDER_BANDS = (0, 1, 2, 3, 4)
+_ANCHOR_LADDER_BAND = 2          # balanced -- the flat span the cut plays at
 
 # Peak lead: a Done beat pays off at its impact (keep mostly the run-in), a held
 # Shown subject is uniform (center is fine).
@@ -144,6 +149,29 @@ def _people_facet(actor: Optional[str], region: Optional[dict]) -> List[dict]:
     return [p]
 
 
+def _video_span_at(level_params: EnergyParams, channel: str, core_in: int,
+                   core_out: int, peak_ms: int, lead: float, field, clip,
+                   *, can_split: bool) -> Tuple[int, int, Optional[List[Tuple[int, int]]]]:
+    """Zoom ONE beat at ONE band -> (in_ms, out_ms, keep_spans|None).
+
+    Sharp (split_at_peak) on a single-member beat may excise the field-safe
+    interior lull (windup|payoff jump-cut); otherwise the beat insets toward its
+    peak to the band's span-proportional handle (None below Tight = keep full).
+    Every edge flows through the fused seam field. This is the per-rung primitive
+    the ladder loop calls for each band, and the single-cut path reuses."""
+    from app.services.l3 import hero_cuts as hc
+    if level_params.split_at_peak and can_split:
+        split = _excise_lull(clip.motion, core_in, core_out, peak_ms)
+        if split:
+            ks = [hc._snap_segment(field, a, b, level_params, clip, channel) for a, b in split]
+            return ks[0][0], ks[-1][1], ks
+    cin, cout = hc._core_inset(core_in, core_out, peak_ms,
+                               _core_ms_for(channel, level_params, core_out - core_in),
+                               lead_frac=lead)
+    in_ms, out_ms = hc._snap_segment(field, cin, cout, level_params, clip, channel)
+    return in_ms, out_ms, None
+
+
 def combine_video(atoms: List[Atom], params: EnergyParams, field, clip,
                   source=None) -> List["object"]:
     """Build Done/Shown hero cuts from gated+folded atoms via the uniform fuse +
@@ -161,33 +189,40 @@ def combine_video(atoms: List[Atom], params: EnergyParams, field, clip,
             core_in = min(m.start_ms for m in members)
             core_out = max(m.end_ms for m in members)
             best = max(members, key=lambda m: m.confidence)
-
-            # Peak SPLIT (Sharp band, either video channel): windup|payoff around
-            # the peak -- excise the field-safe interior lull of the FULL beat
-            # (before any inset, so there's a lull left to find). A Done action
-            # splits around its impact; a moving Shown shot splits the slow travel
-            # from its arrival. A static hold has no lull -> falls back to the zoom
-            # inset below. Otherwise peak ZOOM: inset toward the peak to the band's
-            # span-proportional handle length.
-            keep_spans = None
-            if params.split_at_peak and len(members) == 1:
-                split = _excise_lull(clip.motion, core_in, core_out, best.peak_ms)
-                if split:
-                    keep_spans = [hc._snap_segment(field, a, b, params, clip, channel) for a, b in split]
-                    in_ms, out_ms = keep_spans[0][0], keep_spans[-1][1]
-            if keep_spans is None:
-                cin, cout = hc._core_inset(core_in, core_out, best.peak_ms,
-                                           _core_ms_for(channel, params, core_out - core_in),
-                                           lead_frac=lead)
-                in_ms, out_ms = hc._snap_segment(field, cin, cout, params, clip, channel)
-            if out_ms <= in_ms:
-                continue
-            score = _video_score(channel, members, clip, in_ms, out_ms)
-            if score < _MIN_VIDEO_SCORE:
-                continue
+            can_split = len(members) == 1   # a windup|payoff split needs one beat
             label = (best.label or vocab.channel_label(channel)).strip()[:200]
-            ladder = [hc.Rung(_ladder_level(params.band),
-                              keep_spans or [(in_ms, out_ms)], text=label, score=score)]
+
+            # Build the OWNED broad..sharp ladder by zooming this SAME beat at each
+            # band (mirrors the speech thought-ladder): Broad/Calm/Balanced keep
+            # the full beat, Tight/Sharp inset toward the peak, Sharp may split.
+            # The cut's identity (the fused beat) is fixed; only the zoom varies.
+            ladder = []
+            flat: Optional[Tuple[int, int, Optional[List[Tuple[int, int]]], float]] = None
+            for band in _LADDER_BANDS:
+                lp = en.params_for_band(band)
+                i, o, ks = _video_span_at(lp, channel, core_in, core_out,
+                                          best.peak_ms, lead, field, clip, can_split=can_split)
+                if o <= i:
+                    continue
+                rscore = _video_score(channel, members, clip, i, o)
+                ladder.append(hc.Rung(_ladder_level(band), ks or [(i, o)],
+                                      text=label, score=rscore))
+                if band == params.band:        # flat span follows the called band
+                    flat = (i, o, ks, rscore)
+
+            # The cut plays at the called band's rung (like a speech cut plays its
+            # selected level); fall back to Balanced, then the widest rung, if that
+            # band's zoom collapsed.
+            if flat is None:
+                pick = next((r for r in ladder if r.level == _ladder_level(_ANCHOR_LADDER_BAND)),
+                            ladder[0] if ladder else None)
+                if pick is None:
+                    continue
+                flat = (pick.in_ms(), pick.out_ms(), pick.keep_spans(), pick.score)
+            in_ms, out_ms, keep_spans, score = flat
+            if out_ms <= in_ms or score < _MIN_VIDEO_SCORE:
+                continue
+
             out.append(hc.HeroCut(
                 hero_id=f"{clip.file_id[:8]}:{channel[:2]}{ci}",
                 file_id=clip.file_id,

@@ -75,14 +75,17 @@ BAND_EDGES = (0.2, 0.4, 0.6, 0.8)   # band i covers [edge[i-1], edge[i]) with 0 
 
 # --- Video cuts (DONE | SHOWN): one uniform negative-padding knob --------------
 # The handle a video beat keeps at each band, expressed as a FRACTION of the
-# beat's OWN span -- so the trim scales with content length (a 10s drone hold
-# keeps proportionally more than a 2s one; there are no fixed second-counts).
-# Broad..Balanced = None = keep the full beat; only Tight/Sharp inset toward the
-# peak (impact / reveal). Symmetric with the positive padding that pivots at
-# Balanced. Done and Shown share the ladder; kept as two tuples so either channel
-# can be tuned independently later.
-_DONE_CORE_FRAC = (None, None, None, 0.6, 0.4)
-_SHOWN_CORE_FRAC = (None, None, None, 0.6, 0.4)
+# beat's OWN span -- always proportional, so the trim scales with content length
+# (a 10s drone hold keeps proportionally more than a 2s one; there are NO fixed
+# second-counts and no absolute caps). Broad..Balanced = None = keep the full
+# beat (the roomy, most-used range; Broad also gets the most breathing-room air
+# from the positive pad, so it reads closest to raw). Tight/Sharp then inset hard
+# toward the peak (impact / reveal): Tight is a lean cut, Sharp is a very sharp
+# banger -- kept deliberately small so the high end lands like a trailer cut, but
+# still a pure fraction of the beat. Done and Shown share the ladder; two tuples
+# so either channel can be tuned independently later.
+_DONE_CORE_FRAC = (None, None, None, 0.4, 0.15)
+_SHOWN_CORE_FRAC = (None, None, None, 0.4, 0.15)
 # Floor so a short beat never insets below a usable, frame-safe handle.
 CORE_FLOOR_MS = 600
 
@@ -157,6 +160,19 @@ def energy_band(energy: float) -> int:
     if e >= BAND_EDGES[0]:
         return 1
     return 0
+
+
+# A representative energy at the CENTER of each band, so a per-band param set
+# lands squarely in that band (used to build a cut's broad..sharp ladder in one
+# pass -- each rung is that band's zoom of the SAME beat).
+_BAND_CENTERS = (0.1, 0.3, 0.5, 0.7, 0.9)
+
+
+def params_for_band(band: int) -> EnergyParams:
+    """The EnergyParams for one band (0 Broad .. 4 Sharp), via its center energy.
+    Lets the combiner zoom a single beat at every level to build its ladder."""
+    b = max(0, min(int(band), len(_BAND_CENTERS) - 1))
+    return energy_to_params(_BAND_CENTERS[b])
 
 
 def energy_to_params(energy: float) -> EnergyParams:

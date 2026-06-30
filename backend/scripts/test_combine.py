@@ -83,6 +83,39 @@ def test_done_split_excises_lull_at_sharp():
     print("ok  Done split excises lull, keeps peak")
 
 
+# -- owned broad..sharp ladder (video cuts are shrinkable) --------------------
+
+def test_video_cut_owns_full_ladder():
+    """A done/shown cut now carries the full broad..sharp ladder (the SAME beat
+    zoomed at every band), not a single flat rung -- so it is shrinkable like a
+    speech cut. Plays are non-increasing; Balanced is the flat span; Sharp is
+    genuinely tighter."""
+    atoms = [_shown(0, 8000, conf=0.7)]            # 8s static hold, no motion
+    cuts = cmb.combine_video(atoms, energy_to_params(0.5), None, _clip())
+    c = next(c for c in cuts if c.channel == vocab.CHANNEL_SHOWN)
+    levels = [r.level for r in c.ladder]
+    assert levels == ["broad", "calm", "balanced", "tight", "sharp"], levels
+    plays = [r.play_ms() for r in c.ladder]
+    assert plays == sorted(plays, reverse=True), plays            # non-increasing
+    bal = next(r for r in c.ladder if r.level == "balanced")
+    assert (bal.in_ms(), bal.out_ms()) == (c.src_in_ms, c.src_out_ms)  # flat = balanced
+    sharp = next(r for r in c.ladder if r.level == "sharp")
+    assert sharp.play_ms() < bal.play_ms()                        # genuinely shrinks
+    print("ok  video cut owns full broad..sharp ladder")
+
+
+def test_video_ladder_round_trips():
+    """The owned ladder survives the cache round-trip (HeroCut.from_cache)."""
+    from app.services.l3.hero_cuts import HeroCut
+    atoms = [_done(0, 8000, peak=6000, conf=0.7)]
+    cuts = cmb.combine_video(atoms, energy_to_params(0.5), None, _clip())
+    c = next(c for c in cuts if c.channel == vocab.CHANNEL_DONE)
+    back = HeroCut.from_cache(c.to_dict())
+    assert [r.level for r in back.ladder] == [r.level for r in c.ladder]
+    assert back.src_in_ms == c.src_in_ms and back.src_out_ms == c.src_out_ms
+    print("ok  video ladder round-trips through cache")
+
+
 # -- capture-moments -----------------------------------------------------------
 
 def _mk(channel, a, b, subject=None, speaker=None, region=None, fid="abcdef12"):

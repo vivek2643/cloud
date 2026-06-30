@@ -73,7 +73,11 @@ logger = logging.getLogger(__name__)
 # v10: the v1 affordance/primitive/modality vocabulary is fully removed -- cuts
 # carry ONLY channel + subject; the map no longer reads or emits affordance/
 # primitive/modality. Clusters carry a channel mix + subject mix.
-TREE_VERSION = 10
+# v11: DONE/SHOWN cuts now carry a full broad..sharp ladder, so their moments
+# expose all five variants (not a single flat span) for the brain to zoom.
+# v12: video core fractions retuned (Tight 0.4 / Sharp 0.15) -- a wider, sharper
+# proportional ladder, so Sharp variants land as bangers.
+TREE_VERSION = 12
 
 # Band index -> energy-level name. Band 2 (energy 0.5) is the anchor: one
 # complete thought per cut. Lower = wider (whole answer), higher = tighter.

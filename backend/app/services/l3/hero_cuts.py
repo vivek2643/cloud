@@ -106,7 +106,12 @@ _MERGE_LEN_RATIO = 0.7
 # v14: the v1 affordance engines + anchors/territory are deleted; cuts carry
 # ONLY channel + subject (no modality/affordances/primitive). Video handles are
 # span-PROPORTIONAL (not fixed ms) and SHOWN may split at its peak (Sharp).
-PARAMS_VERSION = 14
+# v15: DONE/SHOWN cuts now own a full broad..sharp ladder (zoom the SAME beat at
+# every band) like SAID -- so a video cut is shrinkable, not a single flat span.
+# v16: video core fractions retuned for a wider proportional range -- Tight/Sharp
+# inset harder (0.4 / 0.15) so Sharp lands as a true banger; Broad..Balanced stay
+# full (the roomy, most-used middle). Still pure fractions, no absolute caps.
+PARAMS_VERSION = 16
 
 # The five canonical product energy LEVELS = the band centers (Broad .. Sharp).
 # Hero cuts are precomputed at exactly these after L2; any requested energy
