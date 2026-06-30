@@ -114,7 +114,10 @@ _MERGE_LEN_RATIO = 0.7
 # v17: windup|payoff split moved to the TIGHT band (and used only when it lands
 # tighter than the inset); SHARP is now a pure peak-inset banger that never
 # splits -- so the broad..sharp ladder is monotonic for video cuts too.
-PARAMS_VERSION = 17
+# v18: cross-channel capture-moments retired -- a cut no longer carries a
+# `moment_id`/`is_moment`; grouping is left to the brain (it reads same-clip
+# overlapping timestamps) and adjacent same-clip cuts weld at compile time.
+PARAMS_VERSION = 18
 
 # The five canonical product energy LEVELS = the band centers (Broad .. Sharp).
 # Hero cuts are precomputed at exactly these after L2; any requested energy
@@ -263,11 +266,6 @@ class HeroCut:
     framing: Optional[dict] = None
     # Quality facet: {delivery, vlm, ...} -- deterministic + subjective scores.
     quality: Optional[dict] = None
-    # The connected-cluster this cut belongs to, when it is linked to other cuts
-    # by a cross-channel capture-moment. None for a standalone cut. The "Moments"
-    # view is just the set of clusters -- a moment is a BUNDLE of first-class
-    # cuts, not a separate entity.
-    moment_id: Optional[str] = None
     # For an information-dense graphic, the gist of what it CONVEYS (from the
     # VLM's `summary`, not OCR) -- e.g. "revenue up 40% in Q3". None for ordinary
     # footage. Lets the brain place a graphic by meaning without re-reading it.
@@ -284,12 +282,6 @@ class HeroCut:
         """The capture channel this cut delivers on (said|done|shown). Always set
         by the builders; `modality` mirrors it for back-compat."""
         return self.channel or self.modality
-
-    def is_moment(self) -> bool:
-        """True when this cut is part of a multi-cut moment cluster (it has a
-        moment_id), i.e. the VLM stated a real relationship between it and other
-        cuts. A lone talking-head line with no relations is not a moment."""
-        return self.moment_id is not None
 
     def play_ms(self) -> int:
         """On-screen duration once breaths are excised (kept spans only)."""
@@ -329,9 +321,7 @@ class HeroCut:
             "people": self.people or None,
             "framing": self.framing,
             "quality": self.quality,
-            "moment_id": self.moment_id,
             "summary": self.summary,
-            "is_moment": self.is_moment(),
         }
 
     def to_cache(self) -> Dict[str, Any]:
@@ -356,7 +346,6 @@ class HeroCut:
             people=list(d.get("people") or []),
             framing=d.get("framing"),
             quality=d.get("quality"),
-            moment_id=d.get("moment_id"),
             summary=d.get("summary"),
             subject=d.get("subject"),
         )
@@ -1407,8 +1396,10 @@ def _file_heroes(
       2. build the fused field with every atom peak as an attractor + peak-core
          protected (Said = word span -- the mid-word-cut guarantee);
       3. SAID cuts keep the linguistic thought-ladder (_speech_candidates);
-         DONE/SHOWN cuts come from the uniform combiner (l3.combine);
-      4. derive cross-channel capture-MOMENTS deterministically.
+         DONE/SHOWN cuts come from the uniform combiner (l3.combine).
+
+    Cross-channel grouping is no longer precomputed -- the brain reads same-clip
+    overlapping timestamps off the map directly.
 
     The remaining v1 beat builder (_beat_segments) stays in the tree but is no
     longer called -- the version bump invalidates its cache."""
@@ -1419,7 +1410,6 @@ def _file_heroes(
     speech = _speech_candidates(clip, source, field, params)
     video = cmb.combine_video(atoms, params, field, clip, source)
     heroes: List[HeroCut] = list(speech) + list(video)
-    cmb.derive_moments(heroes, params)
     return heroes
 
 

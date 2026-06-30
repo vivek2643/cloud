@@ -1,6 +1,6 @@
 """
 The uniform energy combiner -- the single deterministic step that turns gated,
-folded ATOMS (l3.atoms) into hero cuts and capture-moments.
+folded ATOMS (l3.atoms) into hero cuts.
 
 One algorithm for every video channel (no bespoke per-affordance engines):
 
@@ -19,9 +19,8 @@ One algorithm for every video channel (no bespoke per-affordance engines):
 SAID is not combined here -- it keeps the richer linguistic thought-ladder in
 `hero_cuts._speech_candidates`; the caller passes those cuts straight through.
 
-`derive_moments` then groups cuts ACROSS channels into capture-moments
-(proximity + a shared actor / region / non-person subject). Narrative grouping
-(a reaction answering a line three cuts away) is left to the brain.
+Cross-channel grouping (a line + its reaction + illustrating b-roll) is left to
+the brain, which reads same-clip overlapping timestamps directly off the map.
 
 Pure given the clip artifacts; `hero_cuts` is imported lazily to avoid an import
 cycle (it imports this module).
@@ -51,10 +50,6 @@ _MIN_VIDEO_SCORE = 0.18
 # pieces and the lull itself clear these floors -- otherwise the beat is contiguous.
 _LULL_MIN_MS = 500
 _SPLIT_MIN_KEEP_MS = 300
-
-
-def _overlap(a0: int, a1: int, b0: int, b1: int) -> int:
-    return max(0, min(a1, b1) - max(a0, b0))
 
 
 def _gap(a: Atom, b: Atom) -> int:
@@ -252,99 +247,3 @@ def combine_video(atoms: List[Atom], params: EnergyParams, field, clip,
 def _ladder_level(band: int) -> str:
     levels = ("broad", "calm", "balanced", "tight", "sharp")
     return levels[max(0, min(band, len(levels) - 1))]
-
-
-# --------------------------------------------------------------------------
-# Capture-moments: cross-channel fusion (proximity + shared subject/actor/region)
-# --------------------------------------------------------------------------
-
-def _region_overlap(ra: Optional[dict], rb: Optional[dict]) -> bool:
-    if not ra or not rb:
-        return False
-    ax0, ay0 = float(ra.get("x", 0)), float(ra.get("y", 0))
-    ax1, ay1 = ax0 + float(ra.get("w", 0)), ay0 + float(ra.get("h", 0))
-    bx0, by0 = float(rb.get("x", 0)), float(rb.get("y", 0))
-    bx1, by1 = bx0 + float(rb.get("w", 0)), by0 + float(rb.get("h", 0))
-    return max(0.0, min(ax1, bx1) - max(ax0, bx0)) > 0 and \
-        max(0.0, min(ay1, by1) - max(ay0, by0)) > 0
-
-
-def _cut_region(h) -> Optional[dict]:
-    return (h.framing or {}).get("region") if h.framing else None
-
-
-def _actor_id(h) -> Optional[str]:
-    """The person local_id this cut is about, from its people facet (works for a
-    speech cut and a video cut alike -- the raw `speaker` field uses different
-    namespaces, the cast-resolved person_id is the common key)."""
-    for p in (h.people or []):
-        pid = p.get("person_id")
-        if pid:
-            return pid
-    return None
-
-
-def _shares_capture(a, b) -> bool:
-    """Two cuts belong to the SAME captured moment when they share the human
-    performing it (actor), the patch of frame they happen in (region), or -- for
-    non-person subjects -- the same thing on screen. Person<->person across
-    different actors is left to the brain (a podcast stays moment-free)."""
-    ai, bi = _actor_id(a), _actor_id(b)
-    if ai and ai == bi:
-        return True
-    if _region_overlap(_cut_region(a), _cut_region(b)):
-        return True
-    sa, sb = getattr(a, "subject", None), getattr(b, "subject", None)
-    if sa and sa == sb and sa != vocab.SUBJECT_PERSON:
-        return True
-    return False
-
-
-def _time_gap(a, b) -> int:
-    return max(b.src_in_ms, a.src_in_ms) - min(b.src_out_ms, a.src_out_ms)
-
-
-def derive_moments(cuts: List["object"], params: EnergyParams) -> None:
-    """Stamp `moment_id` on cuts that form a cross-channel capture-moment: cuts
-    on DIFFERENT channels, proximate within `params.fuse_gap_ms`, that share a
-    capture (actor / region / non-person subject). A cluster needs >= 2 distinct
-    channels to be a moment, so adjacent same-channel beats never masquerade as
-    one (a smash + a line = a moment; two lines are not). Mutates in place."""
-    parent: Dict[int, int] = {i: i for i in range(len(cuts))}
-
-    def find(i: int) -> int:
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
-    def union(i: int, j: int) -> None:
-        parent[find(i)] = find(j)
-
-    reach = max(0, params.fuse_gap_ms)
-    for i in range(len(cuts)):
-        for j in range(i + 1, len(cuts)):
-            a, b = cuts[i], cuts[j]
-            if getattr(a, "channel", None) == getattr(b, "channel", None):
-                continue
-            if _time_gap(a, b) > reach:
-                continue
-            if _shares_capture(a, b):
-                union(i, j)
-
-    clusters: Dict[int, List[int]] = {}
-    for i in range(len(cuts)):
-        clusters.setdefault(find(i), []).append(i)
-
-    m = 0
-    for members in clusters.values():
-        if len(members) < 2:
-            continue
-        channels = {getattr(cuts[i], "channel", None) for i in members}
-        if len(channels) < 2:
-            continue
-        file_id = cuts[members[0]].file_id
-        mid = f"{file_id[:8]}:m{m}"
-        m += 1
-        for i in members:
-            cuts[i].moment_id = mid

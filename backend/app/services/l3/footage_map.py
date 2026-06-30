@@ -79,7 +79,11 @@ logger = logging.getLogger(__name__)
 # proportional ladder, so Sharp variants land as bangers.
 # v13: windup|payoff split moved to TIGHT (Sharp is a pure banger), so video
 # moments' Sharp variant is always the tightest rung (monotonic ladder).
-TREE_VERSION = 13
+# v14: cross-channel capture-moment CLUSTERS retired -- the tree no longer emits
+# `clusters` / per-cut `cluster_id`, and the resident line drops the "· moment:X"
+# tag. Grouping is the brain's job (it reads same-clip overlapping timestamps),
+# and adjacent same-clip cuts weld at compile time.
+TREE_VERSION = 14
 
 # Band index -> energy-level name. Band 2 (energy 0.5) is the anchor: one
 # complete thought per cut. Lower = wider (whole answer), higher = tighter.
@@ -151,102 +155,6 @@ def _flat_variant(cut: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _cluster_ladder(members: List[Dict[str, Any]]) -> Tuple[Dict[str, List[str]], str]:
-    """The zoom ladder for one connected bundle (moment): at Broad the whole run
-    of member cuts, narrowing to just the PEAK member at Sharp.
-
-    The peak is the highest-scoring member; lower energy admits its temporal
-    NEIGHBOURS, nearest-first, until the full run is in at Broad. So a moment
-    behaves like every other cut -- one selectable unit with a coarse..fine
-    ladder -- one level up from the individual cuts. Returns
-    ``({level: [moment_id, ...]}, peak_moment_id)``."""
-    by_time = sorted(members, key=lambda m: int(m["in_ms"]))
-    n = len(by_time)
-    peak_idx = max(range(n), key=lambda i: float(by_time[i].get("score", 0.0)))
-    peak = by_time[peak_idx]
-    ladder: Dict[str, List[str]] = {}
-    for band in range(len(_LEVEL_NAMES)):
-        # Broad (band 0) = whole run; Sharp (band 4) = the peak alone.
-        k = max(1, round(n * (1.0 - band / (len(_LEVEL_NAMES) - 1))))
-        lo = hi = peak_idx
-        while (hi - lo + 1) < k:
-            left_ok, right_ok = lo > 0, hi < n - 1
-            if left_ok and right_ok:
-                left_gap = int(peak["in_ms"]) - int(by_time[lo - 1]["out_ms"])
-                right_gap = int(by_time[hi + 1]["in_ms"]) - int(peak["out_ms"])
-                if left_gap <= right_gap:
-                    lo -= 1
-                else:
-                    hi += 1
-            elif left_ok:
-                lo -= 1
-            elif right_ok:
-                hi += 1
-            else:
-                break
-        ladder[_LEVEL_NAMES[band]] = [by_time[i]["moment_id"] for i in range(lo, hi + 1)]
-    return ladder, peak["moment_id"]
-
-
-def _distinct_ladder(ladder: Dict[str, List[str]]) -> List[Dict[str, Any]]:
-    """Collapse consecutive levels with an IDENTICAL member set into one rung, so
-    only meaningfully-distinct zoom steps materialize. A moment that reads the
-    same from Broad through Balanced is ONE rung spanning those levels, not three
-    duplicates -- the antidote to a ladder of look-alike rungs. Additive: the
-    full per-level ``ladder`` stays for callers that index by level."""
-    rungs: List[Dict[str, Any]] = []
-    for level in _LEVEL_NAMES:
-        members = list(ladder.get(level) or [])
-        if rungs and rungs[-1]["members"] == members:
-            rungs[-1]["levels"].append(level)
-        else:
-            rungs.append({"levels": [level], "members": members})
-    return rungs
-
-
-def _build_clusters(moments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Roll the flat moments up into their connected bundles (shared
-    ``cluster_id``). Each cluster is a moment-as-unit: its member run, the peak
-    member, the run's time span, and the whole-run -> peak zoom ladder. Only
-    bundles of >= 2 cuts are clusters (a lone cut is already its own moment)."""
-    groups: Dict[str, List[Dict[str, Any]]] = {}
-    for m in moments:
-        cid = m.get("cluster_id")
-        if cid:
-            groups.setdefault(cid, []).append(m)
-    clusters: List[Dict[str, Any]] = []
-    for cid, members in sorted(groups.items()):
-        if len(members) < 2:
-            continue
-        ladder, peak = _cluster_ladder(members)
-        ordered = sorted(members, key=lambda m: int(m["in_ms"]))
-        channels = []
-        subjects = []
-        for m in ordered:
-            ch = m.get("channel")
-            if ch and ch not in channels:
-                channels.append(ch)
-            sub = m.get("subject")
-            if sub and sub not in subjects:
-                subjects.append(sub)
-        clusters.append({
-            "cluster_id": cid,
-            "members": [m["moment_id"] for m in ordered],
-            "peak": peak,
-            # The channel mix (said+done+shown) -- a capture-moment is exactly a
-            # cross-channel bundle, so this is what defines it.
-            "channels": channels,
-            # The subject mix (person/place/object/graphic) across members.
-            "subjects": subjects,
-            "in_ms": min(int(m["in_ms"]) for m in ordered),
-            "out_ms": max(int(m["out_ms"]) for m in ordered),
-            "ladder": ladder,
-            # Only the meaningfully-distinct zoom steps (look-alike rungs merged).
-            "rungs": _distinct_ladder(ladder),
-        })
-    return clusters
-
-
 # --------------------------------------------------------------------------
 # Tree builder (pure: given a clip header + its anchor-band cut-set)
 # --------------------------------------------------------------------------
@@ -310,10 +218,6 @@ def build_clip_tree(
             "people": cut.get("people") or [],
             "framing": cut.get("framing"),
             "quality": cut.get("quality"),
-            # The connected-cluster id this cut shares with the cuts it forms a
-            # moment with (a line + its reaction + illustrating b-roll). None for
-            # a standalone cut. The "Moments" view groups by this.
-            "cluster_id": cut.get("moment_id"),
             "variants": variants,
             "atoms": [],
         })
@@ -333,9 +237,6 @@ def build_clip_tree(
         "logline": header.get("logline"),
         "moment_count": len(moments),
         "moments": moments,
-        # Connected bundles (>= 2 cuts) rolled up as moment-as-unit, each with a
-        # whole-run -> peak zoom ladder. Empty for clips with no relations.
-        "clusters": _build_clusters(moments),
     }
 
 
@@ -480,15 +381,6 @@ def _people_tag(m: Dict[str, Any]) -> str:
     return ""
 
 
-def _relation_tag(m: Dict[str, Any]) -> str:
-    """Compact view of the cross-channel moment cluster this cut belongs to, so
-    the brain sees the deterministic capture-moment grouping (a line + its
-    reaction + illustrating b-roll) instead of guessing from adjacency."""
-    if m.get("cluster_id"):
-        return f" · moment:{str(m['cluster_id']).split(':')[-1]}"
-    return ""
-
-
 def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     levels = list(m["variants"].keys())
     nrg = "|".join(L for L in _LEVEL_NAMES if L in levels)
@@ -511,28 +403,7 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     return (f"  {m['moment_id'].split(':')[-1]} {_capture_tag(m)}{spk}{cam} "
             f".{int(round(m['score'] * 100)):02d} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])}] "
-            f"\"{gist}\"{gloss} · nrg:{nrg}{dup}{_relation_tag(m)}")
-
-
-def _short_mid(mid: str) -> str:
-    return str(mid).split(":")[-1]
-
-
-def _cluster_line(c: Dict[str, Any]) -> str:
-    """One line for a connected bundle (moment-as-unit): its capture mix, the run
-    span, the peak member, and the whole-run -> peak zoom ladder so the brain can
-    place the moment as ONE thing -- the whole run loose, or just its peak when
-    tight. Members are still listed above (each tagged with this cluster id), so
-    nothing is hidden; this is the rolled-up unit on top of them."""
-    mix = "+".join(p for p in (c.get("channels") or []) if p)
-    rungs = []
-    for L in _LEVEL_NAMES:
-        ids = c["ladder"].get(L) or []
-        if ids:
-            rungs.append(f"{L}:{','.join(_short_mid(i) for i in ids)}")
-    return (f"  moment {_short_mid(c['cluster_id'])} {mix} "
-            f"[{_fmt_ts(c['in_ms'])}-{_fmt_ts(c['out_ms'])}] "
-            f"peak={_short_mid(c['peak'])} · zoom {' -> '.join(rungs)}")
+            f"\"{gist}\"{gloss} · nrg:{nrg}{dup}")
 
 
 def _clip_block(tree: Dict[str, Any], *, compact: bool = False) -> str:
@@ -548,11 +419,6 @@ def _clip_block(tree: Dict[str, Any], *, compact: bool = False) -> str:
     header = (f"CLIP {tree['file_id'][:8]} \"{tree['name']}\" · "
               + " · ".join(head_bits))
     lines = [header] + [_moment_line(m, compact=compact) for m in tree["moments"]]
-    clusters = tree.get("clusters") or []
-    if clusters:
-        lines.append("  MOMENTS (connected bundles -- take the whole run loose, "
-                     "or just the peak tight):")
-        lines.extend(_cluster_line(c) for c in clusters)
     return "\n".join(lines)
 
 

@@ -319,6 +319,10 @@ _EDITOR_SYSTEM = (
     "- Never include two cuts that say the same thing (keep the stronger).\n"
     "- Respect the target length if given (sum of play_ms ~ target); fewer, "
     "stronger cuts beat a long flabby list.\n"
+    "- Consecutive picks from the SAME clip whose source times touch/overlap are "
+    "auto-welded into ONE continuous segment (no visible cut) -- so pick adjacent "
+    "slices freely to build a longer beat; to force a hard cut WITHIN a clip, pick "
+    "non-adjacent slices.\n"
     "- You may map each pick to one of the director's beats by its purpose.\n\n"
     "Return ONLY JSON (no prose):\n"
     '{"picks": [{"hero_id": "<id>", "beat": "<beat purpose or null>", '

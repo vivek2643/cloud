@@ -41,6 +41,12 @@ logger = logging.getLogger(__name__)
 # this module import-light. Track 0 is the main line.
 _MAIN_TRACK = 0
 
+# Two adjacent main-line segments from the SAME clip whose source spans touch (or
+# overlap) within this tolerance are welded into one continuous segment -- no
+# redundant hard cut. ~3 frames @ 25fps; small enough that a real intra-clip jump
+# (distant slices) and a cut's own keep_spans jump-cuts stay separate.
+_WELD_TOL_MS = 120
+
 
 # --------------------------------------------------------------------------
 # Result shape
@@ -319,11 +325,42 @@ def resolve_placements(placements: List[Placement],
     return out
 
 
+def _weld_segments(segments: List[dict]) -> List[dict]:
+    """Merge consecutive main-line segments from the SAME clip whose source spans
+    are contiguous/overlapping (the next starts within ``_WELD_TOL_MS`` of where
+    the previous ended), so two adjacent slices of one continuous shot play as ONE
+    segment -- no redundant hard cut, no stutter.
+
+    Safe by construction: a cut's own ``keep_spans`` jump-cuts and any intentional
+    intra-clip jump (distant slices) are NON-contiguous, so they fail the test and
+    stay separate. The merged segment keeps the first slice's level/ref/provenance
+    and is marked ``speech`` if either side carried audio. Seg ids are re-issued
+    (they are opaque everywhere downstream)."""
+    welded: List[dict] = []
+    for s in segments:
+        prev = welded[-1] if welded else None
+        if (prev is not None
+                and prev["file_id"] == s["file_id"]
+                and prev["in_ms"] <= s["in_ms"] <= prev["out_ms"] + _WELD_TOL_MS):
+            prev["out_ms"] = max(prev["out_ms"], s["out_ms"])
+            if s.get("axis") == "speech":
+                prev["axis"] = "speech"
+            if s.get("content") and s["content"] != prev.get("content"):
+                prev["content"] = f"{(prev.get('content') or '').strip()} "\
+                                  f"{s['content'].strip()}".strip()
+            continue
+        welded.append(s)
+    for i, s in enumerate(welded):
+        s["seg_id"] = f"a{i:03d}"
+    return welded
+
+
 def _segments_from_main(cuts: List[ResolvedCut]) -> List[dict]:
     """Main-line cuts -> contiguous timeline segments (the no-gap critic: track-0
     segments are laid back-to-back by the resolver, so order alone removes gaps).
     A breath-removal edit-list (``keep_spans``) expands into one segment per kept
-    span so the jump-cuts survive."""
+    span so the jump-cuts survive. Finally, adjacent same-clip source-contiguous
+    segments are WELDED so two neighbouring slices of one shot play continuously."""
     segments: List[dict] = []
     i = 0
     for rc in cuts:
@@ -352,7 +389,7 @@ def _segments_from_main(cuts: List[ResolvedCut]) -> List[dict]:
                 "level": rc.level,
             })
         i += 1
-    return segments
+    return _weld_segments(segments)
 
 
 def _operations_from_overlays(cuts: List[ResolvedCut], total_ms: int) -> List[dict]:

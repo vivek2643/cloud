@@ -164,93 +164,14 @@ def test_moment_line_shows_channel_subject_v2():
     print("ok  test_moment_line_shows_channel_subject_v2")
 
 
-def _cluster_cuts():
-    """Three cuts in one connected bundle: a line, its peak reaction, and a
-    b-roll that illustrates it -- all sharing a cluster id (moment_id)."""
-    def lad(level, a, b, s):
-        return [_rung(level, a, b, "", s)]
-    return [
-        _cut("f:c0", 0, 1000, "the line", channel="said", subject="person", score=0.5,
-             moment_id="cl1", ladder=lad("balanced", 0, 1000, 0.5)),
-        _cut("f:c1", 2000, 3000, "the reaction", channel="done", subject="person", score=0.9,
-             moment_id="cl1", ladder=lad("balanced", 2000, 3000, 0.9)),
-        _cut("f:c2", 4000, 5000, "the b-roll", channel="shown", subject="place", score=0.6,
-             moment_id="cl1", ladder=lad("balanced", 4000, 5000, 0.6)),
-    ]
-
-
-def test_cluster_ladder_whole_run_to_peak():
-    """A connected bundle is a moment-as-unit: Broad takes the whole run of
-    members, Sharp narrows to just the peak, by neighbour inclusion."""
-    tree = fm.build_clip_tree("ffffffff-1111",
-                              {"name": "Reel", "duration_ms": 8000}, _cluster_cuts())
-    clusters = tree["clusters"]
-    assert len(clusters) == 1, clusters
-    c = clusters[0]
-    # All three cuts are members; peak = the highest-scoring (the reaction = m01).
-    assert c["members"] == ["ffffffff:m00", "ffffffff:m01", "ffffffff:m02"], c["members"]
-    assert c["peak"] == "ffffffff:m01", c["peak"]
-    assert set(c["channels"]) == {"said", "done", "shown"}, c["channels"]
-    lad = c["ladder"]
-    # Broad = whole run; Sharp = peak alone; inclusion is monotonic non-increasing.
-    assert lad["broad"] == ["ffffffff:m00", "ffffffff:m01", "ffffffff:m02"], lad["broad"]
-    assert lad["sharp"] == ["ffffffff:m01"], lad["sharp"]
-    sizes = [len(lad[L]) for L in ("broad", "calm", "balanced", "tight", "sharp")]
-    assert sizes == sorted(sizes, reverse=True), sizes
-    assert sizes[0] == 3 and sizes[-1] == 1, sizes
-    # The peak is in every rung of the ladder.
-    assert all("ffffffff:m01" in lad[L] for L in lad), lad
-    print("ok  test_cluster_ladder_whole_run_to_peak")
-
-
-def test_cluster_block_rendered_in_map():
-    """The compact map surfaces a MOMENTS section with each bundle's zoom rungs."""
-    tree = fm.build_clip_tree("ffffffff-1111",
-                              {"name": "Reel", "duration_ms": 8000}, _cluster_cuts())
-    block = fm._clip_block(tree)
-    assert "MOMENTS (connected bundles" in block, block
-    assert "moment cl1" in block, block
-    assert "peak=m01" in block, block
-    assert "broad:m00,m01,m02" in block, block
-    print("ok  test_cluster_block_rendered_in_map")
-
-
-def test_lone_cut_forms_no_cluster():
-    """A cut with no shared cluster id is its own moment -- no bundle."""
-    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000},
-                              [_thought_cut()])
-    assert tree["clusters"] == [], tree["clusters"]
-    print("ok  test_lone_cut_forms_no_cluster")
-
-
-def test_cluster_rungs_collapse_lookalike_levels():
-    """A cluster exposes only the meaningfully-distinct zoom steps: consecutive
-    levels with the same member set collapse into one rung spanning them, while
-    the full per-level ladder is still present for level-indexed callers."""
-    tree = fm.build_clip_tree("ffffffff-1111",
-                              {"name": "Reel", "duration_ms": 8000}, _cluster_cuts())
-    c = tree["clusters"][0]
-    rungs = c["rungs"]
-    # Distinct rungs partition the 5 levels with no duplicate adjacent member-set.
-    assert sum(len(r["levels"]) for r in rungs) == 5, rungs
-    for r in rungs:
-        assert r["members"] == c["ladder"][r["levels"][0]], r
-    for a, b in zip(rungs, rungs[1:]):
-        assert a["members"] != b["members"], rungs
-    # The 3-member run (broad) and the 1-member peak (sharp) are different rungs.
-    assert rungs[0]["members"] == ["ffffffff:m00", "ffffffff:m01", "ffffffff:m02"]
-    assert rungs[-1]["members"] == ["ffffffff:m01"]
-    print("ok  test_cluster_rungs_collapse_lookalike_levels")
-
-
 def test_default_energy_from_genre():
     """The tree opens the slider per genre: long-form calm, short-form punchy."""
     calm = fm.build_clip_tree("ffffffff-2222",
                               {"name": "Pod", "duration_ms": 8000, "content_type": "interview"},
-                              _cluster_cuts())
+                              [_thought_cut()])
     punchy = fm.build_clip_tree("ffffffff-3333",
                                 {"name": "Ad", "duration_ms": 8000, "content_type": "product"},
-                                _cluster_cuts())
+                                [_thought_cut()])
     assert calm["default_energy"] < 0.5 < punchy["default_energy"], (
         calm["default_energy"], punchy["default_energy"])
     print("ok  test_default_energy_from_genre")
@@ -264,10 +185,6 @@ def main():
     test_no_ladder_uses_flat_span()
     test_facets_surface_on_moment()
     test_map_text_lists_variants_no_atoms()
-    test_cluster_ladder_whole_run_to_peak()
-    test_cluster_block_rendered_in_map()
-    test_lone_cut_forms_no_cluster()
-    test_cluster_rungs_collapse_lookalike_levels()
     test_default_energy_from_genre()
     print("\nall footage-map tests passed")
 

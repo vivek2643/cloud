@@ -39,21 +39,19 @@ function cutChannel(h: HeroCut): string {
 // A tab is the special "all" / "Moments" view or one of the three surfaced
 // capture channels. Showing WHAT each cut is (said/done/shown) is the honest
 // substrate -- no editorial affordance bias. Heard is detected but never shown.
-type FilterKey = "all" | "moment" | "said" | "done" | "shown";
+type FilterKey = "all" | "said" | "done" | "shown";
 
 const FILTERS: { key: FilterKey; label: string }[] = [
   { key: "all", label: "All" },
-  { key: "moment", label: "Moments" },
   { key: "said", label: "Said" },
   { key: "done", label: "Done" },
   { key: "shown", label: "Shown" },
 ];
 
-// Does a cut serve a given tab? Moments = belongs to a cross-channel capture
-// cluster; a channel tab matches when the cut delivers on that channel.
+// Does a cut serve a given tab? A channel tab matches when the cut delivers on
+// that channel.
 function matchesFilter(h: HeroCut, key: FilterKey): boolean {
   if (key === "all") return true;
-  if (key === "moment") return Boolean(h.is_moment);
   return cutChannel(h) === key;
 }
 
@@ -88,31 +86,6 @@ function loserHero(l: LoserTake): HeroCut {
     speaker: null,
     flags: [],
     subject: (l.subject ?? null) as HeroCut["subject"],
-    moment_id: null,
-    is_moment: false,
-    take_count: 1,
-    alt_takes: [],
-  };
-}
-
-// A moment as ONE combined unit: plays the whole run by chaining each member's
-// span (a cluster is always within one file). keep_spans drives the jump-cut
-// preview; dragging takes the whole loose run. Members stay reachable on expand.
-function combinedHero(members: HeroCut[]): HeroCut {
-  const ordered = [...members].sort((a, b) => a.src_in_ms - b.src_in_ms);
-  const lead = ordered[0];
-  const inMs = Math.min(...ordered.map((m) => m.src_in_ms));
-  const outMs = Math.max(...ordered.map((m) => m.src_out_ms));
-  const playMs = ordered.reduce((s, m) => s + (m.src_out_ms - m.src_in_ms), 0);
-  return {
-    ...lead,
-    hero_id: lead.moment_id ?? `moment:${lead.hero_id}`,
-    src_in_ms: inMs,
-    src_out_ms: outMs,
-    duration_ms: outMs - inMs,
-    play_ms: playMs,
-    keep_spans: ordered.map((m) => ({ in_ms: m.src_in_ms, out_ms: m.src_out_ms })),
-    score: Math.max(...ordered.map((m) => m.score)),
     take_count: 1,
     alt_takes: [],
   };
@@ -216,45 +189,14 @@ export function HeroCutsView() {
     () => (filter === "all" ? present : present.filter((h) => matchesFilter(h, filter))),
     [present, filter]
   );
-  // Moments tab: group the cluster members by their shared moment_id so each
-  // moment renders as ONE expandable bundle (a line + its reaction + b-roll),
-  // best-scored cut first. Other tabs render the flat grid.
-  const clusters = useMemo(() => {
-    if (filter !== "moment") return [];
-    const by: Record<string, HeroCut[]> = {};
-    for (const h of visible) {
-      const id = h.moment_id ?? h.hero_id;
-      (by[id] ??= []).push(h);
-    }
-    return Object.entries(by)
-      .map(([id, members]) => ({
-        id,
-        members: [...members].sort((a, b) => b.score - a.score),
-      }))
-      .sort((a, b) => b.members[0].score - a.members[0].score);
-  }, [filter, visible]);
-
   // "All" tab ONLY: group the cuts by the file they belong to. The feed is
   // already de-duped to the BEST take, so each file shows the cuts it WON;
   // a take it LOST to a better version elsewhere is appended greyed (from the
   // winner's alt_takes) so the file stays honest while steering to the best.
   const fileGroups = useMemo(() => {
     if (filter !== "all") return [];
-    // Collapse moment members into ONE combined card per moment (a cluster is
-    // always within one file), so the All tab shows moment cards too -- not
-    // each member loose. Non-moment cuts stay as themselves.
-    const momentMembers: Record<string, HeroCut[]> = {};
-    const singles: HeroCut[] = [];
-    for (const h of present) {
-      if (h.is_moment && h.moment_id) (momentMembers[h.moment_id] ??= []).push(h);
-      else singles.push(h);
-    }
-    const collapsed: HeroCut[] = [...singles];
-    for (const members of Object.values(momentMembers)) {
-      collapsed.push(members.length > 1 ? combinedHero(members) : members[0]);
-    }
     const winners: Record<string, HeroCut[]> = {};
-    for (const h of collapsed) (winners[h.file_id] ??= []).push(h);
+    for (const h of present) (winners[h.file_id] ??= []).push(h);
     for (const list of Object.values(winners)) list.sort((a, b) => b.score - a.score);
     // Every losing take (the whole point of "All": show it all). Each take is
     // appended -- greyed -- to the file group it physically lives in, tagged
@@ -357,29 +299,6 @@ export function HeroCutsView() {
         </div>
       )}
 
-      {!loading && totalClips > 0 && filter === "moment" && (
-        <div className="grid grid-cols-2 gap-4 md:grid-cols-3 2xl:grid-cols-4">
-          {clusters.map((c) => {
-            const combined = combinedHero(c.members);
-            return (
-              <HeroClipCard
-                key={c.id}
-                file={filesById[combined.file_id]!}
-                hero={combined}
-                getUrl={getUrl}
-                orientation={orientation}
-                fit={fit}
-                isActive={activeHeroId === combined.hero_id}
-                onActivate={() => setActiveHeroId(() => combined.hero_id)}
-                onDeactivate={() =>
-                  setActiveHeroId((id) => (id === combined.hero_id ? null : id))
-                }
-              />
-            );
-          })}
-        </div>
-      )}
-
       {/* All tab: grouped by file (grey filename + divider, then its cuts;
           takes that lost to a better file are appended greyed). */}
       {!loading && totalClips > 0 && filter === "all" && (
@@ -443,8 +362,8 @@ export function HeroCutsView() {
         </div>
       )}
 
-      {/* Primitive tabs: flat grid (no file grouping). */}
-      {!loading && totalClips > 0 && filter !== "moment" && filter !== "all" && (
+      {/* Channel tabs: flat grid (no file grouping). */}
+      {!loading && totalClips > 0 && filter !== "all" && (
         <div className="grid grid-cols-2 gap-4 md:grid-cols-3 2xl:grid-cols-4">
           {visible.map((h) => (
             <HeroClipCard

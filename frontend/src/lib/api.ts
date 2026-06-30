@@ -193,11 +193,6 @@ export interface HeroCut {
   // For an information-dense graphic / insert cut, the gist of what it CONVEYS
   // (the VLM's read, not OCR) -- e.g. "User selects video files for upload".
   summary?: string | null;
-  // The connected-cluster id this cut shares with the cuts it forms a moment
-  // with. null for a standalone cut. The Moments view groups by this.
-  moment_id?: string | null;
-  // True when this cut belongs to a multi-cut moment cluster (has a moment_id).
-  is_moment?: boolean;
   take_count: number;
   alt_takes: HeroTake[];
 }

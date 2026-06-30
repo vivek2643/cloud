@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Tests for the uniform energy combiner (l3.combine): within-channel fuse,
-peak zoom/split, cross-channel capture-moments, and the speech-safety guarantee
-(a cut never lands inside a spoken word, even with a peak attractor). Run:
+peak zoom/split, and the owned broad..sharp ladder. (Cross-channel capture-
+moments were retired -- grouping is the brain's job; the timeline weld is tested
+in test_arrange.py.) Run:
     python scripts/test_combine.py
 """
 from __future__ import annotations
@@ -134,61 +135,6 @@ def test_video_ladder_round_trips():
     assert [r.level for r in back.ladder] == [r.level for r in c.ladder]
     assert back.src_in_ms == c.src_in_ms and back.src_out_ms == c.src_out_ms
     print("ok  video ladder round-trips through cache")
-
-
-# -- capture-moments -----------------------------------------------------------
-
-def _mk(channel, a, b, subject=None, speaker=None, region=None, fid="abcdef12"):
-    from app.services.l3.hero_cuts import HeroCut
-    people = [{"person_id": speaker, "on_camera": True}] if speaker else []
-    return HeroCut(hero_id=f"{fid}:{channel}{a}", file_id="abcdef12-x",
-                   modality=channel, label="", src_in_ms=a, src_out_ms=b,
-                   score=0.5, channel=channel, subject=subject, speaker=speaker,
-                   people=people,
-                   framing=({"region": region} if region else None))
-
-
-def test_moment_cross_channel_same_actor():
-    """A line and an action by the SAME person, close in time, form a moment."""
-    said = _mk(vocab.CHANNEL_SAID, 0, 2000, subject="person", speaker="p1")
-    done = _mk(vocab.CHANNEL_DONE, 1800, 3000, subject="person", speaker="p1")
-    cuts = [said, done]
-    cmb.derive_moments(cuts, energy_to_params(0.3))
-    assert said.moment_id and said.moment_id == done.moment_id
-    print("ok  moment: cross-channel same actor")
-
-
-def test_no_moment_same_channel():
-    """Two adjacent lines (same channel) are NOT a moment -- a podcast stays
-    moment-free."""
-    a = _mk(vocab.CHANNEL_SAID, 0, 2000, subject="person", speaker="p1")
-    b = _mk(vocab.CHANNEL_SAID, 2100, 4000, subject="person", speaker="p1")
-    cuts = [a, b]
-    cmb.derive_moments(cuts, energy_to_params(0.3))
-    assert a.moment_id is None and b.moment_id is None
-    print("ok  no moment for same-channel adjacency")
-
-
-def test_no_moment_unrelated_subjects():
-    """A line by p1 + b-roll of an unrelated object don't auto-moment (brain's
-    job). Different actors, different subjects, no region overlap."""
-    said = _mk(vocab.CHANNEL_SAID, 0, 2000, subject="person", speaker="p1")
-    broll = _mk(vocab.CHANNEL_SHOWN, 1800, 3000, subject="object")
-    cuts = [said, broll]
-    cmb.derive_moments(cuts, energy_to_params(0.3))
-    assert said.moment_id is None and broll.moment_id is None
-    print("ok  no moment for unrelated subjects")
-
-
-def test_atomize_breaks_moment_at_sharp():
-    """At Sharp (fuse reach 0) only literally-overlapping cross-channel cuts
-    group; a small time gap leaves them apart."""
-    said = _mk(vocab.CHANNEL_SAID, 0, 2000, subject="person", speaker="p1")
-    done = _mk(vocab.CHANNEL_DONE, 2200, 3000, subject="person", speaker="p1")
-    cuts = [said, done]
-    cmb.derive_moments(cuts, energy_to_params(0.95))
-    assert said.moment_id is None and done.moment_id is None
-    print("ok  Sharp atomizes the moment")
 
 
 if __name__ == "__main__":

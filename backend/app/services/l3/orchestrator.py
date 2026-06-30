@@ -105,7 +105,10 @@ _PAGED_SYSTEM = (
     "an equal candidate for the main line -- never rank one category over another; "
     "choose energy level per cut for pacing; honor the target length. Track 0 is "
     "the main line (back-to-back, no gaps); overlays on higher tracks are optional "
-    "and rare.\n\n"
+    "and rare. Consecutive main-line picks from the SAME clip whose source times "
+    "touch/overlap are auto-welded into one continuous segment (no visible cut), "
+    "so adjacent slices build a longer beat; pick non-adjacent slices to force a "
+    "hard cut within a clip.\n\n"
     "Be efficient: do not inspect everything -- only real candidates. Then call "
     "submit_timeline once."
 )
