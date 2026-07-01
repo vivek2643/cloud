@@ -125,6 +125,42 @@ def test_video_cut_owns_full_ladder():
     print("ok  video cut owns full broad..sharp ladder")
 
 
+# -- audio policy on video cuts (mute stray speech under a shot) ---------------
+
+def _src(words):
+    """A minimal SpanSource-like stub for the audio policy (only .words read)."""
+    return SimpleNamespace(words=words)
+
+
+def _word(a, b):
+    return {"start_ms": a, "end_ms": b, "text": "x", "is_filler": False}
+
+
+def test_video_audio_muted_when_speech_under_shot():
+    """A shown/done cut with real talking under it (>=15% of the span) is tagged
+    audio='speech' and muted by default -- b-roll shouldn't drag an out-of-context
+    half-sentence onto the edit."""
+    atoms = [_shown(0, 8000, conf=0.7)]
+    src = _src([_word(500, 2000), _word(2100, 3500)])   # ~3s talk over 8s -> 37%
+    cuts = cmb.combine_video(atoms, energy_to_params(0.5), None, _clip(), source=src)
+    c = next(c for c in cuts if c.channel == vocab.CHANNEL_SHOWN)
+    assert c.audio == "speech" and c.mute is True, (c.audio, c.mute)
+    assert c.to_dict()["mute"] is True
+    print("ok  video cut mutes stray speech under the shot")
+
+
+def test_video_audio_kept_when_ambient():
+    """A cut with little/no speech under it stays audio='ambient' and unmuted --
+    we never silence possible music/sfx we can't classify."""
+    atoms = [_shown(0, 8000, conf=0.7)]
+    src = _src([_word(500, 900)])                        # <15% talk -> ambient
+    cuts = cmb.combine_video(atoms, energy_to_params(0.5), None, _clip(), source=src)
+    c = next(c for c in cuts if c.channel == vocab.CHANNEL_SHOWN)
+    assert c.audio == "ambient" and c.mute is False, (c.audio, c.mute)
+    assert c.to_dict()["mute"] is None                   # not emitted when false
+    print("ok  video cut keeps ambient audio")
+
+
 def test_video_ladder_round_trips():
     """The owned ladder survives the cache round-trip (HeroCut.from_cache)."""
     from app.services.l3.hero_cuts import HeroCut

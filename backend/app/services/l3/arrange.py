@@ -76,6 +76,7 @@ class ResolvedCut:
     reason: str
     ref: str = ""               # the map id (carried onto segments for refinement)
     level: str = "balanced"
+    mute: bool = False          # default: mute this cut's source audio (stray speech under video)
 
 
 # --------------------------------------------------------------------------
@@ -108,7 +109,7 @@ class _MapIndex:
                 channel=a.get("channel") or m.get("channel"),
                 label=a.get("gist") or m.get("gist") or "",
                 track=p.track, from_ms=p.from_ms, reason=p.reason,
-                ref=p.ref, level="atom",
+                ref=p.ref, level="atom", mute=bool(m.get("mute")),
             )
         m = self.moments.get(p.ref)
         if m is None:
@@ -123,7 +124,7 @@ class _MapIndex:
             src_out_ms=int(v["out_ms"]), keep_spans=v.get("keep_spans"),
             channel=m.get("channel"), label=m.get("gist") or "",
             track=p.track, from_ms=p.from_ms, reason=p.reason,
-            ref=p.ref, level=v.get("level", level),
+            ref=p.ref, level=v.get("level", level), mute=bool(m.get("mute")),
         )
 
     def level_ok(self, ref: str, level: str) -> bool:
@@ -143,16 +144,22 @@ _ARRANGER_SYSTEM = (
     "library, and you can read every line in full. Edit like a real editor who has "
     "watched all the footage: read for meaning, not keywords.\n\n"
     "Map notation (one MOMENT per line, grouped under its CLIP in time order):\n"
-    "  m07 said.person S1 .82 [0:14-0:21] \"the full line text\" · nrg:broad|calm|balanced|tight|sharp · run:r1 · dup:tg4\n"
+    "  m07 said.person S1 .82 [0:14-0:21 6.4s] \"the full line text\" · nrg:broad|calm|balanced|tight|sharp · run:r1 · dup:tg4\n"
     "  - the id is <clip8>:<m##>; refer to a moment by its FULL id (e.g. ab12cd34:m07).\n"
     "  - <channel>.<subject> is WHAT was captured: channel = said (spoken) | done "
     "(an action performed) | shown (something on screen); subject = person | place "
     "| object | graphic. The label only DESCRIBES the shot -- it never decides its "
     "place.\n"
-    "  - then the speaker, an optional 'off-cam' tag, the score (.82), the source "
-    "[in-out], and -- for said -- the COMPLETE line in quotes (judge delivery and "
-    "relevance from it). A 'shows:\"...\"' tag gives a graphic/insert's gist when "
-    "speech does not already narrate it.\n"
+    "  - then the speaker, an optional 'off-cam' tag, an optional 'muted' tag, the "
+    "score (.82), the source [in-out] and PLAY length (6.4s -- what it runs after "
+    "dead-air trimming; use it to pace + hit a target length), and -- for said -- "
+    "the COMPLETE line in quotes (judge delivery and relevance from it). A "
+    "'shows:\"...\"' tag gives a graphic/insert's gist when speech does not already "
+    "narrate it.\n"
+    "  - 'muted' on a done/shown cut means it carries stray speech under the shot "
+    "that plays SILENT by default (b-roll/action shouldn't drag in an out-of-"
+    "context half-sentence). It still shows the picture; keep it muted unless you "
+    "specifically want that audio.\n"
     "  - nrg lists the levels you may take it at: broad (whole answer) .. balanced "
     "(one thought) .. sharp (tightest). Pick the level that fits the pacing.\n"
     "  - 'run:rN' marks a CONTINUOUS RUN: several moments in this clip that are ONE "
@@ -369,6 +376,10 @@ def _weld_segments(segments: List[dict]) -> List[dict]:
             prev["out_ms"] = max(prev["out_ms"], s["out_ms"])
             if s.get("axis") == "speech":
                 prev["axis"] = "speech"
+            # Keep audio if EITHER side wants it -- only a fully-stray merged span
+            # stays muted (never silence real speech that welded onto a video cut).
+            if not s.get("mute"):
+                prev["mute"] = None
             if s.get("content") and s["content"] != prev.get("content"):
                 prev["content"] = f"{(prev.get('content') or '').strip()} "\
                                   f"{s['content'].strip()}".strip()
@@ -408,6 +419,10 @@ def _segments_from_main(cuts: List[ResolvedCut]) -> List[dict]:
                 "cut_in_cost": 0.0,
                 "cut_out_cost": 0.0,
                 "warnings": [],
+                # Default source-audio policy: mute stray speech under a video cut
+                # (b-roll/action) so the edit doesn't drag in an out-of-context
+                # half-sentence. Never set for said cuts.
+                "mute": True if rc.mute else None,
                 # Map provenance: lets a refinement turn speak in the same ids.
                 "ref": rc.ref or None,
                 "level": rc.level,

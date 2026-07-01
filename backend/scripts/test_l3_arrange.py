@@ -122,9 +122,13 @@ def test_resolve_and_main_line_is_contiguous():
     assert len(cuts) == 2
     assert (cuts[0].src_in_ms, cuts[0].src_out_ms) == (0, 8000)   # m00 widened to answer
     assert (cuts[1].src_in_ms, cuts[1].src_out_ms) == (4000, 8000)  # m01 balanced
+    # Both picks are the SAME clip and their source spans overlap (m01 sits inside
+    # m00's widened answer), so the weld fuses them into ONE continuous segment --
+    # no redundant hard cut. Ids are re-issued post-weld (opaque downstream).
     segs = ar._segments_from_main(cuts)
-    assert len(segs) == 2
-    assert [s["seg_id"] for s in segs] == ["a000_0", "a001_0"], segs
+    assert len(segs) == 1, segs
+    assert segs[0]["seg_id"] == "a000", segs
+    assert (segs[0]["in_ms"], segs[0]["out_ms"]) == (0, 8000), segs
     assert segs[0]["file_id"] == "ffffffff-1111"
     print("ok  test_resolve_and_main_line_is_contiguous")
 

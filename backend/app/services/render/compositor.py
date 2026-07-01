@@ -139,6 +139,9 @@ def render_resolved(
         all(v.get("kind") == "spine" for v in video)
         and all(a.get("kind") == "spine" for a in audio)
         and len(audio) <= len(video)  # spine: one dialogue layer per picture
+        # A muted/gained spine layer needs the filter graph (the concat fast path
+        # can't apply per-segment volume) -- fall through to the layered renderer.
+        and all(abs(float(a.get("gain_db", 0.0))) < 0.01 for a in audio)
     )
 
     with tempfile.TemporaryDirectory(prefix="edso_render_") as tmp:

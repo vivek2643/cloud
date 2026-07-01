@@ -162,6 +162,33 @@ def test_sharp_breath_removal_edit_list():
     print("ok  test_sharp_breath_removal_edit_list")
 
 
+def test_dead_air_floor_excises_long_hole_at_every_band():
+    """The dead-air FLOOR excises a long internal silence (>= _DEAD_AIR_FLOOR_MS)
+    even at BROAD, where the Sharp breath pass is off -- so no speech cut ever
+    plays a big hole (e.g. a merged turn spanning the gap between two thoughts).
+    Below the floor, a short breath is kept contiguous."""
+    clip = hc._ClipInputs(
+        file_id="dddddddd-1", duration_ms=8000,
+        dialogue={"topic": [], "sentence": [
+            _seg("s0", "sentence", "the product really changes everything today", 0, 4300),
+        ]},
+        perception=None, motion=None,
+    )
+    # A 2.0s dead hole (>= 1.2s floor) between 'really' and 'changes'.
+    words = _words([
+        ("the", 0, 300), ("product", 300, 800), ("really", 800, 1300),
+        ("changes", 3300, 3800), ("everything", 3800, 4200), ("today", 4200, 4300),
+    ])
+    src = _src("dddddddd-1", 8000, words)
+    broad = hc._speech_candidates(clip, src, None, hc.energy_to_params(0.0))
+    assert len(broad) == 1, broad
+    ks = broad[0].keep_spans
+    assert ks is not None and len(ks) == 2, ks                 # hole excised at Broad
+    assert ks[0][1] <= 1300 and ks[1][0] >= 3300, ks           # cut spans the 2s hole
+    assert broad[0].play_ms() < broad[0].src_out_ms - broad[0].src_in_ms
+    print("ok  test_dead_air_floor_excises_long_hole_at_every_band")
+
+
 def test_take_stacking_collapses_repeats(monkeypatch=None):
     """A take group (from l3.takes) of two deliveries collapses into ONE hero
     with take_count=2, higher-scoring delivery in front, loser as an alt. An
@@ -432,6 +459,7 @@ def main():
     test_energy_selects_granularity()
     test_clustering_gradient()
     test_sharp_breath_removal_edit_list()
+    test_dead_air_floor_excises_long_hole_at_every_band()
     test_take_stacking_collapses_repeats()
     test_best_take_prefers_on_camera_then_delivery()
     test_thought_bands_select_hierarchy()

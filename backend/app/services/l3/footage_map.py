@@ -90,7 +90,10 @@ logger = logging.getLogger(__name__)
 # resident line shows "· run:rN" so the brain sees continuous footage at DECISION
 # time and doesn't fragment it by accident -- a hint, not a rule (it stays free
 # to break/intercut a run on purpose).
-TREE_VERSION = 15
+# v16: moments carry the video-cut AUDIO facet (audio kind + default `mute` for
+# stray speech under a shot); the resident line shows a 'muted' tag + the cut's
+# PLAY length so the brain sees dropped audio and can pace to a target length.
+TREE_VERSION = 16
 
 # Two moments are one continuous source run when the next starts within this gap
 # of where the previous ended (back-to-back in the original footage). Loose
@@ -265,6 +268,11 @@ def build_clip_tree(
             "speaker": cut.get("speaker"),
             "gist": cut.get("label") or "",
             "flags": cut.get("flags") or [],
+            # Source-audio facet for video cuts: what's on the track ("speech"/
+            # "ambient") and whether it's muted by default (stray speech under a
+            # shot). Said cuts leave these unset (their audio is the point).
+            "audio": cut.get("audio"),
+            "mute": bool(cut.get("mute")),
             "score": float(cut.get("score", 0.0)),
             "in_ms": anchor["in_ms"],
             "out_ms": anchor["out_ms"],
@@ -438,6 +446,25 @@ def _people_tag(m: Dict[str, Any]) -> str:
     return ""
 
 
+def _dur_tag(m: Dict[str, Any]) -> str:
+    """The cut's PLAY length (after any breath/dead-air excision) so the brain
+    can pace + honor a target length without arithmetic on the timestamps."""
+    ms = int(m.get("play_ms", m["out_ms"] - m["in_ms"]))
+    s = ms / 1000.0
+    return f"{s:.1f}s" if s < 10 else f"{int(round(s))}s"
+
+
+def _audio_tag(m: Dict[str, Any]) -> str:
+    """Source-audio note for a VIDEO cut: 'muted' when it carries stray speech
+    that plays silent by default (the brain can still choose to keep it), so the
+    brain knows the shot has talking under it and isn't surprised by silence."""
+    if m.get("mute"):
+        return " muted"
+    if m.get("audio") == "speech":
+        return " aud:speech"
+    return ""
+
+
 def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     levels = list(m["variants"].keys())
     nrg = "|".join(L for L in _LEVEL_NAMES if L in levels)
@@ -462,9 +489,9 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     dup = ""
     if m.get("dup_group"):
         dup = f" · dup:{m['dup_group']}{' retry' if m.get('dup_restart') else ''}"
-    return (f"  {m['moment_id'].split(':')[-1]} {_capture_tag(m)}{spk}{cam} "
+    return (f"  {m['moment_id'].split(':')[-1]} {_capture_tag(m)}{spk}{cam}{_audio_tag(m)} "
             f".{int(round(m['score'] * 100)):02d} "
-            f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])}] "
+            f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])} {_dur_tag(m)}] "
             f"\"{gist}\"{gloss} · nrg:{nrg}{run}{dup}")
 
 

@@ -117,7 +117,14 @@ _MERGE_LEN_RATIO = 0.7
 # v18: cross-channel capture-moments retired -- a cut no longer carries a
 # `moment_id`/`is_moment`; grouping is left to the brain (it reads same-clip
 # overlapping timestamps) and adjacent same-clip cuts weld at compile time.
-PARAMS_VERSION = 18
+# v19: (1) DEAD-AIR FLOOR on speech at EVERY band -- a said cut excises any
+# internal hole longer than _DEAD_AIR_FLOOR_MS (not only the Sharp breath pass),
+# so even a merged Broad turn never plays a long silence. (2) speech SCORE
+# rewritten: density (speech ratio) + clean delivery carry it, a long hole/low
+# density is gated hard, and the unbounded word-count reward is gone (a long
+# rambling take no longer outranks a tight clean one). (3) DONE/SHOWN cuts carry
+# an `audio` facet (speech|ambient) and mute stray speech under video by default.
+PARAMS_VERSION = 19
 
 # The five canonical product energy LEVELS = the band centers (Broad .. Sharp).
 # Hero cuts are precomputed at exactly these after L2; any requested energy
@@ -145,6 +152,12 @@ ACTION_TIGHT_WINDOW_MS = 600      # ... shrinks as energy rises
 
 # A speech hero needs at least this much real content to be worth surfacing.
 MIN_SPEECH_WORDS = 3
+# Dead-air FLOOR for speech, applied at EVERY energy band (not only the Sharp
+# breath pass): any internal silent gap this long inside a said cut is excised
+# into a jump-cut, so a cut never PLAYS a long hole -- most importantly a merged
+# Broad "turn" that spans the gap between two consecutive thoughts. The Sharp
+# band's own breath gap (which ramps tighter than this) takes over when active.
+_DEAD_AIR_FLOOR_MS = 1200
 # A spoken span this poorly covered by the VLM's visible-speaking spans is
 # almost certainly off-camera audio (a crew cue like "go", a voice off-frame).
 SPEAKING_COVERAGE_MIN = 0.25
@@ -273,6 +286,16 @@ class HeroCut:
     # The orthogonal SUBJECT tag riding on the channel (person|place|object|
     # graphic) -- WHAT the channel is about.
     subject: Optional[str] = None
+    # What is on this cut's SOURCE AUDIO track (video channels only): "speech"
+    # (someone talking under the shot), "ambient" (room tone / sfx / possible
+    # music). Said cuts leave this None (their audio IS the point). Lets the brain
+    # and the compiler decide whether the underlying audio should play.
+    audio: Optional[str] = None
+    # Default source-audio policy for this cut: True = mute on the timeline. Set
+    # for video (done/shown) cuts carrying stray SPEECH -- b-roll/action shouldn't
+    # drag an out-of-context half-sentence onto the edit. A sensible default the
+    # brain can still override; never set for said cuts.
+    mute: bool = False
 
     def __post_init__(self):
         # `modality` is a strict alias of `channel`.
@@ -322,6 +345,8 @@ class HeroCut:
             "framing": self.framing,
             "quality": self.quality,
             "summary": self.summary,
+            "audio": self.audio,
+            "mute": self.mute or None,
         }
 
     def to_cache(self) -> Dict[str, Any]:
@@ -348,6 +373,8 @@ class HeroCut:
             quality=d.get("quality"),
             summary=d.get("summary"),
             subject=d.get("subject"),
+            audio=d.get("audio"),
+            mute=bool(d.get("mute")),
         )
 
 
@@ -493,26 +520,39 @@ def _vlm_quality_score(events: List[dict], start_ms: int, end_ms: int) -> Option
 
 
 def _speech_score(metrics: Dict[str, Any], vlm: Optional[float]) -> float:
-    """Composite 0..1 rank for a speech span: reward clean, on-camera, content-
-    bearing delivery; penalize fillers, dead air, runaway pace. Objective
-    metrics carry it; the VLM's subjective score nudges when present."""
+    """Composite 0..1 SURFACING rank for a speech span: is this worth showing?
+
+    Density (how much of the span is actually speech) and clean delivery carry
+    it; a long dead hole or a low speech ratio is gated HARD (a rambling, gappy
+    take must not outrank a tight clean one). Deliberately NOT rewarded by raw
+    word count -- that only made longer spans win regardless of quality (the bug
+    where a worse-but-longer take ranked above a better one). Length is a floor
+    (enough to be a usable unit), never a growing bonus. The VLM's subjective
+    score nudges when present."""
     speech_ratio = float(metrics.get("speech_ratio", 0.0))
     fillers = float(metrics.get("filler_per_min", 0.0))
     wpm = float(metrics.get("wpm", 0.0))
     words = int(metrics.get("word_count", 0))
+    longest_pause = float(metrics.get("longest_pause_ms", 0.0))
     gaze = metrics.get("gaze_to_camera_ratio")
 
     filler_pen = min(1.0, fillers / 12.0)            # ~12 fillers/min -> full penalty
     # Comfortable speaking pace ~110-170 wpm; penalize outside that band.
     pace_pen = 0.0 if 90 <= wpm <= 190 else min(1.0, abs(wpm - 140) / 140.0)
-    content = min(1.0, words / 12.0)                 # a few words -> enough to use
+    # A single dead hole reads as a stumble / a spanned gap -> saturates at the
+    # dead-air floor (a >=1.2s hole is fully penalized).
+    hole_pen = min(1.0, longest_pause / _DEAD_AIR_FLOOR_MS)
 
     base = (
-        0.40 * speech_ratio
-        + 0.25 * content
-        + 0.20 * (1.0 - filler_pen)
+        0.45 * speech_ratio
+        + 0.25 * (1.0 - filler_pen)
         + 0.15 * (1.0 - pace_pen)
+        + 0.15 * (1.0 - hole_pen)
     )
+    # Length is a GATE, not a reward: too few words to be a unit scales the whole
+    # score down; anything at/above the floor is unpenalized (and doesn't grow).
+    if words < MIN_SPEECH_WORDS:
+        base *= max(0.0, words / MIN_SPEECH_WORDS)
     if gaze is not None:
         base = 0.85 * base + 0.15 * float(gaze)
     if vlm is not None:
@@ -1092,11 +1132,14 @@ def _speech_candidates(
         # Tightness: snap to fused seams + energy-scaled breathing room.
         in_ms, out_ms = _snap_fused(field, in_ms, out_ms, params, clip.duration_ms)
 
-        # Sharp band: excise internal breaths -> jump-cut edit-list.
+        # Excise internal silence into a jump-cut edit-list. The Sharp band uses
+        # its progressive breath gap (short, snappy); every other band still
+        # applies the DEAD-AIR FLOOR so a cut never plays a long hole -- crucially
+        # a merged Broad turn spanning the gap between two thoughts.
         keep_spans = None
-        if params.speech_breath_gap_ms > 0 and source is not None:
-            keep_spans = _breath_keep_spans(
-                source.words, in_ms, out_ms, params.speech_breath_gap_ms)
+        if source is not None:
+            gap = params.speech_breath_gap_ms or _DEAD_AIR_FLOOR_MS
+            keep_spans = _breath_keep_spans(source.words, in_ms, out_ms, gap)
 
         # Reconcile the rung the energy dial selected with the snapped/excised
         # flat output, so the cut's owned ladder agrees with what actually plays.

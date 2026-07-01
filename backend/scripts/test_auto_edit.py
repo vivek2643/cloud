@@ -193,8 +193,11 @@ def test_make_edit_end_to_end(monkeypatch=None):
     doc = result.document
     assert result.plan.energy == 0.7 and result.plan.aspect == "portrait"
     assert doc["format"]["aspect"] == "portrait"
-    assert [s["ref"] for s in doc["timeline"]] == ["f1:m00", "f1:m01"], doc["timeline"]
-    assert [(s["in_ms"], s["out_ms"]) for s in doc["timeline"]] == [(0, 2000), (2000, 4000)]
+    # m00 (0-2000) and m01 (2000-4000) are the SAME clip, back-to-back in source,
+    # so they weld into one continuous main-line segment (no visible cut). The
+    # weld keeps the first pick's ref/provenance.
+    assert [s["ref"] for s in doc["timeline"]] == ["f1:m00"], doc["timeline"]
+    assert [(s["in_ms"], s["out_ms"]) for s in doc["timeline"]] == [(0, 4000)]
     assert doc["operations"] == [], doc["operations"]
     assert doc["resolved"]["video_layers"], "resolved layers must exist"
     # Arranger runs a two-pass draft -> self-critique cycle (both EDITOR calls).

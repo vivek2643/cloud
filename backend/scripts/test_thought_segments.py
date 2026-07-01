@@ -137,6 +137,52 @@ def test_fallback_from_dialogue(monkeypatch=None):
     print("ok  test_fallback_from_dialogue")
 
 
+def _words_with_gap():
+    """6 words in TWO runs split by a 3.2s dead gap: run A = words 0..2
+    (t=0,1,2s), then silence, run B = words 3..5 (t=6,7,8s). 800ms each."""
+    toks = ["ok", "so", "watch", "and", "it", "works"]
+    starts = [0, 1000, 2000, 6000, 7000, 8000]
+    return [{"text": t, "start_ms": s, "end_ms": s + 800, "speaker": "S0"}
+            for t, s in zip(toks, starts)]
+
+
+def test_silence_ceiling_clamps_thought_to_punch_run():
+    # The model (mis)groups a thought ACROSS the dead gap [0..5] with the punch
+    # in the SECOND run (words 4..5). The clamp must drop the pre-gap words and
+    # keep only run B (words 3..5), so no level straddles the 3.2s silence.
+    body = """{"thoughts":[
+      {"speaker":"S0","thought":[0,5],"core":[3,5],"punch":[4,5],"setup":null,"strength":0.8}
+    ]}"""
+    out = ts.segment_with_llm(_words_with_gap(), _FakeLLM(body))
+    assert len(out) == 1, out
+    t = out[0]
+    # thought clamped to run B start (word 3 @ 6000) .. word 5 end (8800).
+    assert (t.thought.raw_in_ms, t.thought.raw_out_ms) == (6000, 8800), t.thought
+    assert t.thought.text == "and it works", t.thought.text
+    # every level sits inside the one pause-bounded run.
+    assert t.core.raw_in_ms >= 6000 and t.punch.raw_in_ms >= 6000
+    print("ok  test_silence_ceiling_clamps_thought_to_punch_run")
+
+
+def test_no_long_gap_is_left_untouched():
+    # A clean thought with only tiny inter-word gaps is not clamped at all.
+    body = """{"thoughts":[
+      {"speaker":"S0","thought":[0,5],"core":[0,3],"punch":[2,3],"setup":null,"strength":0.8}
+    ]}"""
+    out = ts.segment_with_llm(_words(), _FakeLLM(body))
+    t = out[0]
+    assert (t.thought.raw_in_ms, t.thought.raw_out_ms) == (0, 5800), t.thought
+    print("ok  test_no_long_gap_is_left_untouched")
+
+
+def test_render_words_emits_pause_markers():
+    rendered = ts._render_words(_words_with_gap())
+    assert "<pause 3.2s>" in rendered, rendered
+    # the small 200ms gaps are below the mark threshold -> not surfaced.
+    assert "<pause 0.2s>" not in rendered, rendered
+    print("ok  test_render_words_emits_pause_markers")
+
+
 def test_roundtrip_serialization():
     body = '{"thoughts":[{"speaker":"S0","thought":[2,5],"core":[2,3],"punch":[2,3],"setup":[0,1],"strength":0.5}]}'
     t = ts.segment_with_llm(_words(), _FakeLLM(body))[0]
@@ -150,6 +196,9 @@ def main():
     test_validation_clamps_and_drops()
     test_empty_or_bad_json_returns_nothing()
     test_fallback_from_dialogue()
+    test_silence_ceiling_clamps_thought_to_punch_run()
+    test_no_long_gap_is_left_untouched()
+    test_render_words_emits_pause_markers()
     test_roundtrip_serialization()
     print("\nall thought-segment tests passed")
 

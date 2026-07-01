@@ -438,6 +438,9 @@ def resolve(document: dict, durations: Optional[Dict[str, int]] = None) -> Resol
             src_in_ms=int(seg["in_ms"]), src_out_ms=int(seg["out_ms"]),
             prog_start_ms=s.prog_start_ms, prog_end_ms=s.prog_end_ms,
             kind="spine",
+            # A muted segment (stray speech under a video cut) keeps its picture
+            # but drops its source audio -- rendered as volume=0 downstream.
+            gain_db=-120.0 if seg.get("mute") else 0.0,
         ))
 
     # --- J/L split edits reshape the spine audio boundaries ---

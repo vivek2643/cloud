@@ -51,10 +51,25 @@ logger = logging.getLogger(__name__)
 # recompute. Combined with the clip's word count into the cache signature.
 # v2: prompt keeps questions as thoughts + allows degenerate depth (punch==core
 # ==thought for one-liners); the speech cut now owns its full zoom ladder.
-THOUGHT_SCHEMA_VERSION = 2
+# v3: SILENCE CEILING -- the word stream now carries pause markers so the model
+# won't span a long dead gap, and every level is deterministically clamped to
+# the pause-bounded run containing its punch (a spoken thought can't hold a big
+# hole of silence). Speech-only by construction -- a demo's silence lives in the
+# video channels, not here.
+THOUGHT_SCHEMA_VERSION = 3
 
 # A thought needs at least this many real words to be worth keeping as a unit.
 _MIN_THOUGHT_WORDS = 3
+
+# The silence ceiling for a spoken thought. A dead gap longer than this between
+# two words is not natural phrasing -- it is the boundary between two thoughts
+# (the speaker stopped, a demo happened, the camera cut). No single said cut may
+# straddle it: every level is clamped to the pause-bounded run around its punch.
+_SILENCE_MAX_MS = 1500
+# Gaps at/above this are surfaced to the model as an explicit ``pause`` marker in
+# the word stream, so it segments across them instead of merging (the marker is
+# informational -- it does not consume a word index).
+_PAUSE_MARK_MS = 800
 
 
 # --------------------------------------------------------------------------
@@ -154,6 +169,27 @@ def _span_from_words(words: List[dict], i: int, j: int) -> Span:
                end_word=max(0, min(j, len(words) - 1)))
 
 
+def _gap_after(words: List[dict], i: int) -> int:
+    """Silence between word ``i`` and word ``i+1`` (0 at the list edges)."""
+    if i < 0 or i + 1 >= len(words):
+        return 0
+    return int(words[i + 1].get("start_ms", 0)) - int(words[i].get("end_ms", 0))
+
+
+def _run_within(words: List[dict], lo_bound: int, hi_bound: int, anchor: int) -> Tuple[int, int]:
+    """Widen out from ``anchor`` (a word index) as far as possible WITHOUT
+    crossing a gap longer than ``_SILENCE_MAX_MS``, staying inside
+    [lo_bound, hi_bound]. This is the pause-bounded run of speech the anchor sits
+    in -- everything past the first long silence on either side is a DIFFERENT
+    thought. Used to strip dead air out of a thought's levels."""
+    lo = hi = max(lo_bound, min(anchor, hi_bound))
+    while lo > lo_bound and _gap_after(words, lo - 1) <= _SILENCE_MAX_MS:
+        lo -= 1
+    while hi < hi_bound and _gap_after(words, hi) <= _SILENCE_MAX_MS:
+        hi += 1
+    return lo, hi
+
+
 # --------------------------------------------------------------------------
 # LLM pass
 # --------------------------------------------------------------------------
@@ -166,7 +202,11 @@ _SYSTEM = (
 
 _INSTR = (
     "Below is one clip's transcript. Every word is numbered `i:word`; a `[Sx]` "
-    "marks where the speaker changes. Split it into thoughts IN ORDER.\n\n"
+    "marks where the speaker changes; a `<pause Ns>` marks N seconds of silence "
+    "between words. NEVER let one thought span a long pause (a `<pause>` of ~1.5s "
+    "or more) -- that silence is a boundary BETWEEN thoughts (the speaker stopped, "
+    "a demo happened, the shot changed), so start a new thought after it. Split "
+    "the transcript into thoughts IN ORDER.\n\n"
     "For each thought give word indices (inclusive) into the numbered words:\n"
     "  - thought: the complete idea proper, start to end (one speaker) -- NOT "
     "counting any throat-clearing run-up.\n"
@@ -192,7 +232,9 @@ _INSTR = (
 
 
 def _render_words(words: List[dict]) -> str:
-    """Numbered, speaker-marked word stream for the model."""
+    """Numbered, speaker-marked word stream for the model, with explicit pause
+    markers so a long silence reads as a thought boundary (the model is otherwise
+    blind to time and would merge words across a dead gap)."""
     out: List[str] = []
     prev_spk = object()
     for i, w in enumerate(words):
@@ -201,6 +243,9 @@ def _render_words(words: List[dict]) -> str:
             out.append(f"\n[{spk or 'S?'}]")
             prev_spk = spk
         out.append(f"{i}:{(w.get('text') or '').strip()}")
+        gap = _gap_after(words, i)
+        if gap >= _PAUSE_MARK_MS:
+            out.append(f"<pause {gap / 1000:.1f}s>")
     return " ".join(out).strip()
 
 
@@ -256,6 +301,19 @@ def _coerce_thought(raw: Any, words: List[dict]) -> Optional[Thought]:
     pi, pj = max(ci, punch[0]), min(cj, punch[1])
     if pj < pi:
         pi, pj = ci, cj
+
+    # SILENCE CEILING (deterministic guarantee, independent of the model): a
+    # spoken thought must sit inside ONE pause-bounded run. Clamp every level to
+    # the run of speech around the punch, dropping any words the model reached
+    # across a long dead gap (they are a separate thought). A no-op when the
+    # model already segmented on the pauses it was shown; a hard backstop when it
+    # didn't. Video demos keep their silence -- this ceiling is speech-only.
+    rlo, rhi = _run_within(words, ti, tj, pi)
+    ti, tj = rlo, rhi
+    ci, cj = max(ci, rlo), min(cj, rhi)
+    pi, pj = max(pi, rlo), min(pj, rhi)
+    if tj - ti + 1 < _MIN_THOUGHT_WORDS:
+        return None
 
     # Setup is the run-up BEFORE the thought (so Calm = setup + thought is a
     # strictly wider level than Balanced = thought). Clamp it to end just before

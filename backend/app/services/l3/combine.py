@@ -145,6 +145,34 @@ def _people_facet(actor: Optional[str], region: Optional[dict]) -> List[dict]:
     return [p]
 
 
+# A video cut whose source audio is talking for at least this fraction of its
+# span carries stray SPEECH (a half-sentence, an off-topic remark) that a b-roll
+# / action shot shouldn't drag onto the edit -- so it is muted by default.
+_VIDEO_SPEECH_FRAC = 0.15
+
+
+def _audio_policy(source, in_ms: int, out_ms: int) -> Tuple[Optional[str], bool]:
+    """Classify a video cut's SOURCE AUDIO and give the default mute policy.
+
+    Returns ``(audio_kind, mute)``: ``"speech"`` + mute=True when real words
+    cover >= _VIDEO_SPEECH_FRAC of the span (stray talk under the shot); else
+    ``"ambient"`` + mute=False (room tone / sfx / possible music -- kept, since
+    we can't safely tell music from noise and silencing it would be worse). None
+    when there's no transcript to judge (leave the audio alone)."""
+    if source is None or not getattr(source, "words", None):
+        return None, False
+    span = max(1, out_ms - in_ms)
+    talk = 0
+    for w in source.words:
+        if w.get("is_filler"):
+            continue
+        ov = max(0, min(out_ms, int(w.get("end_ms", 0))) - max(in_ms, int(w.get("start_ms", 0))))
+        talk += ov
+    if talk / span >= _VIDEO_SPEECH_FRAC:
+        return "speech", True
+    return "ambient", False
+
+
 def _video_span_at(level_params: EnergyParams, channel: str, core_in: int,
                    core_out: int, peak_ms: int, lead: float, field, clip,
                    *, can_split: bool) -> Tuple[int, int, Optional[List[Tuple[int, int]]]]:
@@ -224,6 +252,8 @@ def combine_video(atoms: List[Atom], params: EnergyParams, field, clip,
             if out_ms <= in_ms or score < _MIN_VIDEO_SCORE:
                 continue
 
+            audio_kind, mute = _audio_policy(source, in_ms, out_ms)
+
             out.append(hc.HeroCut(
                 hero_id=f"{clip.file_id[:8]}:{channel[:2]}{ci}",
                 file_id=clip.file_id,
@@ -240,6 +270,8 @@ def combine_video(atoms: List[Atom], params: EnergyParams, field, clip,
                 framing=hc._framing_facet(clip, in_ms, out_ms, best.region),
                 summary=best.summary,
                 subject=best.subject,
+                audio=audio_kind,
+                mute=mute,
             ))
     return out
 
