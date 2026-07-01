@@ -1,35 +1,31 @@
 """
-Conversational L3: a chat-first assistant over a project's footage + current edit.
+Conversational L3: a chat-first, AGENTIC editor over a project's footage + edit.
 
 Design note (why it's shaped this way): a strong model edits best with a NEAR-
-EMPTY frame and room to think in prose -- the same way it does when you just hand
-it the footage and ask. Heavy rule-lists, a controlled vocabulary and a "return
-JSON" demand turn an editor into a form-filler and cap quality. So the brain just
-THINKS in prose:
+EMPTY frame and room to think -- the same way it does when you just hand it the
+footage and ask. So the brain works like a coding agent over a repo: it SEES the
+whole shoot (footage map) and the current edit, and it has TOOLS -- deterministic
+SENSES (``observe``: read_state / predict / validate / diagnose / affordances)
+and edit VERBS (``act``: place / trim / remove / move / set_audio / tighten).
 
-  THINK -- a tiny frame (you're an editor, here's the footage with full lines,
-  here's the timeline) and the model replies naturally in PROSE: it chats,
-  answers, or PROPOSES a cut and ends with its cut list (moments by id, one per
-  line, in play order). This prose is what the user sees.
+Each user turn runs a bounded perceive -> act -> re-perceive loop (``tools``):
+the brain looks, edits the WORKING document, checks its work, and ends with a
+prose reply. There is no propose->confirm round-trip anymore -- edits apply
+directly (the user sees the timeline update + can undo via version history),
+exactly like a coding agent editing files. ``respond`` returns the prose reply +
+the mutated document; the caller persists it as a new version when it changed.
 
-We then HARVEST that cut list DETERMINISTICALLY out of the reply (no second LLM
-guessing intent): every map-valid moment id the brain named, in order. A non-empty
-harvest is a PROPOSAL -- the caller shows the user a Confirm button and only
-applies (re-harvesting the same reply) once they say yes.
-
-Returns ``{reply, proposal, brief}``; the caller owns persistence and, on
-confirm, compiling the proposal. Fails OPEN: any LLM/parse error degrades to a
-plain chat reply with no proposal, so a turn never hard-fails.
+Fails OPEN: any LLM/tool error degrades to a plain chat reply with no document
+change, so a turn never hard-fails.
 """
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 from app.config import get_settings
-from app.services.l3 import arrange, footage_map, store
+from app.services.l3 import arrange, footage_map, observe, store, tools
 from app.services.llm import LLMClient, get_llm
 
 logger = logging.getLogger(__name__)
@@ -44,40 +40,50 @@ _MAP_CHAR_CAP = 200_000
 @dataclass
 class ConverseResult:
     reply: str
-    # The chat brain IS the editor. When it proposes a cut we HARVEST its cut list
-    # deterministically out of its own reply (every map-valid moment id it named,
-    # in play order) -- no second LLM guessing intent. A non-empty proposal means
-    # the user is shown a Confirm button; nothing is applied until they say yes.
-    proposal: List[dict] = field(default_factory=list)
-    brief: str = ""           # one-line label for the proposed edit
+    # The mutated working document + whether this turn changed it. The caller
+    # persists a new version when ``changed`` is True.
+    document: Optional[dict] = None
+    changed: bool = False
+    # When the editor asked the user to decide (ask_user), the turn paused: these
+    # questions are surfaced and the user's next message is the answer.
+    questions: List[dict] = field(default_factory=list)
+    awaiting_user: bool = False
 
 
-# THINK frame: deliberately minimal. Give the editor the footage + the way to
-# refer to it, the chat etiquette (propose -> confirm -> apply), and then get out
-# of its way. No taste rules, no arc lecture, no JSON demand -- those narrow a
-# strong model and lower quality (verified). It thinks and replies in prose.
-_THINK_SYSTEM = (
-    "You are EDSO, a sharp video editor talking with someone about their footage. "
-    "Below you can see the WHOLE shoot -- every clip and every usable moment, with "
-    "the COMPLETE line of what is said -- and the CURRENT TIMELINE of the edit so "
-    "far.\n\n"
+# The agentic frame: you're an editor working ON an edit with TOOLS. Minimal
+# taste rules -- give it its senses + verbs, the channel model, and the way to
+# refer to footage, then get out of its way.
+_LOOP_SYSTEM = (
+    "You are EDSO, a sharp video editor. You are working ON an edit with real "
+    "TOOLS, like a coding agent editing a repo. Below you can see the WHOLE shoot "
+    "-- every clip and every usable moment, with the COMPLETE line of what is said "
+    "-- and the CURRENT TIMELINE of the edit so far.\n\n"
     "Each moment reads like: clip8:m07 speech .82 [0:14-0:21] \"the full line\" · "
     "nrg:calm|balanced · dup:tg4*\n"
     "  - refer to a moment by its full id (e.g. ab12cd34:m07).\n"
     "  - the quoted text is the complete line -- judge from it.\n"
-    "  - nrg = the energy LEVELS you can take it at (broad = the whole thing .. "
-    "sharp = tightest); pick what fits.\n"
+    "  - nrg = the energy LEVELS (broad = the whole thing .. sharp = tightest).\n"
     "  - dup:tgN = the same content as others in that group (another take/angle); "
-    "use only one of them.\n\n"
-    "Just talk by default -- answer, discuss, give your honest editorial opinion. "
-    "Don't change the edit on your own. When they want a change (or ask you to "
-    "build the edit), edit like a real editor who watched everything and PROPOSE "
-    "the cut: a sentence on the idea, then END your message with your cut list -- "
-    "the moments in PLAY ORDER, each on its OWN LINE led by its id, with a word on "
-    "why. The user gets a Confirm button to apply it, so present the cut as a "
-    "proposal -- don't claim it's already applied. Use only ids that appear below. "
-    "(By default each cut plays in sequence; if you specifically want a silent "
-    "video cutaway laid over the ongoing audio, just say so and where.)"
+    "use only one.\n\n"
+    "HOW YOU WORK. When the user just wants to talk or asks a question, answer in "
+    "prose and DON'T touch the edit. When they want a change (or to build the "
+    "edit), use your tools: OBSERVE first (read_state / diagnose / affordances / "
+    "predict), then ACT (place / trim / remove / move / set_audio / tighten / "
+    "split_screen), then read_state again to check your work. Your edits apply "
+    "DIRECTLY -- the user "
+    "watches the timeline update and can undo -- so don't ask for confirmation or "
+    "say 'I will'; just do it, then tell them what you did in a sentence or two.\n\n"
+    "CHANNELS. The main line is V1 video + A1 audio, playing in sequence -- that's "
+    "`place` with channel V1. A silent video cutaway laid over the ongoing A1 audio "
+    "rides V2 (`place` channel V2). A music/SFX bed rides A2. Default is just "
+    "V1/A1; only add a cutaway or bed when it earns its place. Showing V1 and a "
+    "second source at the SAME time (side-by-side, stacked, or picture-in-picture) "
+    "is `split_screen` over a program window. Use only ids that appear below.\n\n"
+    "ASKING. Most calls are yours to make -- just make them. But when a choice is "
+    "genuinely the USER's (a split-screen or PiP layout, the delivery aspect / "
+    "framing, a big pacing tradeoff), use `ask_user` with 2+ concrete options "
+    "BEFORE acting -- that ends your turn and you resume when they answer. Don't "
+    "ask about things you can reasonably decide."
 )
 
 def _context_block(file_ids: List[str], document: Optional[dict]) -> str:
@@ -96,14 +102,32 @@ def _context_block(file_ids: List[str], document: Optional[dict]) -> str:
     return "\n\n".join(parts)
 
 
-def respond(thread_id: str, *, llm: Optional[LLMClient] = None) -> ConverseResult:
-    """Produce the assistant's reply to the latest user turn on a thread.
+def _seed_document(file_ids: List[str]) -> dict:
+    """An empty Edit Document the agentic loop builds onto (place/... verbs).
+    Mirrors the document shape the rest of the system reads so preview / render
+    read it identically once resolved (via ``observe.resolve_doc``)."""
+    return {
+        "brief": {"goal": None, "aspect": "landscape", "target_duration_s": None, "assumptions": []},
+        "format": {"aspect": "landscape"},
+        "spine": {"regions": []},
+        "outline": [],
+        "timeline": [],
+        "operations": [],
+        "open_questions": [],
+        "summary": "",
+        "notes": [],
+        "diagnostics": {"engine": "agentic_loop"},
+    }
 
-    THINK: the editor reads the footage + timeline and replies in prose -- it
-    chats, answers, or proposes a cut (ending with its cut list). We then HARVEST
-    that cut list deterministically out of the reply (``harvest_cut_list``); a
-    non-empty harvest is a PROPOSAL the user confirms before anything is applied.
-    No second LLM guesses intent -- the Confirm button is the intent."""
+
+def respond(thread_id: str, *, llm: Optional[LLMClient] = None) -> ConverseResult:
+    """Run one agentic turn on a thread.
+
+    The editor SEES the footage map + current edit and drives a bounded tool loop
+    (``tools.run_edit_loop``): observe -> act -> re-observe, mutating a WORKING
+    copy of the Edit Document, then replies in prose. Returns the reply + the
+    mutated document + whether it changed; the caller persists a new version when
+    it did. Fails OPEN -- any error degrades to a plain reply, no doc change."""
     settings = get_settings()
     if llm is None:
         llm = get_llm(provider=settings.autoedit_provider or None,
@@ -116,94 +140,22 @@ def respond(thread_id: str, *, llm: Optional[LLMClient] = None) -> ConverseResul
     if not messages:
         return ConverseResult(reply="Tell me what you'd like to do with these clips.")
 
-    system = _THINK_SYSTEM + "\n\n" + _context_block(file_ids, document)
+    working = document if isinstance(document, dict) else _seed_document(file_ids)
+    system = _LOOP_SYSTEM + "\n\n" + _context_block(file_ids, document)
     max_tokens = settings.autoedit_max_output_tokens
-    # cache_system keeps the resident map cached across turns (Anthropic/Gemini;
-    # a no-op on OpenAI) so multi-turn chat stays cheap and fast.
     try:
-        resp = llm.run(system=system, messages=messages,
-                       max_tokens=max_tokens, cache_system=True)
+        ctx = observe.build_context(file_ids)
+        result = tools.run_edit_loop(llm, system=system, messages=messages,
+                                     ctx=ctx, document=working, max_tokens=max_tokens)
     except Exception:
-        logger.exception("converse: think call failed for thread %s", thread_id)
+        logger.exception("converse: agentic loop failed for thread %s", thread_id)
         return ConverseResult(reply="Sorry -- I hit an error there. Mind trying again?")
 
-    reply = (resp.text or "").strip() or "…"
-    proposal = harvest_cut_list(reply, file_ids)
-    brief = _latest_user_text(messages) if proposal else ""
-    return ConverseResult(reply=reply, proposal=proposal, brief=brief)
-
-
-# --------------------------------------------------------------------------
-# Deterministic cut-list harvest
-# --------------------------------------------------------------------------
-# A moment id is <fid8>:m## (see footage_map). Match it generously and validate
-# every hit against the live map index, so prose can never inject a bogus cut.
-_ID_RE = re.compile(r"\b[0-9A-Za-z]{4,}:m\d{1,3}\b")
-# A "cut-list line" leads with an id after an optional number/bullet + markdown
-# bold -- exactly the shape the brain is told to end with (one moment per line).
-_LINE_ID_RE = re.compile(r"^\s*(?:\d{1,3}[.)]|[-*•])?\s*\*{0,2}\s*([0-9A-Za-z]{4,}:m\d{1,3})\b")
-_LEVELS = ("broad", "calm", "balanced", "tight", "sharp")
-
-
-def harvest_cut_list(reply: str, file_ids: List[str]) -> List[dict]:
-    """Pull the editor's proposed cut list out of its own prose, deterministically.
-
-    Strategy (verified the brain emits valid ids reliably): prefer the brain's
-    FINAL list -- lines that LEAD with a moment id -- since that's the authoritative
-    play order; fall back to every id mentioned, in first-mention order. Each id is
-    validated against the live footage map (bogus/hallucinated ids are dropped),
-    deduped, and given the energy level the brain named on that line if any (else
-    the compiler defaults to balanced). What the user saw the brain pick is exactly
-    what gets cut -- no LLM re-guess. Returns [] on any failure (treated as chat)."""
-    if not reply or not file_ids:
-        return []
-    try:
-        # assemble_map returns a wrapper; the clip/moment tree the index walks
-        # lives under "struct".
-        struct = footage_map.assemble_map(file_ids).get("struct") or {}
-        index = arrange._MapIndex(struct)
-    except Exception:
-        logger.exception("converse: map build failed during harvest")
-        return []
-
-    candidates = _list_line_candidates(reply) or _inline_candidates(reply)
-    out: List[dict] = []
-    seen: set[str] = set()
-    for ref, context in candidates:
-        if ref in seen or not index.has(ref):
-            continue
-        seen.add(ref)
-        entry: dict = {"ref": ref}
-        ctx = context.lower()
-        level = next((lv for lv in _LEVELS if lv in ctx and index.level_ok(ref, lv)), "")
-        if level:
-            entry["level"] = level
-        out.append(entry)
-    return out
-
-
-def _list_line_candidates(reply: str) -> List[tuple[str, str]]:
-    """(id, rest-of-line) for every line that LEADS with a moment id."""
-    pairs: List[tuple[str, str]] = []
-    for line in reply.splitlines():
-        m = _LINE_ID_RE.match(line)
-        if m:
-            pairs.append((m.group(1), line[m.end():]))
-    return pairs
-
-
-def _inline_candidates(reply: str) -> List[tuple[str, str]]:
-    """(id, short trailing window) for every id mentioned anywhere in the reply."""
-    pairs: List[tuple[str, str]] = []
-    for m in _ID_RE.finditer(reply):
-        pairs.append((m.group(0), reply[m.end():m.end() + 32]))
-    return pairs
-
-
-def _latest_user_text(messages: List[dict]) -> str:
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            text = m.get("content")
-            if isinstance(text, str) and text.strip():
-                return text.strip()[:200]
-    return "edit"
+    reply = (result.reply or "").strip() or "…"
+    if result.changed:
+        try:
+            observe.resolve_doc(result.document, ctx)
+        except Exception:
+            logger.exception("converse: resolve after edit failed for thread %s", thread_id)
+    return ConverseResult(reply=reply, document=result.document, changed=result.changed,
+                          questions=result.questions, awaiting_user=result.awaiting_user)

@@ -120,6 +120,22 @@ export function deleteFile(id: string, token: string) {
   return request<void>(`/api/files/${id}`, { method: "DELETE", token });
 }
 
+/** Force a fresh L2 perception run for one clip (on-demand backfill). */
+export function reanalyzeFile(id: string, token: string) {
+  return request<{ file_id: string; state: string }>(
+    `/api/files/${id}/reanalyze`,
+    { method: "POST", token }
+  );
+}
+
+/** Re-enqueue L2 for every clip whose perception predates the current schema. */
+export function reanalyzeStale(token: string) {
+  return request<{ candidates: number; queued: number; results: Record<string, string> }>(
+    `/api/files/reanalyze-stale`,
+    { method: "POST", token }
+  );
+}
+
 export function getFilePlaybackUrl(id: string, token: string) {
   return request<{ url: string }>(`/api/files/${id}/playback`, { token });
 }
@@ -430,6 +446,14 @@ export interface LayerMotion {
   dur_ms: number;
 }
 
+/** A split/PiP cell: a normalized sub-rect of the canvas (0..1). */
+export interface DestRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 /** Per-layer geometric framing; mirrors backend `layers.solve_transform`. */
 export interface LayerTransform {
   rotate?: 0 | 90 | 180 | 270;
@@ -438,7 +462,20 @@ export interface LayerTransform {
   zoom?: number;
   focus?: LayerFocus;
   motion?: LayerMotion;
-  dest?: "full";
+  dest?: "full" | DestRect;
+}
+
+/** A time-scoped spatial layout (split-screen / PiP): mirrors backend
+ * `document.layout_regions`. Cells map a template slot to a layer selector
+ * ("spine" for the main line, or a place_video op_id). */
+export type LayoutTemplate = "split_h" | "split_v" | "pip";
+
+export interface LayoutRegion {
+  region_id: string;
+  from_ms: number;
+  to_ms: number;
+  template: LayoutTemplate;
+  cells: Record<string, { layer: string }>;
 }
 
 export interface EditFormat {
@@ -507,7 +544,6 @@ export interface EditDiagnostics {
 
 export type EditOperationType =
   | "place_video"
-  | "pick_angle"
   | "place_audio"
   | "split_edit"
   | "level";
@@ -517,7 +553,7 @@ export interface EditOperation {
   type: EditOperationType;
   rationale?: string | null;
   warnings?: string[];
-  // place_video / pick_angle / place_audio
+  // place_video / place_audio
   source_file_id?: string;
   src_in_ms?: number;
   src_out_ms?: number;
@@ -582,6 +618,7 @@ export interface EditDocument {
   format?: EditFormat;
   spine?: EditSpine | null;
   operations?: EditOperation[];
+  layout_regions?: LayoutRegion[];
   resolved?: ResolvedTimeline | null;
   outline?: EditBeat[];
   timeline?: EditSegment[];
@@ -636,31 +673,31 @@ export function createEditThread(
   );
 }
 
+export interface ThreadQuestion {
+  id: string;
+  prompt: string;
+  options: string[];
+  allow_multiple?: boolean;
+}
+
 export interface ThreadMessageResult {
   reply: string;
-  // The assistant proposed a cut (its cut list was harvested deterministically).
-  // The client shows a Confirm button; nothing is applied until the user says yes.
-  proposal: boolean;
-  proposal_count: number;
+  // The agentic editor applies edits DIRECTLY during the turn (no confirm). When
+  // the turn changed the edit, `changed` is true and `document_version` is the
+  // new version to refresh the timeline from.
+  changed: boolean;
+  document_version: number | null;
+  // When the editor needs a user-owned decision (ask_user), the turn PAUSES:
+  // `awaiting_user` is true and `questions` are shown as pickable options; the
+  // user's answer is just their next message.
+  awaiting_user: boolean;
+  questions: ThreadQuestion[];
 }
 
 export function sendThreadMessage(id: string, text: string, token: string) {
   return request<ThreadMessageResult>(`/api/edit/threads/${id}/messages`, {
     method: "POST",
     body: JSON.stringify({ text }),
-    token,
-  });
-}
-
-export interface ApplyEditResult {
-  applied: boolean;
-  version: number;
-  cuts: number;
-}
-
-export function applyThreadEdit(id: string, token: string) {
-  return request<ApplyEditResult>(`/api/edit/threads/${id}/apply`, {
-    method: "POST",
     token,
   });
 }

@@ -29,6 +29,7 @@ import { useProgramPlayer } from "./use-program-player";
 export function CompositePreview({ token }: { token: string | undefined }) {
   const timeline = useEditDocStore((s) => s.timeline);
   const operations = useEditDocStore((s) => s.operations);
+  const layoutRegions = useEditDocStore((s) => s.layoutRegions);
   const durations = useEditDocStore((s) => s.durations);
   const aspect = useEditDocStore((s) => s.aspect);
   const mergeDurations = useEditDocStore((s) => s.mergeDurations);
@@ -36,9 +37,12 @@ export function CompositePreview({ token }: { token: string | undefined }) {
   const resolved: ResolvedTimeline | null = useMemo(
     () =>
       timeline.length
-        ? resolveTimeline({ timeline, operations, format: { aspect } }, durations)
+        ? resolveTimeline(
+            { timeline, operations, layout_regions: layoutRegions, format: { aspect } },
+            durations
+          )
         : null,
-    [timeline, operations, durations, aspect]
+    [timeline, operations, layoutRegions, durations, aspect]
   );
 
   // Frame box ratio for the program monitor, matching the delivery aspect.

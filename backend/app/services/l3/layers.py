@@ -28,7 +28,6 @@ from typing import Dict, List, Optional, Tuple
 
 # Z bands so layer kinds stack predictably regardless of insertion order.
 Z_SPINE_VIDEO = 0
-Z_ANGLE = 5            # a synced multicam angle re-pointing the spine picture
 Z_COVERAGE = 10        # video laid over the spine (coverage / cutaway / overlay)
 DEFAULT_LAYOUT = "full_frame"
 
@@ -79,11 +78,41 @@ FIT_COVER = "cover"        # fill the canvas, crop the overflow
 FIT_CONTAIN = "contain"    # fit inside the canvas, letterbox the remainder
 FITS = (FIT_COVER, FIT_CONTAIN)
 ANCHORS = ("center", "left", "right", "top", "bottom")
-DEST_FULL = "full"         # whole canvas; sub-rects (split/PiP) are deferred
+DEST_FULL = "full"         # whole canvas; a sub-rect dict {x,y,w,h} = split/PiP cell
 
 DEFAULT_ROTATE = 0
 DEFAULT_ANCHOR = "center"
 DEFAULT_ZOOM = 1.0
+
+# Spatial layout TEMPLATES (Phase 5): a template + cell name -> a normalized dest
+# rect (x, y, w, h in 0..1 canvas coords). Split-screen and PiP are the SAME
+# layered primitive as coverage -- a video layer painted into a sub-rect of the
+# canvas instead of the full frame. A time-scoped LAYOUT REGION on the document
+# assigns cells to layers (spine / a place_video op) over a program window, and
+# the resolver slices + stamps the dest rect onto the layers in that window.
+LAYOUT_TEMPLATES: Dict[str, Dict[str, Tuple[float, float, float, float]]] = {
+    "split_h": {"left": (0.0, 0.0, 0.5, 1.0), "right": (0.5, 0.0, 0.5, 1.0)},
+    "split_v": {"top": (0.0, 0.0, 1.0, 0.5), "bottom": (0.0, 0.5, 1.0, 0.5)},
+    "pip": {"base": (0.0, 0.0, 1.0, 1.0), "inset": (0.66, 0.66, 0.32, 0.32)},
+}
+
+
+def _rect(t: Tuple[float, float, float, float]) -> dict:
+    x, y, w, h = t
+    return {"x": round(x, 4), "y": round(y, 4), "w": round(w, 4), "h": round(h, 4)}
+
+
+def solve_layout(template: str) -> Dict[str, dict]:
+    """A layout template -> {cell_name: dest_rect}. Empty for an unknown template
+    (the region is then a no-op -- never an error that could break a render)."""
+    cells = LAYOUT_TEMPLATES.get(template)
+    return {name: _rect(t) for name, t in cells.items()} if cells else {}
+
+
+def is_rect(dest) -> bool:
+    """True when a transform `dest` is a real sub-rect (split/PiP cell) rather
+    than the full-canvas default."""
+    return isinstance(dest, dict) and all(k in dest for k in ("x", "y", "w", "h"))
 
 # Phase 3 -- animated motion. A `motion` path makes scale + focus VARY over the
 # layer's program span (push-in, pull-out, follow). It is a from->to move (two
@@ -295,14 +324,23 @@ class ResolvedTimeline:
     aspect: str = DEFAULT_ASPECT   # delivery frame shape; render + preview read it
 
     def video_at(self, ms: int) -> Optional[VideoLayer]:
-        """The picture shown at `ms`: the highest-z full-frame opaque layer
-        covering it. (Spatial compositing of partial layouts is deferred.)"""
+        """The single top picture shown at `ms` (highest-z covering layer). For
+        split/PiP use ``video_stack_at`` -- multiple cells show at once."""
         shown: Optional[VideoLayer] = None
         for v in self.video_layers:
             if v.prog_start_ms <= ms < v.prog_end_ms:
                 if shown is None or v.z > shown.z:
                     shown = v
         return shown
+
+    def video_stack_at(self, ms: int) -> List[VideoLayer]:
+        """Every video layer covering `ms`, bottom->top by z -- the compositing
+        stack. With split/PiP, several cells (each with its own dest rect) are
+        live at once; without, this is just the spine (+ any coverage) layer."""
+        return sorted(
+            [v for v in self.video_layers if v.prog_start_ms <= ms < v.prog_end_ms],
+            key=lambda v: v.z,
+        )
 
     def audio_at(self, ms: int) -> List[AudioLayer]:
         """All audio layers sounding at `ms` (they sum)."""
@@ -357,11 +395,6 @@ def prog_to_source(spans: List[SpineSpan], prog_ms: int) -> Optional[Tuple[dict,
     return last.seg, int(last.seg["out_ms"]), last
 
 
-def covering_segments(spans: List[SpineSpan], from_ms: int, to_ms: int) -> List[SpineSpan]:
-    """Spine spans overlapping a program range."""
-    return [s for s in spans if s.prog_start_ms < to_ms and s.prog_end_ms > from_ms]
-
-
 # --------------------------------------------------------------------------
 # Resolution: spine + operations -> layers
 # --------------------------------------------------------------------------
@@ -403,6 +436,75 @@ def _apply_split_edits(
         # Next audio starts at the new boundary.
         cur_a.prog_start_ms = max(0, boundary)
         cur_a.src_in_ms = _clamp(cur_a.src_in_ms + offset, 0, cur_a.src_out_ms)
+
+
+def _slice_video(v: VideoLayer, ps: int, pe: int, dest: Optional[dict]) -> VideoLayer:
+    """A sub-span [ps, pe) of a video layer, source-mapped, with an optional dest
+    rect stamped on (and fit forced to cover so a split/PiP cell fills, not
+    letterboxes). Used to carve the spine where a layout region overlaps it."""
+    src_in = v.src_in_ms + (ps - v.prog_start_ms)
+    src_out = v.src_in_ms + (pe - v.prog_start_ms)
+    tf = dict(v.transform or {})
+    if dest is not None:
+        tf["dest"] = dest
+        tf["fit"] = FIT_COVER
+    suffix = "" if (ps == v.prog_start_ms and pe == v.prog_end_ms) else f"__{ps}"
+    return VideoLayer(
+        layer_id=f"{v.layer_id}{suffix}", source_file_id=v.source_file_id,
+        src_in_ms=src_in, src_out_ms=src_out, prog_start_ms=ps, prog_end_ms=pe,
+        z=v.z, layout=v.layout, opacity=v.opacity, kind=v.kind, op_id=v.op_id,
+        transform=tf,
+    )
+
+
+def _dest_spine_window(video: List[VideoLayer], f: int, t: int, dest: dict) -> List[VideoLayer]:
+    """Stamp `dest` onto the SPINE picture across [f, t), slicing spine layers that
+    straddle the window (the parts outside keep the full frame). Coverage/op layers
+    are untouched here (they're addressed by op_id)."""
+    out: List[VideoLayer] = []
+    for v in video:
+        if v.kind != "spine" or v.prog_end_ms <= f or v.prog_start_ms >= t:
+            out.append(v)
+            continue
+        os_, oe = max(v.prog_start_ms, f), min(v.prog_end_ms, t)
+        if v.prog_start_ms < os_:
+            out.append(_slice_video(v, v.prog_start_ms, os_, None))
+        out.append(_slice_video(v, os_, oe, dest))
+        if oe < v.prog_end_ms:
+            out.append(_slice_video(v, oe, v.prog_end_ms, None))
+    return out
+
+
+def _apply_layout_regions(video: List[VideoLayer], regions: List[dict]) -> List[VideoLayer]:
+    """Turn each layout region into dest rects on the layers it names.
+
+    A region is {from_ms, to_ms, template, cells:{cell_name:{layer:"spine"|op_id}}}.
+    For each cell we look up the template's rect and stamp it: the "spine" cell
+    slices the picture across the window; an op cell stamps its place_video layer.
+    Unknown templates/cells are skipped (never fatal)."""
+    for r in regions:
+        template = str(r.get("template") or "")
+        rects = solve_layout(template)
+        if not rects:
+            continue
+        try:
+            f, t = int(r.get("from_ms")), int(r.get("to_ms"))
+        except (TypeError, ValueError):
+            continue
+        if t <= f:
+            continue
+        for cell_name, sel in (r.get("cells") or {}).items():
+            rect = rects.get(cell_name)
+            if rect is None:
+                continue
+            layer_sel = (sel or {}).get("layer") if isinstance(sel, dict) else None
+            if layer_sel == "spine":
+                video = _dest_spine_window(video, f, t, rect)
+            elif layer_sel:
+                for v in video:
+                    if v.op_id == layer_sel or v.layer_id == layer_sel:
+                        v.transform = {**(v.transform or {}), "dest": rect, "fit": FIT_COVER}
+    return video
 
 
 def resolve(document: dict, durations: Optional[Dict[str, int]] = None) -> ResolvedTimeline:
@@ -461,20 +563,6 @@ def resolve(document: dict, durations: Optional[Dict[str, int]] = None) -> Resol
                 kind="coverage", op_id=op["op_id"],
                 transform=solve_transform(document, op.get("transform")),
             ))
-        elif t == "pick_angle":
-            # A synced multicam angle re-points the SPINE picture (a normal cut),
-            # so it resolves as a spine-band video layer just above the base
-            # spine -- not as coverage. Audio is untouched (stays the spine).
-            video.append(VideoLayer(
-                layer_id=op["op_id"],
-                source_file_id=op["source_file_id"],
-                src_in_ms=int(op["src_in_ms"]), src_out_ms=int(op["src_out_ms"]),
-                prog_start_ms=int(op["from_ms"]), prog_end_ms=int(op["to_ms"]),
-                z=int(op.get("z", Z_ANGLE)),
-                layout=op.get("layout", DEFAULT_LAYOUT),
-                opacity=1.0, kind="angle", op_id=op["op_id"],
-                transform=solve_transform(document, op.get("transform")),
-            ))
         elif t == "place_audio":
             audio.append(AudioLayer(
                 layer_id=op["op_id"],
@@ -485,6 +573,11 @@ def resolve(document: dict, durations: Optional[Dict[str, int]] = None) -> Resol
                 gain_db=float(op.get("gain_db", 0.0)),
                 kind=op.get("audio_kind", "bed"), op_id=op["op_id"],
             ))
+
+    # --- spatial layout regions (split-screen / PiP): stamp dest sub-rects ---
+    regions = document.get("layout_regions") or []
+    if regions:
+        video = _apply_layout_regions(video, regions)
 
     # --- ducking + level automation: dialogue presence ducks beds ---
     _apply_levels(audio, operations)
@@ -539,100 +632,3 @@ def _apply_levels(audio_layers: List[AudioLayer], operations: List[dict]) -> Non
                 a.gain_db = float(op["gain_db"])
 
 
-# --------------------------------------------------------------------------
-# Spine-lock validation (operations are legal-by-construction)
-# --------------------------------------------------------------------------
-#
-# The spine declares, per region, which channels are LOCKED (irreplaceable).
-# Until regions carry explicit program-time bounds, a single region governs the
-# whole timeline; with several, we combine conservatively (a lock anywhere
-# locks globally). The safe default -- no spine, or a `sync` region -- keeps
-# A/V coupled, so decoupling operations are refused unless positively allowed.
-
-def _regions(document: dict) -> List[dict]:
-    spine = document.get("spine") or {}
-    return spine.get("regions") or []
-
-
-def video_is_free(document: dict) -> bool:
-    """True only if the declared spine positively frees the video channel
-    (dialogue/music spine, or visual with video NOT locked). No spine or any
-    `sync`/video-locked region => not free (coupling is the safe default)."""
-    regions = _regions(document)
-    if not regions:
-        return False
-    for r in regions:
-        if r.get("kind") == "sync":
-            return False
-        if "video" in (r.get("locked_channels") or []):
-            return False
-    return True
-
-
-def av_is_coupled(document: dict) -> bool:
-    """True when A and V must stay together (no spine, or a `sync` region) --
-    split edits and coverage are then refused."""
-    regions = _regions(document)
-    if not regions:
-        return True
-    return any(r.get("kind") == "sync" for r in regions)
-
-
-def protected_windows_for(document: dict, file_id: str) -> List[Tuple[int, int, str]]:
-    """Do-not-cover spans declared on the spine for a given source clip."""
-    out: List[Tuple[int, int, str]] = []
-    for r in _regions(document):
-        for w in r.get("protected_windows") or []:
-            if w.get("file_id") == file_id:
-                out.append((int(w.get("start_ms", 0)), int(w.get("end_ms", 0)),
-                            w.get("reason", "")))
-    return out
-
-
-def coverage_conflicts(
-    document: dict, spans: List[SpineSpan], from_ms: int, to_ms: int
-) -> Optional[str]:
-    """Reason a video-coverage over [from_ms,to_ms] would be illegal, else None.
-
-    Checks: (1) video must be freed by the spine, (2) the covered program range
-    must not overlap a protected window of the spine clip(s) underneath it.
-    """
-    if av_is_coupled(document):
-        return "spine keeps A/V coupled (sync / no spine); cannot cover the picture"
-    if not video_is_free(document):
-        return "spine locks the video channel; the picture is the content and must show"
-    for s in covering_segments(spans, from_ms, to_ms):
-        seg = s.seg
-        ov_start = max(from_ms, s.prog_start_ms)
-        ov_end = min(to_ms, s.prog_end_ms)
-        src_a = int(seg["in_ms"]) + (ov_start - s.prog_start_ms)
-        src_b = int(seg["in_ms"]) + (ov_end - s.prog_start_ms)
-        for (ws, we, reason) in protected_windows_for(document, seg["file_id"]):
-            if _overlaps(src_a, src_b, ws, we):
-                return (f"covers a protected window in {seg['file_id']} "
-                        f"[{ws}-{we}ms]{f': {reason}' if reason else ''}")
-    return None
-
-
-def angle_conflicts(
-    document: dict, spans: List[SpineSpan], from_ms: int, to_ms: int
-) -> Optional[str]:
-    """Reason a multicam ANGLE switch over [from_ms,to_ms] would be illegal, else
-    None.
-
-    Unlike coverage, an angle switch is legal on ANY spine kind (a synced angle
-    is the same moment, so A/V stay coherent) -- the sync-group membership
-    requirement is enforced by the executor. The only document-level block is a
-    protected window of the spine clip underneath (switching away would hide
-    the very thing the window protects)."""
-    for s in covering_segments(spans, from_ms, to_ms):
-        seg = s.seg
-        ov_start = max(from_ms, s.prog_start_ms)
-        ov_end = min(to_ms, s.prog_end_ms)
-        src_a = int(seg["in_ms"]) + (ov_start - s.prog_start_ms)
-        src_b = int(seg["in_ms"]) + (ov_end - s.prog_start_ms)
-        for (ws, we, reason) in protected_windows_for(document, seg["file_id"]):
-            if _overlaps(src_a, src_b, ws, we):
-                return (f"covers a protected window in {seg['file_id']} "
-                        f"[{ws}-{we}ms]{f': {reason}' if reason else ''}")
-    return None

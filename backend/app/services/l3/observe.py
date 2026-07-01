@@ -1,0 +1,389 @@
+"""
+Observe: the brain's deterministic SENSES over an edit -- no VLM, no LLM.
+
+Where ``act`` mutates the document, ``observe`` reads it and reports, so the
+agentic loop can perceive -> act -> re-perceive cheaply (a coding agent reading
+the repo before/after an edit). Every function is a pure projection of the
+document + a per-turn ``EditContext`` (footage map, source durations, clip
+valence) assembled ONCE by ``build_context`` -- the only place that touches the
+DB. The five senses:
+
+  * read_state  -- what the edit IS now (cuts, channels, duration, feel).
+  * predict     -- what a proposed change WOULD do (e.g. length after tightening)
+                   without applying it.
+  * validate    -- structural legality (spans in range, refs real, no bad ops).
+  * diagnose    -- editorial problems worth fixing (sags, jump-cuts, over length,
+                   redundant takes) -- read off feel + the map.
+  * affordances -- what CAN be done, and to what (tighter takes, alternates,
+                   mute toggles, channels) -- the brain's menu.
+
+Feel is delegated to ``feel.simulate`` (also pure). Nothing here renders.
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+import psycopg
+
+from app.config import get_settings
+from app.services.l3 import feel, footage_map, framing, layers
+from app.services.l3.arrange import _MapIndex, _weld_segments
+
+logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------
+# Per-turn context (the ONLY DB access)
+# --------------------------------------------------------------------------
+
+@dataclass
+class EditContext:
+    file_ids: List[str]
+    index: _MapIndex
+    map_struct: dict
+    durations: Dict[str, int]          # file_id -> ms
+    valence_by_file: Dict[str, str]    # file_id -> clip valence
+    dup_groups: List[dict] = field(default_factory=list)
+
+    @property
+    def meta_by_ref(self) -> Dict[str, dict]:
+        """moment_id -> moment node (speaker / channel / variants / flags)."""
+        return self.index.moments
+
+
+def _valence_by_file(file_ids: List[str]) -> Dict[str, str]:
+    if not file_ids:
+        return {}
+    try:
+        with psycopg.connect(get_settings().database_url, autocommit=True) as conn:
+            rows = conn.execute(
+                "select file_id::text, perception->>'valence' "
+                "from clip_perception where file_id = any(%s::uuid[])",
+                (file_ids,),
+            ).fetchall()
+        return {fid: v for fid, v in rows if v}
+    except Exception:
+        logger.exception("observe: valence lookup failed (continuing without)")
+        return {}
+
+
+def build_context(file_ids: List[str]) -> EditContext:
+    """Assemble the per-turn context once (footage map + durations + valence).
+    All DB reads live here; the sense functions stay pure over the result."""
+    fmap = footage_map.assemble_map(file_ids) if file_ids else {}
+    map_struct = fmap.get("struct") or {"clips": []}
+    durations: Dict[str, int] = {}
+    try:
+        from app.services.render.tasks import _durations
+        durations = _durations(file_ids)
+    except Exception:
+        logger.exception("observe: duration lookup failed (continuing)")
+    return EditContext(
+        file_ids=list(file_ids),
+        index=_MapIndex(map_struct),
+        map_struct=map_struct,
+        durations=durations,
+        valence_by_file=_valence_by_file(file_ids),
+        dup_groups=fmap.get("dup_groups") or [],
+    )
+
+
+def resolve_doc(document: dict, ctx: EditContext) -> dict:
+    """Finalize the working document (in place) after a batch of acts, so preview
+    == render and the timeline reads cleanly:
+      1. WELD the main line -- merge adjacent same-clip source-contiguous cuts
+         into one segment (act appends slices raw; welding removes the redundant
+         hard cuts, matching the old compile path). Jump-cuts / distant slices
+         stay separate by construction.
+      2. bake the reframe transform, then resolve the flat layer set.
+    Reuses the same resolve the manual-edit path uses."""
+    document["timeline"] = _weld_segments(document.get("timeline") or [])
+    try:
+        framing.annotate_document(document)
+    except Exception:
+        logger.exception("observe: framing annotation failed (continuing)")
+    document["resolved"] = layers.resolve(document, ctx.durations).to_dict()
+    return document
+
+
+# --------------------------------------------------------------------------
+# 1. read_state
+# --------------------------------------------------------------------------
+
+def _fid8(s: str) -> str:
+    return (s or "")[:8]
+
+
+def read_state(document: dict, ctx: EditContext) -> dict:
+    """The current edit at a glance: ordered cuts, channels in use, duration, and
+    the feel narration. This is the brain's primary 'look at the timeline'."""
+    timeline = document.get("timeline") or []
+    ops = document.get("operations") or []
+    report = feel.simulate(timeline, ctx.meta_by_ref, ctx.valence_by_file)
+
+    cuts = []
+    prog = 0
+    for i, seg in enumerate(timeline):
+        dur = int(seg.get("out_ms", 0)) - int(seg.get("in_ms", 0))
+        meta = ctx.meta_by_ref.get(seg.get("ref") or "") or {}
+        snippet = (seg.get("content") or "").replace("\n", " ").strip()
+        if len(snippet) > 60:
+            snippet = snippet[:57] + "..."
+        cuts.append({
+            "pos": i + 1,
+            "seg_id": seg.get("seg_id"),
+            "ref": seg.get("ref"),
+            "file": _fid8(seg.get("file_id") or ""),
+            # Program window (ms) so the brain can target split/PiP by time.
+            "prog_start_ms": prog,
+            "prog_end_ms": prog + dur,
+            "dur_ms": dur,
+            "channel": meta.get("channel") or seg.get("axis"),
+            "speaker": meta.get("speaker"),
+            "muted": bool(seg.get("mute")),
+            "text": snippet,
+        })
+        prog += dur
+
+    channels = ["V1", "A1"] if timeline else []
+    if any(o.get("type") == "place_video" for o in ops):
+        channels.append("V2")
+    if any(o.get("type") == "place_audio" for o in ops):
+        channels.append("A2")
+
+    layouts = [
+        {"region_id": r.get("region_id"), "template": r.get("template"),
+         "from_ms": r.get("from_ms"), "to_ms": r.get("to_ms"),
+         "cells": {c: (s or {}).get("layer") for c, s in (r.get("cells") or {}).items()}}
+        for r in (document.get("layout_regions") or [])
+    ]
+
+    return {
+        "cut_count": len(timeline),
+        "op_count": len(ops),
+        "total_ms": report.total_ms,
+        "channels": channels,
+        "layouts": layouts,
+        "feel": report.narrate(),
+        "feel_detail": report.to_dict(),
+        "cuts": cuts,
+    }
+
+
+# --------------------------------------------------------------------------
+# 2. predict (what a change would do -- without applying it)
+# --------------------------------------------------------------------------
+
+def _seg_ms(seg: dict) -> int:
+    return max(0, int(seg.get("out_ms", 0)) - int(seg.get("in_ms", 0)))
+
+
+def _variant_ms(ctx: EditContext, ref: Optional[str], level: str) -> Optional[int]:
+    """Play length of a moment ref at a level (post dead-air), or None."""
+    m = ctx.index.moments.get(ref or "")
+    if not m:
+        return None
+    v = (m.get("variants") or {}).get(level)
+    if not v:
+        return None
+    return int(v.get("play_ms", int(v.get("out_ms", 0)) - int(v.get("in_ms", 0))))
+
+
+def predict(document: dict, ctx: EditContext, *,
+            set_level: Optional[str] = None,
+            drop: Optional[List[str]] = None,
+            add: Optional[List[dict]] = None) -> dict:
+    """Project the program LENGTH under a proposed change, without mutating:
+      * set_level: re-take every main-line cut at this level (pacing dial);
+      * drop:      seg_ids to remove;
+      * add:       [{ref, level}] cuts to append.
+    Returns {current_ms, projected_ms, delta_ms, note}. Approximate (uses map
+    play lengths; ignores weld overlaps) -- a planning aid, not the final cut."""
+    timeline = document.get("timeline") or []
+    drop_set = set(drop or [])
+    current = sum(_seg_ms(s) for s in timeline)
+    projected = 0
+    for seg in timeline:
+        if seg.get("seg_id") in drop_set:
+            continue
+        if set_level and seg.get("ref"):
+            vm = _variant_ms(ctx, seg.get("ref"), set_level)
+            projected += vm if vm is not None else _seg_ms(seg)
+        else:
+            projected += _seg_ms(seg)
+    for a in (add or []):
+        vm = _variant_ms(ctx, a.get("ref"), a.get("level", "balanced"))
+        projected += vm if vm is not None else 0
+
+    delta = projected - current
+    note = f"{current / 1000:.1f}s -> {projected / 1000:.1f}s ({'+' if delta >= 0 else ''}{delta / 1000:.1f}s)"
+    return {"current_ms": current, "projected_ms": projected, "delta_ms": delta, "note": note}
+
+
+# --------------------------------------------------------------------------
+# 3. validate (structural legality)
+# --------------------------------------------------------------------------
+
+def validate(document: dict, ctx: EditContext) -> List[dict]:
+    """Structural problems that would break resolve/render. Empty list == clean.
+    Each issue: {kind, id, message}."""
+    issues: List[dict] = []
+    for seg in document.get("timeline") or []:
+        sid = seg.get("seg_id")
+        fid = str(seg.get("file_id") or "")
+        in_ms, out_ms = int(seg.get("in_ms", 0)), int(seg.get("out_ms", 0))
+        if not fid:
+            issues.append({"kind": "segment", "id": sid, "message": "missing file_id"})
+        if out_ms <= in_ms:
+            issues.append({"kind": "segment", "id": sid, "message": f"empty span {in_ms}-{out_ms}"})
+        dur = ctx.durations.get(fid)
+        if dur and out_ms > dur:
+            issues.append({"kind": "segment", "id": sid,
+                           "message": f"out {out_ms}ms exceeds source {dur}ms"})
+        if in_ms < 0:
+            issues.append({"kind": "segment", "id": sid, "message": "negative in_ms"})
+
+    program_end = _seg_span_total(document)
+    for op in document.get("operations") or []:
+        oid = op.get("op_id")
+        if op.get("type") == "place_video":
+            frm, to = int(op.get("from_ms", 0)), int(op.get("to_ms", 0))
+            if to <= frm:
+                issues.append({"kind": "op", "id": oid, "message": f"empty overlay window {frm}-{to}"})
+            if program_end and frm > program_end:
+                issues.append({"kind": "op", "id": oid,
+                               "message": f"overlay starts {frm}ms past program end {program_end}ms"})
+            if int(op.get("src_out_ms", 0)) <= int(op.get("src_in_ms", 0)):
+                issues.append({"kind": "op", "id": oid, "message": "empty source span"})
+
+    op_ids = {o.get("op_id") for o in (document.get("operations") or [])}
+    for r in document.get("layout_regions") or []:
+        rid = r.get("region_id")
+        if not layers.LAYOUT_TEMPLATES.get(str(r.get("template") or "")):
+            issues.append({"kind": "layout", "id": rid, "message": f"unknown template {r.get('template')!r}"})
+        if int(r.get("to_ms", 0)) <= int(r.get("from_ms", 0)):
+            issues.append({"kind": "layout", "id": rid, "message": "empty layout window"})
+        for cell, sel in (r.get("cells") or {}).items():
+            layer = (sel or {}).get("layer")
+            if layer and layer != "spine" and layer not in op_ids:
+                issues.append({"kind": "layout", "id": rid,
+                               "message": f"cell {cell} references missing layer {layer}"})
+    return issues
+
+
+def _seg_span_total(document: dict) -> int:
+    return sum(_seg_ms(s) for s in (document.get("timeline") or []))
+
+
+# --------------------------------------------------------------------------
+# 4. diagnose (editorial problems worth fixing)
+# --------------------------------------------------------------------------
+
+def diagnose(document: dict, ctx: EditContext) -> List[dict]:
+    """Editorial findings the brain may want to act on. Each: {severity, message,
+    anchor?}. Derived from feel + the map -- opinion-free about the fix."""
+    timeline = document.get("timeline") or []
+    findings: List[dict] = []
+    if not timeline:
+        return findings
+    report = feel.simulate(timeline, ctx.meta_by_ref, ctx.valence_by_file)
+
+    for lo, hi in feel._same_speaker_runs(report.cuts):
+        findings.append({"severity": "warn", "anchor": f"cuts {lo}-{hi}",
+                         "message": "same speaker back-to-back (jump-cut risk); consider a cutaway or reorder"})
+    for lo, hi in feel._low_energy_runs(report.cuts):
+        findings.append({"severity": "info", "anchor": f"cuts {lo}-{hi}",
+                         "message": "energy sags; consider tightening or trimming"})
+
+    # Target length (from the brief) vs current.
+    target_s = (document.get("brief") or {}).get("target_duration_s")
+    if target_s:
+        cur = report.total_ms / 1000.0
+        if cur > target_s * 1.15:
+            findings.append({"severity": "warn", "anchor": "whole",
+                             "message": f"over target: {cur:.1f}s vs {target_s:.1f}s (tighten or drop)"})
+        elif cur < target_s * 0.7:
+            findings.append({"severity": "info", "anchor": "whole",
+                             "message": f"under target: {cur:.1f}s vs {target_s:.1f}s (widen or add)"})
+
+    # Redundant takes: two main-line cuts from the same dup group.
+    group_of: Dict[str, str] = {}
+    for g in ctx.dup_groups:
+        for mid in g.get("members") or []:
+            group_of[mid] = g.get("group_id")
+    seen_groups: Dict[str, int] = {}
+    for i, seg in enumerate(timeline):
+        gid = group_of.get(seg.get("ref") or "")
+        if gid and gid in seen_groups:
+            findings.append({"severity": "warn", "anchor": f"cuts {seen_groups[gid]+1} & {i+1}",
+                             "message": "same-beat takes both on the main line (redundant); keep the stronger"})
+        elif gid:
+            seen_groups[gid] = i
+    return findings
+
+
+# --------------------------------------------------------------------------
+# 5. affordances (what can be done, to what)
+# --------------------------------------------------------------------------
+
+_LEVELS = ("broad", "calm", "balanced", "tight", "sharp")
+
+
+def affordances(document: dict, ctx: EditContext) -> dict:
+    """The brain's menu: per-cut options (retake levels, alternates, mute) + the
+    global channel state. Purely what's POSSIBLE -- the brain decides what to do."""
+    timeline = document.get("timeline") or []
+    group_members: Dict[str, List[str]] = {}
+    for g in ctx.dup_groups:
+        for mid in g.get("members") or []:
+            group_members[mid] = [x for x in (g.get("members") or []) if x != mid]
+
+    per_cut = []
+    for i, seg in enumerate(timeline):
+        ref = seg.get("ref")
+        meta = ctx.meta_by_ref.get(ref or "") or {}
+        variants = list((meta.get("variants") or {}).keys())
+        cur = seg.get("level")
+        tighter = [L for L in _LEVELS if L in variants and _idx(L) > _idx(cur)]
+        wider = [L for L in _LEVELS if L in variants and _idx(L) < _idx(cur)]
+        is_video = (meta.get("channel") in ("done", "shown")) or seg.get("axis") == "any"
+        per_cut.append({
+            "pos": i + 1,
+            "seg_id": seg.get("seg_id"),
+            "ref": ref,
+            "can_tighten_to": tighter,
+            "can_widen_to": wider,
+            "alternate_takes": group_members.get(ref or "", []),
+            "can_toggle_audio": bool(is_video),
+        })
+
+    # Video moments in the library not already on the main line -> cutaway pool.
+    on_line = {s.get("ref") for s in timeline}
+    cutaway_pool = [
+        m["moment_id"] for clip in ctx.map_struct.get("clips", [])
+        for m in clip.get("moments", []) or []
+        if m.get("channel") in ("done", "shown") and m["moment_id"] not in on_line
+    ]
+    channels = ["V1", "A1"] if timeline else []
+    if any(o.get("type") == "place_video" for o in (document.get("operations") or [])):
+        channels.append("V2")
+    if any(o.get("type") == "place_audio" for o in (document.get("operations") or [])):
+        channels.append("A2")
+
+    return {
+        "cuts": per_cut,
+        "channels_in_use": channels,
+        "can_add_channel": ["V2", "A2"],
+        "cutaway_pool": cutaway_pool[:50],
+        "layout_templates": ["split_h", "split_v", "pip"],
+        "verbs": ["place", "trim", "remove", "move", "set_audio", "tighten", "split_screen"],
+    }
+
+
+def _idx(level: Optional[str]) -> int:
+    try:
+        return _LEVELS.index(level)
+    except (ValueError, TypeError):
+        return _LEVELS.index("balanced")

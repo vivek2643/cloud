@@ -14,7 +14,6 @@ import {
   Music,
   Scissors,
   SlidersHorizontal,
-  Check,
 } from "lucide-react";
 import { useDriveStore } from "@/stores/drive-store";
 import { RenderBar } from "@/components/render-bar";
@@ -27,7 +26,7 @@ import {
   createEditThread,
   getEditThread,
   sendThreadMessage,
-  applyThreadEdit,
+  type ThreadQuestion,
   type EditThread,
   type EditThreadStatus,
   type EditOperation,
@@ -116,10 +115,9 @@ export function AiEditPanel() {
   const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
-  // The assistant proposed a cut on its latest turn -> show a Confirm button.
-  // Only the most recent assistant turn can carry a live proposal.
-  const [pendingProposal, setPendingProposal] = useState(false);
-  const [applying, setApplying] = useState(false);
+  // The editor asked for a user-owned decision on its latest turn -> show pickable
+  // options. Answering is just sending the picked option as the next message.
+  const [questions, setQuestions] = useState<ThreadQuestion[]>([]);
   const [error, setError] = useState<string | null>(null);
   // Portal target for the bottom editor dock (program monitor + timeline) that
   // lives in the main area, pro-editor style.
@@ -166,7 +164,6 @@ export function AiEditPanel() {
   useEffect(() => {
     if (!aiPanelOpen) return;
     setError(null);
-    setPendingProposal(false);
     const existing = loadThreadId(scope);
     setThreadId(existing);
     setThread(null);
@@ -213,14 +210,13 @@ export function AiEditPanel() {
     setDockEl(document.getElementById("ai-editor-dock"));
   }, [aiPanelOpen]);
 
-  async function handleSend() {
-    const text = input.trim();
+  async function handleSend(override?: string) {
+    const text = (override ?? input).trim();
     if (!text || !token || busy) return;
-    setInput("");
+    if (override === undefined) setInput("");
     setError(null);
     setBusy(true);
-    setPendingProposal(false);
-
+    setQuestions([]);
     // Optimistically show the user's message right away.
     const withUser: ChatMsg[] = [...messages, { role: "user", text }];
     setMessages(withUser);
@@ -240,39 +236,20 @@ export function AiEditPanel() {
       const withReply: ChatMsg[] = [...withUser, { role: "assistant", text: res.reply }];
       setMessages(withReply);
       saveMsgs(id, withReply);
-      // Nothing is applied yet: if the assistant proposed a cut, surface the
-      // Confirm button. The user decides whether it lands on the timeline.
-      setPendingProposal(res.proposal);
+      // Agentic: the editor already APPLIED any edit during its turn. If the edit
+      // changed, pull the new document version so the timeline reflects it.
+      if (res.changed) {
+        await refresh(id);
+      }
+      // If it paused to ask, surface the options; answering is the next message.
+      if (res.awaiting_user && res.questions?.length) {
+        setQuestions(res.questions);
+      }
       setBusy(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Message failed.");
       setBusy(false);
     }
-  }
-
-  async function handleApplyProposal() {
-    if (!token || !threadId || busy) return;
-    setError(null);
-    setBusy(true);
-    setApplying(true);
-    setPendingProposal(false);
-    try {
-      // Deterministic apply: the backend re-harvests the proposed cut list from
-      // the assistant's last reply and compiles it -- exactly what the user saw.
-      await applyThreadEdit(threadId, token);
-      await refresh(threadId);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not apply the edit.");
-      // Let the user try again.
-      setPendingProposal(true);
-    } finally {
-      setApplying(false);
-      setBusy(false);
-    }
-  }
-
-  function handleDeclineProposal() {
-    setPendingProposal(false);
   }
 
   // Ensure an edit session exists WITHOUT seeding the working doc (so manually
@@ -305,7 +282,7 @@ export function AiEditPanel() {
     setInput("");
     setError(null);
     setBusy(false);
-    setPendingProposal(false);
+    setQuestions([]);
   }
 
   function handleSavedEdit(newVersion: number, newDoc: NonNullable<EditThread["document"]>) {
@@ -383,8 +360,8 @@ export function AiEditPanel() {
           </Bubble>
         ))}
 
-        {pendingProposal && !busy && (
-          <ProposalConfirm onYes={handleApplyProposal} onNo={handleDeclineProposal} />
+        {questions.length > 0 && !busy && (
+          <QuestionCard questions={questions} onPick={(text) => handleSend(text)} />
         )}
 
         {doc && <DocumentView doc={doc} version={thread?.document_version ?? null} />}
@@ -395,7 +372,7 @@ export function AiEditPanel() {
             style={{ color: "var(--muted)" }}
           >
             <Loader2 size={14} className="animate-spin" />
-            {applying || status === "drafting" ? "Applying the edit…" : "Thinking…"}
+            {status === "drafting" ? "Editing…" : "Thinking…"}
           </div>
         )}
 
@@ -430,7 +407,7 @@ export function AiEditPanel() {
             className="max-h-32 min-h-[24px] flex-1 resize-none bg-transparent text-sm outline-none"
           />
           <button
-            onClick={handleSend}
+            onClick={() => handleSend()}
             disabled={!input.trim() || busy}
             className="rounded-lg p-1.5 transition-opacity disabled:opacity-30"
             style={{ background: "var(--accent)", color: "var(--background)" }}
@@ -478,29 +455,39 @@ function EmptyState() {
   );
 }
 
-function ProposalConfirm({ onYes, onNo }: { onYes: () => void; onNo: () => void }) {
+function QuestionCard({
+  questions,
+  onPick,
+}: {
+  questions: ThreadQuestion[];
+  onPick: (text: string) => void;
+}) {
   return (
-    <div
-      className="flex flex-col gap-2 rounded-2xl border px-3 py-3"
-      style={{ borderColor: "var(--accent)", background: "var(--accent-soft)" }}
-    >
-      <p className="text-sm font-medium">Apply this cut to the timeline?</p>
-      <div className="flex gap-2">
-        <button
-          onClick={onYes}
-          className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-semibold transition-opacity hover:opacity-90"
-          style={{ background: "var(--accent)", color: "var(--background)" }}
+    <div className="flex flex-col gap-3">
+      {questions.map((q) => (
+        <div
+          key={q.id}
+          className="flex flex-col gap-2 rounded-2xl border px-3 py-3"
+          style={{ borderColor: "var(--accent)", background: "var(--accent-soft)" }}
         >
-          <Check size={14} /> Yes, apply
-        </button>
-        <button
-          onClick={onNo}
-          className="rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--background)]"
-          style={{ borderColor: "var(--border)" }}
-        >
-          No
-        </button>
-      </div>
+          <p className="text-sm font-medium">{q.prompt}</p>
+          <div className="flex flex-wrap gap-2">
+            {q.options.map((opt) => (
+              <button
+                key={opt}
+                onClick={() => onPick(opt)}
+                className="rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--background)]"
+                style={{ borderColor: "var(--border)" }}
+              >
+                {opt}
+              </button>
+            ))}
+          </div>
+          <p className="text-xs" style={{ color: "var(--muted)" }}>
+            …or just type your own answer below.
+          </p>
+        </div>
+      ))}
     </div>
   );
 }

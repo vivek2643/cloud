@@ -1,44 +1,32 @@
 """
-The arranger: one free-canvas LLM call that takes the WHOLE footage map and
-returns a timeline.
+Map index + shared placement primitives for the agentic editor.
 
-This replaces the prescriptive Director -> Editor -> Coverage chain (spine /
-overlay / angle) with a single editorial call modelled on how Cursor hands a
-model a codebase: give it total awareness of every usable moment (the Tier-0
-``footage_map``), let it pick + order freely, and resolve its choices
-deterministically.
-
-The model's only job -- exactly as specified -- is to identify the right
-moments, at the right energy, and place them in order. It refers to content by
-the map's stable ids:
+The LLM brain lives in ``converse`` + ``tools``: it sees the whole footage map
+and edits the document DIRECTLY with tools (``observe``/``act``). Those tools
+refer to content by this module's stable map ids and resolve them through
+``_MapIndex``:
 
   * a MOMENT id (e.g. ``ab12cd34:m07``) taken at one of its available energy
     LEVELS (broad/calm/balanced/tight/sharp), or
   * an ATOM id (a moment's finest sub-cut) when it wants just a piece.
 
-Everything it places on track 0 is the main line and plays back-to-back (the
-simple "no gaps" critic is satisfied by construction -- segments are laid
-contiguously by the resolver). Tracks >= 1 are overlays anchored at a program
-time. Hallucinated ids and illegal levels are dropped/normalised, never trusted.
-
-``compile_placements`` turns the validated placements into the SAME Edit
-Document the preview / timeline / render already read, so nothing downstream
-changes.
+What lives here now (the compile/arrange pipeline is gone -- ``act`` mutates the
+document and ``observe.resolve_doc`` resolves it):
+  * ``Placement`` / ``ResolvedCut`` -- the neutral pick + its resolved span.
+  * ``_MapIndex`` -- validate a ref + resolve (ref, level) -> a source span.
+  * ``_weld_segments`` -- merge adjacent same-clip contiguous main-line cuts
+    (used by ``observe.resolve_doc`` to keep the agentic timeline clean).
+  * ``timeline_overlay`` -- render the current timeline for a chat turn.
 """
 from __future__ import annotations
 
 import logging
-import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-
-from app.config import get_settings
-from app.services.llm import user_message
 
 logger = logging.getLogger(__name__)
 
-# Overlay z (matches layers.Z_COVERAGE); imported lazily in the compiler to keep
-# this module import-light. Track 0 is the main line.
+# Track 0 is the main line; tracks >= 1 are overlays anchored at a program time.
 _MAIN_TRACK = 0
 
 # Two adjacent main-line segments from the SAME clip whose source spans touch (or
@@ -150,240 +138,8 @@ class _MapIndex:
 
 
 # --------------------------------------------------------------------------
-# The arranger call
+# Welding (used by observe.resolve_doc to keep the agentic main line clean)
 # --------------------------------------------------------------------------
-
-_ARRANGER_SYSTEM = (
-    "You are the EDITOR of a video. You are given a BRIEF and a complete MAP of "
-    "all available footage: every clip, and within each clip every usable MOMENT "
-    "-- what was captured (said / done / shown), the FULL line of any speech, and "
-    "the energy LEVELS it can be taken at. Nothing is hidden -- this is the whole "
-    "library, and you can read every line in full. Edit like a real editor who has "
-    "watched all the footage: read for meaning, not keywords.\n\n"
-    "Map notation (one MOMENT per line, grouped under its CLIP in time order):\n"
-    "  m07 said.person S1 .82 [0:14-0:21 6.4s] \"the full line text\" · nrg:broad|calm|balanced|tight|sharp · run:r1 · dup:tg4\n"
-    "  - the id is <clip8>:<m##>; refer to a moment by its FULL id (e.g. ab12cd34:m07).\n"
-    "  - <channel>.<subject> is WHAT was captured: channel = said (spoken) | done "
-    "(an action performed) | shown (something on screen); subject = person | place "
-    "| object | graphic. The label only DESCRIBES the shot -- it never decides its "
-    "place.\n"
-    "  - then the speaker, an optional 'off-cam' tag, an optional 'muted' tag, the "
-    "score (.82), the source [in-out] and PLAY length (6.4s -- what it runs after "
-    "dead-air trimming; use it to pace + hit a target length), and -- for said -- "
-    "the COMPLETE line in quotes (judge delivery and relevance from it). A "
-    "'shows:\"...\"' tag gives a graphic/insert's gist when speech does not already "
-    "narrate it.\n"
-    "  - a 'muted' tag on a done/shown cut means its SOURCE AUDIO plays SILENT by "
-    "default -- it still shows the picture. 'muted(talk)' = a stray half-sentence "
-    "under the shot; 'muted(sound)' = uncontrolled sound (off-mic voice, room/crew "
-    "noise, OR the action's own sound). Default is silent so b-roll never drags in "
-    "stray audio. When the shot's SOUND is the POINT -- an action's own sound (a "
-    "hit, a whoosh, a splash), a laugh, applause, or music you want as a bed -- add "
-    "\"audio\":\"keep\" to that pick to play it; add \"audio\":\"mute\" to silence a "
-    "cut that isn't muted by default. Prefer 'keep' on a 'muted(sound)' action when "
-    "its sound sells the moment.\n"
-    "  - nrg lists the levels you may take it at: broad (whole answer) .. balanced "
-    "(one thought) .. sharp (tightest). Pick the level that fits the pacing.\n"
-    "  - 'run:rN' marks a CONTINUOUS RUN: several moments in this clip that are ONE "
-    "uninterrupted stretch of the source, back-to-back in time (the clip was "
-    "atomized into beats), listed in source order. This is INFORMATION, not a "
-    "rule: by DEFAULT keep a run's members ADJACENT and in source order (they weld "
-    "into one seamless shot) so you don't fragment continuous footage by accident. "
-    "You are still free to break a run -- intercut another clip, reorder, or use "
-    "just one member -- whenever the edit calls for it; just do it on purpose, "
-    "knowing the pieces were continuous, not unknowingly.\n"
-    "  - 'dup:tgN' means this moment is the SAME beat as others in group tgN (a "
-    "retake or another camera angle); 'retry' marks an abandoned take. No take is "
-    "pre-picked -- choose the member that reads/looks best by its text and score. "
-    "Avoid putting the same line on the main line twice unless that repeat is "
-    "intended; you MAY place another member as a silent reaction/cutaway over that "
-    "line's audio (e.g. the listener while the speaker talks). A SAME-BEAT GROUPS "
-    "section lists each group's members.\n\n"
-    "Working principles (let the BRIEF and the footage decide the style -- there "
-    "is no fixed format):\n"
-    "- The map is raw footage; not all of it belongs. Cut slates, mic-checks, "
-    "false starts, and anything that does not serve the brief.\n"
-    "- Avoid UNINTENTIONAL repetition: don't place the same line (a same-beat "
-    "group) or a near-repeat twice unless the brief calls for it or the footage "
-    "is limited -- a deliberate repeat is fine when it serves the edit.\n"
-    "- Choose energy LEVEL per cut for pacing; tighten for momentum, widen to let "
-    "a beat breathe.\n"
-    "- EVERY moment is an equal candidate for the MAIN LINE no matter its "
-    "channel -- said, done, or shown (a spoken line, an action, or something on "
-    "screen). NEVER prefer or rank one channel over another; the label describes "
-    "the shot, it does not decide its place. Pick purely by what the edit needs "
-    "-- any channel can open, carry, or close the cut. Everything on track 0 is "
-    "the main line and plays back-to-back with no gaps. A higher track is an "
-    "OPTIONAL silent video cutaway laid over the track-0 audio -- never where any "
-    "channel must go, and rarely needed.\n"
-    "- Cuts in the SAME clip whose [in-out] ranges overlap are SIMULTANEOUS -- a "
-    "spoken line and the action / thing on screen at that instant. Lay the silent "
-    "video cut on a higher track over the line's audio to SHOW what is talked "
-    "about, or just pick whichever reads best; you are not told which.\n"
-    "- Consecutive MAIN-LINE picks from the same clip whose source times "
-    "touch/overlap are auto-welded into ONE continuous segment (no visible cut), "
-    "so adjacent slices build a longer beat; pick non-adjacent slices to force a "
-    "hard cut within a clip.\n"
-    "- Respect the target length if one is given.\n\n"
-    "How to work, in two steps:\n"
-    "1) DRAFT: first write a one-paragraph THESIS (what this edit is and why these "
-    "choices), then the draft timeline JSON.\n"
-    "2) You will then be asked to CRITIQUE your own draft and return the FINAL JSON.\n\n"
-    "JSON shape (the timeline is what matters):\n"
-    '{"thesis": "<what this edit is and why>", "timeline": [{"ref": "<id>", "level": "balanced", '
-    '"track": 0, "reason": "<short why>"}], "notes": "<one line>"}\n'
-    'Optional per-pick key: "audio":"keep" plays a muted shot\'s own sound (an '
-    'action/laugh/applause/music), "audio":"mute" silences one. Omit to use the '
-    "cut's default."
-)
-
-_CRITIQUE_PROMPT = (
-    "Now critique your own draft as a tough editor, then return the FINAL timeline.\n"
-    "Check, in order:\n"
-    "- Redundancy: is the same line (a same-beat group) repeated on the main line "
-    "without reason? Unless the brief wants the repeat, keep one read on the main "
-    "line (a second member is fine as a silent reaction/cutaway over that audio).\n"
-    "- Order: is the sequence coherent for the brief?\n"
-    "- Continuity: if you split a 'run:rN' (cut away and came back into its middle), "
-    "was that DELIBERATE and earned? Re-join footage you fragmented by accident "
-    "(members adjacent, source order); a purposeful intercut is fine.\n"
-    "- Delivery/angle: for each same-beat group you used, is the member you chose "
-    "the strongest read/look? Compare their text and score.\n"
-    "- Length: within the target? Cut the weakest beats to fit.\n"
-    "- Junk: remove any slate/mic-check/false-start moment that slipped in.\n"
-    "Return ONLY the final JSON (no prose), same shape as before."
-)
-
-
-def _arranger_prompt(brief: str, plan, map_text: str,
-                     current_timeline: Optional[str]) -> str:
-    lines = [f"BRIEF: {brief.strip() or '(none -- infer a sensible edit)'}"]
-    if getattr(plan, "intent", ""):
-        lines.append(f"INTENT: {plan.intent}")
-    bits = [f"energy~{getattr(plan, 'energy', 0.5):.2f}",
-            f"aspect:{getattr(plan, 'aspect', 'landscape')}"]
-    if getattr(plan, "target_duration_ms", None):
-        bits.append(f"target:{round(plan.target_duration_ms / 1000.0, 1)}s")
-    lines.append("PLAN: " + " · ".join(bits))
-    if current_timeline:
-        lines += ["", "CURRENT TIMELINE (refine this; keep what works, change what "
-                  "the brief asks):", current_timeline]
-    lines += ["", "FOOTAGE MAP:", map_text]
-    return "\n".join(lines)
-
-
-def arrange(brief: str, map_struct: Dict[str, Any], plan, *,
-            llm, map_text: Optional[str] = None,
-            current_timeline: Optional[str] = None) -> List[Placement]:
-    """Run the arranger: brief + footage map -> ordered, validated placements.
-
-    The brain reads the whole map in one resident context and reasons in a
-    draft -> self-critique cycle (the faithful "edit like a human who watched
-    everything" path). When the map is too large to hold resident it pages: a
-    compact index + on-demand inspect tools (see ``orchestrator.run_paged``).
-
-    ``plan`` carries energy/aspect/target defaults (the Director's read).
-    ``current_timeline`` is the optional refinement overlay. Returns [] on any
-    failure so the caller can fall back deterministically."""
-    index = _MapIndex(map_struct)
-    map_text = map_text or ""
-    settings = get_settings()
-    budget = int(getattr(settings, "arranger_resident_char_budget", 180_000))
-
-    if map_text and len(map_text) > budget:
-        try:
-            from app.services.l3 import orchestrator   # lazy: paged path only
-            return orchestrator.run_paged(
-                brief, map_struct, plan, llm=llm, current_timeline=current_timeline)
-        except Exception:
-            logger.exception("arrange: paged path failed; deterministic fallback")
-            return []
-
-    return _resident_arrange(brief, plan, map_text, current_timeline, index, llm)
-
-
-def _resident_arrange(brief: str, plan, map_text: str,
-                      current_timeline: Optional[str], index: "_MapIndex",
-                      llm) -> List[Placement]:
-    """The whole map in one resident, cached context, reasoned over in a
-    draft -> critique+revise cycle. System + map are a stable prefix reused
-    across passes (``cache_system`` lets the provider reuse it), so iterating is
-    cheap. Falls back to the draft if the critique pass yields nothing usable."""
-    from app.services.l3.auto_edit import _parse_json   # lazy: avoid import cycle
-
-    settings = get_settings()
-    passes = int(getattr(settings, "arranger_passes", 2))
-    max_tokens = settings.autoedit_max_output_tokens
-    final_effort = (getattr(settings, "autoedit_effort", None) or "high")
-    draft_effort = (getattr(settings, "arranger_draft_effort", None)
-                    or (final_effort if passes <= 1 else "medium"))
-
-    messages = [user_message(_arranger_prompt(brief, plan, map_text, current_timeline))]
-
-    # Pass 1: thesis + draft.
-    r1 = llm.run(system=_ARRANGER_SYSTEM, messages=messages, max_tokens=max_tokens,
-                 effort=(final_effort if passes <= 1 else draft_effort),
-                 cache_system=True)
-    draft = _coerce_placements(_parse_json(r1.text), index)
-    if passes <= 1:
-        return draft
-
-    # Pass 2: critique own draft + revise. Reuses the identical cached prefix.
-    messages.append(r1.assistant_message)
-    messages.append(user_message(_CRITIQUE_PROMPT))
-    r2 = llm.run(system=_ARRANGER_SYSTEM, messages=messages, max_tokens=max_tokens,
-                 effort=final_effort, cache_system=True)
-    final = _coerce_placements(_parse_json(r2.text), index)
-    return final or draft
-
-
-def _coerce_placements(doc: Optional[dict], index: _MapIndex) -> List[Placement]:
-    """Validate the model's timeline: keep only real ids, normalise illegal
-    levels to the moment's balanced take, de-dupe, preserve order."""
-    out: List[Placement] = []
-    seen: set = set()
-    for item in (doc or {}).get("timeline", []) or []:
-        if not isinstance(item, dict):
-            continue
-        ref = str(item.get("ref") or "").strip()
-        if not ref or ref in seen or not index.has(ref):
-            continue
-        seen.add(ref)
-        level = str(item.get("level") or "balanced").strip().lower()
-        if ref in index.moments and not index.level_ok(ref, level):
-            level = "balanced"
-        try:
-            track = int(item.get("track", _MAIN_TRACK))
-        except (TypeError, ValueError):
-            track = _MAIN_TRACK
-        from_ms = item.get("from_ms")
-        try:
-            from_ms = int(from_ms) if from_ms is not None else None
-        except (TypeError, ValueError):
-            from_ms = None
-        audio = str(item.get("audio") or "").strip().lower() or None
-        if audio not in ("keep", "mute"):
-            audio = None
-        out.append(Placement(ref=ref, level=level, track=max(0, track),
-                              from_ms=from_ms, reason=str(item.get("reason") or "").strip(),
-                              audio=audio))
-    return out
-
-
-# --------------------------------------------------------------------------
-# Compile placements -> Edit Document (Phase 2, + the no-gap critic)
-# --------------------------------------------------------------------------
-
-def resolve_placements(placements: List[Placement],
-                       map_struct: Dict[str, Any]) -> List[ResolvedCut]:
-    index = _MapIndex(map_struct)
-    out: List[ResolvedCut] = []
-    for p in placements:
-        rc = index.resolve(p)
-        if rc is not None and rc.src_out_ms > rc.src_in_ms:
-            out.append(rc)
-    return out
-
 
 def _weld_segments(segments: List[dict]) -> List[dict]:
     """Merge consecutive main-line segments from the SAME clip whose source spans
@@ -417,102 +173,6 @@ def _weld_segments(segments: List[dict]) -> List[dict]:
     for i, s in enumerate(welded):
         s["seg_id"] = f"a{i:03d}"
     return welded
-
-
-def _segments_from_main(cuts: List[ResolvedCut]) -> List[dict]:
-    """Main-line cuts -> contiguous timeline segments (the no-gap critic: track-0
-    segments are laid back-to-back by the resolver, so order alone removes gaps).
-    A breath-removal edit-list (``keep_spans``) expands into one segment per kept
-    span so the jump-cuts survive. Finally, adjacent same-clip source-contiguous
-    segments are WELDED so two neighbouring slices of one shot play continuously."""
-    segments: List[dict] = []
-    i = 0
-    for rc in cuts:
-        if rc.track != _MAIN_TRACK:
-            continue
-        spans = rc.keep_spans or [{"in_ms": rc.src_in_ms, "out_ms": rc.src_out_ms}]
-        for j, sp in enumerate(spans):
-            in_ms, out_ms = int(sp["in_ms"]), int(sp["out_ms"])
-            if out_ms <= in_ms:
-                continue
-            segments.append({
-                "seg_id": f"a{i:03d}_{j}",
-                "file_id": rc.file_id,
-                "in_ms": in_ms,
-                "out_ms": out_ms,
-                "axis": "speech" if rc.channel == "said" else "any",
-                "beat_id": None,
-                "content": rc.label,
-                "rationale": rc.reason or None,
-                "priority": 3,
-                "cut_in_cost": 0.0,
-                "cut_out_cost": 0.0,
-                "warnings": [],
-                # Source-audio mute: the video cut's default (silence stray talk /
-                # uncontrolled sound under a shot) folded with the brain's per-pick
-                # audio:keep/mute. Never set for said cuts.
-                "mute": True if rc.mute else None,
-                # Map provenance: lets a refinement turn speak in the same ids.
-                "ref": rc.ref or None,
-                "level": rc.level,
-            })
-        i += 1
-    return _weld_segments(segments)
-
-
-def _operations_from_overlays(cuts: List[ResolvedCut], total_ms: int) -> List[dict]:
-    """Track>=1 cuts -> place_video overlay operations anchored on the program
-    clock. Skipped when no anchor / out of range -- overlays never break the
-    main line."""
-    from app.services.l3 import layers
-
-    ops: List[dict] = []
-    for rc in cuts:
-        if rc.track == _MAIN_TRACK or rc.from_ms is None:
-            continue
-        from_ms = max(0, min(int(rc.from_ms), total_ms))
-        cut_len = rc.src_out_ms - rc.src_in_ms
-        span = min(cut_len, max(0, total_ms - from_ms)) if total_ms else cut_len
-        if span < 200:
-            continue
-        ops.append({
-            "op_id": f"ov_{uuid.uuid4().hex[:6]}",
-            "type": "place_video",
-            "source_file_id": rc.file_id,
-            "src_in_ms": int(rc.src_in_ms),
-            "src_out_ms": int(rc.src_in_ms + span),
-            "from_ms": from_ms,
-            "to_ms": from_ms + span,
-            "layout": layers.DEFAULT_LAYOUT,
-            "z": layers.Z_COVERAGE + max(0, rc.track - 1),
-            "opacity": 1.0,
-            "rationale": rc.reason or None,
-            "warnings": [],
-        })
-    return ops
-
-
-def fallback_placements(map_struct: Dict[str, Any], plan) -> List[Placement]:
-    """Deterministic draft when the arranger fails: top moments by score, taken
-    at balanced, ordered chronologically, capped to the target (or 60s). Mirrors
-    the old ``_fallback_picks`` over the map."""
-    moments = [m for clip in (map_struct or {}).get("clips", []) or []
-               for m in clip.get("moments", []) or []]
-    if not moments:
-        return []
-    target = getattr(plan, "target_duration_ms", None) or 60000
-    ranked = sorted(moments, key=lambda m: float(m.get("score", 0)), reverse=True)
-    chosen: List[dict] = []
-    total = 0
-    for m in ranked:
-        chosen.append(m)
-        bal = (m.get("variants") or {}).get("balanced") or {}
-        total += int(bal.get("play_ms", m.get("play_ms", 0)))
-        if total >= target:
-            break
-    chosen.sort(key=lambda m: (m["file_id"], m.get("in_ms", 0)))
-    return [Placement(ref=m["moment_id"], level="balanced", track=_MAIN_TRACK,
-                      reason="auto (fallback: top score)") for m in chosen]
 
 
 def timeline_overlay(document: Optional[dict]) -> str:
@@ -556,19 +216,3 @@ def timeline_overlay(document: Optional[dict]) -> str:
 def _ms(ms: int) -> str:
     s = max(0, int(ms)) // 1000
     return f"{s // 60}:{s % 60:02d}"
-
-
-def compile_placements(brief: str, plan, placements: List[Placement],
-                       map_struct: Dict[str, Any], file_ids: List[str]) -> dict:
-    """Validated placements -> the resolved Edit Document (same shape the rest of
-    the system reads). Track 0 becomes the contiguous spine; tracks >= 1 become
-    overlay operations."""
-    from app.services.l3.auto_edit import _build_document
-    from app.services.l3 import layers
-
-    cuts = resolve_placements(placements, map_struct)
-    segments = _segments_from_main(cuts)
-    _, total_ms = layers.spine_spans(segments)
-    operations = _operations_from_overlays(cuts, total_ms)
-    summary = getattr(plan, "intent", "") or "Auto-assembled edit."
-    return _build_document(brief, plan, segments, operations, file_ids, summary, [])

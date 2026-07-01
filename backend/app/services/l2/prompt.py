@@ -43,6 +43,12 @@ Log the clip the way a professional footage logger would:
   * Set `frame_orientation`: almost always "upright". Only flag rotate_cw90 /
     rotate_ccw90 / rotate_180 if the footage was genuinely shot sideways or
     upside-down (it reads rotated and would need turning to sit level).
+  * Set `valence`: the clip's overall EMOTIONAL TONE, read from tone of voice,
+    faces, and content -- positive (upbeat/warm/funny), neutral (informational/
+    matter-of-fact), negative (sad/frustrated/critical), tense (anxious/high-
+    stakes/suspenseful), or somber (solemn/reflective/heavy). This is the one
+    feel signal only a viewer can read; keep it coarse and honest, null if
+    genuinely unreadable. It colours how the edit feels; it does not pick cuts.
 
 CAPTURE ATOMS (`atoms` -- the core output: WHAT the camera captured, on the
 video track). Each atom is one captured beat on exactly ONE channel:

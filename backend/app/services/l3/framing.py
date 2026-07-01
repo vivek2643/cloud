@@ -314,7 +314,7 @@ def annotate_document(document: dict) -> dict:
 
     file_ids = {str(seg.get("file_id")) for seg in timeline if seg.get("file_id")}
     for op in operations:
-        if op.get("type") in ("place_video", "pick_angle") and op.get("source_file_id"):
+        if op.get("type") == "place_video" and op.get("source_file_id"):
             file_ids.add(str(op["source_file_id"]))
     file_ids.discard("None")
     if not file_ids:
@@ -334,7 +334,7 @@ def annotate_document(document: dict) -> dict:
                    perceptions, motion_cache, style, feel)
 
     for op in operations:
-        if op.get("type") in ("place_video", "pick_angle") and op.get("source_file_id"):
+        if op.get("type") == "place_video" and op.get("source_file_id"):
             _apply(op, str(op["source_file_id"]),
                    int(op.get("src_in_ms", 0)), int(op.get("src_out_ms", 0)),
                    perceptions, motion_cache, style, feel)

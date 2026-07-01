@@ -59,7 +59,10 @@ def _to_unit(v):
 # graphic) + peak + confidence. The old v1 editorial tracks (events / reactions
 # / cutaways / content_units / relations / role) have been REMOVED -- the cut
 # pipeline reads atoms (+ Said from L1, Heard from the audio envelope) only.
-SCHEMA_VERSION = 6
+# v7 adds a single clip-level `valence` (emotional tone) -- the one feel signal
+# a VLM must supply that L1 cannot derive; the rest of "feel" (pace, energy,
+# pauses) is computed downstream from L1. Null-safe: old docs simply lack it.
+SCHEMA_VERSION = 7
 
 
 # The editing vocabulary (vocab.py) is the single source of truth.
@@ -133,6 +136,17 @@ class PrimaryAxis(str, Enum):
     action = "action"
     visual = "visual"
     performance = "performance"
+
+
+class Valence(str, Enum):
+    """The clip's overall EMOTIONAL TONE -- the one feel signal only a viewer can
+    read (L1 gives pace/energy/pauses; this gives colour). Keep it coarse; it
+    tints how the edit feels, it does not decide cuts."""
+    positive = "positive"   # upbeat, warm, celebratory, funny
+    neutral = "neutral"     # informational, matter-of-fact
+    negative = "negative"   # sad, frustrated, critical
+    tense = "tense"         # anxious, high-stakes, suspenseful
+    somber = "somber"       # solemn, reflective, heavy, quiet-serious
 
 
 class CutSensitivity(str, Enum):
@@ -508,10 +522,20 @@ class ClipPerception(BaseModel):
         None, description="how the footage must be rotated to sit upright (almost always 'upright'); flag sideways/flipped footage so the editor can correct it"
     )
 
-    @field_validator("content_type", "frame_orientation", mode="before")
+    valence: Optional[Valence] = Field(
+        None,
+        description=(
+            "the clip's overall EMOTIONAL TONE: positive (upbeat/warm/funny), "
+            "neutral (informational), negative (sad/frustrated/critical), tense "
+            "(anxious/high-stakes), or somber (solemn/reflective/heavy). Coarse "
+            "colour, not a cut decision; null if genuinely unreadable."
+        ),
+    )
+
+    @field_validator("content_type", "frame_orientation", "valence", mode="before")
     @classmethod
     def _coerce_clip_enums(cls, v, info):
-        return _coerce_enum({"content_type": ContentType, "frame_orientation": FrameOrientation}[info.field_name])(v)
+        return _coerce_enum({"content_type": ContentType, "frame_orientation": FrameOrientation, "valence": Valence}[info.field_name])(v)
     logline: Optional[str] = Field(None, description="one sentence: what this clip is and what happens in it")
     synopsis: Optional[str] = Field(None, description="a short chronological paragraph describing the take start to finish")
     topics: List[str] = Field(default_factory=list)

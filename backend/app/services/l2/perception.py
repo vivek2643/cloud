@@ -423,6 +423,58 @@ def l2_perception(file_id: str) -> None:
         raise
 
 
+def reenqueue_l2(file_id: str) -> str:
+    """Force a fresh L2 perception run for an EXISTING clip, on demand.
+
+    Unlike ``enqueue_l2_if_eligible`` (idempotent -- skips anything already
+    queued/running/ready/skipped), this deliberately RE-runs so a schema bump
+    (e.g. adding ``valence``) can be backfilled. Re-running L2 cascades on its
+    own: the task re-defers thought segmentation + the hero-cuts precompute, so
+    the whole footage map rebuilds off the fresh perception.
+
+    Applies the same config/duration gate as the normal path. Returns one of
+    "queued" | "skipped" | "disabled" | "gone" | "error" (the resulting state).
+    """
+    settings = get_settings()
+    if not settings.enable_l2_perception or not settings.gemini_api_key:
+        return "disabled"
+
+    meta = _file_meta(file_id)
+    if meta is None:
+        return "gone"
+    _, _, duration_s = meta
+    if duration_s <= 0 or duration_s > settings.l2_max_duration_seconds:
+        _set_l2_status(file_id, "skipped")
+        return "skipped"
+
+    try:
+        l2_perception.defer(file_id=file_id)
+        _set_l2_status(file_id, "queued")
+        logger.info("L2: re-enqueued perception for %s (backfill, %.1fs)", file_id, duration_s)
+        return "queued"
+    except Exception:
+        logger.exception("L2: failed to re-enqueue perception for %s", file_id)
+        return "error"
+
+
+def stale_perception_file_ids(user_id: str) -> List[str]:
+    """A user's video/audio clips whose stored perception predates the current
+    SCHEMA_VERSION (or was never perceived) -- the backfill candidates."""
+    with _pg_conn() as conn:
+        rows = conn.execute(
+            """
+            select f.id::text
+              from files f
+              left join clip_perception cp on cp.file_id = f.id
+             where f.user_id = %s
+               and f.file_type in ('video', 'audio')
+               and (cp.schema_version is null or cp.schema_version < %s)
+            """,
+            (user_id, SCHEMA_VERSION),
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
 def enqueue_l2_if_eligible(file_id: str, duration_seconds: float) -> None:
     """Called by L1 on completion. Defers the perception task when the clip is
     short enough and L2 is configured; otherwise marks it skipped."""

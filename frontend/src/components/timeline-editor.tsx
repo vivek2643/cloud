@@ -605,13 +605,11 @@ export function TimelineEditor({
       {selOp && (
         <div className="flex flex-wrap items-center gap-2 border-t pt-2 text-xs" style={{ borderColor: "var(--border)" }}>
           <span className="font-medium">
-            {selOp.type === "pick_angle"
-              ? "Angle"
-              : selOp.type === "place_video"
-                ? "Coverage"
-                : selOp.role === "sfx"
-                  ? "SFX"
-                  : "Music"}
+            {selOp.type === "place_video"
+              ? "Coverage"
+              : selOp.role === "sfx"
+                ? "SFX"
+                : "Music"}
           </span>
           <span style={{ color: "var(--muted)" }}>{fmt(selOp.from_ms ?? 0)}–{fmt(selOp.to_ms ?? 0)}</span>
           {(selOp.type === "place_audio") && (
@@ -631,7 +629,7 @@ export function TimelineEditor({
               </button>
             </>
           )}
-          <button onClick={() => { removeOpStore(selOp.op_id); setSelectedOp(null); }} title="Delete layer" className={`rounded p-1 hover:bg-[var(--accent-soft)] ${selOp.type === "place_video" || selOp.type === "pick_angle" ? "ml-auto" : ""}`}>
+          <button onClick={() => { removeOpStore(selOp.op_id); setSelectedOp(null); }} title="Delete layer" className={`rounded p-1 hover:bg-[var(--accent-soft)] ${selOp.type === "place_video" ? "ml-auto" : ""}`}>
             <Trash2 size={13} style={{ color: "var(--danger)" }} />
           </button>
         </div>

@@ -29,11 +29,12 @@
  */
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import type {
+  DestRect,
   EditAspect,
   LayerTransform,
   ResolvedTimeline,
 } from "@/lib/api";
-import { sampleMotion } from "@/lib/resolve-timeline";
+import { isRect, sampleMotion } from "@/lib/resolve-timeline";
 
 const POOL_SIZE = 6;
 const DRIFT_S = 0.18; // re-seek a free-running element only past this much drift
@@ -52,6 +53,9 @@ interface Clip {
   hasVideo: boolean;
   z: number;
   transform?: LayerTransform;
+  // A split/PiP cell rect (normalized); null = full frame. When set, several
+  // clips are visible at once, each painted into its own rect.
+  dest: DestRect | null;
   hasAudio: boolean;
   gainDb: number; // base + duck, already summed (constant per layer)
 }
@@ -126,6 +130,7 @@ function buildClips(resolved: ResolvedTimeline | null): Clip[] {
       hasVideo: true,
       z: v.z,
       transform: v.transform,
+      dest: isRect(v.transform?.dest) ? v.transform!.dest : null,
       hasAudio: !!a,
       gainDb: a ? a.gain_db + a.duck_db : 0,
     });
@@ -140,6 +145,7 @@ function buildClips(resolved: ResolvedTimeline | null): Clip[] {
       progEnd: a.prog_end_ms,
       hasVideo: false,
       z: -1,
+      dest: null,
       hasAudio: true,
       gainDb: a.gain_db + a.duck_db,
     });
@@ -147,12 +153,31 @@ function buildClips(resolved: ResolvedTimeline | null): Clip[] {
   return clips;
 }
 
+/** Position the element into its canvas cell: a split/PiP dest rect (percent
+ * box) or the full frame. Mirrors the compositor's overlay-into-dest step. */
+function applyDestGeometry(el: HTMLVideoElement, dest: DestRect | null) {
+  if (dest) {
+    el.style.inset = "auto";
+    el.style.left = `${dest.x * 100}%`;
+    el.style.top = `${dest.y * 100}%`;
+    el.style.width = `${dest.w * 100}%`;
+    el.style.height = `${dest.h * 100}%`;
+  } else {
+    el.style.inset = "0";
+    el.style.left = "";
+    el.style.top = "";
+    el.style.width = "100%";
+    el.style.height = "100%";
+  }
+}
+
 /** CSS framing for the visible element, mirroring the render transform chain
  * (rotate -> fit -> zoom) and the motion midpoint preview. */
 function applyFrameStyle(el: HTMLVideoElement, clip: Clip, aspect: EditAspect) {
   const t = clip.transform;
   const mid = t?.motion ? sampleMotion(t.motion, t.motion.dur_ms / 2) : null;
-  const fit = mid ? "cover" : t?.fit ?? (aspect === "landscape" ? "contain" : "cover");
+  // A split/PiP cell fills its rect (cover); otherwise honor the transform fit.
+  const fit = clip.dest ? "cover" : mid ? "cover" : t?.fit ?? (aspect === "landscape" ? "contain" : "cover");
   const anchor = t?.anchor ?? "center";
   const focus = mid ? { cx: mid.cx, cy: mid.cy } : t?.focus ?? null;
   let objectPosition: string;
@@ -179,6 +204,7 @@ function applyFrameStyle(el: HTMLVideoElement, clip: Clip, aspect: EditAspect) {
   el.style.objectFit = fit;
   el.style.objectPosition = objectPosition;
   el.style.transform = tf.join(" ");
+  applyDestGeometry(el, clip.dest);
 }
 
 export function useProgramPlayer(
@@ -331,10 +357,16 @@ export function useProgramPlayer(
     const needed = [...active, ...prewarm];
     const neededIds = new Set(needed.map((c) => c.id));
 
-    // Top-z active picture is what shows.
-    let visible: Clip | null = null;
-    for (const c of active) {
-      if (c.hasVideo && (!visible || c.z > visible.z)) visible = c;
+    // What shows: split/PiP CELLS (every active picture with a dest rect) paint
+    // at once; otherwise the single top-z active picture fills the frame.
+    const placed = active.filter((c) => c.hasVideo && c.dest);
+    let visibleIds: Set<string>;
+    if (placed.length) {
+      visibleIds = new Set(placed.map((c) => c.id));
+    } else {
+      let top: Clip | null = null;
+      for (const c of active) if (c.hasVideo && (!top || c.z > top.z)) top = c;
+      visibleIds = new Set(top ? [top.id] : []);
     }
 
     const slotFor = (id: string) => pool.find((s) => s.clip?.id === id);
@@ -387,8 +419,10 @@ export function useProgramPlayer(
       const g = active_ && clip.hasAudio ? dbToGain(clip.gainDb) : 0;
       slot.gain.gain.setTargetAtTime(g, ctx.currentTime, GAIN_TC);
 
-      if (clip === visible && active_) {
+      if (active_ && visibleIds.has(clip.id)) {
         applyFrameStyle(slot.el, clip, aspectRef.current);
+        // Stack cells by layer z (PiP inset over base); split cells don't overlap.
+        slot.el.style.zIndex = String(clip.z);
         slot.el.style.opacity = "1";
       } else {
         slot.el.style.opacity = "0";

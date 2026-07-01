@@ -367,6 +367,20 @@ def _vf_normalize(cfg: Dict[str, Any]) -> str:
     return _transform_vf(cfg, None)
 
 
+def _dest_px(transform: Optional[Dict[str, Any]], W: int, H: int) -> Optional[Tuple[int, int, int, int]]:
+    """A split/PiP cell's pixel rect (x, y, w, h) on the W x H canvas, or None for
+    the full-frame default. Mirrors layers.is_rect + the normalized dest rect."""
+    d = (transform or {}).get("dest")
+    if not isinstance(d, dict):
+        return None
+    try:
+        x, y = _even(W * float(d["x"])), _even(H * float(d["y"]))
+        w, h = _even(W * float(d["w"])), _even(H * float(d["h"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    return (x, y, w, h) if (w > 0 and h > 0) else None
+
+
 def _produce_segment(
     *, src: str, dst: str, in_ms: int, out_ms: int, cfg: Dict[str, Any],
     transform: Optional[Dict[str, Any]] = None,
@@ -446,9 +460,14 @@ def _render_layers(
         out_s = int(v["src_out_ms"]) / 1000.0
         ps = int(v["prog_start_ms"]) / 1000.0
         opacity = float(v.get("opacity", 1.0))
+        # A split/PiP cell frames its source to the CELL size and overlays at the
+        # cell origin; a full-frame layer frames to the whole canvas at (0,0).
+        cell = _dest_px(v.get("transform"), W, H)
+        vf_cfg = {**cfg, "width": cell[2], "height": cell[3]} if cell else cfg
+        ov_xy = f"x={cell[0]}:y={cell[1]}:" if cell else ""
         chain = (
             f"[{idx}:v]trim=start={in_s:.3f}:end={out_s:.3f},setpts=PTS-STARTPTS,"
-            f"{_transform_vf(cfg, v.get('transform'))},format=yuva420p"
+            f"{_transform_vf(vf_cfg, v.get('transform'))},format=yuva420p"
         )
         if opacity < 0.999:
             chain += f",colorchannelmixer=aa={max(0.0, min(1.0, opacity)):.3f}"
@@ -456,7 +475,7 @@ def _render_layers(
         chain += f",setpts=PTS+{ps:.3f}/TB[v{i}]"
         filt.append(chain)
         out = f"[vt{i}]"
-        filt.append(f"{cur}[v{i}]overlay=eof_action=pass:format=auto{out}")
+        filt.append(f"{cur}[v{i}]overlay={ov_xy}eof_action=pass:format=auto{out}")
         cur = out
     video_out = cur
 

@@ -81,6 +81,41 @@ def get_file(
     return _with_progress(result.data[0])
 
 
+@router.post("/{file_id}/reanalyze")
+def reanalyze_file(
+    file_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Force a fresh L2 perception run for ONE owned clip (on-demand backfill).
+
+    Re-running L2 cascades: it re-defers thought segmentation + the hero-cuts
+    precompute, so the footage map rebuilds off the fresh perception (e.g. to
+    pick up a new schema tag like `valence`)."""
+    sb = get_supabase()
+    owned = sb.table("files").select("id").eq("id", file_id).eq("user_id", user_id).execute()
+    if not owned.data:
+        raise HTTPException(status_code=404, detail="File not found")
+    from app.services.l2.perception import reenqueue_l2
+
+    state = reenqueue_l2(file_id)
+    return {"file_id": file_id, "state": state}
+
+
+@router.post("/reanalyze-stale")
+def reanalyze_stale(
+    user_id: str = Depends(get_current_user_id),
+):
+    """Backfill: re-enqueue L2 for every owned clip whose stored perception
+    predates the current schema (or was never perceived). Idempotent enough to
+    call repeatedly -- a clip already at the current schema is not listed."""
+    from app.services.l2.perception import reenqueue_l2, stale_perception_file_ids
+
+    stale = stale_perception_file_ids(user_id)
+    results = {fid: reenqueue_l2(fid) for fid in stale}
+    queued = sum(1 for s in results.values() if s == "queued")
+    return {"candidates": len(stale), "queued": queued, "results": results}
+
+
 @router.patch("/{file_id}", response_model=FileResponse)
 def rename_file(
     file_id: str,

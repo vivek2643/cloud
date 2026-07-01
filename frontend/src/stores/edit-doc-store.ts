@@ -8,7 +8,7 @@
  * version re-seeds the baseline.
  */
 import { create } from "zustand";
-import type { EditAspect, EditDocument, EditOperation, EditSegment } from "@/lib/api";
+import type { EditAspect, EditDocument, EditOperation, EditSegment, LayoutRegion } from "@/lib/api";
 import type { Durations } from "@/lib/resolve-timeline";
 
 function docAspect(doc: EditDocument | null): EditAspect {
@@ -45,6 +45,8 @@ interface EditDocState {
   baselineOperations: EditOperation[];
   timeline: EditSegment[];
   operations: EditOperation[];
+  /** Time-scoped split-screen / PiP layouts (agent-authored; read by preview). */
+  layoutRegions: LayoutRegion[];
   durations: Durations;
   /** Delivery frame shape for the preview/render (from the document format). */
   aspect: EditAspect;
@@ -92,7 +94,7 @@ interface EditDocState {
   // --- operation mutators ---
   setGain: (opId: string, gainDb: number) => void;
   removeOp: (opId: string) => void;
-  /** Reposition a placed clip (place_video/pick_angle/place_audio) on the
+  /** Reposition a placed clip (place_video/place_audio) on the
    * program clock, keeping its duration. `maxMs` clamps the end to the base. */
   setOpFrom: (opId: string, fromMs: number, maxMs: number) => void;
   /** Trim a placed clip's in/out edge in PROGRAM ms; the source range shifts
@@ -109,6 +111,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
   baselineOperations: [],
   timeline: [],
   operations: [],
+  layoutRegions: [],
   durations: {},
   aspect: "landscape",
   selected: null,
@@ -123,6 +126,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       baselineOperations: operations,
       timeline: timeline.map((s) => ({ ...s })),
       operations: operations.map((o) => ({ ...o })),
+      layoutRegions: doc?.layout_regions ?? [],
       aspect: docAspect(doc),
       selected: null,
     });
@@ -136,6 +140,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       baselineOperations: [],
       timeline: [],
       operations: [],
+      layoutRegions: [],
       aspect: "landscape",
       selected: null,
     }),
@@ -149,6 +154,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       baselineOperations: operations,
       timeline: timeline.map((s) => ({ ...s })),
       operations: operations.map((o) => ({ ...o })),
+      layoutRegions: doc.layout_regions ?? [],
       aspect: docAspect(doc),
     });
   },

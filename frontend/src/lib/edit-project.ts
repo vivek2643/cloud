@@ -11,7 +11,7 @@
  * Mapping (lossless, both directions):
  *   - base video track  ← spine segments (gapless, owns the program clock)
  *   - base audio track  ← the spine's coupled dialogue
- *   - upper video tracks ← `place_video` / `pick_angle` ops, stacked by z
+ *   - upper video tracks ← `place_video` ops, stacked by z
  *   - audio tracks       ← `place_audio` ops, grouped by role
  *
  * Spatial layouts (PiP / split-screen) are intentionally NOT modelled yet, but
@@ -117,12 +117,10 @@ export function documentToProject(
   }
   const durationMs = t;
 
-  // --- upper video tracks: place_video / pick_angle ops, stacked by z ---
-  const videoOps = operations.filter(
-    (o) => o.type === "place_video" || o.type === "pick_angle"
-  );
+  // --- upper video tracks: place_video ops, stacked by z ---
+  const videoOps = operations.filter((o) => o.type === "place_video");
   const videoZs = Array.from(
-    new Set(videoOps.map((o) => Math.round(o.z ?? (o.type === "pick_angle" ? 5 : 10))))
+    new Set(videoOps.map((o) => Math.round(o.z ?? 10)))
   ).sort((a, b) => a - b);
   const zToTrack = new Map<number, ProjectTrack>();
   videoZs.forEach((z, i) => {
@@ -136,7 +134,7 @@ export function documentToProject(
     zToTrack.set(z, track);
   });
   for (const op of videoOps) {
-    const z = Math.round(op.z ?? (op.type === "pick_angle" ? 5 : 10));
+    const z = Math.round(op.z ?? 10);
     const track = zToTrack.get(z);
     if (!track) continue;
     const from = Math.round(op.from_ms ?? 0);

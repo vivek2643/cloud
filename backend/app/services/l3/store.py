@@ -91,8 +91,8 @@ def set_thread_status(thread_id: str, status: str) -> None:
 
 
 def update_brief(thread_id: str, brief: str) -> None:
-    """Set the thread's active instruction -- the agreed edit a confirmed chat
-    turn hands to the arranger run (run_thread reads it back)."""
+    """Set the thread's active instruction -- the one-line label/goal for the
+    thread's edit."""
     with _pg_conn() as conn:
         conn.execute(
             "update edit_threads set brief = %s where id = %s",

@@ -10,6 +10,7 @@
  * both sides and diff) protects against drift — see the backend parity fixture.
  */
 import type {
+  DestRect,
   EditAspect,
   EditDocument,
   EditOperation,
@@ -18,6 +19,7 @@ import type {
   LayerFit,
   LayerMotion,
   LayerTransform,
+  LayoutRegion,
   MotionPoint,
   ResolvedAudioLayer,
   ResolvedTimeline,
@@ -26,7 +28,6 @@ import type {
 
 // Z bands so layer kinds stack predictably regardless of insertion order.
 export const Z_SPINE_VIDEO = 0;
-export const Z_ANGLE = 5; // a synced multicam angle re-pointing the spine picture
 export const Z_COVERAGE = 10;
 export const DEFAULT_LAYOUT = "full_frame";
 
@@ -230,8 +231,116 @@ function solveTransform(
   return t;
 }
 
+// --- spatial layout: split-screen / PiP templates (mirror layers.py) ---
+const round4 = (v: number) => Math.round(v * 1e4) / 1e4;
+
+const LAYOUT_TEMPLATES: Record<string, Record<string, [number, number, number, number]>> = {
+  split_h: { left: [0, 0, 0.5, 1], right: [0.5, 0, 0.5, 1] },
+  split_v: { top: [0, 0, 1, 0.5], bottom: [0, 0.5, 1, 0.5] },
+  pip: { base: [0, 0, 1, 1], inset: [0.66, 0.66, 0.32, 0.32] },
+};
+
+/** A layout template -> {cell: dest rect}; {} for an unknown template. */
+export function solveLayout(template: string): Record<string, DestRect> {
+  const cells = LAYOUT_TEMPLATES[template];
+  if (!cells) return {};
+  const out: Record<string, DestRect> = {};
+  for (const [name, [x, y, w, h]] of Object.entries(cells)) {
+    out[name] = { x: round4(x), y: round4(y), w: round4(w), h: round4(h) };
+  }
+  return out;
+}
+
+/** True when a transform `dest` is a real sub-rect (split/PiP cell). */
+export function isRect(dest: LayerTransform["dest"]): dest is DestRect {
+  return (
+    !!dest &&
+    typeof dest === "object" &&
+    ["x", "y", "w", "h"].every((k) => k in (dest as unknown as Record<string, unknown>))
+  );
+}
+
+/** A sub-span [ps, pe) of a video layer, source-mapped, with an optional dest
+ * rect stamped on (fit forced to cover). Mirrors layers._slice_video. */
+function sliceVideo(
+  v: ResolvedVideoLayer,
+  ps: number,
+  pe: number,
+  dest: DestRect | null
+): ResolvedVideoLayer {
+  const tf: LayerTransform = { ...(v.transform ?? {}) };
+  if (dest) {
+    tf.dest = dest;
+    tf.fit = "cover";
+  }
+  const suffix = ps === v.prog_start_ms && pe === v.prog_end_ms ? "" : `__${ps}`;
+  return {
+    ...v,
+    layer_id: `${v.layer_id}${suffix}`,
+    src_in_ms: v.src_in_ms + (ps - v.prog_start_ms),
+    src_out_ms: v.src_in_ms + (pe - v.prog_start_ms),
+    prog_start_ms: ps,
+    prog_end_ms: pe,
+    transform: tf,
+  };
+}
+
+/** Stamp `dest` onto the spine picture across [f, t), slicing straddling spine
+ * layers. Mirrors layers._dest_spine_window. */
+function destSpineWindow(
+  video: ResolvedVideoLayer[],
+  f: number,
+  t: number,
+  dest: DestRect
+): ResolvedVideoLayer[] {
+  const out: ResolvedVideoLayer[] = [];
+  for (const v of video) {
+    if (v.kind !== "spine" || v.prog_end_ms <= f || v.prog_start_ms >= t) {
+      out.push(v);
+      continue;
+    }
+    const os = Math.max(v.prog_start_ms, f);
+    const oe = Math.min(v.prog_end_ms, t);
+    if (v.prog_start_ms < os) out.push(sliceVideo(v, v.prog_start_ms, os, null));
+    out.push(sliceVideo(v, os, oe, dest));
+    if (oe < v.prog_end_ms) out.push(sliceVideo(v, oe, v.prog_end_ms, null));
+  }
+  return out;
+}
+
+/** Turn each layout region into dest rects on the layers it names. Mirrors
+ * layers._apply_layout_regions. */
+function applyLayoutRegions(
+  video: ResolvedVideoLayer[],
+  regions: LayoutRegion[]
+): ResolvedVideoLayer[] {
+  let out = video;
+  for (const r of regions) {
+    const rects = solveLayout(r.template);
+    if (!Object.keys(rects).length) continue;
+    const f = Math.round(r.from_ms);
+    const t = Math.round(r.to_ms);
+    if (t <= f) continue;
+    for (const [cell, sel] of Object.entries(r.cells ?? {})) {
+      const rect = rects[cell];
+      if (!rect) continue;
+      const layer = sel?.layer;
+      if (layer === "spine") {
+        out = destSpineWindow(out, f, t, rect);
+      } else if (layer) {
+        for (const v of out) {
+          if (v.op_id === layer || v.layer_id === layer) {
+            v.transform = { ...(v.transform ?? {}), dest: rect, fit: "cover" };
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
 export function resolveTimeline(
-  document: Pick<EditDocument, "timeline" | "operations" | "format">,
+  document: Pick<EditDocument, "timeline" | "operations" | "format" | "layout_regions">,
   durations: Durations = {}
 ): ResolvedTimeline {
   const timeline = document.timeline ?? [];
@@ -294,23 +403,6 @@ export function resolveTimeline(
         op_id: op.op_id,
         transform: solveTransform(aspect, formatFit, op.transform),
       });
-    } else if (op.type === "pick_angle") {
-      // Synced multicam angle: re-points the spine PICTURE (a normal cut) just
-      // above the base spine; audio stays the spine. Mirrors layers.resolve.
-      video.push({
-        layer_id: op.op_id,
-        source_file_id: op.source_file_id ?? "",
-        src_in_ms: Math.round(op.src_in_ms ?? 0),
-        src_out_ms: Math.round(op.src_out_ms ?? 0),
-        prog_start_ms: Math.round(op.from_ms ?? 0),
-        prog_end_ms: Math.round(op.to_ms ?? 0),
-        z: Math.round(op.z ?? Z_ANGLE),
-        layout: op.layout ?? DEFAULT_LAYOUT,
-        opacity: 1,
-        kind: "angle",
-        op_id: op.op_id,
-        transform: solveTransform(aspect, formatFit, op.transform),
-      });
     } else if (op.type === "place_audio") {
       audio.push({
         layer_id: op.op_id,
@@ -330,5 +422,8 @@ export function resolveTimeline(
 
   applyLevels(audio, operations);
 
-  return { duration_ms: total, video_layers: video, audio_layers: audio, aspect };
+  const regions = document.layout_regions ?? [];
+  const videoOut = regions.length ? applyLayoutRegions(video, regions) : video;
+
+  return { duration_ms: total, video_layers: videoOut, audio_layers: audio, aspect };
 }
