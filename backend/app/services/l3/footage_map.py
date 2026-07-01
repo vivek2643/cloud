@@ -93,7 +93,10 @@ logger = logging.getLogger(__name__)
 # v16: moments carry the video-cut AUDIO facet (audio kind + default `mute` for
 # stray speech under a shot); the resident line shows a 'muted' tag + the cut's
 # PLAY length so the brain sees dropped audio and can pace to a target length.
-TREE_VERSION = 16
+# v17: audio facet is speech|sound|silent -- a shot mutes ANY uncontrolled audio
+# by default (talk OR off-mic/crew/action sound); the line shows 'muted(talk)' vs
+# 'muted(sound)' so the brain knows when to `audio:keep` an action's own sound.
+TREE_VERSION = 17
 
 # Two moments are one continuous source run when the next starts within this gap
 # of where the previous ended (back-to-back in the original footage). Loose
@@ -455,13 +458,17 @@ def _dur_tag(m: Dict[str, Any]) -> str:
 
 
 def _audio_tag(m: Dict[str, Any]) -> str:
-    """Source-audio note for a VIDEO cut: 'muted' when it carries stray speech
-    that plays silent by default (the brain can still choose to keep it), so the
-    brain knows the shot has talking under it and isn't surprised by silence."""
+    """Source-audio note for a VIDEO cut. A muted cut plays SILENT by default so
+    the brain isn't surprised, and the kind tells it WHY -- 'muted(talk)' is a
+    stray half-sentence (usually leave silent); 'muted(sound)' is uncontrolled or
+    the action's own sound (the brain may want to `audio:keep` it)."""
     if m.get("mute"):
+        kind = m.get("audio")
+        if kind == "speech":
+            return " muted(talk)"
+        if kind == "sound":
+            return " muted(sound)"
         return " muted"
-    if m.get("audio") == "speech":
-        return " aud:speech"
     return ""
 
 

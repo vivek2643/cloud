@@ -133,10 +133,50 @@ def test_resolve_and_main_line_is_contiguous():
     print("ok  test_resolve_and_main_line_is_contiguous")
 
 
+def _video(hero_id, in_ms, out_ms, *, mute, audio, label="a shot"):
+    return {"hero_id": hero_id, "file_id": "ffffffff-1111", "channel": "shown",
+            "subject": "object", "label": label, "src_in_ms": in_ms,
+            "src_out_ms": out_ms, "play_ms": out_ms - in_ms, "keep_spans": None,
+            "score": 0.7, "speaker": None, "flags": [], "audio": audio,
+            "mute": mute, "ladder": [_rung("balanced", in_ms, out_ms, label, 0.7)]}
+
+
+def _video_map():
+    shot = _video("f:s0", 0, 5000, mute=True, audio="sound")
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 5000}, [shot])
+    return {"clips": [tree]}
+
+
+def test_brain_audio_override_folds_onto_default():
+    """The arranger's per-pick audio choice overrides the cut's default mute:
+    'keep' plays a muted shot's own sound (an action the brain wants), 'mute'
+    silences one; absent = the deterministic default stands."""
+    idx = ar._MapIndex(_video_map())
+    ref = "ffffffff:m00"
+    assert idx.resolve(ar.Placement(ref, "balanced", 0)).mute is True          # default muted
+    assert idx.resolve(ar.Placement(ref, "balanced", 0, audio="keep")).mute is False  # keep the sound
+    assert idx.resolve(ar.Placement(ref, "balanced", 0, audio="mute")).mute is True   # force silent
+    print("ok  test_brain_audio_override_folds_onto_default")
+
+
+def test_coerce_reads_audio_override():
+    """The audio override is parsed from the model JSON; junk values are dropped."""
+    m = _video_map()
+    body = '{"timeline": [{"ref": "ffffffff:m00", "level": "balanced", "audio": "keep"}]}'
+    places = ar.arrange("x", m, _Plan(), llm=_FakeLLM(body), map_text="(m)")
+    assert len(places) == 1 and places[0].audio == "keep", places
+    body2 = '{"timeline": [{"ref": "ffffffff:m00", "level": "balanced", "audio": "loud"}]}'
+    places2 = ar.arrange("x", m, _Plan(), llm=_FakeLLM(body2), map_text="(m)")
+    assert places2[0].audio is None, places2
+    print("ok  test_coerce_reads_audio_override")
+
+
 def main():
     test_validates_and_normalises()
     test_illegal_level_falls_back()
     test_resolve_and_main_line_is_contiguous()
+    test_brain_audio_override_folds_onto_default()
+    test_coerce_reads_audio_override()
     print("\nall arranger tests passed")
 
 

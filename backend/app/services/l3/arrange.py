@@ -60,6 +60,10 @@ class Placement:
     track: int = _MAIN_TRACK       # 0 = main line; >=1 = overlay
     from_ms: Optional[int] = None  # overlay anchor on the program clock (track>=1)
     reason: str = ""
+    # Per-pick audio override on a video shot's DEFAULT mute policy: "keep" plays
+    # its source sound (the shot's own audio is the point -- an action, a laugh,
+    # applause, music), "mute" silences it, None = use the cut's default.
+    audio: Optional[str] = None
 
 
 @dataclass
@@ -76,12 +80,23 @@ class ResolvedCut:
     reason: str
     ref: str = ""               # the map id (carried onto segments for refinement)
     level: str = "balanced"
-    mute: bool = False          # default: mute this cut's source audio (stray speech under video)
+    mute: bool = False          # final source-audio mute (video default folded with the brain's audio:keep/mute)
 
 
 # --------------------------------------------------------------------------
 # Map index (validation + resolution)
 # --------------------------------------------------------------------------
+
+def _resolve_mute(default_mute: bool, audio_override: Optional[str]) -> bool:
+    """Fold the arranger's per-pick audio choice onto a cut's DEFAULT mute.
+    'keep' plays the source sound, 'mute' silences it, anything else defers to
+    the deterministic default the combiner set on the moment."""
+    if audio_override == "keep":
+        return False
+    if audio_override == "mute":
+        return True
+    return default_mute
+
 
 class _MapIndex:
     """Fast lookup over an ``assemble_map`` struct: moment_id -> moment, and
@@ -109,7 +124,8 @@ class _MapIndex:
                 channel=a.get("channel") or m.get("channel"),
                 label=a.get("gist") or m.get("gist") or "",
                 track=p.track, from_ms=p.from_ms, reason=p.reason,
-                ref=p.ref, level="atom", mute=bool(m.get("mute")),
+                ref=p.ref, level="atom",
+                mute=_resolve_mute(bool(m.get("mute")), p.audio),
             )
         m = self.moments.get(p.ref)
         if m is None:
@@ -124,7 +140,8 @@ class _MapIndex:
             src_out_ms=int(v["out_ms"]), keep_spans=v.get("keep_spans"),
             channel=m.get("channel"), label=m.get("gist") or "",
             track=p.track, from_ms=p.from_ms, reason=p.reason,
-            ref=p.ref, level=v.get("level", level), mute=bool(m.get("mute")),
+            ref=p.ref, level=v.get("level", level),
+            mute=_resolve_mute(bool(m.get("mute")), p.audio),
         )
 
     def level_ok(self, ref: str, level: str) -> bool:
@@ -156,10 +173,15 @@ _ARRANGER_SYSTEM = (
     "the COMPLETE line in quotes (judge delivery and relevance from it). A "
     "'shows:\"...\"' tag gives a graphic/insert's gist when speech does not already "
     "narrate it.\n"
-    "  - 'muted' on a done/shown cut means it carries stray speech under the shot "
-    "that plays SILENT by default (b-roll/action shouldn't drag in an out-of-"
-    "context half-sentence). It still shows the picture; keep it muted unless you "
-    "specifically want that audio.\n"
+    "  - a 'muted' tag on a done/shown cut means its SOURCE AUDIO plays SILENT by "
+    "default -- it still shows the picture. 'muted(talk)' = a stray half-sentence "
+    "under the shot; 'muted(sound)' = uncontrolled sound (off-mic voice, room/crew "
+    "noise, OR the action's own sound). Default is silent so b-roll never drags in "
+    "stray audio. When the shot's SOUND is the POINT -- an action's own sound (a "
+    "hit, a whoosh, a splash), a laugh, applause, or music you want as a bed -- add "
+    "\"audio\":\"keep\" to that pick to play it; add \"audio\":\"mute\" to silence a "
+    "cut that isn't muted by default. Prefer 'keep' on a 'muted(sound)' action when "
+    "its sound sells the moment.\n"
     "  - nrg lists the levels you may take it at: broad (whole answer) .. balanced "
     "(one thought) .. sharp (tightest). Pick the level that fits the pacing.\n"
     "  - 'run:rN' marks a CONTINUOUS RUN: several moments in this clip that are ONE "
@@ -209,7 +231,10 @@ _ARRANGER_SYSTEM = (
     "2) You will then be asked to CRITIQUE your own draft and return the FINAL JSON.\n\n"
     "JSON shape (the timeline is what matters):\n"
     '{"thesis": "<what this edit is and why>", "timeline": [{"ref": "<id>", "level": "balanced", '
-    '"track": 0, "reason": "<short why>"}], "notes": "<one line>"}'
+    '"track": 0, "reason": "<short why>"}], "notes": "<one line>"}\n'
+    'Optional per-pick key: "audio":"keep" plays a muted shot\'s own sound (an '
+    'action/laugh/applause/music), "audio":"mute" silences one. Omit to use the '
+    "cut's default."
 )
 
 _CRITIQUE_PROMPT = (
@@ -336,8 +361,12 @@ def _coerce_placements(doc: Optional[dict], index: _MapIndex) -> List[Placement]
             from_ms = int(from_ms) if from_ms is not None else None
         except (TypeError, ValueError):
             from_ms = None
+        audio = str(item.get("audio") or "").strip().lower() or None
+        if audio not in ("keep", "mute"):
+            audio = None
         out.append(Placement(ref=ref, level=level, track=max(0, track),
-                              from_ms=from_ms, reason=str(item.get("reason") or "").strip()))
+                              from_ms=from_ms, reason=str(item.get("reason") or "").strip(),
+                              audio=audio))
     return out
 
 
@@ -419,9 +448,9 @@ def _segments_from_main(cuts: List[ResolvedCut]) -> List[dict]:
                 "cut_in_cost": 0.0,
                 "cut_out_cost": 0.0,
                 "warnings": [],
-                # Default source-audio policy: mute stray speech under a video cut
-                # (b-roll/action) so the edit doesn't drag in an out-of-context
-                # half-sentence. Never set for said cuts.
+                # Source-audio mute: the video cut's default (silence stray talk /
+                # uncontrolled sound under a shot) folded with the brain's per-pick
+                # audio:keep/mute. Never set for said cuts.
                 "mute": True if rc.mute else None,
                 # Map provenance: lets a refinement turn speak in the same ids.
                 "ref": rc.ref or None,

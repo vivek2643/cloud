@@ -125,15 +125,19 @@ def test_video_cut_owns_full_ladder():
     print("ok  video cut owns full broad..sharp ladder")
 
 
-# -- audio policy on video cuts (mute stray speech under a shot) ---------------
+# -- audio policy on video cuts (mute uncontrolled audio under a shot) ---------
 
-def _src(words):
-    """A minimal SpanSource-like stub for the audio policy (only .words read)."""
-    return SimpleNamespace(words=words)
+def _src(words=None, silences=None):
+    """A minimal SpanSource-like stub for the audio policy (.words + .silences)."""
+    return SimpleNamespace(words=words or [], silences=silences or [])
 
 
 def _word(a, b):
     return {"start_ms": a, "end_ms": b, "text": "x", "is_filler": False}
+
+
+def _sil(a, b):
+    return {"start_ms": a, "end_ms": b}
 
 
 def test_video_audio_muted_when_speech_under_shot():
@@ -141,7 +145,7 @@ def test_video_audio_muted_when_speech_under_shot():
     audio='speech' and muted by default -- b-roll shouldn't drag an out-of-context
     half-sentence onto the edit."""
     atoms = [_shown(0, 8000, conf=0.7)]
-    src = _src([_word(500, 2000), _word(2100, 3500)])   # ~3s talk over 8s -> 37%
+    src = _src(words=[_word(500, 2000), _word(2100, 3500)])   # ~3s talk over 8s -> 37%
     cuts = cmb.combine_video(atoms, energy_to_params(0.5), None, _clip(), source=src)
     c = next(c for c in cuts if c.channel == vocab.CHANNEL_SHOWN)
     assert c.audio == "speech" and c.mute is True, (c.audio, c.mute)
@@ -149,16 +153,39 @@ def test_video_audio_muted_when_speech_under_shot():
     print("ok  video cut mutes stray speech under the shot")
 
 
-def test_video_audio_kept_when_ambient():
-    """A cut with little/no speech under it stays audio='ambient' and unmuted --
-    we never silence possible music/sfx we can't classify."""
+def test_video_audio_muted_when_untranscribed_sound():
+    """No transcribed speech, but the shot is mostly NON-silence (off-mic voice /
+    crew noise / an action's own sound) -> audio='sound', muted by default. This
+    is the Reel-5 case: loud opener with an empty transcript."""
     atoms = [_shown(0, 8000, conf=0.7)]
-    src = _src([_word(500, 900)])                        # <15% talk -> ambient
+    # Only 1s of logged silence over 8s -> 87% sound -> well over _VIDEO_SOUND_FRAC.
+    src = _src(words=[], silences=[_sil(3000, 4000)])
     cuts = cmb.combine_video(atoms, energy_to_params(0.5), None, _clip(), source=src)
     c = next(c for c in cuts if c.channel == vocab.CHANNEL_SHOWN)
-    assert c.audio == "ambient" and c.mute is False, (c.audio, c.mute)
+    assert c.audio == "sound" and c.mute is True, (c.audio, c.mute)
+    assert c.to_dict()["mute"] is True
+    print("ok  video cut mutes uncontrolled (untranscribed) sound")
+
+
+def test_video_audio_silent_when_mostly_silence():
+    """A shot that is essentially silence -> audio='silent', not muted (there is
+    nothing to silence, and we don't assert a policy on quiet)."""
+    atoms = [_shown(0, 8000, conf=0.7)]
+    src = _src(words=[], silences=[_sil(0, 7800)])       # ~97% silence
+    cuts = cmb.combine_video(atoms, energy_to_params(0.5), None, _clip(), source=src)
+    c = next(c for c in cuts if c.channel == vocab.CHANNEL_SHOWN)
+    assert c.audio == "silent" and c.mute is False, (c.audio, c.mute)
     assert c.to_dict()["mute"] is None                   # not emitted when false
-    print("ok  video cut keeps ambient audio")
+    print("ok  video cut leaves near-silent audio alone")
+
+
+def test_video_audio_none_without_audio_data():
+    """No words AND no silence map -> we can't judge; leave the audio alone."""
+    atoms = [_shown(0, 8000, conf=0.7)]
+    cuts = cmb.combine_video(atoms, energy_to_params(0.5), None, _clip(), source=_src())
+    c = next(c for c in cuts if c.channel == vocab.CHANNEL_SHOWN)
+    assert c.audio is None and c.mute is False, (c.audio, c.mute)
+    print("ok  video cut without audio data asserts no policy")
 
 
 def test_video_ladder_round_trips():

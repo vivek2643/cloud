@@ -124,7 +124,11 @@ _MERGE_LEN_RATIO = 0.7
 # density is gated hard, and the unbounded word-count reward is gone (a long
 # rambling take no longer outranks a tight clean one). (3) DONE/SHOWN cuts carry
 # an `audio` facet (speech|ambient) and mute stray speech under video by default.
-PARAMS_VERSION = 19
+# v20: audio facet is now speech|sound|silent -- a video shot mutes ANY
+# uncontrolled audio by default (stray talk OR off-mic/crew/action sound found
+# via the silence map), not only transcribed speech; the brain unmutes when the
+# sound is the point (arranger `audio:keep`).
+PARAMS_VERSION = 20
 
 # The five canonical product energy LEVELS = the band centers (Broad .. Sharp).
 # Hero cuts are precomputed at exactly these after L2; any requested energy
@@ -287,9 +291,10 @@ class HeroCut:
     # graphic) -- WHAT the channel is about.
     subject: Optional[str] = None
     # What is on this cut's SOURCE AUDIO track (video channels only): "speech"
-    # (someone talking under the shot), "ambient" (room tone / sfx / possible
-    # music). Said cuts leave this None (their audio IS the point). Lets the brain
-    # and the compiler decide whether the underlying audio should play.
+    # (transcribed talk under the shot), "sound" (uncontrolled non-speech audio --
+    # off-mic voice, room/crew noise, an action's own sound), or "silent". Said
+    # cuts leave this None (their audio IS the point). Lets the brain and the
+    # compiler decide whether the underlying audio should play.
     audio: Optional[str] = None
     # Default source-audio policy for this cut: True = mute on the timeline. Set
     # for video (done/shown) cuts carrying stray SPEECH -- b-roll/action shouldn't

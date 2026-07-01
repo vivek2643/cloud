@@ -149,28 +149,55 @@ def _people_facet(actor: Optional[str], region: Optional[dict]) -> List[dict]:
 # span carries stray SPEECH (a half-sentence, an off-topic remark) that a b-roll
 # / action shot shouldn't drag onto the edit -- so it is muted by default.
 _VIDEO_SPEECH_FRAC = 0.15
+# With no dominant transcribed speech, any non-silence audio covering at least
+# this fraction of the span is uncontrolled SOUND under the shot (off-mic voice,
+# room/crew noise, an action's own sound). It is muted by default too -- b-roll
+# should never drag in stray audio, transcribed or not -- but the brain KEEPS it
+# when the sound is the point (a hit, a laugh, applause, music): that override
+# lives in the arranger, not here.
+_VIDEO_SOUND_FRAC = 0.20
 
 
 def _audio_policy(source, in_ms: int, out_ms: int) -> Tuple[Optional[str], bool]:
-    """Classify a video cut's SOURCE AUDIO and give the default mute policy.
+    """Classify a video cut's SOURCE AUDIO and give the DEFAULT mute policy.
 
-    Returns ``(audio_kind, mute)``: ``"speech"`` + mute=True when real words
-    cover >= _VIDEO_SPEECH_FRAC of the span (stray talk under the shot); else
-    ``"ambient"`` + mute=False (room tone / sfx / possible music -- kept, since
-    we can't safely tell music from noise and silencing it would be worse). None
-    when there's no transcript to judge (leave the audio alone)."""
-    if source is None or not getattr(source, "words", None):
+    Returns ``(audio_kind, mute)``:
+      * ``"speech"`` + mute=True -- real words cover >= _VIDEO_SPEECH_FRAC of the
+        span (a stray half-sentence under the shot).
+      * ``"sound"``  + mute=True -- no dominant speech, but non-silence audio
+        covers >= _VIDEO_SOUND_FRAC (off-mic voice, crew/room noise, an action's
+        own sound). Muted by default; the brain unmutes when it wants that sound.
+      * ``"silent"`` + mute=False -- essentially silent; nothing to mute.
+      * ``None`` + mute=False -- no transcript AND no silence map, so we can't
+        judge; leave the audio alone.
+
+    The mute is only a DEFAULT: a video shot is a picture whose raw audio is
+    incidental, so uncontrolled sound is silenced unless something (the brain)
+    asks to keep it. Speech we WANT rides on ``said`` cuts, never on a shot."""
+    if source is None:
         return None, False
     span = max(1, out_ms - in_ms)
+    words = getattr(source, "words", None) or []
+    silences = getattr(source, "silences", None) or []
+    if not words and not silences:
+        return None, False
+
     talk = 0
-    for w in source.words:
+    for w in words:
         if w.get("is_filler"):
             continue
         ov = max(0, min(out_ms, int(w.get("end_ms", 0))) - max(in_ms, int(w.get("start_ms", 0))))
         talk += ov
     if talk / span >= _VIDEO_SPEECH_FRAC:
         return "speech", True
-    return "ambient", False
+
+    silent_ms = 0
+    for s in silences:
+        silent_ms += max(0, min(out_ms, int(s.get("end_ms", 0))) - max(in_ms, int(s.get("start_ms", 0))))
+    sound_frac = 1.0 - min(1.0, silent_ms / span)
+    if sound_frac >= _VIDEO_SOUND_FRAC:
+        return "sound", True
+    return "silent", False
 
 
 def _video_span_at(level_params: EnergyParams, channel: str, core_in: int,
