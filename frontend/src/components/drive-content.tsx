@@ -6,7 +6,7 @@ import { useDriveStore } from "@/stores/drive-store";
 import { useAuthStore } from "@/stores/auth-store";
 import { FileIcon } from "./file-icon";
 import { formatBytes, formatDuration } from "@/lib/utils";
-import { getFilePlaybackUrl, deleteFile, getFolderCovers } from "@/lib/api";
+import { getFilePlaybackUrl, deleteFile, getFolderCovers, getFiles } from "@/lib/api";
 import {
   MoreHorizontal,
   Loader2,
@@ -35,10 +35,32 @@ export function DriveContent({ onFileContextMenu, onFolderContextMenu }: DriveCo
     loading,
     selectedIds,
     searchQuery,
+    currentFolderId,
     toggleSelected,
     removeFile,
+    setFiles,
   } = useDriveStore();
   const session = useAuthStore((s) => s.session);
+
+  // While anything is still being analyzed, re-poll the file list so the
+  // per-clip progress bars advance without a manual refresh. Stops as soon as
+  // every file reports done (analysis_progress >= 1).
+  const anyProcessing = useMemo(
+    () => files.some((f) => (f.analysis_progress ?? 1) < 1),
+    [files],
+  );
+  useEffect(() => {
+    const token = session?.access_token;
+    if (!anyProcessing || !token) return;
+    const t = setInterval(async () => {
+      try {
+        setFiles(await getFiles(currentFolderId, token));
+      } catch {
+        /* transient network error -- next tick retries */
+      }
+    }, 4000);
+    return () => clearInterval(t);
+  }, [anyProcessing, currentFolderId, session?.access_token, setFiles]);
 
   const [fileMenu, setFileMenu] = useState<{ file: FileRecord; x: number; y: number } | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -407,9 +429,13 @@ function VideoCard({
   const videoRef = useRef<HTMLVideoElement>(null);
   const pinnedRef = useRef(false);
 
-  const isProcessing = file.status === "processing" || file.status === "uploading";
   const isVideo = file.file_type === "video";
   const canPlay = isVideo && file.status === "ready";
+  // Analysis progress (0..1) + phase from the server. Bar/overlay show while
+  // analysis is still running; the bar disappears once fully ready.
+  const progress = file.analysis_progress ?? (file.status === "ready" ? 1 : 0);
+  const analyzing = file.status !== "failed" && progress < 1;
+  const phase = file.analysis_phase ?? "processing";
 
   async function ensureUrl(): Promise<void> {
     if (playUrl) return;
@@ -568,10 +594,15 @@ function VideoCard({
           </button>
         )}
 
-        {isProcessing && !deleting && (
+        {/* Dark analysis overlay only until the clip becomes playable; once the
+            editing proxy is ready we let the user scrub while any tail-end
+            perception finishes (the thin bar below keeps tracking it). */}
+        {analyzing && !canPlay && !deleting && (
           <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-black/40">
             <Loader2 size={20} className="animate-spin text-white" />
-            <span className="text-xs text-white/80">Processing…</span>
+            <span className="text-xs capitalize text-white/80">
+              {phase} · {Math.round(progress * 100)}%
+            </span>
           </div>
         )}
 
@@ -592,6 +623,16 @@ function VideoCard({
           <span className="absolute bottom-2 right-2 z-10 rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-medium text-white">
             {formatDuration(file.duration_seconds)}
           </span>
+        )}
+
+        {/* Thin determinate analysis bar pinned to the bottom edge. */}
+        {analyzing && !deleting && (
+          <div className="absolute bottom-0 left-0 right-0 z-20 h-1 bg-black/30">
+            <div
+              className="h-full rounded-r-full transition-[width] duration-700 ease-out"
+              style={{ width: `${Math.max(5, Math.round(progress * 100))}%`, background: "#f59e0b" }}
+            />
+          </div>
         )}
       </div>
 

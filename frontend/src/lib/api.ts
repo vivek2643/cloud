@@ -83,6 +83,10 @@ export interface FileRecord {
   height: number | null;
   status: "uploading" | "processing" | "ready" | "failed";
   l1_status?: "pending" | "running" | "ready" | "failed" | "skipped" | null;
+  l2_status?: "pending" | "queued" | "running" | "ready" | "failed" | "skipped" | null;
+  // Coarse analysis progress (0..1) + short phase label from the server.
+  analysis_progress?: number;
+  analysis_phase?: string;
   created_at: string;
   updated_at: string;
 }

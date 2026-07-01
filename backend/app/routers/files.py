@@ -10,6 +10,42 @@ from app.models.schemas import FileResponse, FileUpdate, FileMoveRequest
 router = APIRouter(prefix="/api/files", tags=["files"])
 
 
+def _analysis_progress(f: dict) -> tuple[float, str]:
+    """Coarse, monotonic (progress, phase) for a file, from its lifecycle flags.
+
+    Tracks the full analysis (L1 + optional L2), not the raw upload -- in the
+    client-proxy fast path L1 runs on the proxies while the raw is still
+    uploading. L2 is only awaited when it was actually enqueued (l2_status set);
+    audio / ineligible clips have l2_status=None and finish at L1. The final
+    100% is gated on status=='ready' so the bar completes only once the file is
+    actually playable (editing proxy done)."""
+    if f.get("file_type") not in ("video", "audio"):
+        return 1.0, "ready"
+    status = f.get("status")
+    l1 = f.get("l1_status") or "pending"
+    l2 = f.get("l2_status")
+    if l1 == "failed":
+        return 1.0, "failed"
+    if l1 == "pending":
+        return (0.03, "uploading") if status == "uploading" else (0.08, "queued")
+    if l1 == "running":
+        return 0.4, "analyzing"
+    # L1 done (ready/skipped) -> optional Gemini (L2) phase.
+    if l2 == "queued":
+        return 0.72, "perceiving"
+    if l2 == "running":
+        return 0.85, "perceiving"
+    # Analysis complete (l2 None/ready/skipped/failed).
+    return (1.0, "ready") if status == "ready" else (0.95, "finishing")
+
+
+def _with_progress(f: dict) -> dict:
+    p, phase = _analysis_progress(f)
+    f["analysis_progress"] = p
+    f["analysis_phase"] = phase
+    return f
+
+
 class HeroCutsFeedRequest(BaseModel):
     file_ids: List[str] = Field(default_factory=list)
     energy: float = Field(0.5, ge=0.0, le=1.0)
@@ -30,7 +66,7 @@ def list_files(
         query = query.eq("folder_id", folder_id)
 
     result = query.order("created_at", desc=True).execute()
-    return result.data
+    return [_with_progress(f) for f in result.data]
 
 
 @router.get("/{file_id}", response_model=FileResponse)
@@ -42,7 +78,7 @@ def get_file(
     result = sb.table("files").select("*").eq("id", file_id).eq("user_id", user_id).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="File not found")
-    return result.data[0]
+    return _with_progress(result.data[0])
 
 
 @router.patch("/{file_id}", response_model=FileResponse)
