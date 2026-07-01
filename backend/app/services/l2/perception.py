@@ -92,19 +92,26 @@ def _stage_fail(conn: psycopg.Connection, file_id: str, err: str) -> None:
 
 def _file_meta(file_id: str) -> Optional[Tuple[str, str, float]]:
     """(r2_key_to_use, mime, duration_seconds) or None if the file is gone.
-    Prefers the proxy (small, normalized) over the raw upload."""
+
+    Prefers the client analysis proxy A (480p@1fps + audio -- purpose-built for
+    perception and available seconds after upload starts), then the 1080p
+    editing proxy, then the raw upload. Perception at 1fps is intentional: the
+    VLM samples frames, not motion, so the tiny proxy is plenty and lets L2 run
+    without waiting on the multi-GB raw.
+    """
     with _pg_conn() as conn:
         row = conn.execute(
-            "select r2_key, r2_proxy_key, duration_seconds from files where id = %s",
+            "select r2_key, r2_proxy_a_key, r2_proxy_key, duration_seconds from files where id = %s",
             (file_id,),
         ).fetchone()
     if not row:
         return None
-    raw_key, proxy_key, duration = row
-    key = proxy_key or raw_key
+    raw_key, proxy_a_key, proxy_key, duration = row
+    analysis_key = proxy_a_key or proxy_key
+    key = analysis_key or raw_key
     if not key:
         return None
-    if proxy_key:
+    if analysis_key:
         mime = "video/mp4"  # proxies are always normalized H.264/mp4
     else:
         guessed, _ = mimetypes.guess_type(key)
@@ -425,6 +432,18 @@ def enqueue_l2_if_eligible(file_id: str, duration_seconds: float) -> None:
     if duration_seconds <= 0 or duration_seconds > settings.l2_max_duration_seconds:
         _set_l2_status(file_id, "skipped")
         return
+    # Idempotent: L2 is now fired early (right after the speech track) so an L1
+    # retry -- or the no-audio fallback path -- must not enqueue it twice. Only
+    # a never-run file (null l2_status) is eligible.
+    try:
+        with _pg_conn() as conn:
+            row = conn.execute(
+                "select l2_status from files where id = %s", (file_id,)
+            ).fetchone()
+        if row and (row[0] or "") in ("queued", "running", "ready", "skipped"):
+            return
+    except Exception:
+        logger.exception("L2: eligibility check failed for %s; enqueuing anyway", file_id)
     try:
         l2_perception.defer(file_id=file_id)
         _set_l2_status(file_id, "queued")

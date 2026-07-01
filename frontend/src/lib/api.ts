@@ -75,6 +75,8 @@ export interface FileRecord {
   file_type: "video" | "image" | "audio" | "document" | "other";
   r2_key: string;
   r2_proxy_key: string | null;
+  r2_proxy_a_key?: string | null;
+  r2_proxy_b_key?: string | null;
   r2_thumbnail_key: string | null;
   duration_seconds: number | null;
   width: number | null;
@@ -306,6 +308,31 @@ export function abortMultipartUpload(
     body: JSON.stringify({ file_id: fileId, upload_id: uploadId }),
     token,
   });
+}
+
+// --- Client analysis proxies (see client_proxy.plan.md) ---
+// The desktop app uploads two tiny proxies (A: 480p@1fps+audio, B: 160x90@10fps)
+// so analysis starts in seconds instead of waiting on the multi-GB raw.
+
+export interface AnalysisProxyPresignResponse {
+  proxy_a_url: string;
+  proxy_a_key: string;
+  proxy_b_url: string;
+  proxy_b_key: string;
+}
+
+export function presignAnalysisProxies(fileId: string, token: string) {
+  return request<AnalysisProxyPresignResponse>(
+    `/api/upload/${fileId}/analysis-proxies/presign`,
+    { method: "POST", token }
+  );
+}
+
+export function completeAnalysisProxies(fileId: string, token: string) {
+  return request<FileRecord>(
+    `/api/upload/${fileId}/analysis-proxies/complete`,
+    { method: "POST", token }
+  );
 }
 
 // --- L1 debug ---

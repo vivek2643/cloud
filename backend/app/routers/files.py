@@ -95,7 +95,9 @@ def delete_file(
     user_id: str = Depends(get_current_user_id),
 ):
     sb = get_supabase()
-    file_result = sb.table("files").select("r2_key, r2_proxy_key, r2_thumbnail_key").eq("id", file_id).eq("user_id", user_id).execute()
+    file_result = sb.table("files").select(
+        "r2_key, r2_proxy_key, r2_proxy_a_key, r2_proxy_b_key, r2_thumbnail_key"
+    ).eq("id", file_id).eq("user_id", user_id).execute()
     if not file_result.data:
         raise HTTPException(status_code=404, detail="File not found")
 
@@ -103,7 +105,11 @@ def delete_file(
 
     from app.services.r2 import delete_object
     f = file_result.data[0]
-    for key in [f.get("r2_key"), f.get("r2_proxy_key"), f.get("r2_thumbnail_key")]:
+    for key in [
+        f.get("r2_key"), f.get("r2_proxy_key"),
+        f.get("r2_proxy_a_key"), f.get("r2_proxy_b_key"),
+        f.get("r2_thumbnail_key"),
+    ]:
         if key:
             try:
                 delete_object(key)

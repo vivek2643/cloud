@@ -777,14 +777,29 @@ def _run_stage(
 # `dialogue_cut` is NOT in a track: it needs transcript + diarization + audio
 # features, so it runs after the tracks join.
 
-def _track_speech(file_id: str, wav_path: str) -> None:
-    """transcript (Whisper) -> diarization. The heaviest track."""
+def _enqueue_l2(file_id: str, duration_s: float) -> None:
+    """Best-effort defer of L2 (Gemini) perception. L2 is its own task so a VLM
+    hiccup retries independently of the L1 index; eligibility + idempotency are
+    enforced inside enqueue_l2_if_eligible."""
+    try:
+        from app.services.l2.perception import enqueue_l2_if_eligible
+        enqueue_l2_if_eligible(file_id, duration_s)
+    except Exception:
+        logger.exception("L1: enqueuing L2 failed for %s", file_id)
+
+
+def _track_speech(file_id: str, wav_path: str, duration_s: float) -> None:
+    """transcript (Whisper) -> diarization -> dialogue_segments. The heaviest
+    track. Once it lands we fire L2 (Phase D): L2 needs proxy A plus exactly this
+    speech scaffolding, so enqueuing here overlaps it with the audio + motion
+    tracks instead of waiting for the whole L1 join."""
     with _pg_conn() as conn:
         _run_stage(conn, file_id, "transcript", _stage2_transcript, file_id, wav_path, conn)
         _run_stage(conn, file_id, "diarization", _stage6_diarization, file_id, wav_path, conn)
         # Dialogues lens: needs the diarized words + the WAV (for silence-snapped
         # cuts), both in hand here, so it rides the speech track after diarization.
         _run_stage(conn, file_id, "dialogue_segments", _stage_dialogue_segments, file_id, wav_path, conn)
+    _enqueue_l2(file_id, duration_s)
 
 
 def _track_audio(file_id: str, wav_path: str, duration_s: float) -> None:
@@ -813,8 +828,11 @@ def _run_deep_stages_parallel(
     """
     tracks = [(_track_motion, (file_id, video_source, duration_s))]
     if has_audio:
-        tracks.append((_track_speech, (file_id, wav_path)))
+        tracks.append((_track_speech, (file_id, wav_path, duration_s)))
         tracks.append((_track_audio, (file_id, wav_path, duration_s)))
+    else:
+        # No speech track to gate on -> fire visual-only L2 now, overlapping motion.
+        _enqueue_l2(file_id, duration_s)
 
     with ThreadPoolExecutor(max_workers=len(tracks)) as ex:
         futs = [ex.submit(fn, *args) for fn, args in tracks]
@@ -898,11 +916,148 @@ def _orchestrate_audio(file_id: str, r2_key: str, settings) -> None:
 
 # --- Top-level procrastinate task ----------------------------------------
 
+def _analysis_proxy_keys(file_id: str) -> tuple[Optional[str], Optional[str]]:
+    """(r2_proxy_a_key, r2_proxy_b_key) -- the client-generated analysis proxies,
+    or (None, None) when the client couldn't produce them (fallback to raw)."""
+    with _pg_conn() as conn:
+        row = conn.execute(
+            "select r2_proxy_a_key, r2_proxy_b_key from files where id = %s",
+            (file_id,),
+        ).fetchone()
+    if not row:
+        return None, None
+    return row[0], row[1]
+
+
+def _prepare_from_raw(
+    file_id: str, r2_key: str, tmpdir: str, wav_path: str
+) -> tuple[float, bool, str]:
+    """Fallback ingest: download the raw once and derive every analysis input
+    from it -- the 1080p editing proxy + thumbnail, the demuxed WAV, and the
+    motion source. This is the pre-client-proxy behavior, unchanged, so ingest
+    still works for any upload that arrives without client proxies. Returns
+    (duration_s, has_audio, motion_source)."""
+    raw_path = os.path.join(tmpdir, "raw")
+    logger.info("L1: downloading raw %s for file %s (no client proxies)", r2_key, file_id)
+    _download_from_r2(r2_key, raw_path)
+
+    has_audio = _has_audio_stream(raw_path)
+    if not has_audio:
+        logger.info("File %s has no audio stream; skipping transcript/audio.", file_id)
+
+    # Audio demux is a pure subprocess->file step with no DB access, so we
+    # overlap it with the (CPU/NVENC-heavy) proxy encode to take it off the
+    # critical path. Transcript/audio stages join on it below.
+    demux_err: dict = {}
+
+    def _demux_bg() -> None:
+        try:
+            _demux_wav(raw_path, wav_path)
+        except Exception as e:  # noqa: BLE001 - surfaced after join
+            demux_err["e"] = e
+
+    demux_thread: Optional[threading.Thread] = None
+    if has_audio:
+        demux_thread = threading.Thread(target=_demux_bg, daemon=True)
+        demux_thread.start()
+
+    with _pg_conn() as conn:
+        duration, _w, _h = _run_stage(
+            conn, file_id, "proxy",
+            _stage1_proxy, file_id, raw_path, tmpdir,
+        ) or (0.0, 0, 0)
+        cur = conn.execute(
+            "select duration_seconds from files where id = %s", (file_id,)
+        )
+        row = cur.fetchone()
+        duration_s = float(row[0]) if row and row[0] else (duration or 0.0)
+
+    if demux_thread is not None:
+        demux_thread.join()
+        if "e" in demux_err:
+            raise demux_err["e"]
+
+    # Prefer the 1080p proxy for the motion pass (much cheaper to decode than a
+    # 4K raw). It exists locally whenever the proxy stage ran in this
+    # invocation; on a rare retry where it doesn't, fall back to the raw.
+    proxy_local = os.path.join(tmpdir, "proxy.mp4")
+    motion_source = proxy_local if os.path.exists(proxy_local) else raw_path
+    return duration_s, has_audio, motion_source
+
+
+def _prepare_from_client_proxies(
+    file_id: str, proxy_a_key: str, proxy_b_key: str, tmpdir: str, wav_path: str
+) -> tuple[float, bool, str]:
+    """Fast path: analysis runs entirely off the two tiny client proxies and
+    never touches the multi-GB raw. Proxy A (480p@1fps + audio) feeds the whole
+    speech/audio stack (WAV demux) and L2; proxy B (160x90@10fps) feeds motion.
+    The 1080p editing proxy + real width/height/thumbnail are produced
+    separately by `l1_editing_proxy` when the raw finishes uploading. Returns
+    (duration_s, has_audio, motion_source)."""
+    proxy_a_path = os.path.join(tmpdir, "proxy_a.mp4")
+    motion_source = os.path.join(tmpdir, "proxy_b.mp4")
+    logger.info("L1: downloading client proxies A/B for file %s", file_id)
+    _download_from_r2(proxy_a_key, proxy_a_path)
+    _download_from_r2(proxy_b_key, motion_source)
+
+    probe = _probe_video(proxy_a_path)
+    duration_s = float(probe.get("format", {}).get("duration", 0) or 0.0)
+    has_audio = any(s.get("codec_type") == "audio" for s in probe.get("streams", []))
+    if not has_audio:
+        logger.info("File %s proxy A has no audio; skipping transcript/audio.", file_id)
+
+    # Record duration now so the deep-stage guardrail and L2 eligibility don't
+    # wait on the editing-proxy task. width/height/thumbnail/status come from the
+    # raw in l1_editing_proxy.
+    try:
+        get_supabase().table("files").update(
+            {"duration_seconds": duration_s}
+        ).eq("id", file_id).execute()
+    except Exception:
+        logger.exception("L1: failed to record duration for %s", file_id)
+
+    if has_audio:
+        _demux_wav(proxy_a_path, wav_path)
+    return duration_s, has_audio, motion_source
+
+
+@app.task(name="l1_editing_proxy", queue="gpu", retry=RetryStrategy(max_attempts=3, exponential_wait=4))
+def l1_editing_proxy(file_id: str, r2_key: str) -> None:
+    """Build the 1080p editing proxy + thumbnail from the raw once it finishes
+    uploading. Split out of l1_orchestrate so analysis can run off the client
+    proxies without blocking on the multi-GB raw. Idempotent via the shared
+    'proxy' stage, so it's a harmless no-op when the raw-fallback path already
+    generated it."""
+    if not _file_exists(file_id):
+        logger.info("File %s gone; skipping editing proxy.", file_id)
+        return
+    if _file_type(file_id) == "audio":
+        return  # audio's playable proxy is made inside _orchestrate_audio
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_path = os.path.join(tmpdir, "raw")
+            logger.info("Editing proxy: downloading %s for file %s", r2_key, file_id)
+            _download_from_r2(r2_key, raw_path)
+            with _pg_conn() as conn:
+                _run_stage(conn, file_id, "proxy", _stage1_proxy, file_id, raw_path, tmpdir)
+    except psycopg.errors.ForeignKeyViolation:
+        logger.info("File %s deleted mid editing-proxy; abandoning cleanly.", file_id)
+        return
+    except Exception:
+        if not _file_exists(file_id):
+            logger.info("File %s deleted mid editing-proxy; abandoning cleanly.", file_id)
+            return
+        logger.exception("Editing proxy failed for %s", file_id)
+        raise
+
+
 @app.task(name="l1_orchestrate", queue="gpu", retry=RetryStrategy(max_attempts=3, exponential_wait=4))
 def l1_orchestrate(file_id: str, r2_key: str) -> None:
     """
-    Single procrastinate task that downloads the raw media once and runs the L1
-    stages. Branches by file_type: audio uploads run the video-free music path.
+    Runs the L1 analysis stages. When the client uploaded the two analysis
+    proxies (see client_proxy.plan.md) analysis runs off them and never touches
+    the raw; otherwise every input is regenerated from the raw (fallback).
+    Branches by file_type: audio uploads run the video-free music path.
     Idempotent: each stage checks processing_jobs first.
     """
     settings = get_settings()
@@ -919,70 +1074,29 @@ def l1_orchestrate(file_id: str, r2_key: str) -> None:
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
-            raw_path = os.path.join(tmpdir, "raw")
             wav_path = os.path.join(tmpdir, "audio.wav")
-            logger.info("L1: downloading %s for file %s", r2_key, file_id)
-            _download_from_r2(r2_key, raw_path)
+            proxy_a_key, proxy_b_key = _analysis_proxy_keys(file_id)
 
-            has_audio = _has_audio_stream(raw_path)
-            if not has_audio:
-                logger.info("File %s has no audio stream; skipping transcript/audio.", file_id)
-
-            # Audio demux is a pure subprocess->file step with no DB access, so
-            # we overlap it with the (CPU/NVENC-heavy) proxy encode to take it
-            # off the critical path. Transcript/audio stages join on it later.
-            demux_err: dict = {}
-
-            def _demux_bg() -> None:
-                try:
-                    _demux_wav(raw_path, wav_path)
-                except Exception as e:  # noqa: BLE001 - surfaced after join
-                    demux_err["e"] = e
-
-            demux_thread: Optional[threading.Thread] = None
-            if has_audio:
-                demux_thread = threading.Thread(target=_demux_bg, daemon=True)
-                demux_thread.start()
-
-            with _pg_conn() as conn:
-                duration, _w, _h = _run_stage(
-                    conn, file_id, "proxy",
-                    _stage1_proxy, file_id, raw_path, tmpdir,
-                ) or (0.0, 0, 0)
-
-                cur = conn.execute(
-                    "select duration_seconds from files where id = %s",
-                    (file_id,),
+            if proxy_a_key and proxy_b_key:
+                duration_s, has_audio, video_source = _prepare_from_client_proxies(
+                    file_id, proxy_a_key, proxy_b_key, tmpdir, wav_path,
                 )
-                row = cur.fetchone()
-                duration_s = float(row[0]) if row and row[0] else (duration or 0.0)
+            else:
+                duration_s, has_audio, video_source = _prepare_from_raw(
+                    file_id, r2_key, tmpdir, wav_path,
+                )
 
             if duration_s > settings.max_l1_duration_seconds:
                 logger.info(
                     "Duration %.1fs > guardrail %ds; skipping deep L1 stages",
                     duration_s, settings.max_l1_duration_seconds,
                 )
-                if demux_thread is not None:
-                    demux_thread.join()
                 _set_l1_status(file_id, "skipped")
                 return
 
-            # Ensure the demux finished (it almost always has, in parallel
-            # with the proxy) before the transcript/audio stages need it.
-            if demux_thread is not None:
-                demux_thread.join()
-                if "e" in demux_err:
-                    raise demux_err["e"]
-
-            # Prefer the 1080p proxy for the motion pass (much cheaper to
-            # decode than a 4K raw). It exists locally whenever the proxy
-            # stage ran in this invocation; on a rare retry where it
-            # doesn't, fall back to the raw file.
-            proxy_local = os.path.join(tmpdir, "proxy.mp4")
-            video_source = proxy_local if os.path.exists(proxy_local) else raw_path
-
             # Deep stages run as three concurrent tracks (speech / audio / video),
-            # overlapping the two heaviest stages (Whisper + optical flow).
+            # overlapping the two heaviest stages (Whisper + optical flow). L2 is
+            # fired from inside as soon as the speech track lands (Phase D).
             _run_deep_stages_parallel(
                 file_id, wav_path, video_source, duration_s, has_audio,
             )
@@ -995,14 +1109,6 @@ def l1_orchestrate(file_id: str, r2_key: str) -> None:
             logger.info("L1 analysis written to %s", log_path)
         except Exception:
             logger.exception("L1 succeeded but writing the audit log failed for %s", file_id)
-
-        # L2 (Gemini perception) runs as its own task so a VLM hiccup retries
-        # independently of the L1 index. Gated by duration inside the enqueue.
-        try:
-            from app.services.l2.perception import enqueue_l2_if_eligible
-            enqueue_l2_if_eligible(file_id, duration_s)
-        except Exception:
-            logger.exception("L1 done but enqueuing L2 failed for %s", file_id)
     except psycopg.errors.ForeignKeyViolation:
         # The files row was deleted while we were processing it -- the inserts
         # have nowhere to land. Stop cleanly instead of failing + retrying.

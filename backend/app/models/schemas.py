@@ -100,3 +100,15 @@ class MultipartCompleteRequest(BaseModel):
 class MultipartAbortRequest(BaseModel):
     file_id: str
     upload_id: str
+
+
+# --- Client analysis proxies (see client_proxy.plan.md) ---
+# The desktop app decodes the local file once and uploads two tiny proxies
+# (A: 480p@1fps + audio for L2 + speech/audio; B: 160x90@10fps for motion) so
+# analysis starts in seconds, decoupled from the multi-GB raw upload.
+
+class AnalysisProxyPresignResponse(BaseModel):
+    proxy_a_url: str
+    proxy_a_key: str
+    proxy_b_url: str
+    proxy_b_key: str

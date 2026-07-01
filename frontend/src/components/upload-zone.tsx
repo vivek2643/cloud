@@ -11,7 +11,10 @@ import {
   createMultipartUpload,
   completeMultipartUpload,
   abortMultipartUpload,
+  presignAnalysisProxies,
+  completeAnalysisProxies,
 } from "@/lib/api";
+import { generateProxies } from "@/lib/proxy-gen";
 
 const VIDEO_ACCEPT = {
   "video/*": [".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv", ".mxf", ".mts"],
@@ -47,6 +50,33 @@ function putBlob(
   });
 }
 
+/**
+ * Best-effort: decode the local video once, upload the two tiny analysis
+ * proxies, and register them so the server fires analysis immediately -- without
+ * waiting on the multi-GB raw (see client_proxy.plan.md). Resolves to true when
+ * the fast path was armed, false when we couldn't (any failure), in which case
+ * the raw's own /complete triggers full analysis from the raw as before. This
+ * NEVER throws, so it can't break the raw upload it runs alongside.
+ */
+async function armAnalysisProxies(
+  fileId: string,
+  file: File,
+  token: string
+): Promise<boolean> {
+  try {
+    const proxies = await generateProxies(file);
+    if (!proxies) return false;
+    const pres = await presignAnalysisProxies(fileId, token);
+    await putBlob(pres.proxy_a_url, proxies.proxyA, "video/mp4", () => {});
+    await putBlob(pres.proxy_b_url, proxies.proxyB, "video/mp4", () => {});
+    await completeAnalysisProxies(fileId, token);
+    return true;
+  } catch (err) {
+    console.warn("Analysis-proxy fast path unavailable; server will use the raw.", err);
+    return false;
+  }
+}
+
 export function useUploadFiles() {
   const currentFolderId = useDriveStore((s) => s.currentFolderId);
   const addUpload = useDriveStore((s) => s.addUpload);
@@ -78,6 +108,12 @@ export function useUploadFiles() {
             token
           );
           try {
+            // Decode + upload the analysis proxies in parallel with the raw so
+            // analysis can start in seconds. Video only; audio uses the raw path.
+            const proxyTask = contentType.startsWith("video/")
+              ? armAnalysisProxies(mp.file_id, file, token)
+              : Promise.resolve(false);
+
             let uploadedBytes = 0;
             for (let i = 0; i < mp.part_urls.length; i++) {
               const start = i * mp.part_size;
@@ -90,6 +126,10 @@ export function useUploadFiles() {
               });
               uploadedBytes += end - start;
             }
+            // Let the proxy decision settle before completing the raw: if it
+            // armed, raw-complete only makes the editing proxy; otherwise the
+            // server runs full analysis from the raw.
+            await proxyTask;
             await completeMultipartUpload(mp.file_id, mp.upload_id, token);
             updateUpload(uploadId, {
               status: "complete",
