@@ -77,6 +77,14 @@ def _specs() -> List[Dict[str, Any]]:
           "need a span that ISN'T a pre-baked cut -- e.g. a person's silent reaction "
           "-- then place it with place_span. Each clip is headed 'CLIP <file8>'.",
           obj({})),
+        S("scan_source", "Query one clip's continuous timeline for spans matching a "
+          "facet: `lane` (e.g. 'presence:p2', 'speaking', 'shot', 'speech', 'action') "
+          "+ optional `match` (e.g. {state:'on'} or {subject:'p1'}). Each hit carries "
+          "the full facets at its midpoint, so ask 'where is p2 on screen?' with lane "
+          "'presence:p2' match {state:'on'} and read each hit's facets to see if they "
+          "are also silent. `file` is the 'CLIP <file8>' id.",
+          obj({"file": {"type": "string"}, "lane": {"type": "string"},
+               "match": {"type": "object"}}, ["file", "lane"])),
         # --- ACT (edit verbs; each mutates the working document) ---
         S("place", "Add a cut from a map ref. channel 'V1' inserts on the MAIN LINE "
           "(picture+sound) at index `at` (default append); 'V2' lays a SILENT video "
@@ -198,6 +206,9 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
             return _json(observe.affordances(doc, ctx)), doc, False
         if name == "source_awareness":
             return observe.source_awareness(ctx)[:12000], doc, False
+        if name == "scan_source":
+            return _json(observe.scan_source(ctx, args.get("file"), args.get("lane"),
+                                             args.get("match"))), doc, False
 
         # ACT (mutate)
         if name == "place":

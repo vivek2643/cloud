@@ -46,6 +46,9 @@ class EditContext:
     durations: Dict[str, int]          # file_id -> ms
     valence_by_file: Dict[str, str]    # file_id -> clip valence
     dup_groups: List[dict] = field(default_factory=list)
+    # Lazily-built continuous Clip Timelines (source-only, edit-independent), so
+    # source_awareness/scan_source don't re-fuse a clip within the same turn.
+    tl_cache: Dict[str, object] = field(default_factory=dict)
 
     @property
     def meta_by_ref(self) -> Dict[str, dict]:
@@ -381,7 +384,7 @@ def affordances(document: dict, ctx: EditContext) -> dict:
         "verbs": ["place", "place_span", "trim", "remove", "move", "set_audio",
                   "tighten", "split_screen"],
         "senses": ["read_state", "predict", "validate", "diagnose", "affordances",
-                   "source_awareness"],
+                   "source_awareness", "scan_source"],
     }
 
 
@@ -396,6 +399,21 @@ def _idx(level: Optional[str]) -> int:
 # 6. source_awareness (the continuous, fully-addressable source)
 # --------------------------------------------------------------------------
 
+def _timeline(ctx: EditContext, file_id: str):
+    """Lazily build + cache the continuous Clip Timeline for one clip (None if its
+    L1/L2 inputs aren't materialized). Cached on ctx for the turn."""
+    if file_id in ctx.tl_cache:
+        return ctx.tl_cache[file_id]
+    tl = None
+    try:
+        from app.services.l3 import clip_timeline_store as cts
+        tl = cts.load_clip_timeline(file_id)
+    except Exception:
+        logger.exception("observe: clip timeline build failed for %s", file_id)
+    ctx.tl_cache[file_id] = tl
+    return tl
+
+
 def source_awareness(ctx: EditContext) -> str:
     """The CONTINUOUS clip timeline for every clip in scope: change-point lanes
     (who is present / who is speaking on camera / gaze / shot / action over the
@@ -407,9 +425,40 @@ def source_awareness(ctx: EditContext) -> str:
     Degrades to a short notice (never raises) when the continuous store or its
     L1/L2 inputs are unavailable, so the loop is unaffected."""
     try:
-        from app.services.l3 import clip_timeline_store as cts
-        digest = cts.awareness_digest(ctx.file_ids)
-        return digest or "(no continuous timeline available for these clips yet)"
+        from app.services.l3.clip_timeline import render_awareness
+        blocks = [render_awareness(tl) for fid in ctx.file_ids
+                  if (tl := _timeline(ctx, fid)) is not None]
+        return "\n\n".join(blocks) or "(no continuous timeline available for these clips yet)"
     except Exception:
         logger.exception("observe: source_awareness failed (continuing)")
         return "(continuous timeline unavailable)"
+
+
+def scan_source(ctx: EditContext, file_ref: str, lane: str,
+                match: Optional[Dict[str, object]] = None) -> dict:
+    """Facet QUERY over one clip's continuous timeline: return the intervals of
+    ``lane`` whose value matches every key in ``match`` -- e.g. lane
+    'presence:p2' match {state:'on'} for "where is p2 on screen", or lane
+    'speaking' match {subject:'p1'}. Each hit carries the full ``facets`` at its
+    midpoint (who's present, who's speaking, shot, action) so a compound question
+    like "p2 present AND silent" is answered by scanning presence:p2 and reading
+    each hit's facets. ``file_ref`` accepts a full id or the 'CLIP <file8>' prefix.
+
+    Returns {file, lane, hits:[{in_ms,out_ms, <value>, facets}]}. Read-only;
+    empty hits when the lane/clip is unknown."""
+    fid = ""
+    for f in ctx.file_ids:
+        if f == file_ref or f.startswith(str(file_ref or "")):
+            fid = f
+            break
+    tl = _timeline(ctx, fid) if fid else None
+    if tl is None:
+        return {"file": fid or file_ref, "lane": lane, "hits": [],
+                "note": "no continuous timeline for this clip"}
+    hits = []
+    for it in tl.scan(lane, **(match or {})):
+        mid = (it.start_ms + it.end_ms) // 2
+        hits.append({"in_ms": it.start_ms, "out_ms": it.end_ms, **it.value,
+                     "facets": tl.facet_at(mid)})
+    return {"file": fid[:8], "lane": lane, "hits": hits[:40],
+            "lanes_available": [ln.name for ln in tl.lanes]}

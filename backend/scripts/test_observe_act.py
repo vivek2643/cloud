@@ -273,6 +273,36 @@ def test_affordances_menu():
     print("ok  affordances lists retake levels + channels + continuous verbs")
 
 
+def test_source_awareness_and_scan_source_via_cache():
+    """observe.source_awareness + scan_source read the continuous timeline. Seed
+    the per-turn cache so no DB is needed (the store path is exercised live)."""
+    from app.services.l3.clip_timeline import TimelineInputs, build_clip_timeline
+    struct = _map()
+    ctx = _ctx(struct)
+    tl = build_clip_timeline(TimelineInputs(
+        file_id="ffffffff-1111", duration_ms=8000,
+        persons=[{"local_id": "p1"}, {"local_id": "p2"}],
+        presence_lane=[{"start_ms": 0, "end_ms": 5000, "present": ["p1", "p2"]},
+                       {"start_ms": 5000, "end_ms": 8000, "present": ["p2"]}],
+        speaking=[{"start_ms": 1000, "end_ms": 4000, "subject": "p1"}],
+        activity_lane=[{"start_ms": 5000, "end_ms": 8000, "mode": "held",
+                        "subject": "person", "actor": "p2", "label": "listens, silent",
+                        "peak_ms": 6500, "confidence": 0.7}]))
+    ctx.tl_cache["ffffffff-1111"] = tl
+
+    text = observe.source_awareness(ctx)
+    assert "CLIP" in text and "listens, silent" in text, text
+
+    # "where is p2 on screen?" -> and each hit shows who is speaking (facets)
+    res = observe.scan_source(ctx, "ffffffff", "presence:p2", {"state": "on"})
+    assert res["hits"] and res["hits"][0]["in_ms"] == 0, res
+    assert "facets" in res["hits"][0] and "speaking" in res["hits"][0]["facets"], res
+    # the silent held reaction (5-8s) is queryable on the action lane
+    act_hits = observe.scan_source(ctx, "ffffffff", "action", {"channel": "shown"})
+    assert act_hits["hits"] and act_hits["hits"][0]["label"] == "listens, silent", act_hits
+    print("ok  source_awareness + scan_source read continuous lanes (cache path)")
+
+
 def test_place_span_arbitrary_main_line():
     """place_span lifts ANY source window onto V1 -- no map ref needed."""
     struct = _map()
@@ -317,6 +347,7 @@ def main():
     test_remove_tears_down_region()
     test_solve_layout_templates()
     test_affordances_menu()
+    test_source_awareness_and_scan_source_via_cache()
     test_place_span_arbitrary_main_line()
     test_place_span_v2_cutaway_and_bad_span_noop()
     print("\nall observe/act tests passed")
