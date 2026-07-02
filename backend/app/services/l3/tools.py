@@ -70,6 +70,13 @@ def _specs() -> List[Dict[str, Any]]:
         S("affordances", "The menu of what you CAN do and to what: per-cut retake "
           "levels (tighter/wider), alternate takes, audio toggles, channels in use, "
           "and a pool of video moments you could add as cutaways.", obj({})),
+        S("source_awareness", "See the clips as a CONTINUOUS, fully-addressable "
+          "source: change-point lanes (who is present / speaking on camera / gaze / "
+          "shot size / action over the whole clock), the cleanest seams, the "
+          "impact/reveal peaks, and a scored cut INDEX per clip. Use this when you "
+          "need a span that ISN'T a pre-baked cut -- e.g. a person's silent reaction "
+          "-- then place it with place_span. Each clip is headed 'CLIP <file8>'.",
+          obj({})),
         # --- ACT (edit verbs; each mutates the working document) ---
         S("place", "Add a cut from a map ref. channel 'V1' inserts on the MAIN LINE "
           "(picture+sound) at index `at` (default append); 'V2' lays a SILENT video "
@@ -80,6 +87,20 @@ def _specs() -> List[Dict[str, Any]]:
                "at": {"type": "integer"}, "from_ms": {"type": "integer"},
                "audio": {"type": "string", "enum": ["keep", "mute"]},
                "reason": {"type": "string"}}, ["ref"])),
+        S("place_span", "Place an ARBITRARY source span (from source_awareness) -- "
+          "not just a pre-baked cut. `file` is the 'CLIP <file8>' id; in_ms/out_ms "
+          "are SOURCE ms into that clip. channel 'V1' = main line (picture+sound) at "
+          "index `at`; 'V2' = video cutaway at program `from_ms`. axis:'speech' marks "
+          "it audio-load-bearing; audio 'keep'/'mute' sets its sound. Use this to lift "
+          "a silent reaction or any window the lanes revealed.",
+          obj({"file": {"type": "string"}, "in_ms": {"type": "integer"},
+               "out_ms": {"type": "integer"},
+               "channel": {"type": "string", "enum": ["V1", "V2"]},
+               "at": {"type": "integer"}, "from_ms": {"type": "integer"},
+               "axis": {"type": "string", "enum": ["speech", "any"]},
+               "audio": {"type": "string", "enum": ["keep", "mute"]},
+               "content": {"type": "string"}, "reason": {"type": "string"}},
+              ["file", "in_ms", "out_ms"])),
         S("trim", "Nudge a cut's SOURCE in/out. Absolute (in_ms/out_ms) or relative "
           "(delta_in_ms/delta_out_ms, e.g. delta_in_ms:200 starts 200ms later). "
           "Targets a main-line seg_id or a V2 op_id.",
@@ -127,6 +148,19 @@ def _specs() -> List[Dict[str, Any]]:
     ]
 
 
+def _resolve_file(ctx: EditContext, ref: Any) -> str:
+    """Resolve a brain-supplied clip id to a full file_id. Accepts a full id or
+    the 8-char 'CLIP <file8>' prefix shown in source_awareness. Falls back to the
+    raw value (validate/act will no-op on a bad id)."""
+    s = str(ref or "").strip()
+    if not s:
+        return ""
+    for fid in ctx.file_ids:
+        if fid == s or fid.startswith(s):
+            return fid
+    return s
+
+
 def _normalize_questions(args: Dict[str, Any]) -> List[dict]:
     """Coerce the brain's ask_user payload into surfaced questions: each needs a
     prompt + >= 2 concrete options (bad ones dropped)."""
@@ -162,6 +196,8 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
             return _json({"findings": observe.diagnose(doc, ctx)}), doc, False
         if name == "affordances":
             return _json(observe.affordances(doc, ctx)), doc, False
+        if name == "source_awareness":
+            return observe.source_awareness(ctx)[:12000], doc, False
 
         # ACT (mutate)
         if name == "place":
@@ -169,6 +205,13 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
                             channel=args.get("channel", "V1"), at=args.get("at"),
                             from_ms=args.get("from_ms"), audio=args.get("audio"),
                             reason=args.get("reason", ""))
+        elif name == "place_span":
+            fid = _resolve_file(ctx, args.get("file"))
+            new = act.place_span(doc, fid, in_ms=args.get("in_ms"), out_ms=args.get("out_ms"),
+                                 channel=args.get("channel", "V1"), at=args.get("at"),
+                                 from_ms=args.get("from_ms"), audio=args.get("audio"),
+                                 axis=args.get("axis", "any"), content=args.get("content", ""),
+                                 reason=args.get("reason", ""))
         elif name == "trim":
             new = act.trim(doc, args["target_id"], in_ms=args.get("in_ms"), out_ms=args.get("out_ms"),
                            delta_in_ms=args.get("delta_in_ms"), delta_out_ms=args.get("delta_out_ms"))

@@ -80,6 +80,72 @@ def _program_end(document: dict) -> int:
     return total
 
 
+def place_span(document: dict, file_id: str, *, in_ms: int, out_ms: int,
+               channel: str = "V1", at: Optional[int] = None,
+               from_ms: Optional[int] = None, audio: Optional[str] = None,
+               axis: str = "any", content: str = "", reason: str = "") -> dict:
+    """Place an ARBITRARY source span ``[in_ms, out_ms]`` of ``file_id`` -- the
+    continuous-editing verb. Unlike ``place`` (which can only place a pre-baked
+    map ref), this addresses the clip as a continuous source, so the brain can
+    lift a person's *silent* reaction, a held beat, or any window the awareness
+    lanes revealed -- not just a minted cut.
+
+    channel="V1": insert on the main line at index ``at`` (default append).
+    channel="V2": lay a video cutaway over the program at ``from_ms``.
+    ``axis="speech"`` marks the span as audio-load-bearing (protects it in the
+    weld/coverage). Boundaries are expected to be seam-snapped by the caller.
+    Empty/invalid span or missing file -> unchanged doc."""
+    try:
+        a, b = int(in_ms), int(out_ms)
+    except (TypeError, ValueError):
+        return document
+    if not file_id or b <= a:
+        return document
+
+    doc = _clone(document)
+    if channel.upper() == "V1":
+        seg = {
+            "seg_id": _new_seg_id(),
+            "file_id": file_id,
+            "in_ms": a,
+            "out_ms": b,
+            "axis": "speech" if axis == "speech" else "any",
+            "beat_id": None,
+            "content": content,
+            "rationale": reason or None,
+            "priority": 3,
+            "cut_in_cost": 0.0,
+            "cut_out_cost": 0.0,
+            "warnings": [],
+            "mute": True if audio == "mute" else None,
+            "ref": None,
+            "level": "span",
+        }
+        tl = doc["timeline"]
+        idx = len(tl) if at is None else max(0, min(int(at), len(tl)))
+        doc["timeline"] = tl[:idx] + [seg] + tl[idx:]
+        return doc
+
+    anchor = _program_end(doc) if from_ms is None else max(0, int(from_ms))
+    span = b - a
+    doc["operations"].append({
+        "op_id": f"sp_{uuid.uuid4().hex[:6]}",
+        "type": "place_video",
+        "source_file_id": file_id,
+        "src_in_ms": a,
+        "src_out_ms": b,
+        "from_ms": anchor,
+        "to_ms": anchor + span,
+        "layout": layers.DEFAULT_LAYOUT,
+        "z": layers.Z_COVERAGE,
+        "opacity": 1.0,
+        "rationale": reason or None,
+        "warnings": [],
+        "mute": False if audio == "keep" else True,
+    })
+    return doc
+
+
 # --------------------------------------------------------------------------
 # Verbs
 # --------------------------------------------------------------------------

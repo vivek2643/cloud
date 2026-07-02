@@ -378,7 +378,10 @@ def affordances(document: dict, ctx: EditContext) -> dict:
         "can_add_channel": ["V2", "A2"],
         "cutaway_pool": cutaway_pool[:50],
         "layout_templates": ["split_h", "split_v", "pip"],
-        "verbs": ["place", "trim", "remove", "move", "set_audio", "tighten", "split_screen"],
+        "verbs": ["place", "place_span", "trim", "remove", "move", "set_audio",
+                  "tighten", "split_screen"],
+        "senses": ["read_state", "predict", "validate", "diagnose", "affordances",
+                   "source_awareness"],
     }
 
 
@@ -387,3 +390,26 @@ def _idx(level: Optional[str]) -> int:
         return _LEVELS.index(level)
     except (ValueError, TypeError):
         return _LEVELS.index("balanced")
+
+
+# --------------------------------------------------------------------------
+# 6. source_awareness (the continuous, fully-addressable source)
+# --------------------------------------------------------------------------
+
+def source_awareness(ctx: EditContext) -> str:
+    """The CONTINUOUS clip timeline for every clip in scope: change-point lanes
+    (who is present / who is speaking on camera / gaze / shot / action over the
+    whole clock), the cleanest seams, the impact/reveal peaks, and a scored cut
+    INDEX. Unlike ``affordances`` (which lists the pre-baked cuts), this exposes
+    the clip as a fully-addressable source: any span the brain can describe can
+    be placed with ``place_span``, seam-snapped to a clean boundary. Read-only.
+
+    Degrades to a short notice (never raises) when the continuous store or its
+    L1/L2 inputs are unavailable, so the loop is unaffected."""
+    try:
+        from app.services.l3 import clip_timeline_store as cts
+        digest = cts.awareness_digest(ctx.file_ids)
+        return digest or "(no continuous timeline available for these clips yet)"
+    except Exception:
+        logger.exception("observe: source_awareness failed (continuing)")
+        return "(continuous timeline unavailable)"

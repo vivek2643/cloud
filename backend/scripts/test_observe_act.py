@@ -269,7 +269,36 @@ def test_affordances_menu():
     assert "tight" in cut["can_tighten_to"], cut
     assert "broad" in cut["can_widen_to"], cut
     assert aff["verbs"] and "V2" in aff["can_add_channel"]
-    print("ok  affordances lists retake levels + channels")
+    assert "place_span" in aff["verbs"] and "source_awareness" in aff["senses"], aff
+    print("ok  affordances lists retake levels + channels + continuous verbs")
+
+
+def test_place_span_arbitrary_main_line():
+    """place_span lifts ANY source window onto V1 -- no map ref needed."""
+    struct = _map()
+    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    n0 = len(doc["timeline"])
+    doc2 = act.place_span(doc, "ffffffff-1111", in_ms=1200, out_ms=1900,
+                          channel="V1", axis="any", content="silent reaction")
+    assert doc2 is not doc and len(doc2["timeline"]) == n0 + 1, doc2["timeline"]
+    seg = doc2["timeline"][-1]
+    assert (seg["in_ms"], seg["out_ms"]) == (1200, 1900) and seg["ref"] is None, seg
+    assert seg["level"] == "span" and seg["file_id"] == "ffffffff-1111", seg
+    print("ok  place_span puts an arbitrary window on the main line")
+
+
+def test_place_span_v2_cutaway_and_bad_span_noop():
+    struct = _map()
+    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    prog = act._program_end(doc)
+    doc2 = act.place_span(doc, "ffffffff-1111", in_ms=3000, out_ms=3500,
+                          channel="V2", from_ms=prog, audio="keep")
+    ops = [o for o in doc2["operations"] if o["type"] == "place_video"]
+    assert ops and ops[-1]["from_ms"] == prog and ops[-1]["mute"] is False, ops
+    # empty/invalid span -> unchanged doc (total verb)
+    assert act.place_span(doc, "ffffffff-1111", in_ms=2000, out_ms=2000) is doc
+    assert act.place_span(doc, "", in_ms=0, out_ms=100) is doc
+    print("ok  place_span V2 cutaway keeps sound; bad span is a no-op")
 
 
 def main():
@@ -288,6 +317,8 @@ def main():
     test_remove_tears_down_region()
     test_solve_layout_templates()
     test_affordances_menu()
+    test_place_span_arbitrary_main_line()
+    test_place_span_v2_cutaway_and_bad_span_noop()
     print("\nall observe/act tests passed")
 
 
