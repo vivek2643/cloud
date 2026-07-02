@@ -102,10 +102,19 @@ class Settings(BaseSettings):
     autoedit_max_output_tokens: int = 16384
     # Deep reasoning for the editorial calls (taste, story, ordering).
     autoedit_effort: str = "high"
-    # V1 is a pure clip ASSEMBLER: pick the right clips and order them, nothing
-    # else. Leave False to skip the coverage/overlay pass (no place_video ops);
-    # flip True to let it lay B-roll / reaction / insert overlays on the spine.
+    # A pure clip ASSEMBLER: pick the right clips and order them, nothing else.
+    # Leave False to skip the coverage pass (no V2 cutaway ops); flip True to let
+    # it lay B-roll / reaction cutaways as V2 over the V1 spine.
     autoedit_coverage: bool = False
+    # Conversational arranger (edit-thread brain) version.
+    #   "v1" -- the original MOMENT-framed loop: clips are a bag of pre-scored
+    #           speech moments; place/split_screen only. Kept for fallback.
+    #   "v2" -- the CONTINUOUS-SOURCE loop (default): each clip is a fully-
+    #           addressable timeline (lanes/seams/peaks + a scored cut index).
+    #           The brain builds the spoken spine from the index AND lifts silent
+    #           reactions / cutaways / any window via source_awareness+place_span,
+    #           and it ACTS on an explicit split-screen request instead of asking.
+    autoedit_arranger_version: str = "v2"
 
     # --- L3 thought segmentation (the speech primitive) ------------------
     # A post-L2 pass that splits a clip's speaker-tagged transcript into generic

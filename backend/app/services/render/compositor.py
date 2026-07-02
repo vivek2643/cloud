@@ -426,7 +426,7 @@ def _concat_segments(segments: List[str], dst: str, cfg: Dict[str, Any]) -> None
 
 
 # --------------------------------------------------------------------------
-# Layered path: one filter_complex graph (overlay stack + audio mix)
+# Layered path: one filter_complex graph (video layer stack + audio mix)
 # --------------------------------------------------------------------------
 
 def _render_layers(
@@ -460,8 +460,9 @@ def _render_layers(
         out_s = int(v["src_out_ms"]) / 1000.0
         ps = int(v["prog_start_ms"]) / 1000.0
         opacity = float(v.get("opacity", 1.0))
-        # A split/PiP cell frames its source to the CELL size and overlays at the
-        # cell origin; a full-frame layer frames to the whole canvas at (0,0).
+        # A split/PiP cell frames its source to the CELL size and composites at
+        # the cell origin; a full-frame layer frames to the whole canvas at (0,0).
+        # (ffmpeg's `overlay` filter below is just the compositing primitive.)
         cell = _dest_px(v.get("transform"), W, H)
         vf_cfg = {**cfg, "width": cell[2], "height": cell[3]} if cell else cfg
         ov_xy = f"x={cell[0]}:y={cell[1]}:" if cell else ""

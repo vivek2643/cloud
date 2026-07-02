@@ -47,7 +47,7 @@ export interface ProjectClip {
   progEndMs: number;
   label: string;
   origin: ClipOrigin;
-  /** Free horizontal repositioning (overlay/audio ops). Base clips are fixed. */
+  /** Free horizontal repositioning (V2 cutaway / A2 audio ops). Base clips are fixed. */
   movable: boolean;
   /** Edge trimming. */
   trimmable: boolean;

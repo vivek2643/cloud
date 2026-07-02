@@ -254,10 +254,10 @@ def validate(document: dict, ctx: EditContext) -> List[dict]:
         if op.get("type") == "place_video":
             frm, to = int(op.get("from_ms", 0)), int(op.get("to_ms", 0))
             if to <= frm:
-                issues.append({"kind": "op", "id": oid, "message": f"empty overlay window {frm}-{to}"})
+                issues.append({"kind": "op", "id": oid, "message": f"empty V2 cutaway window {frm}-{to}"})
             if program_end and frm > program_end:
                 issues.append({"kind": "op", "id": oid,
-                               "message": f"overlay starts {frm}ms past program end {program_end}ms"})
+                               "message": f"V2 cutaway starts {frm}ms past program end {program_end}ms"})
             if int(op.get("src_out_ms", 0)) <= int(op.get("src_in_ms", 0)):
                 issues.append({"kind": "op", "id": oid, "message": "empty source span"})
 

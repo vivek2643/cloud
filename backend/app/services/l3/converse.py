@@ -86,6 +86,61 @@ _LOOP_SYSTEM = (
     "ask about things you can reasonably decide."
 )
 
+
+# --- v2: continuous-source arranger ----------------------------------------
+# The clip is no longer a bag of pre-scored speech "moments". It is a
+# CONTINUOUS, fully-addressable timeline: the brain sees change-point lanes
+# (present / speaking / gaze / shot / action over the whole clock), the clean
+# seams, the impact peaks, and a scored cut INDEX -- and it can place ANY span,
+# not just a pre-baked said-line. The speech-cut index stays as a fast way to
+# lay the spoken spine, but reactions / listening beats / cutaways / b-roll come
+# from `source_awareness` (+ `scan_source`) then `place_span`.
+_LOOP_SYSTEM_V2 = (
+    "You are EDSO, a sharp video editor working ON an edit with real TOOLS, like "
+    "a coding agent editing a repo. Below you see the shoot as a CONTINUOUS "
+    "SOURCE -- each clip is a fully-addressable timeline with change-point lanes "
+    "(who is present / who is speaking on camera / gaze / shot size / action over "
+    "the whole clock), its cleanest seams, its impact/reveal PEAKS, and a scored "
+    "CUT INDEX -- plus a SPEECH-CUT INDEX of pre-scored said-lines, and the "
+    "CURRENT TIMELINE of the edit so far.\n\n"
+    "TWO WAYS TO CUT -- USE BOTH.\n"
+    "  1. The spoken spine: lay the said-lines fast with `place` (channel V1) "
+    "using a speech-cut ref (e.g. ab12cd34:m07). The quoted text is the complete "
+    "line -- judge from it. dup:tgN = the same content as another take; use one.\n"
+    "  2. Anything that ISN'T a clean said-line -- a person's SILENT reaction, a "
+    "listening beat, a face just before/after their line, a held action, b-roll -- "
+    "is NOT in the speech index. To use it: read `source_awareness` to see the "
+    "lanes/peaks, `scan_source` to locate the exact window (e.g. lane "
+    "'presence:p2' match {state:'on'} to find where p2 is on screen, then read "
+    "each hit's facets to see if they're silent), then `place_span` that window "
+    "(the 'CLIP <file8>' id + source in/out ms). Seam-snapping is automatic.\n"
+    "A strong cut breathes: it doesn't just staple talking-head lines back to "
+    "back. When one speaker runs long, cut to the LISTENER's reaction; open or "
+    "close a beat on a face or an action, not always on a word. Reach for "
+    "`place_span` whenever the moment you want to show isn't a spoken line.\n\n"
+    "CHANNELS. The main line is V1 video + A1 audio, in sequence -- `place` / "
+    "`place_span` channel V1. A SILENT video cutaway over the ongoing A1 audio "
+    "rides V2 (channel V2 at a program `from_ms`). A music/SFX bed rides A2. "
+    "Showing V1 and a second source at the SAME time (side-by-side, stacked, or "
+    "PiP) is `split_screen` over a program window.\n\n"
+    "HOW YOU WORK. When the user just wants to talk, answer in prose and DON'T "
+    "touch the edit. When they want a change, use your tools and OBSERVE as you "
+    "go (read_state / source_awareness / diagnose / validate), then ACT. Your "
+    "edits apply DIRECTLY -- the user watches the timeline update and can undo -- "
+    "so never ask for confirmation or say 'I will'; just do it, then tell them "
+    "what you did in a sentence or two.\n\n"
+    "ACTING ON A LOOK. A split-screen / PiP is normally the user's call. BUT when "
+    "the user has already TOLD you to use one (e.g. 'use split screen on the "
+    "short exchanges', 'PiP the reactions'), that request IS their decision -- "
+    "just DO it with a sensible default (short two-person exchanges -> split_h "
+    "side-by-side; a reaction over a talker -> pip), across the beats they meant. "
+    "Only use `ask_user` when the look is genuinely unspecified and the choice is "
+    "truly theirs (which template, which aspect/framing, a big pacing tradeoff), "
+    "with 2+ concrete options. Never turn an explicit instruction back into a "
+    "question. Use only ids that appear below."
+)
+
+
 def _context_block(file_ids: List[str], document: Optional[dict]) -> str:
     parts: List[str] = []
     try:
@@ -96,8 +151,47 @@ def _context_block(file_ids: List[str], document: Optional[dict]) -> str:
             parts.append("FOOTAGE MAP:\n" + text)
     except Exception:
         logger.exception("converse: map build failed (continuing without it)")
-    overlay = arrange.timeline_overlay(document)
-    parts.append("CURRENT TIMELINE:\n" + overlay if overlay
+    tl_text = arrange.render_timeline(document)
+    parts.append("CURRENT TIMELINE:\n" + tl_text if tl_text
+                 else "CURRENT TIMELINE: (empty -- no edit drafted yet)")
+    return "\n\n".join(parts)
+
+
+# Split the char budget between the two substrates so neither starves the other
+# (the continuous digest is compact; the speech index can be long).
+_AWARE_CHAR_CAP = 90_000
+_INDEX_CHAR_CAP = 110_000
+
+
+def _context_block_v2(file_ids: List[str], document: Optional[dict],
+                      ctx: "observe.EditContext") -> str:
+    """v2 context: the CONTINUOUS SOURCE (lanes/seams/peaks/cut index) is the
+    primary substrate, followed by the speech-cut index (fast spine) and the
+    current timeline. Falls back gracefully if either projection is unavailable."""
+    parts: List[str] = []
+    try:
+        aware = observe.source_awareness(ctx) if file_ids else ""
+        if aware and not aware.lstrip().startswith("("):  # skip "(no ... available)" notices
+            if len(aware) > _AWARE_CHAR_CAP:
+                aware = aware[:_AWARE_CHAR_CAP] + "\n…(truncated)"
+            parts.append(
+                "CONTINUOUS SOURCE (each clip as a fully-addressable timeline -- "
+                "lanes, seams, peaks, and a scored cut index; place ANY span with "
+                "place_span):\n" + aware)
+    except Exception:
+        logger.exception("converse: source_awareness build failed (continuing)")
+    try:
+        text = (footage_map.assemble_map(file_ids).get("text") or "") if file_ids else ""
+        if len(text) > _INDEX_CHAR_CAP:
+            text = text[:_INDEX_CHAR_CAP] + "\n…(truncated)"
+        if text:
+            parts.append(
+                "SPEECH-CUT INDEX (pre-scored said-lines -- lay the spoken spine "
+                "fast with `place <ref>`):\n" + text)
+    except Exception:
+        logger.exception("converse: map build failed (continuing without it)")
+    tl_text = arrange.render_timeline(document)
+    parts.append("CURRENT TIMELINE:\n" + tl_text if tl_text
                  else "CURRENT TIMELINE: (empty -- no edit drafted yet)")
     return "\n\n".join(parts)
 
@@ -141,10 +235,14 @@ def respond(thread_id: str, *, llm: Optional[LLMClient] = None) -> ConverseResul
         return ConverseResult(reply="Tell me what you'd like to do with these clips.")
 
     working = document if isinstance(document, dict) else _seed_document(file_ids)
-    system = _LOOP_SYSTEM + "\n\n" + _context_block(file_ids, document)
     max_tokens = settings.autoedit_max_output_tokens
+    version = (settings.autoedit_arranger_version or "v2").strip().lower()
     try:
         ctx = observe.build_context(file_ids)
+        if version == "v2":
+            system = _LOOP_SYSTEM_V2 + "\n\n" + _context_block_v2(file_ids, document, ctx)
+        else:
+            system = _LOOP_SYSTEM + "\n\n" + _context_block(file_ids, document)
         result = tools.run_edit_loop(llm, system=system, messages=messages,
                                      ctx=ctx, document=working, max_tokens=max_tokens)
     except Exception:

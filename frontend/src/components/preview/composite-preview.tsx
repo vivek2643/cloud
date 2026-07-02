@@ -265,7 +265,7 @@ export function CompositePreview({ token }: { token: string | undefined }) {
           <div className="absolute left-2 top-2 flex gap-1">
             {activeVideo && activeVideo.z > 0 && (
               <span className="flex items-center gap-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] text-white">
-                <Layers size={10} /> overlay
+                <Layers size={10} /> V2
               </span>
             )}
             {activeBeds > 0 && (

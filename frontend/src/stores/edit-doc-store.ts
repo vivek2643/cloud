@@ -79,7 +79,7 @@ interface EditDocState {
     seg: { file_id: string; in_ms: number; out_ms: number },
     atIndex?: number
   ) => void;
-  /** Add a placed video overlay / audio bed from a dragged clip. */
+  /** Add a placed V2 video cutaway / A2 audio bed from a dragged clip. */
   addOp: (op: {
     type: "place_video" | "place_audio";
     source_file_id: string;

@@ -63,7 +63,7 @@ def _specs() -> List[Dict[str, Any]]:
                "add": {"type": "array", "items": {"type": "object", "properties": {
                    "ref": {"type": "string"}, "level": {"type": "string"}}}}})),
         S("validate", "Check the edit for STRUCTURAL problems (spans out of range, "
-          "empty cuts, bad overlays). Empty result means clean.", obj({})),
+          "empty cuts, bad V2 cutaways/layouts). Empty result means clean.", obj({})),
         S("diagnose", "Editorial problems worth fixing (jump-cut risk, energy sags, "
           "over/under target length, redundant same-beat takes). Advice, not orders.",
           obj({})),

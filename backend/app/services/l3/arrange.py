@@ -16,7 +16,7 @@ document and ``observe.resolve_doc`` resolves it):
   * ``_MapIndex`` -- validate a ref + resolve (ref, level) -> a source span.
   * ``_weld_segments`` -- merge adjacent same-clip contiguous main-line cuts
     (used by ``observe.resolve_doc`` to keep the agentic timeline clean).
-  * ``timeline_overlay`` -- render the current timeline for a chat turn.
+  * ``render_timeline`` -- render the current timeline for a chat turn.
 """
 from __future__ import annotations
 
@@ -26,7 +26,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Track 0 is the main line; tracks >= 1 are overlays anchored at a program time.
+# Channel model: track 0 is the V1 main line; track >= 1 is a V2+ video cutaway
+# lane, anchored at a program time (never a "layer over" -- a full channel).
 _MAIN_TRACK = 0
 
 # Two adjacent main-line segments from the SAME clip whose source spans touch (or
@@ -45,8 +46,8 @@ class Placement:
     """One arranger choice: a map id taken at a level, placed on a track."""
     ref: str                       # moment_id or atom_id (validated against map)
     level: str = "balanced"        # energy level (moments only; atoms ignore it)
-    track: int = _MAIN_TRACK       # 0 = main line; >=1 = overlay
-    from_ms: Optional[int] = None  # overlay anchor on the program clock (track>=1)
+    track: int = _MAIN_TRACK       # 0 = V1 main line; >=1 = V2+ cutaway lane
+    from_ms: Optional[int] = None  # V2+ cutaway anchor on the program clock (track>=1)
     reason: str = ""
     # Per-pick audio override on a video shot's DEFAULT mute policy: "keep" plays
     # its source sound (the shot's own audio is the point -- an action, a laugh,
@@ -203,13 +204,13 @@ def _weld_segments(segments: List[dict]) -> List[dict]:
     return welded
 
 
-def timeline_overlay(document: Optional[dict]) -> str:
-    """Render the current timeline as a map-overlay for a refinement turn.
+def render_timeline(document: Optional[dict]) -> str:
+    """Render the current timeline for a refinement turn.
 
-    Each main-line segment is shown with its map id when known (so the model can
-    keep/move/replace it in the SAME vocabulary as the map) or as a raw source
-    span when it was hand-edited and no longer maps to a moment. Returns "" when
-    there is nothing to refine."""
+    Each main-line (V1) segment is shown with its map id when known (so the model
+    can keep/move/replace it in the SAME vocabulary as the map) or as a raw source
+    span when it was hand-edited and no longer maps to a moment. V2 cutaways are
+    listed after. Returns "" when there is nothing to refine."""
     if not document:
         return ""
     segs = document.get("timeline") or []
@@ -232,12 +233,11 @@ def timeline_overlay(document: Optional[dict]) -> str:
         gist = (s.get("content") or "").replace("\n", " ").strip()
         if len(gist) > 60:
             gist = gist[:57] + "..."
-        lines.append(f"  {_ms(t)} track0 {tag} \"{gist}\"")
+        lines.append(f"  {_ms(t)} V1 {tag} \"{gist}\"")
         t += dur
     for o in ops:
         f = int(o.get("from_ms", 0))
-        lines.append(f"  {_ms(f)} overlay raw {str(o.get('source_file_id', '?'))[:8]} "
-                     f"(z{o.get('z', 1)})")
+        lines.append(f"  {_ms(f)} V2 cutaway raw {str(o.get('source_file_id', '?'))[:8]}")
     return "\n".join(lines)
 
 

@@ -222,7 +222,7 @@ export function TimelineEditor({
     const onMove = (ev: PointerEvent) => {
       const dMs = (ev.clientX - startX) / pxPerMs;
       setOpFrom(opId, snapMs(startFrom + dMs), total);
-      // Cross-track: only video overlays restack, only onto another non-base
+      // Cross-track: only V2+ video cutaways restack, only onto another non-base
       // video layer (never onto the spine or an audio track).
       if (clip.kind === "video") {
         const tgt = trackAtY(ev.clientY);
@@ -274,7 +274,7 @@ export function TimelineEditor({
 
   // --- drag clips IN from the Hero Cuts / Dialogues bins ---
   // Base video lane (V1) = insert a spine cut at the drop index; an upper video
-  // lane = a placed overlay; an audio lane = a placed bed — all at the drop time.
+  // lane (V2+) = a placed cutaway; an audio lane = a placed bed — all at the drop time.
   const [dropTrack, setDropTrack] = useState<string | null>(null);
 
   function progMsAtX(trackId: string, clientX: number): number {

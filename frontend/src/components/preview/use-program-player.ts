@@ -154,7 +154,7 @@ function buildClips(resolved: ResolvedTimeline | null): Clip[] {
 }
 
 /** Position the element into its canvas cell: a split/PiP dest rect (percent
- * box) or the full frame. Mirrors the compositor's overlay-into-dest step. */
+ * box) or the full frame. Mirrors the compositor's composite-into-dest step. */
 function applyDestGeometry(el: HTMLVideoElement, dest: DestRect | null) {
   if (dest) {
     el.style.inset = "auto";

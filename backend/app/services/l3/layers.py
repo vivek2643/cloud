@@ -11,9 +11,9 @@ Design intent: GENERAL, not B-roll-specific.
   * Video is a z-ordered stack of LAYERS. Each layer carries a `layout`
     (default "full_frame"), `z`, and `opacity`. The compositor paints
     bottom->top. A full-frame, opaque, top layer is the degenerate "replace the
-    picture" case (coverage / cutaway / multicam angle). Non-full-frame layouts
-    (split-screen, PiP, overlay) are the SAME primitive with a different layout
-    -- deferred, but the model already admits them.
+    picture" case (a full-frame V2 cutaway / alternate angle). Non-full-frame
+    layouts (split-screen, PiP) are the SAME primitive with a different layout
+    -- the model already admits them.
   * Audio is a set of ROLE layers (dialogue / music / sfx) that the mixer SUMS,
     applying per-layer gain and side-chain ducking. Audio has no spatial axis.
 
@@ -28,7 +28,7 @@ from typing import Dict, List, Optional, Tuple
 
 # Z bands so layer kinds stack predictably regardless of insertion order.
 Z_SPINE_VIDEO = 0
-Z_COVERAGE = 10        # video laid over the spine (coverage / cutaway / overlay)
+Z_COVERAGE = 10        # a V2 cutaway painted above the V1 spine (full-frame or a cell)
 DEFAULT_LAYOUT = "full_frame"
 
 # Audio roles (the mixer knows how to duck dialogue under music, etc.).

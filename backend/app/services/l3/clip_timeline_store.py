@@ -19,8 +19,11 @@ it.
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
+import psycopg
+
+from app.config import get_settings
 from app.services.l3 import atoms as atoms_mod
 from app.services.l3 import hero_cuts, score_span
 from app.services.l3.clip_timeline import (
@@ -28,6 +31,33 @@ from app.services.l3.clip_timeline import (
 )
 
 logger = logging.getLogger("l3.clip_timeline_store")
+
+# Process-level cache: fusing a clip's continuous timeline (L1 inputs + the
+# cuts-v2 seam field) costs ~seconds, and the v2 arranger reads it EVERY turn.
+# Cache the built ClipTimeline keyed by (file_id, energy) with a cheap
+# perception token (schema_version + updated marker); a lookup rebuilds only
+# when the clip's perception actually changed (e.g. a re-analysis), so an edit
+# session pays the cold build once and every later turn is instant. Not
+# persisted across process restarts (a redeploy re-warms it on first use).
+_TL_CACHE: Dict[Tuple[str, float], Tuple[str, ClipTimeline]] = {}
+
+
+def _perception_token(file_id: str) -> Optional[str]:
+    """A cheap validity token for a clip's perception -- schema_version +
+    created_at. Changes iff the perception was (re)written, so it invalidates a
+    stale cached timeline without re-fusing to check. None when unknown."""
+    try:
+        with psycopg.connect(get_settings().database_url, autocommit=True) as conn:
+            row = conn.execute(
+                "select schema_version, created_at from clip_perception where file_id = %s",
+                (file_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return f"{row[0]}:{row[1].isoformat() if row[1] else ''}"
+    except Exception:
+        logger.exception("clip_timeline: perception token lookup failed for %s", file_id)
+        return None
 
 
 def load_timeline_inputs(file_id: str, *, energy: float = 0.5) -> Optional[TimelineInputs]:
@@ -72,11 +102,24 @@ def load_timeline_inputs(file_id: str, *, energy: float = 0.5) -> Optional[Timel
     )
 
 
-def load_clip_timeline(file_id: str, *, energy: float = 0.5) -> Optional[ClipTimeline]:
+def load_clip_timeline(file_id: str, *, energy: float = 0.5,
+                       use_cache: bool = True) -> Optional[ClipTimeline]:
+    """Build (or reuse) the continuous ClipTimeline for one clip. Cached in
+    process behind a cheap perception token so repeated turns don't re-fuse."""
+    key = (file_id, float(energy))
+    token = _perception_token(file_id) if use_cache else None
+    if use_cache and token is not None:
+        hit = _TL_CACHE.get(key)
+        if hit is not None and hit[0] == token:
+            return hit[1]
+
     inputs = load_timeline_inputs(file_id, energy=energy)
     if inputs is None:
         return None
-    return build_clip_timeline(inputs)
+    tl = build_clip_timeline(inputs)
+    if use_cache and token is not None:
+        _TL_CACHE[key] = (token, tl)
+    return tl
 
 
 def load_clip_timelines(file_ids: List[str], *, energy: float = 0.5) -> List[ClipTimeline]:
