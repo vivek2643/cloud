@@ -135,6 +135,12 @@ def render_resolved(
             except Exception:
                 logger.exception("render progress_cb raised; ignoring")
 
+    # The concat fast path encodes video+audio from ONE shared source window per
+    # segment, so it is only valid while every audio layer is still coupled to a
+    # video layer (same source span, same program window). A J/L split edit
+    # decouples them -- those must render through the layered graph.
+    v_windows = {(v.get("source_file_id"), v.get("src_in_ms"), v.get("src_out_ms"),
+                  v.get("prog_start_ms"), v.get("prog_end_ms")) for v in video}
     pure_spine = (
         all(v.get("kind") == "spine" for v in video)
         and all(a.get("kind") == "spine" for a in audio)
@@ -142,6 +148,8 @@ def render_resolved(
         # A muted/gained spine layer needs the filter graph (the concat fast path
         # can't apply per-segment volume) -- fall through to the layered renderer.
         and all(abs(float(a.get("gain_db", 0.0))) < 0.01 for a in audio)
+        and all((a.get("source_file_id"), a.get("src_in_ms"), a.get("src_out_ms"),
+                 a.get("prog_start_ms"), a.get("prog_end_ms")) in v_windows for a in audio)
     )
 
     with tempfile.TemporaryDirectory(prefix="edso_render_") as tmp:

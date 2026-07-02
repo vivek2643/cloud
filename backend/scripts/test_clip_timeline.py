@@ -207,6 +207,44 @@ def test_snap_span_moves_edges_to_clean_seams():
     print("ok  snap_span pulls raw edges onto clean seams + reports deltas/quality")
 
 
+def test_snap_span_cap_keeps_far_edge_and_suggests():
+    """Sovereignty cap: an edge whose best seam is further than max_move_ms is
+    NOT moved -- the seam comes back as a suggestion. The near edge still snaps."""
+    cost = [1.0] * 100
+    cost[16] = 0.0              # seam at 1600ms: 700ms from raw in of 2300 --
+    #                             inside the snapper's search window, beyond the cap
+    cost[59] = 0.0              # seam at 5900ms (200ms from raw out of 5700)
+    fld = FusedField(hop_ms=100, cost=cost, seams=[])
+    tl = build_clip_timeline(TimelineInputs(file_id=FID, duration_ms=10000, field=fld))
+    r = tl.snap_span(2300, 5700, max_move_ms=400)
+    assert r["in_ms"] == 2300 and r["in_suggested_ms"] == 1600, r   # kept + suggested
+    assert r["out_ms"] == 5900 and "out_suggested_ms" not in r, r   # snapped normally
+    print("ok  snap_span cap keeps a deliberate edge and suggests the far seam")
+
+
+def test_render_summary_one_liner():
+    tl = build_clip_timeline(TimelineInputs(
+        file_id=FID, duration_ms=12000,
+        words=[_word(500, 5800, "a substantive spoken turn")],
+        persons=[{"local_id": "p1", "role": "host"}]))
+    line = ct.render_summary(tl)
+    assert line.startswith("CLIP") and "\n" not in line, line
+    assert "p1(host)" in line and "speech" in line, line
+    print("ok  render_summary is a single informative line")
+
+
+def test_render_awareness_compact_tier_shrinks():
+    """Compact detail keeps every section but under a smaller budget."""
+    tl = build_clip_timeline(TimelineInputs(
+        file_id=FID, duration_ms=60000,
+        words=[_word(i * 2000, i * 2000 + 900, f"line {i}") for i in range(25)]))
+    full = ct.render_awareness(tl)
+    compact = ct.render_awareness(tl, detail="compact")
+    assert len(compact) < len(full), (len(compact), len(full))
+    assert "CUT INDEX" in compact and "LANES" in compact, compact
+    print("ok  compact tier renders every section, shorter")
+
+
 def test_snap_span_no_field_is_noop():
     """No seam field (no L1 grids) -> snap degrades to an unchanged no-op."""
     tl = build_clip_timeline(TimelineInputs(file_id=FID, duration_ms=10000))

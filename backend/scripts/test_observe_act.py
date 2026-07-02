@@ -331,6 +331,141 @@ def test_place_span_v2_cutaway_and_bad_span_noop():
     print("ok  place_span V2 cutaway keeps sound; bad span is a no-op")
 
 
+def test_split_edit_add_replace_clear_and_guards():
+    """split_edit decouples the audio edge at a seam: adds one op per seam,
+    re-issuing replaces, 0 clears, and the first cut (no seam) is a no-op."""
+    struct = _map()
+    doc = _doc(struct, [("ffffffff:m00", "tight"), ("ffffffff:m01", "tight")])
+    ids = [s["seg_id"] for s in doc["timeline"]]
+    assert len(ids) == 2, ids
+
+    doc2 = act.split_edit(doc, ids[1], audio_offset_ms=-400)   # J-cut
+    ses = [o for o in doc2["operations"] if o["type"] == "split_edit"]
+    assert len(ses) == 1 and ses[0]["audio_offset_ms"] == -400, ses
+    doc3 = act.split_edit(doc2, ids[1], audio_offset_ms=300)   # replace, not stack
+    ses = [o for o in doc3["operations"] if o["type"] == "split_edit"]
+    assert len(ses) == 1 and ses[0]["audio_offset_ms"] == 300, ses
+    doc4 = act.split_edit(doc3, ids[1], audio_offset_ms=0)     # clear
+    assert not [o for o in doc4["operations"] if o["type"] == "split_edit"]
+    assert act.split_edit(doc, ids[0], audio_offset_ms=-400) is doc   # first cut
+    assert act.split_edit(doc, "nope", audio_offset_ms=-400) is doc  # unknown
+    print("ok  split_edit adds/replaces/clears; first-cut + unknown are no-ops")
+
+
+def test_split_edit_resolves_decoupled_audio():
+    """Through layers.resolve, a J-cut moves the AUDIO boundary and leaves the
+    video boundary alone -- per-channel edges, end to end."""
+    struct = _map()
+    doc = _doc(struct, [("ffffffff:m00", "tight"), ("ffffffff:m01", "tight")])
+    ids = [s["seg_id"] for s in doc["timeline"]]
+    doc = act.split_edit(doc, ids[1], audio_offset_ms=-400)
+    res = layers.resolve(doc, {"ffffffff-1111": 8000})
+    aud = [a for a in res.audio_layers if a.kind == "spine"]
+    vid = [v for v in res.video_layers if v.kind == "spine"]
+    # video seam unchanged; audio boundary moved 400ms earlier
+    assert vid[0].prog_end_ms == vid[1].prog_start_ms, (vid[0], vid[1])
+    assert aud[1].prog_start_ms == vid[1].prog_start_ms - 400, aud[1]
+    assert aud[0].prog_end_ms == aud[1].prog_start_ms, (aud[0], aud[1])
+    print("ok  split_edit J-cut decouples audio from video through resolve")
+
+
+def test_validate_flags_bad_split_edit():
+    struct = _map()
+    doc = _doc(struct, [("ffffffff:m00", "tight"), ("ffffffff:m01", "tight")])
+    ids = [s["seg_id"] for s in doc["timeline"]]
+    doc["operations"].append({"op_id": "se_x", "type": "split_edit",
+                              "seam_seg_id": "gone", "audio_offset_ms": -300})
+    doc["operations"].append({"op_id": "se_y", "type": "split_edit",
+                              "seam_seg_id": ids[0], "audio_offset_ms": -300})
+    msgs = [i["message"] for i in observe.validate(doc, _ctx(struct))]
+    assert any("not a main-line seg_id" in m for m in msgs), msgs
+    assert any("first cut" in m for m in msgs), msgs
+    print("ok  validate flags orphaned + first-cut split edits")
+
+
+def test_weld_remaps_split_edit_seams():
+    """resolve_doc's weld re-issues seg_ids; a split at a SURVIVING seam is
+    remapped, a split at a seam that welded away is dropped."""
+    struct = _map()
+    ctx = _ctx(struct)
+    # m00 tight (0-2000) + m01 tight (4000-6000): non-contiguous, both survive.
+    doc = _doc(struct, [("ffffffff:m00", "tight"), ("ffffffff:m01", "tight")])
+    ids = [s["seg_id"] for s in doc["timeline"]]
+    doc = act.split_edit(doc, ids[1], audio_offset_ms=-400)
+    out = observe.resolve_doc(doc, ctx)
+    ses = [o for o in out["operations"] if o["type"] == "split_edit"]
+    new_ids = [s["seg_id"] for s in out["timeline"]]
+    assert len(ses) == 1 and ses[0]["seam_seg_id"] == new_ids[1], (ses, new_ids)
+
+    # m00 balanced (0-4000) + m01 balanced (4000-8000): contiguous -> weld away.
+    doc2 = _doc(struct, [("ffffffff:m00", "balanced")])
+    idx = _MapIndex(struct)
+    doc2 = act.place(doc2, idx, "ffffffff:m01", level="balanced", channel="V1")
+    seam_id = doc2["timeline"][1]["seg_id"]
+    doc2 = act.split_edit(doc2, seam_id, audio_offset_ms=-400)
+    out2 = observe.resolve_doc(doc2, ctx)
+    assert len(out2["timeline"]) == 1, out2["timeline"]          # welded
+    assert not [o for o in out2["operations"] if o["type"] == "split_edit"], \
+        out2["operations"]                                        # split moot -> dropped
+    print("ok  weld remaps surviving split seams and drops welded-away ones")
+
+
+def test_place_span_snap_cap_keeps_edge_and_suggests():
+    """Snap sovereignty: an edge whose nearest seam is beyond the cap stays
+    where the brain put it; the seam arrives as a suggestion instead."""
+    import json as _json_mod
+
+    from app.services.l1.fused_seams import FusedField
+    from app.services.l3 import tools
+    from app.services.l3.clip_timeline import TimelineInputs, build_clip_timeline
+
+    struct = _map()
+    ctx = _ctx(struct)
+    cost = [1.0] * 80
+    cost[13] = 0.0             # clean seam at 1300ms -- 700ms from the raw in
+    #                            (inside the snapper's window, beyond the 400 cap)
+    cost[31] = 0.0             # clean seam at 3100ms -- 100ms from the raw out
+    ctx.tl_cache["ffffffff-1111"] = build_clip_timeline(TimelineInputs(
+        file_id="ffffffff-1111", duration_ms=8000,
+        field=FusedField(hop_ms=100, cost=cost, seams=[])))
+    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    obs, new, changed = tools._dispatch(
+        "place_span",
+        {"file": "ffffffff", "in_ms": 2000, "out_ms": 3000, "channel": "V1"},
+        ctx, doc)
+    assert changed
+    seg = new["timeline"][-1]
+    assert seg["in_ms"] == 2000, seg           # kept: seam was 700ms away (> cap)
+    assert seg["out_ms"] == 3100, seg          # snapped: 100ms move (< cap)
+    payload = _json_mod.loads(obs)
+    assert payload["snap"]["in_suggested_ms"] == 1300, payload
+    print("ok  snap cap keeps the brain's edge and only SUGGESTS the far seam")
+
+
+def test_place_span_snap_off_places_raw():
+    from app.services.l1.fused_seams import FusedField
+    from app.services.l3 import tools
+    from app.services.l3.clip_timeline import TimelineInputs, build_clip_timeline
+
+    struct = _map()
+    ctx = _ctx(struct)
+    cost = [1.0] * 80
+    cost[12] = 0.0
+    ctx.tl_cache["ffffffff-1111"] = build_clip_timeline(TimelineInputs(
+        file_id="ffffffff-1111", duration_ms=8000,
+        field=FusedField(hop_ms=100, cost=cost, seams=[])))
+    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    _, new, changed = tools._dispatch(
+        "place_span",
+        {"file": "ffffffff", "in_ms": 1150, "out_ms": 3000, "channel": "V1",
+         "snap": "off"},
+        ctx, doc)
+    assert changed
+    seg = new["timeline"][-1]
+    assert (seg["in_ms"], seg["out_ms"]) == (1150, 3000), seg   # untouched
+    print("ok  snap:'off' places the raw span (deliberate mid-motion edge)")
+
+
 def test_place_span_snaps_to_seam_via_dispatch():
     """place_span through the tool loop snaps its raw window to the fused seam
     field (the same snapper the cut index uses) and reports the snap deltas."""
@@ -385,6 +520,12 @@ def main():
     test_place_span_arbitrary_main_line()
     test_place_span_v2_cutaway_and_bad_span_noop()
     test_place_span_snaps_to_seam_via_dispatch()
+    test_split_edit_add_replace_clear_and_guards()
+    test_split_edit_resolves_decoupled_audio()
+    test_validate_flags_bad_split_edit()
+    test_weld_remaps_split_edit_seams()
+    test_place_span_snap_cap_keeps_edge_and_suggests()
+    test_place_span_snap_off_places_raw()
     print("\nall observe/act tests passed")
 
 

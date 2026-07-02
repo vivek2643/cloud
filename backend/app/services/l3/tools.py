@@ -27,6 +27,9 @@ from app.services.llm import LLMClient, tool_result_block, tool_spec, user_messa
 logger = logging.getLogger(__name__)
 
 _MAX_TURNS = 12
+# Snap sovereignty: the seam-snapper may move a place_span edge at most this far.
+# Further than this, the brain's edge is kept and the seam is only SUGGESTED.
+_SNAP_CAP_MS = 400
 
 
 @dataclass
@@ -101,15 +104,19 @@ def _specs() -> List[Dict[str, Any]]:
           "index `at`; 'V2' = video cutaway at program `from_ms`. axis:'speech' marks "
           "it audio-load-bearing; audio 'keep'/'mute' sets its sound. Use this to lift "
           "a silent reaction or any window the lanes revealed. Edges are AUTO-SNAPPED "
-          "to the nearest clean seam (word gap / silence / impact; never mid-word), so "
-          "nominate an approximate window -- the result's `snap` field reports how far "
-          "each edge moved and the seam quality it landed on.",
+          "to the nearest clean seam (word gap / silence / impact; never mid-word) "
+          "within ~400ms -- nominate an approximate window and the result's `snap` "
+          "field reports how far each edge moved and its seam quality. An edge whose "
+          "nearest seam is FURTHER than that stays exactly where you put it (the seam "
+          "arrives as in/out_suggested_ms instead). snap:'off' places raw, for "
+          "deliberate mid-motion edges like a match-cut.",
           obj({"file": {"type": "string"}, "in_ms": {"type": "integer"},
                "out_ms": {"type": "integer"},
                "channel": {"type": "string", "enum": ["V1", "V2"]},
                "at": {"type": "integer"}, "from_ms": {"type": "integer"},
                "axis": {"type": "string", "enum": ["speech", "any"]},
                "audio": {"type": "string", "enum": ["keep", "mute"]},
+               "snap": {"type": "string", "enum": ["auto", "off"]},
                "content": {"type": "string"}, "reason": {"type": "string"}},
               ["file", "in_ms", "out_ms"])),
         S("trim", "Nudge a cut's SOURCE in/out. Absolute (in_ms/out_ms) or relative "
@@ -128,6 +135,15 @@ def _specs() -> List[Dict[str, Any]]:
           "mute:true silences (e.g. a b-roll cutaway); mute:false plays its sound.",
           obj({"target_id": {"type": "string"}, "mute": {"type": "boolean"}},
               ["target_id", "mute"])),
+        S("split_edit", "J/L cut: decouple the AUDIO edge from the VIDEO edge at the "
+          "seam just BEFORE main-line cut `seam_seg_id`. audio_offset_ms < 0 (J-cut): "
+          "the incoming cut's audio LEADS under the previous picture (e.g. -400 = hear "
+          "the next speaker 400ms before seeing them). > 0 (L-cut): the previous cut's "
+          "audio lingers over the new picture. 0 clears the split at that seam. One "
+          "split per seam (re-issuing replaces). Keep offsets subtle (200-800ms).",
+          obj({"seam_seg_id": {"type": "string"},
+               "audio_offset_ms": {"type": "integer"}},
+              ["seam_seg_id", "audio_offset_ms"])),
         S("tighten", "Re-take main-line cut(s) at a different energy `level` for "
           "pacing. With seg_id -> just that cut; without -> every cut that has that "
           "level. Tighter = shorter/punchier.",
@@ -157,6 +173,19 @@ def _specs() -> List[Dict[str, Any]]:
               "allow_multiple": {"type": "boolean"}},
               "required": ["prompt", "options"]}}}, ["questions"])),
     ]
+
+
+def _snap_prog(ctx: EditContext, ms: Any) -> Any:
+    """Snap a PROGRAM-clock anchor (V2 from_ms, split window edge) to the program
+    field when one exists (e.g. a music beat grid). None field -> pass-through,
+    which is the common case until a program-side source lands."""
+    if ms is None or ctx.program_field is None:
+        return ms
+    try:
+        from app.services.l3.program_clock import snap_program_ms
+        return snap_program_ms(ctx.program_field, int(ms))
+    except (TypeError, ValueError):
+        return ms
 
 
 def _resolve_file(ctx: EditContext, ref: Any) -> str:
@@ -218,22 +247,26 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
         if name == "place":
             new = act.place(doc, ctx.index, args["ref"], level=args.get("level", "balanced"),
                             channel=args.get("channel", "V1"), at=args.get("at"),
-                            from_ms=args.get("from_ms"), audio=args.get("audio"),
-                            reason=args.get("reason", ""))
+                            from_ms=_snap_prog(ctx, args.get("from_ms")),
+                            audio=args.get("audio"), reason=args.get("reason", ""))
         elif name == "place_span":
             fid = _resolve_file(ctx, args.get("file"))
             in_ms, out_ms = args.get("in_ms"), args.get("out_ms")
             # Snap the brain's arbitrary window to the SAME fused seam field the
             # cut index uses (word gaps / silence / impacts, mid-word veto), so a
-            # nominated span lands on a clean cut. No field -> unchanged no-op.
-            tl = observe._timeline(ctx, fid) if fid else None
+            # nominated span lands on a clean cut. SOVEREIGN: snap:'off' skips it,
+            # and an edge whose nearest seam is beyond the cap stays put (the
+            # seam is only SUGGESTED back). No field -> unchanged no-op.
+            tl = (observe._timeline(ctx, fid)
+                  if fid and args.get("snap") != "off" else None)
             if tl is not None and in_ms is not None and out_ms is not None:
-                snap_info = tl.snap_span(in_ms, out_ms)
+                snap_info = tl.snap_span(in_ms, out_ms, max_move_ms=_SNAP_CAP_MS)
                 if snap_info.get("snapped"):
                     in_ms, out_ms = snap_info["in_ms"], snap_info["out_ms"]
             new = act.place_span(doc, fid, in_ms=in_ms, out_ms=out_ms,
                                  channel=args.get("channel", "V1"), at=args.get("at"),
-                                 from_ms=args.get("from_ms"), audio=args.get("audio"),
+                                 from_ms=_snap_prog(ctx, args.get("from_ms")),
+                                 audio=args.get("audio"),
                                  axis=args.get("axis", "any"), content=args.get("content", ""),
                                  reason=args.get("reason", ""))
         elif name == "trim":
@@ -245,12 +278,16 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
             new = act.move(doc, args["seg_id"], args["to_index"])
         elif name == "set_audio":
             new = act.set_audio(doc, args["target_id"], mute=bool(args.get("mute")))
+        elif name == "split_edit":
+            new = act.split_edit(doc, args["seam_seg_id"],
+                                 audio_offset_ms=args.get("audio_offset_ms", 0))
         elif name == "tighten":
             new = act.tighten(doc, ctx.index, seg_id=args.get("seg_id"), level=args.get("level", "tight"))
         elif name == "split_screen":
             new = act.split_screen(doc, ctx.index, args["ref"],
                                    template=args.get("template", "split_h"),
-                                   from_ms=args.get("from_ms"), to_ms=args.get("to_ms"),
+                                   from_ms=_snap_prog(ctx, args.get("from_ms")),
+                                   to_ms=_snap_prog(ctx, args.get("to_ms")),
                                    level=args.get("level", "balanced"),
                                    audio=args.get("audio"), reason=args.get("reason", ""))
         else:
@@ -262,9 +299,11 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
         if not changed:
             result["note"] = "no-op (unknown id or illegal argument)"
         # Tell the brain how far its place_span edges were seam-snapped (+ the
-        # quality of the boundary it landed on), so it can judge/adjust its cut.
+        # quality of the boundary it landed on), or which seam was SUGGESTED when
+        # an edge was kept under the sovereignty cap, so it can judge/adjust.
         if (changed and snap_info.get("snapped")
-                and (snap_info.get("in_delta_ms") or snap_info.get("out_delta_ms"))):
+                and (snap_info.get("in_delta_ms") or snap_info.get("out_delta_ms")
+                     or "in_suggested_ms" in snap_info or "out_suggested_ms" in snap_info)):
             result["snap"] = snap_info
         return _json(result), new, changed
     except Exception as e:  # a bad tool call must never crash the turn

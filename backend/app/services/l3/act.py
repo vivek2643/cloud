@@ -271,6 +271,43 @@ def trim(document: dict, target_id: str, *,
     return doc
 
 
+def split_edit(document: dict, seam_seg_id: str, *, audio_offset_ms: int) -> dict:
+    """J/L cut: decouple the AUDIO boundary from the VIDEO boundary at the seam
+    just BEFORE main-line segment ``seam_seg_id``.
+
+    offset > 0 (L-cut): the previous cut's audio lingers over the incoming
+    picture. offset < 0 (J-cut): the incoming cut's audio leads under the
+    previous picture. offset 0 clears any existing split at that seam.
+
+    One split per seam: re-issuing replaces the previous offset. The first
+    segment has no seam before it -> unchanged doc. The offset itself is applied
+    at resolve time (``layers._apply_split_edits``), so it survives welds that
+    keep the seam and simply no-ops if the seam disappears."""
+    try:
+        offset = int(audio_offset_ms)
+    except (TypeError, ValueError):
+        return document
+    timeline = document.get("timeline") or []
+    idx = next((i for i, s in enumerate(timeline)
+                if s.get("seg_id") == seam_seg_id), None)
+    if idx is None or idx == 0:
+        return document
+
+    doc = _clone(document)
+    ops = [o for o in doc["operations"]
+           if not (o.get("type") == "split_edit"
+                   and o.get("seam_seg_id") == seam_seg_id)]
+    if offset != 0:
+        ops.append({
+            "op_id": f"se_{uuid.uuid4().hex[:6]}",
+            "type": "split_edit",
+            "seam_seg_id": seam_seg_id,
+            "audio_offset_ms": offset,
+        })
+    doc["operations"] = ops
+    return doc
+
+
 def set_audio(document: dict, target_id: str, *, mute: bool) -> dict:
     """Mute/unmute the SOURCE audio of a main-line segment (A1) or a V2 cutaway,
     keeping its picture. mute=True silences; mute=False plays the source sound."""

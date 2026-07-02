@@ -214,16 +214,24 @@ class ClipTimeline:
         is available via ``facet_at`` at the extended instant."""
         return {"lead_ms": max(0, int(in_ms)), "tail_ms": max(0, self.duration_ms - int(out_ms))}
 
-    def snap_span(self, in_ms: int, out_ms: int) -> Dict[str, Any]:
+    def snap_span(self, in_ms: int, out_ms: int, *,
+                  max_move_ms: Optional[int] = None) -> Dict[str, Any]:
         """Snap a raw ``[in_ms, out_ms]`` to the clip's fused seam field -- the
         same deterministic snapper the pre-scored cut index uses (word gaps /
         silence / motion impacts, with the mid-word + camera-shake vetoes). This
         is what lets the brain nominate an APPROXIMATE window (a silent reaction,
         a beat before a line) and still land on a clean cut.
 
+        SOVEREIGNTY CAP. The snapper is a service, never a veto: with
+        ``max_move_ms`` set, an edge the field wants to move FURTHER than the cap
+        stays where the brain put it, and the seam the field preferred is
+        reported as ``in_suggested_ms`` / ``out_suggested_ms`` instead -- the
+        brain can take the suggestion or keep its deliberate (e.g. match-cut)
+        edge.
+
         Returns ``{in_ms, out_ms, snapped, [in_delta_ms, out_delta_ms, in_q,
-        out_q]}``. Degrades to an unchanged no-op (``snapped=False``) when the
-        clip has no seam field (no L1 grids materialized)."""
+        out_q, in_suggested_ms?, out_suggested_ms?]}``. Degrades to an unchanged
+        no-op (``snapped=False``) when the clip has no seam field."""
         try:
             a, b = int(in_ms), int(out_ms)
         except (TypeError, ValueError):
@@ -232,11 +240,21 @@ class ClipTimeline:
         if fld is None or not fld.cost or b <= a:
             return {"in_ms": a, "out_ms": b, "snapped": False}
         si, so = snap_bounds(fld, a, b, duration_ms=self.duration_ms)
-        return {
-            "in_ms": si, "out_ms": so, "snapped": True,
+        out: Dict[str, Any] = {"snapped": True}
+        if max_move_ms is not None and abs(si - a) > int(max_move_ms):
+            out["in_suggested_ms"] = si
+            si = a
+        if max_move_ms is not None and abs(so - b) > int(max_move_ms):
+            out["out_suggested_ms"] = so
+            so = b
+        if so <= si:                       # capping one edge must not invert
+            si, so = a, b
+        out.update({
+            "in_ms": si, "out_ms": so,
             "in_delta_ms": si - a, "out_delta_ms": so - b,
             "in_q": round(fld.q_at(si), 3), "out_q": round(fld.q_at(so), 3),
-        }
+        })
+        return out
 
     def to_dict(self) -> dict:
         return {
@@ -675,11 +693,38 @@ def _lane_line(lane: Lane, *, key: str, max_ivs: int = 10) -> str:
     return " | ".join(parts)
 
 
+def render_summary(tl: ClipTimeline, *, fid8: Optional[str] = None) -> str:
+    """One line per clip -- the SUMMARY disclosure tier for large shoots. Enough
+    to know what the clip IS (duration, who, how much speech/action, index size)
+    so the brain can drill in with source_awareness/scan_source on the clips
+    that matter, instead of every clip's full digest crowding the context."""
+    fid = fid8 or tl.file_id[:8]
+    who = ", ".join(f"{p.local_id}{f'({p.role})' if p.role else ''}"
+                    for p in tl.persons) or "no tracked people"
+    speech = tl.lane(LANE_SPEECH)
+    talk_ms = sum(it.end_ms - it.start_ms for it in (speech.intervals if speech else [])
+                  if it.value.get("state") == "speech")
+    action = tl.lane(LANE_ACTION)
+    n_act = len(action.intervals) if action else 0
+    return (f"CLIP {fid}  {_secs(tl.duration_ms)}  people: {who}  "
+            f"speech {_secs(talk_ms)}  action events {n_act}  "
+            f"cut index {len(tl.cuts)}")
+
+
 def render_awareness(tl: ClipTimeline, *, fid8: Optional[str] = None,
-                     max_cuts: int = 12) -> str:
+                     max_cuts: int = 12, detail: str = "full") -> str:
     """A compact digest of the continuous clip for the brain -- complete
     awareness in one screen: people, change-point lanes, seams, peaks, and the
-    scored cut index (bookmarks it can place with place_span)."""
+    scored cut index (bookmarks it can place with place_span).
+
+    ``detail`` is the disclosure tier: 'full' (default) or 'compact' (roughly
+    half the per-section budget, for shoots with many clips -- every section
+    still appears, just shorter; scan_source recovers anything elided)."""
+    compact = detail == "compact"
+    max_ivs = 4 if compact else 10
+    n_action, n_seams, n_peaks = (4, 4, 4) if compact else (8, 8, 10)
+    if compact:
+        max_cuts = min(max_cuts, 6)
     fid = fid8 or tl.file_id[:8]
     lines: List[str] = [f"CLIP {fid}  duration {_secs(tl.duration_ms)}"]
 
@@ -694,7 +739,7 @@ def render_awareness(tl: ClipTimeline, *, fid8: Optional[str] = None,
     lines.append("LANES (change-point intervals over the clip clock):")
     speech = tl.lane(LANE_SPEECH)
     if speech:
-        lines.append(f"  speech:   {_lane_line(speech, key='state')}")
+        lines.append(f"  speech:   {_lane_line(speech, key='state', max_ivs=max_ivs)}")
     for ln in tl.lanes:
         if ln.name.startswith(LANE_PRESENCE + ":"):
             on = [it for it in ln.intervals if it.value.get("state") == "on"]
@@ -702,30 +747,32 @@ def render_awareness(tl: ClipTimeline, *, fid8: Optional[str] = None,
             lines.append(f"  present {ln.name.split(':', 1)[1]}: on {span}")
     speaking = tl.lane(LANE_SPEAKING)
     if speaking and any(it.value.get("subject") for it in speaking.intervals):
-        lines.append(f"  speaking: {_lane_line(speaking, key='subject')}")
+        lines.append(f"  speaking: {_lane_line(speaking, key='subject', max_ivs=max_ivs)}")
     gaze = tl.lane(LANE_GAZE)
     if gaze and any(it.value.get("direction") not in (None, 'unknown') for it in gaze.intervals):
-        lines.append(f"  gaze:     {_lane_line(gaze, key='direction')}")
+        lines.append(f"  gaze:     {_lane_line(gaze, key='direction', max_ivs=max_ivs)}")
     shot = tl.lane(LANE_SHOT)
     if shot and any(it.value.get("shot_size") not in (None, 'unsure') for it in shot.intervals):
-        lines.append(f"  shot:     {_lane_line(shot, key='shot_size')}")
+        lines.append(f"  shot:     {_lane_line(shot, key='shot_size', max_ivs=max_ivs)}")
 
     action = tl.lane(LANE_ACTION)
     if action and action.intervals:
         lines.append("ACTION (capture events):")
-        for it in action.intervals[:8]:
+        for it in action.intervals[:n_action]:
             v = it.value
             lines.append(f"  [{v.get('channel')}] {_secs(it.start_ms)}-{_secs(it.end_ms)} "
                          f"peak {_secs(v.get('peak_ms'))} {v.get('subject') or ''} "
                          f"\"{v.get('label')}\" c{v.get('confidence')}".rstrip())
+        if len(action.intervals) > n_action:
+            lines.append(f"  … {len(action.intervals) - n_action} more (scan_source lane 'action')")
 
     if tl.seams:
-        top = sorted(tl.seams, key=lambda s: -s.get("q", 0))[:8]
+        top = sorted(tl.seams, key=lambda s: -s.get("q", 0))[:n_seams]
         lines.append("SEAMS (cleanest cut points): " +
                      ", ".join(f"{_secs(s['ts_ms'])}({s.get('kind')} {s.get('q')})" for s in top))
     if tl.peaks:
         lines.append("PEAKS (impacts/reveals): " +
-                     ", ".join(f"{_secs(p.ts_ms)}({p.kind})" for p in tl.peaks[:10]))
+                     ", ".join(f"{_secs(p.ts_ms)}({p.kind})" for p in tl.peaks[:n_peaks]))
 
     if tl.cuts:
         lines.append("CUT INDEX (scored bookmarks — place any with place_span, or any custom span):")
@@ -734,4 +781,6 @@ def render_awareness(tl: ClipTimeline, *, fid8: Optional[str] = None,
             lbl = f' "{c.label}"' if c.label else ""
             lines.append(f"  {c.cut_id} [{c.kind}] {_secs(c.in_ms)}-{_secs(c.out_ms)} "
                          f"peak {_secs(c.peak_ms)} {who}{lbl} score {c.score:.2f}".rstrip())
+        if len(tl.cuts) > max_cuts:
+            lines.append(f"  … {len(tl.cuts) - max_cuts} more bookmarks")
     return "\n".join(lines)

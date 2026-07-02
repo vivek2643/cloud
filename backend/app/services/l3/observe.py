@@ -46,6 +46,14 @@ class EditContext:
     durations: Dict[str, int]          # file_id -> ms
     valence_by_file: Dict[str, str]    # file_id -> clip valence
     dup_groups: List[dict] = field(default_factory=list)
+    # Cross-clip relations derived from existing perception (same-event time
+    # offsets between clips + one person identity across files). Rendered into
+    # source_awareness; empty when clips share nothing.
+    relations: dict = field(default_factory=dict)
+    # The PROGRAM clock's cut field (program_clock.build_program_field) -- None
+    # until a program-side source (e.g. a music bed's beat grid) populates it.
+    # Consumers treat None as "no opinion".
+    program_field: Optional[object] = None
     # Lazily-built continuous Clip Timelines (source-only, edit-independent), so
     # source_awareness/scan_source don't re-fuse a clip within the same turn.
     tl_cache: Dict[str, object] = field(default_factory=dict)
@@ -73,8 +81,9 @@ def _valence_by_file(file_ids: List[str]) -> Dict[str, str]:
 
 
 def build_context(file_ids: List[str]) -> EditContext:
-    """Assemble the per-turn context once (footage map + durations + valence).
-    All DB reads live here; the sense functions stay pure over the result."""
+    """Assemble the per-turn context once (footage map + durations + valence +
+    cross-clip relations). All DB reads live here; the sense functions stay pure
+    over the result."""
     fmap = footage_map.assemble_map(file_ids) if file_ids else {}
     map_struct = fmap.get("struct") or {"clips": []}
     durations: Dict[str, int] = {}
@@ -83,6 +92,12 @@ def build_context(file_ids: List[str]) -> EditContext:
         durations = _durations(file_ids)
     except Exception:
         logger.exception("observe: duration lookup failed (continuing)")
+    rels: dict = {}
+    try:
+        from app.services.l3 import relations as relations_mod
+        rels = relations_mod.build_relations(list(file_ids))
+    except Exception:
+        logger.exception("observe: relations build failed (continuing without)")
     return EditContext(
         file_ids=list(file_ids),
         index=_MapIndex(map_struct),
@@ -90,6 +105,7 @@ def build_context(file_ids: List[str]) -> EditContext:
         durations=durations,
         valence_by_file=_valence_by_file(file_ids),
         dup_groups=fmap.get("dup_groups") or [],
+        relations=rels,
     )
 
 
@@ -102,13 +118,42 @@ def resolve_doc(document: dict, ctx: EditContext) -> dict:
          stay separate by construction.
       2. bake the reframe transform, then resolve the flat layer set.
     Reuses the same resolve the manual-edit path uses."""
+    old_ids = [s.get("seg_id") for s in (document.get("timeline") or [])]
+    old_segs = list(document.get("timeline") or [])
     document["timeline"] = _weld_segments(document.get("timeline") or [])
+    _remap_split_edits(document, old_ids, old_segs)
     try:
         framing.annotate_document(document)
     except Exception:
         logger.exception("observe: framing annotation failed (continuing)")
     document["resolved"] = layers.resolve(document, ctx.durations).to_dict()
     return document
+
+
+def _remap_split_edits(document: dict, old_ids: List[Optional[str]],
+                       old_segs: List[dict]) -> None:
+    """Welding re-issues seg_ids, which would orphan split_edit (J/L cut) ops
+    keyed on ``seam_seg_id``. Weld keeps the SAME dicts for surviving segments
+    (mutating ids in place), so identity tells us where each seam went: a
+    surviving segment gets its op remapped to the new id; a segment that merged
+    into its predecessor lost its seam -- the split there is meaningless, drop it."""
+    ops = document.get("operations") or []
+    if not any(o.get("type") == "split_edit" for o in ops):
+        return
+    survivors = {id(s): s.get("seg_id") for s in (document.get("timeline") or [])}
+    new_by_old = {old: survivors.get(id(seg))
+                  for old, seg in zip(old_ids, old_segs) if old}
+    kept: List[dict] = []
+    for o in ops:
+        if o.get("type") != "split_edit":
+            kept.append(o)
+            continue
+        new_id = new_by_old.get(o.get("seam_seg_id"))
+        if new_id is None:
+            continue                      # seam welded away -> split is moot
+        o["seam_seg_id"] = new_id
+        kept.append(o)
+    document["operations"] = kept
 
 
 # --------------------------------------------------------------------------
@@ -163,7 +208,7 @@ def read_state(document: dict, ctx: EditContext) -> dict:
         for r in (document.get("layout_regions") or [])
     ]
 
-    return {
+    state = {
         "cut_count": len(timeline),
         "op_count": len(ops),
         "total_ms": report.total_ms,
@@ -173,6 +218,12 @@ def read_state(document: dict, ctx: EditContext) -> dict:
         "feel_detail": report.to_dict(),
         "cuts": cuts,
     }
+    splits = [{"op_id": o.get("op_id"), "seam_seg_id": o.get("seam_seg_id"),
+               "audio_offset_ms": o.get("audio_offset_ms")}
+              for o in ops if o.get("type") == "split_edit"]
+    if splits:
+        state["split_edits"] = splits
+    return state
 
 
 # --------------------------------------------------------------------------
@@ -260,6 +311,15 @@ def validate(document: dict, ctx: EditContext) -> List[dict]:
                                "message": f"V2 cutaway starts {frm}ms past program end {program_end}ms"})
             if int(op.get("src_out_ms", 0)) <= int(op.get("src_in_ms", 0)):
                 issues.append({"kind": "op", "id": oid, "message": "empty source span"})
+        elif op.get("type") == "split_edit":
+            seam = op.get("seam_seg_id")
+            seg_ids = [s.get("seg_id") for s in (document.get("timeline") or [])]
+            if seam not in seg_ids:
+                issues.append({"kind": "op", "id": oid,
+                               "message": f"split_edit seam {seam!r} is not a main-line seg_id"})
+            elif seg_ids and seam == seg_ids[0]:
+                issues.append({"kind": "op", "id": oid,
+                               "message": "split_edit on the first cut (no seam before it)"})
 
     op_ids = {o.get("op_id") for o in (document.get("operations") or [])}
     for r in document.get("layout_regions") or []:
@@ -414,6 +474,14 @@ def _timeline(ctx: EditContext, file_id: str):
     return tl
 
 
+# Disclosure tiers: how much per-clip detail the shoot digest carries. The
+# brain must NEVER lose awareness silently -- as the clip count grows the
+# digests get shorter, the header SAYS so, and scan_source/source_awareness
+# recover any elided detail on demand.
+_FULL_DETAIL_MAX_CLIPS = 6      # <= this many clips: full digest each
+_COMPACT_DETAIL_MAX_CLIPS = 14  # <= this many: compact digest each; above: summary lines
+
+
 def source_awareness(ctx: EditContext) -> str:
     """The CONTINUOUS clip timeline for every clip in scope: change-point lanes
     (who is present / who is speaking on camera / gaze / shot / action over the
@@ -422,13 +490,45 @@ def source_awareness(ctx: EditContext) -> str:
     the clip as a fully-addressable source: any span the brain can describe can
     be placed with ``place_span``, seam-snapped to a clean boundary. Read-only.
 
+    Scales by PROGRESSIVE DISCLOSURE, never silent truncation: few clips get
+    full digests, many clips get compact ones, very many get one-line summaries
+    -- and the header states the tier so the brain knows to drill down with
+    scan_source. Cross-clip relations (co-temporal offsets, one person across
+    files) lead the digest, since they connect everything after them.
+
     Degrades to a short notice (never raises) when the continuous store or its
     L1/L2 inputs are unavailable, so the loop is unaffected."""
     try:
-        from app.services.l3.clip_timeline import render_awareness
-        blocks = [render_awareness(tl) for fid in ctx.file_ids
-                  if (tl := _timeline(ctx, fid)) is not None]
-        return "\n\n".join(blocks) or "(no continuous timeline available for these clips yet)"
+        from app.services.l3.clip_timeline import render_awareness, render_summary
+        n = len(ctx.file_ids)
+        detail = ("full" if n <= _FULL_DETAIL_MAX_CLIPS
+                  else "compact" if n <= _COMPACT_DETAIL_MAX_CLIPS
+                  else "summary")
+        blocks: List[str] = []
+        if n > 1:
+            note = {"full": "full detail per clip",
+                    "compact": ("compact detail per clip -- every section is present "
+                                "but shortened; scan_source recovers anything elided"),
+                    "summary": ("ONE LINE per clip -- drill into any clip with "
+                                "scan_source (lanes/facets) before cutting from it"),
+                    }[detail]
+            blocks.append(f"SHOOT: {n} clips. Disclosure tier: {note}.")
+        try:
+            from app.services.l3.relations import render_relations
+            rel = render_relations(ctx.relations)
+            if rel:
+                blocks.append(rel)
+        except Exception:
+            logger.exception("observe: relations render failed (continuing)")
+        for fid in ctx.file_ids:
+            tl = _timeline(ctx, fid)
+            if tl is None:
+                continue
+            blocks.append(render_summary(tl) if detail == "summary"
+                          else render_awareness(tl, detail=detail))
+        body = "\n\n".join(blocks)
+        return body if any(b.startswith("CLIP") for b in blocks) else \
+            "(no continuous timeline available for these clips yet)"
     except Exception:
         logger.exception("observe: source_awareness failed (continuing)")
         return "(continuous timeline unavailable)"

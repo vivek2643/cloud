@@ -114,18 +114,27 @@ _LOOP_SYSTEM_V2 = (
     "'presence:p2' match {state:'on'} to find where p2 is on screen, then read "
     "each hit's facets to see if they're silent), then `place_span` that window "
     "(the 'CLIP <file8>' id + source in/out ms). Boundaries are AUTO-SNAPPED to "
-    "the nearest clean seam (word gap / silence / impact, never mid-word), so "
-    "nominate approximate windows -- the tool's `snap` field tells you how far "
-    "each edge moved and how clean it is.\n"
+    "the nearest clean seam (word gap / silence / impact, never mid-word) within "
+    "~400ms -- nominate approximate windows and read the tool's `snap` field. An "
+    "edge you place deliberately (a match-cut, a mid-motion edge) stays put: the "
+    "snapper never moves an edge further than that cap (it only SUGGESTS the "
+    "seam back), and snap:'off' skips it entirely.\n"
     "A strong cut breathes: it doesn't just staple talking-head lines back to "
     "back. When one speaker runs long, cut to the LISTENER's reaction; open or "
     "close a beat on a face or an action, not always on a word. Reach for "
     "`place_span` whenever the moment you want to show isn't a spoken line.\n\n"
+    "CROSS-CLIP RELATIONS. When the digest shows 'co-temporal' (two clips are "
+    "the SAME live moment at a known offset) you can cut between those angles "
+    "mid-beat; 'same person G#' means those per-clip ids are ONE human -- use "
+    "that to find their reactions in the other clip.\n\n"
     "CHANNELS. The main line is V1 video + A1 audio, in sequence -- `place` / "
     "`place_span` channel V1. A SILENT video cutaway over the ongoing A1 audio "
     "rides V2 (channel V2 at a program `from_ms`). A music/SFX bed rides A2. "
     "Showing V1 and a second source at the SAME time (side-by-side, stacked, or "
-    "PiP) is `split_screen` over a program window.\n\n"
+    "PiP) is `split_screen` over a program window. The audio edge at a seam can "
+    "LEAD or LAG the picture edge with `split_edit` (a J-cut -- hearing the next "
+    "speaker ~300-500ms before seeing them -- makes dialogue flow; use it on "
+    "conversational seams, not every cut).\n\n"
     "HOW YOU WORK. When the user just wants to talk, answer in prose and DON'T "
     "touch the edit. When they want a change, use your tools and OBSERVE as you "
     "go (read_state / source_awareness / diagnose / validate), then ACT. Your "
@@ -176,7 +185,12 @@ def _context_block_v2(file_ids: List[str], document: Optional[dict],
         aware = observe.source_awareness(ctx) if file_ids else ""
         if aware and not aware.lstrip().startswith("("):  # skip "(no ... available)" notices
             if len(aware) > _AWARE_CHAR_CAP:
-                aware = aware[:_AWARE_CHAR_CAP] + "\n…(truncated)"
+                # Loud, instructive cut -- the brain must know awareness is
+                # partial and how to recover it (never silently).
+                aware = (aware[:_AWARE_CHAR_CAP] +
+                         "\n[TRUNCATED: the digest exceeded its budget here. Clips "
+                         "after this point are MISSING above -- call source_awareness "
+                         "/ scan_source to read any clip before cutting from it.]")
             parts.append(
                 "CONTINUOUS SOURCE (each clip as a fully-addressable timeline -- "
                 "lanes, seams, peaks, and a scored cut index; place ANY span with "
@@ -186,7 +200,10 @@ def _context_block_v2(file_ids: List[str], document: Optional[dict],
     try:
         text = (footage_map.assemble_map(file_ids).get("text") or "") if file_ids else ""
         if len(text) > _INDEX_CHAR_CAP:
-            text = text[:_INDEX_CHAR_CAP] + "\n…(truncated)"
+            text = (text[:_INDEX_CHAR_CAP] +
+                    "\n[TRUNCATED: the speech index exceeded its budget here -- lines "
+                    "after this point are MISSING; use source_awareness / scan_source "
+                    "(lane 'speech') on the later clips instead of assuming they are empty.]")
         if text:
             parts.append(
                 "SPEECH-CUT INDEX (pre-scored said-lines -- lay the spoken spine "
