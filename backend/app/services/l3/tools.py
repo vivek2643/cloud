@@ -100,7 +100,10 @@ def _specs() -> List[Dict[str, Any]]:
           "are SOURCE ms into that clip. channel 'V1' = main line (picture+sound) at "
           "index `at`; 'V2' = video cutaway at program `from_ms`. axis:'speech' marks "
           "it audio-load-bearing; audio 'keep'/'mute' sets its sound. Use this to lift "
-          "a silent reaction or any window the lanes revealed.",
+          "a silent reaction or any window the lanes revealed. Edges are AUTO-SNAPPED "
+          "to the nearest clean seam (word gap / silence / impact; never mid-word), so "
+          "nominate an approximate window -- the result's `snap` field reports how far "
+          "each edge moved and the seam quality it landed on.",
           obj({"file": {"type": "string"}, "in_ms": {"type": "integer"},
                "out_ms": {"type": "integer"},
                "channel": {"type": "string", "enum": ["V1", "V2"]},
@@ -191,6 +194,7 @@ def _normalize_questions(args: Dict[str, Any]) -> List[dict]:
 
 def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
               doc: dict) -> Tuple[str, dict, bool]:
+    snap_info: Dict[str, Any] = {}
     try:
         # OBSERVE (read-only)
         if name == "read_state":
@@ -218,7 +222,16 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
                             reason=args.get("reason", ""))
         elif name == "place_span":
             fid = _resolve_file(ctx, args.get("file"))
-            new = act.place_span(doc, fid, in_ms=args.get("in_ms"), out_ms=args.get("out_ms"),
+            in_ms, out_ms = args.get("in_ms"), args.get("out_ms")
+            # Snap the brain's arbitrary window to the SAME fused seam field the
+            # cut index uses (word gaps / silence / impacts, mid-word veto), so a
+            # nominated span lands on a clean cut. No field -> unchanged no-op.
+            tl = observe._timeline(ctx, fid) if fid else None
+            if tl is not None and in_ms is not None and out_ms is not None:
+                snap_info = tl.snap_span(in_ms, out_ms)
+                if snap_info.get("snapped"):
+                    in_ms, out_ms = snap_info["in_ms"], snap_info["out_ms"]
+            new = act.place_span(doc, fid, in_ms=in_ms, out_ms=out_ms,
                                  channel=args.get("channel", "V1"), at=args.get("at"),
                                  from_ms=args.get("from_ms"), audio=args.get("audio"),
                                  axis=args.get("axis", "any"), content=args.get("content", ""),
@@ -248,6 +261,11 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
         result = {"applied": changed, "state": observe.read_state(new, ctx)}
         if not changed:
             result["note"] = "no-op (unknown id or illegal argument)"
+        # Tell the brain how far its place_span edges were seam-snapped (+ the
+        # quality of the boundary it landed on), so it can judge/adjust its cut.
+        if (changed and snap_info.get("snapped")
+                and (snap_info.get("in_delta_ms") or snap_info.get("out_delta_ms"))):
+            result["snap"] = snap_info
         return _json(result), new, changed
     except Exception as e:  # a bad tool call must never crash the turn
         logger.exception("tools: %s failed", name)

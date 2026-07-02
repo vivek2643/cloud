@@ -171,6 +171,10 @@ class ClipTimeline:
     persons: List[PersonCard] = field(default_factory=list)
     cuts: List[IndexCut] = field(default_factory=list)
     version: int = CLIP_TIMELINE_VERSION
+    # In-memory only (not serialized in to_dict): the dense fused seam field, kept
+    # so an arbitrary span placed by the brain snaps to the SAME clean boundaries
+    # the pre-scored cut index already uses. None when the clip has no L1 grids.
+    seam_field: Optional[FusedField] = None
 
     # -- queries (the brain's "senses" over the continuous clock) -----------
 
@@ -209,6 +213,30 @@ class ClipTimeline:
         extended (lead/tail) before it runs off the clip. The facet of that room
         is available via ``facet_at`` at the extended instant."""
         return {"lead_ms": max(0, int(in_ms)), "tail_ms": max(0, self.duration_ms - int(out_ms))}
+
+    def snap_span(self, in_ms: int, out_ms: int) -> Dict[str, Any]:
+        """Snap a raw ``[in_ms, out_ms]`` to the clip's fused seam field -- the
+        same deterministic snapper the pre-scored cut index uses (word gaps /
+        silence / motion impacts, with the mid-word + camera-shake vetoes). This
+        is what lets the brain nominate an APPROXIMATE window (a silent reaction,
+        a beat before a line) and still land on a clean cut.
+
+        Returns ``{in_ms, out_ms, snapped, [in_delta_ms, out_delta_ms, in_q,
+        out_q]}``. Degrades to an unchanged no-op (``snapped=False``) when the
+        clip has no seam field (no L1 grids materialized)."""
+        try:
+            a, b = int(in_ms), int(out_ms)
+        except (TypeError, ValueError):
+            return {"in_ms": in_ms, "out_ms": out_ms, "snapped": False}
+        fld = self.seam_field
+        if fld is None or not fld.cost or b <= a:
+            return {"in_ms": a, "out_ms": b, "snapped": False}
+        si, so = snap_bounds(fld, a, b, duration_ms=self.duration_ms)
+        return {
+            "in_ms": si, "out_ms": so, "snapped": True,
+            "in_delta_ms": si - a, "out_delta_ms": so - b,
+            "in_q": round(fld.q_at(si), 3), "out_q": round(fld.q_at(so), 3),
+        }
 
     def to_dict(self) -> dict:
         return {
@@ -614,7 +642,7 @@ def build_clip_timeline(inputs: TimelineInputs) -> ClipTimeline:
     return ClipTimeline(
         file_id=inputs.file_id, duration_ms=dur, lanes=lanes, seams=seams,
         peaks=peaks, energy_hop_ms=inputs.prosody_hop_ms, energy=norm_energy,
-        persons=persons, cuts=cuts,
+        persons=persons, cuts=cuts, seam_field=inputs.field,
     )
 
 

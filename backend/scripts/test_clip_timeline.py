@@ -190,6 +190,32 @@ def test_scan_and_handles_queries():
     print("ok  scan() facet query + handles() room query")
 
 
+def test_snap_span_moves_edges_to_clean_seams():
+    """place_span's snapper: a raw window near two clean seams is pulled onto
+    them, reporting the deltas + the seam quality it landed on."""
+    cost = [1.0] * 100          # unsafe everywhere...
+    cost[20] = 0.0              # ...except a clean seam at 2000ms
+    cost[60] = 0.0              # ...and 6000ms
+    fld = FusedField(hop_ms=100, cost=cost, seams=[])
+    tl = build_clip_timeline(TimelineInputs(file_id=FID, duration_ms=10000, field=fld))
+    assert tl.seam_field is not None, "field must be retained on the timeline"
+    r = tl.snap_span(2300, 5700)
+    assert r["snapped"] is True, r
+    assert r["in_ms"] == 2000 and r["out_ms"] == 6000, r
+    assert r["in_delta_ms"] == -300 and r["out_delta_ms"] == 300, r
+    assert r["in_q"] == 1.0 and r["out_q"] == 1.0, r
+    print("ok  snap_span pulls raw edges onto clean seams + reports deltas/quality")
+
+
+def test_snap_span_no_field_is_noop():
+    """No seam field (no L1 grids) -> snap degrades to an unchanged no-op."""
+    tl = build_clip_timeline(TimelineInputs(file_id=FID, duration_ms=10000))
+    assert tl.seam_field is None
+    r = tl.snap_span(2300, 5700)
+    assert r == {"in_ms": 2300, "out_ms": 5700, "snapped": False}, r
+    print("ok  snap_span with no field is an unchanged no-op")
+
+
 def test_presence_lane_v8_dense_coverage_and_reentry():
     """The dense v8 presence_lane handles re-entry (off in the middle) that
     coarse enters/exits cannot express."""

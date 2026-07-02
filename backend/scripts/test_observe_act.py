@@ -331,6 +331,40 @@ def test_place_span_v2_cutaway_and_bad_span_noop():
     print("ok  place_span V2 cutaway keeps sound; bad span is a no-op")
 
 
+def test_place_span_snaps_to_seam_via_dispatch():
+    """place_span through the tool loop snaps its raw window to the fused seam
+    field (the same snapper the cut index uses) and reports the snap deltas."""
+    import json as _json_mod
+
+    from app.services.l1.fused_seams import FusedField
+    from app.services.l3 import tools
+    from app.services.l3.clip_timeline import TimelineInputs, build_clip_timeline
+
+    struct = _map()
+    ctx = _ctx(struct)
+    cost = [1.0] * 80          # unsafe everywhere...
+    cost[12] = 0.0             # ...clean seam at 1200ms
+    cost[32] = 0.0             # ...clean seam at 3200ms
+    ctx.tl_cache["ffffffff-1111"] = build_clip_timeline(TimelineInputs(
+        file_id="ffffffff-1111", duration_ms=8000,
+        field=FusedField(hop_ms=100, cost=cost, seams=[])))
+
+    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    n0 = len(doc["timeline"])
+    obs, new, changed = tools._dispatch(
+        "place_span",
+        {"file": "ffffffff", "in_ms": 1000, "out_ms": 3000, "channel": "V1"},
+        ctx, doc)
+    assert changed and len(new["timeline"]) == n0 + 1, new["timeline"]
+    seg = new["timeline"][-1]
+    assert (seg["in_ms"], seg["out_ms"]) == (1200, 3200), seg   # snapped, not 1000/3000
+    payload = _json_mod.loads(obs)
+    assert payload.get("snap"), payload
+    assert payload["snap"]["in_delta_ms"] == 200 and payload["snap"]["out_delta_ms"] == 200, payload
+    assert payload["snap"]["in_q"] == 1.0 and payload["snap"]["out_q"] == 1.0, payload
+    print("ok  place_span snaps to the fused seam field through the tool loop")
+
+
 def main():
     test_read_state_reports_cuts_and_feel()
     test_place_adds_main_line_cut()
@@ -350,6 +384,7 @@ def main():
     test_source_awareness_and_scan_source_via_cache()
     test_place_span_arbitrary_main_line()
     test_place_span_v2_cutaway_and_bad_span_noop()
+    test_place_span_snaps_to_seam_via_dispatch()
     print("\nall observe/act tests passed")
 
 
