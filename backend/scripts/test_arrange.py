@@ -77,8 +77,8 @@ def test_different_clips_never_weld():
 def test_keep_spans_jumpcut_survives():
     """A cut's own windup|payoff keep_spans expand into separate segments (act),
     and being non-contiguous they SURVIVE the weld (not stitched back shut)."""
-    cut = _rc(FID_A, 0, 8000, channel="done",
-              keep_spans=[{"in_ms": 0, "out_ms": 1000}, {"in_ms": 6000, "out_ms": 8000}])
+    # keep_spans is the canonical (in_ms, out_ms) pair list (see arrange._norm_keep_spans).
+    cut = _rc(FID_A, 0, 8000, channel="done", keep_spans=[(0, 1000), (6000, 8000)])
     segs = _weld_segments(act._segments_from_cut(cut))
     assert len(segs) == 2, segs
     assert (segs[0]["in_ms"], segs[0]["out_ms"]) == (0, 1000), segs

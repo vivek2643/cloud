@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.services.l3 import act, layers, observe  # noqa: E402
 from app.services.l3 import footage_map as fm  # noqa: E402
-from app.services.l3.arrange import _MapIndex, _weld_segments  # noqa: E402
+from app.services.l3.arrange import Placement, _MapIndex, _weld_segments  # noqa: E402
 
 
 def _rung(level, in_ms, out_ms, text="", score=0.6):
@@ -159,6 +159,44 @@ def test_validate_flags_bad_span():
     print("ok  validate flags an out-of-range span")
 
 
+def _rung_multi(level, spans, text="", score=0.7):
+    """A ladder rung whose take is SPLIT across >1 source span (a breath-excised
+    jump-cut). footage_map turns this into a variant with keep_spans PAIRS -- the
+    real production shape that a single-span fixture never exercises."""
+    return {"level": level, "spans": [{"in_ms": a, "out_ms": b} for a, b in spans],
+            "in_ms": spans[0][0], "out_ms": spans[-1][1],
+            "play_ms": sum(b - a for a, b in spans), "text": text, "score": score}
+
+
+def test_place_multispan_keep_spans_survives():
+    """Regression: a moment whose chosen take is multi-span resolves keep_spans as
+    [in,out] PAIRS. act.place must place one segment per span (not crash on a
+    dict-shaped keep_span). This is the exact path that broke the live loop."""
+    c0 = _cut("f:t0", 0, 3000, "jump cut line", ladder=[
+        _rung_multi("balanced", [(0, 1000), (1500, 3000)], "jump cut line")])
+    tree = fm.build_clip_tree("ffffffff-2222", {"name": "J", "duration_ms": 3000}, [c0])
+    struct = {"clips": [tree]}
+    idx = _MapIndex(struct)
+    # The map really carries pairs, and resolve normalizes to (in, out) tuples.
+    rc = idx.resolve(Placement(ref="ffffffff:m00", level="balanced"))
+    assert rc is not None and rc.keep_spans == [(0, 1000), (1500, 3000)], rc.keep_spans
+    doc = {"format": {"aspect": "landscape"}, "timeline": [], "operations": []}
+    doc2 = act.place(doc, idx, "ffffffff:m00", level="balanced", channel="V1")
+    assert doc2 is not doc, "place no-oped -- the multi-span crash is back"
+    spans = [(s["in_ms"], s["out_ms"]) for s in doc2["timeline"]]
+    assert spans == [(0, 1000), (1500, 3000)], spans
+    print("ok  place survives multi-span keep_spans (pairs) -- the live-loop bug")
+
+
+def test_norm_keep_spans_accepts_both_shapes():
+    from app.services.l3.arrange import _norm_keep_spans
+    assert _norm_keep_spans([[0, 1000], [1500, 3000]]) == [(0, 1000), (1500, 3000)]
+    assert _norm_keep_spans([{"in_ms": 0, "out_ms": 1000}]) == [(0, 1000)]
+    assert _norm_keep_spans(None) is None
+    assert _norm_keep_spans([[500, 400]]) is None      # inverted span dropped
+    print("ok  _norm_keep_spans canonicalizes pairs + dicts, drops junk")
+
+
 def test_split_screen_adds_op_and_region():
     struct = _map()
     # One long welded main-line cut (0-8000ms) to place a split over.
@@ -243,6 +281,8 @@ def main():
     test_tighten_reshapes_span()
     test_predict_length_under_tighten()
     test_validate_flags_bad_span()
+    test_place_multispan_keep_spans_survives()
+    test_norm_keep_spans_accepts_both_shapes()
     test_split_screen_adds_op_and_region()
     test_split_screen_resolves_to_dest_rects()
     test_remove_tears_down_region()

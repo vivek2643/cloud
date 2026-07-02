@@ -56,11 +56,16 @@ class Placement:
 
 @dataclass
 class ResolvedCut:
-    """A placement resolved against the map to a concrete source span."""
+    """A placement resolved against the map to a concrete source span.
+
+    ``keep_spans`` is the CANONICAL jump-cut list -- a list of ``(in_ms, out_ms)``
+    pairs, or None when the span plays whole. ``_MapIndex.resolve`` normalizes
+    whatever the map carries into this one shape (see ``_norm_keep_spans``), so no
+    downstream verb ever has to guess the encoding."""
     file_id: str
     src_in_ms: int
     src_out_ms: int
-    keep_spans: Optional[List[Dict[str, int]]]
+    keep_spans: Optional[List[Tuple[int, int]]]
     channel: Optional[str]        # said | done | shown
     label: str
     track: int
@@ -74,6 +79,29 @@ class ResolvedCut:
 # --------------------------------------------------------------------------
 # Map index (validation + resolution)
 # --------------------------------------------------------------------------
+
+def _norm_keep_spans(raw: Any) -> Optional[List[Tuple[int, int]]]:
+    """Coerce a map variant/atom keep-list into the canonical ``[(in, out), ...]``.
+
+    The footage map stores jump-cut spans as ``[in_ms, out_ms]`` PAIRS
+    (``footage_map._variant_from_rung``); some serialized forms use
+    ``{"in_ms","out_ms"}`` dicts (``HeroCut.to_dict``). Accept both, drop anything
+    malformed or empty. None/[] -> None (the span plays whole)."""
+    if not raw:
+        return None
+    out: List[Tuple[int, int]] = []
+    for sp in raw:
+        try:
+            if isinstance(sp, dict):
+                a, b = int(sp["in_ms"]), int(sp["out_ms"])
+            else:
+                a, b = int(sp[0]), int(sp[1])
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+        if b > a:
+            out.append((a, b))
+    return out or None
+
 
 def _resolve_mute(default_mute: bool, audio_override: Optional[str]) -> bool:
     """Fold the arranger's per-pick audio choice onto a cut's DEFAULT mute.
@@ -108,7 +136,7 @@ class _MapIndex:
             m, a = self.atoms[p.ref]
             return ResolvedCut(
                 file_id=m["file_id"], src_in_ms=int(a["in_ms"]),
-                src_out_ms=int(a["out_ms"]), keep_spans=a.get("keep_spans"),
+                src_out_ms=int(a["out_ms"]), keep_spans=_norm_keep_spans(a.get("keep_spans")),
                 channel=a.get("channel") or m.get("channel"),
                 label=a.get("gist") or m.get("gist") or "",
                 track=p.track, from_ms=p.from_ms, reason=p.reason,
@@ -125,7 +153,7 @@ class _MapIndex:
             return None
         return ResolvedCut(
             file_id=m["file_id"], src_in_ms=int(v["in_ms"]),
-            src_out_ms=int(v["out_ms"]), keep_spans=v.get("keep_spans"),
+            src_out_ms=int(v["out_ms"]), keep_spans=_norm_keep_spans(v.get("keep_spans")),
             channel=m.get("channel"), label=m.get("gist") or "",
             track=p.track, from_ms=p.from_ms, reason=p.reason,
             ref=p.ref, level=v.get("level", level),

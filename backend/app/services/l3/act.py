@@ -47,11 +47,12 @@ def _segments_from_cut(rc: ResolvedCut) -> List[dict]:
     """A resolved cut -> one or more main-line segments (one per keep_span so a
     breath-excised jump-cut survives). The segment shape matches what the timeline
     / render read; adjacent contiguous slices are later merged by
-    ``arrange._weld_segments`` in ``observe.resolve_doc``."""
-    spans = rc.keep_spans or [{"in_ms": rc.src_in_ms, "out_ms": rc.src_out_ms}]
+    ``arrange._weld_segments`` in ``observe.resolve_doc``. ``rc.keep_spans`` is the
+    canonical ``[(in_ms, out_ms), ...]`` (normalized in ``_MapIndex.resolve``)."""
+    spans = rc.keep_spans or [(rc.src_in_ms, rc.src_out_ms)]
     out: List[dict] = []
-    for sp in spans:
-        in_ms, out_ms = int(sp["in_ms"]), int(sp["out_ms"])
+    for a, b in spans:
+        in_ms, out_ms = int(a), int(b)
         if out_ms <= in_ms:
             continue
         out.append({
