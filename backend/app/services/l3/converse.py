@@ -48,6 +48,9 @@ class ConverseResult:
     # questions are surfaced and the user's next message is the answer.
     questions: List[dict] = field(default_factory=list)
     awaiting_user: bool = False
+    # Ordered tool-call trace for this turn (persisted on the assistant turn so
+    # the reasoning is auditable later).
+    trace: List[dict] = field(default_factory=list)
 
 
 # The agentic frame: you're an editor working ON an edit with TOOLS. Minimal
@@ -106,7 +109,10 @@ _LOOP_SYSTEM_V2 = (
     "TWO WAYS TO CUT -- USE BOTH.\n"
     "  1. The spoken spine: lay the said-lines fast with `place` (channel V1) "
     "using a speech-cut ref (e.g. ab12cd34:m07). The quoted text is the complete "
-    "line -- judge from it. dup:tgN = the same content as another take; use one.\n"
+    "line -- judge from it. dup:tgN links a line to a COVERAGE GROUP (below): the "
+    "same beat delivered more than once, each member showing who and how well -- "
+    "read the facts and decide which to show (and you can reuse another delivery "
+    "as a cutaway).\n"
     "  2. Anything that ISN'T a clean said-line -- a person's SILENT reaction, a "
     "listening beat, a face just before/after their line, a held action, b-roll -- "
     "is NOT in the speech index. To use it: read `source_awareness` to see the "
@@ -123,10 +129,14 @@ _LOOP_SYSTEM_V2 = (
     "back. When one speaker runs long, cut to the LISTENER's reaction; open or "
     "close a beat on a face or an action, not always on a word. Reach for "
     "`place_span` whenever the moment you want to show isn't a spoken line.\n\n"
-    "CROSS-CLIP RELATIONS. When the digest shows 'co-temporal' (two clips are "
-    "the SAME live moment at a known offset) you can cut between those angles "
-    "mid-beat; 'same person G#' means those per-clip ids are ONE human -- use "
-    "that to find their reactions in the other clip.\n\n"
+    "PEOPLE ACROSS CLIPS. The PEOPLE OF THE SHOOT block names each person once "
+    "with a global id (G1, G2, ...) that holds across every clip; the speech "
+    "index and coverage groups use those ids too. To work with one person "
+    "anywhere -- e.g. find a window where they listen silently -- scan the whole "
+    "shoot in one call: `scan_source` with file:'*' and a lane like 'presence:G2' "
+    "(the global id resolves to each clip's local person). To find a plausible "
+    "reaction near a specific beat, take that beat's coverage member window and "
+    "pass it as `within_ms` to a scan of another clip.\n\n"
     "CHANNELS. The main line is V1 video + A1 audio, in sequence -- `place` / "
     "`place_span` channel V1. A SILENT video cutaway over the ongoing A1 audio "
     "rides V2 (channel V2 at a program `from_ms`). A music/SFX bed rides A2. "
@@ -198,7 +208,9 @@ def _context_block_v2(file_ids: List[str], document: Optional[dict],
     except Exception:
         logger.exception("converse: source_awareness build failed (continuing)")
     try:
-        text = (footage_map.assemble_map(file_ids).get("text") or "") if file_ids else ""
+        text = (footage_map.assemble_map(
+            file_ids, relations=getattr(ctx, "relations", None)).get("text") or ""
+        ) if file_ids else ""
         if len(text) > _INDEX_CHAR_CAP:
             text = (text[:_INDEX_CHAR_CAP] +
                     "\n[TRUNCATED: the speech index exceeded its budget here -- lines "
@@ -276,4 +288,5 @@ def respond(thread_id: str, *, llm: Optional[LLMClient] = None) -> ConverseResul
         except Exception:
             logger.exception("converse: resolve after edit failed for thread %s", thread_id)
     return ConverseResult(reply=reply, document=result.document, changed=result.changed,
-                          questions=result.questions, awaiting_user=result.awaiting_user)
+                          questions=result.questions, awaiting_user=result.awaiting_user,
+                          trace=result.trace)

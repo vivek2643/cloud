@@ -254,6 +254,104 @@ def test_remove_tears_down_region():
     print("ok  removing a split op tears down its layout region")
 
 
+def test_split_screen_window_path():
+    """A cell source can be a raw (file, in, out) window, not just a map ref --
+    the continuous-source path, mirroring place_span."""
+    struct = _map()
+    doc = _doc(struct, [("ffffffff:m00", "balanced"), ("ffffffff:m01", "balanced")])
+    idx = _MapIndex(struct)
+    doc2 = act.split_screen(doc, idx, None, file="ffffffff-1111",
+                            in_ms=5000, out_ms=6500, template="pip",
+                            from_ms=1000, to_ms=2500)
+    assert doc2 is not doc, "window path should apply"
+    ops = [o for o in doc2["operations"] if o["type"] == "place_video"]
+    assert len(ops) == 1 and ops[0]["source_file_id"] == "ffffffff-1111", ops
+    assert ops[0]["src_in_ms"] == 5000 and ops[0]["purpose"] == "split_cell", ops
+    regs = doc2["layout_regions"]
+    assert regs[0]["cells"]["inset"]["layer"] == ops[0]["op_id"], regs
+    # neither ref nor a full window -> no-op
+    assert act.split_screen(doc, idx, None, template="pip",
+                            from_ms=1000, to_ms=2500) is doc
+    print("ok  split_screen fills a cell from a raw source window")
+
+
+def test_remove_region_tears_down_its_op():
+    """Teardown symmetry: removing a REGION also retires the coverage op it fed
+    (no orphaned full-frame silent paste-over left behind)."""
+    struct = _map()
+    doc = _doc(struct, [("ffffffff:m00", "balanced"), ("ffffffff:m01", "balanced")])
+    idx = _MapIndex(struct)
+    doc = act.split_screen(doc, idx, "ffffffff:m01", template="split_h",
+                           from_ms=1000, to_ms=3000)
+    region_id = doc["layout_regions"][0]["region_id"]
+    doc2 = act.remove(doc, region_id)
+    assert not doc2.get("layout_regions"), doc2.get("layout_regions")
+    assert not [o for o in doc2["operations"] if o["type"] == "place_video"], \
+        doc2["operations"]     # coverage op retired with its region
+    print("ok  removing a region tears down its coverage op (symmetry)")
+
+
+def test_validate_flags_orphaned_split_cell():
+    """A split_cell op with no region referencing it is an orphan; an ordinary
+    V2 cutaway (region-less by design) is NOT flagged."""
+    struct = _map()
+    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    # An orphaned split cell (purpose marker, no region):
+    doc["operations"].append({
+        "op_id": "sp_orphan", "type": "place_video", "purpose": "split_cell",
+        "source_file_id": "ffffffff-1111", "src_in_ms": 0, "src_out_ms": 1000,
+        "from_ms": 0, "to_ms": 1000, "layout": layers.DEFAULT_LAYOUT})
+    # A legitimate cutaway (no purpose marker) that should stay clean:
+    doc["operations"].append({
+        "op_id": "ov_ok", "type": "place_video",
+        "source_file_id": "ffffffff-1111", "src_in_ms": 0, "src_out_ms": 1000,
+        "from_ms": 0, "to_ms": 1000, "layout": layers.DEFAULT_LAYOUT})
+    msgs = [(i["id"], i["message"]) for i in observe.validate(doc, _ctx(struct))]
+    assert any(i == "sp_orphan" and "orphaned split cell" in m for i, m in msgs), msgs
+    assert not any(i == "ov_ok" for i, _ in msgs), msgs
+    print("ok  validate flags an orphaned split cell, not a normal cutaway")
+
+
+def test_scan_source_cross_clip_within_and_global():
+    """scan_source spans the whole shoot (file='*'), resolves a global person id
+    per clip, and honors a within_ms window."""
+    from app.services.l3.clip_timeline import TimelineInputs, build_clip_timeline
+    fa, fb = "aaaaaaaa-1", "bbbbbbbb-2"
+    tla = build_clip_timeline(TimelineInputs(
+        file_id=fa, duration_ms=8000, persons=[{"local_id": "p2"}],
+        presence_lane=[{"start_ms": 0, "end_ms": 4000, "present": ["p2"]},
+                       {"start_ms": 4000, "end_ms": 8000, "present": []}]))
+    tlb = build_clip_timeline(TimelineInputs(
+        file_id=fb, duration_ms=8000, persons=[{"local_id": "p5"}],
+        presence_lane=[{"start_ms": 2000, "end_ms": 8000, "present": ["p5"]},
+                       {"start_ms": 0, "end_ms": 2000, "present": []}]))
+    ctx = observe.EditContext(
+        file_ids=[fa, fb], index=_MapIndex({"clips": []}), map_struct={"clips": []},
+        durations={fa: 8000, fb: 8000}, valence_by_file={},
+        relations={"identities": [{"global_id": "G2", "members": [
+            {"file": fa, "person": "p2", "voice": "S0"},
+            {"file": fb, "person": "p5", "voice": "S1"}]}]})
+    ctx.tl_cache[fa] = tla
+    ctx.tl_cache[fb] = tlb
+
+    # G2 across the whole shoot: resolves to p2 in A, p5 in B.
+    res = observe.scan_source(ctx, "*", "presence:G2", {"state": "on"})
+    files = {h["file"] for h in res["hits"]}
+    assert files == {fa[:8], fb[:8]}, res
+    assert res["file"] == "*" and set(res["files"]) == {fa[:8], fb[:8]}, res
+
+    # within_ms limits hits to a window (clip B, only after 4000ms).
+    res2 = observe.scan_source(ctx, fb, "presence:G2", {"state": "on"},
+                               within_ms=[4000, 8000])
+    assert res2["hits"] and all(h["out_ms"] > 4000 for h in res2["hits"]), res2
+
+    # a global id not present in a clip simply yields no hits there (not an error).
+    ctx.relations["identities"][0]["members"][1]["person"] = None
+    res3 = observe.scan_source(ctx, fb, "presence:G2", {"state": "on"})
+    assert res3["hits"] == [], res3
+    print("ok  scan_source spans the shoot, resolves globals, honors within_ms")
+
+
 def test_solve_layout_templates():
     assert layers.solve_layout("split_v")["bottom"] == {"x": 0.0, "y": 0.5, "w": 1.0, "h": 0.5}
     assert layers.solve_layout("pip")["inset"]["w"] < 0.5
@@ -513,7 +611,11 @@ def main():
     test_norm_keep_spans_accepts_both_shapes()
     test_split_screen_adds_op_and_region()
     test_split_screen_resolves_to_dest_rects()
+    test_split_screen_window_path()
     test_remove_tears_down_region()
+    test_remove_region_tears_down_its_op()
+    test_validate_flags_orphaned_split_cell()
+    test_scan_source_cross_clip_within_and_global()
     test_solve_layout_templates()
     test_affordances_menu()
     test_source_awareness_and_scan_source_via_cache()

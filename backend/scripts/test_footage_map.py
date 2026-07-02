@@ -196,6 +196,42 @@ def test_source_contiguous_beats_form_a_run_channel_agnostic():
     print("ok  test_source_contiguous_beats_form_a_run_channel_agnostic")
 
 
+def test_coverage_group_renders_member_facts_no_use_one():
+    """The coverage-group block lists each delivery's facts (who/on-cam/shot/
+    score) with the speaker aliased to a global id -- and carries NO 'use one'
+    directive (facts, not a verdict)."""
+    summary = [{
+        "group_id": "tg1",
+        "members": ["48c93cef:m22", "1aedb093:m14"],
+        "member_facts": [
+            {"moment_id": "48c93cef:m22", "file": "48c93cef-aaa", "voice": "S0",
+             "cam": "off-cam", "framing": "MCU", "score": 0.78, "restart": False},
+            {"moment_id": "1aedb093:m14", "file": "1aedb093-bbb", "voice": "S1",
+             "cam": "on-cam", "framing": "", "score": 0.74, "restart": True},
+        ],
+        "text": "the same line delivered twice",
+    }]
+    alias = {("48c93cef-aaa", "S0"): "G1", ("1aedb093-bbb", "S1"): "G1"}
+    block = fm._dups_block(summary, alias=alias)
+    assert "COVERAGE GROUPS" in block, block
+    assert "use one" not in block.lower(), block
+    assert "48c93cef:m22 G1 off-cam MCU .78" in block, block
+    assert "1aedb093:m14 G1 on-cam .74 retry" in block, block
+    print("ok  test_coverage_group_renders_member_facts_no_use_one")
+
+
+def test_moment_line_aliases_global_speaker():
+    """A per-line speaker is shown as its global person id when the registry
+    linked it; without the alias it falls back to the raw voice."""
+    cut = _cut("f:g", 1000, 4000, "hello there", speaker="S0", score=0.6,
+               ladder=[_rung("balanced", 1000, 4000, "hello there", 0.6)])
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    m = tree["moments"][0]
+    assert "G3" in fm._moment_line(m, alias={("ffffffff-1111", "S0"): "G3"})
+    assert "S0" in fm._moment_line(m)         # no alias -> raw voice
+    print("ok  test_moment_line_aliases_global_speaker")
+
+
 def test_default_energy_from_genre():
     """The tree opens the slider per genre: long-form calm, short-form punchy."""
     calm = fm.build_clip_tree("ffffffff-2222",
@@ -217,6 +253,8 @@ def main():
     test_no_ladder_uses_flat_span()
     test_facets_surface_on_moment()
     test_map_text_lists_variants_no_atoms()
+    test_coverage_group_renders_member_facts_no_use_one()
+    test_moment_line_aliases_global_speaker()
     test_source_contiguous_beats_form_a_run_channel_agnostic()
     test_default_energy_from_genre()
     print("\nall footage-map tests passed")

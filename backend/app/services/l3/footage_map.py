@@ -449,6 +449,47 @@ def _people_tag(m: Dict[str, Any]) -> str:
     return ""
 
 
+def _cam_state(m: Dict[str, Any]) -> str:
+    """Tri-state on-camera marker for one delivery: 'on-cam' / 'off-cam' / '' when
+    there's no signal to judge. Used by the coverage groups so the brain can see
+    which member actually SHOWS the speaker."""
+    if "offscreen" in (m.get("flags") or []):
+        return "off-cam"
+    people = m.get("people") or []
+    if any(p.get("on_camera") is False for p in people):
+        return "off-cam"
+    if any(p.get("on_camera") is True for p in people):
+        return "on-cam"
+    return ""
+
+
+def _framing_tag(m: Dict[str, Any]) -> str:
+    """A short shot-size note for a delivery, when the perception carries one
+    (never invented). '' when unknown."""
+    fr = m.get("framing")
+    if isinstance(fr, str) and fr.strip():
+        return fr.strip()
+    if isinstance(fr, dict):
+        for k in ("shot", "shot_size", "size"):
+            v = fr.get(k)
+            if v:
+                return str(v)
+    return ""
+
+
+def _global_speaker(file_id: Optional[str], voice: Optional[str],
+                    alias: Optional[Dict[Any, str]]) -> Optional[str]:
+    """The shoot-wide person id for a per-clip voice, when the registry linked it
+    across clips; else the raw voice (never nothing when a voice exists)."""
+    if not voice:
+        return None
+    if alias and file_id is not None:
+        gid = alias.get((file_id, voice))
+        if gid:
+            return gid
+    return voice
+
+
 def _dur_tag(m: Dict[str, Any]) -> str:
     """The cut's PLAY length (after any breath/dead-air excision) so the brain
     can pace + honor a target length without arithmetic on the timestamps."""
@@ -472,10 +513,12 @@ def _audio_tag(m: Dict[str, Any]) -> str:
     return ""
 
 
-def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
+def _moment_line(m: Dict[str, Any], *, compact: bool = False,
+                 alias: Optional[Dict[Any, str]] = None) -> str:
     levels = list(m["variants"].keys())
     nrg = "|".join(L for L in _LEVEL_NAMES if L in levels)
-    spk = f" {m['speaker']}" if m.get("speaker") else ""
+    gspk = _global_speaker(m.get("file_id"), m.get("speaker"), alias)
+    spk = f" {gspk}" if gspk else ""
     cam = _people_tag(m)
     gist = (m.get("gist") or "").strip().replace("\n", " ")
     # Resident mode gives the model the FULL line so it picks by reading, not
@@ -502,7 +545,8 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
             f"\"{gist}\"{gloss} · nrg:{nrg}{run}{dup}")
 
 
-def _clip_block(tree: Dict[str, Any], *, compact: bool = False) -> str:
+def _clip_block(tree: Dict[str, Any], *, compact: bool = False,
+                alias: Optional[Dict[Any, str]] = None) -> str:
     head_bits = [f"{tree['duration_ms'] // 1000}s"]
     if tree.get("content_type"):
         head_bits.append(tree["content_type"])
@@ -514,7 +558,8 @@ def _clip_block(tree: Dict[str, Any], *, compact: bool = False) -> str:
         head_bits.append("people:" + ",".join(tree["people"]))
     header = (f"CLIP {tree['file_id'][:8]} \"{tree['name']}\" · "
               + " · ".join(head_bits))
-    lines = [header] + [_moment_line(m, compact=compact) for m in tree["moments"]]
+    lines = [header] + [_moment_line(m, compact=compact, alias=alias)
+                        for m in tree["moments"]]
     return "\n".join(lines)
 
 
@@ -569,12 +614,14 @@ def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     summary: List[Dict[str, Any]] = []
     for g in groups:
         linked: Dict[str, Dict[str, Any]] = {}   # moment_id -> moment
+        file_by_mid: Dict[str, str] = {}
         restart_ids: set = set()
         for a in g.attempts:
             m = _best_overlap_moment(by_file.get(a.file_id, []), a.start_ms, a.end_ms)
             if m is None:
                 continue
             linked.setdefault(m["moment_id"], m)
+            file_by_mid[m["moment_id"]] = a.file_id
             if a.is_restart:
                 restart_ids.add(m["moment_id"])
         # A real choice needs >= 2 DISTINCT moments (one moment alone is not a
@@ -588,32 +635,67 @@ def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             m["dup_group"] = g.group_id
             if mid in restart_ids:
                 m["dup_restart"] = True
+        # Per-member facts so the brain can compare deliveries WITHOUT re-reading
+        # the whole index: who (voice, aliased to a global person at render), on/
+        # off camera, shot size, and quality score. Facts, not a verdict.
+        member_facts = [{
+            "moment_id": mid,
+            "file": file_by_mid.get(mid, ""),
+            "voice": m.get("speaker"),
+            "cam": _cam_state(m),
+            "framing": _framing_tag(m),
+            "score": float(m.get("score", 0.0)),
+            "restart": mid in restart_ids,
+        } for mid, m in linked.items()]
         summary.append({
             "group_id": g.group_id,
-            "members": list(linked.keys()),
+            "members": list(linked.keys()),     # moment_ids (consumers key on this)
+            "member_facts": member_facts,
             "text": (g.attempts[0].text or "").strip(),
         })
     return summary
 
 
-def _dups_block(summary: List[Dict[str, Any]]) -> str:
+def _dups_block(summary: List[Dict[str, Any]],
+                *, alias: Optional[Dict[Any, str]] = None) -> str:
     if not summary:
         return ""
-    lines = ["SAME-BEAT GROUPS (the same spoken line captured more than once -- a "
-             "retake or another camera angle). Choose the member that reads/looks "
-             "best by its text and score; do not repeat the same line on the main "
-             "line, but you MAY place another member as a silent reaction/cutaway "
-             "over that line's audio:"]
+    # Coverage, not "pick one": each member is one delivery of the same beat.
+    # The brain chooses which to SHOW and may reuse another as a cutaway -- no
+    # directive here, the facts carry the decision. (Genre-agnostic: "beat"
+    # covers a retake, a second camera, or the same line said twice.)
+    lines = ["COVERAGE GROUPS (the same beat delivered more than once -- different "
+             "takes and/or cameras; each member is one delivery, with who it shows "
+             "and how well):"]
     for d in summary:
-        members = " ".join(d["members"])
         gist = d["text"].replace("\n", " ")
         if len(gist) > 80:
             gist = gist[:77] + "..."
-        lines.append(f"  {d['group_id']}: {members}  \"{gist}\"")
+        facts = d.get("member_facts")
+        if facts:
+            parts = []
+            for f in facts:
+                gspk = _global_speaker(f.get("file"), f.get("voice"), alias)
+                bits = [f["moment_id"]]
+                if gspk:
+                    bits.append(gspk)
+                if f.get("cam"):
+                    bits.append(f["cam"])
+                if f.get("framing"):
+                    bits.append(f["framing"])
+                bits.append(f".{int(round(f.get('score', 0.0) * 100)):02d}")
+                if f.get("restart"):
+                    bits.append("retry")
+                parts.append(" ".join(bits))
+            body = " · ".join(parts)
+        else:
+            body = " ".join(d["members"])
+        lines.append(f"  {d['group_id']} \"{gist}\": {body}")
     return "\n".join(lines)
 
 
-def assemble_map(file_ids: List[str], *, compact: bool = False) -> Dict[str, Any]:
+def assemble_map(file_ids: List[str], *, compact: bool = False,
+                 relations: Optional[dict] = None) -> Dict[str, Any]:
     """The Tier-0 footage index for the arranger.
 
     Returns ``{"text", "struct", "clip_count", "moment_count", "dup_groups"}``
@@ -621,13 +703,22 @@ def assemble_map(file_ids: List[str], *, compact: bool = False) -> Dict[str, Any
     ``struct`` is the machine-readable trees the arranger/compiler resolve
     placements against. ``compact`` truncates gists for the paged (over-budget)
     path; resident mode emits the full line. Moments are tagged in place with
-    cross-clip duplicate links.
+    cross-clip duplicate links. When ``relations`` (the shoot identity registry)
+    is supplied, per-line and coverage-group speakers are aliased to their global
+    person id so the same human reads consistently across clips.
     """
+    alias: Optional[Dict[Any, str]] = None
+    if relations:
+        try:
+            from app.services.l3 import relations as relations_mod
+            alias = relations_mod.identity_index(relations)
+        except Exception:
+            logger.exception("footage map: identity index failed (continuing)")
     trees = get_trees(file_ids)
     ordered = [trees[fid] for fid in file_ids if fid in trees]
     dups = _annotate_dups(ordered)   # tags moments in `ordered` in place
-    text = "\n\n".join(_clip_block(t, compact=compact) for t in ordered)
-    dblock = _dups_block(dups)
+    text = "\n\n".join(_clip_block(t, compact=compact, alias=alias) for t in ordered)
+    dblock = _dups_block(dups, alias=alias)
     if dblock:
         text = f"{text}\n\n{dblock}"
     n_moments = sum(t["moment_count"] for t in ordered)

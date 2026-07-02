@@ -118,11 +118,46 @@ def test_render_relations_reads_clean():
     relations = {"offsets": rel.derive_offsets(groups),
                  "identities": rel.derive_identities(groups, _clips())}
     text = rel.render_relations(relations)
-    assert "co-temporal" in text and "same person G1" in text, text
+    # Identity-only digest, no time/offset ontology anywhere.
+    assert "PEOPLE OF THE SHOOT" in text and "G1" in text, text
+    assert "co-temporal" not in text and "offset" not in text.lower(), text
     assert "bbbbbbbb" in text and "aaaaaaaa" in text, text
     assert rel.render_relations({}) == ""
-    print("ok  relations render into a clean brain-facing digest")
+    print("ok  relations render into a clean identity-only digest")
     print("--- sample relations ---\n" + text + "\n------------------------")
+
+
+def test_identity_trait_fallback_links_silent_lookalikes():
+    """Two clips that share NO spoken line still link one person when the VLM
+    appearance descriptions overlap -- as a LOW-confidence, trait-based id."""
+    perc_a = {"file_id": FA, "persons": [
+        {"local_id": "p1", "role": "host",
+         "canonical_description": "bald head gray beard dark jacket"}]}
+    perc_b = {"file_id": FB, "persons": [
+        {"local_id": "p3", "role": "host",
+         "canonical_description": "gray beard bald head dark jacket glasses"}]}
+    clips = {FA: (perc_a, []), FB: (perc_b, [])}
+    idents = rel.derive_identities([], clips)      # no take groups at all
+    assert len(idents) == 1, idents
+    assert idents[0]["basis"] == "traits", idents[0]
+    assert idents[0]["confidence"] < 0.5, idents[0]
+    files = {m["file"] for m in idents[0]["members"]}
+    assert files == {FA, FB}, idents[0]
+    text = rel.render_relations({"identities": idents})
+    assert "appearance-matched" in text and "low confidence" in text, text
+    print("ok  trait fallback links silent look-alikes at low confidence")
+
+
+def test_identity_registry_lookups():
+    groups = [_group("tg1", [_att(FA, 1000, 3000, speaker="S0"),
+                             _att(FB, 13400, 15400, speaker="S1")])]
+    relations = {"identities": rel.derive_identities(groups, _clips())}
+    assert rel.global_id_of(relations, FA, "S0") == "G1"
+    assert rel.global_id_of(relations, FB, "p2") == "G1"   # by person handle too
+    assert rel.global_id_of(relations, FA, "S9") is None
+    loc = rel.local_of(relations, FB, "G1")
+    assert loc and loc["voice"] == "S1", loc
+    print("ok  registry aliases voice/person <-> global id both directions")
 
 
 # --------------------------------------------------------------------------

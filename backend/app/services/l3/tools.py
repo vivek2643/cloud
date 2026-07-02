@@ -38,6 +38,9 @@ class LoopResult:
     document: dict
     changed: bool = False
     steps: List[str] = field(default_factory=list)   # tool names called, in order
+    # Full per-call trace ({name, args, applied, result}) so a turn's REASONING
+    # is auditable after the fact ("check the reasoning") without re-running it.
+    trace: List[dict] = field(default_factory=list)
     # When the brain called ask_user, the turn PAUSES: these are the questions to
     # surface, and the user's next message is their answer (the loop resumes).
     questions: List[dict] = field(default_factory=list)
@@ -80,14 +83,19 @@ def _specs() -> List[Dict[str, Any]]:
           "need a span that ISN'T a pre-baked cut -- e.g. a person's silent reaction "
           "-- then place it with place_span. Each clip is headed 'CLIP <file8>'.",
           obj({})),
-        S("scan_source", "Query one clip's continuous timeline for spans matching a "
-          "facet: `lane` (e.g. 'presence:p2', 'speaking', 'shot', 'speech', 'action') "
-          "+ optional `match` (e.g. {state:'on'} or {subject:'p1'}). Each hit carries "
+        S("scan_source", "Query the continuous timeline for spans matching a facet: "
+          "`lane` (e.g. 'presence:p2', 'speaking', 'shot', 'speech', 'action') + "
+          "optional `match` (e.g. {state:'on'} or {subject:'p1'}). Each hit carries "
           "the full facets at its midpoint, so ask 'where is p2 on screen?' with lane "
           "'presence:p2' match {state:'on'} and read each hit's facets to see if they "
-          "are also silent. `file` is the 'CLIP <file8>' id.",
+          "are also silent. `file` is a 'CLIP <file8>' id, or '*' to scan EVERY clip "
+          "at once; a global person id (G1, G2, ...) in the lane/match is resolved per "
+          "clip. Optional `within_ms` ([a,b]) limits hits to a time window (e.g. scan "
+          "another clip near a coverage member's window for a reaction).",
           obj({"file": {"type": "string"}, "lane": {"type": "string"},
-               "match": {"type": "object"}}, ["file", "lane"])),
+               "match": {"type": "object"},
+               "within_ms": {"type": "array", "items": {"type": "integer"}}},
+              ["file", "lane"])),
         # --- ACT (edit verbs; each mutates the working document) ---
         S("place", "Add a cut from a map ref. channel 'V1' inserts on the MAIN LINE "
           "(picture+sound) at index `at` (default append); 'V2' lays a SILENT video "
@@ -149,18 +157,23 @@ def _specs() -> List[Dict[str, Any]]:
           "level. Tighter = shorter/punchier.",
           obj({"seg_id": {"type": "string"}, "level": {"type": "string", "enum": list(observe._LEVELS)}},
               ["level"])),
-        S("split_screen", "Show the MAIN LINE and a second source `ref` at the same "
-          "time over the window [from_ms, to_ms]: template 'split_h' (side-by-side), "
-          "'split_v' (stacked), or 'pip' (ref inset over the main line). The added "
-          "cell is silent unless audio:'keep'. This is a user-owned look -- ask_user "
-          "first. from_ms/to_ms are PROGRAM ms (see read_state).",
+        S("split_screen", "Show the MAIN LINE and a second source at the same time "
+          "over the window [from_ms, to_ms]: template 'split_h' (side-by-side), "
+          "'split_v' (stacked), or 'pip' (inset over the main line). The added cell "
+          "source is EITHER a map `ref` OR a raw window `file`+`in_ms`+`out_ms` (any "
+          "span from source_awareness/scan_source -- e.g. a silent listener), which "
+          "seam-snaps like place_span. The added cell is silent unless audio:'keep'. "
+          "This is a user-owned look -- ask_user first. from_ms/to_ms are PROGRAM ms.",
           obj({"ref": {"type": "string"},
+               "file": {"type": "string"},
+               "in_ms": {"type": "integer"}, "out_ms": {"type": "integer"},
                "template": {"type": "string", "enum": ["split_h", "split_v", "pip"]},
                "from_ms": {"type": "integer"}, "to_ms": {"type": "integer"},
                "level": {"type": "string", "enum": list(observe._LEVELS)},
                "audio": {"type": "string", "enum": ["keep", "mute"]},
+               "snap": {"type": "string", "enum": ["off"]},
                "reason": {"type": "string"}},
-              ["ref", "template", "from_ms", "to_ms"])),
+              ["template", "from_ms", "to_ms"])),
         # --- ASK (pause the turn for a user-owned decision) ---
         S("ask_user", "Pause and ask the user when a choice is genuinely THEIRS -- "
           "a split-screen/PiP layout, the delivery aspect/framing, or a big pacing "
@@ -241,7 +254,8 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
             return observe.source_awareness(ctx)[:12000], doc, False
         if name == "scan_source":
             return _json(observe.scan_source(ctx, args.get("file"), args.get("lane"),
-                                             args.get("match"))), doc, False
+                                             args.get("match"),
+                                             args.get("within_ms"))), doc, False
 
         # ACT (mutate)
         if name == "place":
@@ -284,7 +298,20 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
         elif name == "tighten":
             new = act.tighten(doc, ctx.index, seg_id=args.get("seg_id"), level=args.get("level", "tight"))
         elif name == "split_screen":
-            new = act.split_screen(doc, ctx.index, args["ref"],
+            # A cell source is a map ref OR a raw (file, in, out) window. The
+            # window path seam-snaps like place_span so a nominated cell lands on
+            # a clean boundary; the ref path is already a minted cut.
+            sc_file = _resolve_file(ctx, args.get("file")) if args.get("file") else None
+            sc_in, sc_out = args.get("in_ms"), args.get("out_ms")
+            if (sc_file and sc_in is not None and sc_out is not None
+                    and args.get("snap") != "off"):
+                tl = observe._timeline(ctx, sc_file)
+                if tl is not None:
+                    snap_info = tl.snap_span(sc_in, sc_out, max_move_ms=_SNAP_CAP_MS)
+                    if snap_info.get("snapped"):
+                        sc_in, sc_out = snap_info["in_ms"], snap_info["out_ms"]
+            new = act.split_screen(doc, ctx.index, args.get("ref"),
+                                   file=sc_file, in_ms=sc_in, out_ms=sc_out,
                                    template=args.get("template", "split_h"),
                                    from_ms=_snap_prog(ctx, args.get("from_ms")),
                                    to_ms=_snap_prog(ctx, args.get("to_ms")),
@@ -329,11 +356,12 @@ def run_edit_loop(llm: LLMClient, *, system: str, messages: List[dict],
     working = document
     changed = False
     steps: List[str] = []
+    trace: List[dict] = []
     tools = _specs()
     last_text = ""
     questions: List[dict] = []
 
-    for _ in range(max_turns):
+    for turn in range(max_turns):
         resp = llm.run(system=system, messages=convo, tools=tools,
                        max_tokens=max_tokens, cache_system=True)
         last_text = (resp.text or "").strip() or last_text
@@ -349,10 +377,14 @@ def run_edit_loop(llm: LLMClient, *, system: str, messages: List[dict],
                 asked = True
                 results.append(tool_result_block(tc.id, _json(
                     {"posed": True, "note": "Shown to the user; end your turn and wait for their answer."})))
+                trace.append({"turn": turn, "name": tc.name, "args": tc.input or {},
+                              "applied": False, "result": "posed to user"})
                 continue
             obs, working, did = _dispatch(tc.name, tc.input or {}, ctx, working)
             changed = changed or did
             results.append(tool_result_block(tc.id, obs))
+            trace.append({"turn": turn, "name": tc.name, "args": tc.input or {},
+                          "applied": bool(did), "result": obs[:600]})
         convo.append(user_message(results))
         # ask_user PAUSES the turn: the user's next message is the answer.
         if asked and questions:
@@ -365,4 +397,4 @@ def run_edit_loop(llm: LLMClient, *, system: str, messages: List[dict],
         "Before I go further I need your call on a couple of things below."
         if awaiting else "Done.")
     return LoopResult(reply=reply, document=working, changed=changed, steps=steps,
-                      questions=questions, awaiting_user=awaiting)
+                      trace=trace, questions=questions, awaiting_user=awaiting)

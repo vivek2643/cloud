@@ -102,18 +102,21 @@ def update_brief(thread_id: str, brief: str) -> None:
 
 # --- Turns (the agent message log) ------------------------------------------
 
-def append_turn(thread_id: str, role: str, content: Any, usage: Optional[dict] = None) -> None:
+def append_turn(thread_id: str, role: str, content: Any, usage: Optional[dict] = None,
+                trace: Optional[list] = None) -> None:
     with _pg_conn() as conn:
         conn.execute(
             """
-            insert into edit_turns (thread_id, seq, role, content, usage)
+            insert into edit_turns (thread_id, seq, role, content, usage, trace)
             values (
                 %s,
                 coalesce((select max(seq) from edit_turns where thread_id = %s), 0) + 1,
-                %s, %s::jsonb, %s::jsonb
+                %s, %s::jsonb, %s::jsonb, %s::jsonb
             )
             """,
-            (thread_id, thread_id, role, json.dumps(content), json.dumps(usage) if usage else None),
+            (thread_id, thread_id, role, json.dumps(content),
+             json.dumps(usage) if usage else None,
+             json.dumps(trace) if trace else None),
         )
 
 

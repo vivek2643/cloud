@@ -112,7 +112,7 @@ def post_message(
 
     store.append_turn(thread_id, "user", text)
     result = converse.respond(thread_id)
-    store.append_turn(thread_id, "assistant", result.reply)
+    store.append_turn(thread_id, "assistant", result.reply, trace=result.trace or None)
 
     version: Optional[int] = None
     if result.changed and result.document is not None:

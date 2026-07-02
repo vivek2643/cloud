@@ -22,8 +22,9 @@ Feel is delegated to ``feel.simulate`` (also pure). Nothing here renders.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import psycopg
 
@@ -84,7 +85,14 @@ def build_context(file_ids: List[str]) -> EditContext:
     """Assemble the per-turn context once (footage map + durations + valence +
     cross-clip relations). All DB reads live here; the sense functions stay pure
     over the result."""
-    fmap = footage_map.assemble_map(file_ids) if file_ids else {}
+    # Identities first: the footage map aliases per-clip voices to global people.
+    rels: dict = {}
+    try:
+        from app.services.l3 import relations as relations_mod
+        rels = relations_mod.build_relations(list(file_ids))
+    except Exception:
+        logger.exception("observe: relations build failed (continuing without)")
+    fmap = footage_map.assemble_map(file_ids, relations=rels) if file_ids else {}
     map_struct = fmap.get("struct") or {"clips": []}
     durations: Dict[str, int] = {}
     try:
@@ -92,12 +100,6 @@ def build_context(file_ids: List[str]) -> EditContext:
         durations = _durations(file_ids)
     except Exception:
         logger.exception("observe: duration lookup failed (continuing)")
-    rels: dict = {}
-    try:
-        from app.services.l3 import relations as relations_mod
-        rels = relations_mod.build_relations(list(file_ids))
-    except Exception:
-        logger.exception("observe: relations build failed (continuing without)")
     return EditContext(
         file_ids=list(file_ids),
         index=_MapIndex(map_struct),
@@ -321,6 +323,22 @@ def validate(document: dict, ctx: EditContext) -> List[dict]:
                 issues.append({"kind": "op", "id": oid,
                                "message": "split_edit on the first cut (no seam before it)"})
 
+    # A split/PiP cell feed whose region is gone is an ORPHAN: it would paste
+    # full-frame over the main line as a silent take-over (the teardown should
+    # have retired it with its region). Precise -- keyed on the split_cell marker
+    # so ordinary V2 cutaways (deliberately region-less) are never flagged.
+    referenced_layers = {
+        (sel or {}).get("layer")
+        for r in (document.get("layout_regions") or [])
+        for sel in (r.get("cells") or {}).values()
+    }
+    for op in document.get("operations") or []:
+        if op.get("type") == "place_video" and op.get("purpose") == "split_cell" \
+                and op.get("op_id") not in referenced_layers:
+            issues.append({"kind": "op", "id": op.get("op_id"),
+                           "message": "orphaned split cell (no layout region references it -- "
+                                      "remove it or re-add its split_screen region)"})
+
     op_ids = {o.get("op_id") for o in (document.get("operations") or [])}
     for r in document.get("layout_regions") or []:
         rid = r.get("region_id")
@@ -493,8 +511,8 @@ def source_awareness(ctx: EditContext) -> str:
     Scales by PROGRESSIVE DISCLOSURE, never silent truncation: few clips get
     full digests, many clips get compact ones, very many get one-line summaries
     -- and the header states the tier so the brain knows to drill down with
-    scan_source. Cross-clip relations (co-temporal offsets, one person across
-    files) lead the digest, since they connect everything after them.
+    scan_source. The shoot's PEOPLE (one global person across clips) lead the
+    digest, since the per-clip blocks after them reference those ids.
 
     Degrades to a short notice (never raises) when the continuous store or its
     L1/L2 inputs are unavailable, so the loop is unaffected."""
@@ -534,31 +552,124 @@ def source_awareness(ctx: EditContext) -> str:
         return "(continuous timeline unavailable)"
 
 
-def scan_source(ctx: EditContext, file_ref: str, lane: str,
-                match: Optional[Dict[str, object]] = None) -> dict:
-    """Facet QUERY over one clip's continuous timeline: return the intervals of
-    ``lane`` whose value matches every key in ``match`` -- e.g. lane
-    'presence:p2' match {state:'on'} for "where is p2 on screen", or lane
-    'speaking' match {subject:'p1'}. Each hit carries the full ``facets`` at its
-    midpoint (who's present, who's speaking, shot, action) so a compound question
-    like "p2 present AND silent" is answered by scanning presence:p2 and reading
-    each hit's facets. ``file_ref`` accepts a full id or the 'CLIP <file8>' prefix.
+_GLOBAL_RE = re.compile(r"^G\d+$")
 
-    Returns {file, lane, hits:[{in_ms,out_ms, <value>, facets}]}. Read-only;
-    empty hits when the lane/clip is unknown."""
-    fid = ""
-    for f in ctx.file_ids:
-        if f == file_ref or f.startswith(str(file_ref or "")):
-            fid = f
-            break
-    tl = _timeline(ctx, fid) if fid else None
+
+def _parse_window(within_ms: object) -> Optional[Tuple[int, int]]:
+    """Normalize a caller-supplied time window to (lo, hi) ms, or None. Accepts
+    [a, b], (a, b), or {in_ms, out_ms}."""
+    if not within_ms:
+        return None
+    try:
+        if isinstance(within_ms, dict):
+            a, b = int(within_ms.get("in_ms")), int(within_ms.get("out_ms"))
+        else:
+            a, b = int(within_ms[0]), int(within_ms[1])
+        return (min(a, b), max(a, b)) if b > a else (a, a)
+    except (TypeError, ValueError, IndexError, KeyError):
+        return None
+
+
+def _resolve_global(ctx: EditContext, fid: str, token: object) -> Tuple[object, bool]:
+    """Map a shoot-wide person id (G1, G2, ...) to its LOCAL handle in file
+    ``fid`` (person id, else voice). Returns (resolved, ok): a non-global token
+    passes through unchanged (ok=True); a global id not present in this file
+    yields (None, False) so the caller can skip the clip without erroring."""
+    if token is None or not _GLOBAL_RE.match(str(token)):
+        return token, True
+    try:
+        from app.services.l3 import relations as relations_mod
+        m = relations_mod.local_of(ctx.relations, fid, str(token))
+    except Exception:
+        logger.exception("scan_source: global id resolution failed")
+        return None, False
+    if not m:
+        return None, False
+    local = m.get("person") or m.get("voice")
+    return (local, True) if local else (None, False)
+
+
+def _scan_one(ctx: EditContext, fid: str, lane: str,
+              match: Optional[Dict[str, object]],
+              win: Optional[Tuple[int, int]], cap: int) -> List[dict]:
+    """Scan one clip, resolving any global person id in the lane suffix or match
+    values to that clip's local handle first. [] when the clip has no timeline or
+    the referenced person isn't in it."""
+    tl = _timeline(ctx, fid)
     if tl is None:
-        return {"file": fid or file_ref, "lane": lane, "hits": [],
-                "note": "no continuous timeline for this clip"}
-    hits = []
-    for it in tl.scan(lane, **(match or {})):
+        return []
+    prefix, sep, suf = lane.partition(":")
+    lane_name = lane
+    if sep:
+        rt, ok = _resolve_global(ctx, fid, suf)
+        if not ok:
+            return []
+        lane_name = f"{prefix}:{rt}"
+    rmatch: Dict[str, object] = {}
+    for k, v in (match or {}).items():
+        rt, ok = _resolve_global(ctx, fid, v)
+        if not ok:
+            return []
+        rmatch[k] = rt
+    hits: List[dict] = []
+    for it in tl.scan(lane_name, **rmatch):
+        if win and not (it.start_ms < win[1] and it.end_ms > win[0]):
+            continue
         mid = (it.start_ms + it.end_ms) // 2
-        hits.append({"in_ms": it.start_ms, "out_ms": it.end_ms, **it.value,
-                     "facets": tl.facet_at(mid)})
-    return {"file": fid[:8], "lane": lane, "hits": hits[:40],
-            "lanes_available": [ln.name for ln in tl.lanes]}
+        hits.append({"file": fid[:8], "in_ms": it.start_ms, "out_ms": it.end_ms,
+                     **it.value, "facets": tl.facet_at(mid)})
+        if len(hits) >= cap:
+            break
+    return hits
+
+
+def scan_source(ctx: EditContext, file_ref: str, lane: str,
+                match: Optional[Dict[str, object]] = None,
+                within_ms: object = None) -> dict:
+    """Facet QUERY over the continuous timeline -- ONE clip or the WHOLE shoot.
+
+    ``lane`` (e.g. 'presence:p2', 'speaking', 'shot', 'action') + optional
+    ``match`` (e.g. {state:'on'} or {subject:'p1'}). Each hit carries the full
+    ``facets`` at its midpoint, so a compound question ("p2 present AND silent")
+    is answered by scanning presence:p2 and reading each hit's facets.
+
+    CROSS-CLIP: ``file_ref`` of '*'/'all' (or empty) scans every clip in scope;
+    a full id or 'CLIP <file8>' prefix scans just that one. A global PERSON id
+    (G1, G2, ...) in the lane suffix or a match value is resolved to each clip's
+    local handle automatically, so "where is G2 on screen anywhere" is one call.
+
+    ``within_ms`` ([a,b] or {in_ms,out_ms}) constrains hits to a time window --
+    e.g. take a coverage-group member's own window and scan a co-delivered clip
+    near it for a plausible reaction, without any shoot-wide clock.
+
+    Returns {file, lane, hits:[{file,in_ms,out_ms,<value>,facets}], files}.
+    Read-only; empty hits when the lane/clip/person is unknown."""
+    ref = str(file_ref or "").strip()
+    if ref in ("", "*", "all", "any", "CLIP"):
+        targets = list(ctx.file_ids)
+    else:
+        targets = [f for f in ctx.file_ids
+                   if f == ref or f.startswith(ref) or ref.startswith(f[:8])][:1] \
+            or [f for f in ctx.file_ids if f[:8] == ref[:8]]
+    if not targets:
+        return {"file": file_ref, "lane": lane, "hits": [],
+                "note": "no such clip in scope", "files": []}
+    win = _parse_window(within_ms)
+    multi = len(targets) > 1
+    cap = 40 if not multi else max(4, 40 // len(targets))
+    hits: List[dict] = []
+    scanned: List[str] = []
+    for fid in targets:
+        fh = _scan_one(ctx, fid, lane, match, win, cap)
+        if _timeline(ctx, fid) is not None:
+            scanned.append(fid[:8])
+        hits.extend(fh)
+    out: dict = {"file": (targets[0][:8] if not multi else "*"),
+                 "lane": lane, "hits": hits[:60], "files": scanned}
+    if not multi and targets:
+        tl = _timeline(ctx, targets[0])
+        if tl is not None:
+            out["lanes_available"] = [ln.name for ln in tl.lanes]
+        else:
+            out["note"] = "no continuous timeline for this clip"
+    return out

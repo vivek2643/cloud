@@ -201,23 +201,36 @@ def place(document: dict, index: _MapIndex, ref: str, *,
 
 def remove(document: dict, target_id: str) -> dict:
     """Drop a main-line segment (by seg_id), an operation (by op_id), or a layout
-    region (by region_id). Removing an op that a layout region references also
-    drops that now-dangling region (so a split/PiP tears down cleanly)."""
+    region (by region_id) -- and tear the split/PiP down SYMMETRICALLY:
+      * removing an op that a region references also drops that now-dangling
+        region, and
+      * removing a region also drops the coverage op(s) it fed (so no orphaned
+        full-frame silent paste-over is left behind).
+    A cell pointing at 'spine' is the main line, never dropped."""
     doc = _clone(document)
     regions = doc.get("layout_regions") or []
     before = len(doc["timeline"]) + len(doc["operations"]) + len(regions)
+
+    ops_to_drop = {target_id}     # target may itself be an op id
+    kept_regions: List[dict] = []
+    for r in regions:
+        cell_layers = {(sel or {}).get("layer")
+                       for sel in (r.get("cells") or {}).values()}
+        if r.get("region_id") == target_id or target_id in cell_layers:
+            # This region goes (removed directly, or its op was the target): also
+            # retire the coverage op(s) it fed so nothing dangles.
+            ops_to_drop |= {ly for ly in cell_layers if ly and ly != "spine"}
+        else:
+            kept_regions.append(r)
+
     doc["timeline"] = [s for s in doc["timeline"] if s.get("seg_id") != target_id]
-    doc["operations"] = [o for o in doc["operations"] if o.get("op_id") != target_id]
-    regions = [
-        r for r in regions
-        if r.get("region_id") != target_id
-        and not any((sel or {}).get("layer") == target_id for sel in (r.get("cells") or {}).values())
-    ]
-    if regions:
-        doc["layout_regions"] = regions
+    doc["operations"] = [o for o in doc["operations"]
+                         if o.get("op_id") not in ops_to_drop]
+    if kept_regions:
+        doc["layout_regions"] = kept_regions
     else:
         doc.pop("layout_regions", None)
-    after = len(doc["timeline"]) + len(doc["operations"]) + len(regions)
+    after = len(doc["timeline"]) + len(doc["operations"]) + len(kept_regions)
     if after == before:
         return document  # nothing matched -> unchanged
     return doc
@@ -332,23 +345,41 @@ _SPLIT_CELLS = {
 }
 
 
-def split_screen(document: dict, index: _MapIndex, ref: str, *,
+def split_screen(document: dict, index: _MapIndex, ref: Optional[str] = None, *,
+                 file: Optional[str] = None,
+                 in_ms: Optional[int] = None, out_ms: Optional[int] = None,
                  template: str = "split_h", from_ms: int, to_ms: int,
                  level: str = "balanced", audio: Optional[str] = None,
                  reason: str = "") -> dict:
-    """Show the ongoing main line (V1) AND a second source `ref` side-by-side (or
-    PiP) over the program window [from_ms, to_ms].
+    """Show the ongoing main line (V1) AND a second source side-by-side (or PiP)
+    over the program window [from_ms, to_ms].
 
-    Adds a V2 place_video op for `ref` and a LAYOUT REGION that assigns the spine
-    to one cell and the op to the other per the template (split_h/split_v/pip).
-    The added cell is silent by default (audio="keep" plays its sound). This is a
-    user-owned look -- the brain should ``ask_user`` before calling it. Unknown
-    template / bad window -> unchanged doc."""
+    The added cell's source is EITHER a pre-baked map ``ref`` OR any raw source
+    window ``file`` + ``in_ms`` + ``out_ms`` (the continuous-source path, mirroring
+    ``place_span`` -- so a silent listener or any window the awareness lanes reveal
+    can fill a cell, not just a minted cut). Adds a V2 place_video op and a LAYOUT
+    REGION assigning the spine to one cell and the op to the other per the template
+    (split_h/split_v/pip). The added cell is silent by default (audio="keep" plays
+    its sound). This is a user-owned look -- the brain should ``ask_user`` before
+    calling it. Unknown template / no source / bad window -> unchanged doc."""
     cells = _SPLIT_CELLS.get(template)
     if cells is None:
         return document
-    rc = index.resolve(Placement(ref=ref, level=level))
-    if rc is None:
+    # Resolve the added source: a map ref, else a raw (file, in, out) window.
+    if ref:
+        rc = index.resolve(Placement(ref=ref, level=level))
+        if rc is None:
+            return document
+        src_file, src_in, src_out = rc.file_id, int(rc.src_in_ms), int(rc.src_out_ms)
+    elif file and in_ms is not None and out_ms is not None:
+        try:
+            src_in, src_out = int(in_ms), int(out_ms)
+        except (TypeError, ValueError):
+            return document
+        if src_out <= src_in:
+            return document
+        src_file = file
+    else:
         return document
     try:
         f, t = int(from_ms), int(to_ms)
@@ -356,7 +387,7 @@ def split_screen(document: dict, index: _MapIndex, ref: str, *,
         return document
     if t <= f:
         return document
-    span = min(t - f, rc.src_out_ms - rc.src_in_ms)
+    span = min(t - f, src_out - src_in)
     if span < 200:
         return document
 
@@ -368,9 +399,12 @@ def split_screen(document: dict, index: _MapIndex, ref: str, *,
     doc["operations"].append({
         "op_id": op_id,
         "type": "place_video",
-        "source_file_id": rc.file_id,
-        "src_in_ms": int(rc.src_in_ms),
-        "src_out_ms": int(rc.src_in_ms + span),
+        # Marks this op as a split/PiP cell feed (not a standalone cutaway), so a
+        # region teardown can retire it and validate can spot it if orphaned.
+        "purpose": "split_cell",
+        "source_file_id": src_file,
+        "src_in_ms": src_in,
+        "src_out_ms": src_in + span,
         "from_ms": f,
         "to_ms": f + span,
         "layout": layers.DEFAULT_LAYOUT,
