@@ -190,6 +190,48 @@ def test_scan_and_handles_queries():
     print("ok  scan() facet query + handles() room query")
 
 
+def test_presence_lane_v8_dense_coverage_and_reentry():
+    """The dense v8 presence_lane handles re-entry (off in the middle) that
+    coarse enters/exits cannot express."""
+    tl = build_clip_timeline(TimelineInputs(
+        file_id=FID, duration_ms=10000,
+        persons=[{"local_id": "p1"}, {"local_id": "p2"}],
+        presence_lane=[
+            {"start_ms": 0, "end_ms": 3000, "present": ["p1"]},
+            {"start_ms": 3000, "end_ms": 6000, "present": ["p1", "p2"]},
+            {"start_ms": 6000, "end_ms": 10000, "present": ["p2"]},  # p1 left
+        ]))
+    p1 = tl.lane(f"{LANE_PRESENCE}:p1")
+    assert p1.value_at(1000)["state"] == "on"
+    assert p1.value_at(8000)["state"] == "off"       # re-entry/exit expressed
+    assert tl.facet_at(4000)[LANE_PRESENCE] == ["p1", "p2"], tl.facet_at(4000)
+    assert tl.facet_at(8000)[LANE_PRESENCE] == ["p2"]
+    print("ok  v8 presence_lane gives dense per-person coverage w/ re-entry")
+
+
+def test_activity_lane_v8_held_reaction_is_addressable():
+    """A silent HELD reaction in activity_lane becomes an action-lane event AND a
+    placeable cut-index bookmark -- the case the sparse atoms miss."""
+    tl = build_clip_timeline(TimelineInputs(
+        file_id=FID, duration_ms=12000,
+        activity_lane=[
+            {"start_ms": 0, "end_ms": 4000, "mode": "action", "subject": "person",
+             "actor": "p1", "label": "makes the point", "peak_ms": 2000, "confidence": 0.8},
+            {"start_ms": 4000, "end_ms": 5000, "mode": "idle"},          # dropped
+            {"start_ms": 5000, "end_ms": 9000, "mode": "held", "subject": "person",
+             "actor": "p2", "label": "listens, silent", "peak_ms": 7000, "confidence": 0.7},
+        ]))
+    action = tl.lane(LANE_ACTION)
+    assert len(action.intervals) == 2, action.intervals    # idle skipped
+    held = action.value_at(7000)
+    assert held["channel"] == "shown" and held["label"] == "listens, silent", held
+    # the held reaction is a placeable bookmark in the index
+    assert any(c.kind == "shown" and c.label == "listens, silent" for c in tl.cuts), tl.cuts
+    # peaks fuse from activity
+    assert any(p.ts_ms == 7000 and p.kind == "shown" for p in tl.peaks), tl.peaks
+    print("ok  v8 activity_lane: silent held reaction is addressable (event+bookmark+peak)")
+
+
 def test_render_awareness_digest():
     fld = FusedField(hop_ms=100, cost=[0.0] * 120,
                      seams=[FusedSeam(6000, 0.95, "sentence_end", ["dialogue"])])

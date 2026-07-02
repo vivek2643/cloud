@@ -90,6 +90,27 @@ video track). Each atom is one captured beat on exactly ONE channel:
   Note: SPEECH and non-speech SOUND are NOT atoms here -- speech comes from the
   transcript and audio is handled separately. Emit video atoms only.
 
+CONTINUOUS LANES (`presence_lane`, `activity_lane` -- describe the WHOLE clock,
+not just highlights). Where `atoms` are the few standout beats worth a card,
+these two lanes TILE the entire clip so the editor can address ANY moment:
+
+  * `presence_lane`: back-to-back intervals of WHO is on screen. Start a new
+    interval only when the visible set changes (someone enters, exits, or comes
+    back); hold one interval while it is stable. List the person p-ids `present`
+    and the `primary` one the framing is on. Cover 0..duration with no gaps
+    (an interval with nobody visible has present=[]).
+  * `activity_lane`: back-to-back intervals of WHAT the camera is capturing --
+    `mode` = "action" (something happening, peak = impact), "held" (a subject
+    held to look at, peak = clearest frame), or "idle" (a lull/transition).
+    Give the `subject`, `actor` (p-id if a person), a short `label`, and `peak_ms`
+    for action/held. This is where a person's SILENT held reaction lives (mode
+    "held", the listener) even though it is not a highlight atom. Cover the whole
+    clip; keep it COARSE -- a handful of intervals for a short clip, not one per
+    second. Change an interval only at a real change point.
+
+  These lanes should be CONSISTENT with the atoms and speaking spans (an atom's
+  time falls inside a matching activity interval), just denser and gap-free.
+
 TAKE SELECTION (so an editor can later pick the best version of a moment):
   * If the subject flubs and re-attempts the SAME content within this clip
     (a retry), emit a `restart_markers` entry at the start of the retry (with

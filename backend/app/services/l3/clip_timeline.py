@@ -244,6 +244,9 @@ class TimelineInputs:
     camera_craft: List[dict] = field(default_factory=list)
     atoms: List[dict] = field(default_factory=list)
     quality_events: List[dict] = field(default_factory=list)
+    # v8 dense change-point lanes (preferred over enters/exits + atoms when present)
+    presence_lane: List[dict] = field(default_factory=list)   # {start_ms,end_ms,present:[...],primary}
+    activity_lane: List[dict] = field(default_factory=list)   # {start_ms,end_ms,mode,subject,actor,label,peak_ms}
     # L1 motion
     action_points: List[dict] = field(default_factory=list)  # {ts_ms,kind,score,...}
     # Reused fused seam field (built by the loader via fused_seams.compute_fused_field)
@@ -331,6 +334,7 @@ def _speech_lane(turns: List[dict], duration_ms: int) -> Lane:
 
 
 def _presence_lanes(persons: List[dict], duration_ms: int) -> List[Lane]:
+    """Per-person on/off from coarse enters/exits (v7 fallback)."""
     lanes: List[Lane] = []
     for p in persons:
         pid = p.get("local_id")
@@ -341,6 +345,24 @@ def _presence_lanes(persons: List[dict], duration_ms: int) -> List[Lane]:
         a = 0 if enters is None else max(0, int(enters))
         b = duration_ms if exits is None else min(duration_ms, int(exits))
         spans = [(a, b, {"state": "on"})] if b > a else []
+        ivs = _full_coverage(spans, duration_ms, {"state": "off"})
+        lanes.append(Lane(f"{LANE_PRESENCE}:{pid}", ivs, full_coverage=True))
+    return lanes
+
+
+def _presence_lanes_from_lane(presence_lane: List[dict], persons: List[dict],
+                              duration_ms: int) -> List[Lane]:
+    """Per-person on/off from the DENSE v8 presence_lane (change-point coverage
+    of who is on screen) -- far richer than enters/exits (handles re-entry)."""
+    ids = [p.get("local_id") for p in persons if p.get("local_id")]
+    for sp in presence_lane:                     # include ids only seen in the lane
+        for pid in sp.get("present") or []:
+            if pid and pid not in ids:
+                ids.append(pid)
+    lanes: List[Lane] = []
+    for pid in ids:
+        spans = [(sp.get("start_ms", 0), sp.get("end_ms", 0), {"state": "on"})
+                 for sp in presence_lane if pid in (sp.get("present") or [])]
         ivs = _full_coverage(spans, duration_ms, {"state": "off"})
         lanes.append(Lane(f"{LANE_PRESENCE}:{pid}", ivs, full_coverage=True))
     return lanes
@@ -389,23 +411,58 @@ def _action_lane(atoms: List[dict]) -> Lane:
     return Lane(LANE_ACTION, ivs, full_coverage=False)
 
 
+_MODE_CHANNEL = {"action": "done", "held": "shown"}
+
+
+def _action_lane_from_activity(activity_lane: List[dict]) -> Lane:
+    """The DENSE v8 activity_lane -> action-lane events. Skips 'idle' lulls (the
+    speech/presence lanes already cover those); keeps action + held so a silent
+    held reaction is a visible, addressable interval."""
+    ivs: List[Interval] = []
+    for a in activity_lane:
+        mode = a.get("mode")
+        ch = _MODE_CHANNEL.get(mode)
+        if ch is None:                            # idle / unknown -> not an event
+            continue
+        s, e = a.get("start_ms"), a.get("end_ms")
+        if s is None or e is None or int(e) <= int(s):
+            continue
+        ivs.append(Interval(int(s), int(e), {
+            "channel": ch, "mode": mode, "subject": a.get("subject"),
+            "actor": a.get("actor"), "label": a.get("label") or "",
+            "peak_ms": a.get("peak_ms"), "confidence": a.get("confidence"),
+        }))
+    ivs.sort(key=lambda it: it.start_ms)
+    return Lane(LANE_ACTION, ivs, full_coverage=False)
+
+
 # --------------------------------------------------------------------------
 # Peaks / energy / person cards
 # --------------------------------------------------------------------------
 
-def _build_peaks(atoms: List[dict], action_points: List[dict]) -> List[Peak]:
+def _build_peaks(atoms: List[dict], action_points: List[dict],
+                 activity_lane: Optional[List[dict]] = None) -> List[Peak]:
     peaks: List[Peak] = []
-    for a in atoms:
-        ch = a.get("channel")
-        if ch not in ("done", "shown"):
-            continue
-        pk = a.get("peak_ms")
-        if pk is None:
-            s, e = a.get("start_ms"), a.get("end_ms")
-            if s is None or e is None:
+    # Prefer the dense activity_lane peaks when present; else the sparse atoms.
+    if activity_lane:
+        for a in activity_lane:
+            ch = _MODE_CHANNEL.get(a.get("mode"))
+            pk = a.get("peak_ms")
+            if ch is None or pk is None:
                 continue
-            pk = (int(s) + int(e)) // 2
-        peaks.append(Peak(int(pk), ch, float(a.get("confidence") or 0.5), a.get("actor")))
+            peaks.append(Peak(int(pk), ch, float(a.get("confidence") or 0.5), a.get("actor")))
+    else:
+        for a in atoms:
+            ch = a.get("channel")
+            if ch not in ("done", "shown"):
+                continue
+            pk = a.get("peak_ms")
+            if pk is None:
+                s, e = a.get("start_ms"), a.get("end_ms")
+                if s is None or e is None:
+                    continue
+                pk = (int(s) + int(e)) // 2
+            peaks.append(Peak(int(pk), ch, float(a.get("confidence") or 0.5), a.get("actor")))
     for p in action_points or []:
         ts = p.get("ts_ms")
         if ts is not None:
@@ -488,8 +545,19 @@ def _derive_cut_index(inputs: TimelineInputs, turns: List[dict],
         n += 1
         cuts.append(IndexCut(f"c{n}", "said", a, b, score, peak_ms=peak,
                              speaker=t.get("speaker"), label=(t.get("text") or "")[:80]))
-    # Video bookmarks: one per capture atom, snapped around its peak core.
-    for atom in inputs.atoms:
+    # Video bookmarks: prefer the DENSE activity_lane (so a silent held reaction
+    # becomes a placeable bookmark), else the sparse atoms highlights.
+    if inputs.activity_lane:
+        video_beats = [
+            {"channel": _MODE_CHANNEL.get(a.get("mode")), "start_ms": a.get("start_ms"),
+             "end_ms": a.get("end_ms"), "peak_ms": a.get("peak_ms"),
+             "subject": a.get("subject"), "label": a.get("label"),
+             "confidence": a.get("confidence")}
+            for a in inputs.activity_lane if _MODE_CHANNEL.get(a.get("mode"))
+        ]
+    else:
+        video_beats = inputs.atoms
+    for atom in video_beats:
         ch = atom.get("channel")
         if ch not in ("done", "shown"):
             continue
@@ -525,14 +593,20 @@ def build_clip_timeline(inputs: TimelineInputs) -> ClipTimeline:
     turns = _merge_turns(inputs.words)
 
     lanes: List[Lane] = [_speech_lane(turns, dur)]
-    lanes.extend(_presence_lanes(inputs.persons, dur))
+    if inputs.presence_lane:                       # v8 dense coverage preferred
+        lanes.extend(_presence_lanes_from_lane(inputs.presence_lane, inputs.persons, dur))
+    else:
+        lanes.extend(_presence_lanes(inputs.persons, dur))
     lanes.append(_speaking_lane(inputs.speaking, dur))
     lanes.append(_gaze_lane(inputs.gaze, dur))
     lanes.append(_shot_lane(inputs.camera_craft, dur))
-    lanes.append(_action_lane(inputs.atoms))
+    if inputs.activity_lane:                        # v8 dense coverage preferred
+        lanes.append(_action_lane_from_activity(inputs.activity_lane))
+    else:
+        lanes.append(_action_lane(inputs.atoms))
 
     seams = [s.to_dict() for s in inputs.field.seams] if inputs.field else []
-    peaks = _build_peaks(inputs.atoms, inputs.action_points)
+    peaks = _build_peaks(inputs.atoms, inputs.action_points, inputs.activity_lane)
     norm_energy = _normalize_energy(inputs.rms_db)
     persons = _person_cards(inputs.persons)
     cuts = _derive_cut_index(inputs, turns, norm_energy)

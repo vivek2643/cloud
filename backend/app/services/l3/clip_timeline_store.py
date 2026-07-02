@@ -66,6 +66,8 @@ def load_timeline_inputs(file_id: str, *, energy: float = 0.5) -> Optional[Timel
         atoms=list(perc.get("atoms") or []),
         quality_events=list(perc.get("take_quality_events") or []),
         action_points=list(motion.get("action_points") or []),
+        presence_lane=list(perc.get("presence_lane") or []),
+        activity_lane=list(perc.get("activity_lane") or []),
         field=field,
     )
 

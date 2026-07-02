@@ -62,7 +62,14 @@ def _to_unit(v):
 # v7 adds a single clip-level `valence` (emotional tone) -- the one feel signal
 # a VLM must supply that L1 cannot derive; the rest of "feel" (pace, energy,
 # pauses) is computed downstream from L1. Null-safe: old docs simply lack it.
-SCHEMA_VERSION = 7
+# v8 (continuous editing) adds two DENSE, full-coverage CHANGE-POINT lanes that
+# tile the whole clip clock -- `presence_lane` (who is on screen, a new interval
+# whenever that set changes) and `activity_lane` (what the camera is capturing:
+# action / held / idle, the dense superset of the sparse `atoms` highlights).
+# These feed the Clip Timeline substrate so the brain can address ANY span, not
+# just a minted cut. Purely additive: `atoms` + every v7 track stay unchanged and
+# the v1 cut pipeline is untouched; old docs simply lack the new lanes.
+SCHEMA_VERSION = 8
 
 
 # The editing vocabulary (vocab.py) is the single source of truth.
@@ -512,6 +519,62 @@ class CaptureAtom(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# v8 continuous editing: DENSE change-point lanes (tile the whole clip clock)
+# --------------------------------------------------------------------------
+
+class PresenceSpan(BaseModel):
+    """A CHANGE-POINT interval of who is on screen. Emit a NEW interval only when
+    the visible set changes (someone enters, exits, or returns); hold one interval
+    while it is stable. Together these must TILE the whole clip -- back-to-back,
+    no gaps -- so the timeline can answer 'who is on screen?' at any instant."""
+    start_ms: int
+    end_ms: int
+    present: List[str] = Field(default_factory=list, description="person local_ids visible in this interval (empty = no one)")
+    primary: Optional[str] = Field(None, description="the person the framing is mainly on this interval, if any")
+
+
+class ActivityMode(str, Enum):
+    action = "action"   # something changing / happening over time (peak = impact)
+    held = "held"       # a subject held still to look at (peak = clearest frame)
+    idle = "idle"       # a lull / transition with nothing notable being captured
+
+
+class ActivitySpan(BaseModel):
+    """A CHANGE-POINT interval of WHAT the camera is capturing, tiling the whole
+    clip (full coverage, back-to-back). Start a new interval each time the activity
+    changes: an action begins/ends, the held subject changes, or it lapses to idle.
+
+    This is the DENSE continuous companion to `atoms`: where `atoms` are the few
+    standout beats worth a card, `activity_lane` describes the ENTIRE clock so the
+    editor can address any moment (e.g. a person's silent, held reaction that was
+    never a highlight). Keep it coarse -- a handful of intervals for a short clip,
+    not one per second."""
+    start_ms: int
+    end_ms: int
+    mode: Optional[ActivityMode] = None
+    subject: Optional[Subject] = Field(None, description="what it is ABOUT: person / place / object / graphic")
+    actor: Optional[str] = Field(None, description="person local_id when the subject is a known person")
+    label: str = Field("", description="short human-facing line, e.g. 'listens, silent' / 'pours coffee'")
+    peak_ms: Optional[int] = Field(None, description="impact (action) or clearest-frame (held) instant within the span")
+    confidence: Optional[float] = Field(None, description="0..1 how clearly this is what the shot is capturing")
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def _norm_mode(cls, v):
+        return _coerce_enum(ActivityMode)(v)
+
+    @field_validator("subject", mode="before")
+    @classmethod
+    def _norm_activity_subject(cls, v):
+        return _coerce_subject(v)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _norm_activity_conf(cls, v):
+        return _to_unit(v)
+
+
+# --------------------------------------------------------------------------
 # Root artifact
 # --------------------------------------------------------------------------
 
@@ -563,6 +626,12 @@ class ClipPerception(BaseModel):
         if not isinstance(v, list):
             return v
         return [a for a in v if isinstance(a, dict) and _coerce_channel(a.get("channel"))]
+
+    # v8 continuous-editing DENSE lanes (tile the whole clip clock). Additive:
+    # the Clip Timeline substrate prefers these; the v1 cut pipeline ignores them
+    # and reads `atoms`. Old docs simply have them empty.
+    presence_lane: List[PresenceSpan] = Field(default_factory=list)
+    activity_lane: List[ActivitySpan] = Field(default_factory=list)
 
     # Take selection (span-level): localized quality + retry markers.
     take_quality_events: List[TakeQualityEvent] = Field(default_factory=list)
