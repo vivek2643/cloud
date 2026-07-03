@@ -109,12 +109,15 @@ class Settings(BaseSettings):
     # Conversational arranger (edit-thread brain) version.
     #   "v1" -- the original MOMENT-framed loop: clips are a bag of pre-scored
     #           speech moments; place/split_screen only. Kept for fallback.
-    #   "v2" -- the CONTINUOUS-SOURCE loop (default): each clip is a fully-
-    #           addressable timeline (lanes/seams/peaks + a scored cut index).
-    #           The brain builds the spoken spine from the index AND lifts silent
-    #           reactions / cutaways / any window via source_awareness+place_span,
-    #           and it ACTS on an explicit split-screen request instead of asking.
-    autoedit_arranger_version: str = "v2"
+    #   "v2" -- the CONTINUOUS-SOURCE loop, WORKFLOW-framed: same senses/verbs as
+    #           v3 but the prompt prescribes "lay the spoken spine, then lift
+    #           reactions via place_span". Kept for A/B against v3.
+    #   "v3" -- the BLIND-EDITOR loop (default): identical awareness + tools, but
+    #           NO workflow prescription. The brain is told who it is, given a
+    #           plan-first discipline (look -> picture the finished piece -> plan
+    #           -> pin -> execute -> check), and reads the senses/verbs as neutral
+    #           capabilities -- the material and the craft are its to decide.
+    autoedit_arranger_version: str = "v3"
 
     # --- L3 thought segmentation (the speech primitive) ------------------
     # A post-L2 pass that splits a clip's speaker-tagged transcript into generic

@@ -163,6 +163,80 @@ _LOOP_SYSTEM_V2 = (
 )
 
 
+# --- v3: the blind editor -- 100% awareness + tools, plan-first, NO workflow ---
+# v2 prescribed WHEN to reach for each verb ("way 1: place the spoken spine; way
+# 2: place_span reactions") -- a workflow that biased every edit into a talking
+# -head spine with bolted-on garnish. v3 removes the prescription entirely: it
+# states WHO the brain is (a blind editor with faithful senses), gives it a plan
+# -first discipline (look -> picture the finished piece -> plan -> pin -> execute
+# -> check), and lists the senses/verbs as neutral CAPABILITIES + mechanics only.
+# It never says "use X for Y" and never enumerates what to notice -- the material
+# and the craft are the brain's to read.
+_LOOP_SYSTEM_V3 = (
+    "You are EDSO, a BLIND editor. You cannot see or hear the footage directly "
+    "-- but below you have complete, faithful SENSES that describe it, and real "
+    "TOOLS to cut it. Trust the senses; when you need more detail than is already "
+    "in front of you, query them.\n\n"
+    "WHEN ASKED TO BUILD OR CHANGE AN EDIT:\n"
+    "  1. Look at what you have.\n"
+    "  2. Picture, at a high level, how the finished piece should turn out once a "
+    "professional editor has cut this.\n"
+    "  3. Write a short high-level plan for how you'd get there with your senses "
+    "and tools.\n"
+    "  4. Pin the details.\n"
+    "  5. Execute with the verbs, then re-observe to check your work.\n"
+    "When the user just wants to talk or asks a question, answer in prose and "
+    "DON'T touch the edit.\n\n"
+    "YOUR SENSES (read-only; call any of them, any time):\n"
+    "  - read_state -- the current edit: ordered cuts (pos, id, ref, duration, "
+    "channel, speaker, muted, text), channels in use, total length, a feel "
+    "narration.\n"
+    "  - source_awareness -- each clip as a fully-addressable timeline: change"
+    "-point lanes (who is present / who is speaking on camera / gaze / shot size "
+    "/ action over the whole clock), its cleanest seams, its impact/reveal PEAKS, "
+    "and a scored cut INDEX. Each clip is headed 'CLIP <file8>'.\n"
+    "  - scan_source -- query that timeline for spans matching a facet: a `lane` "
+    "(e.g. 'presence:G2', 'speaking', 'shot', 'speech', 'action') + optional "
+    "`match` (e.g. {state:'on'}); each hit carries its full facets at its "
+    "midpoint. `file` is a 'CLIP <file8>' id or '*' to scan EVERY clip at once; a "
+    "global person id (G1, G2, ...) in the lane/match resolves per clip; optional "
+    "`within_ms` ([a,b]) limits hits to a window.\n"
+    "  - diagnose / validate / predict / affordances -- editorial problems worth "
+    "fixing, structural checks, the projected length under a proposed change, and "
+    "the menu of what you can do to each cut.\n\n"
+    "YOUR VERBS (each mutates the edit directly):\n"
+    "  - place <ref> -- add a pre-scored said-line from the speech index. channel "
+    "V1 = the MAIN LINE (picture+sound) at index `at`; V2 = a SILENT video layer "
+    "over the ongoing audio at program `from_ms`. `level` picks the energy take.\n"
+    "  - place_span <file, in_ms, out_ms> -- add ANY source window (the SOURCE ms "
+    "into a 'CLIP <file8>'), not just a said-line. Same channels. Edges auto-snap "
+    "to the nearest clean seam (word gap / silence / impact; never mid-word) "
+    "within ~400ms -- nominate an approximate window and read the result's `snap` "
+    "field; an edge whose nearest seam is further stays put, and snap:'off' "
+    "places it raw.\n"
+    "  - trim / remove / move / set_audio / tighten -- adjust a cut's source in/"
+    "out, drop it, reorder it, mute or unmute its sound, or re-take it at another "
+    "energy level.\n"
+    "  - split_edit -- decouple the AUDIO edge from the PICTURE edge at a seam (a "
+    "J/L cut): audio_offset_ms < 0 leads the next cut's sound in early, > 0 lets "
+    "the previous sound linger. Keep it subtle (200-800ms).\n"
+    "  - split_screen -- show the main line AND a second source at the same time "
+    "over a program window [from_ms, to_ms]: template split_h (side-by-side) / "
+    "split_v (stacked) / pip (inset). The added cell is a map `ref` OR a raw "
+    "`file`+`in_ms`+`out_ms` window (seam-snaps like place_span), silent unless "
+    "audio:'keep'.\n\n"
+    "CHANNELS: the main line is V1 video + A1 audio in sequence; V2 is a silent "
+    "video layer over A1; A2 is a music/SFX bed.\n\n"
+    "HOW EDITS LAND. Your edits apply DIRECTLY -- the user watches the timeline "
+    "update and can undo -- so never ask for confirmation or say 'I will'; just "
+    "do it, then tell them what you did in a sentence or two. A split-screen / "
+    "PiP look is normally the user's call: use `ask_user` (2+ concrete options) "
+    "when the look is genuinely unspecified and truly theirs. But when the user "
+    "has already asked for one, that IS their decision -- just do it with a "
+    "sensible default. Use only ids that appear below."
+)
+
+
 def _context_block(file_ids: List[str], document: Optional[dict]) -> str:
     parts: List[str] = []
     try:
@@ -185,11 +259,14 @@ _AWARE_CHAR_CAP = 90_000
 _INDEX_CHAR_CAP = 110_000
 
 
-def _context_block_v2(file_ids: List[str], document: Optional[dict],
-                      ctx: "observe.EditContext") -> str:
-    """v2 context: the CONTINUOUS SOURCE (lanes/seams/peaks/cut index) is the
-    primary substrate, followed by the speech-cut index (fast spine) and the
-    current timeline. Falls back gracefully if either projection is unavailable."""
+def _assemble_source_context(file_ids: List[str], document: Optional[dict],
+                             ctx: "observe.EditContext", *,
+                             aware_header: str, index_header: str) -> str:
+    """The shared continuous-source context: the CONTINUOUS SOURCE digest
+    (lanes/seams/peaks/cut index), the speech-cut index, and the current
+    timeline. The two block HEADERS are supplied by the caller so v2 (workflow
+    -framed) and v3 (neutral) can present the identical awareness differently.
+    Falls back gracefully if either projection is unavailable."""
     parts: List[str] = []
     try:
         aware = observe.source_awareness(ctx) if file_ids else ""
@@ -201,10 +278,7 @@ def _context_block_v2(file_ids: List[str], document: Optional[dict],
                          "\n[TRUNCATED: the digest exceeded its budget here. Clips "
                          "after this point are MISSING above -- call source_awareness "
                          "/ scan_source to read any clip before cutting from it.]")
-            parts.append(
-                "CONTINUOUS SOURCE (each clip as a fully-addressable timeline -- "
-                "lanes, seams, peaks, and a scored cut index; place ANY span with "
-                "place_span):\n" + aware)
+            parts.append(aware_header + "\n" + aware)
     except Exception:
         logger.exception("converse: source_awareness build failed (continuing)")
     try:
@@ -217,15 +291,38 @@ def _context_block_v2(file_ids: List[str], document: Optional[dict],
                     "after this point are MISSING; use source_awareness / scan_source "
                     "(lane 'speech') on the later clips instead of assuming they are empty.]")
         if text:
-            parts.append(
-                "SPEECH-CUT INDEX (pre-scored said-lines -- lay the spoken spine "
-                "fast with `place <ref>`):\n" + text)
+            parts.append(index_header + "\n" + text)
     except Exception:
         logger.exception("converse: map build failed (continuing without it)")
     tl_text = arrange.render_timeline(document)
     parts.append("CURRENT TIMELINE:\n" + tl_text if tl_text
                  else "CURRENT TIMELINE: (empty -- no edit drafted yet)")
     return "\n\n".join(parts)
+
+
+def _context_block_v2(file_ids: List[str], document: Optional[dict],
+                      ctx: "observe.EditContext") -> str:
+    """v2 context: workflow-framed headers (spoken spine + place_span garnish)."""
+    return _assemble_source_context(
+        file_ids, document, ctx,
+        aware_header=("CONTINUOUS SOURCE (each clip as a fully-addressable timeline "
+                      "-- lanes, seams, peaks, and a scored cut index; place ANY span "
+                      "with place_span):"),
+        index_header=("SPEECH-CUT INDEX (pre-scored said-lines -- lay the spoken "
+                      "spine fast with `place <ref>`):"))
+
+
+def _context_block_v3(file_ids: List[str], document: Optional[dict],
+                      ctx: "observe.EditContext") -> str:
+    """v3 context: identical awareness, NEUTRAL headers -- they describe what each
+    block IS and how to reference it, with no 'lay the spine' / 'garnish' framing."""
+    return _assemble_source_context(
+        file_ids, document, ctx,
+        aware_header=("CONTINUOUS SOURCE (each clip as a fully-addressable timeline "
+                      "-- change-point lanes, cleanest seams, impact peaks, and a "
+                      "scored cut index):"),
+        index_header=("SPEECH-CUT INDEX (pre-scored said-lines, each with a ref you "
+                      "can place):"))
 
 
 def _seed_document(file_ids: List[str]) -> dict:
@@ -268,10 +365,12 @@ def respond(thread_id: str, *, llm: Optional[LLMClient] = None) -> ConverseResul
 
     working = document if isinstance(document, dict) else _seed_document(file_ids)
     max_tokens = settings.autoedit_max_output_tokens
-    version = (settings.autoedit_arranger_version or "v2").strip().lower()
+    version = (settings.autoedit_arranger_version or "v3").strip().lower()
     try:
         ctx = observe.build_context(file_ids)
-        if version == "v2":
+        if version == "v3":
+            system = _LOOP_SYSTEM_V3 + "\n\n" + _context_block_v3(file_ids, document, ctx)
+        elif version == "v2":
             system = _LOOP_SYSTEM_V2 + "\n\n" + _context_block_v2(file_ids, document, ctx)
         else:
             system = _LOOP_SYSTEM + "\n\n" + _context_block(file_ids, document)
