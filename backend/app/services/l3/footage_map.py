@@ -490,6 +490,24 @@ def _global_speaker(file_id: Optional[str], voice: Optional[str],
     return voice
 
 
+def _shown_and_cam(file_id: Optional[str], voice: Optional[str],
+                   alias: Optional[Dict[Any, str]],
+                   oncam: Optional[Dict[str, str]]) -> Tuple[Optional[str], str]:
+    """(global face on screen, on/off-cam) DERIVED from the reconciled cast: whose
+    FACE this clip shows, and whether the speaker is that person. This is the
+    trustworthy on-camera fact -- it survives a clip whose per-clip A/V sensor was
+    wrong -- so it OVERRIDES the per-moment on_camera flag when available. Returns
+    (None, "") when the shoot cast doesn't know who this clip shows."""
+    if not oncam or file_id is None:
+        return None, ""
+    shown = oncam.get(file_id)
+    if not shown:
+        return None, ""
+    spk = _global_speaker(file_id, voice, alias)
+    cam = "on-cam" if (spk and spk == shown) else "off-cam"
+    return shown, cam
+
+
 def _dur_tag(m: Dict[str, Any]) -> str:
     """The cut's PLAY length (after any breath/dead-air excision) so the brain
     can pace + honor a target length without arithmetic on the timestamps."""
@@ -514,12 +532,20 @@ def _audio_tag(m: Dict[str, Any]) -> str:
 
 
 def _moment_line(m: Dict[str, Any], *, compact: bool = False,
-                 alias: Optional[Dict[Any, str]] = None) -> str:
+                 alias: Optional[Dict[Any, str]] = None,
+                 oncam: Optional[Dict[str, str]] = None) -> str:
     levels = list(m["variants"].keys())
     nrg = "|".join(L for L in _LEVEL_NAMES if L in levels)
     gspk = _global_speaker(m.get("file_id"), m.get("speaker"), alias)
     spk = f" {gspk}" if gspk else ""
-    cam = _people_tag(m)
+    # Prefer the reconciled shoot cast for on/off-camera + WHOSE FACE shows here;
+    # it is right even where a clip's own A/V link was wrong. Fall back to the
+    # per-moment flag only when the shoot cast has no opinion for this clip.
+    shown, cam_state = _shown_and_cam(m.get("file_id"), m.get("speaker"), alias, oncam)
+    if shown:
+        cam = f" {cam_state} shows:{shown}"
+    else:
+        cam = _people_tag(m)
     gist = (m.get("gist") or "").strip().replace("\n", " ")
     # Resident mode gives the model the FULL line so it picks by reading, not
     # guessing; compact (paged) mode truncates and relies on inspect_moment.
@@ -530,7 +556,7 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False,
     gloss = ""
     summ = (m.get("summary") or "").strip().replace("\n", " ")
     if summ and not m.get("summary_covered_by_speech"):
-        gloss = f" shows:\"{_short_gist(summ)}\""
+        gloss = f" graphic:\"{_short_gist(summ)}\""
     # Continuity run: this beat is part of one uninterrupted same-clip shot
     # (members listed in source order); keep run members together + in order.
     run = ""
@@ -546,7 +572,8 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False,
 
 
 def _clip_block(tree: Dict[str, Any], *, compact: bool = False,
-                alias: Optional[Dict[Any, str]] = None) -> str:
+                alias: Optional[Dict[Any, str]] = None,
+                oncam: Optional[Dict[str, str]] = None) -> str:
     head_bits = [f"{tree['duration_ms'] // 1000}s"]
     if tree.get("content_type"):
         head_bits.append(tree["content_type"])
@@ -558,7 +585,7 @@ def _clip_block(tree: Dict[str, Any], *, compact: bool = False,
         head_bits.append("people:" + ",".join(tree["people"]))
     header = (f"CLIP {tree['file_id'][:8]} \"{tree['name']}\" · "
               + " · ".join(head_bits))
-    lines = [header] + [_moment_line(m, compact=compact, alias=alias)
+    lines = [header] + [_moment_line(m, compact=compact, alias=alias, oncam=oncam)
                         for m in tree["moments"]]
     return "\n".join(lines)
 
@@ -647,6 +674,9 @@ def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "score": float(m.get("score", 0.0)),
             "restart": mid in restart_ids,
         } for mid, m in linked.items()]
+        # `shows` (whose FACE this delivery is on-camera) is filled at render from
+        # the reconciled shoot cast -- kept out of the cached facts because it is
+        # cross-set (identity) dependent, exactly like the aliased speaker.
         summary.append({
             "group_id": g.group_id,
             "members": list(linked.keys()),     # moment_ids (consumers key on this)
@@ -657,7 +687,8 @@ def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _dups_block(summary: List[Dict[str, Any]],
-                *, alias: Optional[Dict[Any, str]] = None) -> str:
+                *, alias: Optional[Dict[Any, str]] = None,
+                oncam: Optional[Dict[str, str]] = None) -> str:
     if not summary:
         return ""
     # Coverage, not "pick one": each member is one delivery of the same beat.
@@ -665,8 +696,8 @@ def _dups_block(summary: List[Dict[str, Any]],
     # directive here, the facts carry the decision. (Genre-agnostic: "beat"
     # covers a retake, a second camera, or the same line said twice.)
     lines = ["COVERAGE GROUPS (the same beat delivered more than once -- different "
-             "takes and/or cameras; each member is one delivery, with who it shows "
-             "and how well):"]
+             "takes and/or cameras; each member is one delivery: who SPEAKS it, "
+             "whose face it SHOWS, and how well):"]
     for d in summary:
         gist = d["text"].replace("\n", " ")
         if len(gist) > 80:
@@ -676,10 +707,16 @@ def _dups_block(summary: List[Dict[str, Any]],
             parts = []
             for f in facts:
                 gspk = _global_speaker(f.get("file"), f.get("voice"), alias)
+                shown, cam_state = _shown_and_cam(f.get("file"), f.get("voice"),
+                                                  alias, oncam)
                 bits = [f["moment_id"]]
                 if gspk:
                     bits.append(gspk)
-                if f.get("cam"):
+                # Reconciled cam + shown-face when known; else the per-moment cam.
+                if shown:
+                    bits.append(cam_state)
+                    bits.append(f"shows:{shown}")
+                elif f.get("cam"):
                     bits.append(f["cam"])
                 if f.get("framing"):
                     bits.append(f["framing"])
@@ -708,17 +745,20 @@ def assemble_map(file_ids: List[str], *, compact: bool = False,
     person id so the same human reads consistently across clips.
     """
     alias: Optional[Dict[Any, str]] = None
+    oncam: Optional[Dict[str, str]] = None
     if relations:
         try:
             from app.services.l3 import relations as relations_mod
             alias = relations_mod.identity_index(relations)
+            oncam = relations_mod.oncam_global_by_file(relations)
         except Exception:
             logger.exception("footage map: identity index failed (continuing)")
     trees = get_trees(file_ids)
     ordered = [trees[fid] for fid in file_ids if fid in trees]
     dups = _annotate_dups(ordered)   # tags moments in `ordered` in place
-    text = "\n\n".join(_clip_block(t, compact=compact, alias=alias) for t in ordered)
-    dblock = _dups_block(dups, alias=alias)
+    text = "\n\n".join(_clip_block(t, compact=compact, alias=alias, oncam=oncam)
+                       for t in ordered)
+    dblock = _dups_block(dups, alias=alias, oncam=oncam)
     if dblock:
         text = f"{text}\n\n{dblock}"
     n_moments = sum(t["moment_count"] for t in ordered)

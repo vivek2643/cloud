@@ -90,6 +90,13 @@ def build_context(file_ids: List[str]) -> EditContext:
     try:
         from app.services.l3 import relations as relations_mod
         rels = relations_mod.build_relations(list(file_ids))
+        # Safety net: catch any structural corruption in the reconciled cast and
+        # surface it honestly (as a warning the brain will read) rather than let
+        # it silently mislead the edit.
+        violations = relations_mod.validate(rels)
+        if violations:
+            logger.warning("observe: identity invariant violations: %s", violations)
+            rels.setdefault("warnings", []).extend(violations)
     except Exception:
         logger.exception("observe: relations build failed (continuing without)")
     fmap = footage_map.assemble_map(file_ids, relations=rels) if file_ids else {}

@@ -61,6 +61,7 @@ class CastMember:
     av_link_confidence: float = 0.0         # 0..1 strength of the voice<->person link
     speaking_spans: List[Tuple[int, int]] = field(default_factory=list)
     durable: Optional[dict] = None          # VLM durable traits (cross-clip re-id, later)
+    appearance: Optional[str] = None        # VLM canonical description of the linked face
 
     def label(self) -> str:
         """Best human-facing name for this member: role, else person, else voice."""
@@ -222,6 +223,7 @@ def build_cast(perception: Optional[dict], words: List[dict]) -> ClipCast:
                 voice_speaker_id=voice, person_id=pid, role=p.get("role"),
                 region=region, on_camera=True, av_link_confidence=conf,
                 speaking_spans=spans, durable=p.get("durable"),
+                appearance=p.get("canonical_description"),
             ))
             linked_persons.add(pid)
         else:
@@ -243,6 +245,7 @@ def build_cast(perception: Optional[dict], words: List[dict]) -> ClipCast:
             region=p.get("frame_region"),
             on_camera=True if spans else None,
             speaking_spans=spans, durable=p.get("durable"),
+            appearance=p.get("canonical_description"),
         ))
 
     return ClipCast(file_id=perception.get("file_id"), members=members,

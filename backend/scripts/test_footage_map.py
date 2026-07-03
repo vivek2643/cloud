@@ -220,6 +220,47 @@ def test_coverage_group_renders_member_facts_no_use_one():
     print("ok  test_coverage_group_renders_member_facts_no_use_one")
 
 
+def test_reconciled_shows_face_and_cam_override():
+    """With the shoot cast (oncam map) supplied, the resident line reports WHOSE
+    FACE shows in the clip and derives on/off-camera from the reconciled cast --
+    right even when the per-moment flag disagrees (a clip whose A/V link was
+    wrong). An off-camera speaker still names the face on screen."""
+    # Speaker G2 (voice S1) talks, but this clip SHOWS G1's face (off-cam speaker).
+    cut = _cut("48c93cef:m03", 1000, 4000, "and then we shipped it", channel="said",
+               subject="person", speaker="S1", score=0.6,
+               ladder=[_rung("balanced", 1000, 4000, "and then we shipped it", 0.6)],
+               people=[{"voice_speaker_id": "S1", "person_id": None, "on_camera": True}])
+    tree = fm.build_clip_tree("48c93cef-aaa", {"name": "T", "duration_ms": 8000}, [cut])
+    alias = {("48c93cef-aaa", "S1"): "G2"}
+    oncam = {"48c93cef-aaa": "G1"}                       # this clip shows G1's face
+    line = fm._moment_line(tree["moments"][0], alias=alias, oncam=oncam)
+    assert "G2 off-cam shows:G1" in line, line           # reconciled cam overrides flag
+    print("ok  test_reconciled_shows_face_and_cam_override")
+
+
+def test_coverage_group_carries_shown_face():
+    """A coverage member reports who SPEAKS and whose face it SHOWS, from the
+    reconciled cast -- so the brain can pick the delivery that shows the reactor."""
+    summary = [{
+        "group_id": "tg1",
+        "members": ["48c93cef:m22", "1aedb093:m14"],
+        "member_facts": [
+            {"moment_id": "48c93cef:m22", "file": "48c93cef-aaa", "voice": "S1",
+             "cam": "on-cam", "framing": "MCU", "score": 0.78, "restart": False},
+            {"moment_id": "1aedb093:m14", "file": "1aedb093-bbb", "voice": "S1",
+             "cam": "on-cam", "framing": "", "score": 0.74, "restart": False},
+        ],
+        "text": "the same line from two cameras",
+    }]
+    alias = {("48c93cef-aaa", "S1"): "G2", ("1aedb093-bbb", "S1"): "G2"}
+    oncam = {"48c93cef-aaa": "G1", "1aedb093-bbb": "G2"}   # cam A shows G1, cam B shows G2
+    block = fm._dups_block(summary, alias=alias, oncam=oncam)
+    # Same speaker G2: off-camera on the clip that shows G1, on-camera where G2 shows.
+    assert "48c93cef:m22 G2 off-cam shows:G1" in block, block
+    assert "1aedb093:m14 G2 on-cam shows:G2" in block, block
+    print("ok  test_coverage_group_carries_shown_face")
+
+
 def test_moment_line_aliases_global_speaker():
     """A per-line speaker is shown as its global person id when the registry
     linked it; without the alias it falls back to the raw voice."""
@@ -254,6 +295,8 @@ def main():
     test_facets_surface_on_moment()
     test_map_text_lists_variants_no_atoms()
     test_coverage_group_renders_member_facts_no_use_one()
+    test_reconciled_shows_face_and_cam_override()
+    test_coverage_group_carries_shown_face()
     test_moment_line_aliases_global_speaker()
     test_source_contiguous_beats_form_a_run_channel_agnostic()
     test_default_energy_from_genre()
