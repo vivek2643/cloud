@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Tests for cross-clip relations (l3.relations) and the program clock field
-(l3.program_clock) -- the shoot-level substrate: co-temporal offsets + global
-person identity derived from existing take groups / cast, and the program-side
-cut field. Pure (no DB / no VLM). Run:
+"""Tests for cross-clip identity (l3.relations) and the program clock field
+(l3.program_clock). Identity is derived from matched SPEECH alone -- lines are
+content-clustered across clips (label-agnostic), voted into per-pair one-to-one
+voice correspondences, and unioned under the hard same-clip-distinctness
+constraint (no appearance/offset fallbacks). Pure (no DB / no VLM). Run:
     PYTHONPATH=. .venv/bin/python scripts/test_relations.py
 """
 from __future__ import annotations
@@ -14,63 +15,25 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.services.l3 import program_clock as pc  # noqa: E402
 from app.services.l3 import relations as rel  # noqa: E402
-from app.services.l3.takes import Attempt, TakeGroup  # noqa: E402
+from app.services.l3.takes import Attempt  # noqa: E402
 
 FA = "aaaaaaaa-0000-0000-0000-000000000000"
 FB = "bbbbbbbb-0000-0000-0000-000000000000"
+FC = "cccccccc-0000-0000-0000-000000000000"
+
+LINE1 = "the first shared sentence here today"
+LINE2 = "another common line we all spoke"
 
 
-def _att(fid, start, end, speaker="S0", text="the same line here"):
+def _att(fid, start, end, speaker="S0", text=LINE1):
     return Attempt(attempt_id=f"{fid[:8]}:u:{start}", file_id=fid, unit_id="u",
                    start_ms=start, end_ms=end, kind="speech",
                    content_key=text, text=text, speaker=speaker,
                    tokens=frozenset(text.split()))
 
 
-def _group(gid, attempts):
-    return TakeGroup(group_id=gid, content_key="k", attempts=attempts)
-
-
 # --------------------------------------------------------------------------
-# TIME: co-temporal offsets
-# --------------------------------------------------------------------------
-
-def test_offsets_agreeing_deltas_mean_co_temporal():
-    """Three matched lines all ~12.4s apart -> the clips are the SAME live
-    moment at that offset."""
-    groups = [
-        _group("tg1", [_att(FA, 1000, 3000), _att(FB, 13400, 15400)]),
-        _group("tg2", [_att(FA, 20000, 22000), _att(FB, 32500, 34500)]),
-        _group("tg3", [_att(FA, 40000, 42000), _att(FB, 52300, 54300)]),
-    ]
-    offs = rel.derive_offsets(groups)
-    assert len(offs) == 1, offs
-    o = offs[0]
-    assert (o["file_a"], o["file_b"]) == (FA, FB), o
-    assert abs(o["offset_ms"] - 12400) <= rel.OFFSET_AGREE_MS, o
-    assert o["matches"] == 3 and o["confidence"] > 0.5, o
-    print("ok  agreeing start-time deltas yield a co-temporal offset")
-
-
-def test_offsets_scattered_deltas_are_retakes_not_co_temporal():
-    """The same line delivered again minutes apart (true retakes) must NOT
-    produce a time relation -- that case belongs to the dup groups."""
-    groups = [
-        _group("tg1", [_att(FA, 1000, 3000), _att(FB, 5000, 7000)]),      # +4s
-        _group("tg2", [_att(FA, 20000, 22000), _att(FB, 95000, 97000)]),  # +75s
-    ]
-    assert rel.derive_offsets(groups) == [], rel.derive_offsets(groups)
-    print("ok  scattered deltas (retakes) produce no offset relation")
-
-
-def test_offsets_need_two_matches():
-    groups = [_group("tg1", [_att(FA, 1000, 3000), _att(FB, 13400, 15400)])]
-    assert rel.derive_offsets(groups) == []
-    print("ok  a single matched line is not enough to claim co-temporal")
-
-
-# --------------------------------------------------------------------------
-# IDENTITY: one human across files
+# IDENTITY: one human across files, from matched speech (>= MIN_LINK_VOTES lines)
 # --------------------------------------------------------------------------
 
 def _clips():
@@ -80,20 +43,22 @@ def _clips():
               "persons": [{"local_id": "p1", "role": "host",
                            "canonical_description": "tall man, beard"}],
               "speaking": [{"start_ms": 1000, "end_ms": 3000, "subject": "p1"}]}
-    words_a = [{"start_ms": 1000, "end_ms": 3000, "text": "the same line here",
-                "speaker": "S0"}]
+    words_a = [{"start_ms": 1000, "end_ms": 3000, "text": LINE1, "speaker": "S0"}]
     perc_b = {"file_id": FB,
               "persons": [{"local_id": "p2", "role": "host"}],
               "speaking": [{"start_ms": 13400, "end_ms": 15400, "subject": "p2"}]}
-    words_b = [{"start_ms": 13400, "end_ms": 15400, "text": "the same line here",
-                "speaker": "S1"}]
+    words_b = [{"start_ms": 13400, "end_ms": 15400, "text": LINE1, "speaker": "S1"}]
     return {FA: (perc_a, words_a), FB: (perc_b, words_b)}
 
 
 def test_identity_links_voices_and_dresses_with_cast():
-    groups = [_group("tg1", [_att(FA, 1000, 3000, speaker="S0"),
-                             _att(FB, 13400, 15400, speaker="S1")])]
-    idents = rel.derive_identities(groups, _clips())
+    """Two shared lines both delivered by FA:S0 and FB:S1 -> one global person,
+    dressed from the per-clip cast (person/role + appearance)."""
+    attempts = [
+        _att(FA, 1000, 3000, "S0", LINE1), _att(FB, 13400, 15400, "S1", LINE1),
+        _att(FA, 20000, 22000, "S0", LINE2), _att(FB, 32400, 34400, "S1", LINE2),
+    ]
+    idents = rel.derive_identities(attempts, _clips())
     assert len(idents) == 1, idents
     members = {(m["file"], m["voice"], m["person"]) for m in idents[0]["members"]}
     assert (FA, "S0", "p1") in members and (FB, "S1", "p2") in members, members
@@ -101,24 +66,60 @@ def test_identity_links_voices_and_dresses_with_cast():
     print("ok  matched voices across files become ONE identity with a face+role")
 
 
+def test_identity_needs_corroborating_lines():
+    """A SINGLE loose content match is not enough to invent a cross-clip link."""
+    attempts = [_att(FA, 1000, 3000, "S0", LINE1),
+                _att(FB, 13400, 15400, "S1", LINE1)]
+    assert rel.derive_identities(attempts, _clips()) == []
+    print("ok  one shared line is below the corroboration threshold")
+
+
 def test_identity_requires_cross_file_evidence():
     """Two voices matched only WITHIN one file never form a (cross-clip)
     identity."""
-    groups = [_group("tg1", [_att(FA, 1000, 3000, speaker="S0"),
-                             _att(FA, 50000, 52000, speaker="S0")])]
-    assert rel.derive_identities(groups, _clips()) == []
+    attempts = [_att(FA, 1000, 3000, "S0", LINE1),
+                _att(FA, 50000, 52000, "S0", LINE1),
+                _att(FA, 60000, 62000, "S0", LINE2)]
+    assert rel.derive_identities(attempts, _clips()) == []
     print("ok  same-file matches alone form no cross-clip identity")
 
 
+def test_identity_never_merges_two_voices_of_one_clip():
+    """The hard constraint: two distinct voices in the SAME clip must land in
+    DIFFERENT global people. Two people talk in every clip and a third clip
+    SWAPS the diarization labels -- the collapse trap -- yet they stay apart."""
+    a1, a2 = LINE1, "morning everyone welcome back to the studio now"
+    b1, b2 = LINE2, "thanks so much for having me here today"
+    perc = lambda f: {"file_id": f, "persons": [
+        {"local_id": "p1", "role": "host"}, {"local_id": "p2", "role": "guest"}]}
+    words = lambda: [
+        {"start_ms": 0, "end_ms": 2000, "text": a1, "speaker": "S0"},
+        {"start_ms": 3000, "end_ms": 5000, "text": b1, "speaker": "S1"}]
+    clips = {FA: (perc(FA), words()), FB: (perc(FB), words()), FC: (perc(FC), words())}
+    attempts = []
+    # Person A speaks a1+a2 in all three clips; person B speaks b1+b2. Voice
+    # labels are SWAPPED in the noisy clip C (A=S1, B=S0) on purpose.
+    for f, sA, sB in [(FA, "S0", "S1"), (FB, "S0", "S1"), (FC, "S1", "S0")]:
+        attempts += [_att(f, 0, 2000, sA, a1), _att(f, 100000, 102000, sA, a2),
+                     _att(f, 3000, 5000, sB, b1), _att(f, 103000, 105000, sB, b2)]
+    idents = rel.derive_identities(attempts, clips)
+    # Exactly two people, and no identity mixes two voices from the same clip.
+    assert len(idents) == 2, idents
+    for ident in idents:
+        seen = {}
+        for m in ident["members"]:
+            assert m["file"] not in seen, ("collapsed two voices of one clip", ident)
+            seen[m["file"]] = m["voice"]
+    print("ok  two voices of one clip never collapse into one person")
+
+
 def test_render_relations_reads_clean():
-    groups = [
-        _group("tg1", [_att(FA, 1000, 3000), _att(FB, 13400, 15400, speaker="S1")]),
-        _group("tg2", [_att(FA, 20000, 22000), _att(FB, 32400, 34400, speaker="S1")]),
+    attempts = [
+        _att(FA, 1000, 3000, "S0", LINE1), _att(FB, 13400, 15400, "S1", LINE1),
+        _att(FA, 20000, 22000, "S0", LINE2), _att(FB, 32400, 34400, "S1", LINE2),
     ]
-    relations = {"offsets": rel.derive_offsets(groups),
-                 "identities": rel.derive_identities(groups, _clips())}
+    relations = {"identities": rel.derive_identities(attempts, _clips())}
     text = rel.render_relations(relations)
-    # Identity-only digest, no time/offset ontology anywhere.
     assert "PEOPLE OF THE SHOOT" in text and "G1" in text, text
     assert "co-temporal" not in text and "offset" not in text.lower(), text
     assert "bbbbbbbb" in text and "aaaaaaaa" in text, text
@@ -127,31 +128,12 @@ def test_render_relations_reads_clean():
     print("--- sample relations ---\n" + text + "\n------------------------")
 
 
-def test_identity_trait_fallback_links_silent_lookalikes():
-    """Two clips that share NO spoken line still link one person when the VLM
-    appearance descriptions overlap -- as a LOW-confidence, trait-based id."""
-    perc_a = {"file_id": FA, "persons": [
-        {"local_id": "p1", "role": "host",
-         "canonical_description": "bald head gray beard dark jacket"}]}
-    perc_b = {"file_id": FB, "persons": [
-        {"local_id": "p3", "role": "host",
-         "canonical_description": "gray beard bald head dark jacket glasses"}]}
-    clips = {FA: (perc_a, []), FB: (perc_b, [])}
-    idents = rel.derive_identities([], clips)      # no take groups at all
-    assert len(idents) == 1, idents
-    assert idents[0]["basis"] == "traits", idents[0]
-    assert idents[0]["confidence"] < 0.5, idents[0]
-    files = {m["file"] for m in idents[0]["members"]}
-    assert files == {FA, FB}, idents[0]
-    text = rel.render_relations({"identities": idents})
-    assert "appearance-matched" in text and "low confidence" in text, text
-    print("ok  trait fallback links silent look-alikes at low confidence")
-
-
 def test_identity_registry_lookups():
-    groups = [_group("tg1", [_att(FA, 1000, 3000, speaker="S0"),
-                             _att(FB, 13400, 15400, speaker="S1")])]
-    relations = {"identities": rel.derive_identities(groups, _clips())}
+    attempts = [
+        _att(FA, 1000, 3000, "S0", LINE1), _att(FB, 13400, 15400, "S1", LINE1),
+        _att(FA, 20000, 22000, "S0", LINE2), _att(FB, 32400, 34400, "S1", LINE2),
+    ]
+    relations = {"identities": rel.derive_identities(attempts, _clips())}
     assert rel.global_id_of(relations, FA, "S0") == "G1"
     assert rel.global_id_of(relations, FB, "p2") == "G1"   # by person handle too
     assert rel.global_id_of(relations, FA, "S9") is None
