@@ -138,8 +138,9 @@ def test_map_text_lists_variants_no_atoms():
 
 
 def test_moment_line_flags_offcamera():
-    """The brain's one-line index keys on CHANNEL.SUBJECT and flags an off-camera
-    voice (an off-screen interviewer / voiceover)."""
+    """The brain's one-line index keys on CHANNEL.SUBJECT; an off-camera voice
+    (an off-screen interviewer / voiceover) renders an honest PIC:? -- never a
+    fabricated face -- while SND still names who is heard."""
     cut = _cut("f:mo", 1000, 4000, "what made you start this", channel="said",
                subject="person", speaker="interviewer", score=0.7,
                ladder=[_rung("balanced", 1000, 4000, "what made you start this", 0.7)],
@@ -148,7 +149,8 @@ def test_moment_line_flags_offcamera():
     tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
     line = fm._moment_line(tree["moments"][0])
     assert "said.person" in line, line
-    assert "interviewer off-cam" in line, line
+    assert "PIC:?" in line, line
+    assert "SND:interviewer speaking" in line, line
     print("ok  test_moment_line_flags_offcamera")
 
 
@@ -196,35 +198,11 @@ def test_source_contiguous_beats_form_a_run_channel_agnostic():
     print("ok  test_source_contiguous_beats_form_a_run_channel_agnostic")
 
 
-def test_coverage_group_renders_member_facts_no_use_one():
-    """The coverage-group block lists each delivery's facts (who/on-cam/shot/
-    score) with the speaker aliased to a global id -- and carries NO 'use one'
-    directive (facts, not a verdict)."""
-    summary = [{
-        "group_id": "tg1",
-        "members": ["48c93cef:m22", "1aedb093:m14"],
-        "member_facts": [
-            {"moment_id": "48c93cef:m22", "file": "48c93cef-aaa", "voice": "S0",
-             "cam": "off-cam", "framing": "MCU", "score": 0.78, "restart": False},
-            {"moment_id": "1aedb093:m14", "file": "1aedb093-bbb", "voice": "S1",
-             "cam": "on-cam", "framing": "", "score": 0.74, "restart": True},
-        ],
-        "text": "the same line delivered twice",
-    }]
-    alias = {("48c93cef-aaa", "S0"): "G1", ("1aedb093-bbb", "S1"): "G1"}
-    block = fm._dups_block(summary, alias=alias)
-    assert "COVERAGE GROUPS" in block, block
-    assert "use one" not in block.lower(), block
-    assert "48c93cef:m22 G1 off-cam MCU .78" in block, block
-    assert "1aedb093:m14 G1 on-cam .74 retry" in block, block
-    print("ok  test_coverage_group_renders_member_facts_no_use_one")
-
-
 def test_reconciled_shows_face_and_cam_override():
-    """With the shoot cast (oncam map) supplied, the resident line reports WHOSE
-    FACE shows in the clip and derives on/off-camera from the reconciled cast --
-    right even when the per-moment flag disagrees (a clip whose A/V link was
-    wrong). An off-camera speaker still names the face on screen."""
+    """With the shoot cast (oncam map) supplied, PIC reports WHOSE FACE shows in
+    the clip -- from the reconciled cast, right even when the per-moment flag
+    disagrees (a clip whose A/V link was wrong) -- and SND names who's heard.
+    PIC leads the line; SND trails it."""
     # Speaker G2 (voice S1) talks, but this clip SHOWS G1's face (off-cam speaker).
     cut = _cut("48c93cef:m03", 1000, 4000, "and then we shipped it", channel="said",
                subject="person", speaker="S1", score=0.6,
@@ -234,31 +212,64 @@ def test_reconciled_shows_face_and_cam_override():
     alias = {("48c93cef-aaa", "S1"): "G2"}
     oncam = {"48c93cef-aaa": "G1"}                       # this clip shows G1's face
     line = fm._moment_line(tree["moments"][0], alias=alias, oncam=oncam)
-    assert "G2 off-cam shows:G1" in line, line           # reconciled cam overrides flag
+    assert "PIC:G1" in line, line              # reconciled shown-face overrides the flag
+    assert "SND:G2 speaking" in line, line
+    assert line.index("PIC:") < line.index("SND:"), line  # picture leads, never the speaker
     print("ok  test_reconciled_shows_face_and_cam_override")
 
 
-def test_coverage_group_carries_shown_face():
-    """A coverage member reports who SPEAKS and whose face it SHOWS, from the
-    reconciled cast -- so the brain can pick the delivery that shows the reactor."""
-    summary = [{
-        "group_id": "tg1",
-        "members": ["48c93cef:m22", "1aedb093:m14"],
-        "member_facts": [
-            {"moment_id": "48c93cef:m22", "file": "48c93cef-aaa", "voice": "S1",
-             "cam": "on-cam", "framing": "MCU", "score": 0.78, "restart": False},
-            {"moment_id": "1aedb093:m14", "file": "1aedb093-bbb", "voice": "S1",
-             "cam": "on-cam", "framing": "", "score": 0.74, "restart": False},
-        ],
-        "text": "the same line from two cameras",
-    }]
-    alias = {("48c93cef-aaa", "S1"): "G2", ("1aedb093-bbb", "S1"): "G2"}
-    oncam = {"48c93cef-aaa": "G1", "1aedb093-bbb": "G2"}   # cam A shows G1, cam B shows G2
-    block = fm._dups_block(summary, alias=alias, oncam=oncam)
-    # Same speaker G2: off-camera on the clip that shows G1, on-camera where G2 shows.
-    assert "48c93cef:m22 G2 off-cam shows:G1" in block, block
-    assert "1aedb093:m14 G2 on-cam shows:G2" in block, block
-    print("ok  test_coverage_group_carries_shown_face")
+def test_said_beat_on_listener_camera_reads_pic_first_with_alt_pic():
+    """The exact podcast-bug shape: a said beat delivered on the LISTENER's
+    camera renders PIC (who's shown) before SND (who's heard), so placing it can
+    no longer be mistaken for showing the speaker -- and `alt-PIC` points at the
+    camera that DOES show the speaker for the same words (Fact #2 folded onto
+    the beat, not buried in a distant coverage block)."""
+    cut = _cut("48c93cef:m24", 1000, 4000, "that freedom he gave you", channel="said",
+               subject="person", speaker="S2", score=0.6,
+               ladder=[_rung("balanced", 1000, 4000, "that freedom he gave you", 0.6)],
+               people=[{"voice_speaker_id": "S2", "person_id": None, "on_camera": True}],
+               framing="med")
+    tree = fm.build_clip_tree("48c93cef-aaa", {"name": "Cam A", "duration_ms": 8000}, [cut])
+    m = tree["moments"][0]
+    # Folded on by `_annotate_dups` in the real path; set directly here to test
+    # the render in isolation (mirrors how `_dups_block` fixtures worked before).
+    m["alt_pic"] = [{"moment_id": "1aedb093:m13", "file": "1aedb093-bbb", "voice": "S9",
+                     "framing": "med", "score": 0.73, "restart": False}]
+    alias = {("48c93cef-aaa", "S2"): "G2", ("1aedb093-bbb", "S9"): "G2"}
+    oncam = {"48c93cef-aaa": "G1", "1aedb093-bbb": "G2"}   # cam A shows the LISTENER G1
+    line = fm._moment_line(m, alias=alias, oncam=oncam)
+    assert "PIC:G1" in line, line
+    assert "SND:G2 speaking" in line, line
+    assert line.index("PIC:") < line.index("SND:"), line
+    assert "·alt-PIC:G2→1aedb093:m13" in line, line
+    print("ok  test_said_beat_on_listener_camera_reads_pic_first_with_alt_pic")
+
+
+def test_alt_pic_absent_without_co_occurrence():
+    """A one-camera beat (no take-group link) carries no `alt-PIC` -- the fact
+    simply isn't there to state."""
+    cut = _cut("f:solo", 1000, 4000, "just one camera on this", channel="said",
+               speaker="S0", score=0.5,
+               ladder=[_rung("balanced", 1000, 4000, "just one camera on this", 0.5)])
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "alt-PIC" not in line, line
+    print("ok  test_alt_pic_absent_without_co_occurrence")
+
+
+def test_done_beat_pic_first_parity_and_snd_silence():
+    """`done`/`shown` beats render the SAME PIC/SND shape as `said` -- equal
+    citizens, not visually subordinate -- and a silent reaction reads SND:silence."""
+    cut = _cut("f:d0", 1000, 3000, "nods, reacts", channel="done", subject="person",
+               speaker=None, score=0.9, audio="silent", mute=False,
+               ladder=[_rung("balanced", 1000, 3000, "nods, reacts", 0.9)],
+               people=[{"person_id": "G1", "on_camera": True}], framing="med")
+    tree = fm.build_clip_tree("1e529bed-aaa", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "PIC:G1" in line, line
+    assert "SND:silence" in line, line
+    assert line.index("PIC:") < line.index("SND:"), line
+    print("ok  test_done_beat_pic_first_parity_and_snd_silence")
 
 
 def test_speaker_resolves_from_raw_handle_not_label():
@@ -273,35 +284,46 @@ def test_speaker_resolves_from_raw_handle_not_label():
     tree = fm.build_clip_tree("48c93cef-aaa", {"name": "T", "duration_ms": 8000}, [cut])
     m = tree["moments"][0]
     line = fm._moment_line(m, alias={("48c93cef-aaa", "S0"): "G2"})
-    assert " G2 " in f" {line} ", line           # resolved off the raw voice handle
+    assert "SND:G2 speaking" in line, line        # resolved off the raw voice handle
     assert "main subject" not in line, line       # not the unresolvable label
     plain = fm._moment_line(m)                     # no registry -> readable label
-    assert "main subject" in plain, plain
+    assert "SND:main subject speaking" in plain, plain
     print("ok  test_speaker_resolves_from_raw_handle_not_label")
 
 
-def test_coverage_group_names_beat_speaker():
-    """The coverage header names the beat's SPEAKER (resolved off the raw handle);
-    a member whose shows: isn't the speaker is simply that beat from another
-    camera -- the reaction angle, visible declaratively so no scan is needed."""
-    summary = [{
-        "group_id": "tg1",
-        "members": ["48c93cef:m22", "1aedb093:m14"],
-        "member_facts": [
-            {"moment_id": "48c93cef:m22", "file": "48c93cef-aaa", "voice": "S1",
-             "cam": "on-cam", "framing": "MCU", "score": 0.78, "restart": False},
-            {"moment_id": "1aedb093:m14", "file": "1aedb093-bbb", "voice": "S1",
-             "cam": "on-cam", "framing": "", "score": 0.74, "restart": False},
-        ],
-        "text": "the same line from two cameras",
-    }]
-    alias = {("48c93cef-aaa", "S1"): "G2", ("1aedb093-bbb", "S1"): "G2"}
-    oncam = {"48c93cef-aaa": "G1", "1aedb093-bbb": "G2"}
-    block = fm._dups_block(summary, alias=alias, oncam=oncam)
-    assert "tg1 speaker:G2" in block, block                      # beat speaker up front
-    assert "48c93cef:m22 G2 off-cam shows:G1" in block, block    # other camera = reaction angle
-    assert "1aedb093:m14 G2 on-cam shows:G2" in block, block
-    print("ok  test_coverage_group_names_beat_speaker")
+def test_annotate_dups_folds_alt_pic_onto_each_beat():
+    """`_annotate_dups` folds Fact #2 onto each linked beat as `alt_pic` -- every
+    OTHER member's raw facts, in place, no separate lookup table -- so
+    `_moment_line` can render a beat's alternates on its own."""
+    from app.services.l3 import takes
+
+    cut_a = _cut("48c93cef:mA", 1000, 4000, "that freedom he gave you", channel="said",
+                speaker="S2", score=0.6,
+                ladder=[_rung("balanced", 1000, 4000, "that freedom he gave you", 0.6)])
+    cut_b = _cut("1aedb093:mB", 1000, 4000, "that freedom he gave you", channel="said",
+                speaker="S9", score=0.73,
+                ladder=[_rung("balanced", 1000, 4000, "that freedom he gave you", 0.73)])
+    tree_a = fm.build_clip_tree("48c93cef-aaa", {"name": "A", "duration_ms": 8000}, [cut_a])
+    tree_b = fm.build_clip_tree("1aedb093-bbb", {"name": "B", "duration_ms": 8000}, [cut_b])
+
+    group = takes.TakeGroup(group_id="tg1", content_key="k", attempts=[
+        takes.Attempt("a1", "48c93cef-aaa", "u1", 1000, 4000, "said", "k",
+                      "that freedom he gave you", speaker="S2"),
+        takes.Attempt("a2", "1aedb093-bbb", "u1", 1000, 4000, "said", "k",
+                      "that freedom he gave you", speaker="S9"),
+    ])
+    orig = takes.build_take_groups
+    takes.build_take_groups = lambda file_ids: [group]
+    try:
+        summary = fm._annotate_dups([tree_a, tree_b])
+    finally:
+        takes.build_take_groups = orig
+
+    assert len(summary) == 1, summary
+    ma, mb = tree_a["moments"][0], tree_b["moments"][0]
+    assert ma["alt_pic"][0]["moment_id"] == mb["moment_id"], ma["alt_pic"]
+    assert mb["alt_pic"][0]["moment_id"] == ma["moment_id"], mb["alt_pic"]
+    print("ok  test_annotate_dups_folds_alt_pic_onto_each_beat")
 
 
 def test_moment_line_aliases_global_speaker():
@@ -311,8 +333,8 @@ def test_moment_line_aliases_global_speaker():
                ladder=[_rung("balanced", 1000, 4000, "hello there", 0.6)])
     tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
     m = tree["moments"][0]
-    assert "G3" in fm._moment_line(m, alias={("ffffffff-1111", "S0"): "G3"})
-    assert "S0" in fm._moment_line(m)         # no alias -> raw voice
+    assert "SND:G3 speaking" in fm._moment_line(m, alias={("ffffffff-1111", "S0"): "G3"})
+    assert "SND:S0 speaking" in fm._moment_line(m)         # no alias -> raw voice
     print("ok  test_moment_line_aliases_global_speaker")
 
 
@@ -337,11 +359,12 @@ def main():
     test_no_ladder_uses_flat_span()
     test_facets_surface_on_moment()
     test_map_text_lists_variants_no_atoms()
-    test_coverage_group_renders_member_facts_no_use_one()
     test_reconciled_shows_face_and_cam_override()
-    test_coverage_group_carries_shown_face()
+    test_said_beat_on_listener_camera_reads_pic_first_with_alt_pic()
+    test_alt_pic_absent_without_co_occurrence()
+    test_done_beat_pic_first_parity_and_snd_silence()
     test_speaker_resolves_from_raw_handle_not_label()
-    test_coverage_group_names_beat_speaker()
+    test_annotate_dups_folds_alt_pic_onto_each_beat()
     test_moment_line_aliases_global_speaker()
     test_source_contiguous_beats_form_a_run_channel_agnostic()
     test_default_energy_from_genre()

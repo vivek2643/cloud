@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import json
 import logging
-from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import get_settings
@@ -440,28 +439,24 @@ def _short_gist(s: str, max_words: int = 6) -> str:
     return " ".join(words[:max_words]) + "\u2026"
 
 
-def _people_tag(m: Dict[str, Any]) -> str:
-    """Compact on/off-camera marker so the brain knows when the voice it's about
-    to cut to has no on-screen speaker (an off-camera interviewer / voiceover)."""
+def _pic_who(m: Dict[str, Any], handle: Optional[str],
+            alias: Optional[Dict[Any, str]], oncam: Optional[Dict[str, str]]) -> Optional[str]:
+    """WHO or WHAT is on screen for this beat (Fact #1's PICTURE half) -- the
+    reconciled shoot cast's shown face when known (right even where this clip's
+    own on-camera flag was wrong), else this moment's own on-camera person, else
+    the subject noun for a non-person capture (place/object/graphic). None when
+    genuinely unknown -- PIC never invents a face it isn't told about."""
+    shown, _ = _shown_and_cam(m.get("file_id"), handle, alias, oncam)
+    if shown:
+        return shown
+    for p in (m.get("people") or []):
+        if p.get("on_camera") is True:
+            return p.get("person_id") or p.get("voice_speaker_id")
     if "offscreen" in (m.get("flags") or []):
-        return " off-cam"
+        return None
     if any(p.get("on_camera") is False for p in (m.get("people") or [])):
-        return " off-cam"
-    return ""
-
-
-def _cam_state(m: Dict[str, Any]) -> str:
-    """Tri-state on-camera marker for one delivery: 'on-cam' / 'off-cam' / '' when
-    there's no signal to judge. Used by the coverage groups so the brain can see
-    which member actually SHOWS the speaker."""
-    if "offscreen" in (m.get("flags") or []):
-        return "off-cam"
-    people = m.get("people") or []
-    if any(p.get("on_camera") is False for p in people):
-        return "off-cam"
-    if any(p.get("on_camera") is True for p in people):
-        return "on-cam"
-    return ""
+        return None
+    return m.get("subject") or None
 
 
 def _framing_tag(m: Dict[str, Any]) -> str:
@@ -540,19 +535,75 @@ def _dur_tag(m: Dict[str, Any]) -> str:
     return f"{s:.1f}s" if s < 10 else f"{int(round(s))}s"
 
 
-def _audio_tag(m: Dict[str, Any]) -> str:
-    """Source-audio note for a VIDEO cut. A muted cut plays SILENT by default so
-    the brain isn't surprised, and the kind tells it WHY -- 'muted(talk)' is a
-    stray half-sentence (usually leave silent); 'muted(sound)' is uncontrolled or
-    the action's own sound (the brain may want to `audio:keep` it)."""
+def _qual(score: float) -> str:
+    """Compact quality/confidence token shared by PIC and alt-PIC parens."""
+    return f"q.{int(round(max(0.0, score) * 100)):02d}"
+
+
+def _pic_segment(m: Dict[str, Any], handle: Optional[str],
+                 alias: Optional[Dict[Any, str]], oncam: Optional[Dict[str, str]]) -> str:
+    """PIC leads the beat line: whose face / what scene is on screen (never the
+    speaker), + shot size + quality. '?' when genuinely unresolved -- never a
+    guess dressed up as a fact."""
+    who = _pic_who(m, handle, alias, oncam) or "?"
+    bits = [b for b in (_framing_tag(m), _qual(float(m.get("score", 0.0)))) if b]
+    return f"PIC:{who} ({', '.join(bits)})"
+
+
+# Video cut's own source-audio facet (speech/sound/silent) -> the SND state word
+# when it plays as captured (not muted).
+_AUDIO_STATE = {"speech": "talk", "sound": "ambient", "silent": "silence"}
+
+
+def _snd_state(m: Dict[str, Any]) -> str:
+    """The audio STATE half of SND -- 'speaking' for a said beat (the content IS
+    the speech); else the video cut's own source-audio facet, folding in the
+    default mute so the brain isn't surprised by a silent play. Unknown audio
+    (no signal to judge) defaults to 'silence', the harmless assumption."""
+    if m.get("channel") == "said":
+        return "speaking"
     if m.get("mute"):
-        kind = m.get("audio")
-        if kind == "speech":
-            return " muted(talk)"
-        if kind == "sound":
-            return " muted(sound)"
-        return " muted"
-    return ""
+        kind = "talk" if m.get("audio") == "speech" else "ambient" if m.get("audio") == "sound" else "audio"
+        return f"muted({kind})"
+    return _AUDIO_STATE.get(m.get("audio"), "silence")
+
+
+def _snd_segment(m: Dict[str, Any], handle: Optional[str],
+                 alias: Optional[Dict[Any, str]]) -> str:
+    """SND: a co-equal peer of PIC -- who is heard (identity-resolved off the RAW
+    handle, not the display label -- the speaker-id gap) + the audio state."""
+    state = _snd_state(m)
+    if m.get("channel") != "said":
+        return f"SND:{state}"
+    gspk = _global_speaker(m.get("file_id"), handle, alias, label=m.get("speaker"))
+    who = f"{gspk} " if gspk else ""
+    return f"SND:{who}{state}"
+
+
+def _alt_pic_segment(m: Dict[str, Any], alias: Optional[Dict[Any, str]],
+                     oncam: Optional[Dict[str, str]]) -> str:
+    """Fact #2 folded onto the beat: every OTHER picture the SAME sound is also
+    available as (this beat's cross-clip take-group members), each a neutral
+    `Gx→ref (shot, q)`. Never a verdict -- just where else this sound's picture
+    lives. Absent when there is no co-occurrence (`_annotate_dups` sets no
+    `alt_pic` in that case) or when no member resolves to a picture distinct
+    from this beat's own."""
+    facts = m.get("alt_pic") or []
+    if not facts:
+        return ""
+    my_who = _pic_who(m, _speaker_handle(m), alias, oncam)
+    seen = set()
+    parts: List[str] = []
+    for f in facts:
+        shown, _ = _shown_and_cam(f.get("file"), f.get("voice"), alias, oncam)
+        who = shown or _global_speaker(f.get("file"), f.get("voice"), alias)
+        if not who or who == my_who or who in seen:
+            continue
+        seen.add(who)
+        bits = [b for b in (f.get("framing"), _qual(float(f.get("score", 0.0)))) if b]
+        retry = ", retry" if f.get("restart") else ""
+        parts.append(f"{who}→{f['moment_id']} ({', '.join(bits)}{retry})")
+    return f" ·alt-PIC:{', '.join(parts)}" if parts else ""
 
 
 def _moment_line(m: Dict[str, Any], *, compact: bool = False,
@@ -564,16 +615,10 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False,
     # label -- so every speech line names its shoot-wide person (Gx), not a
     # role label the registry can't match.
     handle = _speaker_handle(m)
-    gspk = _global_speaker(m.get("file_id"), handle, alias, label=m.get("speaker"))
-    spk = f" {gspk}" if gspk else ""
-    # Prefer the reconciled shoot cast for on/off-camera + WHOSE FACE shows here;
-    # it is right even where a clip's own A/V link was wrong. Fall back to the
-    # per-moment flag only when the shoot cast has no opinion for this clip.
-    shown, cam_state = _shown_and_cam(m.get("file_id"), handle, alias, oncam)
-    if shown:
-        cam = f" {cam_state} shows:{shown}"
-    else:
-        cam = _people_tag(m)
+    # PIC leads (what actually lands on screen); SND is a co-equal peer, never
+    # the subject -- placing a beat can no longer read as "showing the speaker".
+    pic = _pic_segment(m, handle, alias, oncam)
+    snd = _snd_segment(m, handle, alias)
     gist = (m.get("gist") or "").strip().replace("\n", " ")
     # Resident mode gives the model the FULL line so it picks by reading, not
     # guessing; compact (paged) mode truncates and relies on inspect_moment.
@@ -590,13 +635,10 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False,
     run = ""
     if m.get("run_id"):
         run = f" · run:{m['run_id']}"
-    dup = ""
-    if m.get("dup_group"):
-        dup = f" · dup:{m['dup_group']}{' retry' if m.get('dup_restart') else ''}"
-    return (f"  {m['moment_id'].split(':')[-1]} {_capture_tag(m)}{spk}{cam}{_audio_tag(m)} "
-            f".{int(round(m['score'] * 100)):02d} "
+    alt = _alt_pic_segment(m, alias, oncam)
+    return (f"  {m['moment_id'].split(':')[-1]} {_capture_tag(m)} {pic} {snd} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])} {_dur_tag(m)}] "
-            f"\"{gist}\"{gloss} · nrg:{nrg}{run}{dup}")
+            f"\"{gist}\"{gloss} · nrg:{nrg}{run}{alt}")
 
 
 def _clip_block(tree: Dict[str, Any], *, compact: bool = False,
@@ -649,11 +691,13 @@ def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
     Reconciles cross-clip take groups (``takes.build_take_groups``) onto the
     moment-tree by best temporal IoU, tags each linked moment in place with its
-    ``dup_group`` (and ``dup_restart`` for an abandoned take), and returns a
-    render-ready summary. No winner is crowned -- the brain compares the members
-    and decides. This is cross-set dependent (it changes with the file set), so
-    it is computed per request and never baked into the per-file tree cache.
-    Fail-open: any error yields no links.
+    ``dup_group`` (and ``dup_restart`` for an abandoned take) plus ``alt_pic``
+    (Fact #2 folded onto the beat: every OTHER member's raw facts, so
+    ``_moment_line`` can render this beat's alternates without a separate
+    lookup), and returns a render-ready summary. No winner is crowned -- the
+    brain compares the members and decides. This is cross-set dependent (it
+    changes with the file set), so it is computed per request and never baked
+    into the per-file tree cache. Fail-open: any error yields no links.
     """
     file_ids = [t["file_id"] for t in trees]
     if len(file_ids) < 1:
@@ -691,22 +735,27 @@ def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if mid in restart_ids:
                 m["dup_restart"] = True
         # Per-member facts so the brain can compare deliveries WITHOUT re-reading
-        # the whole index: who (voice, aliased to a global person at render), on/
-        # off camera, shot size, and quality score. Facts, not a verdict.
+        # the whole index: who (voice, aliased to a global person at render),
+        # shot size, and quality score. Facts, not a verdict.
         member_facts = [{
             "moment_id": mid,
             "file": file_by_mid.get(mid, ""),
             # the RAW voice/person handle (not the display label) so it resolves
             # to a global person at render -- see `_speaker_handle`.
             "voice": _speaker_handle(m),
-            "cam": _cam_state(m),
             "framing": _framing_tag(m),
             "score": float(m.get("score", 0.0)),
             "restart": mid in restart_ids,
         } for mid, m in linked.items()]
-        # `shows` (whose FACE this delivery is on-camera) is filled at render from
-        # the reconciled shoot cast -- kept out of the cached facts because it is
-        # cross-set (identity) dependent, exactly like the aliased speaker.
+        # Fold coverage ONTO each beat: every OTHER member's raw facts, so the
+        # beat line renders its own `alt-PIC` without a separate lookup/block.
+        # `shows` (whose FACE a delivery is on-camera) is resolved at RENDER time
+        # from the reconciled shoot cast -- kept out of these cached facts
+        # because it is cross-set (identity) dependent, like the aliased speaker.
+        for f in member_facts:
+            linked[f["moment_id"]]["alt_pic"] = [
+                g for g in member_facts if g["moment_id"] != f["moment_id"]
+            ]
         summary.append({
             "group_id": g.group_id,
             "members": list(linked.keys()),     # moment_ids (consumers key on this)
@@ -714,61 +763,6 @@ def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "text": (g.attempts[0].text or "").strip(),
         })
     return summary
-
-
-def _dups_block(summary: List[Dict[str, Any]],
-                *, alias: Optional[Dict[Any, str]] = None,
-                oncam: Optional[Dict[str, str]] = None) -> str:
-    if not summary:
-        return ""
-    # Coverage, not "pick one": each member is one delivery of the same beat.
-    # The brain chooses which to SHOW and may reuse another as a cutaway -- no
-    # directive here, the facts carry the decision. (Genre-agnostic: "beat"
-    # covers a retake, a second camera, or the same line said twice.)
-    lines = ["COVERAGE GROUPS (the same beat delivered more than once -- different "
-             "takes and/or cameras; the beat's SPEAKER is named, then each member "
-             "is one delivery: whose face it SHOWS and how well -- a member whose "
-             "shows: isn't the speaker is that beat seen from another person):"]
-    for d in summary:
-        gist = d["text"].replace("\n", " ")
-        if len(gist) > 80:
-            gist = gist[:77] + "..."
-        facts = d.get("member_facts") or []
-        # The beat's SPEAKER: the shoot-wide person the members' voice resolves to
-        # (every delivery of one line shares the voice). Named once, up front, so
-        # the brain reads it against each member's shows: -- the angle that shows
-        # someone else is simply this beat from another camera, no query needed.
-        gids = [alias.get((f.get("file"), f.get("voice")))
-                for f in facts] if alias else []
-        gids = [g for g in gids if g]
-        speaker_gid = Counter(gids).most_common(1)[0][0] if gids else None
-        hdr = f" speaker:{speaker_gid}" if speaker_gid else ""
-        if facts:
-            parts = []
-            for f in facts:
-                gspk = _global_speaker(f.get("file"), f.get("voice"), alias)
-                shown, cam_state = _shown_and_cam(f.get("file"), f.get("voice"),
-                                                  alias, oncam)
-                bits = [f["moment_id"]]
-                if gspk:
-                    bits.append(gspk)
-                # Reconciled cam + shown-face when known; else the per-moment cam.
-                if shown:
-                    bits.append(cam_state)
-                    bits.append(f"shows:{shown}")
-                elif f.get("cam"):
-                    bits.append(f["cam"])
-                if f.get("framing"):
-                    bits.append(f["framing"])
-                bits.append(f".{int(round(f.get('score', 0.0) * 100)):02d}")
-                if f.get("restart"):
-                    bits.append("retry")
-                parts.append(" ".join(bits))
-            body = " · ".join(parts)
-        else:
-            body = " ".join(d["members"])
-        lines.append(f"  {d['group_id']}{hdr} \"{gist}\": {body}")
-    return "\n".join(lines)
 
 
 def assemble_map(file_ids: List[str], *, compact: bool = False,
@@ -780,9 +774,11 @@ def assemble_map(file_ids: List[str], *, compact: bool = False,
     ``struct`` is the machine-readable trees the arranger/compiler resolve
     placements against. ``compact`` truncates gists for the paged (over-budget)
     path; resident mode emits the full line. Moments are tagged in place with
-    cross-clip duplicate links. When ``relations`` (the shoot identity registry)
-    is supplied, per-line and coverage-group speakers are aliased to their global
-    person id so the same human reads consistently across clips.
+    cross-clip duplicate links -- coverage reads INLINE on each beat as
+    ``·alt-PIC`` (no separate coverage block: dedupe the information, not the
+    sequence). When ``relations`` (the shoot identity registry) is supplied,
+    per-line and alt-PIC speakers are aliased to their global person id so the
+    same human reads consistently across clips.
     """
     alias: Optional[Dict[Any, str]] = None
     oncam: Optional[Dict[str, str]] = None
@@ -798,9 +794,6 @@ def assemble_map(file_ids: List[str], *, compact: bool = False,
     dups = _annotate_dups(ordered)   # tags moments in `ordered` in place
     text = "\n\n".join(_clip_block(t, compact=compact, alias=alias, oncam=oncam)
                        for t in ordered)
-    dblock = _dups_block(dups, alias=alias, oncam=oncam)
-    if dblock:
-        text = f"{text}\n\n{dblock}"
     n_moments = sum(t["moment_count"] for t in ordered)
     return {
         "text": text,

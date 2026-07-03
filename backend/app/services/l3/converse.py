@@ -195,6 +195,13 @@ _LOOP_SYSTEM_V3 = (
     "-point lanes (who is present / who is speaking on camera / gaze / shot size "
     "/ action over the whole clock), its cleanest seams, its impact/reveal PEAKS, "
     "and a scored cut INDEX. Each clip is headed 'CLIP <file8>'.\n"
+    "  - the BEAT INDEX (below) -- every usable beat across the shoot. Each line "
+    "leads with PIC (what's on screen: a face or a scene, framing, quality), then "
+    "SND (what's heard: a named speaker + 'speaking', or the shot's own audio -- "
+    "silence / ambient / talk), then the words or action -- read PIC before SND, "
+    "a beat's picture is not necessarily its speaker. `·alt-PIC` on a beat states "
+    "a fact: the SAME sound is also available as a picture from another camera or "
+    "take, with its own ref -- never a suggestion of which to use.\n"
     "  - scan_source -- query that timeline for spans matching a facet: a `lane` "
     "(e.g. 'presence:G2', 'speaking', 'shot', 'speech', 'action') + optional "
     "`match` (e.g. {state:'on'}); each hit carries its full facets at its "
@@ -208,9 +215,10 @@ _LOOP_SYSTEM_V3 = (
     "fixing, structural checks, the projected length under a proposed change, and "
     "the menu of what you can do to each cut.\n\n"
     "YOUR VERBS (each mutates the edit directly):\n"
-    "  - place <ref> -- add a pre-scored said-line from the speech index. channel "
-    "V1 = the MAIN LINE (picture+sound) at index `at`; V2 = a SILENT video layer "
-    "over the ongoing audio at program `from_ms`. `level` picks the energy take.\n"
+    "  - place <ref> -- add a pre-scored beat from the beat index, any channel "
+    "(speech, action, or a graphic). channel V1 = the MAIN LINE (picture+sound) "
+    "at index `at`; V2 = a SILENT video layer over the ongoing audio at program "
+    "`from_ms`. `level` picks the energy take.\n"
     "  - place_span <file, in_ms, out_ms> -- add ANY source window (the SOURCE ms "
     "into a 'CLIP <file8>'), not just a said-line. Same channels. Edges auto-snap "
     "to the nearest clean seam (word gap / silence / impact; never mid-word) "
@@ -324,8 +332,8 @@ def _context_block_v3(file_ids: List[str], document: Optional[dict],
         aware_header=("CONTINUOUS SOURCE (each clip as a fully-addressable timeline "
                       "-- change-point lanes, cleanest seams, impact peaks, and a "
                       "scored cut index):"),
-        index_header=("SPEECH-CUT INDEX (pre-scored said-lines, each with a ref you "
-                      "can place):"))
+        index_header=("BEAT INDEX (every usable beat -- PIC then SND then the "
+                      "words/action -- each with a ref you can place):"))
 
 
 def _seed_document(file_ids: List[str]) -> dict:
