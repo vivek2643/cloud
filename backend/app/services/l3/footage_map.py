@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import get_settings
@@ -477,33 +478,56 @@ def _framing_tag(m: Dict[str, Any]) -> str:
     return ""
 
 
-def _global_speaker(file_id: Optional[str], voice: Optional[str],
-                    alias: Optional[Dict[Any, str]]) -> Optional[str]:
-    """The shoot-wide person id for a per-clip voice, when the registry linked it
-    across clips; else the raw voice (never nothing when a voice exists)."""
-    if not voice:
-        return None
+def _speaker_handle(m: Dict[str, Any]) -> Optional[str]:
+    """The RAW, resolvable speaker handle for a said moment -- the diarized voice
+    id (else the VLM person id) that the shoot identity registry is keyed on.
+
+    Critical distinction: the moment's ``speaker`` field is a human DISPLAY LABEL
+    (role/person/voice, e.g. "main subject") produced by the cast map for reading;
+    it does NOT resolve to a global id. The raw id needed to alias a voice to its
+    shoot-wide person lives in the ``people`` facet. Resolving off the label was
+    the "speaker id gap" -- every speech line fell back to its role label and the
+    brain could never match a speaker to their camera. Falls back to the display
+    ``speaker`` for an unresolved cut that already kept its raw voice id there."""
+    for p in (m.get("people") or []):
+        h = p.get("voice_speaker_id") or p.get("person_id")
+        if h:
+            return h
+    return m.get("speaker")
+
+
+def _global_speaker(file_id: Optional[str], handle: Optional[str],
+                    alias: Optional[Dict[Any, str]],
+                    label: Optional[str] = None) -> Optional[str]:
+    """The shoot-wide person id (Gx) for a raw voice/person handle, when the
+    registry linked it across clips; else the human ``label`` (the moment's
+    display speaker) when given, else the handle itself. Never nothing when a
+    speaker exists."""
+    if not handle:
+        return label
     if alias and file_id is not None:
-        gid = alias.get((file_id, voice))
+        gid = alias.get((file_id, handle))
         if gid:
             return gid
-    return voice
+    return label if label is not None else handle
 
 
-def _shown_and_cam(file_id: Optional[str], voice: Optional[str],
+def _shown_and_cam(file_id: Optional[str], handle: Optional[str],
                    alias: Optional[Dict[Any, str]],
                    oncam: Optional[Dict[str, str]]) -> Tuple[Optional[str], str]:
     """(global face on screen, on/off-cam) DERIVED from the reconciled cast: whose
     FACE this clip shows, and whether the speaker is that person. This is the
     trustworthy on-camera fact -- it survives a clip whose per-clip A/V sensor was
-    wrong -- so it OVERRIDES the per-moment on_camera flag when available. Returns
-    (None, "") when the shoot cast doesn't know who this clip shows."""
+    wrong -- so it OVERRIDES the per-moment on_camera flag when available. The
+    speaker is resolved STRICTLY (raw handle -> Gx); an unresolved speaker can't
+    be claimed on-camera. Returns (None, "") when the shoot cast doesn't know who
+    this clip shows."""
     if not oncam or file_id is None:
         return None, ""
     shown = oncam.get(file_id)
     if not shown:
         return None, ""
-    spk = _global_speaker(file_id, voice, alias)
+    spk = alias.get((file_id, handle)) if (alias and handle) else None
     cam = "on-cam" if (spk and spk == shown) else "off-cam"
     return shown, cam
 
@@ -536,12 +560,16 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False,
                  oncam: Optional[Dict[str, str]] = None) -> str:
     levels = list(m["variants"].keys())
     nrg = "|".join(L for L in _LEVEL_NAMES if L in levels)
-    gspk = _global_speaker(m.get("file_id"), m.get("speaker"), alias)
+    # Resolve the speaker off the RAW handle (people facet), not the display
+    # label -- so every speech line names its shoot-wide person (Gx), not a
+    # role label the registry can't match.
+    handle = _speaker_handle(m)
+    gspk = _global_speaker(m.get("file_id"), handle, alias, label=m.get("speaker"))
     spk = f" {gspk}" if gspk else ""
     # Prefer the reconciled shoot cast for on/off-camera + WHOSE FACE shows here;
     # it is right even where a clip's own A/V link was wrong. Fall back to the
     # per-moment flag only when the shoot cast has no opinion for this clip.
-    shown, cam_state = _shown_and_cam(m.get("file_id"), m.get("speaker"), alias, oncam)
+    shown, cam_state = _shown_and_cam(m.get("file_id"), handle, alias, oncam)
     if shown:
         cam = f" {cam_state} shows:{shown}"
     else:
@@ -668,7 +696,9 @@ def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         member_facts = [{
             "moment_id": mid,
             "file": file_by_mid.get(mid, ""),
-            "voice": m.get("speaker"),
+            # the RAW voice/person handle (not the display label) so it resolves
+            # to a global person at render -- see `_speaker_handle`.
+            "voice": _speaker_handle(m),
             "cam": _cam_state(m),
             "framing": _framing_tag(m),
             "score": float(m.get("score", 0.0)),
@@ -696,13 +726,23 @@ def _dups_block(summary: List[Dict[str, Any]],
     # directive here, the facts carry the decision. (Genre-agnostic: "beat"
     # covers a retake, a second camera, or the same line said twice.)
     lines = ["COVERAGE GROUPS (the same beat delivered more than once -- different "
-             "takes and/or cameras; each member is one delivery: who SPEAKS it, "
-             "whose face it SHOWS, and how well):"]
+             "takes and/or cameras; the beat's SPEAKER is named, then each member "
+             "is one delivery: whose face it SHOWS and how well -- a member whose "
+             "shows: isn't the speaker is that beat seen from another person):"]
     for d in summary:
         gist = d["text"].replace("\n", " ")
         if len(gist) > 80:
             gist = gist[:77] + "..."
-        facts = d.get("member_facts")
+        facts = d.get("member_facts") or []
+        # The beat's SPEAKER: the shoot-wide person the members' voice resolves to
+        # (every delivery of one line shares the voice). Named once, up front, so
+        # the brain reads it against each member's shows: -- the angle that shows
+        # someone else is simply this beat from another camera, no query needed.
+        gids = [alias.get((f.get("file"), f.get("voice")))
+                for f in facts] if alias else []
+        gids = [g for g in gids if g]
+        speaker_gid = Counter(gids).most_common(1)[0][0] if gids else None
+        hdr = f" speaker:{speaker_gid}" if speaker_gid else ""
         if facts:
             parts = []
             for f in facts:
@@ -727,7 +767,7 @@ def _dups_block(summary: List[Dict[str, Any]],
             body = " · ".join(parts)
         else:
             body = " ".join(d["members"])
-        lines.append(f"  {d['group_id']} \"{gist}\": {body}")
+        lines.append(f"  {d['group_id']}{hdr} \"{gist}\": {body}")
     return "\n".join(lines)
 
 

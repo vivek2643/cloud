@@ -598,26 +598,38 @@ def _resolve_global(ctx: EditContext, fid: str, token: object) -> Tuple[object, 
 
 def _scan_one(ctx: EditContext, fid: str, lane: str,
               match: Optional[Dict[str, object]],
-              win: Optional[Tuple[int, int]], cap: int) -> List[dict]:
+              win: Optional[Tuple[int, int]], cap: int) -> Tuple[List[dict], dict]:
     """Scan one clip, resolving any global person id in the lane suffix or match
-    values to that clip's local handle first. [] when the clip has no timeline or
-    the referenced person isn't in it."""
+    values to that clip's local handle first. Returns (hits, meta) where meta
+    reports the resolved lane, which match keys were APPLIED vs. IGNORED (a
+    guessed facet name the lane doesn't carry), and the lane's real query
+    vocabulary -- so a slightly-wrong query self-corrects instead of dead-ending.
+    ([], {}) when the clip has no timeline or the referenced person isn't in it."""
     tl = _timeline(ctx, fid)
     if tl is None:
-        return []
+        return [], {}
     prefix, sep, suf = lane.partition(":")
     lane_name = lane
     if sep:
         rt, ok = _resolve_global(ctx, fid, suf)
         if not ok:
-            return []
+            return [], {}
         lane_name = f"{prefix}:{rt}"
     rmatch: Dict[str, object] = {}
     for k, v in (match or {}).items():
         rt, ok = _resolve_global(ctx, fid, v)
         if not ok:
-            return []
+            return [], {}
         rmatch[k] = rt
+    known = tl.lane_value_keys(lane_name)
+    meta: dict = {}
+    if tl.lane(lane_name) is None:
+        meta["missing_lane"] = lane_name
+    elif rmatch:
+        ignored = sorted(k for k in rmatch if k not in known)
+        if ignored:                                  # guessed facet name(s)
+            meta["ignored_match"] = ignored
+            meta["lane_vocab"] = tl.lane_vocab(lane_name)
     hits: List[dict] = []
     for it in tl.scan(lane_name, **rmatch):
         if win and not (it.start_ms < win[1] and it.end_ms > win[0]):
@@ -627,7 +639,7 @@ def _scan_one(ctx: EditContext, fid: str, lane: str,
                      **it.value, "facets": tl.facet_at(mid)})
         if len(hits) >= cap:
             break
-    return hits
+    return hits, meta
 
 
 def scan_source(ctx: EditContext, file_ref: str, lane: str,
@@ -666,17 +678,34 @@ def scan_source(ctx: EditContext, file_ref: str, lane: str,
     cap = 40 if not multi else max(4, 40 // len(targets))
     hits: List[dict] = []
     scanned: List[str] = []
+    meta: dict = {}
     for fid in targets:
-        fh = _scan_one(ctx, fid, lane, match, win, cap)
+        fh, fmeta = _scan_one(ctx, fid, lane, match, win, cap)
         if _timeline(ctx, fid) is not None:
             scanned.append(fid[:8])
         hits.extend(fh)
+        if fmeta and not meta:                       # first informative clip wins
+            meta = fmeta
     out: dict = {"file": (targets[0][:8] if not multi else "*"),
                  "lane": lane, "hits": hits[:60], "files": scanned}
-    if not multi and targets:
-        tl = _timeline(ctx, targets[0])
+    # Always advertise the lanes so a mistaken lane name (the common cause of an
+    # empty scan) self-corrects; ditto the applied-vs-ignored match keys + the
+    # lane's real value vocabulary when a guessed facet name was dropped.
+    lanes_here: List[str] = []
+    for fid in (targets if multi else targets[:1]):
+        tl = _timeline(ctx, fid)
         if tl is not None:
-            out["lanes_available"] = [ln.name for ln in tl.lanes]
-        else:
-            out["note"] = "no continuous timeline for this clip"
+            lanes_here = sorted({*lanes_here, *(ln.name for ln in tl.lanes)})
+    if lanes_here:
+        out["lanes_available"] = lanes_here
+    elif not multi:
+        out["note"] = "no continuous timeline for this clip"
+    if meta.get("missing_lane"):
+        out["note"] = (f"lane '{meta['missing_lane']}' not on this clip -- see "
+                       f"lanes_available")
+    if meta.get("ignored_match"):
+        out["ignored_match"] = meta["ignored_match"]
+        out["lane_vocab"] = meta["lane_vocab"]
+        out["note"] = ("some match keys aren't facets of this lane (ignored); "
+                       "query the keys in lane_vocab, or read each hit's facets")
     return out

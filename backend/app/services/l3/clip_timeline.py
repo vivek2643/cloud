@@ -182,7 +182,43 @@ class ClipTimeline:
         for ln in self.lanes:
             if ln.name == name:
                 return ln
+        # Forgiving fallback: exact match failed, try case-insensitive so a
+        # guessed-case lane name ("Speaking") still resolves. No fuzzy aliasing
+        # beyond that -- the available-lane list (surfaced by scan_source) is how
+        # the caller learns the real names, not magic.
+        nl = (name or "").strip().lower()
+        for ln in self.lanes:
+            if ln.name.lower() == nl:
+                return ln
         return None
+
+    def lane_value_keys(self, name: str) -> set:
+        """The value KEYS a lane's intervals actually carry -- the honest set of
+        facets one can match on. Empty when the lane is unknown."""
+        ln = self.lane(name)
+        if ln is None:
+            return set()
+        keys: set = set()
+        for it in ln.intervals:
+            keys.update(k for k, v in it.value.items() if v is not None)
+        return keys
+
+    def lane_vocab(self, name: str, *, cap: int = 8) -> Dict[str, List[Any]]:
+        """Per-key observed VALUE set for a lane (capped) -- so a caller reads the
+        real query vocabulary ('shot_size' takes wide/medium/close ...) instead of
+        guessing tokens that silently miss."""
+        ln = self.lane(name)
+        if ln is None:
+            return {}
+        vocab: Dict[str, set] = {}
+        for it in ln.intervals:
+            for k, v in it.value.items():
+                if v is None or isinstance(v, (list, dict)):
+                    continue
+                vs = vocab.setdefault(k, set())
+                if len(vs) < cap:
+                    vs.add(v)
+        return {k: sorted(vs, key=str) for k, vs in vocab.items()}
 
     def facet_at(self, ms: int) -> Dict[str, Any]:
         """Sample every full-coverage lane at ``ms`` -- "what is true right now".
@@ -202,11 +238,22 @@ class ClipTimeline:
 
     def scan(self, lane_name: str, **match: Any) -> List[Interval]:
         """Return the intervals of ``lane_name`` whose value matches every
-        ``key=value`` in ``match`` (a facet query over the continuous clock)."""
+        ``key=value`` in ``match`` (a facet query over the continuous clock).
+
+        FORGIVING: only match keys the lane actually carries are applied; a key
+        the lane doesn't have (a guessed facet name) is IGNORED rather than
+        silently zeroing every hit -- so a slightly-wrong query still returns the
+        lane's spans (each with full facets) to read, and ``scan_source`` reports
+        which keys applied vs. the lane's real vocabulary so the query self-
+        corrects. Reactions/other angles come from the coverage groups now; this
+        stays the open-ended escape hatch it was meant to be."""
         ln = self.lane(lane_name)
         if ln is None:
             return []
-        return [it for it in ln.intervals if all(it.value.get(k) == v for k, v in match.items())]
+        known = self.lane_value_keys(lane_name)
+        applied = {k: v for k, v in match.items() if k in known}
+        return [it for it in ln.intervals
+                if all(it.value.get(k) == v for k, v in applied.items())]
 
     def handles(self, in_ms: int, out_ms: int) -> Dict[str, int]:
         """Unused source room around ``[in,out]`` -- how far a span can be

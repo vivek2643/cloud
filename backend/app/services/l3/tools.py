@@ -80,18 +80,22 @@ def _specs() -> List[Dict[str, Any]]:
           "source: change-point lanes (who is present / speaking on camera / gaze / "
           "shot size / action over the whole clock), the cleanest seams, the "
           "impact/reveal peaks, and a scored cut INDEX per clip. Use this when you "
-          "need a span that ISN'T a pre-baked cut -- e.g. a person's silent reaction "
-          "-- then place it with place_span. Each clip is headed 'CLIP <file8>'.",
+          "need a span that ISN'T a pre-baked cut -- e.g. a silent window / b-roll. "
+          "(The OTHER angle of a spoken beat is already a coverage-group member -- "
+          "read it there; you don't need to hunt for it here.) Each clip is headed "
+          "'CLIP <file8>'.",
           obj({})),
-        S("scan_source", "Query the continuous timeline for spans matching a facet: "
-          "`lane` (e.g. 'presence:p2', 'speaking', 'shot', 'speech', 'action') + "
-          "optional `match` (e.g. {state:'on'} or {subject:'p1'}). Each hit carries "
-          "the full facets at its midpoint, so ask 'where is p2 on screen?' with lane "
-          "'presence:p2' match {state:'on'} and read each hit's facets to see if they "
-          "are also silent. `file` is a 'CLIP <file8>' id, or '*' to scan EVERY clip "
-          "at once; a global person id (G1, G2, ...) in the lane/match is resolved per "
-          "clip. Optional `within_ms` ([a,b]) limits hits to a time window (e.g. scan "
-          "another clip near a coverage member's window for a reaction).",
+        S("scan_source", "ESCAPE HATCH for open-ended source questions the index "
+          "doesn't already answer (a silent window, b-roll, where a shot changes). "
+          "You usually DON'T need this to show a reaction/other angle -- that's a "
+          "coverage-group member, read declaratively. Query a `lane` (e.g. "
+          "'presence:p2', 'speaking', 'shot', 'speech', 'action') + optional `match` "
+          "(e.g. {state:'on'}). Each hit carries full facets at its midpoint. It is "
+          "FORGIVING: a wrong lane name returns `lanes_available`, and a guessed "
+          "match key is ignored and reported with the lane's real `lane_vocab` -- so "
+          "read the result and re-query rather than assuming a token. `file` is a "
+          "'CLIP <file8>' id, or '*' to scan EVERY clip; a global id (G1, G2, ...) in "
+          "the lane/match resolves per clip. `within_ms` ([a,b]) limits the window.",
           obj({"file": {"type": "string"}, "lane": {"type": "string"},
                "match": {"type": "object"},
                "within_ms": {"type": "array", "items": {"type": "integer"}}},
@@ -160,9 +164,10 @@ def _specs() -> List[Dict[str, Any]]:
         S("split_screen", "Show the MAIN LINE and a second source at the same time "
           "over the window [from_ms, to_ms]: template 'split_h' (side-by-side), "
           "'split_v' (stacked), or 'pip' (inset over the main line). The added cell "
-          "source is EITHER a map `ref` OR a raw window `file`+`in_ms`+`out_ms` (any "
-          "span from source_awareness/scan_source -- e.g. a silent listener), which "
-          "seam-snaps like place_span. The added cell is silent unless audio:'keep'. "
+          "source is EITHER a map `ref` (e.g. the coverage-group member that SHOWS "
+          "the other person during this beat) OR a raw window `file`+`in_ms`+`out_ms` "
+          "(from source_awareness), which seam-snaps like place_span. The added cell "
+          "is silent unless audio:'keep'. "
           "This is a user-owned look -- ask_user first. from_ms/to_ms are PROGRAM ms.",
           obj({"ref": {"type": "string"},
                "file": {"type": "string"},

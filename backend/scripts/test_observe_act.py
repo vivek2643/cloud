@@ -401,6 +401,36 @@ def test_source_awareness_and_scan_source_via_cache():
     print("ok  source_awareness + scan_source read continuous lanes (cache path)")
 
 
+def test_scan_source_is_forgiving_and_self_correcting():
+    """A slightly-wrong scan self-corrects instead of dead-ending: a guessed facet
+    name is IGNORED (not silently zeroing the hits) and reported alongside the
+    lane's real vocabulary; a wrong lane name names the available lanes."""
+    from app.services.l3.clip_timeline import TimelineInputs, build_clip_timeline
+    struct = _map()
+    ctx = _ctx(struct)
+    tl = build_clip_timeline(TimelineInputs(
+        file_id="ffffffff-1111", duration_ms=8000,
+        persons=[{"local_id": "p1"}, {"local_id": "p2"}],
+        speaking=[{"start_ms": 1000, "end_ms": 4000, "subject": "p1"}],
+        activity_lane=[{"start_ms": 5000, "end_ms": 8000, "mode": "held",
+                        "subject": "person", "actor": "p2", "label": "listens, silent",
+                        "peak_ms": 6500, "confidence": 0.7}]))
+    ctx.tl_cache["ffffffff-1111"] = tl
+
+    # Guessed facet ('state' isn't an action-lane key) -> ignored + vocab shown,
+    # and the lane's spans still come back (each with facets) rather than [].
+    res = observe.scan_source(ctx, "ffffffff", "action", {"state": "shown"})
+    assert res["hits"], res                          # not dead-ended
+    assert res.get("ignored_match") == ["state"], res
+    assert "channel" in res.get("lane_vocab", {}), res
+
+    # Wrong lane name -> no hits, but the real lanes are advertised.
+    bad = observe.scan_source(ctx, "ffffffff", "actions")
+    assert bad["hits"] == [] and "action" in bad.get("lanes_available", []), bad
+    assert "not on this clip" in bad.get("note", ""), bad
+    print("ok  scan_source is forgiving (ignores guessed keys, names lanes)")
+
+
 def test_place_span_arbitrary_main_line():
     """place_span lifts ANY source window onto V1 -- no map ref needed."""
     struct = _map()
@@ -619,6 +649,7 @@ def main():
     test_solve_layout_templates()
     test_affordances_menu()
     test_source_awareness_and_scan_source_via_cache()
+    test_scan_source_is_forgiving_and_self_correcting()
     test_place_span_arbitrary_main_line()
     test_place_span_v2_cutaway_and_bad_span_noop()
     test_place_span_snaps_to_seam_via_dispatch()

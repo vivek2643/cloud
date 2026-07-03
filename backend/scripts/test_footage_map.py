@@ -261,6 +261,49 @@ def test_coverage_group_carries_shown_face():
     print("ok  test_coverage_group_carries_shown_face")
 
 
+def test_speaker_resolves_from_raw_handle_not_label():
+    """The speaker id gap: a said cut's `speaker` is a human LABEL ('main subject')
+    the registry can't match; the raw voice id lives in `people`. Resolution must
+    key on the RAW handle so every line names its shoot-wide person -- else every
+    speech line falls back to a role label and the brain can't match speaker to
+    camera. Without a registry it still reads the label, never the bare id."""
+    cut = _cut("48c93cef:m00", 1000, 4000, "we shipped it", speaker="main subject",
+               score=0.7, ladder=[_rung("balanced", 1000, 4000, "we shipped it", 0.7)],
+               people=[{"voice_speaker_id": "S0", "person_id": "p1", "on_camera": True}])
+    tree = fm.build_clip_tree("48c93cef-aaa", {"name": "T", "duration_ms": 8000}, [cut])
+    m = tree["moments"][0]
+    line = fm._moment_line(m, alias={("48c93cef-aaa", "S0"): "G2"})
+    assert " G2 " in f" {line} ", line           # resolved off the raw voice handle
+    assert "main subject" not in line, line       # not the unresolvable label
+    plain = fm._moment_line(m)                     # no registry -> readable label
+    assert "main subject" in plain, plain
+    print("ok  test_speaker_resolves_from_raw_handle_not_label")
+
+
+def test_coverage_group_names_beat_speaker():
+    """The coverage header names the beat's SPEAKER (resolved off the raw handle);
+    a member whose shows: isn't the speaker is simply that beat from another
+    camera -- the reaction angle, visible declaratively so no scan is needed."""
+    summary = [{
+        "group_id": "tg1",
+        "members": ["48c93cef:m22", "1aedb093:m14"],
+        "member_facts": [
+            {"moment_id": "48c93cef:m22", "file": "48c93cef-aaa", "voice": "S1",
+             "cam": "on-cam", "framing": "MCU", "score": 0.78, "restart": False},
+            {"moment_id": "1aedb093:m14", "file": "1aedb093-bbb", "voice": "S1",
+             "cam": "on-cam", "framing": "", "score": 0.74, "restart": False},
+        ],
+        "text": "the same line from two cameras",
+    }]
+    alias = {("48c93cef-aaa", "S1"): "G2", ("1aedb093-bbb", "S1"): "G2"}
+    oncam = {"48c93cef-aaa": "G1", "1aedb093-bbb": "G2"}
+    block = fm._dups_block(summary, alias=alias, oncam=oncam)
+    assert "tg1 speaker:G2" in block, block                      # beat speaker up front
+    assert "48c93cef:m22 G2 off-cam shows:G1" in block, block    # other camera = reaction angle
+    assert "1aedb093:m14 G2 on-cam shows:G2" in block, block
+    print("ok  test_coverage_group_names_beat_speaker")
+
+
 def test_moment_line_aliases_global_speaker():
     """A per-line speaker is shown as its global person id when the registry
     linked it; without the alias it falls back to the raw voice."""
@@ -297,6 +340,8 @@ def main():
     test_coverage_group_renders_member_facts_no_use_one()
     test_reconciled_shows_face_and_cam_override()
     test_coverage_group_carries_shown_face()
+    test_speaker_resolves_from_raw_handle_not_label()
+    test_coverage_group_names_beat_speaker()
     test_moment_line_aliases_global_speaker()
     test_source_contiguous_beats_form_a_run_channel_agnostic()
     test_default_energy_from_genre()
