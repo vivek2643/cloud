@@ -48,6 +48,28 @@ GRAN_SPLIT_MIN_MS = 1600
 # fraction of the beat's own span).
 VIDEO_CORE_FLOOR_MS = 750
 
+# --- Anchor-aware video tightness (cuts_v2_boundaries.plan follow-on) --------
+# Tightness shrinks a video cut to its important core, but must NEVER trim off
+# a real "payoff" instant (a ball-hit, an impact, an audio crack). So the inset
+# is ANCHORED: the kept core is guaranteed to contain every anchor found inside
+# the cut. Anchors are the SPARSE, genuinely-important instants only -- L1
+# subject-motion impacts (action_points) + sharp audio-energy onsets -- NOT
+# every motion wiggle (that would keep everything and defeat tightness). A cut
+# with no anchors falls back to the plain peak-inset. This is the concrete
+# encoding of "nothing important is ever missed" while still trimming dead time.
+#
+# Breathing room kept on each side of the anchor envelope (so a hit isn't
+# clipped flush at frame zero -- keeps the wind-up / follow-through readable).
+ANCHOR_PAD_MS = 250
+
+# An audio ONSET anchor: a rise of at least this many dB over one prosody hop
+# in the rms_db envelope -- a percussive transient (impact/crack/clap) that
+# optical flow alone tends to miss (flow peaks on the swing, not the contact).
+AUDIO_ANCHOR_RISE_DB = 6.0
+# Minimum spacing between audio-onset anchors, so one loud event isn't counted
+# as a dozen adjacent anchors.
+AUDIO_ANCHOR_MIN_GAP_MS = 300
+
 # --- Boundary snapping / merge -----------------------------------------------
 # Two claimed cuts touching within this gap (after snapping) are the same
 # continuous run, not two separate cuts with a hairline seam between them.

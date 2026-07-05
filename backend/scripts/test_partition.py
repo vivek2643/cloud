@@ -265,6 +265,62 @@ def test_partition_clip_tightens_video_more_at_sharp_than_balanced():
     print("ok  test_partition_clip_tightens_video_more_at_sharp_than_balanced")
 
 
+def test_partition_clip_tightness_keeps_an_impact_near_the_edge():
+    """Anchor-aware tightness: a segment whose only payoff (an L1 action
+    impact) sits near its END must still contain that impact after tightening
+    -- even though the flat energy/blur would otherwise inset toward the clip
+    START (the adversarial 'peak is nowhere near the moment that matters'
+    case that used to drop the ball-hit)."""
+    n = 10_000 // 100 + 1
+    motion = {
+        "hop_ms": 100,
+        "action_energy": [0.05] * n,          # flat -> one whole-clip `shown` segment
+        "camera_stability": [0.95] * n, "camera_motion": [0.02] * n,
+        "blur": [0.5] * n,                     # flat -> `shown` peak lands at ts 0
+        "action_points": [{"ts_ms": 9000, "kind": "action_impact", "score": 1.0}],
+    }
+    clip = _clip(10_000, motion=motion)
+    cuts = pt.partition_clip(clip, energy=0.9)          # Sharp -> tightness on
+    hit = [c for c in cuts if c.src_in_ms <= 9000 <= c.src_out_ms]
+    assert hit, ("impact at 9000 fell into no cut", cuts)
+    c = hit[0]
+    assert c.src_out_ms - c.src_in_ms < 10_000, ("cut was not tightened at all", c)
+    print("ok  test_partition_clip_tightness_keeps_an_impact_near_the_edge")
+
+
+def test_partition_clip_all_action_keeps_nearly_the_whole_span():
+    """'If the clip is all action, show (almost) the whole thing.' Impacts
+    spread across the clip can't tighten without dropping one, so the anchor
+    envelope keeps a span covering every impact."""
+    n = 10_000 // 100 + 1
+    motion = {
+        "hop_ms": 100,
+        "action_energy": [0.05] * n,
+        "camera_stability": [0.95] * n, "camera_motion": [0.02] * n,
+        "blur": [0.5] * n,
+        "action_points": [{"ts_ms": t, "kind": "action_impact", "score": 1.0}
+                         for t in (1000, 3000, 5000, 7000, 9000)],
+    }
+    clip = _clip(10_000, motion=motion)
+    cuts = pt.partition_clip(clip, energy=0.9)
+    span = [c for c in cuts if c.src_in_ms <= 5000 <= c.src_out_ms][0]
+    assert span.src_in_ms <= 1000 and span.src_out_ms >= 9000, ("dropped an impact", span)
+    print("ok  test_partition_clip_all_action_keeps_nearly_the_whole_span")
+
+
+def test_audio_onset_is_an_anchor_flow_misses():
+    """An audio transient (a 'crack') with no motion signal at all is still an
+    anchor tightness must keep -- the case flow alone can't see."""
+    anchors = pt._video_anchors(
+        motion={"hop_ms": 100, "action_energy": [], "action_points": []},
+        audio={"prosody_hop_ms": 100,
+               "rms_db": [-40.0] * 50 + [-30.0] + [-40.0] * 49},  # +10 dB jump at ts 5000
+        s=0, e=10_000,
+    )
+    assert 5000 in anchors, anchors
+    print("ok  test_audio_onset_is_an_anchor_flow_misses")
+
+
 def test_partition_clip_is_deterministic():
     """Same artifacts, same energy -> identical cuts every time (no hidden
     randomness/ordering dependence)."""
@@ -294,6 +350,9 @@ def main():
     test_partition_clip_respects_a_hard_shot_cut_even_at_broad()
     test_partition_clip_multiple_thoughts_with_speakers()
     test_partition_clip_tightens_video_more_at_sharp_than_balanced()
+    test_partition_clip_tightness_keeps_an_impact_near_the_edge()
+    test_partition_clip_all_action_keeps_nearly_the_whole_span()
+    test_audio_onset_is_an_anchor_flow_misses()
     test_partition_clip_is_deterministic()
     print("\nall partition tests passed")
 

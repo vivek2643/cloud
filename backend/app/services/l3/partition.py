@@ -45,6 +45,9 @@ from app.services.l1 import fused_seams as fseams
 from app.services.l3 import vocab
 from app.services.l3.energy import energy_band, energy_to_params
 from app.services.l3.partition_params import (
+    ANCHOR_PAD_MS,
+    AUDIO_ANCHOR_MIN_GAP_MS,
+    AUDIO_ANCHOR_RISE_DB,
     DEFAULT_SNAP_ENERGY,
     MERGE_GAP_MS,
     MIN_SUBUNIT_MS,
@@ -459,7 +462,9 @@ def _assert_non_overlap(cuts: List[Cut]) -> None:
 def _core_inset(core_in: int, core_out: int, peak: int, target: Optional[int],
                 *, lead_frac: float = 0.5) -> Tuple[int, int]:
     """Inset [core_in, core_out] toward ``peak`` to ``target`` ms, keeping
-    ``lead_frac`` of the window before the peak. Only ever shrinks."""
+    ``lead_frac`` of the window before the peak. Only ever shrinks. The
+    anchor-less fallback: used when a cut has no detected payoff instant to
+    protect, so the plain peak is the best (only) thing to center on."""
     if not target or core_out - core_in <= target:
         return core_in, core_out
     peak = max(core_in, min(peak, core_out))
@@ -470,16 +475,82 @@ def _core_inset(core_in: int, core_out: int, peak: int, target: Optional[int],
     return ci, co
 
 
-def _tighten_video(placed: List[_Placed], energy: float) -> List[_Placed]:
+def _audio_onset_anchors(rms_db: List[float], hop_ms: int, s: int, e: int) -> List[int]:
+    """Instants in [s, e) where the rms_db envelope jumps by at least
+    AUDIO_ANCHOR_RISE_DB over one hop -- a percussive transient (impact,
+    ball-crack, clap) that optical flow tends to miss because flow peaks on the
+    swing, not the contact. De-duplicated to one anchor per
+    AUDIO_ANCHOR_MIN_GAP_MS so a single loud event isn't counted many times."""
+    if not rms_db or hop_ms <= 0:
+        return []
+    lo = max(1, s // hop_ms)
+    hi = min(len(rms_db) - 1, (e - 1) // hop_ms)
+    out: List[int] = []
+    last = -AUDIO_ANCHOR_MIN_GAP_MS
+    for i in range(lo, hi + 1):
+        if rms_db[i] - rms_db[i - 1] >= AUDIO_ANCHOR_RISE_DB:
+            t = i * hop_ms
+            if s <= t < e and t - last >= AUDIO_ANCHOR_MIN_GAP_MS:
+                out.append(t)
+                last = t
+    return out
+
+
+def _video_anchors(motion: Optional[dict], audio: Optional[dict], s: int, e: int) -> List[int]:
+    """The important instants inside a video cut that tightness must NOT trim
+    off: L1 subject-motion impacts (``action_points``) + sharp audio onsets.
+    Deliberately SPARSE -- only genuine payoff moments, not every motion
+    wiggle -- so a normal cut still insets tight, while a cut that contains a
+    real impact keeps that impact. Sorted, clamped to (s, e)."""
+    m, a = motion or {}, audio or {}
+    anchors = {int(p["ts_ms"]) for p in (m.get("action_points") or [])
+               if isinstance(p, dict) and "ts_ms" in p and s <= int(p["ts_ms"]) < e}
+    anchors.update(_audio_onset_anchors(
+        a.get("rms_db") or [], int(a.get("prosody_hop_ms") or 0), s, e))
+    return sorted(anchors)
+
+
+def _anchored_inset(s: int, e: int, peak: int, target: int, anchors: List[int]) -> Tuple[int, int]:
+    """Shrink [s, e] toward its important core to ~``target`` ms, but GUARANTEE
+    the kept core contains every anchor (with ANCHOR_PAD_MS breathing room).
+    Only ever shrinks. With no anchors, falls back to the plain peak inset.
+
+    When the anchor envelope is already wider than ``target``, the envelope
+    WINS -- the core stays as wide as needed to hold every payoff instant
+    (this is exactly the "clip is all action -> keep (almost) the whole thing"
+    case: many spread-out anchors => the core can't shrink without dropping
+    one, so it doesn't)."""
+    if e - s <= target:
+        return s, e
+    if not anchors:
+        return _core_inset(s, e, peak, target)
+    a0, a1 = anchors[0], anchors[-1]
+    lo, hi = a0 - ANCHOR_PAD_MS, a1 + ANCHOR_PAD_MS
+    if hi - lo < target:                      # pad out to the desired tightness
+        extra = target - (hi - lo)
+        lo -= extra // 2
+        hi = lo + target
+    # Guarantee containment of every anchor, then clamp inside the cut. Clamping
+    # can only pull the bounds further OUTWARD toward an anchor, never past it,
+    # so no anchor is ever excluded -- the core-contains-anchors invariant.
+    lo = max(s, min(lo, a0))
+    hi = min(e, max(hi, a1))
+    return lo, hi
+
+
+def _tighten_video(placed: List[_Placed], energy: float,
+                   motion: Optional[dict], audio: Optional[dict]) -> List[_Placed]:
     """The energy dial's TIGHTNESS effect on VIDEO cuts (done/shown), layered
     on top of the already-claimed partition (said is left untouched here):
-    peak-inset each cut (negative padding) toward its own peak. At Balanced
-    and below, ``done_core_frac``/``shown_core_frac`` are None, so nothing
-    changes -- the default feed stays a contiguous filmstrip. GRANULARITY
-    (how many video cuts there are) is decided upstream, in
+    ANCHOR-AWARE peak-inset. Each cut shrinks toward its important core, but the
+    core is guaranteed to contain every payoff instant inside the cut (L1
+    impacts + audio onsets) -- tightness trims dead time, never a moment that
+    matters. At Balanced and below, ``done_core_frac``/``shown_core_frac`` are
+    None, so nothing changes -- the default feed stays a contiguous filmstrip.
+    GRANULARITY (how many video cuts there are) is decided upstream, in
     ``video_segments.segment_video`` -- this is tightness only, so it never
-    splits and never extends (extension would break the non-overlap
-    invariant); only ever shrinks within the claimed span."""
+    splits and never extends (extension would break the non-overlap invariant);
+    only ever shrinks within the claimed span."""
     params = energy_to_params(energy)
     for p in placed:
         if p.primary not in (vocab.CHANNEL_DONE, vocab.CHANNEL_SHOWN):
@@ -488,7 +559,14 @@ def _tighten_video(placed: List[_Placed], energy: float) -> List[_Placed]:
         if frac is None:
             continue
         target = max(VIDEO_CORE_FLOOR_MS, int(round(frac * (p.end_ms - p.start_ms))))
-        p.start_ms, p.end_ms = _core_inset(p.start_ms, p.end_ms, p.peak_ms, target)
+        anchors = _video_anchors(motion, audio, p.start_ms, p.end_ms)
+        new_in, new_out = _anchored_inset(p.start_ms, p.end_ms, p.peak_ms, target, anchors)
+        # The invariant this whole change exists to enforce: tightness may drop
+        # dead time, but must never trim an important instant out of its cut.
+        assert all(new_in <= t <= new_out for t in anchors), (
+            f"anchored tightness dropped an anchor: cut [{new_in},{new_out}] "
+            f"anchors={anchors}")
+        p.start_ms, p.end_ms = new_in, new_out
     return placed
 
 
@@ -515,7 +593,9 @@ def partition_clip(clip: ClipArtifacts, energy: float = DEFAULT_SNAP_ENERGY) -> 
         turn) -- see ``_said_candidates``.
       * GRANULARITY for video (how many camera-settle/subject-beat boundaries
         ``video_segments.segment_video`` admits) -- see ``_video_candidates``.
-      * TIGHTNESS for video (peak-inset each claimed cut) -- ``_tighten_video``.
+      * TIGHTNESS for video (anchor-aware peak-inset -- shrinks each claimed
+        cut toward its core but never trims off a payoff instant) --
+        ``_tighten_video``.
       * TIGHTNESS for said (breath excision) is layered on separately, in
         ``tightness.py`` -- it never changes a said cut's own boundaries."""
     candidates = (
@@ -525,7 +605,7 @@ def partition_clip(clip: ClipArtifacts, energy: float = DEFAULT_SNAP_ENERGY) -> 
     field = _build_field(clip)
     placed = _claim(candidates, field, clip.duration_ms)
     placed = _merge_continuous(placed, clip.scene)
-    placed = _tighten_video(placed, energy)
+    placed = _tighten_video(placed, energy, clip.motion, clip.audio)
     placed.sort(key=lambda p: p.start_ms)
     cuts = [_to_cut(clip.file_id, p) for p in placed]
     _assert_non_overlap(cuts)

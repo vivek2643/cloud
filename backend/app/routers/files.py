@@ -318,22 +318,37 @@ def get_hero_cuts_feed(
 # --------------------------------------------------------------------------
 
 def _build_cuts_for(file_ids: List[str], energy: float = 0.5) -> List[dict]:
-    """Partition every file into its non-overlapping, tag-bearing cuts at
-    ``energy`` (as plain dicts, each with a convenience ``duration_ms``).
-    Best-effort per file: a partition failure yields no cuts for that file,
-    never a 500."""
-    from app.services.l3.partition import build_partition
+    """Partition every file into its non-overlapping BASE cuts (the robust,
+    deterministic skeleton -- shot cut / speaker change / speech edge / long
+    pause / camera move / disturbance; no dial, no actions, no junk). ``energy``
+    is accepted for API compatibility but currently unused (base layer is
+    energy-independent). Best-effort per file: a failure yields no cuts for that
+    file, never a 500."""
+    from app.services.l3.base_cuts import build_base_cuts
 
     out: List[dict] = []
     for fid in file_ids:
         try:
-            cuts = build_partition(fid, energy)
+            cuts = build_base_cuts(fid)
         except Exception:
-            logger.exception("cuts v2: partition failed for %s", fid)
+            logger.exception("cuts v2: base partition failed for %s", fid)
             continue
         for c in cuts:
-            d = c.to_dict()
-            d["duration_ms"] = c.src_out_ms - c.src_in_ms
+            primary = "said" if c.kind == "speech" else "shown"
+            d = {
+                "file_id": c.file_id,
+                "src_in_ms": c.start_ms,
+                "src_out_ms": c.end_ms,
+                "tags": [primary],
+                "primary": primary,
+                # Surface WHY each edge exists so boundary quality is visible on
+                # the tile (temporary, for the base-cuts bring-up).
+                "label": f"{c.reason_in} \u2192 {c.reason_out}",
+                "speaker": c.speaker,
+                "peak_ms": (c.start_ms + c.end_ms) // 2,
+                "keep_spans": None,
+            }
+            d["duration_ms"] = c.end_ms - c.start_ms
             out.append(d)
     out.sort(key=lambda d: (d["file_id"], d["src_in_ms"]))
     return out
