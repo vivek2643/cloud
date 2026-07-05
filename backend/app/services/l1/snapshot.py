@@ -146,7 +146,8 @@ def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
                    is_musical, bpm,
                    onsets_ms, silence_intervals,
                    dialogue_cut_cost, dialogue_cut_hop_ms, dialogue_cut_points,
-                   beat_cut_cost, beat_cut_hop_ms, beat_cut_points
+                   beat_cut_cost, beat_cut_hop_ms, beat_cut_points,
+                   prosody_hop_ms, f0_hz
               from audio_features where file_id = %s
             """,
             (file_id,),
@@ -175,6 +176,10 @@ def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
                 "beat_cut_cost": af["beat_cut_cost"] or [],
                 "beat_cut_points": af["beat_cut_points"] or [],
                 "beat_cut_point_count": len(af["beat_cut_points"] or []),
+                # Pitch/f0 track (cuts-v2 Phase C2), same hop as rms_db. Empty
+                # on a clip indexed before this landed (needs a re-analyze).
+                "prosody_hop_ms": af["prosody_hop_ms"],
+                "f0_hz": af["f0_hz"] or [],
             }
 
         # Motion dynamics (action + camera/distortion) -- video-derived, own table.

@@ -28,12 +28,25 @@ OVERLAP_TAG_FRAC = 0.60
 # sub-units) without producing unusable micro-cuts.
 MIN_SUBUNIT_MS = 300
 
-# --- DONE candidates (action rise -> peak -> fall, bounded by calm) ---------
-# An action window expands outward from its impact while motion energy (file-
-# normalized 0..1, see motion_dynamics.normalize_pctl) stays above this floor;
-# the floor IS the "calm" baseline the plan's B2 algorithm names.
-ACTION_CALM_PCTL = 40.0
-DONE_MIN_MS = 400
+# --- Video segment sub-split floor ------------------------------------------
+# A camera-based video segment (see video_segments.py, cuts_v2_boundaries.plan
+# Phase C1) must be at least this long before the dial's granularity axis will
+# even consider sub-splitting it at a subject-motion beat -- too short to be
+# worth it otherwise. Retired the old impact-WINDOW `done` detector
+# (`ACTION_CALM_PCTL`/`DONE_MIN_MS`) it used to belong to; kept the same
+# constant/value since the "how long before we bother subdividing further"
+# meaning carried over cleanly.
+GRAN_SPLIT_MIN_MS = 1600
+
+# The tightest a video beat ever insets to (the peak-inset floor for done/shown)
+# -- a FLOOR (minimum), never a ceiling; low energy keeps cuts full-length.
+# v2-specific -- overrides energy.CORE_FLOOR_MS (600). Retuned per
+# cuts_v2_boundaries.plan's "Tightness floor retune": a ~700-800ms safety net,
+# not a full 1s -- let the per-band fraction do the work so cuts *generally*
+# land ~1s but can dip a little under for a genuinely short beat. A beat whose
+# proportional core is larger still keeps the larger core (the inset is a
+# fraction of the beat's own span).
+VIDEO_CORE_FLOOR_MS = 750
 
 # --- Boundary snapping / merge -----------------------------------------------
 # Two claimed cuts touching within this gap (after snapping) are the same

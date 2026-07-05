@@ -5,8 +5,11 @@ import { useAuthStore } from "@/stores/auth-store";
 import { useDriveStore } from "@/stores/drive-store";
 import { getCutsFeed, getFilePlaybackUrl, type Cut, type FileRecord } from "@/lib/api";
 import { cn } from "@/lib/utils";
-import { Scissors, Play, ChevronDown, Check, GripVertical } from "lucide-react";
+import { Scissors, Play, ChevronDown, Check, GripVertical, Volume2, VolumeX } from "lucide-react";
 import { EditButton } from "./search-edit-bar";
+
+const ENERGY_LABELS = ["Broad", "Calm", "Balanced", "Tight", "Sharp"];
+const energyLabel = (e: number) => ENERGY_LABELS[Math.min(4, Math.round(e * 4))];
 
 // Cuts v2 (see cuts_v2.plan.md). One video = one horizontal row of its
 // deterministic, NON-OVERLAPPING partition. Every cut carries >=1 tag
@@ -19,7 +22,6 @@ const FILTERS: { key: FilterKey; label: string }[] = [
   { key: "all", label: "All" },
   { key: "said", label: "Said" },
   { key: "done", label: "Done" },
-  { key: "shown", label: "Shown" },
 ];
 
 // Uniform tile width per orientation -- large, matching the old hero tiles.
@@ -47,6 +49,7 @@ export function CutsView() {
   const token = useAuthStore((s) => s.session?.access_token);
   const files = useDriveStore((s) => s.files);
   const [filter, setFilter] = useState<FilterKey>("all");
+  const [energy, setEnergy] = useState(0.5);
   const [orientation, setOrientation] = useState<"landscape" | "portrait">("landscape");
   const [fit, setFit] = useState<"adjusted" | "original">("adjusted");
   const [cuts, setCuts] = useState<Cut[]>([]);
@@ -75,22 +78,25 @@ export function CutsView() {
     }
     let cancelled = false;
     setLoading(true);
-    getCutsFeed(candidateIds, token)
-      .then((r) => {
-        if (cancelled) return;
-        setCuts(r.cuts ?? []);
-        setLoading(false);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setCuts([]);
-        setLoading(false);
-      });
+    const t = setTimeout(() => {
+      getCutsFeed(candidateIds, energy, token)
+        .then((r) => {
+          if (cancelled) return;
+          setCuts(r.cuts ?? []);
+          setLoading(false);
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setCuts([]);
+          setLoading(false);
+        });
+    }, 250);
     return () => {
       cancelled = true;
+      clearTimeout(t);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token, candidateKey]);
+  }, [token, candidateKey, energy]);
 
   const getUrl = useCallback(
     (fileId: string): Promise<string | null> => {
@@ -105,9 +111,13 @@ export function CutsView() {
     [token]
   );
 
+  // All cuts stay in the feed (incl. shown) -- we just never WRITE the word
+  // "shown" on a tile (no shown badge, no shown label); see CutCard.
+  const displayCuts = cuts;
+
   // Group by file -> per-video row, each row's cuts in source order.
   const rows = useMemo(() => {
-    const present = cuts.filter((c) => filesById[c.file_id]);
+    const present = displayCuts.filter((c) => filesById[c.file_id]);
     const byFile: Record<string, Cut[]> = {};
     for (const c of present) (byFile[c.file_id] ??= []).push(c);
     return Object.entries(byFile)
@@ -117,7 +127,7 @@ export function CutsView() {
         cuts: [...list].sort((a, b) => a.src_in_ms - b.src_in_ms),
       }))
       .sort((a, b) => a.fileName.localeCompare(b.fileName));
-  }, [cuts, filesById]);
+  }, [displayCuts, filesById]);
 
   // Keep a user-reorderable order of the rows: preserve manual moves, append
   // any newly-arrived videos at the end, drop ones that vanished.
@@ -143,27 +153,16 @@ export function CutsView() {
     const c: Record<string, number> = {};
     for (const f of FILTERS) {
       if (f.key === "all") continue;
-      c[f.key] = cuts.filter((cut) => includesTag(cut, f.key)).length;
+      c[f.key] = displayCuts.filter((cut) => includesTag(cut, f.key)).length;
     }
     return c;
-  }, [cuts]);
+  }, [displayCuts]);
 
   const toggle = useCallback((key: string) => {
     setSelected((prev) => {
       const next = new Set(prev);
       if (next.has(key)) next.delete(key);
       else next.add(key);
-      return next;
-    });
-  }, []);
-
-  const setRowSelection = useCallback((rowCuts: Cut[], on: boolean) => {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      for (const c of rowCuts) {
-        if (on) next.add(cutKey(c));
-        else next.delete(cutKey(c));
-      }
       return next;
     });
   }, []);
@@ -204,7 +203,7 @@ export function CutsView() {
       {/* Dropdowns: category (left) + framing (orientation / fit); Edit right. */}
       <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-2.5">
-          <TagDropdown value={filter} counts={counts} total={cuts.length} onChange={setFilter} />
+          <TagDropdown value={filter} counts={counts} total={displayCuts.length} onChange={setFilter} />
           <PillDropdown
             options={["Landscape", "Portrait"]}
             value={orientation === "landscape" ? "Landscape" : "Portrait"}
@@ -217,6 +216,12 @@ export function CutsView() {
           />
         </div>
         <EditButton />
+      </div>
+
+      {/* Energy dial: tightness for every cut + windup/payoff split for
+          done/shown at the high (Tight/Sharp) end. */}
+      <div className="mb-7">
+        <EnergyBar value={energy} onChange={setEnergy} />
       </div>
 
       {loading && (
@@ -241,7 +246,6 @@ export function CutsView() {
           {orderedRows.map((row) => {
             const visible = row.cuts.filter((c) => includesTag(c, filter));
             if (visible.length === 0) return null;
-            const allSelected = visible.every((c) => selected.has(cutKey(c)));
             const total = visible.reduce((n, c) => n + c.duration_ms, 0);
             return (
               <div
@@ -272,13 +276,6 @@ export function CutsView() {
                     {visible.length} cuts · {fmtDur(total)}
                   </span>
                   <div className="h-px flex-1" style={{ background: "var(--border)" }} />
-                  <button
-                    onClick={() => setRowSelection(visible, !allSelected)}
-                    className="shrink-0 text-xs transition-colors hover:text-[var(--foreground)]"
-                    style={{ color: "var(--muted)" }}
-                  >
-                    {allSelected ? "Clear" : "Select all"}
-                  </button>
                 </div>
                 <div className="-mx-1 flex overflow-x-auto px-1 pb-2">
                   {visible.map((c, i) => {
@@ -384,6 +381,82 @@ function TagDropdown({
   );
 }
 
+function EnergyBar({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+  const trackRef = useRef<HTMLDivElement>(null);
+  const valueRef = useRef(value);
+  valueRef.current = value;
+
+  const apply = useCallback(
+    (clientX: number, isClick: boolean) => {
+      const el = trackRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const t = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+      let snapped = Math.round(t * 4) / 4;
+      const cur = valueRef.current;
+      if (isClick && snapped === cur) {
+        if (t > cur) snapped = Math.min(1, cur + 0.25);
+        else if (t < cur) snapped = Math.max(0, cur - 0.25);
+      }
+      if (snapped !== cur) onChange(snapped);
+    },
+    [onChange]
+  );
+
+  const handlePointerDown = useCallback(
+    (e: React.PointerEvent) => {
+      e.preventDefault();
+      apply(e.clientX, true);
+      const move = (ev: PointerEvent) => apply(ev.clientX, false);
+      const up = () => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+    },
+    [apply]
+  );
+
+  return (
+    <div className="mx-auto flex w-3/4 items-center gap-4">
+      <span className="shrink-0 pl-1 text-sm font-medium" style={{ color: "var(--foreground)" }}>
+        Energy
+      </span>
+      <div
+        ref={trackRef}
+        onPointerDown={handlePointerDown}
+        className="relative flex-1 cursor-pointer select-none py-4"
+        style={{ touchAction: "none" }}
+      >
+        <div className="h-px w-full rounded-full" style={{ background: "rgba(255,255,255,0.16)" }} />
+        <div
+          className="absolute left-0 top-1/2 h-px -translate-y-1/2 rounded-full"
+          style={{
+            width: `${value * 100}%`,
+            background: "var(--foreground)",
+            transition: "width 0.35s cubic-bezier(0.22, 1, 0.36, 1)",
+          }}
+        />
+        <div
+          className="absolute top-1/2 h-3.5 w-[3px] -translate-y-1/2 rounded-full"
+          style={{
+            left: `calc(${value * 100}% - 1.5px)`,
+            background: "var(--foreground)",
+            transition: "left 0.35s cubic-bezier(0.22, 1, 0.36, 1)",
+          }}
+        />
+      </div>
+      <span
+        className="inline-flex min-w-[74px] shrink-0 items-center justify-center rounded-md px-3 py-1 text-xs font-semibold"
+        style={{ background: "var(--accent)", color: "var(--background)" }}
+      >
+        {energyLabel(value)}
+      </span>
+    </div>
+  );
+}
+
 function PillDropdown({
   options,
   value,
@@ -466,6 +539,7 @@ function CutCard({
   onDeactivate: () => void;
 }) {
   const [playUrl, setPlayUrl] = useState<string | null>(null);
+  const [muted, setMuted] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const inSec = cut.src_in_ms / 1000;
   const outSec = cut.src_out_ms / 1000;
@@ -488,7 +562,7 @@ function CutCard({
       } catch {
         /* ignore */
       }
-      v.muted = true;
+      v.muted = muted;
       v.play().catch(() => {});
     } else {
       v.pause();
@@ -499,7 +573,7 @@ function CutCard({
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isActive, playUrl]);
+  }, [isActive, playUrl, muted]);
 
   function onLoadedMetadata() {
     const v = videoRef.current;
@@ -572,7 +646,7 @@ function CutCard({
             src={`${playUrl}#t=${peakSec.toFixed(2)}`}
             playsInline
             preload="metadata"
-            muted
+            muted={muted}
             draggable={false}
             onLoadedMetadata={onLoadedMetadata}
             onTimeUpdate={onTimeUpdate}
@@ -581,21 +655,24 @@ function CutCard({
           />
         )}
 
-        {/* Tag badges (top-left): primary first, then any extra tags. Neutral
-            chips -- the palette stays b/w/grey; the words carry the meaning. */}
+        {/* Tag badges (top-left): primary first, then any extra tags. "shown"
+            is never written on a tile. Neutral chips -- the palette stays
+            b/w/grey; the words carry the meaning. */}
         <div className="absolute left-2 top-2 z-20 flex items-center gap-1">
-          {cut.tags.map((t) => (
-            <span
-              key={t}
-              className="rounded px-1.5 py-0.5 text-[11px] font-semibold capitalize"
-              style={{
-                background: t === cut.primary ? "rgba(255,255,255,0.92)" : "rgba(0,0,0,0.6)",
-                color: t === cut.primary ? "#000" : "#fff",
-              }}
-            >
-              {t}
-            </span>
-          ))}
+          {cut.tags
+            .filter((t) => t !== "shown")
+            .map((t) => (
+              <span
+                key={t}
+                className="rounded px-1.5 py-0.5 text-[11px] font-semibold capitalize"
+                style={{
+                  background: t === cut.primary ? "rgba(255,255,255,0.92)" : "rgba(0,0,0,0.6)",
+                  color: t === cut.primary ? "#000" : "#fff",
+                }}
+              >
+                {t}
+              </span>
+            ))}
         </div>
 
         {/* Selected tick (top-right). */}
@@ -606,6 +683,22 @@ function CutCard({
           >
             <Check size={14} />
           </span>
+        )}
+
+        {/* Mute toggle -- cards play with sound by default; sits left of the
+            selected tick so they never overlap. */}
+        {playUrl && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              setMuted((m) => !m);
+            }}
+            className="absolute top-2 z-20 flex items-center justify-center rounded-full p-1.5 text-white transition-colors hover:bg-black/40"
+            style={{ right: selected ? 36 : 8, background: "rgba(0,0,0,0.55)" }}
+            title={muted ? "Unmute" : "Mute"}
+          >
+            {muted ? <VolumeX size={14} /> : <Volume2 size={14} />}
+          </button>
         )}
 
         {/* Hover play hint. */}
@@ -627,7 +720,7 @@ function CutCard({
         )}
       </div>
       <p className="mt-2 line-clamp-2 px-0.5 text-sm leading-snug" style={{ minHeight: "2.5em" }}>
-        {cut.label || <em style={{ color: "var(--muted)" }}>(no label)</em>}
+        {cut.primary === "shown" ? "" : cut.label}
       </p>
     </div>
   );

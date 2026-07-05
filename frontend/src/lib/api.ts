@@ -269,17 +269,18 @@ export interface CutsResponse {
   ready: boolean;
 }
 
-export function getCuts(fileId: string, token: string) {
-  return request<CutsResponse>(`/api/files/${fileId}/cuts`, { token });
+export function getCuts(fileId: string, energy: number, token: string) {
+  return request<CutsResponse>(`/api/files/${fileId}/cuts?energy=${energy}`, { token });
 }
 
 // One flat list of cuts across many clips; the client groups by file_id into
-// per-video horizontal rows.
-export function getCutsFeed(fileIds: string[], token: string) {
+// per-video horizontal rows. `energy` is the dial: tightness for all cuts +
+// windup/payoff granularity split for done/shown at the high end.
+export function getCutsFeed(fileIds: string[], energy: number, token: string) {
   return request<CutsResponse>(`/api/files/cuts`, {
     method: "POST",
     token,
-    body: JSON.stringify({ file_ids: fileIds }),
+    body: JSON.stringify({ file_ids: fileIds, energy }),
   });
 }
 

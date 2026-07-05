@@ -1,10 +1,12 @@
 """
-Tests for cuts-v2 tightness (Phase B3) -- no DB.
+Tests for cuts-v2 SAID tightness -- no DB.
 
-Tightness applies ONLY on top of an already-partitioned Cut: breath excision
-for a said-primary cut, peak inset for a done/shown-primary cut. It never
-re-scopes a cut's own [src_in_ms, src_out_ms] claim boundaries (that's
-partition.py's job). Run:  .venv/bin/python scripts/test_tightness.py
+Tightness here applies ONLY to said-primary cuts (breath excision into
+keep_spans); it never re-scopes a cut's own [src_in_ms, src_out_ms] claim
+boundaries. Video (done/shown) tightness + granularity moved into
+partition.py's `_tighten_video` (cuts_v2_boundaries.plan.md Phase C1), so a
+done/shown cut passes through this module UNCHANGED -- applying inset again
+here would double-tighten it. Run:  .venv/bin/python scripts/test_tightness.py
 """
 from __future__ import annotations
 
@@ -69,37 +71,33 @@ def test_said_without_words_is_a_safe_noop():
     print("ok  test_said_without_words_is_a_safe_noop")
 
 
-def test_done_insets_toward_peak_at_sharp():
-    """A done cut at Sharp energy insets hard toward its peak (a banger)."""
-    cut = _cut(vocab.CHANNEL_DONE, 1000, 5000, peak_ms=3000)   # 4000ms span
-    out = tt.apply_tightness(cut, energy=0.95)
-    assert out.src_out_ms - out.src_in_ms < 4000, (out.src_in_ms, out.src_out_ms)
-    assert out.src_in_ms <= 3000 <= out.src_out_ms, out   # peak stays inside
-    assert out.src_in_ms >= 1000 and out.src_out_ms <= 5000   # never widens past the claim
-    print("ok  test_done_insets_toward_peak_at_sharp")
-
-
-def test_shown_unchanged_below_tight_band():
-    """Below the Tight band edge (0.6), done/shown core_frac is None -- the
-    cut is returned unchanged (Broad..Balanced keep the full beat)."""
-    cut = _cut(vocab.CHANNEL_SHOWN, 2000, 6000, peak_ms=4000)
-    out = tt.apply_tightness(cut, energy=0.3)
-    assert (out.src_in_ms, out.src_out_ms) == (2000, 6000), out
-    print("ok  test_shown_unchanged_below_tight_band")
+def test_done_and_shown_cuts_pass_through_unchanged():
+    """A done/shown cut is already tightened by partition_clip -- this module
+    must leave it exactly as-is (no re-inset), at any energy."""
+    done = _cut(vocab.CHANNEL_DONE, 1000, 5000, peak_ms=3000)
+    shown = _cut(vocab.CHANNEL_SHOWN, 2000, 6000, peak_ms=4000)
+    for energy in (0.1, 0.5, 0.95):
+        out_done = tt.apply_tightness(done, energy=energy)
+        out_shown = tt.apply_tightness(shown, energy=energy)
+        assert (out_done.src_in_ms, out_done.src_out_ms) == (1000, 5000), (energy, out_done)
+        assert (out_shown.src_in_ms, out_shown.src_out_ms) == (2000, 6000), (energy, out_shown)
+    print("ok  test_done_and_shown_cuts_pass_through_unchanged")
 
 
 def test_apply_tightness_does_not_mutate_the_input_cut():
     """Pure: the original Cut object is untouched."""
-    cut = _cut(vocab.CHANNEL_DONE, 1000, 5000, peak_ms=3000)
+    cut = _cut(vocab.CHANNEL_SAID, 0, 5000)
+    words = _words((0, 800), (900, 1800), (4000, 4800))
     before = (cut.src_in_ms, cut.src_out_ms, cut.keep_spans)
-    tt.apply_tightness(cut, energy=0.95)
+    tt.apply_tightness(cut, energy=0.95, words=words)
     after = (cut.src_in_ms, cut.src_out_ms, cut.keep_spans)
     assert before == after, (before, after)
     print("ok  test_apply_tightness_does_not_mutate_the_input_cut")
 
 
 def test_apply_tightness_all_routes_words_by_file():
-    """The batch helper looks up each cut's words by its own file_id."""
+    """The batch helper looks up each said cut's words by its own file_id;
+    the done cut in a different file passes through unchanged."""
     said = _cut(vocab.CHANNEL_SAID, 0, 5000)
     done = Cut(file_id="f2", src_in_ms=1000, src_out_ms=5000, tags=[vocab.CHANNEL_DONE],
               primary=vocab.CHANNEL_DONE, label="x", peak_ms=3000)
@@ -108,7 +106,7 @@ def test_apply_tightness_all_routes_words_by_file():
     said_out = next(c for c in out if c.file_id == "f1")
     done_out = next(c for c in out if c.file_id == "f2")
     assert said_out.keep_spans is not None
-    assert done_out.src_out_ms - done_out.src_in_ms < 4000
+    assert (done_out.src_in_ms, done_out.src_out_ms) == (1000, 5000)
     print("ok  test_apply_tightness_all_routes_words_by_file")
 
 
@@ -116,8 +114,7 @@ def main():
     test_said_breath_removal_at_sharp_excises_long_gap()
     test_said_no_qualifying_gap_leaves_keep_spans_none()
     test_said_without_words_is_a_safe_noop()
-    test_done_insets_toward_peak_at_sharp()
-    test_shown_unchanged_below_tight_band()
+    test_done_and_shown_cuts_pass_through_unchanged()
     test_apply_tightness_does_not_mutate_the_input_cut()
     test_apply_tightness_all_routes_words_by_file()
     print("\nall tightness tests passed")

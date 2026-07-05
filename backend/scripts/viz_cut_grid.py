@@ -80,7 +80,7 @@ def _load_from_db(file_id: str) -> dict:
         ).fetchone()
         af = conn.execute(
             """
-            select rms_db, prosody_hop_ms,
+            select rms_db, prosody_hop_ms, f0_hz,
                    dialogue_cut_cost, dialogue_cut_hop_ms, dialogue_cut_points,
                    beat_cut_cost, beat_cut_hop_ms, beat_cut_points
               from audio_features where file_id = %s
@@ -114,6 +114,7 @@ def _load_from_db(file_id: str) -> dict:
             "cut_points": af["dialogue_cut_points"] or [],
             "rms_db": af["rms_db"] or [],
             "prosody_hop_ms": af["prosody_hop_ms"] or 0,
+            "f0_hz": af["f0_hz"] or [],
             "words": words,
         }
 

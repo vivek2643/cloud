@@ -3,9 +3,11 @@ Cuts v2: the unified priority partition.
 
 Replaces the overlapping, energy-laddered, channel-tabbed hero-cuts feed with a
 DETERMINISTIC, NON-OVERLAPPING partition of each video into tag-bearing cuts.
-See ``cuts_v2.plan.md`` for the full design; this module is Phase B2, the core.
+See ``cuts_v2.plan.md`` for the original design (this module is that plan's
+Phase B2, the core claim algorithm) and ``cuts_v2_boundaries.plan.md`` for the
+follow-on that re-scopes the dial and video boundary detection (Phase C1).
 
-North star (see the plan for the full rationale):
+North star (see the plans for the full rationale):
   1. One unified partition pass owns the timeline -- never independent per-
      channel passes merged after the fact. Overlap is impossible by
      construction: every cut is claimed against the SAME running "already
@@ -18,18 +20,20 @@ North star (see the plan for the full rationale):
   4. "Never cut said" -- word-level veto via the L1 dialogue cut-cost grid
      (cost 1.0 inside a word), composed into the fused seam field every
      boundary snaps through.
-  5. Boundaries are DETECTED, not chosen by a granularity slider (candidate
-     spans below are ENERGY-INDEPENDENT; the only knob is tightness, Phase B3,
-     applied on top of the claimed cuts, never here).
+  5. Boundaries are DETECTED, not chosen by a slider for ``said`` (still
+     energy-independent). SUPERSEDED for video by ``cuts_v2_boundaries.plan``:
+     the dial now also drives GRANULARITY there -- see ``video_segments.py``
+     -- on top of tightness (still applied here, in ``_tighten_video``).
+     A deliberate, accepted departure from "detect once" for video only.
   6. Over-split, never under-split: a free remainder too small to be a
      meaningful sub-unit is silently absorbed (no cut, no tag) rather than
      forced into one.
 
-Pure core: ``partition_clip(clip: ClipArtifacts) -> List[Cut]`` takes already-
-loaded clip artifacts and does no DB/model call (mirrors ``atoms.build_atoms``'s
-purity), so it is trivially testable -- see ``scripts/test_partition.py``.
-``build_partition(file_id)`` is the convenience wrapper that loads + partitions
-for real callers.
+Pure core: ``partition_clip(clip: ClipArtifacts, energy) -> List[Cut]`` takes
+already-loaded clip artifacts and does no DB/model call (mirrors
+``atoms.build_atoms``'s purity), so it is trivially testable -- see
+``scripts/test_partition.py``. ``build_partition(file_id, energy)`` is the
+convenience wrapper that loads + partitions for real callers.
 """
 from __future__ import annotations
 
@@ -38,20 +42,26 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.services.l1 import fused_seams as fseams
-from app.services.l1.cut_grid_common import percentile
 from app.services.l3 import vocab
+from app.services.l3.energy import energy_band, energy_to_params
 from app.services.l3.partition_params import (
-    ACTION_CALM_PCTL,
     DEFAULT_SNAP_ENERGY,
-    DONE_MIN_MS,
     MERGE_GAP_MS,
     MIN_SUBUNIT_MS,
     OVERLAP_TAG_FRAC,
     PRIORITY_DONE,
     PRIORITY_SAID,
     PRIORITY_SHOWN,
+    VIDEO_CORE_FLOOR_MS,
+)
+from app.services.l3.speech_granularity_params import (
+    ENERGY_DROP_DB,
+    MAX_BRIDGE_GAP_MS,
+    PITCH_FALL_HZ,
+    PROSODY_TAIL_MS,
 )
 from app.services.l3.thought_segments import Thought
+from app.services.l3.video_segments import segment_video
 
 logger = logging.getLogger(__name__)
 
@@ -118,9 +128,9 @@ class ClipArtifacts:
     file_id: str
     duration_ms: int
     thoughts: List[Thought] = field(default_factory=list)
-    motion: Optional[dict] = None    # {hop_ms, action_energy, action_points, camera_cut_cost, camera_coherence, camera_stability, blur}
+    motion: Optional[dict] = None    # {hop_ms, action_energy, action_points, camera_cut_cost, camera_coherence, camera_stability, camera_motion, blur}
     scene: Optional[dict] = None     # {hop_ms, shot_points, composition_points}
-    audio: Optional[dict] = None     # {dialogue_cut_cost, dialogue_cut_hop_ms, dialogue_cut_points, beat_cut_cost, beat_cut_hop_ms, beat_cut_points}
+    audio: Optional[dict] = None     # {dialogue_cut_cost, dialogue_cut_hop_ms, dialogue_cut_points, beat_cut_cost, beat_cut_hop_ms, beat_cut_points, rms_db, prosody_hop_ms, f0_hz}
 
 
 # --------------------------------------------------------------------------
@@ -137,114 +147,146 @@ class _Candidate:
     speaker: Optional[str] = None
 
 
-def _said_candidates(thoughts: List[Thought]) -> List[_Candidate]:
-    """One candidate per THOUGHT (the complete idea) -- already the clean,
-    speaker-pure, silence-ceilinged unit ``thought_segments`` exists to produce
-    (LLM-derived when available, else its own deterministic L1
-    dialogue_segments fallback -- both of the plan's "what we reuse" bullets
-    for said live behind this one call)."""
+def _thought_start_ms(t: Thought) -> int:
+    """The earliest ms of a thought INCLUDING its setup run-up."""
+    return int(t.setup.raw_in_ms if t.setup else t.thought.raw_in_ms)
+
+
+def _thought_text_with_setup(t: Thought) -> str:
+    if t.setup and (t.setup.text or "").strip():
+        return (t.setup.text + " " + t.thought.text).strip()
+    return (t.thought.text or "").strip()
+
+
+def _band_thought_span(t: Thought, band: int) -> Tuple[int, int, str]:
+    """(in_ms, out_ms, text) for one thought at a non-Broad granularity band."""
+    if band == 1:      # Calm: the thought + the speaker's own run-up
+        in_ms = t.setup.raw_in_ms if t.setup else t.thought.raw_in_ms
+        return int(in_ms), int(t.thought.raw_out_ms), _thought_text_with_setup(t)
+    if band == 2:      # Balanced: the complete thought proper
+        return int(t.thought.raw_in_ms), int(t.thought.raw_out_ms), (t.thought.text or "")
+    if band == 3:      # Tight: the core sentence
+        return int(t.core.raw_in_ms), int(t.core.raw_out_ms), (t.core.text or "")
+    return int(t.punch.raw_in_ms), int(t.punch.raw_out_ms), (t.punch.text or "")   # Sharp: punchline
+
+
+def _trend(values: List[float], hop_ms: int, start_ms: int, end_ms: int) -> Optional[float]:
+    """(last - first) of the non-zero (voiced/non-silent) samples in
+    [start_ms, end_ms) -- a simple trailing trend. None when there aren't at
+    least two usable samples to compare."""
+    if not values or hop_ms <= 0:
+        return None
+    lo, hi = max(0, start_ms // hop_ms), min(len(values) - 1, end_ms // hop_ms)
+    usable = [v for v in values[lo:hi + 1] if v]
+    if len(usable) < 2:
+        return None
+    return usable[-1] - usable[0]
+
+
+def _prosody_bridges_gap(f0_hz: List[float], rms_db: List[float], hop_ms: int,
+                         thought_end_ms: int) -> Optional[bool]:
+    """True = an intentional pause (bridge -- merge into one turn); False = a
+    real thought-end (break); None = no pitch signal, fall back to gap-length
+    alone. Reads the TRAILING pitch + energy trend just before the gap (the
+    gap itself is silence, no pitch to read): falling pitch + dropping energy
+    is the classic declarative-statement-ending shape (a real break);
+    anything else means the speaker likely isn't finished (bridge it)."""
+    if not f0_hz or hop_ms <= 0:
+        return None
+    tail_start = max(0, thought_end_ms - PROSODY_TAIL_MS)
+    pitch_trend = _trend(f0_hz, hop_ms, tail_start, thought_end_ms)
+    if pitch_trend is None:
+        return None
+    energy_trend = _trend(rms_db, hop_ms, tail_start, thought_end_ms)
+    falling = pitch_trend <= -PITCH_FALL_HZ
+    dropping = energy_trend is not None and energy_trend <= -ENERGY_DROP_DB
+    return not (falling and dropping)
+
+
+def _merge_thoughts_by_prosody(thoughts: List[Thought], gap_ms: int, f0_hz: List[float],
+                               rms_db: List[float], hop_ms: int) -> List[List[Thought]]:
+    """Group consecutive SAME-SPEAKER thoughts into one turn (the Broad zoom-
+    out) -- graded by PROSODY, not gap-length alone: falling pitch + dropping
+    energy across the gap is a real break (never merge); sustained/rising
+    pitch is an intentional dramatic pause (bridge it), even past the base
+    ``gap_ms`` threshold, up to the absolute MAX_BRIDGE_GAP_MS ceiling.
+    Degrades to the old gap-length-only rule when pitch is unavailable (no
+    re-analyze yet). A speaker change always breaks a group."""
+    items = sorted(thoughts, key=_thought_start_ms)
+    groups: List[List[Thought]] = []
+    for t in items:
+        if groups:
+            prev = groups[-1][-1]
+            gap = _thought_start_ms(t) - int(prev.thought.raw_out_ms)
+            if t.speaker == prev.speaker and 0 <= gap <= MAX_BRIDGE_GAP_MS:
+                verdict = _prosody_bridges_gap(f0_hz, rms_db, hop_ms, int(prev.thought.raw_out_ms))
+                bridge = verdict if verdict is not None else (gap < gap_ms)
+                if bridge:
+                    groups[-1].append(t)
+                    continue
+        groups.append([t])
+    return groups
+
+
+def _said_candidates(thoughts: List[Thought], audio: Optional[dict], energy: float) -> List[_Candidate]:
+    """Speech candidates at ``energy``'s GRANULARITY (Phase C2 of
+    ``cuts_v2_boundaries.plan.md``) -- read off each Thought's OWN nested
+    hierarchy (setup+thought / thought / core / punch), already the clean,
+    speaker-pure, silence-ceilinged units ``thought_segments`` exists to
+    produce. Broad additionally merges consecutive same-speaker thoughts into
+    whole TURNS, graded by prosody (see ``_merge_thoughts_by_prosody``) rather
+    than a bare gap threshold. `said` boundaries are still DETECTED, never
+    invented outright -- but which of a thought's nested levels the dial reads
+    is now energy-dependent, the same exception ``cuts_v2_boundaries.plan.md``
+    already makes for video (Phase C1)."""
+    if not thoughts:
+        return []
+    band = energy_band(energy)
+    audio = audio or {}
+    f0_hz = audio.get("f0_hz") or []
+    rms_db = audio.get("rms_db") or []
+    hop_ms = int(audio.get("prosody_hop_ms") or 0)
+
     out: List[_Candidate] = []
-    for t in thoughts:
-        s, e = t.thought.raw_in_ms, t.thought.raw_out_ms
-        if e <= s:
-            continue
-        peak = (s + e) // 2
-        if t.punch and t.punch.raw_out_ms > t.punch.raw_in_ms:
-            peak = (t.punch.raw_in_ms + t.punch.raw_out_ms) // 2
-        out.append(_Candidate(vocab.CHANNEL_SAID, s, e, peak, t.thought.text, t.speaker))
+    if band == 0:
+        merge_gap_ms = energy_to_params(energy).speech_merge_gap_ms
+        for group in _merge_thoughts_by_prosody(thoughts, merge_gap_ms, f0_hz, rms_db, hop_ms):
+            s = min(_thought_start_ms(t) for t in group)
+            e = max(int(t.thought.raw_out_ms) for t in group)
+            if e <= s:
+                continue
+            text = " ".join(_thought_text_with_setup(t) for t in group).strip()
+            out.append(_Candidate(vocab.CHANNEL_SAID, s, e, (s + e) // 2, text, group[0].speaker))
+    else:
+        for t in thoughts:
+            s, e, text = _band_thought_span(t, band)
+            if e <= s:
+                continue
+            peak = (s + e) // 2
+            if band >= 3 and t.punch and t.punch.raw_out_ms > t.punch.raw_in_ms:
+                peak = (t.punch.raw_in_ms + t.punch.raw_out_ms) // 2
+            out.append(_Candidate(vocab.CHANNEL_SAID, s, e, peak, text, t.speaker))
     out.sort(key=lambda c: c.start_ms)
     return out
 
 
-def _at(arr: List[float], hop: int, ts_ms: int) -> float:
-    if not arr or hop <= 0:
-        return 0.0
-    i = max(0, min(len(arr) - 1, ts_ms // hop))
-    return arr[i]
-
-
-def _done_candidates(motion: Optional[dict]) -> List[_Candidate]:
-    """Action beats: each impact's energy rise -> peak -> fall window, expanded
-    outward from ``action_points`` while ``action_energy`` stays above the
-    calm floor. Overlapping/touching windows from separate impacts merge into
-    one (keeping the stronger peak)."""
-    motion = motion or {}
-    energy = motion.get("action_energy") or []
-    points = motion.get("action_points") or []
-    hop = int(motion.get("hop_ms") or 0)
-    if not energy or not points or hop <= 0:
-        return []
-
-    floor = percentile(energy, ACTION_CALM_PCTL)
-    windows: List[Tuple[int, int, int]] = []   # (start_ms, end_ms, peak_ms)
-    for p in points:
-        peak_ms = int(p.get("ts_ms", 0))
-        pi = max(0, min(len(energy) - 1, peak_ms // hop))
-        lo, hi = pi, pi
-        while lo > 0 and energy[lo - 1] > floor:
-            lo -= 1
-        while hi < len(energy) - 1 and energy[hi + 1] > floor:
-            hi += 1
-        windows.append((lo * hop, (hi + 1) * hop, peak_ms))
-    windows.sort(key=lambda w: w[0])
-
-    merged: List[Tuple[int, int, int]] = []
-    for s, e, pk in windows:
-        if merged and s <= merged[-1][1]:
-            ps, pe, ppk = merged[-1]
-            better_pk = ppk if _at(energy, hop, ppk) >= _at(energy, hop, pk) else pk
-            merged[-1] = (ps, max(pe, e), better_pk)
-        else:
-            merged.append((s, e, pk))
-
-    return [
-        _Candidate(vocab.CHANNEL_DONE, s, e, pk, "action")
-        for s, e, pk in merged if e - s >= DONE_MIN_MS
-    ]
-
-
-def _sharpest_ms(motion: Optional[dict], start_ms: int, end_ms: int, default_ms: int) -> int:
-    """The least-blurred instant in [start,end] -- the thumbnail-worthy frame
-    for a held (shown) span. Falls back to ``default_ms`` when blur isn't
-    available for this window."""
-    motion = motion or {}
-    blur = motion.get("blur") or []
-    hop = int(motion.get("hop_ms") or 0)
-    if not blur or hop <= 0:
-        return default_ms
-    lo, hi = max(0, start_ms // hop), min(len(blur) - 1, end_ms // hop)
-    if hi < lo:
-        return default_ms
-    best_i = min(range(lo, hi + 1), key=lambda i: blur[i])
-    return best_i * hop
-
-
-def _shown_candidates(scene: Optional[dict], motion: Optional[dict], duration_ms: int) -> List[_Candidate]:
-    """Held/stable stretches, bounded by scene/composition change (Phase B1).
-
-    Candidates cover the WHOLE clip by construction (shot + composition
-    boundaries as internal split points, or one candidate spanning the whole
-    clip when scene detection found nothing) -- shown is the lowest-priority,
-    catch-all channel, so full coverage here is what guarantees the partition
-    is gap-free (North Star: "no junk removal yet" = a contiguous filmstrip).
-    Whatever's actually action-heavy within a shown candidate will already
-    have been claimed by `done` before `shown` gets to it (claim order), so
-    the "low action energy" character the plan names falls out of the claim
-    order rather than needing a separate pre-filter here."""
-    scene = scene or {}
-    bounds = {0, duration_ms}
-    for p in (scene.get("shot_points") or []) + (scene.get("composition_points") or []):
-        ts = int(p.get("ts_ms", -1))
-        if 0 < ts < duration_ms:
-            bounds.add(ts)
-    ordered = sorted(bounds)
-    out: List[_Candidate] = []
-    for s, e in zip(ordered, ordered[1:]):
-        if e <= s:
-            continue
-        peak = _sharpest_ms(motion, s, e, (s + e) // 2)
-        out.append(_Candidate(vocab.CHANNEL_SHOWN, s, e, peak, "shown"))
-    return out
+def _video_candidates(motion: Optional[dict], scene: Optional[dict],
+                      duration_ms: int, energy: float) -> List[_Candidate]:
+    """Video candidates from the camera-move-state segmentation
+    (``video_segments.segment_video``, Phases C1 + C3a of
+    ``cuts_v2_boundaries.plan.md``) -- replaces the old impact-WINDOW `done`
+    detector and the scene/shot-bounded `shown` detector (both
+    "known-imperfect" per that plan). ONE segmentation already covers the
+    whole clip and tags each piece done/shown (provisional -- real
+    classification waits on the image pass), so this is a thin adapter, not a
+    second detector: `energy` drives GRANULARITY here (how many camera
+    settles'/subject-beat sub-splits the dial admits) -- a deliberate exception
+    to "detection is energy-independent" for video only, see the plan's
+    "Honest risks" #1 -- while a hard shot cut in `scene` is a TOP-PRIORITY
+    boundary at every granularity (Phase C3a re-enables scene detection as a
+    video boundary source for real multi-shot footage)."""
+    segs = segment_video(motion, duration_ms, energy, scene=scene)
+    return [_Candidate(s.tag, s.start_ms, s.end_ms, s.peak_ms, s.tag) for s in segs]
 
 
 # --------------------------------------------------------------------------
@@ -414,6 +456,42 @@ def _assert_non_overlap(cuts: List[Cut]) -> None:
         prev_end = c.src_out_ms
 
 
+def _core_inset(core_in: int, core_out: int, peak: int, target: Optional[int],
+                *, lead_frac: float = 0.5) -> Tuple[int, int]:
+    """Inset [core_in, core_out] toward ``peak`` to ``target`` ms, keeping
+    ``lead_frac`` of the window before the peak. Only ever shrinks."""
+    if not target or core_out - core_in <= target:
+        return core_in, core_out
+    peak = max(core_in, min(peak, core_out))
+    lead = int(round(target * lead_frac))
+    ci = max(core_in, peak - lead)
+    co = min(core_out, ci + target)
+    ci = max(core_in, co - target)
+    return ci, co
+
+
+def _tighten_video(placed: List[_Placed], energy: float) -> List[_Placed]:
+    """The energy dial's TIGHTNESS effect on VIDEO cuts (done/shown), layered
+    on top of the already-claimed partition (said is left untouched here):
+    peak-inset each cut (negative padding) toward its own peak. At Balanced
+    and below, ``done_core_frac``/``shown_core_frac`` are None, so nothing
+    changes -- the default feed stays a contiguous filmstrip. GRANULARITY
+    (how many video cuts there are) is decided upstream, in
+    ``video_segments.segment_video`` -- this is tightness only, so it never
+    splits and never extends (extension would break the non-overlap
+    invariant); only ever shrinks within the claimed span."""
+    params = energy_to_params(energy)
+    for p in placed:
+        if p.primary not in (vocab.CHANNEL_DONE, vocab.CHANNEL_SHOWN):
+            continue
+        frac = params.done_core_frac if p.primary == vocab.CHANNEL_DONE else params.shown_core_frac
+        if frac is None:
+            continue
+        target = max(VIDEO_CORE_FLOOR_MS, int(round(frac * (p.end_ms - p.start_ms))))
+        p.start_ms, p.end_ms = _core_inset(p.start_ms, p.end_ms, p.peak_ms, target)
+    return placed
+
+
 def _to_cut(file_id: str, p: _Placed) -> Cut:
     return Cut(
         file_id=file_id, src_in_ms=p.start_ms, src_out_ms=p.end_ms,
@@ -426,18 +504,28 @@ def _to_cut(file_id: str, p: _Placed) -> Cut:
 # Public entry point (pure)
 # --------------------------------------------------------------------------
 
-def partition_clip(clip: ClipArtifacts) -> List[Cut]:
-    """One clip's artifacts -> its non-overlapping, tag-bearing partition.
+def partition_clip(clip: ClipArtifacts, energy: float = DEFAULT_SNAP_ENERGY) -> List[Cut]:
+    """One clip's artifacts -> its non-overlapping, tag-bearing partition at a
+    given energy. Pure: no DB/model call. Deterministic given (artifacts,
+    energy).
 
-    Pure: no DB/model call. Deterministic given the same artifacts."""
+    The energy dial acts here as:
+      * GRANULARITY for said (which of a thought's nested levels the dial
+        reads, and whether consecutive same-speaker thoughts merge into a
+        turn) -- see ``_said_candidates``.
+      * GRANULARITY for video (how many camera-settle/subject-beat boundaries
+        ``video_segments.segment_video`` admits) -- see ``_video_candidates``.
+      * TIGHTNESS for video (peak-inset each claimed cut) -- ``_tighten_video``.
+      * TIGHTNESS for said (breath excision) is layered on separately, in
+        ``tightness.py`` -- it never changes a said cut's own boundaries."""
     candidates = (
-        _said_candidates(clip.thoughts)
-        + _done_candidates(clip.motion)
-        + _shown_candidates(clip.scene, clip.motion, clip.duration_ms)
+        _said_candidates(clip.thoughts, clip.audio, energy)
+        + _video_candidates(clip.motion, clip.scene, clip.duration_ms, energy)
     )
     field = _build_field(clip)
     placed = _claim(candidates, field, clip.duration_ms)
     placed = _merge_continuous(placed, clip.scene)
+    placed = _tighten_video(placed, energy)
     placed.sort(key=lambda p: p.start_ms)
     cuts = [_to_cut(clip.file_id, p) for p in placed]
     _assert_non_overlap(cuts)
@@ -471,7 +559,7 @@ def load_clip_artifacts(file_id: str) -> Optional[ClipArtifacts]:
         m_row = conn.execute(
             """
             select hop_ms, action_energy, action_points, camera_cut_cost,
-                   camera_coherence, camera_stability, blur
+                   camera_coherence, camera_stability, blur, camera_motion
               from motion_dynamics where file_id = %s
             """,
             (file_id,),
@@ -482,7 +570,7 @@ def load_clip_artifacts(file_id: str) -> Optional[ClipArtifacts]:
                 "hop_ms": m_row[0], "action_energy": m_row[1] or [],
                 "action_points": m_row[2] or [], "camera_cut_cost": m_row[3] or [],
                 "camera_coherence": m_row[4] or [], "camera_stability": m_row[5] or [],
-                "blur": m_row[6] or [],
+                "blur": m_row[6] or [], "camera_motion": m_row[7] or [],
             }
 
         s_row = conn.execute(
@@ -497,7 +585,8 @@ def load_clip_artifacts(file_id: str) -> Optional[ClipArtifacts]:
         a_row = conn.execute(
             """
             select dialogue_cut_cost, dialogue_cut_hop_ms, dialogue_cut_points,
-                   beat_cut_cost, beat_cut_hop_ms, beat_cut_points
+                   beat_cut_cost, beat_cut_hop_ms, beat_cut_points,
+                   rms_db, prosody_hop_ms, f0_hz
               from audio_features where file_id = %s
             """,
             (file_id,),
@@ -508,6 +597,8 @@ def load_clip_artifacts(file_id: str) -> Optional[ClipArtifacts]:
                 "dialogue_cut_cost": a_row[0] or [], "dialogue_cut_hop_ms": a_row[1] or 100,
                 "dialogue_cut_points": a_row[2] or [], "beat_cut_cost": a_row[3] or [],
                 "beat_cut_hop_ms": a_row[4] or 100, "beat_cut_points": a_row[5] or [],
+                "rms_db": a_row[6] or [], "prosody_hop_ms": a_row[7] or 100,
+                "f0_hz": a_row[8] or [],
             }
 
     thoughts = thoughts_mod.get_thoughts(file_id)
@@ -515,10 +606,10 @@ def load_clip_artifacts(file_id: str) -> Optional[ClipArtifacts]:
                          motion=motion, scene=scene, audio=audio)
 
 
-def build_partition(file_id: str) -> List[Cut]:
-    """Convenience: load + partition one file. Empty when the file has no
-    duration yet (upload still in flight)."""
+def build_partition(file_id: str, energy: float = DEFAULT_SNAP_ENERGY) -> List[Cut]:
+    """Convenience: load + partition one file at ``energy``. Empty when the
+    file has no duration yet (upload still in flight)."""
     clip = load_clip_artifacts(file_id)
     if clip is None:
         return []
-    return partition_clip(clip)
+    return partition_clip(clip, energy)

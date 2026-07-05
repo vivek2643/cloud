@@ -1,10 +1,18 @@
 """
 Tests for the cuts-v2 unified priority partition (no DB).
 
-Exercises the core deterministic claim algorithm against hand-built clip
-artifacts: non-overlap, simultaneity-as-tags, priority demotion vs trim, full
-contiguous coverage, and same-primary merge across a scene-cut break. Run:
-  .venv/bin/python scripts/test_partition.py
+Two layers:
+  * LOW-LEVEL: ``_claim`` / ``_merge_continuous`` tested directly against
+    hand-built ``_Candidate`` / ``_Placed`` objects -- the tag-vs-trim /
+    overlap-threshold logic and same-primary merge, independent of where
+    candidates come from.
+  * END-TO-END: ``partition_clip`` against real ``ClipArtifacts`` (thoughts +
+    a locked-off-camera motion fixture) -- said still claims first, tightness
+    applies, multiple speakers, full contiguous coverage. Camera-move-state
+    video segmentation itself has its own dedicated tests,
+    ``scripts/test_video_segments.py``.
+
+Run:  .venv/bin/python scripts/test_partition.py
 """
 from __future__ import annotations
 
@@ -21,6 +29,108 @@ from app.services.l3 import vocab  # noqa: E402
 from app.services.l3.thought_segments import Span, Thought  # noqa: E402
 
 
+def _cand(channel, s, e, peak=None, label="x", speaker=None):
+    return pt._Candidate(channel, s, e, peak if peak is not None else (s + e) // 2, label, speaker)
+
+
+# --------------------------------------------------------------------------
+# Low-level: _claim / _merge_continuous
+# --------------------------------------------------------------------------
+
+def test_claim_talking_while_gesturing_is_one_tagged_cut():
+    """A done candidate fully inside a said candidate is Fact #2's textbook
+    case: simultaneity is a TAG, never a parallel overlapping cut."""
+    said = _cand(vocab.CHANNEL_SAID, 1000, 6000, label="line")
+    done = _cand(vocab.CHANNEL_DONE, 2500, 3500, label="action")
+    placed = pt._claim([said, done], field=None, duration_ms=8000)
+    assert len(placed) == 1, placed
+    assert placed[0].tags == [vocab.CHANNEL_SAID, vocab.CHANNEL_DONE], placed[0].tags
+    print("ok  test_claim_talking_while_gesturing_is_one_tagged_cut")
+
+
+def test_claim_mostly_covered_candidate_demotes_to_tag():
+    """A candidate ~97% covered by an already-claimed said span is absorbed as
+    a tag (overlap >= 60% of the shorter span), not trimmed into a sliver cut."""
+    said = _cand(vocab.CHANNEL_SAID, 1000, 5000)
+    done = _cand(vocab.CHANNEL_DONE, 1200, 5100)   # pokes 100ms past said's end
+    placed = pt._claim([said, done], field=None, duration_ms=8000)
+    assert len(placed) == 1, placed
+    assert vocab.CHANNEL_DONE in placed[0].tags, placed[0].tags
+    print("ok  test_claim_mostly_covered_candidate_demotes_to_tag")
+
+
+def test_claim_partial_overlap_trims_to_free_remainder():
+    """A candidate that only PARTIALLY overlaps a said span (< 60% covered)
+    keeps its own cut(s), trimmed to the free remainder(s) -- not a tag."""
+    said = _cand(vocab.CHANNEL_SAID, 3000, 4000)
+    done = _cand(vocab.CHANNEL_DONE, 2000, 5000)   # 1000/3000 = 33% covered
+    placed = pt._claim([said, done], field=None, duration_ms=8000)
+    done_placed = [p for p in placed if p.primary == vocab.CHANNEL_DONE]
+    assert done_placed, placed
+    said_placed = next(p for p in placed if p.primary == vocab.CHANNEL_SAID)
+    for d in done_placed:
+        assert d.end_ms <= said_placed.start_ms or d.start_ms >= said_placed.end_ms, (d, said_placed)
+    print("ok  test_claim_partial_overlap_trims_to_free_remainder")
+
+
+def test_claim_two_disjoint_remainders_both_survive_as_cuts():
+    """A catch-all candidate spanning a whole clip with a said cut carved out
+    of its MIDDLE leaves TWO disjoint remainders -- both become their own
+    cuts; the candidate must NOT collapse into a single tag (see partition.py's
+    `_claim` docstring on why multi-remainder candidates skip the aggregate
+    overlap check)."""
+    said = _cand(vocab.CHANNEL_SAID, 1000, 6000)
+    shown = _cand(vocab.CHANNEL_SHOWN, 0, 8000)
+    placed = pt._claim([said, shown], field=None, duration_ms=8000)
+    shown_placed = [p for p in placed if p.primary == vocab.CHANNEL_SHOWN]
+    assert len(shown_placed) == 2, placed
+    print("ok  test_claim_two_disjoint_remainders_both_survive_as_cuts")
+
+
+def test_claim_non_overlap_holds_under_three_way_contention():
+    said = _cand(vocab.CHANNEL_SAID, 2000, 6000)
+    done = _cand(vocab.CHANNEL_DONE, 3000, 4000)
+    shown = _cand(vocab.CHANNEL_SHOWN, 0, 10_000)
+    placed = pt._claim([said, done, shown], field=None, duration_ms=10_000)
+    ordered = sorted(placed, key=lambda p: p.start_ms)
+    for a, b in zip(ordered, ordered[1:]):
+        assert a.end_ms <= b.start_ms, (a, b)
+    assert ordered[0].start_ms == 0 and ordered[-1].end_ms == 10_000, ordered
+    print("ok  test_claim_non_overlap_holds_under_three_way_contention")
+
+
+def test_merge_continuous_same_primary_no_boundary_between():
+    p1 = pt._Placed(1000, 2000, [vocab.CHANNEL_DONE], vocab.CHANNEL_DONE, "a", None, 1500)
+    p2 = pt._Placed(2000, 3000, [vocab.CHANNEL_DONE], vocab.CHANNEL_DONE, "b", None, 2500)
+    merged = pt._merge_continuous([p1, p2], scene=None)
+    assert len(merged) == 1, merged
+    assert merged[0].start_ms == 1000 and merged[0].end_ms == 3000, merged[0]
+    print("ok  test_merge_continuous_same_primary_no_boundary_between")
+
+
+def test_merge_stops_at_a_scene_cut_boundary():
+    """The SAME touching geometry, but with a hard scene cut sitting between
+    the two pieces, must never merge across it."""
+    p1 = pt._Placed(1000, 1990, [vocab.CHANNEL_DONE], vocab.CHANNEL_DONE, "a", None, 1500)
+    p2 = pt._Placed(2010, 3000, [vocab.CHANNEL_DONE], vocab.CHANNEL_DONE, "b", None, 2500)
+    scene = {"shot_points": [{"ts_ms": 2000, "kind": "shot_cut", "score": 1.0}]}
+    merged = pt._merge_continuous([p1, p2], scene=scene)
+    assert len(merged) == 2, merged
+    print("ok  test_merge_stops_at_a_scene_cut_boundary")
+
+
+def test_merge_never_crosses_a_speaker_change():
+    p1 = pt._Placed(1000, 2000, [vocab.CHANNEL_SAID], vocab.CHANNEL_SAID, "a", "S0", 1500)
+    p2 = pt._Placed(2000, 3000, [vocab.CHANNEL_SAID], vocab.CHANNEL_SAID, "b", "S1", 2500)
+    merged = pt._merge_continuous([p1, p2], scene=None)
+    assert len(merged) == 2, merged
+    print("ok  test_merge_never_crosses_a_speaker_change")
+
+
+# --------------------------------------------------------------------------
+# End-to-end: partition_clip
+# --------------------------------------------------------------------------
+
 def _thought(speaker, in_ms, out_ms, text, punch=None, strength=0.7):
     p = punch or (in_ms, out_ms)
     return Thought(
@@ -33,26 +143,23 @@ def _thought(speaker, in_ms, out_ms, text, punch=None, strength=0.7):
     )
 
 
-def _motion(duration_ms, hop_ms=100, elevated=(), points=(), blur=None):
+def _locked_motion(duration_ms, hop_ms=100, bumps=()):
+    """A camera that never moves -- drives ``video_segments``' static-shot
+    fallback (subject-beat sub-split) rather than its camera-move-state
+    machinery (already covered by ``scripts/test_video_segments.py``).
+    ``bumps`` is a list of (center_ms, peak_value) rise-peak-fall bells."""
     n = duration_ms // hop_ms + 1
     energy = [0.05] * n
-    for lo, hi, val in elevated:
-        for i in range(lo // hop_ms, min(n, hi // hop_ms + 1)):
-            energy[i] = val
+    for center_ms, peak_val in bumps:
+        ci = center_ms // hop_ms
+        for off, frac in zip(range(-2, 3), (0.3, 0.7, 1.0, 0.7, 0.3)):
+            i = ci + off
+            if 0 <= i < n:
+                energy[i] = max(energy[i], peak_val * frac)
     return {
         "hop_ms": hop_ms, "action_energy": energy,
-        "action_points": [{"ts_ms": t, "kind": "action_impact", "score": 1.0} for t in points],
-        "camera_cut_cost": [0.0] * n,
-        "blur": blur or [0.5] * n,
-    }
-
-
-def _scene(shot_points=(), composition_points=()):
-    return {
-        "hop_ms": 200,
-        "shot_points": [{"ts_ms": t, "kind": "shot_cut", "score": 1.0} for t in shot_points],
-        "composition_points": [{"ts_ms": t, "kind": "composition_change", "score": 1.0}
-                               for t in composition_points],
+        "camera_stability": [0.95] * n, "camera_motion": [0.02] * n,
+        "blur": [0.5] * n,
     }
 
 
@@ -61,187 +168,133 @@ def _clip(duration_ms, thoughts=(), motion=None, scene=None, audio=None):
                             motion=motion, scene=scene, audio=audio)
 
 
-def test_non_overlap_invariant_holds_under_contention():
-    """A said span, a fully-overlapping done window, and full-clip shown
-    coverage -- classic three-way contention -- never produces overlapping cuts."""
+def test_partition_clip_non_overlap_and_full_coverage():
     clip = _clip(
         10_000,
         thoughts=[_thought("S0", 2000, 6000, "we shipped the whole thing today")],
-        motion=_motion(10_000, elevated=[(3000, 4000, 0.9)], points=[3500]),
-        scene=_scene(shot_points=[7000]),
+        motion=_locked_motion(10_000, bumps=[(7500, 0.9)]),
     )
-    cuts = pt.partition_clip(clip)
-    assert len(cuts) >= 2, cuts
+    cuts = pt.partition_clip(clip, energy=0.5)
     ordered = sorted(cuts, key=lambda c: c.src_in_ms)
     for a, b in zip(ordered, ordered[1:]):
         assert a.src_out_ms <= b.src_in_ms, (a, b)
-    # Full contiguous coverage: first cut starts at 0, last ends at duration.
-    assert ordered[0].src_in_ms == 0, ordered[0]
-    assert ordered[-1].src_out_ms == 10_000, ordered[-1]
-    print("ok  test_non_overlap_invariant_holds_under_contention")
+    assert ordered[0].src_in_ms == 0 and ordered[-1].src_out_ms == 10_000, ordered
+    print("ok  test_partition_clip_non_overlap_and_full_coverage")
 
 
-def test_talking_while_gesturing_is_one_tagged_cut_not_two():
-    """A done window fully inside a said span is Fact #2's textbook case:
-    simultaneity is a TAG, never a parallel overlapping cut."""
-    clip = _clip(
-        8000,
-        thoughts=[_thought("S0", 1000, 6000, "and then i just pointed at it like this")],
-        motion=_motion(8000, elevated=[(2500, 3500, 0.9)], points=[3000]),
-    )
-    cuts = pt.partition_clip(clip)
-    said_cuts = [c for c in cuts if c.primary == vocab.CHANNEL_SAID]
-    assert len(said_cuts) == 1, cuts
-    sc = said_cuts[0]
-    assert sc.tags == [vocab.CHANNEL_SAID, vocab.CHANNEL_DONE], sc.tags
-    # No separate done cut carved out of the said span.
-    assert not any(c.primary == vocab.CHANNEL_DONE
-                   and c.src_in_ms >= sc.src_in_ms and c.src_out_ms <= sc.src_out_ms
-                   for c in cuts), cuts
-    print("ok  test_talking_while_gesturing_is_one_tagged_cut_not_two")
-
-
-def test_mostly_covered_done_candidate_demotes_to_tag():
-    """A done window 90%+ covered by an already-claimed said span is absorbed
-    as a tag (overlap >= 60% of the shorter span), not trimmed into a sliver cut."""
-    said = [(1000, 1000, 5000)]  # placeholder, unused
-    clip = _clip(
-        8000,
-        thoughts=[_thought("S0", 1000, 5000, "a full complete thought right here")],
-        # Window mostly inside [1000,5000] but pokes 100ms past the end -- still
-        # >=60% covered, so it must demote, not spawn a 100ms sliver cut.
-        motion=_motion(8000, elevated=[(1200, 5100, 0.9)], points=[3000]),
-    )
-    cuts = pt.partition_clip(clip)
-    assert not any(c.primary == vocab.CHANNEL_DONE for c in cuts), cuts
-    said_cut = next(c for c in cuts if c.primary == vocab.CHANNEL_SAID)
-    assert vocab.CHANNEL_DONE in said_cut.tags, said_cut.tags
-    print("ok  test_mostly_covered_done_candidate_demotes_to_tag")
-
-
-def test_partially_overlapping_done_trims_to_free_remainder():
-    """A done window that only PARTIALLY overlaps a said span (< 60% covered)
-    keeps its own cut, trimmed to the free remainder -- not absorbed as a tag."""
-    clip = _clip(
-        8000,
-        thoughts=[_thought("S0", 3000, 4000, "quick line")],
-        # 3s window [2000,5000): only 1000ms (1/3) overlaps the 1000ms said span
-        # -> covered_frac ~= 1000/3000 = 33% < 60% tag threshold -> own cut(s).
-        motion=_motion(8000, elevated=[(2000, 5000, 0.9)], points=[2300]),
-    )
-    cuts = pt.partition_clip(clip)
-    done_cuts = [c for c in cuts if c.primary == vocab.CHANNEL_DONE]
-    assert done_cuts, cuts
-    said_cut = next(c for c in cuts if c.primary == vocab.CHANNEL_SAID)
-    for d in done_cuts:
-        assert d.src_out_ms <= said_cut.src_in_ms or d.src_in_ms >= said_cut.src_out_ms, (d, said_cut)
-    print("ok  test_partially_overlapping_done_trims_to_free_remainder")
-
-
-def test_shown_candidates_cover_the_whole_clip_with_no_said_or_done():
-    """A clip with nothing but held footage still partitions -- contiguous
-    shown coverage, no gaps -- and a scene cut splits it into two cuts."""
-    clip = _clip(6000, scene=_scene(shot_points=[3000]))
-    cuts = pt.partition_clip(clip)
-    assert all(c.primary == vocab.CHANNEL_SHOWN for c in cuts), cuts
-    ordered = sorted(cuts, key=lambda c: c.src_in_ms)
-    assert ordered[0].src_in_ms == 0 and ordered[-1].src_out_ms == 6000, ordered
-    # The shot cut at 3000 must be a boundary between two cuts, not inside one.
-    assert any(c.src_out_ms == 3000 for c in ordered), ordered
-    assert any(c.src_in_ms == 3000 for c in ordered), ordered
-    print("ok  test_shown_candidates_cover_the_whole_clip_with_no_said_or_done")
-
-
-def test_no_scene_data_yields_one_whole_clip_shown_cut():
-    """No scene detection at all (best-effort miss) still yields full,
-    single-cut coverage -- never a gap."""
-    clip = _clip(5000)
-    cuts = pt.partition_clip(clip)
-    assert len(cuts) == 1, cuts
-    assert cuts[0].src_in_ms == 0 and cuts[0].src_out_ms == 5000, cuts[0]
-    assert cuts[0].primary == vocab.CHANNEL_SHOWN
-    print("ok  test_no_scene_data_yields_one_whole_clip_shown_cut")
-
-
-def test_adjacent_done_windows_merge_across_no_scene_cut():
-    """Two done candidates that land back-to-back (no scene cut, no said
-    between them) merge into ONE continuous cut, not two hairline-adjacent ones."""
-    clip = _clip(
-        6000,
-        motion=_motion(6000, elevated=[(1000, 2000, 0.9), (2000, 3000, 0.9)],
-                      points=[1500, 2500]),
-    )
-    cuts = pt.partition_clip(clip)
-    done_cuts = [c for c in cuts if c.primary == vocab.CHANNEL_DONE]
-    # The two impacts sit in one contiguous elevated band -> _done_candidates
-    # itself already merges them; assert there's exactly one done cut spanning
-    # both, not two.
-    assert len(done_cuts) == 1, done_cuts
-    print("ok  test_adjacent_done_windows_merge_across_no_scene_cut")
-
-
-def test_scene_cut_between_done_windows_keeps_them_separate():
-    """The SAME back-to-back done geometry, but with a hard scene cut sitting
-    between the two impacts, must never merge across it."""
-    clip = _clip(
-        6000,
-        motion=_motion(6000, elevated=[(1000, 1900, 0.9), (2100, 3000, 0.9)],
-                      points=[1500, 2500]),
-        scene=_scene(shot_points=[2000]),
-    )
-    cuts = pt.partition_clip(clip)
-    done_cuts = sorted((c for c in cuts if c.primary == vocab.CHANNEL_DONE),
-                       key=lambda c: c.src_in_ms)
-    assert len(done_cuts) == 2, done_cuts
-    assert done_cuts[0].src_out_ms <= 2000 <= done_cuts[1].src_in_ms, done_cuts
-    print("ok  test_scene_cut_between_done_windows_keeps_them_separate")
-
-
-def test_said_span_is_never_invaded_by_a_neighboring_cut():
-    """A said cut's claimed span is a hard boundary for its shown/done
-    neighbors -- the snap/clamp logic never lets a neighbor's edge cross it."""
+def test_partition_clip_said_wins_over_video_and_is_never_invaded():
     clip = _clip(
         10_000,
         thoughts=[_thought("S0", 4000, 6000, "the exact same words every single time")],
+        motion=_locked_motion(10_000),
     )
-    cuts = pt.partition_clip(clip)
+    cuts = pt.partition_clip(clip, energy=0.5)
     said_cut = next(c for c in cuts if c.primary == vocab.CHANNEL_SAID)
     for c in cuts:
         if c is said_cut:
             continue
         assert c.src_out_ms <= said_cut.src_in_ms or c.src_in_ms >= said_cut.src_out_ms, (c, said_cut)
-    print("ok  test_said_span_is_never_invaded_by_a_neighboring_cut")
+    print("ok  test_partition_clip_said_wins_over_video_and_is_never_invaded")
 
 
-def test_multiple_thoughts_yield_multiple_said_cuts_with_speakers():
-    """Two thoughts (different speakers) yield two distinct said cuts, each
-    carrying its own speaker -- no cross-speaker merge."""
+def test_partition_clip_no_motion_yields_one_whole_clip_shown_cut():
+    """Best-effort: no motion data at all still yields full, single-cut
+    coverage -- never a gap, never a crash."""
+    clip = _clip(5000)
+    cuts = pt.partition_clip(clip, energy=0.5)
+    assert len(cuts) == 1, cuts
+    assert cuts[0].src_in_ms == 0 and cuts[0].src_out_ms == 5000, cuts[0]
+    assert cuts[0].primary == vocab.CHANNEL_SHOWN
+    print("ok  test_partition_clip_no_motion_yields_one_whole_clip_shown_cut")
+
+
+def test_partition_clip_respects_a_hard_shot_cut_even_at_broad():
+    """Phase C3a: a scene shot cut splits the video into two cuts regardless
+    of energy -- two visually-similar shots stitched together must never read
+    as one continuous cut just because Broad wants fewer, longer segments.
+    At high energy, TIGHTNESS may inset each cut away from the shot-cut
+    boundary (a separate, legitimate effect) -- the invariant that matters
+    here is the COUNT and that they never invade one another, not the exact
+    boundary position."""
+    clip = _clip(10_000, motion=_locked_motion(10_000),
+                 scene={"shot_points": [{"ts_ms": 5000, "kind": "shot_cut", "score": 1.0}]})
+    for energy in (0.1, 0.5, 0.9):
+        cuts = pt.partition_clip(clip, energy=energy)
+        assert len(cuts) == 2, (energy, cuts)
+        ordered = sorted(cuts, key=lambda c: c.src_in_ms)
+        assert ordered[0].src_out_ms <= ordered[1].src_in_ms, (energy, ordered)
+        assert ordered[0].src_in_ms < 5000 <= ordered[1].src_out_ms, (energy, ordered)
+    # At Balanced (no tightness inset), the boundary sits exactly on the cut.
+    balanced = sorted(pt.partition_clip(clip, energy=0.5), key=lambda c: c.src_in_ms)
+    assert balanced[0].src_out_ms == 5000 and balanced[1].src_in_ms == 5000, balanced
+    print("ok  test_partition_clip_respects_a_hard_shot_cut_even_at_broad")
+
+
+def test_partition_clip_multiple_thoughts_with_speakers():
     clip = _clip(
         8000,
         thoughts=[
             _thought("S0", 500, 2000, "what made you start this company"),
             _thought("S1", 2200, 6000, "honestly it was kind of an accident"),
         ],
+        motion=_locked_motion(8000),
     )
-    cuts = pt.partition_clip(clip)
+    cuts = pt.partition_clip(clip, energy=0.5)
     said_cuts = sorted((c for c in cuts if c.primary == vocab.CHANNEL_SAID),
                        key=lambda c: c.src_in_ms)
     assert len(said_cuts) == 2, said_cuts
     assert said_cuts[0].speaker == "S0" and said_cuts[1].speaker == "S1"
-    print("ok  test_multiple_thoughts_yield_multiple_said_cuts_with_speakers")
+    print("ok  test_partition_clip_multiple_thoughts_with_speakers")
+
+
+def test_partition_clip_tightens_video_more_at_sharp_than_balanced():
+    """The dial's TIGHTNESS half: the segment containing a subject beat insets
+    tighter at Sharp than at Balanced (Balanced's done/shown core_frac is None
+    -- no inset at all)."""
+    motion = _locked_motion(10_000, bumps=[(6000, 0.95)])
+    clip = _clip(10_000, motion=motion)
+    balanced = pt.partition_clip(clip, energy=0.5)
+    sharp = pt.partition_clip(clip, energy=0.95)
+
+    def containing(cuts, ts):
+        return next(c for c in cuts if c.src_in_ms <= ts < c.src_out_ms)
+
+    b = containing(balanced, 6000)
+    s = containing(sharp, 6000)
+    assert (s.src_out_ms - s.src_in_ms) < (b.src_out_ms - b.src_in_ms), (b, s)
+    print("ok  test_partition_clip_tightens_video_more_at_sharp_than_balanced")
+
+
+def test_partition_clip_is_deterministic():
+    """Same artifacts, same energy -> identical cuts every time (no hidden
+    randomness/ordering dependence)."""
+    clip = _clip(
+        8000,
+        thoughts=[_thought("S0", 1000, 4000, "a repeatable thought")],
+        motion=_locked_motion(8000, bumps=[(5500, 0.9)]),
+    )
+    a = [c.to_dict() for c in pt.partition_clip(clip, energy=0.6)]
+    b = [c.to_dict() for c in pt.partition_clip(clip, energy=0.6)]
+    assert a == b, (a, b)
+    print("ok  test_partition_clip_is_deterministic")
 
 
 def main():
-    test_non_overlap_invariant_holds_under_contention()
-    test_talking_while_gesturing_is_one_tagged_cut_not_two()
-    test_mostly_covered_done_candidate_demotes_to_tag()
-    test_partially_overlapping_done_trims_to_free_remainder()
-    test_shown_candidates_cover_the_whole_clip_with_no_said_or_done()
-    test_no_scene_data_yields_one_whole_clip_shown_cut()
-    test_adjacent_done_windows_merge_across_no_scene_cut()
-    test_scene_cut_between_done_windows_keeps_them_separate()
-    test_said_span_is_never_invaded_by_a_neighboring_cut()
-    test_multiple_thoughts_yield_multiple_said_cuts_with_speakers()
+    test_claim_talking_while_gesturing_is_one_tagged_cut()
+    test_claim_mostly_covered_candidate_demotes_to_tag()
+    test_claim_partial_overlap_trims_to_free_remainder()
+    test_claim_two_disjoint_remainders_both_survive_as_cuts()
+    test_claim_non_overlap_holds_under_three_way_contention()
+    test_merge_continuous_same_primary_no_boundary_between()
+    test_merge_stops_at_a_scene_cut_boundary()
+    test_merge_never_crosses_a_speaker_change()
+    test_partition_clip_non_overlap_and_full_coverage()
+    test_partition_clip_said_wins_over_video_and_is_never_invaded()
+    test_partition_clip_no_motion_yields_one_whole_clip_shown_cut()
+    test_partition_clip_respects_a_hard_shot_cut_even_at_broad()
+    test_partition_clip_multiple_thoughts_with_speakers()
+    test_partition_clip_tightens_video_more_at_sharp_than_balanced()
+    test_partition_clip_is_deterministic()
     print("\nall partition tests passed")
 
 

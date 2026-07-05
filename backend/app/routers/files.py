@@ -56,6 +56,7 @@ class HeroCutsFeedRequest(BaseModel):
 
 class CutsFeedRequest(BaseModel):
     file_ids: List[str] = Field(default_factory=list)
+    energy: float = Field(0.5, ge=0.0, le=1.0)
 
 
 @router.get("", response_model=List[FileResponse])
@@ -316,16 +317,17 @@ def get_hero_cuts_feed(
 # ladder -- the row is a contiguous, non-overlapping partition by construction.
 # --------------------------------------------------------------------------
 
-def _build_cuts_for(file_ids: List[str]) -> List[dict]:
-    """Partition every file into its non-overlapping, tag-bearing cuts (as
-    plain dicts, each with a convenience ``duration_ms``). Best-effort per
-    file: a partition failure yields no cuts for that file, never a 500."""
+def _build_cuts_for(file_ids: List[str], energy: float = 0.5) -> List[dict]:
+    """Partition every file into its non-overlapping, tag-bearing cuts at
+    ``energy`` (as plain dicts, each with a convenience ``duration_ms``).
+    Best-effort per file: a partition failure yields no cuts for that file,
+    never a 500."""
     from app.services.l3.partition import build_partition
 
     out: List[dict] = []
     for fid in file_ids:
         try:
-            cuts = build_partition(fid)
+            cuts = build_partition(fid, energy)
         except Exception:
             logger.exception("cuts v2: partition failed for %s", fid)
             continue
@@ -340,18 +342,19 @@ def _build_cuts_for(file_ids: List[str]) -> List[dict]:
 @router.get("/{file_id}/cuts")
 def get_cuts(
     file_id: str,
+    energy: float = Query(0.5, ge=0.0, le=1.0, description="0=broad/loose .. 1=tight/split"),
     user_id: str = Depends(get_current_user_id),
 ):
-    """The cuts-v2 partition for ONE file -- a contiguous, non-overlapping,
-    tag-bearing filmstrip in ``src_in_ms`` order. Deterministic; `ready` is
-    false when the file has no usable L1 artifacts yet."""
+    """The cuts-v2 partition for ONE file -- a non-overlapping, tag-bearing
+    filmstrip in ``src_in_ms`` order. Deterministic given ``energy``; `ready`
+    is false when the file has no usable L1 artifacts yet."""
     sb = get_supabase()
     owns = sb.table("files").select("id").eq("id", file_id).eq("user_id", user_id).execute()
     if not owns.data:
         raise HTTPException(status_code=404, detail="File not found")
 
-    cuts = _build_cuts_for([file_id])
-    return {"cuts": cuts, "ready": bool(cuts)}
+    cuts = _build_cuts_for([file_id], energy)
+    return {"cuts": cuts, "energy": energy, "ready": bool(cuts)}
 
 
 @router.post("/cuts")
@@ -364,7 +367,7 @@ def get_cuts_feed(
     dropped."""
     file_ids = list(dict.fromkeys(payload.file_ids or []))
     if not file_ids:
-        return {"cuts": [], "ready": False}
+        return {"cuts": [], "energy": payload.energy, "ready": False}
 
     sb = get_supabase()
     owned = (
@@ -374,8 +377,8 @@ def get_cuts_feed(
     if not owned_ids:
         raise HTTPException(status_code=404, detail="No matching files")
 
-    cuts = _build_cuts_for(owned_ids)
-    return {"cuts": cuts, "ready": bool(cuts)}
+    cuts = _build_cuts_for(owned_ids, payload.energy)
+    return {"cuts": cuts, "energy": payload.energy, "ready": bool(cuts)}
 
 
 @router.get("/{file_id}/l1")
