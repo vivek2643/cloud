@@ -5,7 +5,7 @@ import { useAuthStore } from "@/stores/auth-store";
 import { useDriveStore } from "@/stores/drive-store";
 import { getCutsFeed, getFilePlaybackUrl, type Cut, type FileRecord } from "@/lib/api";
 import { cn } from "@/lib/utils";
-import { Scissors, Play, ChevronDown, Check } from "lucide-react";
+import { Scissors, Play, ChevronDown, Check, GripVertical } from "lucide-react";
 import { EditButton } from "./search-edit-bar";
 
 // Cuts v2 (see cuts_v2.plan.md). One video = one horizontal row of its
@@ -22,7 +22,10 @@ const FILTERS: { key: FilterKey; label: string }[] = [
   { key: "shown", label: "Shown" },
 ];
 
-const CARD_W = 224; // uniform card width (px) -- easiest to scan
+// Uniform tile width per orientation -- large, matching the old hero tiles.
+const CARD_W = { landscape: 340, portrait: 232 } as const;
+
+const ROW_DND = "application/x-cut-row";
 
 function fmtDur(ms: number): string {
   const s = ms / 1000;
@@ -44,10 +47,13 @@ export function CutsView() {
   const token = useAuthStore((s) => s.session?.access_token);
   const files = useDriveStore((s) => s.files);
   const [filter, setFilter] = useState<FilterKey>("all");
+  const [orientation, setOrientation] = useState<"landscape" | "portrait">("landscape");
+  const [fit, setFit] = useState<"adjusted" | "original">("adjusted");
   const [cuts, setCuts] = useState<Cut[]>([]);
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [activeKey, setActiveKey] = useState<string | null>(null);
+  const [order, setOrder] = useState<string[]>([]);
   const urlCache = useRef<Record<string, Promise<string | null>>>({});
 
   const candidates = useMemo(
@@ -113,6 +119,26 @@ export function CutsView() {
       .sort((a, b) => a.fileName.localeCompare(b.fileName));
   }, [cuts, filesById]);
 
+  // Keep a user-reorderable order of the rows: preserve manual moves, append
+  // any newly-arrived videos at the end, drop ones that vanished.
+  useEffect(() => {
+    setOrder((prev) => {
+      const ids = rows.map((r) => r.fileId);
+      const kept = prev.filter((id) => ids.includes(id));
+      const added = ids.filter((id) => !kept.includes(id));
+      const next = [...kept, ...added];
+      return next.length === prev.length && next.every((id, i) => id === prev[i])
+        ? prev
+        : next;
+    });
+  }, [rows]);
+
+  const orderedRows = useMemo(() => {
+    const byId: Record<string, (typeof rows)[number]> = {};
+    for (const r of rows) byId[r.fileId] = r;
+    return order.map((id) => byId[id]).filter(Boolean);
+  }, [order, rows]);
+
   const counts = useMemo(() => {
     const c: Record<string, number> = {};
     for (const f of FILTERS) {
@@ -142,6 +168,32 @@ export function CutsView() {
     });
   }, []);
 
+  // --- Row reorder (drag the grip handle only, so card DnD is untouched) ---
+  const dragRowId = useRef<string | null>(null);
+  const onRowDragStart = useCallback((e: React.DragEvent, fileId: string) => {
+    dragRowId.current = fileId;
+    e.dataTransfer.setData(ROW_DND, fileId);
+    e.dataTransfer.effectAllowed = "move";
+  }, []);
+  const onRowDragOver = useCallback((e: React.DragEvent, overId: string) => {
+    const dragged = dragRowId.current;
+    if (!dragged || dragged === overId) return;
+    if (!e.dataTransfer.types.includes(ROW_DND)) return; // ignore card drags
+    e.preventDefault();
+    setOrder((prev) => {
+      const from = prev.indexOf(dragged);
+      const to = prev.indexOf(overId);
+      if (from < 0 || to < 0 || from === to) return prev;
+      const next = [...prev];
+      next.splice(from, 1);
+      next.splice(to, 0, dragged);
+      return next;
+    });
+  }, []);
+  const onRowDragEnd = useCallback(() => {
+    dragRowId.current = null;
+  }, []);
+
   const totalVisible = rows.reduce(
     (n, r) => n + r.cuts.filter((c) => includesTag(c, filter)).length,
     0
@@ -149,9 +201,21 @@ export function CutsView() {
 
   return (
     <div>
-      {/* Tag filter (replaces the old channel tabs) + Edit pinned right. */}
-      <div className="mb-6 flex items-center justify-between gap-6">
-        <TagDropdown value={filter} counts={counts} total={cuts.length} onChange={setFilter} />
+      {/* Dropdowns: category (left) + framing (orientation / fit); Edit right. */}
+      <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2.5">
+          <TagDropdown value={filter} counts={counts} total={cuts.length} onChange={setFilter} />
+          <PillDropdown
+            options={["Landscape", "Portrait"]}
+            value={orientation === "landscape" ? "Landscape" : "Portrait"}
+            onChange={(v) => setOrientation(v === "Portrait" ? "portrait" : "landscape")}
+          />
+          <PillDropdown
+            options={["Frame Adjusted", "Original"]}
+            value={fit === "adjusted" ? "Frame Adjusted" : "Original"}
+            onChange={(v) => setFit(v === "Original" ? "original" : "adjusted")}
+          />
+        </div>
         <EditButton />
       </div>
 
@@ -174,16 +238,37 @@ export function CutsView() {
 
       {!loading && totalVisible > 0 && (
         <div className="flex flex-col gap-10">
-          {rows.map((row) => {
+          {orderedRows.map((row) => {
             const visible = row.cuts.filter((c) => includesTag(c, filter));
             if (visible.length === 0) return null;
             const allSelected = visible.every((c) => selected.has(cutKey(c)));
             const total = visible.reduce((n, c) => n + c.duration_ms, 0);
             return (
-              <div key={row.fileId}>
-                <div className="mb-3 flex items-center gap-3">
-                  <span className="shrink-0 truncate text-sm font-medium">{row.fileName}</span>
-                  <span className="shrink-0 text-xs" style={{ color: "var(--muted)" }}>
+              <div
+                key={row.fileId}
+                onDragOver={(e) => onRowDragOver(e, row.fileId)}
+                onDrop={(e) => {
+                  if (e.dataTransfer.types.includes(ROW_DND)) e.preventDefault();
+                }}
+              >
+                <div className="mb-3 flex items-center gap-2.5">
+                  <span
+                    draggable
+                    onDragStart={(e) => onRowDragStart(e, row.fileId)}
+                    onDragEnd={onRowDragEnd}
+                    className="shrink-0 cursor-grab active:cursor-grabbing"
+                    style={{ color: "var(--muted)" }}
+                    title="Drag to reorder"
+                  >
+                    <GripVertical size={15} />
+                  </span>
+                  <span
+                    className="shrink-0 truncate text-xs"
+                    style={{ color: "var(--muted)" }}
+                  >
+                    {row.fileName}
+                  </span>
+                  <span className="shrink-0 text-xs" style={{ color: "var(--muted)", opacity: 0.7 }}>
                     {visible.length} cuts · {fmtDur(total)}
                   </span>
                   <div className="h-px flex-1" style={{ background: "var(--border)" }} />
@@ -212,6 +297,8 @@ export function CutsView() {
                         file={filesById[c.file_id]!}
                         cut={c}
                         getUrl={getUrl}
+                        orientation={orientation}
+                        fit={fit}
                         selected={isSel}
                         weldLeft={weldLeft}
                         weldRight={weldRight}
@@ -253,7 +340,7 @@ function TagDropdown({
       <button
         onClick={() => setOpen((v) => !v)}
         className="flex items-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium transition-colors hover:bg-[var(--sidebar)]"
-        style={{ borderColor: "var(--border)", color: "var(--foreground)" }}
+        style={{ borderColor: "rgba(255,255,255,0.4)", color: "var(--foreground)" }}
       >
         {current.label}
         <span className="text-xs" style={{ color: "var(--muted)" }}>
@@ -297,10 +384,66 @@ function TagDropdown({
   );
 }
 
+function PillDropdown({
+  options,
+  value,
+  onChange,
+}: {
+  options: string[];
+  value?: string;
+  onChange?: (v: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [internal, setInternal] = useState(options[0]);
+  const selected = value ?? internal;
+  const select = (opt: string) => {
+    setInternal(opt);
+    onChange?.(opt);
+  };
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium transition-colors hover:bg-[var(--sidebar)]"
+        style={{ borderColor: "rgba(255,255,255,0.4)", color: "var(--foreground)" }}
+      >
+        {selected}
+        <ChevronDown size={15} style={{ color: "var(--muted)" }} />
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-30" onClick={() => setOpen(false)} />
+          <div
+            className="absolute left-0 z-40 mt-1.5 min-w-[170px] overflow-hidden rounded-xl border shadow-xl"
+            style={{ background: "var(--background)", borderColor: "var(--border)" }}
+          >
+            {options.map((opt) => (
+              <button
+                key={opt}
+                onClick={() => {
+                  select(opt);
+                  setOpen(false);
+                }}
+                className="flex w-full items-center justify-between px-3.5 py-2 text-sm transition-colors hover:bg-[var(--sidebar)]"
+                style={{ color: selected === opt ? "var(--foreground)" : "var(--muted)" }}
+              >
+                {opt}
+                {selected === opt && <Check size={14} />}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function CutCard({
   file,
   cut,
   getUrl,
+  orientation,
+  fit,
   selected,
   weldLeft,
   weldRight,
@@ -312,6 +455,8 @@ function CutCard({
   file: FileRecord;
   cut: Cut;
   getUrl: (fileId: string) => Promise<string | null>;
+  orientation: "landscape" | "portrait";
+  fit: "adjusted" | "original";
   selected: boolean;
   weldLeft: boolean;
   weldRight: boolean;
@@ -325,6 +470,7 @@ function CutCard({
   const inSec = cut.src_in_ms / 1000;
   const outSec = cut.src_out_ms / 1000;
   const peakSec = cut.peak_ms / 1000;
+  const objectFit = fit === "adjusted" ? "cover" : "contain";
 
   async function ensureUrl() {
     if (playUrl) return;
@@ -394,7 +540,7 @@ function CutCard({
 
   return (
     <div
-      style={{ width: CARD_W, marginLeft: weldLeft ? 0 : 8 }}
+      style={{ width: CARD_W[orientation], marginLeft: weldLeft ? 0 : 10 }}
       className="shrink-0 first:ml-0"
     >
       <div
@@ -407,9 +553,10 @@ function CutCard({
         draggable
         onDragStart={onDragStart}
         className={cn(
-          "group relative flex aspect-video cursor-pointer items-center justify-center overflow-hidden border transition-colors",
-          !weldLeft && "rounded-l-lg",
-          !weldRight && "rounded-r-lg"
+          "group relative flex cursor-pointer items-center justify-center overflow-hidden border transition-colors",
+          orientation === "portrait" ? "aspect-[9/16]" : "aspect-video",
+          !weldLeft && "rounded-l-xl",
+          !weldRight && "rounded-r-xl"
         )}
         style={{
           background: "#000",
@@ -429,17 +576,18 @@ function CutCard({
             draggable={false}
             onLoadedMetadata={onLoadedMetadata}
             onTimeUpdate={onTimeUpdate}
-            className="h-full w-full bg-black object-cover"
+            className="h-full w-full bg-black"
+            style={{ objectFit }}
           />
         )}
 
         {/* Tag badges (top-left): primary first, then any extra tags. Neutral
             chips -- the palette stays b/w/grey; the words carry the meaning. */}
-        <div className="absolute left-1.5 top-1.5 z-20 flex items-center gap-1">
+        <div className="absolute left-2 top-2 z-20 flex items-center gap-1">
           {cut.tags.map((t) => (
             <span
               key={t}
-              className="rounded px-1.5 py-0.5 text-[10px] font-semibold capitalize"
+              className="rounded px-1.5 py-0.5 text-[11px] font-semibold capitalize"
               style={{
                 background: t === cut.primary ? "rgba(255,255,255,0.92)" : "rgba(0,0,0,0.6)",
                 color: t === cut.primary ? "#000" : "#fff",
@@ -453,32 +601,32 @@ function CutCard({
         {/* Selected tick (top-right). */}
         {selected && (
           <span
-            className="absolute right-1.5 top-1.5 z-20 flex h-5 w-5 items-center justify-center rounded-full"
+            className="absolute right-2 top-2 z-20 flex h-6 w-6 items-center justify-center rounded-full"
             style={{ background: "var(--accent)", color: "var(--background)" }}
           >
-            <Check size={13} />
+            <Check size={14} />
           </span>
         )}
 
         {/* Hover play hint. */}
         <span
-          className="pointer-events-none absolute left-1/2 top-1/2 z-10 flex h-9 w-9 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full opacity-100 shadow-lg transition-opacity group-hover:opacity-0"
+          className="pointer-events-none absolute left-1/2 top-1/2 z-10 flex h-11 w-11 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full opacity-100 shadow-lg transition-opacity group-hover:opacity-0"
           style={{ background: "var(--accent)" }}
         >
-          <Play size={16} className="ml-0.5" fill="currentColor" style={{ color: "var(--background)" }} />
+          <Play size={20} className="ml-0.5" fill="currentColor" style={{ color: "var(--background)" }} />
         </span>
 
         {/* Duration (bottom-right) + speaker (bottom-left). */}
-        <span className="absolute bottom-1.5 right-1.5 z-10 rounded bg-black/70 px-1.5 py-0.5 text-[10px] font-medium text-white">
+        <span className="absolute bottom-2 right-2 z-10 rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-medium text-white">
           {fmtDur(cut.duration_ms)}
         </span>
         {cut.speaker && (
-          <span className="absolute bottom-1.5 left-1.5 z-10 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">
+          <span className="absolute bottom-2 left-2 z-10 rounded bg-black/60 px-1.5 py-0.5 text-[11px] font-medium text-white">
             {cut.speaker}
           </span>
         )}
       </div>
-      <p className="mt-1.5 line-clamp-2 px-0.5 text-[11px] leading-snug" style={{ minHeight: "2.4em" }}>
+      <p className="mt-2 line-clamp-2 px-0.5 text-sm leading-snug" style={{ minHeight: "2.5em" }}>
         {cut.label || <em style={{ color: "var(--muted)" }}>(no label)</em>}
       </p>
     </div>
