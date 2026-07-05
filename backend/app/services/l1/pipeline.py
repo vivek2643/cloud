@@ -31,6 +31,7 @@ from app.services.l1 import diarization as diar_mod
 from app.services.l1 import dialogue_segments as dlg_mod
 from app.services.l1 import motion_dynamics as motion_mod
 from app.services.l1 import music_structure as music_mod
+from app.services.l1 import scene_cuts as scene_mod
 from app.services.l1 import transcript as tr_mod
 from app.services.l1.snapshot import build_l1_snapshot
 from app.services.processing import _download_from_r2, _probe_video, _upload_to_r2
@@ -39,6 +40,10 @@ from app.services.supabase_client import get_supabase
 logger = logging.getLogger(__name__)
 
 STAGES = ("proxy", "transcript", "audio_features", "diarization", "dialogue_cut", "beat_cut", "motion_dynamics", "dialogue_segments")
+# cuts-v2: additive on top of STAGES (old tuple kept as-is; nothing that reads
+# STAGES needs to change). Runs in parallel with the v1 pipeline until v2 is
+# validated -- see cuts_v2.plan.md.
+STAGES_V2 = STAGES + ("scene_detect",)
 # Audio-only uploads (music) run a different, video-free set of stages.
 AUDIO_STAGES = ("audio_proxy", "audio_features", "beat_cut", "music_structure")
 
@@ -743,6 +748,40 @@ def _stage9_motion_dynamics(
     )
 
 
+def _stage_scene_detect(
+    file_id: str, video_path: str, duration_s: float, conn: psycopg.Connection
+) -> None:
+    """cuts-v2: one histogram-drift pass over the proxy -> shot/composition
+    boundaries. Best-effort: a decode failure no-ops without failing L1.
+    """
+    sc = scene_mod.compute_scene_cuts(
+        video_path, duration_ms=int((duration_s or 0) * 1000)
+    )
+    if not sc.has_scenes:
+        return
+
+    conn.execute(
+        """
+        insert into scene_cuts (file_id, hop_ms, shot_points, composition_points, schema_version)
+        values (%s, %s, %s::jsonb, %s::jsonb, %s)
+        on conflict (file_id) do update set
+            hop_ms             = excluded.hop_ms,
+            shot_points        = excluded.shot_points,
+            composition_points = excluded.composition_points,
+            schema_version     = excluded.schema_version
+        """,
+        (
+            file_id, sc.hop_ms,
+            json.dumps(sc.shot_points), json.dumps(sc.composition_points),
+            scene_mod.SCHEMA_VERSION,
+        ),
+    )
+    logger.info(
+        "Scene detect: %s -> %d shot cuts, %d composition points",
+        file_id, len(sc.shot_points), len(sc.composition_points),
+    )
+
+
 # --- Helpers -------------------------------------------------------------
 
 def _run_stage(
@@ -810,10 +849,14 @@ def _track_audio(file_id: str, wav_path: str, duration_s: float) -> None:
 
 
 def _track_motion(file_id: str, video_source: str, duration_s: float) -> None:
-    """motion_dynamics (optical flow). Independent of all audio stages."""
+    """motion_dynamics (optical flow) -> scene_detect (histogram drift).
+    Independent of all audio stages; scene_detect shares this track's proxy
+    (cuts-v2, additive -- see STAGES_V2)."""
     with _pg_conn() as conn:
         _run_stage(conn, file_id, "motion_dynamics",
                    _stage9_motion_dynamics, file_id, video_source, duration_s, conn)
+        _run_stage(conn, file_id, "scene_detect",
+                   _stage_scene_detect, file_id, video_source, duration_s, conn)
 
 
 def _run_deep_stages_parallel(

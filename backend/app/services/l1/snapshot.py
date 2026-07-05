@@ -28,7 +28,8 @@ def _row_to_dict(row) -> Optional[Dict[str, Any]]:
 
 _L1_STAGES = ("proxy", "transcript", "audio_features", "diarization",
               "dialogue_cut", "beat_cut", "motion_dynamics", "dialogue_segments",
-              "audio_proxy", "music_structure")
+              "audio_proxy", "music_structure",
+              "scene_detect")  # cuts-v2, additive -- see STAGES_V2
 
 
 def _iso(v) -> Optional[str]:
@@ -202,6 +203,24 @@ def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
                 "camera_cut_cost": md["camera_cut_cost"] or [],
                 "action_points": md["action_points"] or [],
                 "action_point_count": len(md["action_points"] or []),
+            }
+
+        # Scene/shot detection (cuts-v2) -- video-derived, own table.
+        cur = conn.execute(
+            """
+            select hop_ms, shot_points, composition_points
+              from scene_cuts where file_id = %s
+            """,
+            (file_id,),
+        )
+        sc = cur.fetchone()
+        if sc:
+            out["scene_cuts"] = {
+                "hop_ms": sc["hop_ms"],
+                "shot_points": sc["shot_points"] or [],
+                "shot_point_count": len(sc["shot_points"] or []),
+                "composition_points": sc["composition_points"] or [],
+                "composition_point_count": len(sc["composition_points"] or []),
             }
 
         # Music structure (audio-only uploads) -- own table, music-derived.
