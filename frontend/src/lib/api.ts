@@ -242,6 +242,47 @@ export function getHeroCutsFeed(fileIds: string[], energy: number, token: string
   });
 }
 
+// --- Cuts v2 (deterministic non-overlapping partition) ---
+
+// One disjoint interval of a file's timeline, tagged with every capture channel
+// it serves. INVARIANT: no two cuts from the same file overlap in time -- the
+// row is a contiguous filmstrip. See cuts_v2.plan.md.
+export interface Cut {
+  file_id: string;
+  src_in_ms: number;
+  src_out_ms: number;
+  duration_ms: number;
+  // Subset of {said,done,shown}, always >=1, priority-ordered (said>done>shown).
+  tags: string[];
+  // The highest-priority tag -- drives the label and the primary badge colour.
+  primary: string;
+  label: string;
+  speaker: string | null;
+  // Representative frame instant for the thumbnail (peak / sharpest / midpoint).
+  peak_ms: number;
+  // Set later by tightness; null = play the whole span contiguously.
+  keep_spans?: [number, number][] | null;
+}
+
+export interface CutsResponse {
+  cuts: Cut[];
+  ready: boolean;
+}
+
+export function getCuts(fileId: string, token: string) {
+  return request<CutsResponse>(`/api/files/${fileId}/cuts`, { token });
+}
+
+// One flat list of cuts across many clips; the client groups by file_id into
+// per-video horizontal rows.
+export function getCutsFeed(fileIds: string[], token: string) {
+  return request<CutsResponse>(`/api/files/cuts`, {
+    method: "POST",
+    token,
+    body: JSON.stringify({ file_ids: fileIds }),
+  });
+}
+
 // --- Upload ---
 
 export interface PresignResponse {

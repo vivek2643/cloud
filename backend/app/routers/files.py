@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -6,6 +7,8 @@ from app.auth import get_current_user_id
 from app.services.supabase_client import get_supabase
 from app.services.r2 import generate_presigned_get
 from app.models.schemas import FileResponse, FileUpdate, FileMoveRequest
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/files", tags=["files"])
 
@@ -49,6 +52,10 @@ def _with_progress(f: dict) -> dict:
 class HeroCutsFeedRequest(BaseModel):
     file_ids: List[str] = Field(default_factory=list)
     energy: float = Field(0.5, ge=0.0, le=1.0)
+
+
+class CutsFeedRequest(BaseModel):
+    file_ids: List[str] = Field(default_factory=list)
 
 
 @router.get("", response_model=List[FileResponse])
@@ -300,6 +307,75 @@ def get_hero_cuts_feed(
 
     heroes = get_hero_feed(owned_ids, energy=payload.energy)
     return {"heroes": heroes, "energy": payload.energy, "ready": bool(heroes)}
+
+
+# --------------------------------------------------------------------------
+# Cuts v2 (parallel to /hero-cuts): the deterministic non-overlapping
+# partition, served as one contiguous filmstrip per file. See cuts_v2.plan.md
+# (Phase B4). Compute-on-read over the same L1/L3 artifacts; no VLM, no energy
+# ladder -- the row is a contiguous, non-overlapping partition by construction.
+# --------------------------------------------------------------------------
+
+def _build_cuts_for(file_ids: List[str]) -> List[dict]:
+    """Partition every file into its non-overlapping, tag-bearing cuts (as
+    plain dicts, each with a convenience ``duration_ms``). Best-effort per
+    file: a partition failure yields no cuts for that file, never a 500."""
+    from app.services.l3.partition import build_partition
+
+    out: List[dict] = []
+    for fid in file_ids:
+        try:
+            cuts = build_partition(fid)
+        except Exception:
+            logger.exception("cuts v2: partition failed for %s", fid)
+            continue
+        for c in cuts:
+            d = c.to_dict()
+            d["duration_ms"] = c.src_out_ms - c.src_in_ms
+            out.append(d)
+    out.sort(key=lambda d: (d["file_id"], d["src_in_ms"]))
+    return out
+
+
+@router.get("/{file_id}/cuts")
+def get_cuts(
+    file_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    """The cuts-v2 partition for ONE file -- a contiguous, non-overlapping,
+    tag-bearing filmstrip in ``src_in_ms`` order. Deterministic; `ready` is
+    false when the file has no usable L1 artifacts yet."""
+    sb = get_supabase()
+    owns = sb.table("files").select("id").eq("id", file_id).eq("user_id", user_id).execute()
+    if not owns.data:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    cuts = _build_cuts_for([file_id])
+    return {"cuts": cuts, "ready": bool(cuts)}
+
+
+@router.post("/cuts")
+def get_cuts_feed(
+    payload: CutsFeedRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """The cuts-v2 partition across many files -- one flat list the client
+    groups into per-file rows. Ownership is verified; foreign/unknown ids are
+    dropped."""
+    file_ids = list(dict.fromkeys(payload.file_ids or []))
+    if not file_ids:
+        return {"cuts": [], "ready": False}
+
+    sb = get_supabase()
+    owned = (
+        sb.table("files").select("id").eq("user_id", user_id).in_("id", file_ids).execute()
+    )
+    owned_ids = [r["id"] for r in (owned.data or [])]
+    if not owned_ids:
+        raise HTTPException(status_code=404, detail="No matching files")
+
+    cuts = _build_cuts_for(owned_ids)
+    return {"cuts": cuts, "ready": bool(cuts)}
 
 
 @router.get("/{file_id}/l1")
