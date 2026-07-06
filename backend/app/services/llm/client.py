@@ -139,16 +139,30 @@ def _unstringify_field(raw: Dict[str, Any], key: str) -> Any:
     call ("cuts": "[...]", or double-wrapped: "cuts": "{\"cuts\": [...]}").
     Parses the string and, if the result is itself a dict re-using the same
     key, unwraps that one more level too. Returns the original value
-    unchanged if it isn't a string, or isn't parseable JSON."""
+    unchanged if it isn't a string, or isn't parseable JSON even leniently.
+
+    Tries strict JSON first, then ``strict=False`` (permits literal control
+    characters -- newlines/tabs -- inside string values unescaped): when
+    the model hand-stringifies a big JSON blob as a field value, the OUTER
+    tool-call shape is still constrained-decoded, but that inner string's
+    CONTENT is free text as far as the decoder is concerned, so a pretty-
+    printed multi-line "fake JSON" string can carry a raw newline where a
+    real JSON string would need ``\\n``. That's the one relaxation applied
+    here -- it doesn't reinterpret or repair mismatched quotes/content."""
     v = raw.get(key)
     if not isinstance(v, str):
         return v
     s = v.strip()
     if s[:1] not in "{[":
         return v
-    try:
-        parsed = json.loads(s)
-    except (json.JSONDecodeError, ValueError):
+    parsed = None
+    for strict in (True, False):
+        try:
+            parsed = json.loads(s, strict=strict)
+            break
+        except (json.JSONDecodeError, ValueError):
+            continue
+    if parsed is None:
         return v
     if isinstance(parsed, dict) and key in parsed:
         return parsed[key]

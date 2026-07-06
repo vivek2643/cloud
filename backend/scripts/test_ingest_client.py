@@ -260,6 +260,23 @@ def test_double_wrapped_stringified_field_unwraps_the_matching_key():
     print("ok  test_double_wrapped_stringified_field_unwraps_the_matching_key")
 
 
+def test_stringified_field_with_a_raw_control_char_still_parses_leniently():
+    # A literal (unescaped) newline embedded INSIDE a JSON string value --
+    # strict json.loads rejects raw control characters there; strict=False
+    # permits them. Plausible when the model hand-stringifies a pretty-
+    # printed multi-line blob as a field value instead of a native list.
+    raw_with_control_char = '["a\nb"]'
+    stringified = {"items": raw_with_control_char}
+    fake, orig = _with_fake_client([FakeResponse([FakeBlock("tool_use", ic._TOOL_NAME, stringified)])])
+    try:
+        result = ic.complete("pass1", "system", [text_block("hi")], Bar)
+    finally:
+        ic._sdk_client = orig
+    assert result.attempts == 1, result
+    assert result.data == {"items": ["a\nb"]}, result
+    print("ok  test_stringified_field_with_a_raw_control_char_still_parses_leniently")
+
+
 def test_unparseable_string_field_falls_through_to_the_normal_reask():
     bad = {"items": "not json at all"}
     good = {"items": ["a"]}
@@ -462,6 +479,7 @@ def main():
     test_extra_check_passes_a_genuinely_good_response_straight_through()
     test_stringified_list_field_is_parsed_on_the_first_attempt()
     test_double_wrapped_stringified_field_unwraps_the_matching_key()
+    test_stringified_field_with_a_raw_control_char_still_parses_leniently()
     test_unparseable_string_field_falls_through_to_the_normal_reask()
     test_unknown_stage_raises_before_any_call()
     test_cache_breakpoint_on_last_block_and_system()

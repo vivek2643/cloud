@@ -14,6 +14,7 @@ if BACKEND not in sys.path:
 
 from app.services.l3 import lattice as lt  # noqa: E402
 from app.services.l3.base_cuts import R_CLIP, R_DISTURB, R_MOVE, R_SETTLE, R_SHOT  # noqa: E402
+from app.services.l3.lattice import Atom, R_SPEECH_EDGE  # noqa: E402
 
 
 def _flat_motion(n, hop=100, stability=0.95, camera_motion=0.02, action=0.05, coherence=0.95):
@@ -263,6 +264,63 @@ def test_snap_word_edge_empty_words_is_safe():
     print("ok  test_snap_word_edge_empty_words_is_safe")
 
 
+# --------------------------------------------------------------------------
+# resolve_speech_span_ms
+# --------------------------------------------------------------------------
+
+def _reel_trail_regression_fixture():
+    """The exact word/atom layout that produced a real, reproducible
+    coverage overlap in cuts-v3 (file 93991c78...): a 2.76s pause between
+    words 20 and 21, almost entirely carved into video atoms, where the
+    raw gap-midpoint snap for a speech cut ending at word 20 landed at
+    ms=8240 -- deep inside the atoms' own [6860-9620) span."""
+    words = [
+        {"start_ms": 0, "end_ms": 400, "text": "and"},
+        {"start_ms": 400, "end_ms": 740, "text": "go"},
+        {"start_ms": 740, "end_ms": 1640, "text": "brands"},
+        {"start_ms": 6580, "end_ms": 6860, "text": "you"},
+        {"start_ms": 9620, "end_ms": 10220, "text": "there's"},
+        {"start_ms": 10220, "end_ms": 10300, "text": "a"},
+    ]
+    atoms = [
+        Atom(atom_id=0, file_id="f1", start_ms=6860, end_ms=7700, state_in=R_SPEECH_EDGE,
+             state_out=R_SETTLE, action_energy=0.1, camera_desc="hold", coherence=0.9),
+        Atom(atom_id=1, file_id="f1", start_ms=7700, end_ms=9200, state_in=R_SETTLE,
+             state_out=R_MOVE, action_energy=0.3, camera_desc="pan", coherence=0.8),
+        Atom(atom_id=2, file_id="f1", start_ms=9200, end_ms=9620, state_in=R_MOVE,
+             state_out=R_SPEECH_EDGE, action_energy=0.2, camera_desc="hold", coherence=0.9),
+    ]
+    return words, atoms
+
+
+def test_resolve_speech_span_ms_clamps_end_to_the_next_atom():
+    words, atoms = _reel_trail_regression_fixture()
+    # word_span (0, 3): "and go brands ... you" -- ends at word 3 (index),
+    # the raw gap-midpoint snap for word 4 ("there's") would land at
+    # (6860+9620)//2 = 8240, deep inside atom 0/1's span.
+    s, e = lt.resolve_speech_span_ms(words, atoms, (0, 3), [])
+    assert e == 6860, e   # clamped to where atom 0 begins, not 8240
+    assert s == 0, s
+    print("ok  test_resolve_speech_span_ms_clamps_end_to_the_next_atom")
+
+
+def test_resolve_speech_span_ms_clamps_start_to_the_preceding_atom():
+    words, atoms = _reel_trail_regression_fixture()
+    # word_span (4, 5): "there's a" -- starts right after the same atom run;
+    # the raw gap-midpoint snap for the start would reach back toward 8240,
+    # inside atom 1/2's span, unless clamped to atom 2's own end (9620).
+    s, e = lt.resolve_speech_span_ms(words, atoms, (4, 5), [])
+    assert s == 9620, s   # clamped to where atom 2 ends, not the raw midpoint
+    print("ok  test_resolve_speech_span_ms_clamps_start_to_the_preceding_atom")
+
+
+def test_resolve_speech_span_ms_is_a_noop_without_atoms():
+    words, _atoms = _reel_trail_regression_fixture()
+    s, e = lt.resolve_speech_span_ms(words, [], (0, 3), [])
+    assert e == (6860 + 9620) // 2, e   # unclamped raw gap-midpoint
+    print("ok  test_resolve_speech_span_ms_is_a_noop_without_atoms")
+
+
 def main():
     test_atoms_never_overlap_a_speech_turn()
     test_atoms_cover_the_whole_non_speech_remainder()
@@ -287,6 +345,9 @@ def main():
     test_snap_word_edge_falls_back_to_gap_midpoint_without_silence_data()
     test_snap_word_edge_touching_words_has_no_gap()
     test_snap_word_edge_empty_words_is_safe()
+    test_resolve_speech_span_ms_clamps_end_to_the_next_atom()
+    test_resolve_speech_span_ms_clamps_start_to_the_preceding_atom()
+    test_resolve_speech_span_ms_is_a_noop_without_atoms()
     print("\nall lattice tests passed")
 
 

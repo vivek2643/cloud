@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
-from app.services.l3.lattice import Lattice, _snap_word_edge
+from app.services.l3.lattice import Lattice, resolve_speech_span_ms
 from app.services.l3.pass1 import Pass1Output
 from app.services.l3.video_segments import _sharpest_ms
 
@@ -57,9 +57,7 @@ def _word_span_ms(lattices: Dict[str, Lattice], silences_by_file: Dict[str, List
                    file_id: str, word_span: Tuple[int, int]) -> Tuple[int, int]:
     lattice = lattices[file_id]
     silences = silences_by_file.get(file_id, [])
-    s = _snap_word_edge(lattice.words, word_span[0], silences)
-    e = _snap_word_edge(lattice.words, word_span[1] + 1, silences)
-    return s, e
+    return resolve_speech_span_ms(lattice.words, lattice.atoms, word_span, silences)
 
 
 def _atom_group_span(lattices: Dict[str, Lattice], file_id: str,

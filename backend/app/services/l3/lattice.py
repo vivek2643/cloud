@@ -311,6 +311,39 @@ def _snap_word_edge(words: List[dict], word_idx: int, silences: List[dict]) -> i
     return (prev_end + cur_start) // 2
 
 
+def resolve_speech_span_ms(
+    words: List[dict], atoms: List[Atom], word_span: Tuple[int, int], silences: List[dict],
+) -> Tuple[int, int]:
+    """A speech cut's (start_ms, end_ms), snapped into inter-word silence
+    like ``_snap_word_edge`` but then CLAMPED so the cushioning padding
+    never intrudes into a neighboring atom's already-claimed territory.
+
+    Needed because an inter-word gap and an atom-filled gap aren't always
+    the same boundary: atoms are carved from the non-speech remainder using
+    diarization TURNS, while a speech cut's own word_span/silence snap can
+    independently reach partway into that same gap for a natural cut point.
+    Observed against real data: a 2.8s pause between two words, almost
+    entirely consumed by 3 video atoms, still let the silence-midpoint snap
+    land ~1000ms inside the atoms' own span -- a real, reproducible
+    coverage overlap, not model noise. Atoms and speech together must
+    partition the timeline; this is the one adjustment enforcing that at
+    the boundary the two disagree about."""
+    s = _snap_word_edge(words, word_span[0], silences)
+    e = _snap_word_edge(words, word_span[1] + 1, silences)
+    if not words or not atoms:
+        return s, e
+    idx0, idx1 = word_span[0], word_span[1]
+    first_word_start = int(words[idx0].get("start_ms", s)) if 0 <= idx0 < len(words) else s
+    last_word_end = int(words[idx1].get("end_ms", e)) if 0 <= idx1 < len(words) else e
+    following = [a.start_ms for a in atoms if a.start_ms >= last_word_end]
+    if following:
+        e = min(e, min(following))
+    preceding = [a.end_ms for a in atoms if a.end_ms <= first_word_start]
+    if preceding:
+        s = max(s, max(preceding))
+    return s, e
+
+
 # --------------------------------------------------------------------------
 # DB loaders + convenience wrappers (not pure -- real callers only)
 # --------------------------------------------------------------------------

@@ -139,6 +139,147 @@ def test_no_duplicate_atoms_ignores_speech_cuts():
     print("ok  test_no_duplicate_atoms_ignores_speech_cuts")
 
 
+def test_kind_matches_source_ref_passes_when_consistent():
+    out = pass2.Pass2Output(cuts=[
+        pass2.Pass2Cut(source_ref="speech_cut[0]", kind="speech", file_id="f1",
+                       word_span=(0, 1), label="a", summary="a"),
+        pass2.Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1",
+                       atom_ids=[0, 1], label="b", summary="b"),
+    ])
+    assert pass2._kind_matches_source_ref(out) is None
+    print("ok  test_kind_matches_source_ref_passes_when_consistent")
+
+
+def test_kind_matches_source_ref_catches_a_speech_ref_typed_as_video():
+    # Observed against the real API: a cut kept its "speech_cut[10]" ref
+    # name but was emitted with kind="video" -- word_span/atom_ids then
+    # don't resolve, surfacing as a much less actionable error downstream.
+    out = pass2.Pass2Output(cuts=[
+        pass2.Pass2Cut(source_ref="speech_cut[10]", kind="video", file_id="f1",
+                       atom_ids=[3], label="a", summary="a"),
+    ])
+    err = pass2._kind_matches_source_ref(out)
+    assert err is not None and "speech_cut[10]" in err and "kind='video'" in err, err
+    print("ok  test_kind_matches_source_ref_catches_a_speech_ref_typed_as_video")
+
+
+def test_kind_matches_source_ref_catches_a_video_ref_typed_as_speech():
+    out = pass2.Pass2Output(cuts=[
+        pass2.Pass2Cut(source_ref="video_group[2]", kind="speech", file_id="f1",
+                       word_span=(0, 1), label="a", summary="a"),
+    ])
+    err = pass2._kind_matches_source_ref(out)
+    assert err is not None and "video_group[2]" in err, err
+    print("ok  test_kind_matches_source_ref_catches_a_video_ref_typed_as_speech")
+
+
+def test_no_overlapping_word_spans_passes_when_disjoint():
+    out = pass2.Pass2Output(cuts=[
+        pass2.Pass2Cut(source_ref="speech_cut[0]", kind="speech", file_id="f1",
+                       word_span=(0, 4), label="a", summary="a"),
+        pass2.Pass2Cut(source_ref="speech_cut[1]", kind="speech", file_id="f1",
+                       word_span=(5, 12), label="b", summary="b"),
+    ])
+    assert pass2._no_overlapping_word_spans(out) is None
+    print("ok  test_no_overlapping_word_spans_passes_when_disjoint")
+
+
+def test_no_overlapping_word_spans_catches_a_duplicate_span():
+    # Observed against the real API: two speech cuts with the identical
+    # word_span in the same file, surfacing downstream as a raw ms overlap
+    # with no indication of which cuts or why.
+    out = pass2.Pass2Output(cuts=[
+        pass2.Pass2Cut(source_ref="speech_cut[0]", kind="speech", file_id="f1",
+                       word_span=(0, 4), label="a", summary="a"),
+        pass2.Pass2Cut(source_ref="speech_cut[1]", kind="speech", file_id="f1",
+                       word_span=(0, 4), label="b", summary="b"),
+    ])
+    err = pass2._no_overlapping_word_spans(out)
+    assert err is not None and "speech_cut[0]" in err and "speech_cut[1]" in err, err
+    print("ok  test_no_overlapping_word_spans_catches_a_duplicate_span")
+
+
+def test_no_overlapping_word_spans_ignores_different_files():
+    out = pass2.Pass2Output(cuts=[
+        pass2.Pass2Cut(source_ref="speech_cut[0]", kind="speech", file_id="f1",
+                       word_span=(0, 4), label="a", summary="a"),
+        pass2.Pass2Cut(source_ref="speech_cut[0]", kind="speech", file_id="f2",
+                       word_span=(0, 4), label="b", summary="b"),
+    ])
+    assert pass2._no_overlapping_word_spans(out) is None
+    print("ok  test_no_overlapping_word_spans_ignores_different_files")
+
+
+def test_pass2_semantic_checks_combines_all_checks():
+    kind_mismatch = pass2.Pass2Output(cuts=[
+        pass2.Pass2Cut(source_ref="speech_cut[0]", kind="video", file_id="f1",
+                       atom_ids=[0], label="a", summary="a"),
+    ])
+    assert pass2._pass2_semantic_checks(kind_mismatch, {}) is not None
+
+    dup_atoms = pass2.Pass2Output(cuts=[
+        pass2.Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1",
+                       atom_ids=[0, 1], label="a", summary="a"),
+        pass2.Pass2Cut(source_ref="video_group[1]", kind="video", file_id="f1",
+                       atom_ids=[1, 2], label="b", summary="b"),
+    ])
+    assert pass2._pass2_semantic_checks(dup_atoms, {}) is not None
+
+    dup_words = pass2.Pass2Output(cuts=[
+        pass2.Pass2Cut(source_ref="speech_cut[0]", kind="speech", file_id="f1",
+                       word_span=(0, 4), label="a", summary="a"),
+        pass2.Pass2Cut(source_ref="speech_cut[1]", kind="speech", file_id="f1",
+                       word_span=(2, 6), label="b", summary="b"),
+    ])
+    assert pass2._pass2_semantic_checks(dup_words, {}) is not None
+
+    clean = pass2.Pass2Output(cuts=[
+        pass2.Pass2Cut(source_ref="speech_cut[0]", kind="speech", file_id="f1",
+                       word_span=(0, 1), label="a", summary="a"),
+    ])
+    assert pass2._pass2_semantic_checks(clean, {}) is None
+    print("ok  test_pass2_semantic_checks_combines_all_checks")
+
+
+def _lattice_for_cross_kind_test():
+    from app.services.l3.lattice import Atom, Lattice
+    words = [
+        {"start_ms": 0, "end_ms": 200, "text": "a"},
+        {"start_ms": 300, "end_ms": 500, "text": "b"},
+        {"start_ms": 600, "end_ms": 800, "text": "c"},
+    ]
+    atoms = [Atom(atom_id=0, file_id="f1", start_ms=400, end_ms=1000, state_in="x", state_out="y",
+                 action_energy=0.1, camera_desc="hold", coherence=0.9)]
+    return Lattice(file_id="f1", duration_ms=1000, words=words, turns=[], hints=[], atoms=atoms)
+
+
+def test_no_cross_kind_ms_overlap_passes_when_disjoint():
+    lattices = {"f1": _lattice_for_cross_kind_test()}
+    out = pass2.Pass2Output(cuts=[
+        pass2.Pass2Cut(source_ref="speech_cut[0]", kind="speech", file_id="f1",
+                       word_span=(0, 0), label="a", summary="a"),
+    ])
+    assert pass2._no_cross_kind_ms_overlap(out, lattices) is None
+    print("ok  test_no_cross_kind_ms_overlap_passes_when_disjoint")
+
+
+def test_no_cross_kind_ms_overlap_catches_a_speech_and_video_cut_overlapping():
+    # Observed against the real API: a speech cut and a video cut in the
+    # same file resolve to overlapping ms spans -- neither the atom-id nor
+    # the word-index check catches this (different kinds), only resolving
+    # actual ms spans does.
+    lattices = {"f1": _lattice_for_cross_kind_test()}
+    out = pass2.Pass2Output(cuts=[
+        pass2.Pass2Cut(source_ref="speech_cut[1]", kind="speech", file_id="f1",
+                       word_span=(1, 2), label="a", summary="a"),   # words[1:2] -> ms [300, 800)
+        pass2.Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1",
+                       atom_ids=[0], label="b", summary="b"),        # atom 0 -> ms [400, 1000)
+    ])
+    err = pass2._no_cross_kind_ms_overlap(out, lattices)
+    assert err is not None and "speech_cut[1]" in err and "video_group[0]" in err, err
+    print("ok  test_no_cross_kind_ms_overlap_catches_a_speech_and_video_cut_overlapping")
+
+
 # --------------------------------------------------------------------------
 # Shard building
 # --------------------------------------------------------------------------
@@ -313,6 +454,15 @@ def main():
     test_no_duplicate_atoms_passes_when_every_atom_is_used_once()
     test_no_duplicate_atoms_catches_an_atom_split_across_two_cuts()
     test_no_duplicate_atoms_ignores_speech_cuts()
+    test_kind_matches_source_ref_passes_when_consistent()
+    test_kind_matches_source_ref_catches_a_speech_ref_typed_as_video()
+    test_kind_matches_source_ref_catches_a_video_ref_typed_as_speech()
+    test_no_overlapping_word_spans_passes_when_disjoint()
+    test_no_overlapping_word_spans_catches_a_duplicate_span()
+    test_no_overlapping_word_spans_ignores_different_files()
+    test_pass2_semantic_checks_combines_all_checks()
+    test_no_cross_kind_ms_overlap_passes_when_disjoint()
+    test_no_cross_kind_ms_overlap_catches_a_speech_and_video_cut_overlapping()
     test_single_file_one_shard()
     test_unrelated_files_pack_into_one_shard_when_small()
     test_take_group_forces_co_location_across_files()

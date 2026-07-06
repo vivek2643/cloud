@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.services.l3.image_plan import PlannedFrame
-from app.services.l3.lattice import Lattice
+from app.services.l3.lattice import Lattice, resolve_speech_span_ms
 from app.services.l3.pass1 import Pass1Output, build_pass1_blocks, render_pass1_output
 from app.services.l3.pass2_params import MAX_CUTS_PER_SHARD, MAX_IMAGES_PER_SHARD
 from app.services.llm import client as ic
@@ -276,6 +276,95 @@ def _no_duplicate_atoms(output: Pass2Output) -> Optional[str]:
     return None
 
 
+def _kind_matches_source_ref(output: Pass2Output) -> Optional[str]:
+    """Observed against the real API: a cut keeps its pass-1 ref name
+    (e.g. "speech_cut[10]") but gets emitted with the WRONG kind (e.g.
+    "video") -- word_span/atom_ids then don't resolve, surfacing downstream
+    in post.assemble_cut_records as a much less actionable error. Catching
+    the mismatch here, against the ref's own naming, folds it into the
+    re-ask loop instead."""
+    for cut in output.cuts:
+        if cut.source_ref.startswith("speech_cut[") and cut.kind != "speech":
+            return (f"{cut.source_ref!r} is a speech_cut but was emitted with "
+                    f"kind={cut.kind!r} -- speech_cut refs must always have kind=\"speech\"")
+        if cut.source_ref.startswith("video_group[") and cut.kind != "video":
+            return (f"{cut.source_ref!r} is a video_group but was emitted with "
+                    f"kind={cut.kind!r} -- video_group refs must always have kind=\"video\"")
+    return None
+
+
+def _no_overlapping_word_spans(output: Pass2Output) -> Optional[str]:
+    """Observed against the real API: two speech cuts in the same file with
+    identical/overlapping word_span ranges (a duplicate or a pass-1 grouping
+    mistake pass 2 echoed through) -- this only ever surfaces downstream as
+    a raw ms-coverage overlap in post.assemble_cut_records, which doesn't
+    say WHICH two cuts or why. Checking word indices directly here is both
+    cheaper (no lattice needed) and a clearer message fed back on re-ask."""
+    by_file: Dict[str, List[Tuple[int, int, str]]] = {}
+    for cut in output.cuts:
+        if cut.kind != "speech" or not cut.word_span:
+            continue
+        by_file.setdefault(cut.file_id, []).append((cut.word_span[0], cut.word_span[1], cut.source_ref))
+    for file_id, spans in by_file.items():
+        spans.sort()
+        for (a0, b0, r0), (a1, b1, r1) in zip(spans, spans[1:]):
+            if a1 <= b0:
+                return (f"{r0!r} words[{a0}-{b0}] and {r1!r} words[{a1}-{b1}] overlap in "
+                       f"{file_id} -- speech cuts must partition non-overlapping word ranges")
+    return None
+
+
+def _resolve_cut_span_ms(cut: "Pass2Cut", lattices: Dict[str, Lattice]) -> Optional[Tuple[int, int]]:
+    """Best-effort (s, e) in ms for one cut, same resolution post.py uses --
+    word/atom edges, clamped so a speech cut's silence cushion can never
+    reach into a neighboring atom's span (see resolve_speech_span_ms).
+    Silence data is skipped here (empty list) since the clamp alone is what
+    prevents the overlap this check exists to catch; a few ms of precision
+    beyond that doesn't matter for a GROSS-overlap check like this one."""
+    lattice = lattices.get(cut.file_id)
+    if lattice is None:
+        return None
+    if cut.kind == "speech" and cut.word_span:
+        return resolve_speech_span_ms(lattice.words, lattice.atoms, cut.word_span, [])
+    if cut.kind == "video" and cut.atom_ids:
+        atoms_by_id = {a.atom_id: a for a in lattice.atoms}
+        members = [atoms_by_id[i] for i in cut.atom_ids if i in atoms_by_id]
+        if not members:
+            return None
+        return min(a.start_ms for a in members), max(a.end_ms for a in members)
+    return None
+
+
+def _no_cross_kind_ms_overlap(output: Pass2Output, lattices: Dict[str, Lattice]) -> Optional[str]:
+    """A speech cut and a video cut in the same file resolving to
+    overlapping ms spans -- neither _no_duplicate_atoms (video-only, by
+    atom id) nor _no_overlapping_word_spans (speech-only, by word index)
+    catches this, since it's the CROSS-kind case. Observed against the real
+    API surfacing only as an opaque ms-overlap failure in
+    post.assemble_cut_records; resolving spans here catches it earlier,
+    with a message that names both cuts."""
+    by_file: Dict[str, List[Tuple[int, int, str]]] = {}
+    for cut in output.cuts:
+        span = _resolve_cut_span_ms(cut, lattices)
+        if span is None:
+            continue
+        by_file.setdefault(cut.file_id, []).append((span[0], span[1], cut.source_ref))
+    for file_id, spans in by_file.items():
+        spans.sort()
+        for (s0, e0, r0), (s1, e1, r1) in zip(spans, spans[1:]):
+            if s1 < e0:
+                return (f"{r0!r} [{s0}-{e0}]ms and {r1!r} [{s1}-{e1}]ms overlap in "
+                       f"{file_id} -- every cut's resolved span must be disjoint")
+    return None
+
+
+def _pass2_semantic_checks(output: Pass2Output, lattices: Dict[str, Lattice]) -> Optional[str]:
+    return (_kind_matches_source_ref(output)
+           or _no_duplicate_atoms(output)
+           or _no_overlapping_word_spans(output)
+           or _no_cross_kind_ms_overlap(output, lattices))
+
+
 # --------------------------------------------------------------------------
 # Orchestration
 # --------------------------------------------------------------------------
@@ -295,6 +384,7 @@ def run_pass2_shard(
     image_blocks = build_pass2_shard_blocks(shard_frames, images_b64)
     if not image_blocks:
         raise ValueError("run_pass2_shard: no images resolved for this shard")
+    lattices = {fid: lattice for fid, _name, _dur, lattice in file_rows}
     # A shard's cut count isn't budget-capped (only its IMAGE count is -- see
     # build_shards), and each cut's full record (framing/look/caption_zones/
     # taste fences/...) is verbose JSON -- a real ~70-cut project shard has
@@ -302,4 +392,4 @@ def run_pass2_shard(
     # still re-asks with more room (up to a hard ceiling) if this undershoots.
     return ic.complete("pass2", _SYSTEM, cached_blocks, Pass2Output,
                        extra_blocks=image_blocks, max_tokens=32000,
-                       extra_check=_no_duplicate_atoms)
+                       extra_check=lambda output: _pass2_semantic_checks(output, lattices))

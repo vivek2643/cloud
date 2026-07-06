@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.services.l3.lattice import Lattice, _anchors_in, _snap_word_edge
+from app.services.l3.lattice import Lattice, _anchors_in, resolve_speech_span_ms
 from app.services.l3.pass2 import Pass2Cut, Pass2Output
 from app.services.l3.post_params import (
     ANCHOR_PAD_MS, ENERGY_GRADE_BANDS, FLATLINE_BAND, PACE_LEVEL_TARGETS, SPEED_CEIL, SPEED_FLOOR,
@@ -217,8 +217,7 @@ def assemble_cut_records(
         atom_spans: List[Tuple[int, int, str]] = []
         if cut.kind == "speech":
             silences = silences_by_file.get(cut.file_id, [])
-            s = _snap_word_edge(lattice.words, cut.word_span[0], silences)
-            e = _snap_word_edge(lattice.words, cut.word_span[1] + 1, silences)
+            s, e = resolve_speech_span_ms(lattice.words, lattice.atoms, cut.word_span, silences)
         else:
             atoms_by_id = {a.atom_id: a for a in lattice.atoms}
             members = [atoms_by_id[i] for i in (cut.atom_ids or []) if i in atoms_by_id]
