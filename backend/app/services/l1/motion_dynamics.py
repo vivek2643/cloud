@@ -69,6 +69,15 @@ from app.services.l1.cut_grid_params import (
     MOTION_RANSAC_PX,
     MOTION_W,
 )
+from app.services.l1.motion_params import (
+    DEGENERATE_BLUR_MIN,
+    DEGENERATE_MIN_MS,
+    WIPE_AREA_FRAC,
+    WIPE_COHERENCE_MAX,
+    WIPE_MAG_PX,
+    WIPE_MIN_GAP_MS,
+    WIPE_RECOVERY_MS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +97,10 @@ class MotionDynamics:
     camera_cut_cost: List[float] = field(default_factory=list)
     # Discrete subject-motion impacts (cut ON these).
     action_points: List[Dict] = field(default_factory=list)
+    # cuts-v3: premium natural cut instants -- occlusion wipes (a near-field
+    # blob sweeps the frame) and degenerate spans (the frame collapses to one
+    # texture: over-zoom, lens blocked). [{ts_ms, kind: wipe|degenerate, strength}]
+    transition_points: List[Dict] = field(default_factory=list)
 
     def to_dict(self) -> Dict:
         return {
@@ -101,6 +114,7 @@ class MotionDynamics:
             "action_cut_cost": self.action_cut_cost,
             "camera_cut_cost": self.camera_cut_cost,
             "action_points": self.action_points,
+            "transition_points": self.transition_points,
         }
 
 
@@ -199,6 +213,11 @@ def compute_motion_dynamics(
     camera_raw: List[float] = []
     coherence: List[float] = []
     sharp_raw: List[float] = []
+    # cuts-v3: fraction of the sampled grid sweeping at RAW flow magnitude above
+    # WIPE_MAG_PX -- the occlusion-wipe signal (see transition_points below).
+    # RAW (pre camera-model) on purpose: a near-field object crossing the lens
+    # is exactly the large, chaotic flow the model fit doesn't explain away.
+    wipe_frac_raw: List[float] = []
     params: List[Tuple[float, float, float, float]] = []
     # Per-hop normalized centroid (cx, cy in 0..1) of SUBJECT motion = where the
     # action is, so a reframe can follow it. Camera motion is removed first by
@@ -216,6 +235,7 @@ def compute_motion_dynamics(
                 coherence.append(1.0)
                 params.append((0.0, 0.0, 0.0, 0.0))
                 centroids.append((0.5, 0.5))
+                wipe_frac_raw.append(0.0)
             else:
                 # Deep pyramid (5 levels) + wide window so a fast pan/whip (large
                 # per-hop displacement) is still tracked instead of read as noise.
@@ -224,6 +244,7 @@ def compute_motion_dynamics(
                 )
                 fx = flow[gi_y, gi_x, 0]
                 fy = flow[gi_y, gi_x, 1]
+                wipe_frac_raw.append(float(np.mean(np.hypot(fx, fy) > WIPE_MAG_PX)))
                 # dst = where each sampled source pixel moved to.
                 dst = grid + np.column_stack([fx, fy]).astype(np.float32)
                 cam, coh, resid, pvec = _fit_camera_model(grid, dst, MOTION_RANSAC_PX)
@@ -281,6 +302,11 @@ def compute_motion_dynamics(
     else:
         blur = [round(clamp01(1.0 - (s / sharp_ref)), 3) for s in sharp_raw]
 
+    transition_points = sorted(
+        _wipe_points(wipe_frac_raw, coherence, hop_ms) + _degenerate_points(blur, hop_ms),
+        key=lambda p: p["ts_ms"],
+    )
+
     # ACTION (hit channel): impacts = local maxima of subject motion.
     floor = percentile(action_n, ACTION_PEAK_PCTL)
     impacts = local_maxima(action_n, hop_ms, floor, ACTION_MIN_PEAK_GAP_MS)
@@ -329,6 +355,7 @@ def compute_motion_dynamics(
         action_cut_cost=action_cut_cost or [1.0] * n,
         camera_cut_cost=camera_cut_cost,
         action_points=action_points,
+        transition_points=transition_points,
     )
 
 
@@ -342,4 +369,55 @@ def _moving_avg(xs: List[float], win: int) -> List[float]:
         hi = min(len(xs), i + half + 1)
         seg = xs[lo:hi]
         out.append(sum(seg) / len(seg))
+    return out
+
+
+# --------------------------------------------------------------------------
+# cuts-v3: transition points (premium natural cut instants)
+# --------------------------------------------------------------------------
+
+def _wipe_points(wipe_frac: List[float], coherence: List[float], hop_ms: int) -> List[Dict]:
+    """Occlusion-wipe instants: a large near-field blob sweeps the frame --
+    classic pass-by transition editors hunt for. A candidate is a local
+    maximum of the swept-area FRACTION above WIPE_AREA_FRAC, gated on the
+    camera model's coherence ALSO collapsing (a clean fast pan keeps high
+    coherence at high magnitude -- never mistaken for a wipe) and on a quick
+    RECOVERY afterward (a sustained chaotic stretch is a disturbance, handled
+    elsewhere, not a wipe)."""
+    if not wipe_frac:
+        return []
+    n = len(wipe_frac)
+    recovery_hops = max(1, round(WIPE_RECOVERY_MS / hop_ms))
+    candidates = local_maxima(wipe_frac, hop_ms, WIPE_AREA_FRAC, WIPE_MIN_GAP_MS)
+    out: List[Dict] = []
+    for ts in candidates:
+        i = min(n - 1, ts // hop_ms)
+        if i < len(coherence) and coherence[i] > WIPE_COHERENCE_MAX:
+            continue  # coherent fast motion (a clean pan/zoom) -- not a wipe
+        after = wipe_frac[i + 1:i + 1 + recovery_hops]
+        if after and min(after) > WIPE_AREA_FRAC * 0.5:
+            continue  # never recovers -- sustained chaos, not a quick sweep
+        out.append({"ts_ms": ts, "kind": "wipe", "strength": round(float(wipe_frac[i]), 3)})
+    return out
+
+
+def _degenerate_points(blur: List[float], hop_ms: int) -> List[Dict]:
+    """Degenerate spans: the frame collapses to one texture (over-zoom, lens
+    blocked) -- a sustained run where `blur` stays maxed out, not just one
+    soft frame from fast motion. Marks the ONSET (nothing past this point is
+    worth watching)."""
+    n = len(blur)
+    out: List[Dict] = []
+    i = 0
+    while i < n:
+        if blur[i] >= DEGENERATE_BLUR_MIN:
+            j = i
+            while j < n and blur[j] >= DEGENERATE_BLUR_MIN:
+                j += 1
+            if (j - i) * hop_ms >= DEGENERATE_MIN_MS:
+                strength = sum(blur[i:j]) / (j - i)
+                out.append({"ts_ms": i * hop_ms, "kind": "degenerate", "strength": round(strength, 3)})
+            i = j
+        else:
+            i += 1
     return out

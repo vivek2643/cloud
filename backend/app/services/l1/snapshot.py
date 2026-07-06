@@ -187,7 +187,7 @@ def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
             """
             select hop_ms, action_energy, camera_motion, camera_coherence,
                    camera_stability, blur, action_cut_cost, camera_cut_cost,
-                   action_points
+                   action_points, transition_points
               from motion_dynamics where file_id = %s
             """,
             (file_id,),
@@ -208,6 +208,9 @@ def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
                 "camera_cut_cost": md["camera_cut_cost"] or [],
                 "action_points": md["action_points"] or [],
                 "action_point_count": len(md["action_points"] or []),
+                # cuts-v3 premium natural cut instants (occlusion wipe / degenerate span).
+                "transition_points": md["transition_points"] or [],
+                "transition_point_count": len(md["transition_points"] or []),
             }
 
         # Scene/shot detection (cuts-v2) -- video-derived, own table.

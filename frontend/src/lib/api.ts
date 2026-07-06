@@ -289,6 +289,105 @@ export function getCutsFeed(fileIds: string[], energy: number, token: string) {
   });
 }
 
+// --- Cuts v3 (LLM-grouped ingest over the deterministic lattice) ---
+// See cuts_v3.plan.md. Additive to v2 -- `/api/files/.../cuts` above is
+// untouched; this is a separate project-scoped pipeline + surface.
+
+export interface Pace {
+  min_ms: number;
+  natural_ms: number;
+  max_ms: number;
+  levels: number[];
+  energy_grade: string;
+  natural_sound: boolean;
+}
+
+export interface Framing {
+  subject_box?: [number, number, number, number] | null;
+  crop_16x9?: [number, number, number, number] | null;
+  crop_9x16?: [number, number, number, number] | null;
+  crop_1x1?: [number, number, number, number] | null;
+  rotation_deg?: number;
+}
+
+export interface Look {
+  graded?: boolean;
+  palette?: string[];
+  exposure_flags?: string[];
+}
+
+export type TakeRole = "take" | "outlook" | "winner";
+
+export interface CutRecord {
+  id: string;
+  file_id: string;
+  src_in_ms: number;
+  src_out_ms: number;
+  kind: "speech" | "video";
+  word_span: [number, number] | null;
+  atom_ids: number[] | null;
+  label: string;
+  summary: string;
+  speaker: string | null;
+  on_camera: boolean | null;
+  take_group_id: string | null;
+  take_role: TakeRole | null;
+  junk: boolean;
+  junk_reason: string | null;
+  framing: Framing;
+  look: Look;
+  caption_zones: [number, number, number, number][];
+  pace: Pace;
+  hero_ts_ms: number | null;
+  hero_key: string | null;
+  transition_in: string | null;
+  transition_out: string | null;
+}
+
+export type IngestStatus = "pending" | "pass1" | "images" | "pass2" | "post" | "ready" | "failed";
+
+export interface IngestRun {
+  id: string;
+  status: IngestStatus;
+  pass1_model: string | null;
+  pass2_model: string | null;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  cost_usd: number | null;
+  project_summary: string | null;
+  error: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface CutsV3Response {
+  project_id: string;
+  name: string;
+  ingest_run: IngestRun | null;
+  cuts: CutRecord[];
+}
+
+export function createProject(fileIds: string[], token: string) {
+  return request<{ project_id: string }>("/api/projects", {
+    method: "POST",
+    token,
+    body: JSON.stringify({ file_ids: fileIds }),
+  });
+}
+
+export function kickIngest(projectId: string, token: string) {
+  return request<{ project_id: string; status: string }>(`/api/projects/${projectId}/ingest`, {
+    method: "POST",
+    token,
+  });
+}
+
+export function getCutsV3(projectId: string, token: string) {
+  return request<CutsV3Response>(`/api/projects/${projectId}/cuts-v3`, { token });
+}
+
 // --- Upload ---
 
 export interface PresignResponse {

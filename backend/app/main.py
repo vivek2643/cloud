@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.routers import folders, files, upload, logs as logs_router, edit_threads, renders
+from app.routers import folders, files, upload, logs as logs_router, edit_threads, renders, projects
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +65,7 @@ app.include_router(upload.router)
 app.include_router(logs_router.router)
 app.include_router(edit_threads.router)
 app.include_router(renders.router)
+app.include_router(projects.router)
 
 
 @app.get("/health")

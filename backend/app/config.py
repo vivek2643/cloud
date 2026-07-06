@@ -148,6 +148,18 @@ class Settings(BaseSettings):
     arranger_paged_effort: str = "medium"
     arranger_max_turns: int = 12
 
+    # --- Cuts v3: LLM-grouped ingest (app.services.llm.client) -----------
+    # Two structured Sonnet-class calls per project ingest (text-only pass 1,
+    # then vision pass 2) decide MEANING (grouping/takes/junk/framing/etc.);
+    # boundaries stay code-derived (word/atom edges), never an LLM millisecond.
+    # Model ids are per-stage so either pass can be swapped independently via
+    # env var -- prompts are model-agnostic (see cuts_v3.plan.md, "Model layer").
+    ingest_pass1_model: str = "claude-sonnet-5"
+    ingest_pass2_model: str = "claude-sonnet-5"
+    # Prompt-cache TTL headroom: pass-2 shards must run back-to-back within
+    # this window to keep reading the pass-1 prefix at the cheap cache rate.
+    ingest_cache_ttl_seconds: int = 300
+
     @property
     def r2_endpoint(self) -> str:
         return f"https://{self.r2_account_id}.r2.cloudflarestorage.com"
