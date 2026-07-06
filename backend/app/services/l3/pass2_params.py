@@ -23,4 +23,7 @@ STILL_WIDTH_PX = 768
 # own complexity -- not a truncation (plenty of token budget left), a
 # reliability cliff in generating one very large nested structure. Capping
 # cuts per shard, not just images, keeps each call's output smaller.
-MAX_CUTS_PER_SHARD = 25
+# Lowered 25 -> 15 after observing the missing-field failure recur even on
+# a 17-cut shard -- this isn't purely a size cliff, so this is a mitigation
+# (smaller blast radius per call) more than a guaranteed fix.
+MAX_CUTS_PER_SHARD = 15
