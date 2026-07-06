@@ -27,3 +27,20 @@ STILL_WIDTH_PX = 768
 # a 17-cut shard -- this isn't purely a size cliff, so this is a mitigation
 # (smaller blast radius per call) more than a guaranteed fix.
 MAX_CUTS_PER_SHARD = 15
+
+# Pass-2 shards are independent OUTPUT-wise -- they only share a read-only
+# cached prompt prefix -- so running them concurrently instead of back-to-back
+# is a pure wall-clock win. The only cost is that a shard whose call fires
+# before an earlier shard's cache write has "landed" pays full input price
+# for that call instead of the ~10% cache-read discount; per the plan's own
+# cost table that discount is a small fraction of total cost, so this is a
+# deliberate, cheap trade of a little cost for a lot of latency.
+MAX_PARALLEL_SHARDS = 4
+
+# Pass 2b (visual judgment: framing/look/caption_zones/taste_fences) has NO
+# cross-cut dependency at all -- unlike pass 2a's take comparison, judging
+# one cut's crop/grade/captions never needs another cut's pixels. So batches
+# are pure chunking (no co-location constraint), and can be smaller AND run
+# with more parallelism than pass 2a's shards.
+MAX_CUTS_PER_VISUAL_BATCH = 12
+MAX_PARALLEL_VISUAL_BATCHES = 6

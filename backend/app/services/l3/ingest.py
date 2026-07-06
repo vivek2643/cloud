@@ -1,18 +1,29 @@
 """
-Cuts v3 orchestrator: pass1 -> image_plan -> frame extraction -> pass2
-(shards, back-to-back for cache) -> post -> persist + hero frames. One call
-per project; re-runnable (each call is a fresh ``ingest_run`` row -- nothing
-is patched in place). See cuts_v3.plan.md section 6 and the build-order
-table (step E).
+Cuts v3 orchestrator: pass1 -> image_plan -> frame extraction -> pass2a
+(identity + take resolution, shards run concurrently) -> pass2b (visual
+judgment, batches run concurrently) -> merge -> post -> persist + hero
+frames. One call per project; re-runnable (each call is a fresh
+``ingest_run`` row -- nothing is patched in place). See cuts_v3.plan.md
+section 6 and the build-order table (step E).
+
+Pass 2a and pass 2b both run their calls IN PARALLEL (ThreadPoolExecutor),
+not sequentially: within each stage the calls only share a read-only cached
+prefix, so nothing stops them firing at the same time -- this is a pure
+wall-clock win (pass 2a's take-comparison shards still stay take-group-aware
+via co-location; pass 2b's batches have no such constraint at all and can
+run with even more parallelism). See pass2a.py / pass2b.py for why the
+identity/take half and the pure visual-judgment half are split into two
+calls instead of one large one.
 
 THIS MODULE SPENDS REAL MONEY once invoked: ``run_ingest`` makes one real
-pass-1 API call and one real pass-2 API call per shard. Every deterministic
-step it wires together (pass1's prompt building, image_plan, frame
-extraction, pass2's prompt building, post's assembly) already has its own
-zero-cost test coverage; ``scripts/test_ingest.py`` mocks every one of those
-seams so the ORCHESTRATION ITSELF (stage sequencing, status transitions,
-error handling) is verified without spending anything. Actually calling
-``run_ingest`` against a real project is a separate, explicit decision.
+pass-1 API call, one real pass-2a call per identity shard, and one real
+pass-2b call per visual batch. Every deterministic step it wires together
+(pass1's prompt building, image_plan, pass2a/pass2b's prompt building,
+post's assembly) already has its own zero-cost test coverage;
+``scripts/test_ingest.py`` mocks every one of those seams so the
+ORCHESTRATION ITSELF (stage sequencing, status transitions, error handling)
+is verified without spending anything. Actually calling ``run_ingest``
+against a real project is a separate, explicit decision.
 """
 from __future__ import annotations
 
@@ -30,9 +41,13 @@ from app.services.l3 import image_plan as ip
 from app.services.l3 import ingest_store as store
 from app.services.l3 import pass1
 from app.services.l3 import pass2
+from app.services.l3 import pass2a
+from app.services.l3 import pass2b
 from app.services.l3 import post
 from app.services.l3.lattice import Lattice
-from app.services.l3.pass2_params import STILL_WIDTH_PX
+from app.services.l3.pass2_params import (
+    MAX_CUTS_PER_VISUAL_BATCH, MAX_PARALLEL_SHARDS, MAX_PARALLEL_VISUAL_BATCHES, STILL_WIDTH_PX,
+)
 from app.services.processing import _download_from_r2, _upload_to_r2
 
 logger = logging.getLogger(__name__)
@@ -107,21 +122,56 @@ def run_ingest(project_id: str) -> str:
                                              silences_by_file)
         images_b64 = fr.extract_for_planned_frames(planned_frames, proxy_keys)
 
+        # pass2a/pass2b are both still reported as "pass2" -- the DB status
+        # column's check constraint only knows the original stage names,
+        # and splitting it further isn't worth a migration for what's
+        # purely a finer-grained progress label.
         store.set_status(ingest_run_id, "pass2")
-        shards = pass2.build_shards(pass1_output, planned_frames)
-        all_cuts: List[pass2.Pass2Cut] = []
-        for shard_files in shards:
+        identity_shards = pass2a.build_identity_shards(pass1_output, planned_frames)
+        shard_args = []
+        for shard_files in identity_shards:
             shard_set = set(shard_files)
             shard_frames = [f for f in planned_frames if f.file_id in shard_set]
             shard_file_rows = [row for row in file_rows if row[0] in shard_set]
-            completion = pass2.run_pass2_shard(shard_file_rows, pass1_output, shard_frames, images_b64)
-            store.accumulate_pass2_usage(ingest_run_id, completion.usage)
-            shard_output = pass2.Pass2Output.model_validate(completion.data)
-            all_cuts.extend(shard_output.cuts)
+            shard_args.append((shard_file_rows, shard_frames))
+
+        all_identity_cuts: List[pass2a.IdentityCut] = []
+        # Shards only share a read-only cached prefix -- no reason to make
+        # one wait on another's response. Concurrency here is a pure
+        # wall-clock win (see MAX_PARALLEL_SHARDS); a failure in any shard
+        # still propagates and fails the whole run, same as sequential did.
+        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_SHARDS, len(shard_args)) or 1) as pool:
+            futures = [
+                pool.submit(pass2a.run_identity_shard, rows, pass1_output, frames, images_b64)
+                for rows, frames in shard_args
+            ]
+            for future in futures:
+                completion = future.result()
+                store.accumulate_pass2_usage(ingest_run_id, completion.usage)
+                shard_output = pass2a.IdentityOutput.model_validate(completion.data)
+                all_identity_cuts.extend(shard_output.cuts)
+        identity_output = pass2a.IdentityOutput(cuts=all_identity_cuts)
+
+        batches = pass2b.build_visual_batches(identity_output, MAX_CUTS_PER_VISUAL_BATCH)
+        visual_by_index: Dict[int, pass2b.VisualJudgment] = {}
+        # No take-style co-location constraint here at all (see pass2b.py),
+        # so batches can run with even more parallelism than pass 2a's shards.
+        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_VISUAL_BATCHES, len(batches)) or 1) as pool:
+            futures = [
+                pool.submit(pass2b.run_visual_batch, identity_output, batch, planned_frames, images_b64)
+                for batch in batches
+            ]
+            for future in futures:
+                completion = future.result()
+                store.accumulate_pass2_usage(ingest_run_id, completion.usage)
+                batch_output = pass2b.VisualOutput.model_validate(completion.data)
+                for judgment in batch_output.judgments:
+                    visual_by_index[judgment.cut_index] = judgment
+
+        pass2_output = pass2.merge_identity_and_visual(identity_output, visual_by_index)
 
         store.set_status(ingest_run_id, "post")
-        records = post.assemble_cut_records(pass2.Pass2Output(cuts=all_cuts), lattices,
-                                            motion_by_file, silences_by_file)
+        records = post.assemble_cut_records(pass2_output, lattices, motion_by_file, silences_by_file)
 
         store.delete_cut_records_for_run(ingest_run_id)
         record_ids = store.insert_cut_records(ingest_run_id, records)
