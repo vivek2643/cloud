@@ -344,6 +344,8 @@ def _build_cuts_for(file_ids: List[str], energy: float = 0.5) -> List[dict]:
                 # Surface WHY each edge exists so boundary quality is visible on
                 # the tile (temporary, for the base-cuts bring-up).
                 "label": f"{c.reason_in} \u2192 {c.reason_out}",
+                "reason_in": c.reason_in,
+                "reason_out": c.reason_out,
                 "speaker": c.speaker,
                 "peak_ms": (c.start_ms + c.end_ms) // 2,
                 "keep_spans": None,

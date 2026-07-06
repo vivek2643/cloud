@@ -31,15 +31,34 @@ LONG_PAUSE_MS = 1200
 # ("cut when the camera starts moving, and again where it settles").
 
 # --- Disturbance (bad-camera spans to cut around) ----------------------------
-# A hop is a DISTURBANCE when the camera is genuinely unstable or its motion is
-# incoherent (a whip/jerk/focus-hunt, not a clean intentional move). Detect the
-# BAD span; its edges are boundaries (so the disturbance can be dropped later as
-# junk -- that's a separate job). Absolute thresholds (camera_stability and
-# camera_coherence are 0..1, not per-clip normalized), tuned against real clips.
-DIST_STABILITY_MAX = 0.45
-DIST_COHERENCE_MAX = 0.35
+# A DISTURBANCE is a stretch of genuinely bad camera with NOTHING worth
+# watching: shake / whip / focus-hunt AND no subject payoff. The two-part test
+# is what keeps fast INTENTIONAL action (a follow-pan, a ball-hit) -- which also
+# shakes the camera -- from being mislabeled as junk. No single signal is
+# reliable and per-hop thresholding flip-flaps, so we score, smooth, then
+# trigger with hysteresis. Detect the BAD span; its edges are boundaries
+# (dropping it is a separate junk-removal job).
+#
+# Per-hop badness reuses L1's engineered signals (see motion_dynamics.py):
+#   badness = camera_cut_cost * (1 - action_energy)
+# camera_cut_cost = "how bad is the camera" -- already motion-gated (chaos +
+#   transient + blur), so a STEADY camera watching moving subjects costs ~0.
+# action_energy   = RANSAC-residual subject motion (camera-compensated), so it
+#   is HIGH exactly when there's real content -> vetoes disturbance there.
+DIST_ACTION_VETO = 1.0      # weight of the (1 - action_energy) veto term
+
+# Smooth the badness score over this window before thresholding -- turns the
+# spiky per-hop signal into a stable envelope so it can't oscillate.
+DIST_SMOOTH_MS = 350
+
+# Hysteresis (Schmitt trigger): ENTER a disturbance only when smoothed badness
+# clears ON; stay in it until it drops below OFF. The gap between them is what
+# stops a value hovering near one threshold toggling every hop.
+DIST_ON = 0.35
+DIST_OFF = 0.20
+
 # A disturbance shorter than this is a blip, not a span worth a boundary.
-DIST_MIN_MS = 250
+DIST_MIN_MS = 300
 # Two bad-camera runs separated by a gap this short are ONE disturbance (the
 # shake dipped under threshold for an instant) -- bridge them so a pervasively
 # shaky clip reads as a single disturbance span, not a string of fragments.

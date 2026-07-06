@@ -262,6 +262,11 @@ export interface Cut {
   peak_ms: number;
   // Set later by tightness; null = play the whole span contiguously.
   keep_spans?: [number, number][] | null;
+  // Base-cut boundary reasons: WHY this cut's left/right edges exist
+  // (shot_cut, speaker_change, speech_edge, long_pause, camera_move, settle,
+  // disturbance, clip_edge). Shown under the tile during base-cut bring-up.
+  reason_in?: string;
+  reason_out?: string;
 }
 
 export interface CutsResponse {

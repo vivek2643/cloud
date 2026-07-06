@@ -27,6 +27,19 @@ const FILTERS: { key: FilterKey; label: string }[] = [
 // Uniform tile width per orientation -- large, matching the old hero tiles.
 const CARD_W = { landscape: 340, portrait: 232 } as const;
 
+// Human-readable base-cut boundary reasons (backend enum -> caption text).
+const REASON_LABEL: Record<string, string> = {
+  clip_edge: "clip start/end",
+  shot_cut: "shot cut",
+  speaker_change: "speaker change",
+  speech_edge: "speech edge",
+  long_pause: "long pause",
+  camera_move: "camera move",
+  settle: "camera settle",
+  disturbance: "disturbance",
+};
+const reasonText = (r?: string) => (r ? REASON_LABEL[r] ?? r : "");
+
 const ROW_DND = "application/x-cut-row";
 
 function fmtDur(ms: number): string {
@@ -552,13 +565,16 @@ function CutCard({
     if (url) setPlayUrl(url);
   }
 
-  // Hover -> play the cut span (looping, muted); leave -> park on the peak still.
+  // Hover -> play the cut span from its START (looping); leave -> park on the
+  // peak still. Always seek to inSec on activate: the parked frame is peak_ms
+  // (mid-span), which is INSIDE the cut, so a conditional reseek would (wrongly)
+  // start playback from the middle and only loop back to the start.
   useEffect(() => {
     const v = videoRef.current;
     if (!v || !playUrl) return;
     if (isActive) {
       try {
-        if (v.currentTime < inSec || v.currentTime >= outSec) v.currentTime = inSec;
+        v.currentTime = inSec;
       } catch {
         /* ignore */
       }
@@ -573,7 +589,14 @@ function CutCard({
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isActive, playUrl, muted]);
+  }, [isActive, playUrl]);
+
+  // Mute toggle -- apply without restarting playback (kept out of the play
+  // effect so flipping mute mid-clip doesn't seek back to the start).
+  useEffect(() => {
+    const v = videoRef.current;
+    if (v) v.muted = muted;
+  }, [muted]);
 
   function onLoadedMetadata() {
     const v = videoRef.current;
@@ -719,9 +742,25 @@ function CutCard({
           </span>
         )}
       </div>
-      <p className="mt-2 line-clamp-2 px-0.5 text-sm leading-snug" style={{ minHeight: "2.5em" }}>
-        {cut.primary === "shown" ? "" : cut.label}
-      </p>
+      {/* Boundary readout: WHY this cut's edges exist (in -> out). Shown for
+          every cut so base-cut boundary quality is inspectable at a glance. */}
+      <div className="mt-2 flex items-center gap-1.5 px-0.5" style={{ minHeight: "2.5em" }}>
+        <span
+          className="rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide"
+          style={{ background: "var(--sidebar)", color: "var(--foreground)" }}
+        >
+          {reasonText(cut.reason_in)}
+        </span>
+        <span className="text-[11px]" style={{ color: "var(--muted)" }}>
+          →
+        </span>
+        <span
+          className="rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide"
+          style={{ background: "var(--sidebar)", color: "var(--foreground)" }}
+        >
+          {reasonText(cut.reason_out)}
+        </span>
+      </div>
     </div>
   );
 }

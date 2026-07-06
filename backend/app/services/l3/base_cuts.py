@@ -34,10 +34,12 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from app.services.l3 import vocab
 from app.services.l3.base_cuts_params import (
+    DIST_ACTION_VETO,
     DIST_BRIDGE_MS,
-    DIST_COHERENCE_MAX,
     DIST_MIN_MS,
-    DIST_STABILITY_MAX,
+    DIST_OFF,
+    DIST_ON,
+    DIST_SMOOTH_MS,
     LONG_PAUSE_MS,
     MIN_CUT_MS,
     SNAP_MS,
@@ -129,45 +131,75 @@ def _camera_marks(motion: Optional[dict]) -> List[Tuple[int, str]]:
     return out
 
 
+def _smooth(xs: List[float], win: int) -> List[float]:
+    """Centered moving average over ``win`` samples (odd, clamped >= 1)."""
+    win = max(1, win | 1)
+    if win == 1 or len(xs) < 2:
+        return list(xs)
+    half = win // 2
+    out: List[float] = []
+    for i in range(len(xs)):
+        a, b = max(0, i - half), min(len(xs), i + half + 1)
+        out.append(sum(xs[a:b]) / (b - a))
+    return out
+
+
 def _disturbance_marks(motion: Optional[dict]) -> List[Tuple[int, str]]:
-    """Disturbance boundaries: the edges of a span where the camera is unstable
-    or its motion is incoherent (a whip/jerk/focus-hunt) for at least
-    DIST_MIN_MS. Absolute thresholds -- these signals aren't per-clip
-    normalized."""
+    """Disturbance boundaries via score -> smooth -> hysteresis:
+
+      1. per-hop badness = camera_cut_cost * (1 - action_energy) -- bad camera
+         AND no subject payoff (the veto keeps fast intentional action, which
+         also shakes the camera, from reading as junk),
+      2. smoothed over DIST_SMOOTH_MS (kills per-hop oscillation),
+      3. Schmitt trigger (enter >= DIST_ON, stay until < DIST_OFF),
+      4. drop < DIST_MIN_MS blips, bridge runs < DIST_BRIDGE_MS apart.
+
+    camera_cut_cost is already motion-gated in L1, so a steady camera watching
+    moving subjects -- or a smooth intentional pan -- never trips this; only
+    genuine bad camera over dead time does."""
     m = motion or {}
     hop = int(m.get("hop_ms") or 0)
     if not hop:
         return []
-    stab = m.get("camera_stability") or []
-    coh = m.get("camera_coherence") or []
-    n = max(len(stab), len(coh))
-    bad = [
-        ((stab[i] if i < len(stab) else 1.0) < DIST_STABILITY_MAX)
-        or ((coh[i] if i < len(coh) else 1.0) < DIST_COHERENCE_MAX)
+    ccc = m.get("camera_cut_cost") or []
+    act = m.get("action_energy") or []
+    n = max(len(ccc), len(act))
+    if n == 0:
+        return []
+
+    badness = [
+        (ccc[i] if i < len(ccc) else 0.0)
+        * max(0.0, 1.0 - DIST_ACTION_VETO * (act[i] if i < len(act) else 0.0))
         for i in range(n)
     ]
-    # Bad runs, then bridge those separated by < DIST_BRIDGE_MS (a momentary dip
-    # under threshold in one continuous shake) so a pervasively shaky clip is one
-    # disturbance span, not a string of fragments.
+    score = _smooth(badness, max(1, round(DIST_SMOOTH_MS / hop)))
+
+    # Schmitt trigger -> raw bad spans (hop index ranges).
     runs: List[List[int]] = []
-    i = 0
-    while i < n:
-        if not bad[i]:
-            i += 1
-            continue
-        j = i
-        while j < n and bad[j]:
-            j += 1
-        if runs and i * hop - runs[-1][1] < DIST_BRIDGE_MS:
-            runs[-1][1] = j * hop
-        else:
-            runs.append([i * hop, j * hop])
-        i = j
-    out: List[Tuple[int, str]] = []
+    on = False
+    start = 0
+    for i, v in enumerate(score):
+        if not on and v >= DIST_ON:
+            on, start = True, i
+        elif on and v < DIST_OFF:
+            on = False
+            runs.append([start, i])
+    if on:
+        runs.append([start, n])
+
+    # Bridge spans < DIST_BRIDGE_MS apart (one continuous shake that dipped).
+    bridged: List[List[int]] = []
     for a, b in runs:
-        if b - a >= DIST_MIN_MS:
-            out.append((a, R_DISTURB))
-            out.append((b, R_DISTURB))
+        if bridged and (a - bridged[-1][1]) * hop < DIST_BRIDGE_MS:
+            bridged[-1][1] = b
+        else:
+            bridged.append([a, b])
+
+    out: List[Tuple[int, str]] = []
+    for a, b in bridged:
+        if (b - a) * hop >= DIST_MIN_MS:
+            out.append((a * hop, R_DISTURB))
+            out.append((b * hop, R_DISTURB))
     return out
 
 
@@ -267,7 +299,8 @@ def build_base_cuts(file_id: str) -> List[BaseCut]:
         duration_ms = int(float(row[0]) * 1000)
 
         m = conn.execute(
-            """select hop_ms, camera_stability, camera_coherence, camera_motion, blur
+            """select hop_ms, camera_stability, camera_coherence, camera_motion,
+                      blur, camera_cut_cost, action_energy
                  from motion_dynamics where file_id = %s""",
             (file_id,),
         ).fetchone()
@@ -275,7 +308,8 @@ def build_base_cuts(file_id: str) -> List[BaseCut]:
         if m:
             motion = {"hop_ms": m[0], "camera_stability": m[1] or [],
                       "camera_coherence": m[2] or [], "camera_motion": m[3] or [],
-                      "blur": m[4] or []}
+                      "blur": m[4] or [], "camera_cut_cost": m[5] or [],
+                      "action_energy": m[6] or []}
 
         s = conn.execute(
             "select shot_points from scene_cuts where file_id = %s", (file_id,)
