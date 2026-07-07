@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.services.l3 import lattice as lt
 from app.services.l3.lattice import Lattice
+from app.services.l3.seam import BREAK_BOUNDARY_REASONS, Seam, classify_seam
 from app.services.llm import client as ic
 from app.services.llm.base import text_block
 
@@ -37,6 +38,14 @@ class SpeechCut(BaseModel):
     word_span: Tuple[int, int]
     label: str
     speaker_ids: List[str] = Field(default_factory=list)
+    # Consecutive speech cuts the model judges to be ONE continuous spoken
+    # beat (a single podcast answer, or a line that resumes after a brief
+    # demonstrated action) share a beat_id. It is the model's SEMANTIC call
+    # only -- code merges same-beat neighbours deterministically, and ONLY
+    # across a weldable seam (no shot change / transition / speaker change
+    # between them; see seam.classify_seam). No beat_id -> the cut stands
+    # alone. Purely an ingest-time grouping hint: never persisted downstream.
+    beat_id: str | None = None
 
 
 class TakeMember(BaseModel):
@@ -102,7 +111,17 @@ _SYSTEM = (
     "detected motion impacts. Read these to judge what each shot is doing.\n"
     "  - HINTS: where speaker changes and long pauses fall (informational).\n\n"
     "Produce, across all clips:\n"
-    "  - speech_cuts: coherent spoken beats, as word-index ranges.\n"
+    "  - speech_cuts: coherent spoken beats, as word-index ranges. A held pause "
+    "or a demonstrated action in the MIDDLE of one continuous thought is NOT a "
+    "boundary -- keep 'to inform you ... there's a catch' as ONE range even if "
+    "the speaker pauses dramatically in the middle. When one continuous moment "
+    "is split across consecutive cuts anyway -- a single podcast-style answer, a "
+    "sentence that resumes after a beat -- tag those cuts with the SAME beat_id "
+    "(your call, from meaning: what is one delivered thought?). Code merges "
+    "same-beat cuts ONLY when the footage between is continuous (no shot change, "
+    "transition, or speaker change), so tag freely -- the deterministic guard "
+    "blocks a wrong merge (e.g. it will NOT let a false start you flag as junk "
+    "fuse into the real line). Leave beat_id empty for a cut that stands alone.\n"
     "  - take_candidates: near-identical retakes of the same line (within or across "
     "clips); each member is one whole speech_cut.\n"
     "  - video_tentative_groups: visual moments worth keeping, each a group of "
@@ -194,12 +213,19 @@ def _no_overlapping_speech_cuts(output: Pass1Output) -> str | None:
 
 
 def _no_speech_cut_swallows_atoms(output: Pass1Output, lattices: Dict[str, Lattice]) -> str | None:
-    """A speech cut whose word range fully contains any atom's span would
-    make the cut's resolved ms span swallow that atom -- atoms and speech
-    cuts must partition the timeline. ``enforce_lattice_partition`` splits
-    such cuts deterministically; this check is its post-condition (and is
-    asserted there), kept as a separate function so tests can probe it
-    directly."""
+    """A speech cut whose word range contains an atom that is ALSO a member of
+    some video_tentative_group would make two final cuts (this speech beat and
+    that video cut) claim the same instant -- a real overlap. So the check is
+    against GROUPED atoms only. An atom the beat legitimately ABSORBED across a
+    weldable seam (``_seam_split``) belongs to no group and produces no video
+    cut, so it may sit inside the beat's span -- that is the whole point of the
+    speech-to-speech bridge (cuts_v3_speech_bridge.plan.md). This is
+    ``enforce_lattice_partition``'s post-condition (asserted there), kept
+    separate so tests can probe it directly; ``post._validate_no_overlap`` is
+    the final ms-level guard."""
+    grouped: Dict[str, set] = {}
+    for vg in output.video_tentative_groups:
+        grouped.setdefault(vg.file_id, set()).update(vg.atom_ids)
     for i, sc in enumerate(output.speech_cuts):
         lattice = lattices.get(sc.file_id)
         if lattice is None or not lattice.words:
@@ -210,13 +236,14 @@ def _no_speech_cut_swallows_atoms(output: Pass1Output, lattices: Dict[str, Latti
                     f"{sc.file_id} ({len(lattice.words)} words)")
         span_s = int(lattice.words[a].get("start_ms", 0))
         span_e = int(lattice.words[b].get("end_ms", 0))
+        gset = grouped.get(sc.file_id, set())
         for atom in lattice.atoms:
-            if atom.start_ms >= span_s and atom.end_ms <= span_e:
-                return (f"speech_cut[{i}] \"{sc.label}\" words[{a}-{b}] spans a long "
-                        f"silent gap that contains video atom {atom.atom_id} "
-                        f"[{atom.start_ms}-{atom.end_ms}]ms in {sc.file_id} -- a speech "
-                        f"cut must never cross a 'long pause' hint; split it into "
-                        f"separate cuts on each side of the pause")
+            if atom.atom_id in gset and atom.start_ms >= span_s and atom.end_ms <= span_e:
+                return (f"speech_cut[{i}] \"{sc.label}\" words[{a}-{b}] swallows GROUPED "
+                        f"video atom {atom.atom_id} [{atom.start_ms}-{atom.end_ms}]ms in "
+                        f"{sc.file_id} -- that atom would also become a video cut; split "
+                        f"the beat, or the seam should have absorbed the atom out of its "
+                        f"group")
     return None
 
 
@@ -251,6 +278,121 @@ def _span_pieces(words: List[dict], atoms: List[Any], span: Tuple[int, int]) -> 
     return pieces
 
 
+def _gap_seam(
+    words: List[dict], atoms: List[Any], i: int, junk_atom_ids: set,
+    beat_lo_ms: int, beat_hi_ms: int,
+):
+    """Classify the atom-owned gap between word ``i`` and word ``i+1`` for a beat
+    spanning [``beat_lo_ms``, ``beat_hi_ms``]. Returns ``(verdict, gap_atoms)``;
+    ``(None, [])`` when the gap holds no atom (a bare inter-word pause -- never a
+    boundary on its own). The break-edge test reads the atoms' OWN boundary
+    reasons (shot cut / transition strictly inside the gap); an R_ACTION energy
+    edge is continuous footage, not a break."""
+    gap_lo = int(words[i].get("end_ms", 0))
+    gap_hi = int(words[i + 1].get("start_ms", 0))
+    if gap_hi <= gap_lo:
+        return None, []
+    gap_atoms = [at for at in atoms if gap_lo <= (at.start_ms + at.end_ms) // 2 < gap_hi]
+    if not gap_atoms:
+        return None, []
+    has_break_edge = any(
+        (at.state_in in BREAK_BOUNDARY_REASONS and gap_lo < at.start_ms < gap_hi)
+        or (at.state_out in BREAK_BOUNDARY_REASONS and gap_lo < at.end_ms < gap_hi)
+        for at in gap_atoms
+    )
+    verdict = classify_seam(Seam(
+        same_clip=True,
+        same_speaker=(words[i].get("speaker") == words[i + 1].get("speaker")),
+        gap_ms=gap_hi - gap_lo,
+        bridged_speech_ms=max(0, gap_lo - beat_lo_ms) + max(0, beat_hi_ms - gap_hi),
+        has_scene_or_transition=has_break_edge,
+        has_flagged_break=any(at.atom_id in junk_atom_ids for at in gap_atoms),
+    ))
+    return verdict, gap_atoms
+
+
+def _seam_split(
+    words: List[dict], atoms: List[Any], span: Tuple[int, int], junk_atom_ids: set,
+) -> Tuple[List[Tuple[int, int]], List[int]]:
+    """Seam-aware split of a single LLM word range (cuts_v3_speech_bridge.plan.md).
+    Like ``_span_pieces``, but an atom-owned gap INSIDE the range is split ONLY
+    when the seam is a HARD break (``_gap_seam``); a WELDABLE gap is ABSORBED --
+    the beat keeps spanning it and the gap's atoms are returned as ``absorbed``
+    (they leave the video pool and play inside the spoken beat). Coverage-fill /
+    recovered cuts do NOT use this -- they keep splitting at every gap via
+    ``_span_pieces``.
+
+    Returns ``(pieces, absorbed_atom_ids)``; ``pieces`` always covers the same
+    words (>= 1 piece)."""
+    a, b = span
+    beat_lo = int(words[a].get("start_ms", 0))
+    beat_hi = int(words[b].get("end_ms", 0))
+    pieces: List[Tuple[int, int]] = []
+    absorbed: List[int] = []
+    cur = a
+    for i in range(a, b):
+        verdict, gap_atoms = _gap_seam(words, atoms, i, junk_atom_ids, beat_lo, beat_hi)
+        if verdict is None:
+            continue
+        if verdict.weldable:
+            absorbed.extend(at.atom_id for at in gap_atoms)
+        else:
+            pieces.append((cur, i))
+            cur = i + 1
+    pieces.append((cur, b))
+    return pieces, absorbed
+
+
+def _merge_beats(
+    cuts: List[SpeechCut], lattice: Lattice, junk_atom_ids: set,
+) -> Tuple[List[SpeechCut], List[int]]:
+    """Merge consecutive same-file speech cuts the model tagged with the SAME
+    beat_id into one continuous beat -- but ONLY across a weldable seam (the
+    deterministic guard; see seam.classify_seam). This is the LLM-proposes /
+    code-disposes half of cuts_v3_speech_bridge.plan.md: the model's beat_id is
+    a semantic 'these belong together' call, and code merges only where the
+    footage is genuinely continuous (no shot change / transition / speaker
+    change; a bare wordless pause with no atom merges when same-speaker).
+
+    Two cuts are candidates only when word-adjacent (``prev.end + 1 ==
+    next.start``) -- any words between them belong to another cut, so they are
+    not one beat. Absorbed atoms (in a welded gap) are returned to leave the
+    video pool. Returns ``(merged_cuts, absorbed_atom_ids)``."""
+    words = lattice.words
+    atoms = lattice.atoms
+    ordered = sorted(cuts, key=lambda s: s.word_span[0])
+    out: List[SpeechCut] = []
+    absorbed: List[int] = []
+    for sc in ordered:
+        prev = out[-1] if out else None
+        if (prev is not None and prev.beat_id and sc.beat_id
+                and prev.beat_id == sc.beat_id
+                and prev.word_span[1] + 1 == sc.word_span[0]
+                and prev.word_span[1] < len(words) and sc.word_span[0] < len(words)):
+            beat_lo = int(words[prev.word_span[0]].get("start_ms", 0))
+            beat_hi = int(words[sc.word_span[1]].get("end_ms", 0))
+            verdict, gap_atoms = _gap_seam(words, atoms, prev.word_span[1], junk_atom_ids,
+                                           beat_lo, beat_hi)
+            # No atom in the gap -> a bare short pause; weld iff same speaker
+            # (there is no break to cross). An atom present -> trust the full
+            # seam verdict (which already checks the speaker).
+            if verdict is None:
+                same_spk = (words[prev.word_span[1]].get("speaker")
+                            == words[sc.word_span[0]].get("speaker"))
+                weld = same_spk
+            else:
+                weld = verdict.weldable
+            if weld:
+                out[-1] = SpeechCut(file_id=prev.file_id,
+                                    word_span=(prev.word_span[0], sc.word_span[1]),
+                                    label=prev.label, speaker_ids=list(prev.speaker_ids),
+                                    beat_id=prev.beat_id)
+                absorbed.extend(at.atom_id for at in gap_atoms)
+                continue
+        out.append(sc)
+    return out, absorbed
+
+
 def _contiguous_atom_runs(lattice: Lattice, atom_ids: List[int]) -> List[List[int]]:
     """``atom_ids`` split into time-contiguous runs (next.start_ms ==
     cur.end_ms). Unknown ids are dropped. A video group must be one
@@ -277,11 +419,18 @@ def enforce_lattice_partition(output: Pass1Output, lattices: Dict[str, Lattice])
     Anything it leaves out of every group is surfaced as a recovered candidate;
     the ONLY way something disappears is an explicit, recoverable junk label.
 
-      1. Split any speech_cut at gaps that contain a video atom (that
-         territory belongs to the atoms; see block comment above).
+      1. Split any speech_cut at atom-owned gaps that are a HARD seam
+         (``_seam_split`` / ``seam.classify_seam``); a WELDABLE gap is ABSORBED
+         -- the beat spans it as one continuous cut and the gap's atoms leave
+         the video pool (cuts_v3_speech_bridge.plan.md).
       2. COVERAGE FILL (speech): every transcript word the model left out of
-         all speech_cuts is re-added as a recovered cut (split at atom-owned
-         gaps).
+         all speech_cuts is re-added as a recovered cut (split at EVERY
+         atom-owned gap -- recovered spans were never claimed as a beat, so
+         they don't bridge).
+      2b. BEAT MERGE: fuse consecutive same-beat_id speech cuts into one beat,
+         but ONLY across a weldable seam (``_merge_beats`` / ``seam``). The
+         model proposes the grouping (beat_id); code merges only where the
+         footage is continuous. Welded gaps' atoms are absorbed too.
       3. Remap every take member onto the (possibly split) speech_cut that
          contains most of its words -- so member == whole cut always holds
          downstream (pass 2a source_refs, image_plan joins). Groups left
@@ -290,25 +439,44 @@ def enforce_lattice_partition(output: Pass1Output, lattices: Dict[str, Lattice])
          ``_contiguous_atom_runs``) -- a group must be one continuous
          stretch, never a bridge across speech.
       5. COVERAGE FILL (video): every atom the model left out of all groups
-         is re-added, contiguous ungrouped atoms folded into one group.
+         (and not absorbed into a beat in step 1) is re-added, contiguous
+         ungrouped atoms folded into one group.
 
-    Post-condition asserted: no speech cut swallows an atom."""
+    Post-condition asserted: no speech cut swallows a GROUPED atom (an absorbed
+    one legitimately plays inside its beat)."""
+    # Atoms a pass-1 junk suspect flags -- a flagged break inside a gap makes
+    # its seam hard (seam.classify_seam), so a beat never bridges across a cue.
+    junk_atom_ids: Dict[str, set] = {}
+    for js in output.junk_suspects:
+        if js.atom_ids:
+            junk_atom_ids.setdefault(js.file_id, set()).update(js.atom_ids)
+
+    # Atoms a beat ABSORBED across a weldable seam: they leave the video pool
+    # (below) and play inside the spoken beat instead of becoming a video cut.
+    absorbed_atoms: Dict[str, set] = {}
     new_cuts: List[SpeechCut] = []
     for sc in output.speech_cuts:
         lattice = lattices.get(sc.file_id)
         if lattice is None or not lattice.words:
             new_cuts.append(sc)
             continue
-        pieces = _span_pieces(lattice.words, lattice.atoms, tuple(sc.word_span))
+        pieces, absorbed = _seam_split(lattice.words, lattice.atoms, tuple(sc.word_span),
+                                       junk_atom_ids.get(sc.file_id, set()))
+        if absorbed:
+            absorbed_atoms.setdefault(sc.file_id, set()).update(absorbed)
+            logger.info("pass1 enforce: beat %r words[%d-%d] absorbed %d atom(s) across "
+                        "weldable seam(s)", sc.label, sc.word_span[0], sc.word_span[1], len(absorbed))
         if len(pieces) == 1:
-            new_cuts.append(sc)
+            new_cuts.append(SpeechCut(file_id=sc.file_id, word_span=pieces[0],
+                                      label=sc.label, speaker_ids=list(sc.speaker_ids),
+                                      beat_id=sc.beat_id))
         else:
             logger.info("pass1 enforce: splitting speech_cut %r words[%d-%d] into %d pieces "
-                        "at atom-owned gaps", sc.label, sc.word_span[0], sc.word_span[1], len(pieces))
+                        "at hard seams", sc.label, sc.word_span[0], sc.word_span[1], len(pieces))
             for j, (pa, pb) in enumerate(pieces, start=1):
                 new_cuts.append(SpeechCut(file_id=sc.file_id, word_span=(pa, pb),
                                           label=f"{sc.label} ({j}/{len(pieces)})",
-                                          speaker_ids=list(sc.speaker_ids)))
+                                          speaker_ids=list(sc.speaker_ids), beat_id=sc.beat_id))
 
     # Coverage fill (speech): the model can flag a word junk, but it can't
     # silently drop it. Any word covered by no speech_cut becomes a recovered
@@ -336,6 +504,26 @@ def enforce_lattice_partition(output: Pass1Output, lattices: Dict[str, Lattice])
                 new_cuts.append(SpeechCut(file_id=file_id, word_span=(pa, pb),
                                           label="(recovered)", speaker_ids=[]))
             i = j
+
+    # Beat merge: fuse same-beat_id neighbours across a WELDABLE seam (the model
+    # proposes with beat_id, code disposes via the deterministic seam guard).
+    # Runs after coverage fill so recovered cuts (beat_id=None) are present but
+    # never merge; absorbed atoms leave the video pool below.
+    by_file_cuts: Dict[str, List[SpeechCut]] = {}
+    for sc in new_cuts:
+        by_file_cuts.setdefault(sc.file_id, []).append(sc)
+    merged_cuts: List[SpeechCut] = []
+    for file_id, file_cuts in by_file_cuts.items():
+        lattice = lattices.get(file_id)
+        if lattice is not None and lattice.words:
+            file_cuts, merged_absorbed = _merge_beats(file_cuts, lattice,
+                                                      junk_atom_ids.get(file_id, set()))
+            if merged_absorbed:
+                absorbed_atoms.setdefault(file_id, set()).update(merged_absorbed)
+                logger.info("pass1 enforce: merged same-beat neighbours in %s, absorbing "
+                            "%d atom(s)", file_id, len(merged_absorbed))
+        merged_cuts.extend(file_cuts)
+    new_cuts = merged_cuts
 
     def _dominant_cut_span(file_id: str, span: Tuple[int, int]) -> Tuple[int, int] | None:
         best: Tuple[int, int] | None = None
@@ -375,12 +563,18 @@ def enforce_lattice_partition(output: Pass1Output, lattices: Dict[str, Lattice])
         # cross-kind overlap). NOT action isolation: grouping/merging is the
         # model's job now (signal-judge), so a swing and its follow-through can
         # ride in one group if the model says so.
-        runs = _contiguous_atom_runs(lattice, vg.atom_ids)
-        if len(runs) == 1 and runs[0] == list(vg.atom_ids):
-            new_groups.append(vg)
+        # Drop any atom a speech beat absorbed across a weldable seam -- it now
+        # plays inside that beat, so it must not ALSO become a video cut.
+        absorbed_here = absorbed_atoms.get(vg.file_id, set())
+        kept_ids = [i for i in vg.atom_ids if i not in absorbed_here]
+        if not kept_ids:
+            continue
+        runs = _contiguous_atom_runs(lattice, kept_ids)
+        if len(runs) == 1 and runs[0] == kept_ids:
+            new_groups.append(VideoTentativeGroup(file_id=vg.file_id, atom_ids=kept_ids))
         else:
             logger.info("pass1 enforce: splitting video group atoms=%s into %d "
-                        "contiguous run(s)", vg.atom_ids, len(runs))
+                        "contiguous run(s)", kept_ids, len(runs))
             for run in runs:
                 new_groups.append(VideoTentativeGroup(file_id=vg.file_id, atom_ids=run))
 
@@ -393,7 +587,9 @@ def enforce_lattice_partition(output: Pass1Output, lattices: Dict[str, Lattice])
     for vg in new_groups:
         grouped_ids.setdefault(vg.file_id, set()).update(vg.atom_ids)
     for file_id, lattice in lattices.items():
-        have = grouped_ids.get(file_id, set())
+        # Grouped OR absorbed atoms are already spoken for; only genuinely
+        # ungrouped, un-absorbed atoms need a recovered group.
+        have = grouped_ids.get(file_id, set()) | absorbed_atoms.get(file_id, set())
         ungrouped = sorted((a for a in lattice.atoms if a.atom_id not in have),
                            key=lambda a: a.start_ms)
         if not ungrouped:

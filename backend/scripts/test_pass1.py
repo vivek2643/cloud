@@ -147,10 +147,27 @@ def test_pass1_output_defaults_are_empty_not_missing():
 
 
 def test_no_speech_cut_swallows_atoms_flags_a_cross_pause_group():
-    # Words 0-2 end at 900ms; words 3-4 run 1500-2100ms. An atom in the
-    # 900-1500 gap (a "long pause" the atoms own). A speech cut grouping
-    # words [0-4] spans that gap -> must be rejected with a message naming
-    # the cut and the swallowed atom.
+    # Words 0-2 end at 900ms; words 3-4 run 1500-2100ms. A GROUPED atom in the
+    # 900-1500 gap (it would become a video cut). A speech cut grouping words
+    # [0-4] spans that atom -> a real speech/video overlap, rejected with a
+    # message naming the cut and the swallowed atom.
+    lat = _make_lattice()
+    lat.atoms.insert(0, Atom(atom_id=99, file_id="f1", start_ms=950, end_ms=1450,
+                             state_in="speech_edge", state_out="speech_edge",
+                             action_energy=0.1, coherence=1.0))
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [{"file_id": "f1", "word_span": [0, 4], "label": "whole thing"}],
+        "video_tentative_groups": [{"file_id": "f1", "atom_ids": [99]}],
+    })
+    err = pass1._no_speech_cut_swallows_atoms(out, {"f1": lat})
+    assert err is not None and "atom 99" in err and "speech_cut[0]" in err, err
+    print("ok  test_no_speech_cut_swallows_atoms_flags_a_cross_pause_group")
+
+
+def test_no_speech_cut_swallows_atoms_allows_an_absorbed_ungrouped_atom():
+    # The SAME geometry, but atom 99 is in NO video group -- it was absorbed
+    # into the beat across a weldable seam. It plays inside the beat and
+    # produces no video cut, so there is no overlap: this is legal.
     lat = _make_lattice()
     lat.atoms.insert(0, Atom(atom_id=99, file_id="f1", start_ms=950, end_ms=1450,
                              state_in="speech_edge", state_out="speech_edge",
@@ -158,9 +175,8 @@ def test_no_speech_cut_swallows_atoms_flags_a_cross_pause_group():
     out = pass1.Pass1Output.model_validate({
         "speech_cuts": [{"file_id": "f1", "word_span": [0, 4], "label": "whole thing"}],
     })
-    err = pass1._no_speech_cut_swallows_atoms(out, {"f1": lat})
-    assert err is not None and "atom 99" in err and "speech_cut[0]" in err, err
-    print("ok  test_no_speech_cut_swallows_atoms_flags_a_cross_pause_group")
+    assert pass1._no_speech_cut_swallows_atoms(out, {"f1": lat}) is None
+    print("ok  test_no_speech_cut_swallows_atoms_allows_an_absorbed_ungrouped_atom")
 
 
 def test_no_speech_cut_swallows_atoms_accepts_clean_grouping():
@@ -336,6 +352,153 @@ def test_coverage_fill_recovers_uncovered_speech_words():
     print("ok  test_coverage_fill_recovers_uncovered_speech_words")
 
 
+def _bridge_lattice(gap_atoms, *, second_speaker="S1", gap_span=(2000, 2600)):
+    """A beat that continues across ONE wordless moment: 'Watch this ... and
+    topspin', with ``gap_atoms`` occupying [gap_span] between word 1 and word
+    2. 2s of speech on each side, so the magnitude backstop is slack unless the
+    gap is stretched via ``gap_span``."""
+    g_lo, g_hi = gap_span
+    words = [
+        {"start_ms": 0, "end_ms": 1000, "text": "Watch", "speaker": "S1"},
+        {"start_ms": 1000, "end_ms": g_lo, "text": "this", "speaker": "S1"},
+        {"start_ms": g_hi, "end_ms": g_hi + 1000, "text": "and", "speaker": second_speaker},
+        {"start_ms": g_hi + 1000, "end_ms": g_hi + 2000, "text": "topspin", "speaker": second_speaker},
+    ]
+    return Lattice(file_id="f1", duration_ms=g_hi + 2000, words=words, turns=[],
+                   hints=[], atoms=list(gap_atoms))
+
+
+def test_bridge_absorbs_a_weldable_gap_into_one_beat():
+    # One continuous action atom (no break edge, same speaker, short gap) sits
+    # mid-thought. The beat [0-3] must stay ONE cut, and the atom must LEAVE the
+    # video pool (it plays inside the beat, produces no video cut).
+    atom = Atom(atom_id=10, file_id="f1", start_ms=2000, end_ms=2600,
+                state_in="speech_edge", state_out="speech_edge",
+                action_energy=0.7, coherence=0.9, is_action=True)
+    lat = _bridge_lattice([atom])
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [{"file_id": "f1", "word_span": [0, 3], "label": "demo beat"}],
+        "video_tentative_groups": [{"file_id": "f1", "atom_ids": [10]}],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    assert [tuple(sc.word_span) for sc in fixed.speech_cuts] == [(0, 3)], fixed.speech_cuts
+    assert fixed.speech_cuts[0].label == "demo beat"   # untouched, no (n/n) suffix
+    grouped = {a for vg in fixed.video_tentative_groups for a in vg.atom_ids}
+    assert 10 not in grouped, fixed.video_tentative_groups
+    assert pass1._no_speech_cut_swallows_atoms(fixed, {"f1": lat}) is None
+    print("ok  test_bridge_absorbs_a_weldable_gap_into_one_beat")
+
+
+def test_bridge_splits_at_a_shot_cut_in_the_gap():
+    # Two atoms in the gap with a SHOT CUT between them (a real break). Even
+    # same-speaker, short gap -> hard seam -> beat splits into speech . speech,
+    # and the atoms stay in the video pool.
+    a0 = Atom(atom_id=10, file_id="f1", start_ms=2000, end_ms=2300,
+              state_in="speech_edge", state_out="shot_cut", action_energy=0.5, coherence=0.9)
+    a1 = Atom(atom_id=11, file_id="f1", start_ms=2300, end_ms=2600,
+              state_in="shot_cut", state_out="speech_edge", action_energy=0.5, coherence=0.9)
+    lat = _bridge_lattice([a0, a1])
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [{"file_id": "f1", "word_span": [0, 3], "label": "two shots"}],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    assert [tuple(sc.word_span) for sc in fixed.speech_cuts] == [(0, 1), (2, 3)], fixed.speech_cuts
+    grouped = {a for vg in fixed.video_tentative_groups for a in vg.atom_ids}
+    assert {10, 11} <= grouped, fixed.video_tentative_groups
+    print("ok  test_bridge_splits_at_a_shot_cut_in_the_gap")
+
+
+def test_bridge_splits_at_a_speaker_change():
+    # Same continuous footage, but the second half is a DIFFERENT speaker ->
+    # never one beat -> hard seam -> split.
+    atom = Atom(atom_id=10, file_id="f1", start_ms=2000, end_ms=2600,
+                state_in="speech_edge", state_out="speech_edge", action_energy=0.3, coherence=0.9)
+    lat = _bridge_lattice([atom], second_speaker="S2")
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [{"file_id": "f1", "word_span": [0, 3], "label": "two speakers"}],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    assert [tuple(sc.word_span) for sc in fixed.speech_cuts] == [(0, 1), (2, 3)], fixed.speech_cuts
+    print("ok  test_bridge_splits_at_a_speaker_change")
+
+
+def test_bridge_magnitude_backstop_splits_an_over_long_gap():
+    # The gap (4600ms) is longer than the speech it would bridge (~4s here is
+    # borderline; stretch the gap so gap_ms > left+right speech). More
+    # connective tissue than speech -> not one beat -> hard, no tuned constant.
+    atom = Atom(atom_id=10, file_id="f1", start_ms=2000, end_ms=9000,
+                state_in="speech_edge", state_out="speech_edge", action_energy=0.3, coherence=0.9)
+    lat = _bridge_lattice([atom], gap_span=(2000, 9000))
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [{"file_id": "f1", "word_span": [0, 3], "label": "long gap"}],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    assert [tuple(sc.word_span) for sc in fixed.speech_cuts] == [(0, 1), (2, 3)], fixed.speech_cuts
+    print("ok  test_bridge_magnitude_backstop_splits_an_over_long_gap")
+
+
+def test_beat_merge_fuses_same_beat_neighbours_across_weldable_seam():
+    # The model emitted TWO speech cuts but tagged them one beat_id; a
+    # continuous action atom sits between them (same speaker, short gap, no
+    # break) -> code merges them into ONE beat and absorbs the atom.
+    atom = Atom(atom_id=10, file_id="f1", start_ms=2000, end_ms=2600,
+                state_in="speech_edge", state_out="speech_edge",
+                action_energy=0.7, coherence=0.9, is_action=True)
+    lat = _bridge_lattice([atom])
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [
+            {"file_id": "f1", "word_span": [0, 1], "label": "setup", "beat_id": "b1"},
+            {"file_id": "f1", "word_span": [2, 3], "label": "payoff", "beat_id": "b1"},
+        ],
+        "video_tentative_groups": [{"file_id": "f1", "atom_ids": [10]}],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    assert [tuple(sc.word_span) for sc in fixed.speech_cuts] == [(0, 3)], fixed.speech_cuts
+    grouped = {a for vg in fixed.video_tentative_groups for a in vg.atom_ids}
+    assert 10 not in grouped, fixed.video_tentative_groups
+    assert pass1._no_speech_cut_swallows_atoms(fixed, {"f1": lat}) is None
+    print("ok  test_beat_merge_fuses_same_beat_neighbours_across_weldable_seam")
+
+
+def test_beat_merge_respects_the_seam_guard():
+    # Same beat_id, but a SHOT CUT sits in the gap -> code refuses to merge
+    # even though the model asked, and the atoms stay in the video pool.
+    a0 = Atom(atom_id=10, file_id="f1", start_ms=2000, end_ms=2300,
+              state_in="speech_edge", state_out="shot_cut", action_energy=0.5, coherence=0.9)
+    a1 = Atom(atom_id=11, file_id="f1", start_ms=2300, end_ms=2600,
+              state_in="shot_cut", state_out="speech_edge", action_energy=0.5, coherence=0.9)
+    lat = _bridge_lattice([a0, a1])
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [
+            {"file_id": "f1", "word_span": [0, 1], "label": "a", "beat_id": "b1"},
+            {"file_id": "f1", "word_span": [2, 3], "label": "b", "beat_id": "b1"},
+        ],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    assert [tuple(sc.word_span) for sc in fixed.speech_cuts] == [(0, 1), (2, 3)], fixed.speech_cuts
+    print("ok  test_beat_merge_respects_the_seam_guard")
+
+
+def test_beat_merge_does_not_touch_untagged_neighbours():
+    # No beat_id -> even a perfectly weldable seam is left split (the model
+    # never said these belong together).
+    atom = Atom(atom_id=10, file_id="f1", start_ms=2000, end_ms=2600,
+                state_in="speech_edge", state_out="speech_edge", action_energy=0.3, coherence=0.9)
+    lat = _bridge_lattice([atom])
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [
+            {"file_id": "f1", "word_span": [0, 1], "label": "a"},
+            {"file_id": "f1", "word_span": [2, 3], "label": "b"},
+        ],
+        "video_tentative_groups": [{"file_id": "f1", "atom_ids": [10]}],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    assert [tuple(sc.word_span) for sc in fixed.speech_cuts] == [(0, 1), (2, 3)], fixed.speech_cuts
+    grouped = {a for vg in fixed.video_tentative_groups for a in vg.atom_ids}
+    assert 10 in grouped, "untagged neighbours must not absorb the atom"
+    print("ok  test_beat_merge_does_not_touch_untagged_neighbours")
+
+
 def test_no_overlapping_speech_cuts():
     bad = pass1.Pass1Output.model_validate({
         "speech_cuts": [
@@ -381,6 +544,7 @@ def main():
     test_pass1_output_schema_round_trip_with_junk_suspects()
     test_pass1_output_defaults_are_empty_not_missing()
     test_no_speech_cut_swallows_atoms_flags_a_cross_pause_group()
+    test_no_speech_cut_swallows_atoms_allows_an_absorbed_ungrouped_atom()
     test_no_speech_cut_swallows_atoms_accepts_clean_grouping()
     test_no_speech_cut_swallows_atoms_rejects_out_of_range_span()
     test_enforce_splits_a_speech_cut_at_an_atom_owned_gap()
@@ -390,6 +554,13 @@ def main():
     test_enforce_no_longer_isolates_action_atoms()
     test_coverage_fill_readds_every_ungrouped_atom()
     test_coverage_fill_recovers_uncovered_speech_words()
+    test_bridge_absorbs_a_weldable_gap_into_one_beat()
+    test_bridge_splits_at_a_shot_cut_in_the_gap()
+    test_bridge_splits_at_a_speaker_change()
+    test_bridge_magnitude_backstop_splits_an_over_long_gap()
+    test_beat_merge_fuses_same_beat_neighbours_across_weldable_seam()
+    test_beat_merge_respects_the_seam_guard()
+    test_beat_merge_does_not_touch_untagged_neighbours()
     test_no_overlapping_speech_cuts()
     test_pass1_output_rejects_an_unexpected_wrapper_key()
     print("\nall pass1 tests passed")
