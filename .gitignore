@@ -42,3 +42,6 @@ coverage/
 
 # Source assets (pitch deck, design sources — app uses frontend/public/)
 Assets/
+
+# Separate trail — not part of this app
+website/
