@@ -122,6 +122,29 @@ const SPEECH_TRIM_MAX = 0.85;
 
 type Segment = { inMs: number; outMs: number };
 
+// Shared pace level for the whole project. Maps to an index into pace.levels
+// (target velocities 0.5/0.8/1.0/1.3/1.8); "original" = native 1.0x, no change.
+type PaceMode = "original" | "low" | "medium" | "high";
+const PACE_LEVEL_IDX: Record<Exclude<PaceMode, "original">, number> = {
+  low: 1,
+  medium: 2,
+  high: 3,
+};
+const PACE_LABEL: Record<PaceMode, string> = {
+  original: "Original",
+  low: "Pace Low",
+  medium: "Pace Medium",
+  high: "Pace High",
+};
+
+// The playback rate a cut plays at for a given pace mode. Video reads its
+// per-clip level; speech is ALWAYS native (never sped/slowed).
+function paceRate(cut: CutRecord, mode: PaceMode): number {
+  if (mode === "original" || cut.kind === "speech") return 1;
+  const lvl = cut.pace?.levels?.[PACE_LEVEL_IDX[mode]] ?? 1;
+  return Math.min(4, Math.max(0.25, lvl));
+}
+
 // SPEECH dial: shave dead air + fillers (pace.remove_spans, computed
 // deterministically in post.compute_speech_remove_spans) as energy rises.
 // Removes the LONGEST removable spans first (worst dead air goes first) up to
@@ -212,10 +235,12 @@ export function CutsV3View() {
   const files = useDriveStore((s) => s.files);
   const [aspect, setAspect] = useState<Aspect>("landscape");
   const [fit, setFit] = useState<"adjusted" | "original">("adjusted");
-  // Pace: "adjusted" plays every VIDEO cut at its mid pace level (pace.levels[2],
-  // the neutral target-velocity), normalizing speed across clips. Speech is never
-  // sped/slowed (its levels are all 1.0), so this is a no-op on speech.
-  const [paceMode, setPaceMode] = useState<"adjusted" | "original">("original");
+  // Pace: pick ONE shared pace level for the whole project. Because pace.levels[i]
+  // is normalized per clip to a common target velocity, setting every VIDEO cut to
+  // the same level makes them play at matching visual velocities (they cut together
+  // smoothly). Speech is never sped/slowed (its levels are all 1.0). "Original" =
+  // native speed.
+  const [paceMode, setPaceMode] = useState<PaceMode>("original");
   const [filter, setFilter] = useState<FilterKey>("all");
   const [showDiscarded, setShowDiscarded] = useState(false);
   const [showMicro, setShowMicro] = useState(false);
@@ -491,9 +516,12 @@ export function CutsV3View() {
             onChange={(v) => setFit(v === "Original" ? "original" : "adjusted")}
           />
           <PillDropdown
-            options={["Pace Adjusted", "Original"]}
-            value={paceMode === "adjusted" ? "Pace Adjusted" : "Original"}
-            onChange={(v) => setPaceMode(v === "Pace Adjusted" ? "adjusted" : "original")}
+            options={["Original", "Pace Low", "Pace Medium", "Pace High"]}
+            value={PACE_LABEL[paceMode]}
+            onChange={(v) => {
+              const found = (Object.keys(PACE_LABEL) as PaceMode[]).find((k) => PACE_LABEL[k] === v);
+              if (found) setPaceMode(found);
+            }}
           />
           <TrayToggle
             active={showDiscarded}
@@ -1025,7 +1053,7 @@ function CutCardV3({
   getUrl: (fileId: string) => Promise<string | null>;
   aspect: Aspect;
   fit: "adjusted" | "original";
-  paceMode: "adjusted" | "original";
+  paceMode: PaceMode;
   selected: boolean;
   weldLeft: boolean;
   weldRight: boolean;
@@ -1051,13 +1079,8 @@ function CutCardV3({
   useEffect(() => {
     segsRef.current = segments;
   }, [segments]);
-  // Pace-adjusted playback speed: video plays at its mid pace level (the neutral
-  // target-velocity); speech is NEVER sped/slowed (levels are all 1.0 anyway, but
-  // guard explicitly). "Original" = native speed.
-  const rate =
-    paceMode === "adjusted" && cut.kind !== "speech"
-      ? Math.min(4, Math.max(0.25, cut.pace?.levels?.[2] ?? 1))
-      : 1;
+  // Pace-adjusted playback speed for the chosen level; speech is never touched.
+  const rate = paceRate(cut, paceMode);
   useEffect(() => {
     const v = videoRef.current;
     if (v) v.playbackRate = rate;
