@@ -40,24 +40,77 @@ def _lat(file_id):
 # IdentityCut / IdentityOutput schema
 # --------------------------------------------------------------------------
 
-def test_speech_cut_requires_word_span():
-    try:
+def test_locators_are_optional_at_parse_time_and_backfilled():
+    # word_span/atom_ids are deliberately NOT required by the schema -- the
+    # model no longer echoes them (that echo was the single biggest
+    # output-complexity failure); backfill_locators derives them from pass 1.
+    p1 = Pass1Output(
+        speech_cuts=[SpeechCut(file_id="f1", word_span=(3, 9), label="s")],
+        video_tentative_groups=[VideoTentativeGroup(file_id="f1", atom_ids=[4, 5, 6])],
+    )
+    out = pass2a.IdentityOutput(cuts=[
         pass2a.IdentityCut(source_ref="speech_cut[0]", kind="speech", file_id="f1",
-                          label="x", summary="y")
-        assert False, "expected ValueError"
-    except ValueError:
-        pass
-    print("ok  test_speech_cut_requires_word_span")
-
-
-def test_video_cut_requires_atom_ids():
-    try:
+                          label="x", summary="y"),
         pass2a.IdentityCut(source_ref="video_group[0]", kind="video", file_id="f1",
-                          label="x", summary="y")
-        assert False, "expected ValueError"
-    except ValueError:
-        pass
-    print("ok  test_video_cut_requires_atom_ids")
+                          label="x", summary="y"),
+    ])
+    filled = pass2a.backfill_locators(out, p1)
+    assert filled.cuts[0].word_span == (3, 9), filled.cuts[0]
+    assert filled.cuts[1].atom_ids == [4, 5, 6], filled.cuts[1]
+    assert pass2a._locators_resolved(filled) is None
+    print("ok  test_locators_are_optional_at_parse_time_and_backfilled")
+
+
+def test_kind_alias_is_normalized_at_parse_time():
+    # The model intermittently echoes pass 1's unit name into the kind enum
+    # ("video_tentative_group" instead of "video"). It's unambiguous, so it's
+    # normalized rather than burning a re-ask (observed twice-in-a-row on a
+    # real Reel-trail shard).
+    c = pass2a.IdentityCut(source_ref="video_group[8]", kind="video_tentative_group",
+                           file_id="f1", label="x", summary="y")
+    assert c.kind == "video", c
+    c2 = pass2a.IdentityCut(source_ref="speech_cut[0]", kind="speech_cut",
+                            file_id="f1", label="x", summary="y")
+    assert c2.kind == "speech", c2
+    print("ok  test_kind_alias_is_normalized_at_parse_time")
+
+
+def test_backfill_leaves_split_video_groups_to_the_model():
+    # A video group split into two cuts: backfill must NOT overwrite the
+    # pieces' own atom_ids (that split IS the model's judgment); the
+    # partition check validates them instead.
+    p1 = Pass1Output(
+        video_tentative_groups=[VideoTentativeGroup(file_id="f1", atom_ids=[0, 1, 2])],
+    )
+    good = pass2a.IdentityOutput(cuts=[
+        pass2a.IdentityCut(source_ref="video_group[0]", kind="video", file_id="f1",
+                          atom_ids=[0], label="a", summary="a"),
+        pass2a.IdentityCut(source_ref="video_group[0]", kind="video", file_id="f1",
+                          atom_ids=[1, 2], label="b", summary="b"),
+    ])
+    filled = pass2a.backfill_locators(good, p1)
+    assert filled.cuts[0].atom_ids == [0] and filled.cuts[1].atom_ids == [1, 2]
+    assert pass2a._split_groups_partition_atoms(filled, p1) is None
+
+    lost_atom = pass2a.IdentityOutput(cuts=[
+        pass2a.IdentityCut(source_ref="video_group[0]", kind="video", file_id="f1",
+                          atom_ids=[0], label="a", summary="a"),
+        pass2a.IdentityCut(source_ref="video_group[0]", kind="video", file_id="f1",
+                          atom_ids=[2], label="b", summary="b"),
+    ])
+    err = pass2a._split_groups_partition_atoms(lost_atom, p1)
+    assert err is not None and "[1]" in err, err
+
+    missing_ids = pass2a.IdentityOutput(cuts=[
+        pass2a.IdentityCut(source_ref="video_group[0]", kind="video", file_id="f1",
+                          atom_ids=[0, 1, 2], label="a", summary="a"),
+        pass2a.IdentityCut(source_ref="video_group[0]", kind="video", file_id="f1",
+                          label="b", summary="b"),   # split piece with no atom_ids
+    ])
+    filled2 = pass2a.backfill_locators(missing_ids, p1)
+    err2 = pass2a._locators_resolved(filled2)
+    assert err2 is not None and "atom_ids" in err2, err2
+    print("ok  test_backfill_leaves_split_video_groups_to_the_model")
 
 
 def test_invalid_take_role_rejected():
@@ -210,35 +263,90 @@ def test_no_overlapping_word_spans_ignores_different_files():
     print("ok  test_no_overlapping_word_spans_ignores_different_files")
 
 
+def _pass1_with(n_speech: int = 4, n_video: int = 4) -> Pass1Output:
+    """A Pass1Output with enough refs for every source_ref the semantic-check
+    tests use -- _source_refs_exist validates refs against these counts."""
+    return Pass1Output(
+        speech_cuts=[SpeechCut(file_id="f1", word_span=(i, i), label=f"s{i}")
+                     for i in range(n_speech)],
+        video_tentative_groups=[VideoTentativeGroup(file_id="f1", atom_ids=[i])
+                                for i in range(n_video)],
+    )
+
+
 def test_pass2a_semantic_checks_combines_all_checks():
+    p1 = _pass1_with()
     kind_mismatch = pass2a.IdentityOutput(cuts=[
         pass2a.IdentityCut(source_ref="speech_cut[0]", kind="video", file_id="f1",
                           atom_ids=[0], label="a", summary="a"),
     ])
-    assert pass2a._pass2a_semantic_checks(kind_mismatch, {}) is not None
+    assert pass2a._pass2a_semantic_checks(kind_mismatch, p1, {}, {"f1"}) is not None
 
+    # duplicate atoms are only possible within a SPLIT group now (backfill
+    # overwrites an un-split group's atom_ids from pass 1 wholesale)
     dup_atoms = pass2a.IdentityOutput(cuts=[
         pass2a.IdentityCut(source_ref="video_group[0]", kind="video", file_id="f1",
-                          atom_ids=[0, 1], label="a", summary="a"),
-        pass2a.IdentityCut(source_ref="video_group[1]", kind="video", file_id="f1",
-                          atom_ids=[1, 2], label="b", summary="b"),
+                          atom_ids=[0], label="a", summary="a"),
+        pass2a.IdentityCut(source_ref="video_group[0]", kind="video", file_id="f1",
+                          atom_ids=[0], label="b", summary="b"),
     ])
-    assert pass2a._pass2a_semantic_checks(dup_atoms, {}) is not None
+    assert pass2a._pass2a_semantic_checks(dup_atoms, p1, {}, {"f1"}) is not None
 
+    # overlapping word spans can only originate in pass 1 now (backfill
+    # copies pass 1's spans verbatim) -- caught here too, post-backfill
+    p1_overlap = Pass1Output(speech_cuts=[
+        SpeechCut(file_id="f1", word_span=(0, 4), label="a"),
+        SpeechCut(file_id="f1", word_span=(2, 6), label="b"),
+    ])
     dup_words = pass2a.IdentityOutput(cuts=[
         pass2a.IdentityCut(source_ref="speech_cut[0]", kind="speech", file_id="f1",
-                          word_span=(0, 4), label="a", summary="a"),
+                          label="a", summary="a"),
         pass2a.IdentityCut(source_ref="speech_cut[1]", kind="speech", file_id="f1",
-                          word_span=(2, 6), label="b", summary="b"),
+                          label="b", summary="b"),
     ])
-    assert pass2a._pass2a_semantic_checks(dup_words, {}) is not None
+    assert pass2a._pass2a_semantic_checks(dup_words, p1_overlap, {}, {"f1"}) is not None
 
     clean = pass2a.IdentityOutput(cuts=[
         pass2a.IdentityCut(source_ref="speech_cut[0]", kind="speech", file_id="f1",
                           word_span=(0, 1), label="a", summary="a"),
     ])
-    assert pass2a._pass2a_semantic_checks(clean, {}) is None
+    assert pass2a._pass2a_semantic_checks(clean, p1, {}, {"f1"}) is None
+
+    # a cut for a file OUTSIDE this shard is rejected (observed: a shard
+    # emitting cuts for another shard's clips -> identical-span dupes in post)
+    out_of_scope = pass2a.IdentityOutput(cuts=[
+        pass2a.IdentityCut(source_ref="speech_cut[0]", kind="speech", file_id="f2",
+                          word_span=(0, 1), label="a", summary="a"),
+    ])
+    err = pass2a._pass2a_semantic_checks(out_of_scope, p1, {}, {"f1"})
+    assert err is not None and "NOT part of this call" in err, err
     print("ok  test_pass2a_semantic_checks_combines_all_checks")
+
+
+def test_source_refs_exist_rejects_an_invented_ref():
+    p1 = _pass1_with(n_speech=2, n_video=1)
+    invented = pass2a.IdentityOutput(cuts=[
+        pass2a.IdentityCut(source_ref="take[intro_greeting]_take1", kind="speech",
+                          file_id="f1", word_span=(0, 6), label="a", summary="a"),
+    ])
+    err = pass2a._source_refs_exist(invented, p1)
+    assert err is not None and "take[intro_greeting]_take1" in err, err
+
+    out_of_range = pass2a.IdentityOutput(cuts=[
+        pass2a.IdentityCut(source_ref="speech_cut[7]", kind="speech", file_id="f1",
+                          word_span=(0, 1), label="a", summary="a"),
+    ])
+    err2 = pass2a._source_refs_exist(out_of_range, p1)
+    assert err2 is not None and "speech_cut[7]" in err2, err2
+
+    ok = pass2a.IdentityOutput(cuts=[
+        pass2a.IdentityCut(source_ref="speech_cut[1]", kind="speech", file_id="f1",
+                          word_span=(0, 1), label="a", summary="a"),
+        pass2a.IdentityCut(source_ref="video_group[0]", kind="video", file_id="f1",
+                          atom_ids=[0], label="b", summary="b"),
+    ])
+    assert pass2a._source_refs_exist(ok, p1) is None
+    print("ok  test_source_refs_exist_rejects_an_invented_ref")
 
 
 def _lattice_for_cross_kind_test():
@@ -445,8 +553,9 @@ def test_run_identity_shard_calls_complete_with_pass2_stage_and_cached_prefix():
 
 
 def main():
-    test_speech_cut_requires_word_span()
-    test_video_cut_requires_atom_ids()
+    test_locators_are_optional_at_parse_time_and_backfilled()
+    test_kind_alias_is_normalized_at_parse_time()
+    test_backfill_leaves_split_video_groups_to_the_model()
     test_invalid_take_role_rejected()
     test_take_role_aliases_normalize_to_take()
     test_valid_cuts_round_trip()
@@ -461,6 +570,7 @@ def main():
     test_no_overlapping_word_spans_catches_a_duplicate_span()
     test_no_overlapping_word_spans_ignores_different_files()
     test_pass2a_semantic_checks_combines_all_checks()
+    test_source_refs_exist_rejects_an_invented_ref()
     test_no_cross_kind_ms_overlap_passes_when_disjoint()
     test_no_cross_kind_ms_overlap_catches_a_speech_and_video_cut_overlapping()
     test_single_file_one_shard()

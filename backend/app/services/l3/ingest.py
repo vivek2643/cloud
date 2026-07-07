@@ -114,7 +114,12 @@ def run_ingest(project_id: str) -> str:
         store.set_status(ingest_run_id, "pass1")
         pass1_completion = pass1.run_pass1(file_rows)
         pass1_output = pass1.Pass1Output.model_validate(pass1_completion.data)
-        store.record_pass1_result(ingest_run_id, pass1_completion.data, pass1_completion.usage,
+        # Deterministic boundary repair (split cuts crossing atom-owned gaps,
+        # realign take members) -- the model owns meaning, the lattice owns
+        # boundaries. The ENFORCED output is what gets persisted: pass 2's
+        # cached prefix and the image plan must see the same refs.
+        pass1_output = pass1.enforce_lattice_partition(pass1_output, lattices)
+        store.record_pass1_result(ingest_run_id, pass1_output.model_dump(), pass1_completion.usage,
                                   pass1_output.project_summary)
 
         store.set_status(ingest_run_id, "images")
@@ -149,6 +154,9 @@ def run_ingest(project_id: str) -> str:
                 completion = future.result()
                 store.accumulate_pass2_usage(ingest_run_id, completion.usage)
                 shard_output = pass2a.IdentityOutput.model_validate(completion.data)
+                # locators (word_span/atom_ids) are code-derived from pass 1,
+                # not echoed by the model -- see pass2a.backfill_locators.
+                shard_output = pass2a.backfill_locators(shard_output, pass1_output)
                 all_identity_cuts.extend(shard_output.cuts)
         identity_output = pass2a.IdentityOutput(cuts=all_identity_cuts)
 
@@ -169,6 +177,7 @@ def run_ingest(project_id: str) -> str:
                     visual_by_index[judgment.cut_index] = judgment
 
         pass2_output = pass2.merge_identity_and_visual(identity_output, visual_by_index)
+        pass2_output = pass2.apply_junk_suspects(pass2_output, pass1_output)
 
         store.set_status(ingest_run_id, "post")
         records = post.assemble_cut_records(pass2_output, lattices, motion_by_file, silences_by_file)

@@ -20,22 +20,46 @@ from app.services.processing import _download_from_r2
 FFMPEG_TIMEOUT_S = 30
 MAX_PARALLEL_FILES = 8
 
+# Seek fallbacks (ms) when the requested timestamp lands past the last decodable
+# frame. A planned/hero frame can sit within a few ms of a clip's end (e.g. an
+# action anchor on the final beat); the proxy's real duration is often a hair
+# shorter than the source, so `-ss` there yields no frame and ffmpeg errors.
+# Nudging earlier grabs the nearest real frame -- content-equivalent for a still.
+_SEEK_BACKOFF_MS = (0, 150, 400, 1000, 2000)
+
+
+def _run_ffmpeg_still(video_path: str, ts_s: float, out_path: str, width: int) -> bool:
+    """One ffmpeg still attempt. Returns True iff a non-empty JPEG was written.
+    Swallows the CalledProcessError (returns False) so the caller can retry an
+    earlier seek; other failures (timeout, missing ffmpeg) still raise."""
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-ss", str(max(0.0, ts_s)),
+                "-i", video_path,
+                "-vframes", "1",
+                "-vf", f"scale={width}:-2,format=yuv420p",
+                "-q:v", "3",
+                out_path,
+            ],
+            check=True, capture_output=True, timeout=FFMPEG_TIMEOUT_S,
+        )
+    except subprocess.CalledProcessError:
+        return False
+    return os.path.exists(out_path) and os.path.getsize(out_path) > 0
+
 
 def extract_still(video_path: str, ts_ms: int, out_path: str, width: int = 768) -> None:
     """Pull one JPEG frame from ``video_path`` at ``ts_ms``, scaled to
     ``width``px wide (height auto, even, yuv420p for safe mjpeg encode).
-    Raises on ffmpeg failure -- no silent fallback."""
+    Seeks progressively earlier if the requested point is past the last
+    decodable frame; raises only if no frame can be pulled at all."""
     ts_s = max(0.0, ts_ms / 1000.0)
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-ss", str(ts_s),
-            "-i", video_path,
-            "-vframes", "1",
-            "-vf", f"scale={width}:-2,format=yuv420p",
-            "-q:v", "3",
-            out_path,
-        ],
-        check=True, capture_output=True, timeout=FFMPEG_TIMEOUT_S,
+    for back_ms in _SEEK_BACKOFF_MS:
+        if _run_ffmpeg_still(video_path, ts_s - back_ms / 1000.0, out_path, width):
+            return
+    raise RuntimeError(
+        f"extract_still: no decodable frame at or before {ts_ms}ms in {video_path}"
     )
 
 

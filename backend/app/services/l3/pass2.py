@@ -17,14 +17,19 @@ shape both halves assemble into, and the merge itself.
 """
 from __future__ import annotations
 
+import logging
 from typing import Dict, List, Tuple
 
 from pydantic import BaseModel, Field
 
+from app.services.l3.pass1 import Pass1Output
 from app.services.l3.pass2a import IdentityOutput
 from app.services.l3.pass2b import Framing, Look, TasteFences, VisualJudgment
 
-__all__ = ["Framing", "Look", "TasteFences", "Pass2Cut", "Pass2Output", "merge_identity_and_visual"]
+__all__ = ["Framing", "Look", "TasteFences", "Pass2Cut", "Pass2Output",
+           "merge_identity_and_visual", "apply_junk_suspects"]
+
+logger = logging.getLogger(__name__)
 
 
 class Pass2Cut(BaseModel):
@@ -39,6 +44,7 @@ class Pass2Cut(BaseModel):
     on_camera: bool | None = None
     junk: bool = False
     junk_reason: str = ""
+    junk_confidence: str = "low"     # "high" -> hidden by default; "low"/doubtful -> shown
     framing: Framing = Field(default_factory=Framing)
     look: Look = Field(default_factory=Look)
     caption_zones: List[Tuple[float, float, float, float]] = Field(default_factory=list)
@@ -74,9 +80,48 @@ def merge_identity_and_visual(
             word_span=identity.word_span, atom_ids=identity.atom_ids,
             label=identity.label, summary=identity.summary, speaker=identity.speaker,
             on_camera=identity.on_camera, junk=identity.junk, junk_reason=identity.junk_reason,
+            junk_confidence=identity.junk_confidence,
             framing=visual.framing, look=visual.look, caption_zones=visual.caption_zones,
             taste_fences=visual.taste_fences, readability_ms=visual.readability_ms,
             natural_sound=identity.natural_sound,
             take_group_id=identity.take_group_id, take_role=identity.take_role,
         ))
     return Pass2Output(cuts=cuts)
+
+
+def apply_junk_suspects(pass2: Pass2Output, pass1: Pass1Output) -> Pass2Output:
+    """Deterministically hide what pass 1 already flagged as clearly unusable
+    (editorial pass, section D -- cue-word trimming). A cut fully contained in
+    a pass-1 junk_suspect span (a leading camera cue that pass 1 split into its
+    own short speech_cut, dead air, etc.) is forced to high-confidence junk so
+    it's hidden by default -- rather than trusting pass 2a to re-flag it from a
+    single still. This runs BEFORE post's action-protection override, so a
+    genuine motion payoff a suspect happened to cover is still resurfaced there
+    (protection wins). Conservative: only EXACT containment, never a partial
+    overlap (which might clip real content)."""
+    speech_susp: Dict[str, List[Tuple[int, int, str]]] = {}
+    video_susp: Dict[str, List[Tuple[set, str]]] = {}
+    for js in pass1.junk_suspects:
+        if js.word_span is not None:
+            speech_susp.setdefault(js.file_id, []).append((js.word_span[0], js.word_span[1], js.reason))
+        elif js.atom_ids:
+            video_susp.setdefault(js.file_id, []).append((set(js.atom_ids), js.reason))
+
+    n = 0
+    for c in pass2.cuts:
+        if c.junk and c.junk_confidence == "high":
+            continue
+        hit = None
+        if c.kind == "speech" and c.word_span is not None:
+            a, b = c.word_span
+            hit = next((r for (sa, sb, r) in speech_susp.get(c.file_id, []) if sa <= a and b <= sb), None)
+        elif c.kind == "video" and c.atom_ids:
+            ids = set(c.atom_ids)
+            hit = next((r for (sids, r) in video_susp.get(c.file_id, []) if ids <= sids), None)
+        if hit is not None:
+            c.junk, c.junk_confidence = True, "high"
+            c.junk_reason = c.junk_reason or hit
+            n += 1
+    if n:
+        logger.info("pass2: %d cut(s) hidden as high-confidence junk from pass-1 suspects", n)
+    return pass2

@@ -294,7 +294,7 @@ def test_run_ingest_marks_failed_on_post_invariant_violation():
     file_rows = [("f1", "a.mp4", 2000, _lattice("f1"))]
 
     def boom_post(*a, **k):
-        raise ValueError("f1: coverage gap [0-2000] before the first cut")
+        raise ValueError("f1: overlap between [0-1100] and [1000-2000]")
 
     p = _Patcher()
     _basic_patches(p, fake_store, file_rows)
@@ -309,7 +309,7 @@ def test_run_ingest_marks_failed_on_post_invariant_violation():
         p.restore()
 
     assert fake_store.status_history[-1][0] == "failed"
-    assert "coverage gap" in fake_store.status_history[-1][1]
+    assert "overlap" in fake_store.status_history[-1][1]
     print("ok  test_run_ingest_marks_failed_on_post_invariant_violation")
 
 

@@ -59,6 +59,29 @@ def test_atoms_cover_the_whole_non_speech_remainder():
     print("ok  test_atoms_cover_the_whole_non_speech_remainder")
 
 
+def test_atoms_never_overlap_transcript_words_outside_turns():
+    """Observed against real data: a run of transcript words (a stutter
+    section) fell OUTSIDE every diarized turn, so atoms were built right
+    over them -- and any speech cut using those words overlapped atom
+    territory by construction. Words are ground truth for where speech is:
+    build_atoms must honor word-claimed spans too, not just turns."""
+    motion = _flat_motion(100)
+    turns = [(0, 2000, "S0")]   # diarization missed the later words entirely
+    words = [
+        {"start_ms": 500, "end_ms": 1500, "text": "hello"},
+        {"start_ms": 4000, "end_ms": 4400, "text": "Eto."},
+        {"start_ms": 4600, "end_ms": 5000, "text": "Eto."},   # <LONG_PAUSE gap: merges
+    ]
+    atoms = lt.build_atoms("f1", 10_000, motion, None, turns, words=words)
+    for a in atoms:
+        for s, e in ((500, 1500), (4000, 5000)):
+            assert a.end_ms <= s or a.start_ms >= e, (a, (s, e))
+    # the region between the claims is still covered by atoms
+    assert any(a.start_ms == 2000 for a in atoms), atoms
+    assert any(a.end_ms == 10_000 for a in atoms), atoms
+    print("ok  test_atoms_never_overlap_transcript_words_outside_turns")
+
+
 def test_a_trailing_sliver_shorter_than_min_atom_ms_still_gets_covered():
     """Regression: a real ingest run hit a 20ms coverage gap at a file's
     very end -- the whole-segment MIN_ATOM_MS check was dropping any
@@ -100,30 +123,47 @@ def test_shot_cut_always_splits_an_atom():
     print("ok  test_shot_cut_always_splits_an_atom")
 
 
-def test_camera_move_settle_splits_an_atom():
-    """A hold -> move -> hold sequence yields three atoms, with move/settle
-    reasons at the internal boundaries."""
+def test_camera_move_no_longer_splits_an_atom():
+    """Editorial pass, section B: a hold -> move -> hold sequence is now ONE
+    atom, not three. Camera moves stopped being atom boundaries -- so a pan
+    plays through as a single coherent selectable cut, and no atom edge ever
+    carries a move/settle reason."""
     n = 100
     motion = _flat_motion(n)
     motion["camera_stability"] = [0.9] * 30 + [0.2] * 10 + [0.9] * 60
     motion["camera_motion"] = [0.05] * 30 + [0.6] * 10 + [0.05] * 60
     atoms = lt.build_atoms("f1", 10_000, motion, None, [])
-    assert len(atoms) >= 2, atoms
+    assert len(atoms) == 1, atoms
+    assert (atoms[0].start_ms, atoms[0].end_ms) == (0, 10_000), atoms
     reasons = {a.state_in for a in atoms} | {a.state_out for a in atoms}
-    assert R_MOVE in reasons or R_SETTLE in reasons, atoms
-    print("ok  test_camera_move_settle_splits_an_atom")
+    assert R_MOVE not in reasons and R_SETTLE not in reasons, atoms
+    print("ok  test_camera_move_no_longer_splits_an_atom")
 
 
-def test_disturbance_edges_split_an_atom():
+def test_continuous_pan_is_one_atom_labeled_pan():
+    """A whole-span deliberate move (high coherence + stability) is a single
+    atom classified 'pan' -- motion as a LABEL, not a boundary."""
+    n = 100
+    motion = _flat_motion(n, camera_motion=0.5, coherence=0.9, stability=0.8)
+    atoms = lt.build_atoms("f1", 10_000, motion, None, [])
+    assert len(atoms) == 1, atoms
+    assert atoms[0].camera_desc == "pan", atoms[0]
+    print("ok  test_continuous_pan_is_one_atom_labeled_pan")
+
+
+def test_disturbance_no_longer_splits_an_atom():
+    """Boundaries-v2: handheld jitter (a disturbance span with no subject
+    payoff) is a LABEL now, not a boundary -- it used to carve sub-second
+    slivers where nothing happened. The span stays ONE atom and no edge is ever
+    tagged R_DISTURB."""
     n = 100
     motion = _flat_motion(n)
-    # Bad camera (high camera_cut_cost) with no subject payoff (low action) --
-    # a genuine disturbance span in the middle.
     motion["camera_cut_cost"] = [0.05] * 30 + [0.6] * 20 + [0.05] * 50
     atoms = lt.build_atoms("f1", 10_000, motion, None, [])
     reasons = {a.state_in for a in atoms} | {a.state_out for a in atoms}
-    assert R_DISTURB in reasons, atoms
-    print("ok  test_disturbance_edges_split_an_atom")
+    assert R_DISTURB not in reasons, atoms
+    assert len(atoms) == 1, atoms
+    print("ok  test_disturbance_no_longer_splits_an_atom")
 
 
 def test_transition_point_wipe_splits_an_atom():
@@ -154,13 +194,32 @@ def test_no_motion_or_scene_data_is_a_safe_noop():
     print("ok  test_no_motion_or_scene_data_is_a_safe_noop")
 
 
-def test_anchor_ms_captures_action_points_inside_the_atom():
+def test_action_point_is_carved_into_its_own_action_atom():
+    """Section C: a subject-motion payoff (an action_point) is carved into its
+    OWN atom, typed is_action, padded around the impact -- not left buried in a
+    long calm hold. The calm atoms on either side are not actions."""
     motion = _flat_motion(100)
     motion["action_points"] = [{"ts_ms": 4200, "kind": "action_impact", "score": 1.0}]
     atoms = lt.build_atoms("f1", 10_000, motion, None, [])
-    assert len(atoms) == 1, atoms
-    assert atoms[0].anchor_ms == [4200], atoms[0]
-    print("ok  test_anchor_ms_captures_action_points_inside_the_atom")
+    action = [a for a in atoms if a.is_action]
+    assert len(action) == 1, atoms
+    assert action[0].anchor_ms == [4200], action[0]
+    # padded ~300ms each side of the single impact
+    assert action[0].start_ms <= 4200 <= action[0].end_ms, action[0]
+    assert all(not a.is_action for a in atoms if a is not action[0]), atoms
+    print("ok  test_action_point_is_carved_into_its_own_action_atom")
+
+
+def test_clustered_action_points_are_one_action_atom():
+    """Anchors within ACTION_ANCHOR_MERGE_MS collapse into ONE payoff atom, not
+    several slivers."""
+    motion = _flat_motion(100)
+    motion["action_points"] = [{"ts_ms": 4200}, {"ts_ms": 4600}, {"ts_ms": 5000}]
+    atoms = lt.build_atoms("f1", 10_000, motion, None, [])
+    action = [a for a in atoms if a.is_action]
+    assert len(action) == 1, atoms
+    assert action[0].anchor_ms == [4200, 4600, 5000], action[0]
+    print("ok  test_clustered_action_points_are_one_action_atom")
 
 
 def test_camera_desc_pan_vs_handheld_vs_hold():
@@ -324,16 +383,19 @@ def test_resolve_speech_span_ms_is_a_noop_without_atoms():
 def main():
     test_atoms_never_overlap_a_speech_turn()
     test_atoms_cover_the_whole_non_speech_remainder()
+    test_atoms_never_overlap_transcript_words_outside_turns()
     test_a_trailing_sliver_shorter_than_min_atom_ms_still_gets_covered()
     test_a_leading_sliver_shorter_than_min_atom_ms_still_gets_covered()
     test_no_speech_at_all_yields_one_whole_clip_atom()
     test_shot_cut_always_splits_an_atom()
-    test_camera_move_settle_splits_an_atom()
-    test_disturbance_edges_split_an_atom()
+    test_camera_move_no_longer_splits_an_atom()
+    test_continuous_pan_is_one_atom_labeled_pan()
+    test_disturbance_no_longer_splits_an_atom()
     test_transition_point_wipe_splits_an_atom()
     test_transition_point_degenerate_splits_an_atom()
     test_no_motion_or_scene_data_is_a_safe_noop()
-    test_anchor_ms_captures_action_points_inside_the_atom()
+    test_action_point_is_carved_into_its_own_action_atom()
+    test_clustered_action_points_are_one_action_atom()
     test_camera_desc_pan_vs_handheld_vs_hold()
     test_render_atom_table_format()
     test_render_atom_table_omits_anchors_when_none()

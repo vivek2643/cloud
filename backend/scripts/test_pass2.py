@@ -18,6 +18,7 @@ if BACKEND not in sys.path:
     sys.path.insert(0, BACKEND)
 
 from app.services.l3 import pass2  # noqa: E402
+from app.services.l3.pass1 import JunkSuspect, Pass1Output  # noqa: E402
 from app.services.l3.pass2a import IdentityCut, IdentityOutput  # noqa: E402
 from app.services.l3.pass2b import Framing, Look, TasteFences, VisualJudgment  # noqa: E402
 
@@ -85,11 +86,44 @@ def test_merge_identity_and_visual_empty_is_a_noop():
     print("ok  test_merge_identity_and_visual_empty_is_a_noop")
 
 
+def test_apply_junk_suspects_hides_a_contained_speech_cut():
+    # A leading camera cue pass 1 split into its own short speech_cut and also
+    # listed as a junk_suspect -> forced to high-confidence junk (hidden).
+    p2 = pass2.Pass2Output(cuts=[
+        pass2.Pass2Cut(source_ref="speech_cut[0]", kind="speech", file_id="f1", word_span=(0, 1),
+                       label="and go", summary="cue"),
+        pass2.Pass2Cut(source_ref="speech_cut[1]", kind="speech", file_id="f1", word_span=(2, 8),
+                       label="the real line", summary="content"),
+    ])
+    p1 = Pass1Output(junk_suspects=[JunkSuspect(file_id="f1", word_span=(0, 1), reason="camera cue")])
+    out = pass2.apply_junk_suspects(p2, p1)
+    assert out.cuts[0].junk is True and out.cuts[0].junk_confidence == "high", out.cuts[0]
+    assert out.cuts[0].junk_reason == "camera cue"
+    assert out.cuts[1].junk is False, out.cuts[1]   # real content untouched
+    print("ok  test_apply_junk_suspects_hides_a_contained_speech_cut")
+
+
+def test_apply_junk_suspects_ignores_partial_overlap():
+    # A suspect that only partially overlaps a cut must NOT hide it (clipping
+    # real content is exactly the over-removal the "keep the bar high" rule
+    # forbids).
+    p2 = pass2.Pass2Output(cuts=[
+        pass2.Pass2Cut(source_ref="speech_cut[0]", kind="speech", file_id="f1", word_span=(0, 8),
+                       label="mixed", summary="cue then content"),
+    ])
+    p1 = Pass1Output(junk_suspects=[JunkSuspect(file_id="f1", word_span=(0, 1), reason="camera cue")])
+    out = pass2.apply_junk_suspects(p2, p1)
+    assert out.cuts[0].junk is False, out.cuts[0]
+    print("ok  test_apply_junk_suspects_ignores_partial_overlap")
+
+
 def main():
     test_pass2cut_constructs_with_all_fields()
     test_merge_identity_and_visual_combines_fields_correctly()
     test_merge_identity_and_visual_raises_when_a_judgment_is_missing()
     test_merge_identity_and_visual_empty_is_a_noop()
+    test_apply_junk_suspects_hides_a_contained_speech_cut()
+    test_apply_junk_suspects_ignores_partial_overlap()
     print("\nall pass2 (merged types) tests passed")
 
 

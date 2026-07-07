@@ -25,6 +25,9 @@ import {
   Layers,
   Bug,
   Loader2,
+  Eye,
+  EyeOff,
+  Zap,
 } from "lucide-react";
 import { EditButton } from "./search-edit-bar";
 
@@ -59,6 +62,26 @@ const STATUS_LABEL: Record<IngestStatus, string> = {
   ready: "Ready",
   failed: "Failed",
 };
+
+// The energy dial as pure view-math (cuts_v3_boundaries_v2.plan.md §D). Trims
+// the played span INWARD toward the cut's anchor (hero_ts_ms) as energy rises --
+// "negative padding". energy 0 -> the full grounded span; energy 1 -> pace.min_ms
+// (the anchor-protected floor computed in post.py, so the payoff frame is never
+// trimmed away). Speech cuts have min_ms == natural, so they don't tighten.
+function tightenedSpan(cut: CutRecord, energy: number): { inMs: number; outMs: number } {
+  const inMs0 = cut.src_in_ms;
+  const outMs0 = cut.src_out_ms;
+  const naturalDur = outMs0 - inMs0;
+  const minDur = Math.min(cut.pace?.min_ms ?? naturalDur, naturalDur);
+  const targetDur = Math.round(naturalDur - energy * (naturalDur - minDur));
+  if (targetDur >= naturalDur || targetDur <= 0) return { inMs: inMs0, outMs: outMs0 };
+  const hero = cut.hero_ts_ms ?? (inMs0 + outMs0) / 2;
+  let inMs = Math.round(hero - targetDur / 2);
+  let outMs = inMs + targetDur;
+  if (inMs < inMs0) { inMs = inMs0; outMs = inMs + targetDur; }
+  if (outMs > outMs0) { outMs = outMs0; inMs = outMs - targetDur; }
+  return { inMs, outMs };
+}
 
 function fmtDur(ms: number): string {
   const s = ms / 1000;
@@ -103,6 +126,11 @@ export function CutsV3View() {
   const files = useDriveStore((s) => s.files);
   const [aspect, setAspect] = useState<Aspect>("landscape");
   const [debugMode, setDebugMode] = useState(false);
+  const [showDiscarded, setShowDiscarded] = useState(false);
+  // Energy dial (cuts_v3_boundaries_v2.plan.md §D). 0 = full grounded span,
+  // 1 = tightest (negative padding toward the anchor). Pure view-math over the
+  // stored pace envelope -- never re-fetches or re-ingests.
+  const [energy, setEnergy] = useState(0);
   const [projectId, setProjectId] = useState<string | null>(null);
   const [data, setData] = useState<CutsV3Response | null>(null);
   const [loading, setLoading] = useState(false);
@@ -178,6 +206,15 @@ export function CutsV3View() {
     };
   }, [token, projectId, pollGen]);
 
+  // A finished run stops polling, so a freshly-completed re-ingest wouldn't be
+  // picked up while this view stays mounted. Refetch when the tab regains focus
+  // (i.e. you switch back to check) so you always see the latest run.
+  useEffect(() => {
+    const onFocus = () => setPollGen((g) => g + 1);
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, []);
+
   const handleKickIngest = useCallback(async () => {
     if (!token || !projectId) return;
     setKicking(true);
@@ -226,8 +263,21 @@ export function CutsV3View() {
     return hidden;
   }, [takeGroups]);
 
+  // High-confidence junk (camera cues, pre-roll, dead air) is hidden by
+  // default -- "if in doubt, show", so low/doubtful junk stays visible inline.
+  // "Show discarded" reveals the hidden ones.
+  const hiddenJunkCount = useMemo(
+    () => cuts.filter((c) => c.junk && c.junk_confidence === "high" && filesById[c.file_id]).length,
+    [cuts, filesById]
+  );
+
   const rows = useMemo(() => {
-    const present = cuts.filter((c) => filesById[c.file_id] && !hiddenAsSibling.has(c.id));
+    const present = cuts.filter(
+      (c) =>
+        filesById[c.file_id] &&
+        !hiddenAsSibling.has(c.id) &&
+        (showDiscarded || !(c.junk && c.junk_confidence === "high"))
+    );
     const byFile: Record<string, CutRecord[]> = {};
     for (const c of present) (byFile[c.file_id] ??= []).push(c);
     return Object.entries(byFile)
@@ -237,7 +287,7 @@ export function CutsV3View() {
         cuts: [...list].sort((a, b) => a.src_in_ms - b.src_in_ms),
       }))
       .sort((a, b) => a.fileName.localeCompare(b.fileName));
-  }, [cuts, filesById, hiddenAsSibling]);
+  }, [cuts, filesById, hiddenAsSibling, showDiscarded]);
 
   useEffect(() => {
     setOrder((prev) => {
@@ -326,6 +376,39 @@ export function CutsV3View() {
             <Bug size={13} />
             Debug
           </button>
+          <button
+            onClick={() => setShowDiscarded((v) => !v)}
+            className="flex items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-medium transition-colors hover:bg-[var(--sidebar)]"
+            style={{
+              borderColor: showDiscarded ? "var(--accent)" : "rgba(255,255,255,0.4)",
+              color: showDiscarded ? "var(--accent)" : "var(--foreground)",
+            }}
+            title="Show high-confidence junk (camera cues, pre-roll, dead air) hidden by default"
+          >
+            {showDiscarded ? <Eye size={13} /> : <EyeOff size={13} />}
+            {showDiscarded ? "Hiding" : "Discarded"}
+            {hiddenJunkCount > 0 ? ` (${hiddenJunkCount})` : ""}
+          </button>
+          <div
+            className="flex items-center gap-2 rounded-lg border px-3 py-2"
+            style={{ borderColor: "rgba(255,255,255,0.4)" }}
+            title="Energy: tightens each cut inward toward its peak (speech is left intact)"
+          >
+            <Zap size={13} style={{ color: energy > 0 ? "var(--accent)" : "var(--muted)" }} />
+            <input
+              type="range"
+              min={0}
+              max={100}
+              value={Math.round(energy * 100)}
+              onChange={(e) => setEnergy(Number(e.target.value) / 100)}
+              className="cuts-v3-energy h-1 w-24 cursor-pointer appearance-none rounded-full"
+              style={{ accentColor: "var(--accent)" }}
+              aria-label="Energy"
+            />
+            <span className="w-7 text-right text-xs tabular-nums" style={{ color: "var(--muted)" }}>
+              {Math.round(energy * 100)}
+            </span>
+          </div>
         </div>
         <EditButton />
       </div>
@@ -419,6 +502,7 @@ export function CutsV3View() {
                           <CutCardV3
                             file={filesById[c.file_id]!}
                             cut={c}
+                            energy={energy}
                             getUrl={getUrl}
                             aspect={aspect}
                             debugMode={debugMode}
@@ -441,6 +525,7 @@ export function CutsV3View() {
                             key={cutKey(s)}
                             file={filesById[s.file_id]}
                             cut={s}
+                            energy={energy}
                             getUrl={getUrl}
                             aspect={aspect}
                             debugMode={debugMode}
@@ -672,6 +757,7 @@ function JunkStrip({ cut, width }: { cut: CutRecord; width: number }) {
 function CutCardV3({
   file,
   cut,
+  energy,
   getUrl,
   aspect,
   debugMode,
@@ -689,6 +775,7 @@ function CutCardV3({
 }: {
   file?: FileRecord;
   cut: CutRecord;
+  energy: number;
   getUrl: (fileId: string) => Promise<string | null>;
   aspect: Aspect;
   debugMode: boolean;
@@ -707,8 +794,9 @@ function CutCardV3({
   const [playUrl, setPlayUrl] = useState<string | null>(null);
   const [muted, setMuted] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
-  const inSec = cut.src_in_ms / 1000;
-  const outSec = cut.src_out_ms / 1000;
+  const { inMs, outMs } = tightenedSpan(cut, energy);
+  const inSec = inMs / 1000;
+  const outSec = outMs / 1000;
   const heroSec = (cut.hero_ts_ms ?? (cut.src_in_ms + cut.src_out_ms) / 2) / 1000;
   const crop = cropForAspect(cut, aspect);
   const { objectPosition, transform } = cropStyle(crop, cut.framing?.rotation_deg);
@@ -719,17 +807,47 @@ function CutCardV3({
     if (url) setPlayUrl(url);
   }
 
+  // Keep a live ref of isActive so async seek callbacks (which fire after a
+  // hover has possibly already ended) never act on stale state.
+  const isActiveRef = useRef(isActive);
+  useEffect(() => {
+    isActiveRef.current = isActive;
+  }, [isActive]);
+
+  // Robust "play from the in-point". The old code set currentTime=inSec then
+  // called play() synchronously; on a second hover the previous seek-to-hero
+  // was still settling, the browser coalesced the seeks, and play() resumed
+  // from heroSec (mid-clip) instead of inSec. Fix: only start playback once
+  // the seek to inSec has actually landed (the `seeked` event). The `#t=`
+  // media fragment was also removed from the <video src> for the same reason
+  // (it instructs the browser to start at heroSec, fighting the JS seek).
+  const startPlayback = useCallback(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    v.muted = muted;
+    const play = () => v.play().catch(() => {});
+    if (Math.abs(v.currentTime - inSec) < 0.05) {
+      play();
+      return;
+    }
+    const onSeeked = () => {
+      v.removeEventListener("seeked", onSeeked);
+      if (isActiveRef.current) play();
+    };
+    v.addEventListener("seeked", onSeeked);
+    try {
+      v.currentTime = inSec;
+    } catch {
+      v.removeEventListener("seeked", onSeeked);
+      play();
+    }
+  }, [inSec, muted]);
+
   useEffect(() => {
     const v = videoRef.current;
     if (!v || !playUrl) return;
     if (isActive) {
-      try {
-        v.currentTime = inSec;
-      } catch {
-        /* ignore */
-      }
-      v.muted = muted;
-      v.play().catch(() => {});
+      startPlayback();
     } else {
       v.pause();
       try {
@@ -749,10 +867,17 @@ function CutCardV3({
   function onLoadedMetadata() {
     const v = videoRef.current;
     if (!v) return;
-    try {
-      v.currentTime = heroSec;
-    } catch {
-      /* ignore */
+    // Respect the current hover state: if the user is already hovering when
+    // metadata arrives, go straight to the in-point + play; otherwise park on
+    // the hero frame as the poster.
+    if (isActiveRef.current) {
+      startPlayback();
+    } else {
+      try {
+        v.currentTime = heroSec;
+      } catch {
+        /* ignore */
+      }
     }
   }
 
@@ -774,8 +899,8 @@ function CutCardV3({
       kind: "hero",
       file_id: file.id,
       file_name: file.name,
-      in_ms: cut.src_in_ms,
-      out_ms: cut.src_out_ms,
+      in_ms: inMs,
+      out_ms: outMs,
       content: cut.label,
       speaker: cut.speaker,
     });
@@ -815,7 +940,7 @@ function CutCardV3({
         {playUrl && (
           <video
             ref={videoRef}
-            src={`${playUrl}#t=${heroSec.toFixed(2)}`}
+            src={playUrl}
             playsInline
             preload="metadata"
             muted={muted}
@@ -889,7 +1014,7 @@ function CutCardV3({
         </span>
 
         <span className="absolute bottom-2 right-2 z-10 rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-medium text-white">
-          {fmtDur(cut.src_out_ms - cut.src_in_ms)}
+          {fmtDur(outMs - inMs)}
         </span>
         <div className="absolute bottom-2 left-2 z-10 flex items-center gap-1">
           {cut.speaker && (

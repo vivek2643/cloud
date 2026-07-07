@@ -103,12 +103,12 @@ def insert_cut_records(ingest_run_id: str, records: List[CutRecord]) -> List[str
                 insert into cut_records (
                     ingest_run_id, file_id, src_in_ms, src_out_ms, kind,
                     word_span, atom_ids, label, summary, speaker, on_camera,
-                    take_group_id, take_role, junk, junk_reason,
+                    take_group_id, take_role, junk, junk_reason, junk_confidence,
                     framing, look, caption_zones, pace, hero_ts_ms
                 ) values (
                     %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s
                 )
                 returning id::text
@@ -119,7 +119,7 @@ def insert_cut_records(ingest_run_id: str, records: List[CutRecord]) -> List[str
                     json.dumps(r.atom_ids) if r.atom_ids is not None else None,
                     r.label, r.summary, r.speaker, r.on_camera,
                     tg_map.get(r.take_group_id) if r.take_group_id else None, r.take_role,
-                    r.junk, r.junk_reason,
+                    r.junk, r.junk_reason, r.junk_confidence,
                     json.dumps(r.framing), json.dumps(r.look),
                     json.dumps([list(z) for z in r.caption_zones]),
                     json.dumps(r.pace.to_dict()), r.hero_ts_ms,

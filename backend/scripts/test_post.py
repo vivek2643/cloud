@@ -136,54 +136,41 @@ def test_energy_grade_bands():
 # coverage/overlap invariant
 # --------------------------------------------------------------------------
 
-def test_validate_file_coverage_passes_exact_coverage():
-    post._validate_file_coverage("f1", [(0, 1000), (1000, 2000)], 2000)
-    print("ok  test_validate_file_coverage_passes_exact_coverage")
+def test_validate_no_overlap_passes_exact_coverage():
+    post._validate_no_overlap("f1", [(0, 1000), (1000, 2000)], 2000)
+    print("ok  test_validate_no_overlap_passes_exact_coverage")
 
 
-def test_validate_file_coverage_raises_on_start_gap():
+def test_validate_no_overlap_allows_start_gap():
+    # boundaries-v2: cuts are a selection, gaps are legal. Pre-roll dropped.
+    post._validate_no_overlap("f1", [(100, 2000)], 2000)
+    print("ok  test_validate_no_overlap_allows_start_gap")
+
+
+def test_validate_no_overlap_allows_end_gap():
+    post._validate_no_overlap("f1", [(0, 1900)], 2000)
+    print("ok  test_validate_no_overlap_allows_end_gap")
+
+
+def test_validate_no_overlap_raises_on_overlap():
     try:
-        post._validate_file_coverage("f1", [(100, 2000)], 2000)
-        assert False, "expected ValueError"
-    except ValueError as e:
-        assert "gap" in str(e)
-    print("ok  test_validate_file_coverage_raises_on_start_gap")
-
-
-def test_validate_file_coverage_raises_on_end_gap():
-    try:
-        post._validate_file_coverage("f1", [(0, 1900)], 2000)
-        assert False, "expected ValueError"
-    except ValueError as e:
-        assert "gap" in str(e)
-    print("ok  test_validate_file_coverage_raises_on_end_gap")
-
-
-def test_validate_file_coverage_raises_on_overlap():
-    try:
-        post._validate_file_coverage("f1", [(0, 1100), (1000, 2000)], 2000)
+        post._validate_no_overlap("f1", [(0, 1100), (1000, 2000)], 2000)
         assert False, "expected ValueError"
     except ValueError as e:
         assert "overlap" in str(e)
-    print("ok  test_validate_file_coverage_raises_on_overlap")
+    print("ok  test_validate_no_overlap_raises_on_overlap")
 
 
-def test_validate_file_coverage_raises_on_middle_gap():
-    try:
-        post._validate_file_coverage("f1", [(0, 900), (1000, 2000)], 2000)
-        assert False, "expected ValueError"
-    except ValueError as e:
-        assert "gap" in str(e)
-    print("ok  test_validate_file_coverage_raises_on_middle_gap")
+def test_validate_no_overlap_allows_middle_gap():
+    # A dropped connective hold between two kept cuts -- legal now.
+    post._validate_no_overlap("f1", [(0, 900), (1000, 2000)], 2000)
+    print("ok  test_validate_no_overlap_allows_middle_gap")
 
 
-def test_validate_file_coverage_raises_on_no_cuts():
-    try:
-        post._validate_file_coverage("f1", [], 2000)
-        assert False, "expected ValueError"
-    except ValueError:
-        pass
-    print("ok  test_validate_file_coverage_raises_on_no_cuts")
+def test_validate_no_overlap_allows_no_cuts():
+    # An all-junk / all-dead-air file contributes zero cuts -- legal, not fatal.
+    post._validate_no_overlap("f1", [], 2000)
+    print("ok  test_validate_no_overlap_allows_no_cuts")
 
 
 # --------------------------------------------------------------------------
@@ -235,6 +222,40 @@ def test_assemble_cut_records_end_to_end():
     print("ok  test_assemble_cut_records_end_to_end")
 
 
+def test_protected_action_overrides_model_junk():
+    # A video cut the model called junk, but the span carries impact anchors
+    # -> must be un-junked (the "if doubtful, show" rule; a real action can
+    # never be silently discarded as "trailing junk").
+    atoms = [Atom(atom_id=0, file_id="f1", start_ms=0, end_ms=2000, state_in="clip_edge",
+                  state_out="clip_edge", action_energy=0.6, camera_desc="handheld", coherence=0.5)]
+    lat = Lattice(file_id="f1", duration_ms=2000, words=[], turns=[], hints=[], atoms=atoms)
+    motion = {"hop_ms": 100, "blur": [0.5] * 20, "action_energy": [0.6] * 20,
+              "action_points": [{"ts_ms": 500}, {"ts_ms": 1200}, {"ts_ms": 1600}]}
+    p2 = Pass2Output(cuts=[
+        Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1", atom_ids=[0],
+                 label="Trailing frames", summary="trailing", junk=True, junk_reason="trailing junk"),
+    ])
+    rec = post.assemble_cut_records(p2, {"f1": lat}, {"f1": motion}, {})[0]
+    assert rec.junk is False and rec.junk_reason == "", rec
+    print("ok  test_protected_action_overrides_model_junk")
+
+
+def test_still_junk_when_no_action_signal():
+    # A genuinely still trailing frame (no anchors, low energy) stays junk --
+    # the bar is high enough that protection doesn't resurrect dead air.
+    atoms = [Atom(atom_id=0, file_id="f1", start_ms=0, end_ms=2000, state_in="clip_edge",
+                  state_out="clip_edge", action_energy=0.05, camera_desc="hold", coherence=0.95)]
+    lat = Lattice(file_id="f1", duration_ms=2000, words=[], turns=[], hints=[], atoms=atoms)
+    motion = {"hop_ms": 100, "blur": [0.5] * 20, "action_energy": [0.05] * 20, "action_points": []}
+    p2 = Pass2Output(cuts=[
+        Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1", atom_ids=[0],
+                 label="Trailing frame", summary="dead air", junk=True, junk_reason="trailing junk"),
+    ])
+    rec = post.assemble_cut_records(p2, {"f1": lat}, {"f1": motion}, {})[0]
+    assert rec.junk is True, rec
+    print("ok  test_still_junk_when_no_action_signal")
+
+
 def test_assemble_raises_on_unknown_file_id():
     p2 = Pass2Output(cuts=[Pass2Cut(source_ref="speech_cut[0]", kind="speech", file_id="missing",
                                     word_span=(0, 1), label="x", summary="y")])
@@ -272,22 +293,20 @@ def test_assemble_raises_on_overlap_between_cuts():
     print("ok  test_assemble_raises_on_overlap_between_cuts")
 
 
-def test_assemble_raises_when_a_project_file_gets_zero_cuts():
-    # Two files in the project; pass 2 only reported cuts for one of them --
-    # exactly what a silently-truncated response looks like (see
-    # llm.client._truncated).
+def test_assemble_allows_a_project_file_with_zero_cuts():
+    # boundaries-v2: two files in the project, pass 2 reported cuts for only
+    # one. An all-junk / all-dead-air clip contributing nothing is now a valid
+    # outcome (a warning, not a raise); the run still succeeds with f1's cuts.
     p2 = Pass2Output(cuts=[
         Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1", atom_ids=[0, 1],
                 label="a", summary="a"),
     ])
     lattices = {"f1": _lattice(), "f2": _lattice()}
     motion = {"f1": _motion(), "f2": _motion()}
-    try:
-        post.assemble_cut_records(p2, lattices, motion, {})
-        assert False, "expected ValueError"
-    except ValueError as e:
-        assert "f2" in str(e), e
-    print("ok  test_assemble_raises_when_a_project_file_gets_zero_cuts")
+    records = post.assemble_cut_records(p2, lattices, motion, {})
+    assert records, "expected f1's cut to still be assembled"
+    assert all(r.file_id == "f1" for r in records), [r.file_id for r in records]
+    print("ok  test_assemble_allows_a_project_file_with_zero_cuts")
 
 
 def main():
@@ -302,17 +321,19 @@ def main():
     test_pace_levels_partial_saturation_repeats_nearest_reachable()
     test_pace_levels_zero_intrinsic_velocity_maxes_every_level()
     test_energy_grade_bands()
-    test_validate_file_coverage_passes_exact_coverage()
-    test_validate_file_coverage_raises_on_start_gap()
-    test_validate_file_coverage_raises_on_end_gap()
-    test_validate_file_coverage_raises_on_overlap()
-    test_validate_file_coverage_raises_on_middle_gap()
-    test_validate_file_coverage_raises_on_no_cuts()
+    test_validate_no_overlap_passes_exact_coverage()
+    test_validate_no_overlap_allows_start_gap()
+    test_validate_no_overlap_allows_end_gap()
+    test_validate_no_overlap_raises_on_overlap()
+    test_validate_no_overlap_allows_middle_gap()
+    test_validate_no_overlap_allows_no_cuts()
     test_assemble_cut_records_end_to_end()
+    test_protected_action_overrides_model_junk()
+    test_still_junk_when_no_action_signal()
     test_assemble_raises_on_unknown_file_id()
     test_assemble_raises_on_unresolvable_atom_ids()
     test_assemble_raises_on_overlap_between_cuts()
-    test_assemble_raises_when_a_project_file_gets_zero_cuts()
+    test_assemble_allows_a_project_file_with_zero_cuts()
     print("\nall post tests passed")
 
 

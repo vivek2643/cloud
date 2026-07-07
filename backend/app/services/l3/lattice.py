@@ -13,13 +13,16 @@ model:
     itself. This is a deliberate reversal from ``base_cuts.py``, which turned
     speech turns into fixed cuts -- v3 wants the LLM's judgment there, not a
     deterministic turn-merge.
-  * VIDEO gets ATOMS: the same robust boundary sources ``base_cuts.py``
-    trusts unconditionally (hard shot cut, camera move/settle, disturbance
-    edges), PLUS ``transition_points`` (wipe/degenerate) as additional edges
-    -- but ONLY over the NON-SPEECH remainder of the clip. A video atom
-    overlapping speech never happens by construction: atoms are built inside
-    the gaps between speech turns, not against the whole timeline (unchanged
-    rule -- never cut under speech).
+  * VIDEO gets ATOMS: carved ONLY at boundaries we trust as genuine scene
+    changes -- hard shot cut, disturbance edges, ``transition_points``
+    (wipe/degenerate) -- over the NON-SPEECH remainder of the clip. Camera
+    move/settle are DELIBERATELY NOT boundaries here (editorial pass, see
+    cuts_v3_editorial.plan.md section B): a pan is one coherent atom labeled
+    "pan", not [hold][move][settle] shredded into slivers -- camera motion is
+    a LABEL and a selection handle, not a boundary that shreds the timeline.
+    A video atom overlapping speech never happens by construction: atoms are
+    built inside the gaps between speech turns, not against the whole timeline
+    (unchanged rule -- never cut under speech).
 
 Atoms are deliberately fine (over-segmenting bias is safe -- pass 1/2 merge
 them back into ``video_tentative_groups`` / final cuts; under-splitting, which
@@ -40,21 +43,22 @@ from typing import Any, Dict, List, Optional, Tuple
 from app.services.l3.base_cuts import (
     R_CLIP,
     R_DISTURB,
-    R_MOVE,
-    R_SETTLE,
     R_SHOT,
-    _camera_marks,
-    _disturbance_marks,
     _shot_marks,
 )
 from app.services.l3.base_cuts_params import LONG_PAUSE_MS, SNAP_MS
 from app.services.l3.diarize import Turn
 from app.services.l3.lattice_params import (
+    ACTION_ANCHOR_MERGE_MS,
+    ACTION_PAD_FRAC,
     CAMERA_HOLD_MOTION_MAX,
+    CAMERA_MOVE_FRAC_MIN,
     CAMERA_PAN_COHERENCE_MIN,
     CAMERA_PAN_STABILITY_MIN,
     MIN_ATOM_MS,
+    PERCEPTUAL_FLOOR_MS,
 )
+from app.services.l3.video_segments import MOVE, _confirm_hysteresis, _hop_states
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +67,18 @@ logger = logging.getLogger(__name__)
 # "several signals, one instant -> report the strongest" collapsing.
 R_WIPE = "wipe"
 R_DEGENERATE = "degenerate"
+R_ACTION = "action"             # this edge bounds a subject-motion payoff span
 R_SPEECH_EDGE = "speech_edge"   # this atom's own edge borders a speech turn
 
+# Only GROUNDED events are atom boundaries now (boundaries-v2): hard shot cut,
+# wipe/degenerate transition, ACTION window edge, and the speech/clip edges
+# bounding the remainder. Camera move/settle (section B) and disturbance jitter
+# (boundaries-v2) are LABELS, not edges. R_DISTURB is retained in the rank only
+# so any legacy/base_cuts caller that still passes one collapses sanely; the
+# lattice itself no longer emits disturbance marks.
 _REASON_RANK = {
     R_SHOT: 0, R_DISTURB: 1, R_WIPE: 1, R_DEGENERATE: 1,
-    R_MOVE: 2, R_SETTLE: 2, R_SPEECH_EDGE: 3, R_CLIP: 4,
+    R_ACTION: 2, R_SPEECH_EDGE: 3, R_CLIP: 4,
 }
 
 
@@ -87,6 +98,7 @@ class Atom:
     camera_desc: str       # "hold" | "pan" | "handheld" -- coarse, for the prompt
     coherence: float       # mean camera_coherence over the span, 0..1
     anchor_ms: List[int] = field(default_factory=list)   # action_points inside this atom
+    is_action: bool = False   # this atom is a carved subject-motion payoff (section C)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -95,6 +107,7 @@ class Atom:
             "state_in": self.state_in, "state_out": self.state_out,
             "action_energy": self.action_energy, "camera_desc": self.camera_desc,
             "coherence": self.coherence, "anchor_ms": list(self.anchor_ms),
+            "is_action": self.is_action,
         }
 
 
@@ -135,6 +148,47 @@ def _transition_marks(motion: Optional[dict]) -> List[Tuple[int, str]]:
     return out
 
 
+def _action_marks(motion: Optional[dict]) -> List[Tuple[int, str]]:
+    """Action-span edges (section C). ``action_points`` are discrete L1-detected
+    impacts; a cluster of them (anchors within ACTION_ANCHOR_MERGE_MS) is ONE
+    motion payoff, and its padded edges are atom boundaries so the payoff is
+    carved into its own atom rather than absorbed into a neighboring hold/pan.
+    Only anchors landing in the NON-speech remainder matter -- ``_snap_collect``
+    already drops marks outside a segment, so an anchor fired while the subject
+    was talking never cuts under speech (plan rule)."""
+    pts = sorted(int(p["ts_ms"]) for p in (motion or {}).get("action_points") or []
+                 if isinstance(p, dict) and "ts_ms" in p)
+    if not pts:
+        return []
+    clusters: List[List[int]] = [[pts[0]]]
+    for t in pts[1:]:
+        if t - clusters[-1][-1] <= ACTION_ANCHOR_MERGE_MS:
+            clusters[-1].append(t)
+        else:
+            clusters.append([t])
+    out: List[Tuple[int, str]] = []
+    for members in clusters:
+        cs, ce = members[0], members[-1]
+        pad = _action_pad_ms(members)
+        out.append((max(0, cs - pad), R_ACTION))
+        out.append((ce + pad, R_ACTION))
+    return out
+
+
+def _action_pad_ms(anchors: List[int]) -> int:
+    """Anchor-relative wind-up / follow-through pad (boundaries-v2). Scales with
+    the cluster's OWN rhythm -- median gap between its impacts -- so a fast
+    flurry stays tight and a lone slow swing breathes, without a per-clip
+    magic-ms. Floored at the perceptual floor; a single-anchor cluster (no gap)
+    takes the floor directly."""
+    gaps = [b - a for a, b in zip(anchors, anchors[1:]) if b > a]
+    if not gaps:
+        return PERCEPTUAL_FLOOR_MS
+    gaps.sort()
+    median_gap = gaps[len(gaps) // 2]
+    return max(PERCEPTUAL_FLOOR_MS, int(ACTION_PAD_FRAC * median_gap))
+
+
 def _subtract(span: Tuple[int, int], claimed: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
     """``span`` minus the union of ``claimed`` intervals -> free fragments, in
     time order (the non-speech remainder of the clip)."""
@@ -173,13 +227,24 @@ def _mean(xs: List[float], lo_i: int, hi_i: int) -> float:
 
 
 def _camera_desc(motion: Optional[dict], s_ms: int, e_ms: int) -> str:
+    """Classify an atom's DOMINANT camera behavior -- "hold" | "pan" |
+    "handheld". Since a whole pan is now one atom (moves are no longer
+    boundaries), the mean camera_motion over the span is diluted by any held
+    lead-in/wind-down, so classification runs off the confirmed hold/move
+    STATE MACHINE instead: what fraction of the span is actually moving. A
+    move that stays coherent and stable is a deliberate "pan"; a jittery one
+    is "handheld"; a mostly-still span is "hold"."""
     m = motion or {}
     hop = int(m.get("hop_ms") or 0)
     if not hop:
         return "hold"
-    lo_i, hi_i = s_ms // hop, e_ms // hop
-    m_cam = _mean(m.get("camera_motion") or [], lo_i, hi_i)
-    if m_cam < CAMERA_HOLD_MOTION_MAX:
+    lo_i, hi_i = s_ms // hop, max(s_ms // hop + 1, e_ms // hop)
+    states = _confirm_hysteresis(_hop_states(m))[lo_i:hi_i]
+    if not states:
+        # No state samples (span past the motion track) -- fall back to the
+        # mean-motion test so a short trailing atom still gets a sane label.
+        return "hold" if _mean(m.get("camera_motion") or [], lo_i, hi_i) < CAMERA_HOLD_MOTION_MAX else "handheld"
+    if states.count(MOVE) / len(states) < CAMERA_MOVE_FRAC_MIN:
         return "hold"
     m_coh = _mean(m.get("camera_coherence") or [], lo_i, hi_i)
     m_stab = _mean(m.get("camera_stability") or [], lo_i, hi_i)
@@ -193,21 +258,53 @@ def _anchors_in(motion: Optional[dict], s_ms: int, e_ms: int) -> List[int]:
     return sorted(int(p["ts_ms"]) for p in pts if s_ms <= int(p.get("ts_ms", -1)) < e_ms)
 
 
+def _word_claim_spans(words: List[dict], merge_gap_ms: int = LONG_PAUSE_MS) -> List[Tuple[int, int]]:
+    """Time spans claimed by the words themselves, adjacent words merged
+    when their gap is below ``merge_gap_ms`` (a sub-long-pause gap belongs
+    to the speech around it, and per-word confetti spans would shred the
+    remainder into useless atom slivers). Needed because diarization TURNS
+    and Whisper word timings are two different oracles: observed against
+    real data (a long stutter section), a run of transcript words fell
+    outside every diarized turn -- atoms then got built OVER those words,
+    and any speech cut using them overlapped atom territory by
+    construction. Words are ground truth for where speech is; turns alone
+    are not sufficient."""
+    spans: List[Tuple[int, int]] = []
+    for w in sorted(words, key=lambda w: int(w.get("start_ms", 0))):
+        s, e = int(w.get("start_ms", 0)), int(w.get("end_ms", 0))
+        if e <= s:
+            continue
+        if spans and s - spans[-1][1] < merge_gap_ms:
+            spans[-1] = (spans[-1][0], max(spans[-1][1], e))
+        else:
+            spans.append((s, e))
+    return spans
+
+
 def build_atoms(file_id: str, duration_ms: int, motion: Optional[dict],
-                scene: Optional[dict], turns: List[Turn]) -> List[Atom]:
+                scene: Optional[dict], turns: List[Turn],
+                words: Optional[List[dict]] = None) -> List[Atom]:
     """Pure core: video ATOMS over the non-speech remainder of
     [0, duration_ms]. Speech gets no atoms at all -- atoms are only ever
-    built inside the gaps between speech turns, so a video atom overlapping
-    speech cannot happen by construction (not a filter, a structural
-    guarantee)."""
+    built inside the gaps between speech turns AND word-claimed spans (see
+    ``_word_claim_spans`` for why turns alone aren't enough), so a video
+    atom overlapping speech cannot happen by construction (not a filter, a
+    structural guarantee)."""
     if duration_ms <= 0:
         return []
-    speech_spans = sorted((s, e) for (s, e, _spk) in turns if e > s)
+    claimed = [(s, e) for (s, e, _spk) in turns if e > s]
+    claimed += _word_claim_spans(words or [])
+    speech_spans = sorted(claimed)
     non_speech = _subtract((0, duration_ms), speech_spans)
-    all_marks = (
-        _camera_marks(motion) + _disturbance_marks(motion)
-        + _shot_marks(scene) + _transition_marks(motion)
-    )
+    # Boundaries-v2 (cuts_v3_boundaries_v2.plan.md): only GROUNDED events carve
+    # atoms -- ones that correspond to something real in the footage. Camera
+    # move/settle stopped being edges in section B; disturbance (handheld
+    # jitter) stops being an edge here -- it fired boundaries where nothing
+    # happened (a 60ms sliver on a shaky pan). Jitter is still captured, as a
+    # LABEL (_camera_desc reads "handheld"), never a cut. What remains: hard
+    # shot cut, wipe/degenerate transition, action-anchor windows -- plus the
+    # speech/clip edges bounding the non-speech remainder itself.
+    all_marks = _shot_marks(scene) + _transition_marks(motion) + _action_marks(motion)
 
     m = motion or {}
     hop = int(m.get("hop_ms") or 0)
@@ -241,13 +338,17 @@ def build_atoms(file_id: str, duration_ms: int, motion: Optional[dict],
             reason_in = at.get(a, R_CLIP if a == 0 else R_SPEECH_EDGE)
             reason_out = at.get(b, R_CLIP if b == duration_ms else R_SPEECH_EDGE)
             lo_i, hi_i = (a // hop, b // hop) if hop else (0, 0)
+            anchors = _anchors_in(motion, a, b)
             atoms.append(Atom(
                 atom_id=len(atoms), file_id=file_id, start_ms=a, end_ms=b,
                 state_in=reason_in, state_out=reason_out,
                 action_energy=round(_mean(action, lo_i, hi_i), 3) if hop else 0.0,
                 camera_desc=_camera_desc(motion, a, b),
                 coherence=round(_mean(coherence, lo_i, hi_i), 3) if hop else 0.0,
-                anchor_ms=_anchors_in(motion, a, b),
+                anchor_ms=anchors,
+                # Carved by the action marks above -> any atom holding an anchor
+                # IS a motion payoff (a calm neighbor never carries one).
+                is_action=bool(anchors),
             ))
     return atoms
 
@@ -255,14 +356,15 @@ def build_atoms(file_id: str, duration_ms: int, motion: Optional[dict],
 def render_atom_table(atoms: List[Atom]) -> str:
     """The compact numbered text block for prompts -- motion enters as
     NUMBERS, pixels as stills (pass 2). One line per atom:
-    ``ATOM 7 [12300-15800] move->settle act=0.70 cam=pan coh=0.90 anchors@13100``
+    ``ATOM 7 [12300-15800] shot_cut->speech_edge act=0.70 cam=pan coh=0.90 anchors@13100``
     """
     lines = []
     for a in atoms:
         anchors = f" anchors@{','.join(str(x) for x in a.anchor_ms)}" if a.anchor_ms else ""
+        tag = " ACTION" if a.is_action else ""
         lines.append(
             f"ATOM {a.atom_id} [{a.start_ms}-{a.end_ms}] {a.state_in}->{a.state_out} "
-            f"act={a.action_energy:.2f} cam={a.camera_desc} coh={a.coherence:.2f}{anchors}"
+            f"act={a.action_energy:.2f} cam={a.camera_desc} coh={a.coherence:.2f}{anchors}{tag}"
         )
     return "\n".join(lines)
 
@@ -423,7 +525,7 @@ def load_lattice(file_id: str) -> Optional[Lattice]:
 
     words = _load_words(file_id)
     _text, _speakers, turns = load_turns(file_id, turn_gap_ms=LONG_PAUSE_MS)
-    atoms = build_atoms(file_id, duration_ms, motion, scene, turns)
+    atoms = build_atoms(file_id, duration_ms, motion, scene, turns, words=words)
     hints = speech_hints(words)
     return Lattice(file_id=file_id, duration_ms=duration_ms, words=words,
                    turns=turns, hints=hints, atoms=atoms)

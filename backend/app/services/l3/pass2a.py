@@ -54,6 +54,17 @@ _TAKE_ROLE_ALIASES = {
     "sibling": "take", "loser": "take", "other": "take",
 }
 
+# The model intermittently echoes pass 1's OWN unit name into the kind enum --
+# "video_tentative_group" (the pass-1 group name) instead of the canonical
+# "video", or "speech_cut" instead of "speech". It's unambiguous (the ref
+# prefix already pins the kind), so normalize it at parse time rather than
+# burn a re-ask on a pure naming tic. Observed twice-in-a-row on one real
+# Reel-trail shard, which the one-re-ask loop then couldn't clear.
+_KIND_ALIASES = {
+    "video_tentative_group": "video", "video_group": "video", "vid": "video",
+    "speech_cut": "speech", "speech_group": "speech", "spoken": "speech",
+}
+
 
 class IdentityCut(BaseModel):
     source_ref: str                 # e.g. "speech_cut[2]" / "video_group[0]" -- joins back to pass 1
@@ -67,6 +78,7 @@ class IdentityCut(BaseModel):
     on_camera: bool | None = None
     junk: bool = False
     junk_reason: str = ""
+    junk_confidence: str = "low"     # "high" (clearly unusable -> hidden) | "low" (doubtful -> shown)
     natural_sound: bool = False
     take_group_id: str | None = None
     take_role: str | None = None    # "take" | "outlook" | "winner"
@@ -79,12 +91,20 @@ class IdentityCut(BaseModel):
             return _TAKE_ROLE_ALIASES.get(key, key)
         return v
 
+    @field_validator("kind", mode="before")
+    @classmethod
+    def _normalize_kind(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            key = v.strip().lower()
+            return _KIND_ALIASES.get(key, key)
+        return v
+
     @model_validator(mode="after")
     def _kind_matches_locator(self) -> "IdentityCut":
-        if self.kind == "speech" and self.word_span is None:
-            raise ValueError("speech cut missing word_span")
-        if self.kind == "video" and not self.atom_ids:
-            raise ValueError("video cut missing atom_ids")
+        # word_span/atom_ids may legitimately be omitted -- they're
+        # pass-through from pass 1 and backfilled deterministically by
+        # backfill_locators (the model echoing them verbatim was the single
+        # biggest source of output-complexity failures on big shards).
         if self.take_role is not None and self.take_role not in ("take", "outlook", "winner"):
             raise ValueError(f"invalid take_role {self.take_role!r}")
         return self
@@ -111,14 +131,20 @@ _SYSTEM = (
     "Now you see the actual pixels: numbered stills, each captioned with "
     "which clip/timestamp/pass-1 unit it belongs to.\n\n"
     "This is an IDENTITY pass -- do not judge framing, look/grade, caption "
-    "placement, or pace here; another pass handles those. Your only job:\n\n"
-    "For every speech_cut and every video_tentative_group, emit ONE final "
+    "placement, or pace here; another pass handles those. SCOPE: this call "
+    "covers ONLY the clips whose images you are shown below -- the pass-1 "
+    "result may mention other clips, but those are handled in separate "
+    "calls; never emit a cut for a clip you were not shown images for. "
+    "Your only job:\n\n"
+    "For every in-scope speech_cut and every in-scope video_tentative_group, emit ONE final "
     "cut record (a tentative video group MAY be split back into multiple "
     "cuts along its existing atom_ids if the pixels show it isn't one "
-    "moment -- never invent a boundary inside an atom). Every atom_id you "
-    "were given must end up in EXACTLY ONE output cut, never zero and never "
-    "two -- if you split a group, partition its atom_ids, don't duplicate "
-    "any of them across the pieces. For every "
+    "moment -- never invent a boundary inside an atom).\n\n"
+    "Do NOT echo word_span (it is derived from your source_ref by code). "
+    "Do NOT echo atom_ids either, EXCEPT when you split a video group into "
+    "several cuts -- then each piece must list the atom_ids it owns, the "
+    "pieces together must use every atom_id of the group exactly once, "
+    "never zero times and never twice. For every "
     "take_candidate, resolve it: is it a TAKE (same words, same setting) or "
     "an OUTLOOK (same words, different setting)? Pick a winner; keep the "
     "rest stacked under it. A take boundary is always a hard split. Set "
@@ -127,10 +153,21 @@ _SYSTEM = (
     "value.\n\n"
     "Per cut, judge from the pixels: label, summary (a best guess from image "
     "+ transcript is fine, and expected), on_camera (does the visible person "
-    "match the diarized speaker), junk (+reason), and natural_sound (does "
-    "the cut carry sound worth keeping).\n\n"
+    "match the diarized speaker), junk (+reason +junk_confidence), and "
+    "natural_sound (does the cut carry sound worth keeping). JUNK POLICY -- "
+    "keep the bar HIGH: set junk_confidence=\"high\" ONLY when the cut is "
+    "clearly unusable (a camera cue like 'and go'/'3-2-1'/'take three', "
+    "pre-roll setup, a silent leading/trailing hold, obvious dead air) -- "
+    "high-confidence junk is hidden from the editor by default. If there is "
+    "ANY doubt it might be wanted, use junk_confidence=\"low\" (it stays "
+    "visible). Never mark an ACTION/motion payoff junk at all. A label must "
+    "name what the cut SHOWS (e.g. 'forehand swing', 'catches the ball'), "
+    "never a mechanical 'settle'/'trailing frames'.\n\n"
     "Reference every cut by source_ref using the SAME ref string pass 1 (and "
-    "the image captions) used for it -- speech_cut[i] or video_group[i]."
+    "the image captions) used for it -- speech_cut[i] or video_group[i], "
+    "VERBATIM. Never invent a new ref: every take member is already its own "
+    "speech_cut, so takes are resolved by setting take_group_id/take_role on "
+    "those existing speech_cut refs, never by emitting extra cuts."
 )
 
 
@@ -245,6 +282,112 @@ def build_identity_shards(pass1: Pass1Output, planned_frames: List[PlannedFrame]
 # failures downstream in post.assemble_cut_records.
 # --------------------------------------------------------------------------
 
+def _ref_index(ref: str, prefix: str) -> Optional[int]:
+    if ref.startswith(prefix) and ref.endswith("]"):
+        idx = ref[len(prefix):-1]
+        if idx.isdigit():
+            return int(idx)
+    return None
+
+
+def backfill_locators(output: IdentityOutput, pass1: Pass1Output) -> IdentityOutput:
+    """Deterministically fill/normalize every cut's word_span/atom_ids from
+    pass 1 by source_ref. The model was originally required to echo these
+    verbatim; observed against the real API, that echo was the single
+    biggest output-complexity failure (66 cuts -> 41 validation errors,
+    twice). They carry zero judgment -- pass 1's grouping is final -- so
+    code owns them now:
+
+      * speech cut  -> word_span := pass1.speech_cuts[i].word_span, always.
+      * video cut, ref emitted by exactly ONE cut -> atom_ids := the whole
+        group's atom_ids (no split, nothing to decide).
+      * video cut, ref emitted by SEVERAL cuts (a split) -> each piece keeps
+        its own atom_ids (that IS judgment); _split_groups_partition_atoms
+        validates the pieces partition the group exactly."""
+    video_ref_counts: Dict[str, int] = {}
+    for cut in output.cuts:
+        if cut.kind == "video":
+            video_ref_counts[cut.source_ref] = video_ref_counts.get(cut.source_ref, 0) + 1
+
+    new_cuts: List[IdentityCut] = []
+    for cut in output.cuts:
+        update: Dict[str, Any] = {}
+        if cut.kind == "speech":
+            i = _ref_index(cut.source_ref, "speech_cut[")
+            if i is not None and i < len(pass1.speech_cuts):
+                update["word_span"] = tuple(pass1.speech_cuts[i].word_span)
+        elif cut.kind == "video" and video_ref_counts.get(cut.source_ref) == 1:
+            gi = _ref_index(cut.source_ref, "video_group[")
+            if gi is not None and gi < len(pass1.video_tentative_groups):
+                update["atom_ids"] = list(pass1.video_tentative_groups[gi].atom_ids)
+        new_cuts.append(cut.model_copy(update=update) if update else cut)
+    return IdentityOutput(cuts=new_cuts)
+
+
+def _locators_resolved(output: IdentityOutput) -> Optional[str]:
+    """After backfill, every cut must have its locator: a speech cut missing
+    word_span means its ref didn't resolve; a video cut missing atom_ids
+    means it's one piece of a SPLIT group that didn't say which atoms it
+    owns (the one locator that IS the model's judgment)."""
+    for cut in output.cuts:
+        if cut.kind == "speech" and cut.word_span is None:
+            return (f"{cut.source_ref!r} resolved to no word_span -- its ref must name an "
+                    f"existing pass-1 speech_cut")
+        if cut.kind == "video" and not cut.atom_ids:
+            return (f"{cut.source_ref!r} has no atom_ids -- when you split a video group "
+                    f"into several cuts, every piece must list the atom_ids it owns")
+    return None
+
+
+def _split_groups_partition_atoms(output: IdentityOutput, pass1: Pass1Output) -> Optional[str]:
+    """When a video group is split into several cuts, the pieces' atom_ids
+    must partition the group's atoms exactly -- no atom lost, none invented.
+    (The no-duplicates half is _no_duplicate_atoms; this checks the union.)"""
+    by_ref: Dict[str, List[IdentityCut]] = {}
+    for cut in output.cuts:
+        if cut.kind == "video":
+            by_ref.setdefault(cut.source_ref, []).append(cut)
+    for ref, cuts in by_ref.items():
+        if len(cuts) < 2:
+            continue
+        gi = _ref_index(ref, "video_group[")
+        if gi is None or gi >= len(pass1.video_tentative_groups):
+            continue
+        expected = set(pass1.video_tentative_groups[gi].atom_ids)
+        got = {a for c in cuts for a in (c.atom_ids or [])}
+        if got != expected:
+            missing = sorted(expected - got)
+            extra = sorted(got - expected)
+            return (f"the cuts splitting {ref!r} don't partition its atoms exactly -- "
+                    f"missing atom_ids {missing}, unexpected {extra}; every atom of the "
+                    f"group must land in exactly one piece")
+    return None
+
+
+def _source_refs_exist(output: IdentityOutput, pass1: Pass1Output) -> Optional[str]:
+    """Observed against the real API: the model INVENTED refs (e.g.
+    "take[intro_greeting]_take1") for cuts it wanted to emit around a take,
+    instead of using the pass-1 ref strings. Nothing downstream can join
+    such a ref -- image_plan planned no frames for it, so pass 2b's batch
+    comes up imageless and the whole run dies with an unrelated-looking
+    "no images resolved" error. Every source_ref must be a literal
+    speech_cut[i] / video_group[i] that pass 1 actually emitted."""
+    n_speech, n_video = len(pass1.speech_cuts), len(pass1.video_tentative_groups)
+    for cut in output.cuts:
+        ref = cut.source_ref
+        for prefix, n in (("speech_cut[", n_speech), ("video_group[", n_video)):
+            if ref.startswith(prefix) and ref.endswith("]"):
+                idx_str = ref[len(prefix):-1]
+                if idx_str.isdigit() and int(idx_str) < n:
+                    break
+        else:
+            return (f"source_ref {ref!r} is not a ref pass 1 emitted -- every cut must "
+                    f"reference EXACTLY one of speech_cut[0..{max(n_speech - 1, 0)}] or "
+                    f"video_group[0..{max(n_video - 1, 0)}], verbatim; never invent a new "
+                    f"ref (take members are already their own speech_cuts)")
+    return None
+
+
 def _no_duplicate_atoms(output: IdentityOutput) -> Optional[str]:
     """Every atom_id must end up in exactly one output cut. Observed against
     the real API: the model occasionally double-counts an atom when
@@ -345,8 +488,30 @@ def _no_cross_kind_ms_overlap(output: IdentityOutput, lattices: Dict[str, Lattic
     return None
 
 
-def _pass2a_semantic_checks(output: IdentityOutput, lattices: Dict[str, Lattice]) -> Optional[str]:
-    return (_kind_matches_source_ref(output)
+def _cuts_only_for_shard_files(output: IdentityOutput, shard_files: set) -> Optional[str]:
+    """Observed against the real API on a multi-shard project: the cached
+    pass-1 render lists EVERY file's units, so a shard also emitted cuts for
+    files belonging to OTHER shards -- and since per-shard checks can't see
+    across shards, the duplicates only surfaced as an identical-span overlap
+    in post. Every shard must emit cuts ONLY for its own files."""
+    for cut in output.cuts:
+        if cut.file_id not in shard_files:
+            return (f"{cut.source_ref!r} is for clip {cut.file_id}, which is NOT part of "
+                    f"this call -- emit cuts ONLY for the clips whose images you were "
+                    f"shown here; other clips are handled in separate calls")
+    return None
+
+
+def _pass2a_semantic_checks(output: IdentityOutput, pass1: Pass1Output,
+                            lattices: Dict[str, Lattice], shard_files: set) -> Optional[str]:
+    """Run against the BACKFILLED output (see backfill_locators) -- locator
+    checks are meaningless before the deterministic fill."""
+    output = backfill_locators(output, pass1)
+    return (_cuts_only_for_shard_files(output, shard_files)
+           or _source_refs_exist(output, pass1)
+           or _kind_matches_source_ref(output)
+           or _locators_resolved(output)
+           or _split_groups_partition_atoms(output, pass1)
            or _no_duplicate_atoms(output)
            or _no_overlapping_word_spans(output)
            or _no_cross_kind_ms_overlap(output, lattices))
@@ -372,6 +537,8 @@ def run_identity_shard(
     if not image_blocks:
         raise ValueError("run_identity_shard: no images resolved for this shard")
     lattices = {fid: lattice for fid, _name, _dur, lattice in file_rows}
+    shard_files = {f.file_id for f in shard_frames}
     return ic.complete("pass2", _SYSTEM, cached_blocks, IdentityOutput,
                        extra_blocks=image_blocks, max_tokens=20000,
-                       extra_check=lambda output: _pass2a_semantic_checks(output, lattices))
+                       extra_check=lambda output: _pass2a_semantic_checks(
+                           output, pass1_output, lattices, shard_files))

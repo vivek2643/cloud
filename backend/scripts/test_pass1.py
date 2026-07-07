@@ -146,6 +146,192 @@ def test_pass1_output_defaults_are_empty_not_missing():
     print("ok  test_pass1_output_defaults_are_empty_not_missing")
 
 
+def test_no_speech_cut_swallows_atoms_flags_a_cross_pause_group():
+    # Words 0-2 end at 900ms; words 3-4 run 1500-2100ms. An atom in the
+    # 900-1500 gap (a "long pause" the atoms own). A speech cut grouping
+    # words [0-4] spans that gap -> must be rejected with a message naming
+    # the cut and the swallowed atom.
+    lat = _make_lattice()
+    lat.atoms.insert(0, Atom(atom_id=99, file_id="f1", start_ms=950, end_ms=1450,
+                             state_in="speech_edge", state_out="speech_edge",
+                             action_energy=0.1, camera_desc="hold", coherence=1.0))
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [{"file_id": "f1", "word_span": [0, 4], "label": "whole thing"}],
+    })
+    err = pass1._no_speech_cut_swallows_atoms(out, {"f1": lat})
+    assert err is not None and "atom 99" in err and "speech_cut[0]" in err, err
+    print("ok  test_no_speech_cut_swallows_atoms_flags_a_cross_pause_group")
+
+
+def test_no_speech_cut_swallows_atoms_accepts_clean_grouping():
+    lat = _make_lattice()
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [
+            {"file_id": "f1", "word_span": [0, 2], "label": "first"},
+            {"file_id": "f1", "word_span": [3, 4], "label": "second"},
+        ],
+    })
+    assert pass1._no_speech_cut_swallows_atoms(out, {"f1": lat}) is None
+    print("ok  test_no_speech_cut_swallows_atoms_accepts_clean_grouping")
+
+
+def test_no_speech_cut_swallows_atoms_rejects_out_of_range_span():
+    lat = _make_lattice()
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [{"file_id": "f1", "word_span": [0, 99], "label": "oops"}],
+    })
+    err = pass1._no_speech_cut_swallows_atoms(out, {"f1": lat})
+    assert err is not None and "out of range" in err, err
+    print("ok  test_no_speech_cut_swallows_atoms_rejects_out_of_range_span")
+
+
+def test_enforce_splits_a_speech_cut_at_an_atom_owned_gap():
+    # Words 0-2 end at 900ms; words 3-4 run 1500-2100ms. Put an atom inside
+    # the 900-1500 gap: a cut grouping words [0-4] crosses atom territory and
+    # must come back split into [0-2] + [3-4], deterministically.
+    lat = _make_lattice()
+    lat.atoms.insert(0, Atom(atom_id=99, file_id="f1", start_ms=950, end_ms=1450,
+                             state_in="speech_edge", state_out="speech_edge",
+                             action_energy=0.1, camera_desc="hold", coherence=1.0))
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [{"file_id": "f1", "word_span": [0, 4], "label": "whole thing"}],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    spans = [tuple(sc.word_span) for sc in fixed.speech_cuts]
+    assert spans == [(0, 2), (3, 4)], spans
+    assert "(1/2)" in fixed.speech_cuts[0].label and "(2/2)" in fixed.speech_cuts[1].label
+    assert pass1._no_speech_cut_swallows_atoms(fixed, {"f1": lat}) is None
+    print("ok  test_enforce_splits_a_speech_cut_at_an_atom_owned_gap")
+
+
+def test_enforce_leaves_a_clean_grouping_untouched():
+    lat = _make_lattice()
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [
+            {"file_id": "f1", "word_span": [0, 2], "label": "first"},
+            {"file_id": "f1", "word_span": [3, 4], "label": "second"},
+        ],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    assert [tuple(sc.word_span) for sc in fixed.speech_cuts] == [(0, 2), (3, 4)]
+    assert fixed.speech_cuts[0].label == "first"   # no (1/n) suffix when untouched
+    print("ok  test_enforce_leaves_a_clean_grouping_untouched")
+
+
+def test_enforce_remaps_take_members_onto_split_cuts():
+    lat = _make_lattice()
+    lat.atoms.insert(0, Atom(atom_id=99, file_id="f1", start_ms=950, end_ms=1450,
+                             state_in="speech_edge", state_out="speech_edge",
+                             action_energy=0.1, camera_desc="hold", coherence=1.0))
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [{"file_id": "f1", "word_span": [0, 4], "label": "whole"}],
+        "take_candidates": [{"group_id": "tg1", "members": [
+            {"file_id": "f1", "word_span": [0, 2]},
+            {"file_id": "f1", "word_span": [3, 4]},
+        ]}],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    tc = fixed.take_candidates[0]
+    assert [tuple(m.word_span) for m in tc.members] == [(0, 2), (3, 4)], tc
+
+    # Both members collapsing onto the SAME cut -> group degenerates and is dropped.
+    out2 = pass1.Pass1Output.model_validate({
+        "speech_cuts": [{"file_id": "f1", "word_span": [0, 2], "label": "only"},
+                        {"file_id": "f1", "word_span": [3, 4], "label": "other"}],
+        "take_candidates": [{"group_id": "tg2", "members": [
+            {"file_id": "f1", "word_span": [0, 1]},
+            {"file_id": "f1", "word_span": [1, 2]},
+        ]}],
+    })
+    fixed2 = pass1.enforce_lattice_partition(out2, {"f1": lat})
+    assert fixed2.take_candidates == [], fixed2.take_candidates
+    print("ok  test_enforce_remaps_take_members_onto_split_cuts")
+
+
+def test_enforce_splits_a_discontiguous_video_group():
+    # Atoms 0 (2100-2600) and 1 (2600-3200) are contiguous in _make_lattice;
+    # add atom 2 far away (5000-6000). A group [0, 1, 2] bridges a gap (in
+    # real data: bridges a speech span) and must come back as [0,1] + [2].
+    lat = _make_lattice()
+    lat.atoms.append(Atom(atom_id=2, file_id="f1", start_ms=5000, end_ms=6000,
+                          state_in="speech_edge", state_out="clip_edge",
+                          action_energy=0.3, camera_desc="hold", coherence=0.9))
+    out = pass1.Pass1Output.model_validate({
+        "video_tentative_groups": [{"file_id": "f1", "atom_ids": [0, 1, 2]}],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    groups = [vg.atom_ids for vg in fixed.video_tentative_groups]
+    assert groups == [[0, 1], [2]], groups
+
+    # a contiguous group is left untouched
+    ok = pass1.Pass1Output.model_validate({
+        "video_tentative_groups": [{"file_id": "f1", "atom_ids": [0, 1]}],
+    })
+    fixed_ok = pass1.enforce_lattice_partition(ok, {"f1": lat})
+    assert [vg.atom_ids for vg in fixed_ok.video_tentative_groups] == [[0, 1]]
+    print("ok  test_enforce_splits_a_discontiguous_video_group")
+
+
+def test_enforce_isolates_an_action_atom_into_its_own_group():
+    # Atoms 0,1 contiguous; add atom 2 (contiguous to 1) flagged is_action.
+    # A group [0,1,2] must come back as [0,1] + [2] -- the payoff stands alone.
+    lat = _make_lattice()
+    lat.atoms.append(Atom(atom_id=2, file_id="f1", start_ms=3200, end_ms=3800,
+                          state_in="action", state_out="action",
+                          action_energy=0.7, camera_desc="hold", coherence=0.9,
+                          anchor_ms=[3500], is_action=True))
+    lat.atoms.append(Atom(atom_id=3, file_id="f1", start_ms=3800, end_ms=4400,
+                          state_in="action", state_out="clip_edge",
+                          action_energy=0.2, camera_desc="hold", coherence=0.9))
+    out = pass1.Pass1Output.model_validate({
+        "video_tentative_groups": [{"file_id": "f1", "atom_ids": [0, 1, 2, 3]}],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    groups = [vg.atom_ids for vg in fixed.video_tentative_groups]
+    assert groups == [[0, 1], [2], [3]], groups
+    print("ok  test_enforce_isolates_an_action_atom_into_its_own_group")
+
+
+def test_enforce_readds_an_action_atom_the_model_dropped():
+    # boundaries-v2: grouping is a selection (the model may drop connective
+    # tissue), but an ACTION atom must ALWAYS surface. The model groups only the
+    # calm atoms [0,1] and omits the action atom 2 entirely -- enforcement must
+    # re-add it as its own group so the payoff is never silently lost.
+    lat = _make_lattice()
+    lat.atoms.append(Atom(atom_id=2, file_id="f1", start_ms=3200, end_ms=3800,
+                          state_in="action", state_out="clip_edge",
+                          action_energy=0.7, camera_desc="hold", coherence=0.9,
+                          anchor_ms=[3500], is_action=True))
+    out = pass1.Pass1Output.model_validate({
+        "video_tentative_groups": [{"file_id": "f1", "atom_ids": [0, 1]}],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    groups = [vg.atom_ids for vg in fixed.video_tentative_groups]
+    assert [2] in groups, groups
+    print("ok  test_enforce_readds_an_action_atom_the_model_dropped")
+
+
+def test_no_overlapping_speech_cuts():
+    bad = pass1.Pass1Output.model_validate({
+        "speech_cuts": [
+            {"file_id": "f1", "word_span": [0, 4], "label": "a"},
+            {"file_id": "f1", "word_span": [2, 6], "label": "b"},
+        ],
+    })
+    err = pass1._no_overlapping_speech_cuts(bad)
+    assert err is not None and "overlap" in err, err
+
+    ok = pass1.Pass1Output.model_validate({
+        "speech_cuts": [
+            {"file_id": "f1", "word_span": [0, 4], "label": "a"},
+            {"file_id": "f1", "word_span": [5, 6], "label": "b"},
+            {"file_id": "f2", "word_span": [0, 4], "label": "c"},   # other file: fine
+        ],
+    })
+    assert pass1._no_overlapping_speech_cuts(ok) is None
+    print("ok  test_no_overlapping_speech_cuts")
+
+
 def test_pass1_output_rejects_an_unexpected_wrapper_key():
     # Observed in the wild: the model wrapped its whole real answer under a
     # spurious top-level key. Every field here has a default, so without
@@ -169,6 +355,16 @@ def main():
     test_run_pass1_calls_complete_with_pass1_stage_and_schema()
     test_pass1_output_schema_round_trip_with_junk_suspects()
     test_pass1_output_defaults_are_empty_not_missing()
+    test_no_speech_cut_swallows_atoms_flags_a_cross_pause_group()
+    test_no_speech_cut_swallows_atoms_accepts_clean_grouping()
+    test_no_speech_cut_swallows_atoms_rejects_out_of_range_span()
+    test_enforce_splits_a_speech_cut_at_an_atom_owned_gap()
+    test_enforce_leaves_a_clean_grouping_untouched()
+    test_enforce_remaps_take_members_onto_split_cuts()
+    test_enforce_splits_a_discontiguous_video_group()
+    test_enforce_isolates_an_action_atom_into_its_own_group()
+    test_enforce_readds_an_action_atom_the_model_dropped()
+    test_no_overlapping_speech_cuts()
     test_pass1_output_rejects_an_unexpected_wrapper_key()
     print("\nall pass1 tests passed")
 

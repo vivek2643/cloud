@@ -49,7 +49,7 @@ def load_cuts_v3(project_id: str, user_id: str) -> Optional[Dict[str, Any]]:
             """
             select id::text, file_id::text, src_in_ms, src_out_ms, kind, word_span, atom_ids,
                    label, summary, speaker, on_camera, take_group_id::text, take_role,
-                   junk, junk_reason, framing, look, caption_zones, pace,
+                   junk, junk_reason, junk_confidence, framing, look, caption_zones, pace,
                    hero_ts_ms, hero_key, transition_in, transition_out
               from cut_records where ingest_run_id = %s
              order by file_id, src_in_ms

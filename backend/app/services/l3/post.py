@@ -1,9 +1,11 @@
 """
 Cuts v3 post-compute: deterministic assembly of the final ``cut_records``
-from pass 2's judged output. No model call here, and no fallback -- every
-invariant (full coverage, zero overlap, boundary-on-edge) is enforced in
-code; a violation fails the ingest run loudly for re-run rather than being
-silently patched over. See cuts_v3.plan.md section 6.
+from pass 2's judged output. No model call here, and no fallback -- the
+remaining invariants (zero overlap, boundary-on-edge) are enforced in code; a
+violation fails the ingest run loudly for re-run rather than being silently
+patched over. Full coverage is NO LONGER an invariant: cuts are a selection,
+not a partition, so gaps (dropped connective tissue) are legal. See
+cuts_v3.plan.md section 6 and cuts_v3_boundaries_v2.plan.md.
 
 Note on "framing motion" (plan sec. 6, the subject-centroid-follows-crop
 bullet): that machinery already exists in ``app.services.l3.framing``
@@ -15,6 +17,7 @@ nothing new to build or store here for that bullet.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,6 +27,8 @@ from app.services.l3.post_params import (
     ANCHOR_PAD_MS, ENERGY_GRADE_BANDS, FLATLINE_BAND, PACE_LEVEL_TARGETS, SPEED_CEIL, SPEED_FLOOR,
 )
 from app.services.l3.video_segments import _sharpest_ms
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -55,6 +60,7 @@ class CutRecord:
     on_camera: Optional[bool]
     junk: bool
     junk_reason: str
+    junk_confidence: str                   # "high" -> hidden by default; "low"/doubtful -> shown
     framing: Dict[str, Any]
     look: Dict[str, Any]
     caption_zones: List[Tuple[float, float, float, float]]
@@ -71,6 +77,7 @@ class CutRecord:
             "atom_ids": self.atom_ids, "label": self.label, "summary": self.summary,
             "speaker": self.speaker, "on_camera": self.on_camera,
             "junk": self.junk, "junk_reason": self.junk_reason,
+            "junk_confidence": self.junk_confidence,
             "framing": self.framing, "look": self.look,
             "caption_zones": [list(z) for z in self.caption_zones],
             "hero_ts_ms": self.hero_ts_ms, "pace": self.pace.to_dict(),
@@ -175,22 +182,56 @@ def compute_pace_envelope(
 
 
 # --------------------------------------------------------------------------
-# Invariant enforcement: zero overlap + full coverage, per file.
+# Invariant enforcement: zero overlap, per file (coverage gaps are legal).
 # --------------------------------------------------------------------------
 
-def _validate_file_coverage(file_id: str, spans: List[Tuple[int, int]], duration_ms: int) -> None:
+def _validate_no_overlap(file_id: str, spans: List[Tuple[int, int]], duration_ms: int) -> None:
+    """Boundaries-v2: cuts are a SELECTION, not a partition -- GAPS ARE LEGAL
+    (connective tissue / pre-roll / dead air is dropped, not tiled). The only
+    invariant left is zero overlap: two cuts must never claim the same instant,
+    or the timeline is ambiguous. Coverage gaps used to raise here; that was the
+    full-coverage invariant that forced every dead sliver to become a junk tile
+    (see cuts_v3_boundaries_v2.plan.md)."""
     spans = sorted(spans)
-    if not spans:
-        raise ValueError(f"{file_id}: no cuts at all ({duration_ms}ms uncovered)")
-    if spans[0][0] != 0:
-        raise ValueError(f"{file_id}: coverage gap [0-{spans[0][0]}] before the first cut")
     for (s0, e0), (s1, e1) in zip(spans, spans[1:]):
         if s1 < e0:
             raise ValueError(f"{file_id}: overlap between [{s0}-{e0}] and [{s1}-{e1}]")
-        if s1 > e0:
-            raise ValueError(f"{file_id}: coverage gap [{e0}-{s1}]")
-    if spans[-1][1] < duration_ms:
-        raise ValueError(f"{file_id}: coverage gap [{spans[-1][1]}-{duration_ms}] after the last cut")
+
+
+# --------------------------------------------------------------------------
+# Action protection: a genuine motion payoff can never be silently discarded.
+#
+# Observed against real Reel-trail data: the model labeled high-motion,
+# multi-anchor END-OF-CLIP spans as "trailing junk" ("Trailing frames after
+# carbs line", "Pointing gesture at clip end") -- and the frontend hides junk,
+# so the action "never comes up". This is exactly the user's rule inverted:
+# "if doubtful, SHOW." A span carrying impact anchors or strong subject motion
+# is a payoff, not trailing dead air, so its junk flag is overridden here in
+# code -- the model does not get the final say on discarding a real action.
+#
+# Video-only (visual action); speech junk -- cue words, false starts -- is
+# untouched. The bar is deliberately high enough that a truly still trailing
+# frame (no anchors, low energy) still stays junk.
+# --------------------------------------------------------------------------
+
+ACTION_PROTECT_MIN_ANCHORS = 2       # >= this many impact anchors => real payoff
+ACTION_PROTECT_ENERGY = 0.45         # or mean subject-motion energy over the span
+
+
+def _mean_action_energy(motion: Dict[str, Any], s: int, e: int) -> float:
+    hop = int(motion.get("hop_ms") or 0)
+    ae = motion.get("action_energy") or []
+    if hop <= 0 or not ae:
+        return 0.0
+    lo, hi = max(0, s // hop), min(len(ae), max(s // hop + 1, e // hop))
+    seg = ae[lo:hi]
+    return sum(seg) / len(seg) if seg else 0.0
+
+
+def _is_protected_action(kind: str, anchors: List[int], mean_energy: float) -> bool:
+    return kind == "video" and (
+        len(anchors) >= ACTION_PROTECT_MIN_ANCHORS or mean_energy >= ACTION_PROTECT_ENERGY
+    )
 
 
 # --------------------------------------------------------------------------
@@ -204,10 +245,11 @@ def assemble_cut_records(
     silences_by_file: Dict[str, List[dict]],
 ) -> List[CutRecord]:
     """Resolve every judged cut to its final ms span (word/atom edges only,
-    by construction), enforce zero-overlap + full-coverage per file, then
-    compute hero_ts_ms + the pace envelope for each. Raises ``ValueError``
-    (stage ``post``, per the plan's "no fallback" rule) on any invariant
-    violation -- the caller marks the ingest run ``failed`` for re-run."""
+    by construction), enforce zero-overlap per file (gaps are legal -- cuts are
+    a selection, not a partition), then compute hero_ts_ms + the pace envelope
+    for each. Raises ``ValueError`` (stage ``post``, per the plan's "no
+    fallback" rule) on any invariant violation -- the caller marks the ingest
+    run ``failed`` for re-run."""
     resolved: List[Tuple[Pass2Cut, int, int, List[int], List[Tuple[int, int, str]]]] = []
     for cut in pass2_output.cuts:
         lattice = lattices.get(cut.file_id)
@@ -236,20 +278,22 @@ def assemble_cut_records(
     for idx, (cut, *_rest) in enumerate(resolved):
         by_file.setdefault(cut.file_id, []).append(idx)
 
-    # A file with literally zero assigned cuts is indistinguishable from
-    # "pass 2 silently returned nothing for it" (e.g. a truncated response
-    # that still happens to validate -- see llm.client._truncated) unless
-    # checked explicitly. Loud failure, not a quietly incomplete project.
+    # A file with zero assigned cuts is now LEGAL (boundaries-v2): a clip that's
+    # all dead air / all junk contributes nothing, and that's a valid outcome,
+    # not a failure. Still worth a warning -- it's ALSO what a silently truncated
+    # pass-2 response looks like (see llm.client._truncated), so a surprise empty
+    # file is something to eyeball, just not something to abort the run over.
     missing = set(lattices.keys()) - set(by_file.keys())
     if missing:
-        raise ValueError(f"no cuts at all for file(s) {sorted(missing)} -- pass 2 omitted them entirely")
+        logger.warning("no cuts assigned for file(s) %s -- all-junk clip, or a "
+                        "pass-2 omission worth checking", sorted(missing))
 
     next_start: Dict[int, int] = {}
     for file_id, idxs in by_file.items():
         idxs.sort(key=lambda i: resolved[i][1])
         duration_ms = lattices[file_id].duration_ms
         spans = [(resolved[i][1], resolved[i][2]) for i in idxs]
-        _validate_file_coverage(file_id, spans, duration_ms)
+        _validate_no_overlap(file_id, spans, duration_ms)
         for pos, i in enumerate(idxs):
             next_start[i] = resolved[idxs[pos + 1]][1] if pos + 1 < len(idxs) else duration_ms
 
@@ -268,10 +312,20 @@ def assemble_cut_records(
             min_tasteful_speed=cut.taste_fences.min_tasteful_speed,
             natural_sound=cut.natural_sound,
         )
+
+        junk, junk_reason, junk_conf = cut.junk, cut.junk_reason, cut.junk_confidence
+        if junk and _is_protected_action(cut.kind, anchors, _mean_action_energy(motion, s, e)):
+            logger.info("post: overriding junk on %s [%d-%d] -- protected action "
+                        "(%d anchors, mean_energy=%.2f), model said %r",
+                        cut.source_ref, s, e, len(anchors),
+                        _mean_action_energy(motion, s, e), cut.junk_reason)
+            junk, junk_reason, junk_conf = False, "", "low"
+
         out.append(CutRecord(
             file_id=cut.file_id, src_in_ms=s, src_out_ms=e, kind=cut.kind,
             word_span=cut.word_span, atom_ids=cut.atom_ids, label=cut.label, summary=cut.summary,
-            speaker=cut.speaker, on_camera=cut.on_camera, junk=cut.junk, junk_reason=cut.junk_reason,
+            speaker=cut.speaker, on_camera=cut.on_camera, junk=junk, junk_reason=junk_reason,
+            junk_confidence=junk_conf,
             framing=cut.framing.model_dump(), look=cut.look.model_dump(),
             caption_zones=list(cut.caption_zones), hero_ts_ms=hero_ts, pace=pace,
             take_group_id=cut.take_group_id, take_role=cut.take_role,

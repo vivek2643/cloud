@@ -334,6 +334,7 @@ export interface CutRecord {
   take_role: TakeRole | null;
   junk: boolean;
   junk_reason: string | null;
+  junk_confidence: "high" | "low";
   framing: Framing;
   look: Look;
   caption_zones: [number, number, number, number][];
