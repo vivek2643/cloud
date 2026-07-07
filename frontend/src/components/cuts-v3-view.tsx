@@ -465,12 +465,16 @@ export function CutsV3View() {
                       weldableNeighbor(next) &&
                       selected.has(cutKey(next)) &&
                       c.src_out_ms === next.src_in_ms;
-                    // Passive same-beat indicator: how many cuts (incl. this
-                    // one) share this beat. No hiding, no winner -- every take
-                    // is its own tile in timeline order.
-                    const groupSize = c.take_group_id
-                      ? (takeGroups[c.take_group_id] ?? []).length
-                      : 0;
+                    // Same-beat labels: a group mixes same-setting retakes
+                    // ("take"/"winner") with different-angle "outlook"s. Count
+                    // ONLY the take-class here so an outlook is never badged as
+                    // a "take"; each tile shows its own true role below.
+                    const group = c.take_group_id
+                      ? (takeGroups[c.take_group_id] ?? [])
+                      : [];
+                    const takeCount = group.filter(
+                      (g) => g.take_role === "winner" || g.take_role === "take"
+                    ).length;
                     return (
                       <div key={cutKey(c)} className="flex shrink-0">
                         {c.junk ? (
@@ -490,7 +494,7 @@ export function CutsV3View() {
                             isActive={activeKey === cutKey(c)}
                             onActivate={() => setActiveKey(cutKey(c))}
                             onDeactivate={() => setActiveKey((k) => (k === cutKey(c) ? null : k))}
-                            takeGroupSize={groupSize}
+                            takeCount={takeCount}
                           />
                         )}
                       </div>
@@ -799,7 +803,7 @@ function CutCardV3({
   isActive,
   onActivate,
   onDeactivate,
-  takeGroupSize,
+  takeCount,
 }: {
   file?: FileRecord;
   cut: CutRecord;
@@ -814,7 +818,7 @@ function CutCardV3({
   isActive: boolean;
   onActivate: () => void;
   onDeactivate: () => void;
-  takeGroupSize: number;
+  takeCount: number;
 }) {
   const [playUrl, setPlayUrl] = useState<string | null>(null);
   const [muted, setMuted] = useState(false);
@@ -977,26 +981,27 @@ function CutCardV3({
           />
         )}
 
-        {/* same-beat indicator (top-left): passive -- every take is its own
-            tile; this just flags that N cuts capture the same beat. */}
-        {(takeGroupSize > 1 || cut.take_role === "outlook") && (
+        {/* same-beat role (top-left): each tile shows its OWN role. An outlook
+            (same words, different angle) is labeled "outlook" -- never lumped
+            into the "N takes" count, which only counts same-setting retakes. */}
+        {(cut.take_role === "outlook" || takeCount > 1) && (
           <div className="absolute left-2 top-2 z-20 flex items-center gap-1">
-            {takeGroupSize > 1 && (
-              <span
-                className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-semibold"
-                style={{ background: "rgba(255,255,255,0.92)", color: "#000" }}
-                title={`One of ${takeGroupSize} takes of the same beat`}
-              >
-                <Layers size={11} />
-                {takeGroupSize} takes
-              </span>
-            )}
-            {cut.take_role === "outlook" && (
+            {cut.take_role === "outlook" ? (
               <span
                 className="rounded px-1.5 py-0.5 text-[11px] font-semibold"
                 style={{ background: "rgba(0,0,0,0.6)", color: "#fff" }}
+                title="Same line, different angle/setting"
               >
                 outlook
+              </span>
+            ) : (
+              <span
+                className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-semibold"
+                style={{ background: "rgba(255,255,255,0.92)", color: "#000" }}
+                title={`One of ${takeCount} takes (same setting) of this line`}
+              >
+                <Layers size={11} />
+                {takeCount} takes
               </span>
             )}
           </div>
