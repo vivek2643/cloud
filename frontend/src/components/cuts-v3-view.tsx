@@ -23,14 +23,42 @@ import {
   Volume2,
   VolumeX,
   Layers,
-  Bug,
   Loader2,
   Eye,
   EyeOff,
 } from "lucide-react";
 import { EditButton } from "./search-edit-bar";
 
-const ENERGY_LABELS = ["Broad", "Calm", "Balanced", "Tight", "Sharp"];
+// Category filter, matching the original Cuts tab. v3 cuts carry a delivery
+// CHANNEL (said / done / shown); a cut appears under a filter when its channel
+// matches. "All" shows everything.
+type FilterKey = "all" | "said" | "done" | "shown";
+const FILTERS: { key: FilterKey; label: string }[] = [
+  { key: "all", label: "All" },
+  { key: "said", label: "Said" },
+  { key: "done", label: "Done" },
+  { key: "shown", label: "Shown" },
+];
+
+// Channel with a graceful fallback for runs ingested before the channel field
+// existed: speech -> said, video -> shown.
+function cutChannel(c: CutRecord): "said" | "done" | "shown" {
+  return (c.channel ?? (c.kind === "speech" ? "said" : "shown")) as "said" | "done" | "shown";
+}
+function matchesFilter(c: CutRecord, f: FilterKey): boolean {
+  return f === "all" || cutChannel(c) === f;
+}
+
+// A "micro" cut is far shorter than a typical cut in THIS project (under half
+// the median cut duration) -- a blip that usually just clutters the strip.
+// Project-relative (a fast reel and a slow doc each get their own floor), so no
+// absolute millisecond constant; hidden by default, toggleable, never deleted.
+const MICRO_FRAC = 0.5;
+
+// The dial is a tightness axis: energy 0 keeps each cut's full grounded span
+// (longest playback), energy 1 trims hardest toward the peak (snappiest).
+// Speech never trims (native speed), so this axis bites on video/action cuts.
+const ENERGY_LABELS = ["Broad", "Long-form", "Standard", "Short-form", "Punchy"];
 const energyLabel = (e: number) => ENERGY_LABELS[Math.min(4, Math.round(e * 4))];
 
 // Cuts v3 (see cuts_v3.plan.md). One LLM ingest pass per project decides the
@@ -127,12 +155,15 @@ export function CutsV3View() {
   const token = useAuthStore((s) => s.session?.access_token);
   const files = useDriveStore((s) => s.files);
   const [aspect, setAspect] = useState<Aspect>("landscape");
-  const [debugMode, setDebugMode] = useState(false);
+  const [fit, setFit] = useState<"adjusted" | "original">("adjusted");
+  const [filter, setFilter] = useState<FilterKey>("all");
   const [showDiscarded, setShowDiscarded] = useState(false);
+  const [showMicro, setShowMicro] = useState(false);
   // Energy dial (cuts_v3_boundaries_v2.plan.md §D). 0 = full grounded span,
   // 1 = tightest (negative padding toward the anchor). Pure view-math over the
-  // stored pace envelope -- never re-fetches or re-ingests.
-  const [energy, setEnergy] = useState(0);
+  // stored pace envelope -- never re-fetches or re-ingests. Defaults to the
+  // middle stop ("Balanced").
+  const [energy, setEnergy] = useState(0.5);
   const [projectId, setProjectId] = useState<string | null>(null);
   const [data, setData] = useState<CutsV3Response | null>(null);
   const [loading, setLoading] = useState(false);
@@ -276,10 +307,46 @@ export function CutsV3View() {
     [cuts, filesById]
   );
 
+  // Project-relative micro floor: half the median duration over the real
+  // (non-junk) cuts. Too few cuts to judge -> floor 0 (hide nothing).
+  const microFloorMs = useMemo(() => {
+    const durs = cuts
+      .filter((c) => filesById[c.file_id] && !c.junk)
+      .map((c) => c.src_out_ms - c.src_in_ms)
+      .sort((a, b) => a - b);
+    if (durs.length < 4) return 0;
+    const median = durs[Math.floor(durs.length / 2)];
+    return median * MICRO_FRAC;
+  }, [cuts, filesById]);
+  const isMicro = useCallback(
+    (c: CutRecord) => !c.junk && microFloorMs > 0 && c.src_out_ms - c.src_in_ms < microFloorMs,
+    [microFloorMs]
+  );
+  const microCount = useMemo(
+    () => cuts.filter((c) => filesById[c.file_id] && isMicro(c)).length,
+    [cuts, filesById, isMicro]
+  );
+
+  // Everything visible under the current tray toggles (junk + micro), BEFORE the
+  // category filter -- the dropdown counts are taken from this set.
+  const baseCuts = useMemo(
+    () =>
+      cuts.filter(
+        (c) => filesById[c.file_id] && (showDiscarded || !c.junk) && (showMicro || !isMicro(c))
+      ),
+    [cuts, filesById, showDiscarded, showMicro, isMicro]
+  );
+  const counts = useMemo(() => {
+    const c: Record<string, number> = {};
+    for (const f of FILTERS) {
+      if (f.key === "all") continue;
+      c[f.key] = baseCuts.filter((cut) => matchesFilter(cut, f.key)).length;
+    }
+    return c;
+  }, [baseCuts]);
+
   const rows = useMemo(() => {
-    const present = cuts.filter(
-      (c) => filesById[c.file_id] && (showDiscarded || !c.junk)
-    );
+    const present = baseCuts.filter((c) => matchesFilter(c, filter));
     const byFile: Record<string, CutRecord[]> = {};
     for (const c of present) (byFile[c.file_id] ??= []).push(c);
     return Object.entries(byFile)
@@ -289,7 +356,7 @@ export function CutsV3View() {
         cuts: [...list].sort((a, b) => a.src_in_ms - b.src_in_ms),
       }))
       .sort((a, b) => a.fileName.localeCompare(b.fileName));
-  }, [cuts, filesById, showDiscarded]);
+  }, [baseCuts, filesById, filter]);
 
   useEffect(() => {
     setOrder((prev) => {
@@ -349,6 +416,7 @@ export function CutsV3View() {
     <div>
       <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-2.5">
+          <TagDropdown value={filter} counts={counts} total={baseCuts.length} onChange={setFilter} />
           <PillDropdown
             options={(["Landscape", "Portrait", "Square"] as const).map((l) => l)}
             value={ASPECT_LABEL[aspect]}
@@ -357,33 +425,40 @@ export function CutsV3View() {
               if (found) setAspect(found);
             }}
           />
-          <button
-            onClick={() => setDebugMode((v) => !v)}
-            className="flex items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-medium transition-colors hover:bg-[var(--sidebar)]"
-            style={{
-              borderColor: debugMode ? "var(--accent)" : "rgba(255,255,255,0.4)",
-              color: debugMode ? "var(--accent)" : "var(--foreground)",
-            }}
-            title="Show boundary debug info (kind, word span / atom ids)"
-          >
-            <Bug size={13} />
-            Debug
-          </button>
-          <button
+          <PillDropdown
+            options={["Frame Adjusted", "Original"]}
+            value={fit === "adjusted" ? "Frame Adjusted" : "Original"}
+            onChange={(v) => setFit(v === "Original" ? "original" : "adjusted")}
+          />
+          <TrayToggle
+            active={showDiscarded}
             onClick={() => setShowDiscarded((v) => !v)}
-            className="flex items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-medium transition-colors hover:bg-[var(--sidebar)]"
-            style={{
-              borderColor: showDiscarded ? "var(--accent)" : "rgba(255,255,255,0.4)",
-              color: showDiscarded ? "var(--accent)" : "var(--foreground)",
-            }}
             title="Show discarded cuts (camera cues, pre-roll, dead air) hidden by default"
-          >
-            {showDiscarded ? <Eye size={13} /> : <EyeOff size={13} />}
-            {showDiscarded ? "Hiding" : "Discarded"}
-            {hiddenJunkCount > 0 ? ` (${hiddenJunkCount})` : ""}
-          </button>
+            label={showDiscarded ? "Hiding" : "Discarded"}
+            count={hiddenJunkCount}
+          />
+          <TrayToggle
+            active={showMicro}
+            onClick={() => setShowMicro((v) => !v)}
+            title="Show micro cuts (far shorter than a typical cut) hidden by default"
+            label={showMicro ? "Hiding" : "Micro cuts"}
+            count={microCount}
+          />
         </div>
-        <EditButton />
+        <div className="flex items-center gap-2.5">
+          {run?.status === "ready" && (
+            <button
+              onClick={handleKickIngest}
+              disabled={kicking}
+              className="rounded-lg border px-3 py-2 text-xs font-medium transition-colors hover:bg-[var(--sidebar)] disabled:opacity-50"
+              style={{ borderColor: "rgba(255,255,255,0.4)", color: "var(--foreground)" }}
+              title="Re-run the cuts ingest for this project"
+            >
+              {kicking ? "Re-running…" : "Re-run ingest"}
+            </button>
+          )}
+          <EditButton />
+        </div>
       </div>
 
       {/* Energy dial: tightens each cut inward toward its peak (negative
@@ -486,7 +561,7 @@ export function CutsV3View() {
                             energy={energy}
                             getUrl={getUrl}
                             aspect={aspect}
-                            debugMode={debugMode}
+                            fit={fit}
                             selected={isSel}
                             weldLeft={weldLeft}
                             weldRight={weldRight}
@@ -578,32 +653,9 @@ function IngestBanner({
     );
   }
 
-  return (
-    <div className="mb-7 rounded-xl border px-4 py-3.5" style={{ borderColor: "var(--border)" }}>
-      <div className="flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2">
-          <Sparkles size={15} style={{ color: "var(--accent)" }} />
-          <span className="text-sm font-semibold">Project summary</span>
-        </div>
-        <div className="flex items-center gap-3 text-xs" style={{ color: "var(--muted)" }}>
-          {run.cost_usd != null && <span>${run.cost_usd.toFixed(2)}</span>}
-          <button
-            onClick={onKick}
-            disabled={kicking}
-            className="rounded px-2 py-1 font-medium transition-colors hover:bg-[var(--sidebar)] disabled:opacity-50"
-            style={{ color: "var(--foreground)" }}
-          >
-            {kicking ? "Re-running…" : "Re-run ingest"}
-          </button>
-        </div>
-      </div>
-      {run.project_summary && (
-        <p className="mt-1.5 text-sm" style={{ color: "var(--muted)" }}>
-          {run.project_summary}
-        </p>
-      )}
-    </div>
-  );
+  // Ready: no banner. The project summary is intentionally not shown (the view
+  // matches the original Cuts tab); re-run lives in the top toolbar.
+  return null;
 }
 
 // Copied from the main Cuts view's EnergyBar (cuts-view.tsx) so the two
@@ -711,6 +763,101 @@ function EmptyState({ title, body }: { title: string; body: string }) {
   );
 }
 
+function TrayToggle({
+  active,
+  onClick,
+  title,
+  label,
+  count,
+}: {
+  active: boolean;
+  onClick: () => void;
+  title: string;
+  label: string;
+  count: number;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className="flex items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-medium transition-colors hover:bg-[var(--sidebar)]"
+      style={{
+        borderColor: active ? "var(--accent)" : "rgba(255,255,255,0.4)",
+        color: active ? "var(--accent)" : "var(--foreground)",
+      }}
+      title={title}
+    >
+      {active ? <Eye size={13} /> : <EyeOff size={13} />}
+      {label}
+      {count > 0 ? ` (${count})` : ""}
+    </button>
+  );
+}
+
+// Category filter dropdown (All/Said/Done/Shown), ported from the original Cuts
+// tab so the two surfaces match.
+function TagDropdown({
+  value,
+  counts,
+  total,
+  onChange,
+}: {
+  value: FilterKey;
+  counts: Record<string, number>;
+  total: number;
+  onChange: (v: FilterKey) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const current = FILTERS.find((f) => f.key === value) ?? FILTERS[0];
+  const n = value === "all" ? total : counts[value] ?? 0;
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium transition-colors hover:bg-[var(--sidebar)]"
+        style={{ borderColor: "rgba(255,255,255,0.4)", color: "var(--foreground)" }}
+      >
+        {current.label}
+        <span className="text-xs" style={{ color: "var(--muted)" }}>
+          {n}
+        </span>
+        <ChevronDown size={15} style={{ color: "var(--muted)" }} />
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-30" onClick={() => setOpen(false)} />
+          <div
+            className="absolute left-0 z-40 mt-1.5 min-w-[180px] overflow-hidden rounded-xl border shadow-xl"
+            style={{ background: "var(--background)", borderColor: "var(--border)" }}
+          >
+            {FILTERS.map((f) => {
+              const cn2 = f.key === "all" ? total : counts[f.key] ?? 0;
+              return (
+                <button
+                  key={f.key}
+                  onClick={() => {
+                    onChange(f.key);
+                    setOpen(false);
+                  }}
+                  className="flex w-full items-center justify-between gap-6 px-3.5 py-2 text-sm transition-colors hover:bg-[var(--sidebar)]"
+                  style={{ color: value === f.key ? "var(--foreground)" : "var(--muted)" }}
+                >
+                  <span className="flex items-center gap-2">
+                    {f.label}
+                    <span className="text-xs" style={{ color: "var(--muted)" }}>
+                      {cn2}
+                    </span>
+                  </span>
+                  {value === f.key && <Check size={14} />}
+                </button>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function PillDropdown({
   options,
   value,
@@ -795,7 +942,7 @@ function CutCardV3({
   energy,
   getUrl,
   aspect,
-  debugMode,
+  fit,
   selected,
   weldLeft,
   weldRight,
@@ -810,7 +957,7 @@ function CutCardV3({
   energy: number;
   getUrl: (fileId: string) => Promise<string | null>;
   aspect: Aspect;
-  debugMode: boolean;
+  fit: "adjusted" | "original";
   selected: boolean;
   weldLeft: boolean;
   weldRight: boolean;
@@ -827,8 +974,12 @@ function CutCardV3({
   const inSec = inMs / 1000;
   const outSec = outMs / 1000;
   const heroSec = (cut.hero_ts_ms ?? (cut.src_in_ms + cut.src_out_ms) / 2) / 1000;
-  const crop = cropForAspect(cut, aspect);
+  // "Frame Adjusted" applies the per-aspect crop (fill the tile); "Original"
+  // shows the whole source frame letterboxed (contain), no crop -- only the
+  // rotation is honoured either way.
+  const crop = fit === "adjusted" ? cropForAspect(cut, aspect) : null;
   const { objectPosition, transform } = cropStyle(crop, cut.framing?.rotation_deg);
+  const objectFit = fit === "adjusted" ? "cover" : "contain";
 
   async function ensureUrl() {
     if (playUrl || !file) return;
@@ -977,7 +1128,7 @@ function CutCardV3({
             onLoadedMetadata={onLoadedMetadata}
             onTimeUpdate={onTimeUpdate}
             className="h-full w-full bg-black"
-            style={{ objectFit: "cover", objectPosition, transform }}
+            style={{ objectFit, objectPosition, transform }}
           />
         )}
 
@@ -1057,24 +1208,11 @@ function CutCardV3({
         </div>
       </div>
 
-      {/* label + summary line */}
+      {/* label only (no summary) */}
       <div className="mt-2 px-0.5">
         <p className="truncate text-xs font-semibold" style={{ color: "var(--foreground)" }}>
           {cut.label || "—"}
         </p>
-        {cut.summary && (
-          <p className="mt-0.5 line-clamp-2 text-[11px]" style={{ color: "var(--muted)" }}>
-            {cut.summary}
-          </p>
-        )}
-        {debugMode && (
-          <p className="mt-1 text-[10px] uppercase tracking-wide" style={{ color: "var(--muted)" }}>
-            {cut.kind}
-            {cut.kind === "speech" && cut.word_span ? ` [${cut.word_span[0]}-${cut.word_span[1]}]` : ""}
-            {cut.kind === "video" && cut.atom_ids ? ` atoms[${cut.atom_ids.join(",")}]` : ""}
-            {cut.take_role ? ` · ${cut.take_role}` : ""}
-          </p>
-        )}
       </div>
     </div>
   );
