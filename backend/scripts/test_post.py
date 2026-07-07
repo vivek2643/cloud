@@ -291,7 +291,25 @@ def test_assemble_allows_a_project_file_with_zero_cuts():
     print("ok  test_assemble_allows_a_project_file_with_zero_cuts")
 
 
+def test_one_winner_per_take_group_backstop():
+    # Two clips of one take, both crowned "winner" by pass 2 -> the longest stays
+    # winner, the shorter is demoted to "take"; an outlook is untouched.
+    def rec(fid, s, e, role):
+        return post.CutRecord(
+            file_id=fid, src_in_ms=s, src_out_ms=e, kind="speech", word_span=(0, 4),
+            atom_ids=None, label="line", summary="", speaker=None, on_camera=None,
+            junk=False, junk_reason=None, framing={}, look={}, caption_zones=[],
+            hero_ts_ms=s, pace=None, take_group_id="tg1", take_role=role)
+    recs = [rec("f1", 0, 3000, "winner"), rec("f2", 0, 2000, "winner"),
+            rec("f3", 0, 2500, "outlook")]
+    post._enforce_one_winner_per_take_group(recs)
+    roles = {r.file_id: r.take_role for r in recs}
+    assert roles == {"f1": "winner", "f2": "take", "f3": "outlook"}, roles
+    print("ok  test_one_winner_per_take_group_backstop")
+
+
 def main():
+    test_one_winner_per_take_group_backstop()
     test_hero_ts_prefers_anchor_over_sharp()
     test_hero_ts_falls_back_to_sharpest()
     test_hero_ts_falls_back_to_midpoint_with_no_blur()

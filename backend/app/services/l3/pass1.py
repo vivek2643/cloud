@@ -16,6 +16,7 @@ convenience wrapper for real callers.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -457,6 +458,69 @@ def _fold_silent_speech_cuts(cuts: List[SpeechCut], lattice: Lattice) -> List[Sp
     return out
 
 
+# Take-identity text match: a take group is "the same LINE said again", so its
+# members' transcripts must actually share content words. These two govern that
+# SAME-LINE text test only (not cut boundaries): keep a member when at least
+# half of the shorter line's distinct content words are shared with the group's
+# fullest line, and at least two words overlap (one common word like "business"
+# can't glue two different lines). Calibrated on real over-grouped groups: a
+# "digital-marketing pitch" vs an "architecture print-shop idea" share ~0.1;
+# five takes of one question share 0.5-1.0.
+_TAKE_CONTAINMENT_MIN = 0.5
+_TAKE_MIN_SHARED = 2
+_TAKE_WORD_RE = re.compile(r"[a-z0-9']+")
+# Fillers/function words carry no line identity -- stripped so "the the product"
+# and "product" match, and so two lines don't bond on "and/you/to".
+_TAKE_STOP = {
+    "um", "uh", "er", "ah", "like", "you", "know", "so", "the", "a", "an", "and",
+    "to", "of", "i", "it", "is", "we", "that", "this", "be", "if", "in", "on",
+    "for", "at", "or", "but", "as", "my", "your", "me", "was", "are", "do",
+}
+
+
+def _take_tokens(lattice: Lattice, span: Tuple[int, int]) -> frozenset:
+    """Distinct content words in a member's word span (fillers/function words
+    dropped) -- the surface the same-line test compares."""
+    a, b = span
+    out: set = set()
+    for k in range(max(0, a), min(len(lattice.words), b + 1)):
+        for t in _TAKE_WORD_RE.findall((lattice.words[k].get("text") or "").lower()):
+            if t not in _TAKE_STOP:
+                out.add(t)
+    return frozenset(out)
+
+
+def _same_line(a: frozenset, b: frozenset) -> bool:
+    """True when two members are plausibly the SAME spoken line: enough of the
+    shorter one's content words appear in the other (containment, not full-string
+    -- survives transcription drift and boundary bleed)."""
+    if not a or not b:
+        return False
+    shared = len(a & b)
+    return shared >= _TAKE_MIN_SHARED and shared / min(len(a), len(b)) >= _TAKE_CONTAINMENT_MIN
+
+
+def _take_content_cluster(
+    members: List["TakeMember"], lattices: Dict[str, Lattice]
+) -> List["TakeMember"]:
+    """Keep only the members that actually say the same line (over-grouping
+    guard: the model sometimes lumps different content into one take group).
+    Returns the LARGEST set of mutually same-line members; [] when no two agree
+    (the caller then drops the group). Deterministic, clip-relative -- no cut
+    numbers, just a text-identity check on the members' own transcripts."""
+    toks: List[frozenset] = []
+    for m in members:
+        lat = lattices.get(m.file_id)
+        toks.append(_take_tokens(lat, tuple(m.word_span)) if lat else frozenset())
+    best: List[int] = []
+    for i in range(len(members)):
+        cluster = [i] + [j for j in range(len(members))
+                         if j != i and _same_line(toks[i], toks[j])]
+        if len(cluster) > len(best):
+            best = cluster
+    return [members[i] for i in sorted(best)] if len(best) >= 2 else []
+
+
 def _contiguous_atom_runs(lattice: Lattice, atom_ids: List[int]) -> List[List[int]]:
     """``atom_ids`` split into time-contiguous runs (next.start_ms ==
     cur.end_ms). Unknown ids are dropped. A video group must be one
@@ -613,11 +677,15 @@ def enforce_lattice_partition(output: Pass1Output, lattices: Dict[str, Lattice])
                 continue
             seen.add((m.file_id, mapped))
             members.append(TakeMember(file_id=m.file_id, word_span=mapped))
-        if len(members) >= 2:
-            new_takes.append(TakeCandidate(group_id=tc.group_id, members=members))
+        # Same-line guard: drop members the model lumped in that don't actually
+        # say this line (over-grouping -> otherwise pass 2 is forced to "resolve"
+        # different content as one take and crowns two winners).
+        kept = _take_content_cluster(members, lattices)
+        if len(kept) >= 2:
+            new_takes.append(TakeCandidate(group_id=tc.group_id, members=kept))
         else:
-            logger.info("pass1 enforce: dropping take group %r (%d distinct member(s) "
-                        "after remap)", tc.group_id, len(members))
+            logger.info("pass1 enforce: dropping take group %r (%d member(s) remain "
+                        "after same-line guard; was %d)", tc.group_id, len(kept), len(members))
 
     new_groups: List[VideoTentativeGroup] = []
     for vg in output.video_tentative_groups:

@@ -234,34 +234,79 @@ def test_enforce_leaves_a_clean_grouping_untouched():
     print("ok  test_enforce_leaves_a_clean_grouping_untouched")
 
 
-def test_enforce_remaps_take_members_onto_split_cuts():
-    lat = _make_lattice()
-    lat.atoms.insert(0, Atom(atom_id=99, file_id="f1", start_ms=950, end_ms=1450,
-                             state_in="speech_edge", state_out="speech_edge",
-                             action_energy=0.1, coherence=1.0))
-    out = pass1.Pass1Output.model_validate({
-        "speech_cuts": [{"file_id": "f1", "word_span": [0, 4], "label": "whole"}],
-        "take_candidates": [{"group_id": "tg1", "members": [
-            {"file_id": "f1", "word_span": [0, 2]},
-            {"file_id": "f1", "word_span": [3, 4]},
-        ]}],
-    })
-    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
-    tc = fixed.take_candidates[0]
-    assert [tuple(m.word_span) for m in tc.members] == [(0, 2), (3, 4)], tc
+def _take_line_lattice(fid: str) -> Lattice:
+    """Two clips of the SAME line -- what a real take actually is (same words,
+    different capture). Content tokens (stop-words dropped): launch/new/product/today."""
+    words = [
+        {"start_ms": 0, "end_ms": 400, "text": "Launch", "speaker": "S1"},
+        {"start_ms": 400, "end_ms": 800, "text": "the", "speaker": "S1"},
+        {"start_ms": 800, "end_ms": 1200, "text": "new", "speaker": "S1"},
+        {"start_ms": 1200, "end_ms": 1600, "text": "product", "speaker": "S1"},
+        {"start_ms": 1600, "end_ms": 2000, "text": "today.", "speaker": "S1"},
+    ]
+    atoms = [Atom(atom_id=0, file_id=fid, start_ms=2000, end_ms=2600,
+                  state_in="speech_edge", state_out="clip_edge",
+                  action_energy=0.1, coherence=1.0)]
+    return Lattice(file_id=fid, duration_ms=2600, words=words, turns=[], hints=[], atoms=atoms)
 
-    # Both members collapsing onto the SAME cut -> group degenerates and is dropped.
-    out2 = pass1.Pass1Output.model_validate({
-        "speech_cuts": [{"file_id": "f1", "word_span": [0, 2], "label": "only"},
-                        {"file_id": "f1", "word_span": [3, 4], "label": "other"}],
-        "take_candidates": [{"group_id": "tg2", "members": [
-            {"file_id": "f1", "word_span": [0, 1]},
-            {"file_id": "f1", "word_span": [1, 2]},
+
+def test_enforce_keeps_a_genuine_same_line_take_group():
+    lats = {"f1": _take_line_lattice("f1"), "f2": _take_line_lattice("f2")}
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [{"file_id": "f1", "word_span": [0, 4], "label": "line"},
+                        {"file_id": "f2", "word_span": [0, 4], "label": "line"}],
+        "take_candidates": [{"group_id": "tg1", "members": [
+            {"file_id": "f1", "word_span": [0, 4]},
+            {"file_id": "f2", "word_span": [0, 4]},
         ]}],
     })
-    fixed2 = pass1.enforce_lattice_partition(out2, {"f1": lat})
+    fixed = pass1.enforce_lattice_partition(out, lats)
+    assert len(fixed.take_candidates) == 1, fixed.take_candidates
+    fids = sorted(m.file_id for m in fixed.take_candidates[0].members)
+    assert fids == ["f1", "f2"], fids
+    print("ok  test_enforce_keeps_a_genuine_same_line_take_group")
+
+
+def test_enforce_drops_an_over_grouped_take_member():
+    # Same-line guard: a member that says DIFFERENT words is dropped, and a group
+    # left with <2 same-line members is dropped entirely (the closing_thanks bug).
+    f3 = Lattice(file_id="f3", duration_ms=2600, words=[
+        {"start_ms": 0, "end_ms": 500, "text": "Architecture", "speaker": "S1"},
+        {"start_ms": 500, "end_ms": 1000, "text": "print", "speaker": "S1"},
+        {"start_ms": 1000, "end_ms": 1500, "text": "shop", "speaker": "S1"},
+        {"start_ms": 1500, "end_ms": 2000, "text": "idea.", "speaker": "S1"},
+    ], turns=[], hints=[], atoms=[Atom(atom_id=0, file_id="f3", start_ms=2000, end_ms=2600,
+                                       state_in="speech_edge", state_out="clip_edge",
+                                       action_energy=0.1, coherence=1.0)])
+    lats = {"f1": _take_line_lattice("f1"), "f2": _take_line_lattice("f2"), "f3": f3}
+
+    # f1 + f2 are the same line, f3 is different -> f3 dropped, group of 2 kept.
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [{"file_id": "f1", "word_span": [0, 4], "label": "line"},
+                        {"file_id": "f2", "word_span": [0, 4], "label": "line"},
+                        {"file_id": "f3", "word_span": [0, 3], "label": "other"}],
+        "take_candidates": [{"group_id": "tg1", "members": [
+            {"file_id": "f1", "word_span": [0, 4]},
+            {"file_id": "f2", "word_span": [0, 4]},
+            {"file_id": "f3", "word_span": [0, 3]},
+        ]}],
+    })
+    fixed = pass1.enforce_lattice_partition(out, lats)
+    assert len(fixed.take_candidates) == 1, fixed.take_candidates
+    assert sorted(m.file_id for m in fixed.take_candidates[0].members) == ["f1", "f2"]
+
+    # A group of ONLY mismatched lines (f1 vs f3) collapses to <2 -> dropped.
+    out2 = pass1.Pass1Output.model_validate({
+        "speech_cuts": [{"file_id": "f1", "word_span": [0, 4], "label": "line"},
+                        {"file_id": "f3", "word_span": [0, 3], "label": "other"}],
+        "take_candidates": [{"group_id": "tg2", "members": [
+            {"file_id": "f1", "word_span": [0, 4]},
+            {"file_id": "f3", "word_span": [0, 3]},
+        ]}],
+    })
+    fixed2 = pass1.enforce_lattice_partition(out2, lats)
     assert fixed2.take_candidates == [], fixed2.take_candidates
-    print("ok  test_enforce_remaps_take_members_onto_split_cuts")
+    print("ok  test_enforce_drops_an_over_grouped_take_member")
 
 
 def test_enforce_splits_a_discontiguous_video_group():
@@ -597,7 +642,8 @@ def main():
     test_no_speech_cut_swallows_atoms_rejects_out_of_range_span()
     test_enforce_splits_a_speech_cut_at_an_atom_owned_gap()
     test_enforce_leaves_a_clean_grouping_untouched()
-    test_enforce_remaps_take_members_onto_split_cuts()
+    test_enforce_keeps_a_genuine_same_line_take_group()
+    test_enforce_drops_an_over_grouped_take_member()
     test_enforce_splits_a_discontiguous_video_group()
     test_enforce_no_longer_isolates_action_atoms()
     test_coverage_fill_readds_every_ungrouped_atom()

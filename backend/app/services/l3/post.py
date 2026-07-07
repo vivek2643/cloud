@@ -285,4 +285,29 @@ def assemble_cut_records(
             caption_zones=list(cut.caption_zones), hero_ts_ms=hero_ts, pace=pace,
             take_group_id=cut.take_group_id, take_role=cut.take_role,
         ))
+    _enforce_one_winner_per_take_group(out)
     return out
+
+
+def _enforce_one_winner_per_take_group(records: List[CutRecord]) -> None:
+    """Exactly one winner per take group (in place). Pass 2 resolves takes and
+    can crown two winners in a group (each member looked like the keeper), which
+    the same-line guard in pass 1 mostly prevents but can't fully guarantee. This
+    is the deterministic backstop: within each group keep the longest cut as the
+    single winner (most complete take) and demote the other winners to plain
+    'take'; a lone winner or a winner-less group is left as is. Outlooks
+    (different-angle members) are never touched."""
+    from collections import defaultdict
+    groups: Dict[str, List[CutRecord]] = defaultdict(list)
+    for r in records:
+        if r.take_group_id:
+            groups[r.take_group_id].append(r)
+    for gid, members in groups.items():
+        winners = [m for m in members if m.take_role == "winner"]
+        if len(winners) <= 1:
+            continue
+        winners.sort(key=lambda m: m.src_out_ms - m.src_in_ms, reverse=True)
+        for m in winners[1:]:
+            m.take_role = "take"
+        logger.info("post: take group %s had %d winners -> kept the longest, demoted %d to 'take'",
+                    gid, len(winners), len(winners) - 1)
