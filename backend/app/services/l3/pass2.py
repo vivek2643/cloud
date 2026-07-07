@@ -44,7 +44,6 @@ class Pass2Cut(BaseModel):
     on_camera: bool | None = None
     junk: bool = False
     junk_reason: str = ""
-    junk_confidence: str = "low"     # "high" -> hidden by default; "low"/doubtful -> shown
     framing: Framing = Field(default_factory=Framing)
     look: Look = Field(default_factory=Look)
     caption_zones: List[Tuple[float, float, float, float]] = Field(default_factory=list)
@@ -80,7 +79,6 @@ def merge_identity_and_visual(
             word_span=identity.word_span, atom_ids=identity.atom_ids,
             label=identity.label, summary=identity.summary, speaker=identity.speaker,
             on_camera=identity.on_camera, junk=identity.junk, junk_reason=identity.junk_reason,
-            junk_confidence=identity.junk_confidence,
             framing=visual.framing, look=visual.look, caption_zones=visual.caption_zones,
             taste_fences=visual.taste_fences, readability_ms=visual.readability_ms,
             natural_sound=identity.natural_sound,
@@ -90,15 +88,14 @@ def merge_identity_and_visual(
 
 
 def apply_junk_suspects(pass2: Pass2Output, pass1: Pass1Output) -> Pass2Output:
-    """Deterministically hide what pass 1 already flagged as clearly unusable
-    (editorial pass, section D -- cue-word trimming). A cut fully contained in
-    a pass-1 junk_suspect span (a leading camera cue that pass 1 split into its
-    own short speech_cut, dead air, etc.) is forced to high-confidence junk so
-    it's hidden by default -- rather than trusting pass 2a to re-flag it from a
-    single still. This runs BEFORE post's action-protection override, so a
-    genuine motion payoff a suspect happened to cover is still resurfaced there
-    (protection wins). Conservative: only EXACT containment, never a partial
-    overlap (which might clip real content)."""
+    """Deterministically carry pass 1's semantic junk calls onto the final
+    cuts. A cut fully contained in a pass-1 junk_suspect span (a leading
+    camera cue that the coverage-fill surfaced as its own recovered cut, dead
+    air, etc.) is marked junk -- rather than trusting pass 2a to re-flag it
+    from a single still. Junk is binary and RECOVERABLE (hidden into the
+    Discarded tray, never deleted), so nothing is lost. Conservative: only
+    EXACT containment, never a partial overlap (which might clip real
+    content)."""
     speech_susp: Dict[str, List[Tuple[int, int, str]]] = {}
     video_susp: Dict[str, List[Tuple[set, str]]] = {}
     for js in pass1.junk_suspects:
@@ -109,7 +106,7 @@ def apply_junk_suspects(pass2: Pass2Output, pass1: Pass1Output) -> Pass2Output:
 
     n = 0
     for c in pass2.cuts:
-        if c.junk and c.junk_confidence == "high":
+        if c.junk:
             continue
         hit = None
         if c.kind == "speech" and c.word_span is not None:
@@ -119,9 +116,9 @@ def apply_junk_suspects(pass2: Pass2Output, pass1: Pass1Output) -> Pass2Output:
             ids = set(c.atom_ids)
             hit = next((r for (sids, r) in video_susp.get(c.file_id, []) if ids <= sids), None)
         if hit is not None:
-            c.junk, c.junk_confidence = True, "high"
+            c.junk = True
             c.junk_reason = c.junk_reason or hit
             n += 1
     if n:
-        logger.info("pass2: %d cut(s) hidden as high-confidence junk from pass-1 suspects", n)
+        logger.info("pass2: %d cut(s) marked junk from pass-1 suspects", n)
     return pass2

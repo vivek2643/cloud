@@ -78,7 +78,6 @@ class IdentityCut(BaseModel):
     on_camera: bool | None = None
     junk: bool = False
     junk_reason: str = ""
-    junk_confidence: str = "low"     # "high" (clearly unusable -> hidden) | "low" (doubtful -> shown)
     natural_sound: bool = False
     take_group_id: str | None = None
     take_role: str | None = None    # "take" | "outlook" | "winner"
@@ -153,16 +152,15 @@ _SYSTEM = (
     "value.\n\n"
     "Per cut, judge from the pixels: label, summary (a best guess from image "
     "+ transcript is fine, and expected), on_camera (does the visible person "
-    "match the diarized speaker), junk (+reason +junk_confidence), and "
-    "natural_sound (does the cut carry sound worth keeping). JUNK POLICY -- "
-    "keep the bar HIGH: set junk_confidence=\"high\" ONLY when the cut is "
-    "clearly unusable (a camera cue like 'and go'/'3-2-1'/'take three', "
-    "pre-roll setup, a silent leading/trailing hold, obvious dead air) -- "
-    "high-confidence junk is hidden from the editor by default. If there is "
-    "ANY doubt it might be wanted, use junk_confidence=\"low\" (it stays "
-    "visible). Never mark an ACTION/motion payoff junk at all. A label must "
-    "name what the cut SHOWS (e.g. 'forehand swing', 'catches the ball'), "
-    "never a mechanical 'settle'/'trailing frames'.\n\n"
+    "match the diarized speaker), junk (+reason), and natural_sound (does the "
+    "cut carry sound worth keeping). JUNK is BINARY and by MEANING: set "
+    "junk=true ONLY when the cut is clearly not part of the piece (a camera "
+    "cue like 'and go'/'3-2-1'/'take three', pre-roll setup, obvious dead "
+    "air). Junk is recoverable -- it's hidden into a Discarded tray, not "
+    "deleted -- but keep the bar HIGH: if there is ANY doubt a cut might be "
+    "wanted, leave junk=false. Never mark an ACTION/motion payoff junk. A "
+    "label must name what the cut SHOWS (e.g. 'forehand swing', 'catches the "
+    "ball'), never a mechanical 'settle'/'trailing frames'.\n\n"
     "Reference every cut by source_ref using the SAME ref string pass 1 (and "
     "the image captions) used for it -- speech_cut[i] or video_group[i], "
     "VERBATIM. Never invent a new ref: every take member is already its own "

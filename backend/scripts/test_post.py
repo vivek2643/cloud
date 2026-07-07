@@ -49,8 +49,7 @@ def test_hero_ts_falls_back_to_midpoint_with_no_blur():
 
 def test_speech_pace_envelope_is_native_speed_only():
     pace = post.compute_pace_envelope(
-        kind="speech", s=1000, e=3000, readability_ms=500, anchors=[], atom_spans=[],
-        action_energy=[0.1] * 40, hop_ms=100, next_cut_start_ms=3000,
+        kind="speech", s=1000, e=3000, readability_ms=500, anchors=[],        action_energy=[0.1] * 40, hop_ms=100, next_cut_start_ms=3000,
         max_tasteful_speed=2.0, min_tasteful_speed=0.5, natural_sound=True,
     )
     assert pace.natural_ms == 2000, pace
@@ -63,29 +62,16 @@ def test_speech_pace_envelope_is_native_speed_only():
 
 def test_video_pace_min_ms_from_anchor_span():
     pace = post.compute_pace_envelope(
-        kind="video", s=1000, e=5000, readability_ms=0, anchors=[2000, 2400], atom_spans=[],
-        action_energy=[0.0] * 60, hop_ms=100, next_cut_start_ms=5000,
+        kind="video", s=1000, e=5000, readability_ms=0, anchors=[2000, 2400],        action_energy=[0.0] * 60, hop_ms=100, next_cut_start_ms=5000,
         max_tasteful_speed=2.0, min_tasteful_speed=0.5, natural_sound=False,
     )
     assert pace.min_ms == 900, pace   # (2400-2000) + 2*250
     print("ok  test_video_pace_min_ms_from_anchor_span")
 
 
-def test_video_pace_min_ms_from_move_completion():
-    pace = post.compute_pace_envelope(
-        kind="video", s=1000, e=5000, readability_ms=0, anchors=[],
-        atom_spans=[(1000, 2500, "pan"), (2500, 3200, "hold")],
-        action_energy=[0.0] * 60, hop_ms=100, next_cut_start_ms=5000,
-        max_tasteful_speed=2.0, min_tasteful_speed=0.5, natural_sound=False,
-    )
-    assert pace.min_ms == 1500, pace   # the pan atom's own 1500ms span
-    print("ok  test_video_pace_min_ms_from_move_completion")
-
-
 def test_video_pace_max_ms_extends_through_flatline():
     pace = post.compute_pace_envelope(
-        kind="video", s=1000, e=2000, readability_ms=0, anchors=[], atom_spans=[],
-        action_energy=[0.1] * 100, hop_ms=100, next_cut_start_ms=8000,
+        kind="video", s=1000, e=2000, readability_ms=0, anchors=[],        action_energy=[0.1] * 100, hop_ms=100, next_cut_start_ms=8000,
         max_tasteful_speed=2.0, min_tasteful_speed=0.5, natural_sound=False,
     )
     assert pace.max_ms == 7000, pace   # flat all the way to the ceiling (8000-1000)
@@ -96,8 +82,7 @@ def test_video_pace_max_ms_stops_at_departure_from_flatline():
     ae = [0.1] * 100
     ae[30] = 0.9   # departs the flat band at ts=3000
     pace = post.compute_pace_envelope(
-        kind="video", s=1000, e=2000, readability_ms=0, anchors=[], atom_spans=[],
-        action_energy=ae, hop_ms=100, next_cut_start_ms=8000,
+        kind="video", s=1000, e=2000, readability_ms=0, anchors=[],        action_energy=ae, hop_ms=100, next_cut_start_ms=8000,
         max_tasteful_speed=2.0, min_tasteful_speed=0.5, natural_sound=False,
     )
     assert pace.max_ms == 2000, pace   # 3000 - s(1000)
@@ -106,8 +91,7 @@ def test_video_pace_max_ms_stops_at_departure_from_flatline():
 
 def test_pace_levels_partial_saturation_repeats_nearest_reachable():
     pace = post.compute_pace_envelope(
-        kind="video", s=0, e=1000, readability_ms=0, anchors=[], atom_spans=[],
-        action_energy=[1.0] * 10, hop_ms=100, next_cut_start_ms=1000,
+        kind="video", s=0, e=1000, readability_ms=0, anchors=[],        action_energy=[1.0] * 10, hop_ms=100, next_cut_start_ms=1000,
         max_tasteful_speed=1.2, min_tasteful_speed=0.25, natural_sound=False,
     )
     assert pace.levels == [0.5, 0.8, 1.0, 1.2, 1.2], pace.levels
@@ -117,8 +101,7 @@ def test_pace_levels_partial_saturation_repeats_nearest_reachable():
 
 def test_pace_levels_zero_intrinsic_velocity_maxes_every_level():
     pace = post.compute_pace_envelope(
-        kind="video", s=0, e=1000, readability_ms=0, anchors=[], atom_spans=[],
-        action_energy=[0.0] * 10, hop_ms=100, next_cut_start_ms=1000,
+        kind="video", s=0, e=1000, readability_ms=0, anchors=[],        action_energy=[0.0] * 10, hop_ms=100, next_cut_start_ms=1000,
         max_tasteful_speed=2.0, min_tasteful_speed=0.5, natural_sound=False,
     )
     assert pace.levels == [2.0] * 5, pace.levels
@@ -188,9 +171,9 @@ def _words():
 def _atoms():
     return [
         Atom(atom_id=0, file_id="f1", start_ms=800, end_ms=1400, state_in="speech_edge",
-             state_out="shot", action_energy=0.2, camera_desc="hold", coherence=0.9),
+             state_out="shot", action_energy=0.2, coherence=0.9),
         Atom(atom_id=1, file_id="f1", start_ms=1400, end_ms=2000, state_in="shot",
-             state_out="clip_edge", action_energy=0.4, camera_desc="pan", coherence=0.8),
+             state_out="clip_edge", action_energy=0.4, coherence=0.8),
     ]
 
 
@@ -216,44 +199,43 @@ def test_assemble_cut_records_end_to_end():
     assert (speech.src_in_ms, speech.src_out_ms) == (0, 800), speech
     assert (video.src_in_ms, video.src_out_ms) == (800, 2000), video
     assert video.hero_ts_ms == 1700, video   # anchor inside the video span wins
-    assert video.pace.min_ms == 600, video.pace   # move-completion floor (pan atom, 600ms)
+    assert video.pace.min_ms == 500, video.pace   # anchor-span floor: 0 + 2*250 (single anchor)
     assert video.pace.max_ms == 1200, video.pace   # last cut in file -> capped at natural span
     assert speech.pace.levels == [1.0] * 5
     print("ok  test_assemble_cut_records_end_to_end")
 
 
-def test_protected_action_overrides_model_junk():
-    # A video cut the model called junk, but the span carries impact anchors
-    # -> must be un-junked (the "if doubtful, show" rule; a real action can
-    # never be silently discarded as "trailing junk").
+def test_junk_flag_is_preserved_verbatim():
+    # Deterministic-keep: post no longer second-guesses the model's semantic
+    # junk call with a hardcoded energy/anchor threshold. Whatever the model
+    # (or pass-1 suspects) decided is carried through verbatim -- junk is a
+    # recoverable label shown in the Discarded tray, never a code override.
     atoms = [Atom(atom_id=0, file_id="f1", start_ms=0, end_ms=2000, state_in="clip_edge",
-                  state_out="clip_edge", action_energy=0.6, camera_desc="handheld", coherence=0.5)]
+                  state_out="clip_edge", action_energy=0.6, coherence=0.5)]
     lat = Lattice(file_id="f1", duration_ms=2000, words=[], turns=[], hints=[], atoms=atoms)
     motion = {"hop_ms": 100, "blur": [0.5] * 20, "action_energy": [0.6] * 20,
               "action_points": [{"ts_ms": 500}, {"ts_ms": 1200}, {"ts_ms": 1600}]}
     p2 = Pass2Output(cuts=[
         Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1", atom_ids=[0],
-                 label="Trailing frames", summary="trailing", junk=True, junk_reason="trailing junk"),
+                 label="cue", summary="and go", junk=True, junk_reason="production cue"),
     ])
     rec = post.assemble_cut_records(p2, {"f1": lat}, {"f1": motion}, {})[0]
-    assert rec.junk is False and rec.junk_reason == "", rec
-    print("ok  test_protected_action_overrides_model_junk")
+    assert rec.junk is True and rec.junk_reason == "production cue", rec
+    print("ok  test_junk_flag_is_preserved_verbatim")
 
 
-def test_still_junk_when_no_action_signal():
-    # A genuinely still trailing frame (no anchors, low energy) stays junk --
-    # the bar is high enough that protection doesn't resurrect dead air.
+def test_non_junk_stays_non_junk():
     atoms = [Atom(atom_id=0, file_id="f1", start_ms=0, end_ms=2000, state_in="clip_edge",
-                  state_out="clip_edge", action_energy=0.05, camera_desc="hold", coherence=0.95)]
+                  state_out="clip_edge", action_energy=0.05, coherence=0.95)]
     lat = Lattice(file_id="f1", duration_ms=2000, words=[], turns=[], hints=[], atoms=atoms)
     motion = {"hop_ms": 100, "blur": [0.5] * 20, "action_energy": [0.05] * 20, "action_points": []}
     p2 = Pass2Output(cuts=[
         Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1", atom_ids=[0],
-                 label="Trailing frame", summary="dead air", junk=True, junk_reason="trailing junk"),
+                 label="hold", summary="a quiet hold", junk=False),
     ])
     rec = post.assemble_cut_records(p2, {"f1": lat}, {"f1": motion}, {})[0]
-    assert rec.junk is True, rec
-    print("ok  test_still_junk_when_no_action_signal")
+    assert rec.junk is False, rec
+    print("ok  test_non_junk_stays_non_junk")
 
 
 def test_assemble_raises_on_unknown_file_id():
@@ -315,7 +297,6 @@ def main():
     test_hero_ts_falls_back_to_midpoint_with_no_blur()
     test_speech_pace_envelope_is_native_speed_only()
     test_video_pace_min_ms_from_anchor_span()
-    test_video_pace_min_ms_from_move_completion()
     test_video_pace_max_ms_extends_through_flatline()
     test_video_pace_max_ms_stops_at_departure_from_flatline()
     test_pace_levels_partial_saturation_repeats_nearest_reachable()
@@ -328,8 +309,8 @@ def main():
     test_validate_no_overlap_allows_middle_gap()
     test_validate_no_overlap_allows_no_cuts()
     test_assemble_cut_records_end_to_end()
-    test_protected_action_overrides_model_junk()
-    test_still_junk_when_no_action_signal()
+    test_junk_flag_is_preserved_verbatim()
+    test_non_junk_stays_non_junk()
     test_assemble_raises_on_unknown_file_id()
     test_assemble_raises_on_unresolvable_atom_ids()
     test_assemble_raises_on_overlap_between_cuts()

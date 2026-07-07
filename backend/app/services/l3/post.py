@@ -60,7 +60,6 @@ class CutRecord:
     on_camera: Optional[bool]
     junk: bool
     junk_reason: str
-    junk_confidence: str                   # "high" -> hidden by default; "low"/doubtful -> shown
     framing: Dict[str, Any]
     look: Dict[str, Any]
     caption_zones: List[Tuple[float, float, float, float]]
@@ -77,7 +76,6 @@ class CutRecord:
             "atom_ids": self.atom_ids, "label": self.label, "summary": self.summary,
             "speaker": self.speaker, "on_camera": self.on_camera,
             "junk": self.junk, "junk_reason": self.junk_reason,
-            "junk_confidence": self.junk_confidence,
             "framing": self.framing, "look": self.look,
             "caption_zones": [list(z) for z in self.caption_zones],
             "hero_ts_ms": self.hero_ts_ms, "pace": self.pace.to_dict(),
@@ -127,14 +125,6 @@ def _flatline_bound_ms(action_energy: List[float], hop_ms: int, from_ms: int, ce
     return ceiling_ms
 
 
-def _move_completion_ms(atom_spans: List[Tuple[int, int, str]]) -> int:
-    """The longest deliberate-pan atom's own duration inside this cut -- a
-    cut can't be tightened shorter than the camera move it contains without
-    the move reading as truncated."""
-    pans = [e - s for s, e, desc in atom_spans if desc == "pan"]
-    return max(pans) if pans else 0
-
-
 def _anchor_span_ms(anchors: List[int]) -> int:
     if not anchors:
         return 0
@@ -159,7 +149,7 @@ def _pace_levels(intrinsic_velocity: float, min_speed: float, max_speed: float) 
 
 def compute_pace_envelope(
     *, kind: str, s: int, e: int, readability_ms: int, anchors: List[int],
-    atom_spans: List[Tuple[int, int, str]], action_energy: List[float], hop_ms: int,
+    action_energy: List[float], hop_ms: int,
     next_cut_start_ms: int, max_tasteful_speed: float, min_tasteful_speed: float,
     natural_sound: bool,
 ) -> PaceEnvelope:
@@ -173,7 +163,10 @@ def compute_pace_envelope(
                             max_ms=natural_ms, levels=[1.0] * len(PACE_LEVEL_TARGETS),
                             energy_grade=grade, natural_sound=natural_sound)
 
-    min_ms = max(readability_ms, _anchor_span_ms(anchors), _move_completion_ms(atom_spans))
+    # min_ms floors tightening at readability + the anchor envelope (impacts
+    # stay in frame). No camera-move floor: the derived pan label is gone
+    # (deterministic-keep), and pace stays purely signal-driven.
+    min_ms = max(readability_ms, _anchor_span_ms(anchors))
     flatline_end_ms = _flatline_bound_ms(action_energy, hop_ms, e, next_cut_start_ms)
     max_ms = max(natural_ms, flatline_end_ms - s)
     levels = _pace_levels(mean_ae, min_tasteful_speed, max_tasteful_speed)
@@ -199,43 +192,15 @@ def _validate_no_overlap(file_id: str, spans: List[Tuple[int, int]], duration_ms
 
 
 # --------------------------------------------------------------------------
-# Action protection: a genuine motion payoff can never be silently discarded.
-#
-# Observed against real Reel-trail data: the model labeled high-motion,
-# multi-anchor END-OF-CLIP spans as "trailing junk" ("Trailing frames after
-# carbs line", "Pointing gesture at clip end") -- and the frontend hides junk,
-# so the action "never comes up". This is exactly the user's rule inverted:
-# "if doubtful, SHOW." A span carrying impact anchors or strong subject motion
-# is a payoff, not trailing dead air, so its junk flag is overridden here in
-# code -- the model does not get the final say on discarding a real action.
-#
-# Video-only (visual action); speech junk -- cue words, false starts -- is
-# untouched. The bar is deliberately high enough that a truly still trailing
-# frame (no anchors, low energy) still stays junk.
-# --------------------------------------------------------------------------
-
-ACTION_PROTECT_MIN_ANCHORS = 2       # >= this many impact anchors => real payoff
-ACTION_PROTECT_ENERGY = 0.45         # or mean subject-motion energy over the span
-
-
-def _mean_action_energy(motion: Dict[str, Any], s: int, e: int) -> float:
-    hop = int(motion.get("hop_ms") or 0)
-    ae = motion.get("action_energy") or []
-    if hop <= 0 or not ae:
-        return 0.0
-    lo, hi = max(0, s // hop), min(len(ae), max(s // hop + 1, e // hop))
-    seg = ae[lo:hi]
-    return sum(seg) / len(seg) if seg else 0.0
-
-
-def _is_protected_action(kind: str, anchors: List[int], mean_energy: float) -> bool:
-    return kind == "video" and (
-        len(anchors) >= ACTION_PROTECT_MIN_ANCHORS or mean_energy >= ACTION_PROTECT_ENERGY
-    )
-
-
-# --------------------------------------------------------------------------
 # Assembly
+#
+# No action-protection override here any more (deterministic-keep): it used
+# hardcoded thresholds (>=2 anchors, mean_energy>=0.45) to un-junk a span the
+# model discarded -- exactly the band-aid the plan removes. Keeping a real
+# action is now guaranteed upstream instead: pass 1's total-coverage fill
+# means an action is never silently dropped, and junk is a recoverable label
+# (shown in the Discarded tray), never a deletion. Code no longer second-
+# guesses the model's semantic junk call with a number.
 # --------------------------------------------------------------------------
 
 def assemble_cut_records(
@@ -250,13 +215,12 @@ def assemble_cut_records(
     for each. Raises ``ValueError`` (stage ``post``, per the plan's "no
     fallback" rule) on any invariant violation -- the caller marks the ingest
     run ``failed`` for re-run."""
-    resolved: List[Tuple[Pass2Cut, int, int, List[int], List[Tuple[int, int, str]]]] = []
+    resolved: List[Tuple[Pass2Cut, int, int, List[int]]] = []
     for cut in pass2_output.cuts:
         lattice = lattices.get(cut.file_id)
         if lattice is None:
             raise ValueError(f"assemble_cut_records: unknown file_id {cut.file_id!r} ({cut.source_ref})")
 
-        atom_spans: List[Tuple[int, int, str]] = []
         if cut.kind == "speech":
             silences = silences_by_file.get(cut.file_id, [])
             s, e = resolve_speech_span_ms(lattice.words, lattice.atoms, cut.word_span, silences)
@@ -268,11 +232,10 @@ def assemble_cut_records(
                                  f"in {cut.file_id}")
             s = min(a.start_ms for a in members)
             e = max(a.end_ms for a in members)
-            atom_spans = [(a.start_ms, a.end_ms, a.camera_desc) for a in members]
 
         motion = motion_by_file.get(cut.file_id, {})
         anchors = _anchors_in(motion, s, e)
-        resolved.append((cut, s, e, anchors, atom_spans))
+        resolved.append((cut, s, e, anchors))
 
     by_file: Dict[str, List[int]] = {}
     for idx, (cut, *_rest) in enumerate(resolved):
@@ -298,7 +261,7 @@ def assemble_cut_records(
             next_start[i] = resolved[idxs[pos + 1]][1] if pos + 1 < len(idxs) else duration_ms
 
     out: List[CutRecord] = []
-    for idx, (cut, s, e, anchors, atom_spans) in enumerate(resolved):
+    for idx, (cut, s, e, anchors) in enumerate(resolved):
         motion = motion_by_file.get(cut.file_id, {})
         blur = motion.get("blur") or []
         hop_ms = int(motion.get("hop_ms") or 0)
@@ -306,26 +269,18 @@ def assemble_cut_records(
         hero_ts = pick_hero_ts_ms(anchors, blur, hop_ms, s, e)
         pace = compute_pace_envelope(
             kind=cut.kind, s=s, e=e, readability_ms=cut.readability_ms, anchors=anchors,
-            atom_spans=atom_spans, action_energy=action_energy, hop_ms=hop_ms,
+            action_energy=action_energy, hop_ms=hop_ms,
             next_cut_start_ms=next_start[idx],
             max_tasteful_speed=cut.taste_fences.max_tasteful_speed,
             min_tasteful_speed=cut.taste_fences.min_tasteful_speed,
             natural_sound=cut.natural_sound,
         )
 
-        junk, junk_reason, junk_conf = cut.junk, cut.junk_reason, cut.junk_confidence
-        if junk and _is_protected_action(cut.kind, anchors, _mean_action_energy(motion, s, e)):
-            logger.info("post: overriding junk on %s [%d-%d] -- protected action "
-                        "(%d anchors, mean_energy=%.2f), model said %r",
-                        cut.source_ref, s, e, len(anchors),
-                        _mean_action_energy(motion, s, e), cut.junk_reason)
-            junk, junk_reason, junk_conf = False, "", "low"
-
         out.append(CutRecord(
             file_id=cut.file_id, src_in_ms=s, src_out_ms=e, kind=cut.kind,
             word_span=cut.word_span, atom_ids=cut.atom_ids, label=cut.label, summary=cut.summary,
-            speaker=cut.speaker, on_camera=cut.on_camera, junk=junk, junk_reason=junk_reason,
-            junk_confidence=junk_conf,
+            speaker=cut.speaker, on_camera=cut.on_camera,
+            junk=cut.junk, junk_reason=cut.junk_reason,
             framing=cut.framing.model_dump(), look=cut.look.model_dump(),
             caption_zones=list(cut.caption_zones), hero_ts_ms=hero_ts, pace=pace,
             take_group_id=cut.take_group_id, take_role=cut.take_role,

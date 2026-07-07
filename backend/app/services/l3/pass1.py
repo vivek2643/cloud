@@ -88,64 +88,39 @@ class Pass1Output(BaseModel):
 # --------------------------------------------------------------------------
 
 _SYSTEM = (
-    "You are ingesting raw footage for a video editor. For every clip in "
-    "this project you are given its full word-timed, diarized transcript, a "
-    "table of VIDEO ATOMS (deterministic boundaries: shot cuts, disturbances, "
-    "transitions, and action beats; each atom is also labelled with its "
-    "dominant camera behavior -- hold / pan / handheld -- which is a LABEL, "
-    "not a boundary), and HINTS about where long pauses and speaker changes "
-    "fall in the transcript.\n\n"
-    "Your job, across ALL clips at once:\n"
-    "1. GROUP the words into speech_cuts -- each one coherent spoken beat (a "
-    "sentence, a thought, an exchange). Decide the boundaries yourself using "
-    "word indices; the hints inform you, they never bind you. A speaker "
-    "change almost always starts a new cut. HARD CONSTRAINT: a speech_cut "
-    "must lie within ONE continuous stretch of speech -- it must never span "
-    "across a 'long pause' hint, because the video atoms own that silent "
-    "territory (grouping across one makes the cut's span swallow video "
-    "atoms, which is structurally invalid). If the same thought resumes "
-    "after a long pause, emit separate speech_cuts on each side of it.\n"
-    "2. Find TAKE CANDIDATES: near-identical spoken lines recurring across "
-    "clips (a re-take) or within one clip. HARD CONSTRAINT: every take "
-    "member must be exactly one whole speech_cut (identical file_id and "
-    "word_span) -- a take boundary is always a hard cut boundary, so if a "
-    "repeated line currently sits inside a bigger group, split the group so "
-    "the take stands alone as its own speech_cut.\n"
-    "3. SELECT and GROUP video atoms (by atom_id) into the shots worth keeping. "
-    "This is a SELECTION, not a partition -- you need NOT place every atom in a "
-    "group. Group atoms that read as one continuous, USABLE moment (a real held "
-    "composition, a clean b-roll shot). LEAVE OUT pure connective tissue -- "
-    "pre-roll before the first word, brief transitional holds between beats, "
-    "dead-air gaps: those atoms are simply DROPPED from the edit, not tiled "
-    "(coverage is not required). An atom tagged ACTION is a subject-motion "
-    "PAYOFF (a hit, catch, jump, swing); it already carries its own wind-up / "
-    "follow-through, so keep each ACTION atom as its OWN video_tentative_group, "
-    "payoff intact, and never flag it junk.\n"
-    "4. Flag JUNK. You have the WHOLE project's transcript and full context, "
-    "so you can tell what is part of the delivered message from what is not. "
-    "Apply TWO different bars:\n"
-    "   (a) PRODUCTION NOISE -- words that are NOT part of the intended "
-    "message: spoken direction/cues used to start, stop, reset or count into a "
-    "take, acknowledgements exchanged with an off-camera director/operator, and "
-    "clear self-corrections, restarts or abandoned false starts where the "
-    "speaker resets and re-delivers the line. DIG for these AGGRESSIVELY -- "
-    "this text-only pass is the ONE place with the context to catch them, so "
-    "err toward removing them. Pay special attention to the very START and END "
-    "of each clip and to short stray utterances sitting next to an action beat, "
-    "which is where these cues almost always live. When a beat opens or closes "
-    "with such noise, SPLIT it: emit the noise as its OWN short speech_cut AND "
-    "list that exact span in junk_suspects with a short reason; the real beat "
-    "is a separate speech_cut. These are clearly unusable -- flag them.\n"
-    "   (b) BORDERLINE material -- a slightly awkward but genuinely delivered "
-    "sentence, ambient dead air, plain footage: stay CONSERVATIVE. If in doubt, "
-    "leave it UNFLAGGED and visible. When something IS recognizable junk, FLAG "
-    "it (so it stays recoverable) rather than silently dropping it; never flag "
-    "an ACTION atom as junk.\n"
-    "5. Write a one-paragraph project_summary and a one-line summary per "
-    "clip.\n\n"
-    "Boundaries you emit are WORD INDICES (speech_cuts, take word_spans) or "
-    "ATOM IDS (video_tentative_groups) -- NEVER a millisecond timestamp. "
-    "Exact timing is derived from those, by code, afterward."
+    "You are the editing brain preparing a raw-footage shoot for an editor. You "
+    "see the WHOLE project at once -- every clip and everything the machine "
+    "measured -- so you understand what this footage is and what it is for.\n\n"
+    "Given per clip:\n"
+    "  - TRANSCRIPT: the full word-timed, diarized transcript. Words are numbered; "
+    "[Sx] is the diarized speaker. Diarization is only a rough guide -- it often "
+    "fails to split a quick off-camera call-out ('go', 'action', 'cut') from the "
+    "on-camera line, so trust the WORDS and their MEANING over the speaker tag.\n"
+    "  - VIDEO ATOMS: contiguous non-speech spans, each with raw signals -- "
+    "act / peak = mean / peak subject-motion energy (0..1), mot = camera-motion "
+    "magnitude (0..1), coh = camera coherence (0..1), anchors = timestamps of "
+    "detected motion impacts. Read these to judge what each shot is doing.\n"
+    "  - HINTS: where speaker changes and long pauses fall (informational).\n\n"
+    "Produce, across all clips:\n"
+    "  - speech_cuts: coherent spoken beats, as word-index ranges.\n"
+    "  - take_candidates: near-identical retakes of the same line (within or across "
+    "clips); each member is one whole speech_cut.\n"
+    "  - video_tentative_groups: visual moments worth keeping, each a group of "
+    "atom_ids that belong together as one continuous shot or action.\n"
+    "  - junk_suspects: spans that are NOT part of the delivered piece. Be "
+    "aggressive about the one closed class you alone can catch from meaning: spoken "
+    "PRODUCTION CUES and counts aimed at the crew, not the audience (e.g. go / "
+    "action / cut / rolling / set / reset / 3-2-1), asides to an off-camera "
+    "operator, and clear FALSE STARTS the speaker then re-delivers (e.g. 'sorry', "
+    "'let me redo that', 'take two'). Outside that class keep the bar HIGH -- if "
+    "there is any doubt a span might be wanted, do NOT flag it.\n"
+    "  - project_summary, and a one-line summary per clip.\n\n"
+    "You are the editor's judgment: how to group, what belongs together, what is a "
+    "cue versus a real line -- that is yours to decide from the evidence. Output "
+    "ONLY categories, indices, ids and text: word ranges, atom ids, group ids, "
+    "labels, reasons. NEVER emit a score, confidence, threshold, or any number you "
+    "invented -- every measurement and every millisecond comes from code. Emit WORD "
+    "INDICES (speech) and ATOM IDS (video), never timestamps."
 )
 
 
@@ -276,29 +251,6 @@ def _span_pieces(words: List[dict], atoms: List[Any], span: Tuple[int, int]) -> 
     return pieces
 
 
-def _isolate_action_atoms(lattice: Lattice, run: List[int]) -> List[List[int]]:
-    """A contiguous atom run split so every ACTION atom (a carved subject-motion
-    payoff, section C) stands ALONE as its own group -- a payoff is a
-    first-class candidate cut and must never be swallowed by an adjacent
-    hold/pan group, whatever pass 1 grouped. The model owns which calm atoms
-    belong together; the lattice owns that an action is its own beat."""
-    by_id = {a.atom_id: a for a in lattice.atoms}
-    out: List[List[int]] = []
-    cur: List[int] = []
-    for aid in run:
-        atom = by_id.get(aid)
-        if atom is not None and atom.is_action:
-            if cur:
-                out.append(cur)
-                cur = []
-            out.append([aid])
-        else:
-            cur.append(aid)
-    if cur:
-        out.append(cur)
-    return out
-
-
 def _contiguous_atom_runs(lattice: Lattice, atom_ids: List[int]) -> List[List[int]]:
     """``atom_ids`` split into time-contiguous runs (next.start_ms ==
     cur.end_ms). Unknown ids are dropped. A video group must be one
@@ -318,17 +270,27 @@ def _contiguous_atom_runs(lattice: Lattice, atom_ids: List[int]) -> List[List[in
 
 
 def enforce_lattice_partition(output: Pass1Output, lattices: Dict[str, Lattice]) -> Pass1Output:
-    """Deterministically repair pass 1's grouping against the lattice:
+    """Deterministically repair pass 1's grouping against the lattice, and
+    guarantee TOTAL COVERAGE -- the load-bearing rule of deterministic-keep
+    (cuts_v3_deterministic_keep.plan.md): the model chooses MEANING (grouping,
+    takes, what is junk), but it can never silently drop a word or an atom.
+    Anything it leaves out of every group is surfaced as a recovered candidate;
+    the ONLY way something disappears is an explicit, recoverable junk label.
 
       1. Split any speech_cut at gaps that contain a video atom (that
          territory belongs to the atoms; see block comment above).
-      2. Remap every take member onto the (possibly split) speech_cut that
+      2. COVERAGE FILL (speech): every transcript word the model left out of
+         all speech_cuts is re-added as a recovered cut (split at atom-owned
+         gaps).
+      3. Remap every take member onto the (possibly split) speech_cut that
          contains most of its words -- so member == whole cut always holds
          downstream (pass 2a source_refs, image_plan joins). Groups left
          with fewer than two distinct members are dropped.
-      3. Split any video_tentative_group at time discontinuities (see
+      4. Split any video_tentative_group at time discontinuities (see
          ``_contiguous_atom_runs``) -- a group must be one continuous
          stretch, never a bridge across speech.
+      5. COVERAGE FILL (video): every atom the model left out of all groups
+         is re-added, contiguous ungrouped atoms folded into one group.
 
     Post-condition asserted: no speech cut swallows an atom."""
     new_cuts: List[SpeechCut] = []
@@ -347,6 +309,33 @@ def enforce_lattice_partition(output: Pass1Output, lattices: Dict[str, Lattice])
                 new_cuts.append(SpeechCut(file_id=sc.file_id, word_span=(pa, pb),
                                           label=f"{sc.label} ({j}/{len(pieces)})",
                                           speaker_ids=list(sc.speaker_ids)))
+
+    # Coverage fill (speech): the model can flag a word junk, but it can't
+    # silently drop it. Any word covered by no speech_cut becomes a recovered
+    # cut, split at atom-owned gaps so it never swallows an atom.
+    for file_id, lattice in lattices.items():
+        if not lattice.words:
+            continue
+        covered = [False] * len(lattice.words)
+        for sc in new_cuts:
+            if sc.file_id != file_id:
+                continue
+            a, b = sc.word_span
+            for k in range(max(0, a), min(len(covered), b + 1)):
+                covered[k] = True
+        i = 0
+        while i < len(covered):
+            if covered[i]:
+                i += 1
+                continue
+            j = i
+            while j < len(covered) and not covered[j]:
+                j += 1
+            logger.info("pass1 enforce: recovering uncovered words[%d-%d] in %s", i, j - 1, file_id)
+            for pa, pb in _span_pieces(lattice.words, lattice.atoms, (i, j - 1)):
+                new_cuts.append(SpeechCut(file_id=file_id, word_span=(pa, pb),
+                                          label="(recovered)", speaker_ids=[]))
+            i = j
 
     def _dominant_cut_span(file_id: str, span: Tuple[int, int]) -> Tuple[int, int] | None:
         best: Tuple[int, int] | None = None
@@ -381,31 +370,48 @@ def enforce_lattice_partition(output: Pass1Output, lattices: Dict[str, Lattice])
         if lattice is None:
             new_groups.append(vg)
             continue
+        # Contiguity split only (structural: a group must be one time-continuous
+        # run, else its resolved span brackets a speech beat -- an unfixable
+        # cross-kind overlap). NOT action isolation: grouping/merging is the
+        # model's job now (signal-judge), so a swing and its follow-through can
+        # ride in one group if the model says so.
         runs = _contiguous_atom_runs(lattice, vg.atom_ids)
-        pieces = [p for run in runs for p in _isolate_action_atoms(lattice, run)]
-        if len(pieces) == 1 and pieces[0] == list(vg.atom_ids):
+        if len(runs) == 1 and runs[0] == list(vg.atom_ids):
             new_groups.append(vg)
         else:
             logger.info("pass1 enforce: splitting video group atoms=%s into %d "
-                        "piece(s) (contiguity + action isolation)", vg.atom_ids, len(pieces))
-            for run in pieces:
+                        "contiguous run(s)", vg.atom_ids, len(runs))
+            for run in runs:
                 new_groups.append(VideoTentativeGroup(file_id=vg.file_id, atom_ids=run))
 
-    # boundaries-v2: grouping is now a SELECTION -- the model may (and should)
-    # drop connective tissue by leaving it ungrouped. But an ACTION atom is a
-    # payoff that must ALWAYS surface, so we don't leave that to the model's
-    # whim: any is_action atom not already in some group is re-added as its own
-    # group. Deterministic guarantee, independent of what pass 1 chose to keep.
+    # Coverage fill (video): every atom must land in some group. Grouping is
+    # the model's call, but an atom it left out of every group is not lost --
+    # it's re-added, with contiguous ungrouped atoms folded into one recovered
+    # group (coverage without confetti). Junk stays the model's recoverable
+    # label; nothing vanishes for merely being ungrouped.
     grouped_ids: Dict[str, set] = {}
     for vg in new_groups:
         grouped_ids.setdefault(vg.file_id, set()).update(vg.atom_ids)
     for file_id, lattice in lattices.items():
         have = grouped_ids.get(file_id, set())
-        for atom in lattice.atoms:
-            if atom.is_action and atom.atom_id not in have:
-                logger.info("pass1 enforce: re-adding dropped ACTION atom %d in %s as its own group",
-                            atom.atom_id, file_id)
-                new_groups.append(VideoTentativeGroup(file_id=file_id, atom_ids=[atom.atom_id]))
+        ungrouped = sorted((a for a in lattice.atoms if a.atom_id not in have),
+                           key=lambda a: a.start_ms)
+        if not ungrouped:
+            continue
+        run: List[Any] = []
+        for a in ungrouped:
+            if run and run[-1].end_ms == a.start_ms:
+                run.append(a)
+            else:
+                if run:
+                    new_groups.append(VideoTentativeGroup(
+                        file_id=file_id, atom_ids=[x.atom_id for x in run]))
+                run = [a]
+        if run:
+            new_groups.append(VideoTentativeGroup(
+                file_id=file_id, atom_ids=[x.atom_id for x in run]))
+        logger.info("pass1 enforce: recovered %d ungrouped atom(s) in %s",
+                    len(ungrouped), file_id)
 
     enforced = output.model_copy(update={"speech_cuts": new_cuts, "take_candidates": new_takes,
                                          "video_tentative_groups": new_groups})

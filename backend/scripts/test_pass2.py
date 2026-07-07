@@ -87,8 +87,9 @@ def test_merge_identity_and_visual_empty_is_a_noop():
 
 
 def test_apply_junk_suspects_hides_a_contained_speech_cut():
-    # A leading camera cue pass 1 split into its own short speech_cut and also
-    # listed as a junk_suspect -> forced to high-confidence junk (hidden).
+    # A leading camera cue the coverage-fill surfaced as its own recovered
+    # speech_cut and pass 1 listed as a junk_suspect -> marked junk (binary,
+    # recoverable; hidden into the Discarded tray).
     p2 = pass2.Pass2Output(cuts=[
         pass2.Pass2Cut(source_ref="speech_cut[0]", kind="speech", file_id="f1", word_span=(0, 1),
                        label="and go", summary="cue"),
@@ -97,7 +98,7 @@ def test_apply_junk_suspects_hides_a_contained_speech_cut():
     ])
     p1 = Pass1Output(junk_suspects=[JunkSuspect(file_id="f1", word_span=(0, 1), reason="camera cue")])
     out = pass2.apply_junk_suspects(p2, p1)
-    assert out.cuts[0].junk is True and out.cuts[0].junk_confidence == "high", out.cuts[0]
+    assert out.cuts[0].junk is True, out.cuts[0]
     assert out.cuts[0].junk_reason == "camera cue"
     assert out.cuts[1].junk is False, out.cuts[1]   # real content untouched
     print("ok  test_apply_junk_suspects_hides_a_contained_speech_cut")

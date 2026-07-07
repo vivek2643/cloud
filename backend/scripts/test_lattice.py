@@ -140,15 +140,16 @@ def test_camera_move_no_longer_splits_an_atom():
     print("ok  test_camera_move_no_longer_splits_an_atom")
 
 
-def test_continuous_pan_is_one_atom_labeled_pan():
-    """A whole-span deliberate move (high coherence + stability) is a single
-    atom classified 'pan' -- motion as a LABEL, not a boundary."""
+def test_continuous_pan_is_one_atom():
+    """A whole-span deliberate move (constant camera_motion, so a single
+    energy regime) is ONE atom -- motion is a LABEL carried on the atom
+    (camera_motion), never a boundary. No derived cam= label any more."""
     n = 100
     motion = _flat_motion(n, camera_motion=0.5, coherence=0.9, stability=0.8)
     atoms = lt.build_atoms("f1", 10_000, motion, None, [])
     assert len(atoms) == 1, atoms
-    assert atoms[0].camera_desc == "pan", atoms[0]
-    print("ok  test_continuous_pan_is_one_atom_labeled_pan")
+    assert abs(atoms[0].camera_motion - 0.5) < 1e-6, atoms[0]
+    print("ok  test_continuous_pan_is_one_atom")
 
 
 def test_disturbance_no_longer_splits_an_atom():
@@ -189,48 +190,47 @@ def test_transition_point_degenerate_splits_an_atom():
 def test_no_motion_or_scene_data_is_a_safe_noop():
     atoms = lt.build_atoms("f1", 5000, None, None, [])
     assert len(atoms) == 1, atoms
-    assert atoms[0].camera_desc == "hold"
     assert atoms[0].action_energy == 0.0 and atoms[0].coherence == 0.0
     print("ok  test_no_motion_or_scene_data_is_a_safe_noop")
 
 
-def test_action_point_is_carved_into_its_own_action_atom():
-    """Section C: a subject-motion payoff (an action_point) is carved into its
-    OWN atom, typed is_action, padded around the impact -- not left buried in a
-    long calm hold. The calm atoms on either side are not actions."""
+def test_energy_burst_becomes_its_own_active_atom():
+    """Deterministic-keep atomizer: with a low baseline and a high-energy
+    burst in the middle, the clip's OWN Otsu split carves the burst into its
+    own active atom (is_action=True); the quiet holds on either side are not
+    actions. No hardcoded energy floor -- the split is data-driven."""
+    n = 100
+    motion = _flat_motion(n, action=0.05)
+    motion["action_energy"] = [0.05] * 40 + [0.9] * 20 + [0.05] * 40
+    atoms = lt.build_atoms("f1", 10_000, motion, None, [])
+    active = [a for a in atoms if a.is_action]
+    assert len(active) == 1, atoms
+    assert active[0].start_ms == 4000 and active[0].end_ms == 6000, active[0]
+    assert all(not a.is_action for a in atoms if a is not active[0]), atoms
+    print("ok  test_energy_burst_becomes_its_own_active_atom")
+
+
+def test_action_points_annotate_but_do_not_carve():
+    """action_points are ANNOTATIONS now (anchors@), not carvers. With flat
+    energy there is no regime split, so the whole clip is one atom that simply
+    CARRIES the impact anchor -- it is not sliced around the impact."""
     motion = _flat_motion(100)
     motion["action_points"] = [{"ts_ms": 4200, "kind": "action_impact", "score": 1.0}]
     atoms = lt.build_atoms("f1", 10_000, motion, None, [])
-    action = [a for a in atoms if a.is_action]
-    assert len(action) == 1, atoms
-    assert action[0].anchor_ms == [4200], action[0]
-    # padded ~300ms each side of the single impact
-    assert action[0].start_ms <= 4200 <= action[0].end_ms, action[0]
-    assert all(not a.is_action for a in atoms if a is not action[0]), atoms
-    print("ok  test_action_point_is_carved_into_its_own_action_atom")
+    assert len(atoms) == 1, atoms
+    assert atoms[0].anchor_ms == [4200], atoms[0]
+    assert atoms[0].is_action, atoms[0]   # carries an anchor -> labeled active
+    print("ok  test_action_points_annotate_but_do_not_carve")
 
 
-def test_clustered_action_points_are_one_action_atom():
-    """Anchors within ACTION_ANCHOR_MERGE_MS collapse into ONE payoff atom, not
-    several slivers."""
-    motion = _flat_motion(100)
-    motion["action_points"] = [{"ts_ms": 4200}, {"ts_ms": 4600}, {"ts_ms": 5000}]
-    atoms = lt.build_atoms("f1", 10_000, motion, None, [])
-    action = [a for a in atoms if a.is_action]
-    assert len(action) == 1, atoms
-    assert action[0].anchor_ms == [4200, 4600, 5000], action[0]
-    print("ok  test_clustered_action_points_are_one_action_atom")
-
-
-def test_camera_desc_pan_vs_handheld_vs_hold():
-    n = 60
-    hold = lt._camera_desc(_flat_motion(n, camera_motion=0.02), 0, n * 100)
-    pan = lt._camera_desc(_flat_motion(n, camera_motion=0.5, coherence=0.9, stability=0.8), 0, n * 100)
-    handheld = lt._camera_desc(_flat_motion(n, camera_motion=0.5, coherence=0.3, stability=0.3), 0, n * 100)
-    assert hold == "hold", hold
-    assert pan == "pan", pan
-    assert handheld == "handheld", handheld
-    print("ok  test_camera_desc_pan_vs_handheld_vs_hold")
+def test_otsu_returns_none_on_flat_energy():
+    """The no-magic-number primitive: a near-constant distribution has no
+    meaningful split, so no regime boundary is manufactured."""
+    assert lt._otsu([0.1] * 50) is None
+    assert lt._otsu([]) is None
+    thr = lt._otsu([0.05] * 40 + [0.9] * 20)
+    assert thr is not None and 0.05 < thr < 0.9, thr
+    print("ok  test_otsu_returns_none_on_flat_energy")
 
 
 # --------------------------------------------------------------------------
@@ -240,16 +240,18 @@ def test_camera_desc_pan_vs_handheld_vs_hold():
 def test_render_atom_table_format():
     atom = lt.Atom(atom_id=7, file_id="f1", start_ms=12300, end_ms=15800,
                    state_in=R_MOVE, state_out=R_SETTLE, action_energy=0.7,
-                   camera_desc="pan", coherence=0.9, anchor_ms=[13100])
+                   coherence=0.9, anchor_ms=[13100],
+                   peak_action_energy=0.99, camera_motion=0.55)
     text = lt.render_atom_table([atom])
-    assert text == "ATOM 7 [12300-15800] camera_move->settle act=0.70 cam=pan coh=0.90 anchors@13100", text
+    assert text == ("ATOM 7 [12300-15800] camera_move->settle act=0.70 peak=0.99 "
+                    "mot=0.55 coh=0.90 anchors@13100"), text
     print("ok  test_render_atom_table_format")
 
 
 def test_render_atom_table_omits_anchors_when_none():
     atom = lt.Atom(atom_id=0, file_id="f1", start_ms=0, end_ms=1000,
                    state_in=R_CLIP, state_out=R_CLIP, action_energy=0.0,
-                   camera_desc="hold", coherence=0.0, anchor_ms=[])
+                   coherence=0.0, anchor_ms=[])
     text = lt.render_atom_table([atom])
     assert "anchors@" not in text, text
     print("ok  test_render_atom_table_omits_anchors_when_none")
@@ -343,11 +345,11 @@ def _reel_trail_regression_fixture():
     ]
     atoms = [
         Atom(atom_id=0, file_id="f1", start_ms=6860, end_ms=7700, state_in=R_SPEECH_EDGE,
-             state_out=R_SETTLE, action_energy=0.1, camera_desc="hold", coherence=0.9),
+             state_out=R_SETTLE, action_energy=0.1, coherence=0.9),
         Atom(atom_id=1, file_id="f1", start_ms=7700, end_ms=9200, state_in=R_SETTLE,
-             state_out=R_MOVE, action_energy=0.3, camera_desc="pan", coherence=0.8),
+             state_out=R_MOVE, action_energy=0.3, coherence=0.8),
         Atom(atom_id=2, file_id="f1", start_ms=9200, end_ms=9620, state_in=R_MOVE,
-             state_out=R_SPEECH_EDGE, action_energy=0.2, camera_desc="hold", coherence=0.9),
+             state_out=R_SPEECH_EDGE, action_energy=0.2, coherence=0.9),
     ]
     return words, atoms
 
@@ -389,14 +391,14 @@ def main():
     test_no_speech_at_all_yields_one_whole_clip_atom()
     test_shot_cut_always_splits_an_atom()
     test_camera_move_no_longer_splits_an_atom()
-    test_continuous_pan_is_one_atom_labeled_pan()
+    test_continuous_pan_is_one_atom()
     test_disturbance_no_longer_splits_an_atom()
     test_transition_point_wipe_splits_an_atom()
     test_transition_point_degenerate_splits_an_atom()
     test_no_motion_or_scene_data_is_a_safe_noop()
-    test_action_point_is_carved_into_its_own_action_atom()
-    test_clustered_action_points_are_one_action_atom()
-    test_camera_desc_pan_vs_handheld_vs_hold()
+    test_energy_burst_becomes_its_own_active_atom()
+    test_action_points_annotate_but_do_not_carve()
+    test_otsu_returns_none_on_flat_energy()
     test_render_atom_table_format()
     test_render_atom_table_omits_anchors_when_none()
     test_speech_hints_flags_long_pause()

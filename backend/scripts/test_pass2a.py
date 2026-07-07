@@ -357,7 +357,7 @@ def _lattice_for_cross_kind_test():
         {"start_ms": 600, "end_ms": 800, "text": "c"},
     ]
     atoms = [Atom(atom_id=0, file_id="f1", start_ms=400, end_ms=1000, state_in="x", state_out="y",
-                 action_energy=0.1, camera_desc="hold", coherence=0.9)]
+                 action_energy=0.1, coherence=0.9)]
     return Lattice(file_id="f1", duration_ms=1000, words=words, turns=[], hints=[], atoms=atoms)
 
 

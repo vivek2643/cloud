@@ -40,10 +40,10 @@ def _make_lattice() -> Lattice:
     atoms = [
         Atom(atom_id=0, file_id="f1", start_ms=2100, end_ms=2600,
              state_in="speech_edge", state_out="shot", action_energy=0.2,
-             camera_desc="hold", coherence=0.9, anchor_ms=[2300]),
+             coherence=0.9, anchor_ms=[2300]),
         Atom(atom_id=1, file_id="f1", start_ms=2600, end_ms=3200,
              state_in="shot", state_out="clip_edge", action_energy=0.4,
-             camera_desc="pan", coherence=0.8, anchor_ms=[]),
+             coherence=0.8, anchor_ms=[]),
     ]
     return Lattice(file_id="f1", duration_ms=3200, words=words, turns=[],
                    hints=["speaker change after word 2 (0.6s gap)"], atoms=atoms)
@@ -154,7 +154,7 @@ def test_no_speech_cut_swallows_atoms_flags_a_cross_pause_group():
     lat = _make_lattice()
     lat.atoms.insert(0, Atom(atom_id=99, file_id="f1", start_ms=950, end_ms=1450,
                              state_in="speech_edge", state_out="speech_edge",
-                             action_energy=0.1, camera_desc="hold", coherence=1.0))
+                             action_energy=0.1, coherence=1.0))
     out = pass1.Pass1Output.model_validate({
         "speech_cuts": [{"file_id": "f1", "word_span": [0, 4], "label": "whole thing"}],
     })
@@ -192,7 +192,7 @@ def test_enforce_splits_a_speech_cut_at_an_atom_owned_gap():
     lat = _make_lattice()
     lat.atoms.insert(0, Atom(atom_id=99, file_id="f1", start_ms=950, end_ms=1450,
                              state_in="speech_edge", state_out="speech_edge",
-                             action_energy=0.1, camera_desc="hold", coherence=1.0))
+                             action_energy=0.1, coherence=1.0))
     out = pass1.Pass1Output.model_validate({
         "speech_cuts": [{"file_id": "f1", "word_span": [0, 4], "label": "whole thing"}],
     })
@@ -222,7 +222,7 @@ def test_enforce_remaps_take_members_onto_split_cuts():
     lat = _make_lattice()
     lat.atoms.insert(0, Atom(atom_id=99, file_id="f1", start_ms=950, end_ms=1450,
                              state_in="speech_edge", state_out="speech_edge",
-                             action_energy=0.1, camera_desc="hold", coherence=1.0))
+                             action_energy=0.1, coherence=1.0))
     out = pass1.Pass1Output.model_validate({
         "speech_cuts": [{"file_id": "f1", "word_span": [0, 4], "label": "whole"}],
         "take_candidates": [{"group_id": "tg1", "members": [
@@ -255,7 +255,7 @@ def test_enforce_splits_a_discontiguous_video_group():
     lat = _make_lattice()
     lat.atoms.append(Atom(atom_id=2, file_id="f1", start_ms=5000, end_ms=6000,
                           state_in="speech_edge", state_out="clip_edge",
-                          action_energy=0.3, camera_desc="hold", coherence=0.9))
+                          action_energy=0.3, coherence=0.9))
     out = pass1.Pass1Output.model_validate({
         "video_tentative_groups": [{"file_id": "f1", "atom_ids": [0, 1, 2]}],
     })
@@ -263,52 +263,77 @@ def test_enforce_splits_a_discontiguous_video_group():
     groups = [vg.atom_ids for vg in fixed.video_tentative_groups]
     assert groups == [[0, 1], [2]], groups
 
-    # a contiguous group is left untouched
+    # a contiguous group is left untouched (coverage-fill has nothing to add
+    # here: atoms 0,1 are contiguous and every atom is now grouped).
     ok = pass1.Pass1Output.model_validate({
         "video_tentative_groups": [{"file_id": "f1", "atom_ids": [0, 1]}],
     })
     fixed_ok = pass1.enforce_lattice_partition(ok, {"f1": lat})
-    assert [vg.atom_ids for vg in fixed_ok.video_tentative_groups] == [[0, 1]]
+    assert [0, 1] in [vg.atom_ids for vg in fixed_ok.video_tentative_groups]
     print("ok  test_enforce_splits_a_discontiguous_video_group")
 
 
-def test_enforce_isolates_an_action_atom_into_its_own_group():
-    # Atoms 0,1 contiguous; add atom 2 (contiguous to 1) flagged is_action.
-    # A group [0,1,2] must come back as [0,1] + [2] -- the payoff stands alone.
+def test_enforce_no_longer_isolates_action_atoms():
+    # signal-judge: grouping/merging is the model's job now, so a contiguous
+    # group containing an action atom is LEFT INTACT (no forced isolation) --
+    # a swing and its follow-through can ride together if the model said so.
     lat = _make_lattice()
     lat.atoms.append(Atom(atom_id=2, file_id="f1", start_ms=3200, end_ms=3800,
                           state_in="action", state_out="action",
-                          action_energy=0.7, camera_desc="hold", coherence=0.9,
-                          anchor_ms=[3500], is_action=True))
+                          action_energy=0.7, coherence=0.9,
+                          anchor_ms=[3500], is_action=True, peak_action_energy=0.9))
     lat.atoms.append(Atom(atom_id=3, file_id="f1", start_ms=3800, end_ms=4400,
                           state_in="action", state_out="clip_edge",
-                          action_energy=0.2, camera_desc="hold", coherence=0.9))
+                          action_energy=0.2, coherence=0.9))
     out = pass1.Pass1Output.model_validate({
         "video_tentative_groups": [{"file_id": "f1", "atom_ids": [0, 1, 2, 3]}],
     })
     fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
     groups = [vg.atom_ids for vg in fixed.video_tentative_groups]
-    assert groups == [[0, 1], [2], [3]], groups
-    print("ok  test_enforce_isolates_an_action_atom_into_its_own_group")
+    assert groups == [[0, 1, 2, 3]], groups
+    print("ok  test_enforce_no_longer_isolates_action_atoms")
 
 
-def test_enforce_readds_an_action_atom_the_model_dropped():
-    # boundaries-v2: grouping is a selection (the model may drop connective
-    # tissue), but an ACTION atom must ALWAYS surface. The model groups only the
-    # calm atoms [0,1] and omits the action atom 2 entirely -- enforcement must
-    # re-add it as its own group so the payoff is never silently lost.
+def test_coverage_fill_readds_every_ungrouped_atom():
+    # Deterministic-keep: the model dropped atoms 2 (high energy) AND 3 (low
+    # energy). Coverage-fill re-adds BOTH -- no energy threshold decides who
+    # survives; nothing is silently lost. Contiguous ungrouped atoms fold
+    # into one recovered group.
     lat = _make_lattice()
     lat.atoms.append(Atom(atom_id=2, file_id="f1", start_ms=3200, end_ms=3800,
+                          state_in="action", state_out="action",
+                          action_energy=0.5, coherence=0.9,
+                          anchor_ms=[3500], is_action=True, peak_action_energy=0.99))
+    lat.atoms.append(Atom(atom_id=3, file_id="f1", start_ms=3800, end_ms=4400,
                           state_in="action", state_out="clip_edge",
-                          action_energy=0.7, camera_desc="hold", coherence=0.9,
-                          anchor_ms=[3500], is_action=True))
+                          action_energy=0.1, coherence=0.9, peak_action_energy=0.2))
     out = pass1.Pass1Output.model_validate({
         "video_tentative_groups": [{"file_id": "f1", "atom_ids": [0, 1]}],
     })
     fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
-    groups = [vg.atom_ids for vg in fixed.video_tentative_groups]
-    assert [2] in groups, groups
-    print("ok  test_enforce_readds_an_action_atom_the_model_dropped")
+    covered = {a for vg in fixed.video_tentative_groups for a in vg.atom_ids}
+    assert covered == {0, 1, 2, 3}, fixed.video_tentative_groups
+    # 2 and 3 are contiguous -> folded into ONE recovered group, not two.
+    assert [2, 3] in [vg.atom_ids for vg in fixed.video_tentative_groups], fixed.video_tentative_groups
+    print("ok  test_coverage_fill_readds_every_ungrouped_atom")
+
+
+def test_coverage_fill_recovers_uncovered_speech_words():
+    # The model grouped only words [0-1]; words 2,3,4 were left out of every
+    # speech_cut. Coverage-fill surfaces them as recovered cuts (split at the
+    # atom-owned gap between word 2 and word 3), so no speech is ever dropped.
+    lat = _make_lattice()
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [{"file_id": "f1", "word_span": [0, 1], "label": "kept"}],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    covered = set()
+    for sc in fixed.speech_cuts:
+        for k in range(sc.word_span[0], sc.word_span[1] + 1):
+            covered.add(k)
+    assert covered == {0, 1, 2, 3, 4}, [tuple(sc.word_span) for sc in fixed.speech_cuts]
+    assert any(sc.label == "(recovered)" for sc in fixed.speech_cuts), fixed.speech_cuts
+    print("ok  test_coverage_fill_recovers_uncovered_speech_words")
 
 
 def test_no_overlapping_speech_cuts():
@@ -362,8 +387,9 @@ def main():
     test_enforce_leaves_a_clean_grouping_untouched()
     test_enforce_remaps_take_members_onto_split_cuts()
     test_enforce_splits_a_discontiguous_video_group()
-    test_enforce_isolates_an_action_atom_into_its_own_group()
-    test_enforce_readds_an_action_atom_the_model_dropped()
+    test_enforce_no_longer_isolates_action_atoms()
+    test_coverage_fill_readds_every_ungrouped_atom()
+    test_coverage_fill_recovers_uncovered_speech_words()
     test_no_overlapping_speech_cuts()
     test_pass1_output_rejects_an_unexpected_wrapper_key()
     print("\nall pass1 tests passed")

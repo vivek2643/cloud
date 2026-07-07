@@ -36,7 +36,7 @@ def _lattice_with_atoms(file_id: str, n_words: int, atoms):
 
 def _atom(atom_id, s, e, anchors=None):
     return Atom(atom_id=atom_id, file_id="f1", start_ms=s, end_ms=e, state_in="x", state_out="y",
-                action_energy=0.1, camera_desc="hold", coherence=0.9, anchor_ms=anchors or [])
+                action_energy=0.1, coherence=0.9, anchor_ms=anchors or [])
 
 
 def test_speech_cut_frame_uses_sharpest_ms_in_span():

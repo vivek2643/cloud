@@ -27,9 +27,11 @@ import {
   Loader2,
   Eye,
   EyeOff,
-  Zap,
 } from "lucide-react";
 import { EditButton } from "./search-edit-bar";
+
+const ENERGY_LABELS = ["Broad", "Calm", "Balanced", "Tight", "Sharp"];
+const energyLabel = (e: number) => ENERGY_LABELS[Math.min(4, Math.round(e * 4))];
 
 // Cuts v3 (see cuts_v3.plan.md). One LLM ingest pass per project decides the
 // final speech/video grouping, cross-clip takes, and every per-cut judgment
@@ -207,12 +209,21 @@ export function CutsV3View() {
   }, [token, projectId, pollGen]);
 
   // A finished run stops polling, so a freshly-completed re-ingest wouldn't be
-  // picked up while this view stays mounted. Refetch when the tab regains focus
-  // (i.e. you switch back to check) so you always see the latest run.
+  // picked up while this view stays mounted. Refetch when you come back to the
+  // view -- window focus AND tab visibility (the latter fires even when window
+  // focus doesn't, e.g. switching apps in the same OS space) -- so you always
+  // see the latest run without a manual reload.
   useEffect(() => {
-    const onFocus = () => setPollGen((g) => g + 1);
-    window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
+    const refetch = () => setPollGen((g) => g + 1);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") refetch();
+    };
+    window.addEventListener("focus", refetch);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.removeEventListener("focus", refetch);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, []);
 
   const handleKickIngest = useCallback(async () => {
@@ -263,11 +274,12 @@ export function CutsV3View() {
     return hidden;
   }, [takeGroups]);
 
-  // High-confidence junk (camera cues, pre-roll, dead air) is hidden by
-  // default -- "if in doubt, show", so low/doubtful junk stays visible inline.
-  // "Show discarded" reveals the hidden ones.
+  // Junk is binary + recoverable (deterministic-keep): the model flags what
+  // isn't part of the piece (camera cues, pre-roll, dead air) BY MEANING, and
+  // it's hidden into the Discarded tray, never deleted. "Show discarded"
+  // reveals every hidden junk cut.
   const hiddenJunkCount = useMemo(
-    () => cuts.filter((c) => c.junk && c.junk_confidence === "high" && filesById[c.file_id]).length,
+    () => cuts.filter((c) => c.junk && filesById[c.file_id]).length,
     [cuts, filesById]
   );
 
@@ -276,7 +288,7 @@ export function CutsV3View() {
       (c) =>
         filesById[c.file_id] &&
         !hiddenAsSibling.has(c.id) &&
-        (showDiscarded || !(c.junk && c.junk_confidence === "high"))
+        (showDiscarded || !c.junk)
     );
     const byFile: Record<string, CutRecord[]> = {};
     for (const c of present) (byFile[c.file_id] ??= []).push(c);
@@ -383,34 +395,20 @@ export function CutsV3View() {
               borderColor: showDiscarded ? "var(--accent)" : "rgba(255,255,255,0.4)",
               color: showDiscarded ? "var(--accent)" : "var(--foreground)",
             }}
-            title="Show high-confidence junk (camera cues, pre-roll, dead air) hidden by default"
+            title="Show discarded cuts (camera cues, pre-roll, dead air) hidden by default"
           >
             {showDiscarded ? <Eye size={13} /> : <EyeOff size={13} />}
             {showDiscarded ? "Hiding" : "Discarded"}
             {hiddenJunkCount > 0 ? ` (${hiddenJunkCount})` : ""}
           </button>
-          <div
-            className="flex items-center gap-2 rounded-lg border px-3 py-2"
-            style={{ borderColor: "rgba(255,255,255,0.4)" }}
-            title="Energy: tightens each cut inward toward its peak (speech is left intact)"
-          >
-            <Zap size={13} style={{ color: energy > 0 ? "var(--accent)" : "var(--muted)" }} />
-            <input
-              type="range"
-              min={0}
-              max={100}
-              value={Math.round(energy * 100)}
-              onChange={(e) => setEnergy(Number(e.target.value) / 100)}
-              className="cuts-v3-energy h-1 w-24 cursor-pointer appearance-none rounded-full"
-              style={{ accentColor: "var(--accent)" }}
-              aria-label="Energy"
-            />
-            <span className="w-7 text-right text-xs tabular-nums" style={{ color: "var(--muted)" }}>
-              {Math.round(energy * 100)}
-            </span>
-          </div>
         </div>
         <EditButton />
+      </div>
+
+      {/* Energy dial: tightens each cut inward toward its peak (negative
+          padding); speech is left intact. Same control as the main Cuts view. */}
+      <div className="mb-7">
+        <EnergyBar value={energy} onChange={setEnergy} />
       </div>
 
       <IngestBanner
@@ -646,6 +644,85 @@ function IngestBanner({
           {run.project_summary}
         </p>
       )}
+    </div>
+  );
+}
+
+// Copied from the main Cuts view's EnergyBar (cuts-view.tsx) so the two
+// surfaces share one look + snap behaviour. Snaps to 5 stops (Broad..Sharp);
+// v3 reads the continuous value as tightening view-math (tightenedSpan).
+function EnergyBar({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+  const trackRef = useRef<HTMLDivElement>(null);
+  const valueRef = useRef(value);
+  valueRef.current = value;
+
+  const apply = useCallback(
+    (clientX: number, isClick: boolean) => {
+      const el = trackRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const t = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+      let snapped = Math.round(t * 4) / 4;
+      const cur = valueRef.current;
+      if (isClick && snapped === cur) {
+        if (t > cur) snapped = Math.min(1, cur + 0.25);
+        else if (t < cur) snapped = Math.max(0, cur - 0.25);
+      }
+      if (snapped !== cur) onChange(snapped);
+    },
+    [onChange]
+  );
+
+  const handlePointerDown = useCallback(
+    (e: React.PointerEvent) => {
+      e.preventDefault();
+      apply(e.clientX, true);
+      const move = (ev: PointerEvent) => apply(ev.clientX, false);
+      const up = () => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+    },
+    [apply]
+  );
+
+  return (
+    <div className="mx-auto flex w-3/4 items-center gap-4">
+      <span className="shrink-0 pl-1 text-sm font-medium" style={{ color: "var(--foreground)" }}>
+        Energy
+      </span>
+      <div
+        ref={trackRef}
+        onPointerDown={handlePointerDown}
+        className="relative flex-1 cursor-pointer select-none py-4"
+        style={{ touchAction: "none" }}
+      >
+        <div className="h-px w-full rounded-full" style={{ background: "rgba(255,255,255,0.16)" }} />
+        <div
+          className="absolute left-0 top-1/2 h-px -translate-y-1/2 rounded-full"
+          style={{
+            width: `${value * 100}%`,
+            background: "var(--foreground)",
+            transition: "width 0.35s cubic-bezier(0.22, 1, 0.36, 1)",
+          }}
+        />
+        <div
+          className="absolute top-1/2 h-3.5 w-[3px] -translate-y-1/2 rounded-full"
+          style={{
+            left: `calc(${value * 100}% - 1.5px)`,
+            background: "var(--foreground)",
+            transition: "left 0.35s cubic-bezier(0.22, 1, 0.36, 1)",
+          }}
+        />
+      </div>
+      <span
+        className="inline-flex min-w-[74px] shrink-0 items-center justify-center rounded-md px-3 py-1 text-xs font-semibold"
+        style={{ background: "var(--accent)", color: "var(--background)" }}
+      >
+        {energyLabel(value)}
+      </span>
     </div>
   );
 }

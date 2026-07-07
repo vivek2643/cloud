@@ -13,16 +13,18 @@ model:
     itself. This is a deliberate reversal from ``base_cuts.py``, which turned
     speech turns into fixed cuts -- v3 wants the LLM's judgment there, not a
     deterministic turn-merge.
-  * VIDEO gets ATOMS: carved ONLY at boundaries we trust as genuine scene
-    changes -- hard shot cut, disturbance edges, ``transition_points``
-    (wipe/degenerate) -- over the NON-SPEECH remainder of the clip. Camera
-    move/settle are DELIBERATELY NOT boundaries here (editorial pass, see
-    cuts_v3_editorial.plan.md section B): a pan is one coherent atom labeled
-    "pan", not [hold][move][settle] shredded into slivers -- camera motion is
-    a LABEL and a selection handle, not a boundary that shreds the timeline.
-    A video atom overlapping speech never happens by construction: atoms are
-    built inside the gaps between speech turns, not against the whole timeline
-    (unchanged rule -- never cut under speech).
+  * VIDEO gets ATOMS: carved at boundaries we trust as genuine scene changes
+    -- hard shot cut, ``transition_points`` (wipe/degenerate) -- PLUS the
+    edges where the clip crosses between its OWN quiet and active energy
+    regimes (an Otsu split on this clip's action_energy; see ``_regime_marks``),
+    over the NON-SPEECH remainder of the clip. Camera move/settle are
+    DELIBERATELY NOT boundaries: motion enters the model as RAW numbers
+    (``mot``/``coh``) on each atom, and the LLM categorizes camera behaviour
+    itself -- there is no code-side "pan"/"handheld" label any more, and
+    nothing per-footage is tuned. A video atom overlapping speech never
+    happens by construction: atoms are built inside the gaps between speech
+    turns, not against the whole timeline (unchanged rule -- never cut under
+    speech).
 
 Atoms are deliberately fine (over-segmenting bias is safe -- pass 1/2 merge
 them back into ``video_tentative_groups`` / final cuts; under-splitting, which
@@ -48,17 +50,7 @@ from app.services.l3.base_cuts import (
 )
 from app.services.l3.base_cuts_params import LONG_PAUSE_MS, SNAP_MS
 from app.services.l3.diarize import Turn
-from app.services.l3.lattice_params import (
-    ACTION_ANCHOR_MERGE_MS,
-    ACTION_PAD_FRAC,
-    CAMERA_HOLD_MOTION_MAX,
-    CAMERA_MOVE_FRAC_MIN,
-    CAMERA_PAN_COHERENCE_MIN,
-    CAMERA_PAN_STABILITY_MIN,
-    MIN_ATOM_MS,
-    PERCEPTUAL_FLOOR_MS,
-)
-from app.services.l3.video_segments import MOVE, _confirm_hysteresis, _hop_states
+from app.services.l3.lattice_params import MIN_ATOM_MS
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +59,7 @@ logger = logging.getLogger(__name__)
 # "several signals, one instant -> report the strongest" collapsing.
 R_WIPE = "wipe"
 R_DEGENERATE = "degenerate"
-R_ACTION = "action"             # this edge bounds a subject-motion payoff span
+R_ACTION = "action"             # this edge is a quiet<->active energy-regime crossing (Otsu)
 R_SPEECH_EDGE = "speech_edge"   # this atom's own edge borders a speech turn
 
 # Only GROUNDED events are atom boundaries now (boundaries-v2): hard shot cut,
@@ -95,19 +87,22 @@ class Atom:
     state_in: str          # why this atom's LEFT edge exists
     state_out: str         # why this atom's RIGHT edge exists
     action_energy: float   # mean subject-motion energy over the span, 0..1
-    camera_desc: str       # "hold" | "pan" | "handheld" -- coarse, for the prompt
     coherence: float       # mean camera_coherence over the span, 0..1
     anchor_ms: List[int] = field(default_factory=list)   # action_points inside this atom
-    is_action: bool = False   # this atom is a carved subject-motion payoff (section C)
+    is_action: bool = False   # LABEL: this atom sits in the clip's active energy regime
+    peak_action_energy: float = 0.0  # PEAK subject-motion energy over the span, 0..1
+    camera_motion: float = 0.0       # mean camera-motion magnitude over the span, 0..1
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "atom_id": self.atom_id, "file_id": self.file_id,
             "start_ms": self.start_ms, "end_ms": self.end_ms,
             "state_in": self.state_in, "state_out": self.state_out,
-            "action_energy": self.action_energy, "camera_desc": self.camera_desc,
+            "action_energy": self.action_energy,
             "coherence": self.coherence, "anchor_ms": list(self.anchor_ms),
             "is_action": self.is_action,
+            "peak_action_energy": self.peak_action_energy,
+            "camera_motion": self.camera_motion,
         }
 
 
@@ -148,45 +143,87 @@ def _transition_marks(motion: Optional[dict]) -> List[Tuple[int, str]]:
     return out
 
 
-def _action_marks(motion: Optional[dict]) -> List[Tuple[int, str]]:
-    """Action-span edges (section C). ``action_points`` are discrete L1-detected
-    impacts; a cluster of them (anchors within ACTION_ANCHOR_MERGE_MS) is ONE
-    motion payoff, and its padded edges are atom boundaries so the payoff is
-    carved into its own atom rather than absorbed into a neighboring hold/pan.
-    Only anchors landing in the NON-speech remainder matter -- ``_snap_collect``
-    already drops marks outside a segment, so an anchor fired while the subject
-    was talking never cuts under speech (plan rule)."""
-    pts = sorted(int(p["ts_ms"]) for p in (motion or {}).get("action_points") or []
-                 if isinstance(p, dict) and "ts_ms" in p)
-    if not pts:
+def _otsu(values: List[float]) -> Optional[float]:
+    """Otsu's method: the energy level that best splits THIS clip's own
+    action-energy distribution into a quiet class and an active class, by
+    maximizing between-class variance. Returns None when there is no
+    meaningful split (near-constant energy -> the clip is one regime).
+
+    This is the load-bearing "no magic numbers" primitive: where the motion
+    genuinely rises and falls is read off the clip's OWN histogram, never a
+    hand-set floor like 0.5 or 0.6. A calm talking-head clip yields None
+    (one regime, coarse atoms); a rally/swing clip yields a clean split so
+    the burst becomes its own active atom."""
+    xs = [float(v) for v in values if v is not None]
+    if len(xs) < 2:
+        return None
+    lo, hi = min(xs), max(xs)
+    if hi - lo < 1e-6:
+        return None
+    bins = 64
+    hist = [0] * bins
+    for v in xs:
+        b = int((v - lo) / (hi - lo) * (bins - 1))
+        hist[b] += 1
+    total = len(xs)
+    sum_all = sum((i + 0.5) * hist[i] for i in range(bins))
+    w_b = 0.0
+    sum_b = 0.0
+    best_var = -1.0
+    best_bin = 0
+    for i in range(bins):
+        w_b += hist[i]
+        if w_b == 0:
+            continue
+        w_f = total - w_b
+        if w_f == 0:
+            break
+        sum_b += (i + 0.5) * hist[i]
+        m_b = sum_b / w_b
+        m_f = (sum_all - sum_b) / w_f
+        var = w_b * w_f * (m_b - m_f) ** 2
+        if var > best_var:
+            best_var, best_bin = var, i
+    return lo + (best_bin + 1) / bins * (hi - lo)
+
+
+def _regime_marks(motion: Optional[dict]) -> List[Tuple[int, str]]:
+    """Atom edges where the clip crosses between its OWN quiet and active
+    energy regimes (the Otsu split on this clip's action_energy). This
+    REPLACES the old action-anchor carve (fixed pads + a 0.5-of-peak energy
+    floor): instead of hand-tuned windows around detected impacts, the clip
+    itself tells us where motion rises and falls, so a swing / pan / rally
+    becomes one coherent active atom bordered by quiet ones -- with zero
+    hardcoded energy numbers. Runs shorter than MIN_ATOM_MS are folded into
+    their neighbor (a flicker isn't a regime); over-splitting is harmless
+    anyway -- pass 1 merges coarser and total-coverage never drops a span."""
+    m = motion or {}
+    hop = int(m.get("hop_ms") or 0)
+    energy = m.get("action_energy") or []
+    if not hop or len(energy) < 2:
         return []
-    clusters: List[List[int]] = [[pts[0]]]
-    for t in pts[1:]:
-        if t - clusters[-1][-1] <= ACTION_ANCHOR_MERGE_MS:
-            clusters[-1].append(t)
+    thr = _otsu(energy)
+    if thr is None:
+        return []
+    regime = [1 if (e or 0.0) >= thr else 0 for e in energy]
+    min_hops = max(1, MIN_ATOM_MS // hop)
+
+    runs: List[List[int]] = []  # [state, start_i, end_i)
+    i = 0
+    while i < len(regime):
+        j = i
+        while j < len(regime) and regime[j] == regime[i]:
+            j += 1
+        runs.append([regime[i], i, j])
+        i = j
+    merged: List[List[int]] = []
+    for st, a, b in runs:
+        if merged and (b - a) < min_hops:
+            merged[-1][2] = b   # swallow a sub-MIN_ATOM_MS flicker into the prior regime
         else:
-            clusters.append([t])
-    out: List[Tuple[int, str]] = []
-    for members in clusters:
-        cs, ce = members[0], members[-1]
-        pad = _action_pad_ms(members)
-        out.append((max(0, cs - pad), R_ACTION))
-        out.append((ce + pad, R_ACTION))
-    return out
+            merged.append([st, a, b])
 
-
-def _action_pad_ms(anchors: List[int]) -> int:
-    """Anchor-relative wind-up / follow-through pad (boundaries-v2). Scales with
-    the cluster's OWN rhythm -- median gap between its impacts -- so a fast
-    flurry stays tight and a lone slow swing breathes, without a per-clip
-    magic-ms. Floored at the perceptual floor; a single-anchor cluster (no gap)
-    takes the floor directly."""
-    gaps = [b - a for a, b in zip(anchors, anchors[1:]) if b > a]
-    if not gaps:
-        return PERCEPTUAL_FLOOR_MS
-    gaps.sort()
-    median_gap = gaps[len(gaps) // 2]
-    return max(PERCEPTUAL_FLOOR_MS, int(ACTION_PAD_FRAC * median_gap))
+    return [(a * hop, R_ACTION) for _st, a, _b in merged[1:]]
 
 
 def _subtract(span: Tuple[int, int], claimed: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
@@ -226,31 +263,9 @@ def _mean(xs: List[float], lo_i: int, hi_i: int) -> float:
     return sum(seg) / len(seg) if seg else 0.0
 
 
-def _camera_desc(motion: Optional[dict], s_ms: int, e_ms: int) -> str:
-    """Classify an atom's DOMINANT camera behavior -- "hold" | "pan" |
-    "handheld". Since a whole pan is now one atom (moves are no longer
-    boundaries), the mean camera_motion over the span is diluted by any held
-    lead-in/wind-down, so classification runs off the confirmed hold/move
-    STATE MACHINE instead: what fraction of the span is actually moving. A
-    move that stays coherent and stable is a deliberate "pan"; a jittery one
-    is "handheld"; a mostly-still span is "hold"."""
-    m = motion or {}
-    hop = int(m.get("hop_ms") or 0)
-    if not hop:
-        return "hold"
-    lo_i, hi_i = s_ms // hop, max(s_ms // hop + 1, e_ms // hop)
-    states = _confirm_hysteresis(_hop_states(m))[lo_i:hi_i]
-    if not states:
-        # No state samples (span past the motion track) -- fall back to the
-        # mean-motion test so a short trailing atom still gets a sane label.
-        return "hold" if _mean(m.get("camera_motion") or [], lo_i, hi_i) < CAMERA_HOLD_MOTION_MAX else "handheld"
-    if states.count(MOVE) / len(states) < CAMERA_MOVE_FRAC_MIN:
-        return "hold"
-    m_coh = _mean(m.get("camera_coherence") or [], lo_i, hi_i)
-    m_stab = _mean(m.get("camera_stability") or [], lo_i, hi_i)
-    if m_coh >= CAMERA_PAN_COHERENCE_MIN and m_stab >= CAMERA_PAN_STABILITY_MIN:
-        return "pan"
-    return "handheld"
+def _peak(xs: List[float], lo_i: int, hi_i: int) -> float:
+    seg = xs[max(0, lo_i):max(lo_i + 1, hi_i)]
+    return max(seg) if seg else 0.0
 
 
 def _anchors_in(motion: Optional[dict], s_ms: int, e_ms: int) -> List[int]:
@@ -296,20 +311,25 @@ def build_atoms(file_id: str, duration_ms: int, motion: Optional[dict],
     claimed += _word_claim_spans(words or [])
     speech_spans = sorted(claimed)
     non_speech = _subtract((0, duration_ms), speech_spans)
-    # Boundaries-v2 (cuts_v3_boundaries_v2.plan.md): only GROUNDED events carve
-    # atoms -- ones that correspond to something real in the footage. Camera
-    # move/settle stopped being edges in section B; disturbance (handheld
-    # jitter) stops being an edge here -- it fired boundaries where nothing
-    # happened (a 60ms sliver on a shaky pan). Jitter is still captured, as a
-    # LABEL (_camera_desc reads "handheld"), never a cut. What remains: hard
-    # shot cut, wipe/degenerate transition, action-anchor windows -- plus the
-    # speech/clip edges bounding the non-speech remainder itself.
-    all_marks = _shot_marks(scene) + _transition_marks(motion) + _action_marks(motion)
+    # Deterministic-keep (cuts_v3_deterministic_keep.plan.md): atom edges come
+    # from GROUNDED events plus the clip's OWN energy regimes -- never from
+    # hand-set pads. Hard shot cut + wipe/degenerate transition are grounded
+    # scene changes; _regime_marks adds edges where THIS clip crosses between
+    # its quiet and active energy (Otsu split), so a burst of motion becomes
+    # its own atom with no magic energy floor. Camera move/settle and handheld
+    # jitter remain LABELS (mot/coh on each atom), never edges.
+    all_marks = _shot_marks(scene) + _transition_marks(motion) + _regime_marks(motion)
 
     m = motion or {}
     hop = int(m.get("hop_ms") or 0)
     action = m.get("action_energy") or []
     coherence = m.get("camera_coherence") or []
+    cam_motion = m.get("camera_motion") or []
+    # One Otsu split for the whole clip -> the boundary between its quiet and
+    # active regimes. is_action is then a pure data-derived LABEL (this atom
+    # sits in the active regime), not a keep/drop gate: nothing is dropped for
+    # lacking it. None == the clip never leaves one regime (calm throughout).
+    active_thr = _otsu(action)
 
     atoms: List[Atom] = []
     for seg_s, seg_e in non_speech:
@@ -339,32 +359,40 @@ def build_atoms(file_id: str, duration_ms: int, motion: Optional[dict],
             reason_out = at.get(b, R_CLIP if b == duration_ms else R_SPEECH_EDGE)
             lo_i, hi_i = (a // hop, b // hop) if hop else (0, 0)
             anchors = _anchors_in(motion, a, b)
+            mean_ae = round(_mean(action, lo_i, hi_i), 3) if hop else 0.0
             atoms.append(Atom(
                 atom_id=len(atoms), file_id=file_id, start_ms=a, end_ms=b,
                 state_in=reason_in, state_out=reason_out,
-                action_energy=round(_mean(action, lo_i, hi_i), 3) if hop else 0.0,
-                camera_desc=_camera_desc(motion, a, b),
+                action_energy=mean_ae,
                 coherence=round(_mean(coherence, lo_i, hi_i), 3) if hop else 0.0,
                 anchor_ms=anchors,
-                # Carved by the action marks above -> any atom holding an anchor
-                # IS a motion payoff (a calm neighbor never carries one).
-                is_action=bool(anchors),
+                # Pure LABEL: this atom sits in the clip's ACTIVE regime (its
+                # mean energy clears the clip's own Otsu split) or carries a
+                # detected impact. Never a keep/drop gate -- see build_atoms.
+                is_action=bool(anchors) or (active_thr is not None and mean_ae >= active_thr),
+                peak_action_energy=round(_peak(action, lo_i, hi_i), 3) if hop else 0.0,
+                camera_motion=round(_mean(cam_motion, lo_i, hi_i), 3) if hop else 0.0,
             ))
     return atoms
 
 
 def render_atom_table(atoms: List[Atom]) -> str:
-    """The compact numbered text block for prompts -- motion enters as
+    """The compact numbered text block for prompts -- motion enters as RAW
     NUMBERS, pixels as stills (pass 2). One line per atom:
-    ``ATOM 7 [12300-15800] shot_cut->speech_edge act=0.70 cam=pan coh=0.90 anchors@13100``
-    """
+    ``ATOM 7 [12300-15800] shot_cut->speech_edge act=0.70 peak=0.99 mot=0.55 coh=0.90 anchors@13100``
+    where act/peak = mean/peak subject-motion energy (0..1), mot = camera-motion
+    magnitude (0..1), coh = camera coherence (0..1), anchors = detected impacts.
+
+    No derived ``cam=`` label: the model reads the raw mot/coh signals and
+    categorizes camera behavior itself (deterministic-keep -- code hands over
+    signals, the LLM does the semantics)."""
     lines = []
     for a in atoms:
         anchors = f" anchors@{','.join(str(x) for x in a.anchor_ms)}" if a.anchor_ms else ""
-        tag = " ACTION" if a.is_action else ""
         lines.append(
             f"ATOM {a.atom_id} [{a.start_ms}-{a.end_ms}] {a.state_in}->{a.state_out} "
-            f"act={a.action_energy:.2f} cam={a.camera_desc} coh={a.coherence:.2f}{anchors}{tag}"
+            f"act={a.action_energy:.2f} peak={a.peak_action_energy:.2f} "
+            f"mot={a.camera_motion:.2f} coh={a.coherence:.2f}{anchors}"
         )
     return "\n".join(lines)
 

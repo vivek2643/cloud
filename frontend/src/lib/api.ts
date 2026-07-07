@@ -334,7 +334,6 @@ export interface CutRecord {
   take_role: TakeRole | null;
   junk: boolean;
   junk_reason: string | null;
-  junk_confidence: "high" | "low";
   framing: Framing;
   look: Look;
   caption_zones: [number, number, number, number][];
@@ -386,7 +385,12 @@ export function kickIngest(projectId: string, token: string) {
 }
 
 export function getCutsV3(projectId: string, token: string) {
-  return request<CutsV3Response>(`/api/projects/${projectId}/cuts-v3`, { token });
+  // no-store: this is read after a re-ingest, so a cached body would show
+  // stale cuts (the exact "nothing changed" trap). Always hit the server.
+  return request<CutsV3Response>(`/api/projects/${projectId}/cuts-v3`, {
+    token,
+    cache: "no-store",
+  });
 }
 
 // --- Upload ---

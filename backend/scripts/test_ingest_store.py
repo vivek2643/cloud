@@ -28,7 +28,6 @@ def _record(file_id="f1", take_group_id=None):
     return CutRecord(file_id=file_id, src_in_ms=0, src_out_ms=100, kind="speech",
                      word_span=(0, 1), atom_ids=None, label="x", summary="y",
                      speaker=None, on_camera=None, junk=False, junk_reason="",
-                     junk_confidence="low",
                      framing={}, look={}, caption_zones=[], hero_ts_ms=50,
                      pace=_pace(), take_group_id=take_group_id, take_role=None)
 
