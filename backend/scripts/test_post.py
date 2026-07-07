@@ -291,7 +291,7 @@ def test_assemble_allows_a_project_file_with_zero_cuts():
     print("ok  test_assemble_allows_a_project_file_with_zero_cuts")
 
 
-def test_speech_filler_trim_shaves_leading_and_trailing():
+def test_remove_spans_shaves_edges():
     words = [
         {"start_ms": 0, "end_ms": 300, "text": "Um,"},
         {"start_ms": 300, "end_ms": 600, "text": "so"},
@@ -301,24 +301,43 @@ def test_speech_filler_trim_shaves_leading_and_trailing():
         {"start_ms": 2200, "end_ms": 2500, "text": "you"},
         {"start_ms": 2500, "end_ms": 2800, "text": "know"},
     ]
-    lead, trail = post.compute_speech_filler_trim(words, (0, 6), 0, 2800)
-    assert lead == 600, lead    # content ('the') starts at 600
-    assert trail == 600, trail  # content ends at 'ships.' @2200; 2800-2200
-    print("ok  test_speech_filler_trim_shaves_leading_and_trailing")
+    spans = post.compute_speech_remove_spans(words, (0, 6), 0, 2800)
+    # leading "Um, so" + silence -> [0, 600]; trailing "you know" -> [2200, 2800]
+    assert (0, 600) in spans, spans
+    assert (2200, 2800) in spans, spans
+    print("ok  test_remove_spans_shaves_edges")
 
 
-def test_speech_filler_trim_none_when_clean():
+def test_remove_spans_interior_filler_and_pause():
+    # contiguous words (100ms gaps as rhythm), one interior "um", one long pause
+    words = [
+        {"start_ms": 0, "end_ms": 400, "text": "The"},
+        {"start_ms": 500, "end_ms": 900, "text": "ball"},          # gap 100 (rhythm)
+        {"start_ms": 1000, "end_ms": 1300, "text": "um"},          # interior filler
+        {"start_ms": 1400, "end_ms": 1800, "text": "flies"},       # gap 100
+        {"start_ms": 3800, "end_ms": 4200, "text": "far."},        # gap 2000 -> big pause
+    ]
+    spans = post.compute_speech_remove_spans(words, (0, 4), 0, 4200)
+    # interior filler "um" removed
+    assert (1000, 1300) in spans, spans
+    # a chunk of the 2s pause between "flies" and "far." is removable (excess
+    # over the ~100ms median rhythm), taken from the middle
+    assert any(1800 < a and b < 3800 and (b - a) > 1000 for a, b in spans), spans
+    print("ok  test_remove_spans_interior_filler_and_pause")
+
+
+def test_remove_spans_none_when_clean_and_tight():
     words = [{"start_ms": 0, "end_ms": 500, "text": "Hello"},
              {"start_ms": 500, "end_ms": 1000, "text": "world."}]
-    assert post.compute_speech_filler_trim(words, (0, 1), 0, 1000) == (0, 0)
-    print("ok  test_speech_filler_trim_none_when_clean")
+    assert post.compute_speech_remove_spans(words, (0, 1), 0, 1000) == []
+    print("ok  test_remove_spans_none_when_clean_and_tight")
 
 
-def test_speech_filler_trim_all_filler_left_whole():
+def test_remove_spans_all_filler_left_whole():
     words = [{"start_ms": 0, "end_ms": 300, "text": "um"},
              {"start_ms": 300, "end_ms": 600, "text": "uh"}]
-    assert post.compute_speech_filler_trim(words, (0, 1), 0, 600) == (0, 0)
-    print("ok  test_speech_filler_trim_all_filler_left_whole")
+    assert post.compute_speech_remove_spans(words, (0, 1), 0, 600) == []
+    print("ok  test_remove_spans_all_filler_left_whole")
 
 
 def test_one_winner_per_take_group_backstop():
@@ -339,9 +358,10 @@ def test_one_winner_per_take_group_backstop():
 
 
 def main():
-    test_speech_filler_trim_shaves_leading_and_trailing()
-    test_speech_filler_trim_none_when_clean()
-    test_speech_filler_trim_all_filler_left_whole()
+    test_remove_spans_shaves_edges()
+    test_remove_spans_interior_filler_and_pause()
+    test_remove_spans_none_when_clean_and_tight()
+    test_remove_spans_all_filler_left_whole()
     test_one_winner_per_take_group_backstop()
     test_hero_ts_prefers_anchor_over_sharp()
     test_hero_ts_falls_back_to_sharpest()

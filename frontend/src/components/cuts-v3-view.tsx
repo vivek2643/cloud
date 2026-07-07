@@ -93,19 +93,14 @@ const STATUS_LABEL: Record<IngestStatus, string> = {
   failed: "Failed",
 };
 
-// The energy dial as pure view-math (cuts_v3_boundaries_v2.plan.md §D).
+// The energy dial as pure view-math (cuts_v3_boundaries_v2.plan.md §D). Both
+// modes are non-destructive -- they only change what the preview PLAYS.
 //
 // VIDEO: trims the played span INWARD toward the cut's anchor (hero_ts_ms) as
 // energy rises -- "negative padding". energy 0 -> the full grounded span;
 // energy 1 -> pace.min_ms (the anchor-protected floor, so the payoff frame is
-// never trimmed away).
-//
-// SPEECH: doesn't shrink toward a peak (a spoken beat isn't a peak). Instead the
-// dial shaves the deterministically-detected EDGE filler/breath (pace.filler_trim
-// from post.speechFillerTrim), scaled by energy -- see speechTightenedSpan. This
-// is the separate, tunable "filler removal" path; kept gentle by construction.
+// never trimmed away). Stays one contiguous span.
 function tightenedSpan(cut: CutRecord, energy: number): { inMs: number; outMs: number } {
-  if (cut.kind === "speech") return speechTightenedSpan(cut, energy);
   const inMs0 = cut.src_in_ms;
   const outMs0 = cut.src_out_ms;
   const naturalDur = outMs0 - inMs0;
@@ -120,24 +115,58 @@ function tightenedSpan(cut: CutRecord, energy: number): { inMs: number; outMs: n
   return { inMs, outMs };
 }
 
-// How hard the dial leans on filler removal. Even at max energy we only remove a
-// fraction of the detected edge filler so speech never feels clipped ("not
-// intense"); raise toward 1 to make the dial more aggressive. Tunable knob.
-const FILLER_TRIM_MAX = 0.85;
+// How hard the dial leans on speech tightening. Even at max energy we only ever
+// remove this fraction of the removable budget, so a beat never feels clipped;
+// raise toward 1 to make the dial more aggressive. Single tuning knob.
+const SPEECH_TRIM_MAX = 0.85;
 
-// Speech dial: shave up to FILLER_TRIM_MAX of the detected leading/trailing
-// filler+breath, proportional to energy. Deterministic + edge-only, so the
-// content is untouched; energy 0 keeps the full span.
-function speechTightenedSpan(cut: CutRecord, energy: number): { inMs: number; outMs: number } {
-  const inMs0 = cut.src_in_ms;
-  const outMs0 = cut.src_out_ms;
-  const [lead = 0, trail = 0] = cut.pace?.filler_trim ?? [0, 0];
-  if (lead <= 0 && trail <= 0) return { inMs: inMs0, outMs: outMs0 };
-  const k = energy * FILLER_TRIM_MAX;
-  const inMs = Math.round(inMs0 + lead * k);
-  const outMs = Math.round(outMs0 - trail * k);
-  if (outMs - inMs < 200) return { inMs: inMs0, outMs: outMs0 }; // safety: never collapse
-  return { inMs, outMs };
+type Segment = { inMs: number; outMs: number };
+
+// SPEECH dial: shave dead air + fillers (pace.remove_spans, computed
+// deterministically in post.compute_speech_remove_spans) as energy rises.
+// Removes the LONGEST removable spans first (worst dead air goes first) up to
+// energy * SPEECH_TRIM_MAX of the total budget -- so energy 0 keeps the whole
+// take, and higher energy progressively skips more silence + "um"s.
+function chosenRemoveSpans(cut: CutRecord, energy: number): Segment[] {
+  const spans = cut.pace?.remove_spans ?? [];
+  if (!spans.length || energy <= 0) return [];
+  const total = spans.reduce((acc, [a, b]) => acc + (b - a), 0);
+  const target = energy * SPEECH_TRIM_MAX * total;
+  const byLen = [...spans].sort((x, y) => (y[1] - y[0]) - (x[1] - x[0]));
+  const chosen: Segment[] = [];
+  let acc = 0;
+  for (const [a, b] of byLen) {
+    if (acc >= target) break;
+    chosen.push({ inMs: a, outMs: b });
+    acc += b - a;
+  }
+  return chosen;
+}
+
+// Subtract the removed spans from [inMs, outMs] -> the ordered kept segments the
+// player stitches together (skipping the gaps). Never returns empty.
+function keptSegments(inMs: number, outMs: number, removed: Segment[]): Segment[] {
+  const rs = removed
+    .map((r) => ({ inMs: Math.max(r.inMs, inMs), outMs: Math.min(r.outMs, outMs) }))
+    .filter((r) => r.outMs > r.inMs)
+    .sort((a, b) => a.inMs - b.inMs);
+  const segs: Segment[] = [];
+  let cur = inMs;
+  for (const r of rs) {
+    if (r.inMs > cur) segs.push({ inMs: cur, outMs: r.inMs });
+    cur = Math.max(cur, r.outMs);
+  }
+  if (cur < outMs) segs.push({ inMs: cur, outMs });
+  return segs.length ? segs : [{ inMs, outMs }];
+}
+
+// The play plan for a cut at a given dial position: video is one tightened span;
+// speech is the kept segments after the dial shaves dead air + fillers.
+function playSegments(cut: CutRecord, energy: number): Segment[] {
+  if (cut.kind !== "speech") return [tightenedSpan(cut, energy)];
+  const removed = chosenRemoveSpans(cut, energy);
+  if (!removed.length) return [{ inMs: cut.src_in_ms, outMs: cut.src_out_ms }];
+  return keptSegments(cut.src_in_ms, cut.src_out_ms, removed);
 }
 
 function fmtDur(ms: number): string {
@@ -997,10 +1026,19 @@ function CutCardV3({
   const [playUrl, setPlayUrl] = useState<string | null>(null);
   const [muted, setMuted] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
-  const { inMs, outMs } = tightenedSpan(cut, energy);
+  // The dial's play plan: video = one tightened span; speech = kept segments
+  // with dead air/fillers skipped. The player stitches segments back-to-back.
+  const segments = useMemo(() => playSegments(cut, energy), [cut, energy]);
+  const inMs = segments[0].inMs;
+  const outMs = segments[segments.length - 1].outMs;
+  const playedMs = segments.reduce((acc, s) => acc + (s.outMs - s.inMs), 0);
   const inSec = inMs / 1000;
-  const outSec = outMs / 1000;
   const heroSec = (cut.hero_ts_ms ?? (cut.src_in_ms + cut.src_out_ms) / 2) / 1000;
+  const segsRef = useRef(segments);
+  const segIdxRef = useRef(0);
+  useEffect(() => {
+    segsRef.current = segments;
+  }, [segments]);
   // "Frame Adjusted" applies the per-aspect crop (fill the tile); "Original"
   // shows the whole source frame letterboxed (contain), no crop -- only the
   // rotation is honoured either way.
@@ -1032,8 +1070,10 @@ function CutCardV3({
     const v = videoRef.current;
     if (!v) return;
     v.muted = muted;
+    segIdxRef.current = 0;
+    const startSec = segsRef.current[0].inMs / 1000;
     const play = () => v.play().catch(() => {});
-    if (Math.abs(v.currentTime - inSec) < 0.05) {
+    if (Math.abs(v.currentTime - startSec) < 0.05) {
       play();
       return;
     }
@@ -1043,12 +1083,27 @@ function CutCardV3({
     };
     v.addEventListener("seeked", onSeeked);
     try {
-      v.currentTime = inSec;
+      v.currentTime = startSec;
     } catch {
       v.removeEventListener("seeked", onSeeked);
       play();
     }
   }, [inSec, muted]);
+
+  // Dial moved (segments changed) while hovering: restart from the new first
+  // segment so the preview always reflects the current tightness.
+  useEffect(() => {
+    segIdxRef.current = 0;
+    const v = videoRef.current;
+    if (v && isActiveRef.current) {
+      try {
+        v.currentTime = segments[0].inMs / 1000;
+      } catch {
+        /* ignore */
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [segments]);
 
   useEffect(() => {
     const v = videoRef.current;
@@ -1088,12 +1143,28 @@ function CutCardV3({
     }
   }
 
+  // Stitch the kept segments: when the current segment ends, jump to the next
+  // one's in-point (skipping the removed dead air/filler); loop after the last.
   function onTimeUpdate() {
     const v = videoRef.current;
     if (!v || !isActive) return;
-    if (v.currentTime >= outSec - 0.02 || v.currentTime < inSec - 0.3) {
+    const segs = segsRef.current;
+    let idx = segIdxRef.current;
+    if (idx >= segs.length) idx = 0;
+    const seg = segs[idx];
+    const segOutSec = seg.outMs / 1000;
+    const segInSec = seg.inMs / 1000;
+    if (v.currentTime >= segOutSec - 0.02) {
+      const nextIdx = idx + 1 >= segs.length ? 0 : idx + 1;
+      segIdxRef.current = nextIdx;
       try {
-        v.currentTime = inSec;
+        v.currentTime = segs[nextIdx].inMs / 1000;
+      } catch {
+        /* ignore */
+      }
+    } else if (v.currentTime < segInSec - 0.3) {
+      try {
+        v.currentTime = segInSec;
       } catch {
         /* ignore */
       }
@@ -1216,7 +1287,7 @@ function CutCardV3({
         </span>
 
         <span className="absolute bottom-2 right-2 z-10 rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-medium text-white">
-          {fmtDur(outMs - inMs)}
+          {fmtDur(playedMs)}
         </span>
         <div className="absolute bottom-2 left-2 z-10 flex items-center gap-1">
           {cut.speaker && (

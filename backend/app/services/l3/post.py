@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import re
+import statistics
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -40,65 +41,115 @@ class PaceEnvelope:
     levels: List[float]
     energy_grade: str
     natural_sound: bool
-    # (lead_ms, trail_ms) of edge disfluency + edge silence that the dial MAY
-    # shave off a speech cut -- see compute_speech_filler_trim. (0, 0) for video
-    # or a clean speech edge. The dial scales how much is applied (view-math).
-    filler_trim: Tuple[int, int] = (0, 0)
+    # Removable dead-air + filler spans across a SPEECH cut (absolute ms, inside
+    # [src_in, src_out]) that the dial MAY shave -- edge silence/fillers, interior
+    # disfluencies, and pause-excess. Code owns these numbers; the dial (view-math)
+    # owns how much of them to apply. Empty for video or a clean spoken beat.
+    remove_spans: List[Tuple[int, int]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {"min_ms": self.min_ms, "natural_ms": self.natural_ms, "max_ms": self.max_ms,
                 "levels": list(self.levels), "energy_grade": self.energy_grade,
-                "natural_sound": self.natural_sound, "filler_trim": list(self.filler_trim)}
+                "natural_sound": self.natural_sound,
+                "remove_spans": [list(sp) for sp in self.remove_spans]}
 
 
-# Edge disfluencies + discourse markers that are safe to shave from the START or
-# END of a spoken beat (never the interior). Tunable -- this set plus how the
-# dial scales the trim is the whole knob. Kept deliberately small/conservative
-# ("not intense"): clear fillers + a few leading/trailing markers.
+# Fillers safe to shave from the EDGES of a spoken beat (a leading "so"/"you
+# know" or trailing "right" is throat-clearing). Interior removal uses the
+# tighter _INTERIOR_FILLER_TOKENS below -- a mid-line "so"/"like"/"right" is
+# usually real content, so we never touch it. Both sets + how the dial scales
+# the budget are the whole tuning knob.
 _FILLER_EDGE_TOKENS = {
     "um", "uh", "umm", "uhm", "erm", "er", "ah", "ahh", "hmm", "mm", "mmm", "uhh",
     "so", "well", "okay", "ok", "like", "right", "yeah", "anyway", "basically",
     "actually", "literally", "you", "know", "i", "mean",
 }
+_INTERIOR_FILLER_TOKENS = {
+    "um", "uh", "umm", "uhm", "erm", "er", "ah", "ahh", "hmm", "mm", "mmm", "uhh",
+}
 _FILLER_WORD_RE = re.compile(r"[a-z']+")
 
 
-def _is_filler_word(text: Optional[str]) -> bool:
-    """A word is pure filler only if EVERY alphabetic token in it is a filler
-    token (so 'um,' counts, but 'important' never does)."""
+def _pure_filler(text: Optional[str], vocab: set) -> bool:
+    """True only if EVERY alphabetic token in the word is in ``vocab`` (so 'um,'
+    counts, but 'important' never does)."""
     toks = _FILLER_WORD_RE.findall((text or "").lower())
-    return bool(toks) and all(t in _FILLER_EDGE_TOKENS for t in toks)
+    return bool(toks) and all(t in vocab for t in toks)
 
 
-def compute_speech_filler_trim(
+def _merge_spans(spans: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    """Sort + merge overlapping/adjacent [start, end] spans (drops empties)."""
+    ordered = sorted((int(a), int(b)) for a, b in spans if int(b) > int(a))
+    out: List[Tuple[int, int]] = []
+    for a, b in ordered:
+        if out and a <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def compute_speech_remove_spans(
     words: List[dict], word_span: Optional[Tuple[int, int]], s: int, e: int
-) -> Tuple[int, int]:
-    """Deterministic EDGE filler/breath trim for a speech cut: how many ms of
-    leading and trailing disfluency ('um', 'so', 'you know') PLUS the edge
-    silence around them could be shaved. The dial decides how much of this is
-    actually applied (0 = keep everything, 1 = shave it all) -- this only
-    reports the budget, it never trims here. Conservative by construction: only
-    whole EDGE words that are pure fillers, never an interior word, and it always
-    leaves a non-empty content span. Returns (lead_ms, trail_ms)."""
+) -> List[Tuple[int, int]]:
+    """Deterministic removable dead-air + filler spans across a speech cut, for
+    the dial to shave (edge AND interior). Everything is derived from the cut's
+    OWN word timings -- no absolute constants -- so nothing "real" is ever
+    proposed for removal:
+      * EDGE silence + edge fillers: the run of pure-filler words at each end
+        plus the dead air out to the cut boundary.
+      * INTERIOR fillers: clear disfluencies ('um'/'uh'/...) mid-line only.
+      * INTERIOR pauses: silence between kept words BEYOND the speaker's own
+        median inter-word gap (their natural rhythm); only the EXCESS is
+        removable, taken from the middle so a natural beat of silence remains.
+    Returns a sorted, merged list of [start_ms, end_ms] inside [s, e]. The dial
+    (view-math) decides how much of this budget actually gets cut."""
     if not words or word_span is None:
-        return (0, 0)
+        return []
     a, b = int(word_span[0]), int(word_span[1])
-    a = max(0, a)
-    b = min(len(words) - 1, b)
+    a, b = max(0, a), min(len(words) - 1, b)
     if a > b:
-        return (0, 0)
-    content = [i for i in range(a, b + 1) if not _is_filler_word(words[i].get("text"))]
+        return []
+    content = [i for i in range(a, b + 1) if not _pure_filler(words[i].get("text"), _FILLER_EDGE_TOKENS)]
     if not content:
-        return (0, 0)  # an all-filler span is left whole (likely junk, handled elsewhere)
+        return []  # an all-filler span is left whole (likely junk, handled elsewhere)
     first, last = content[0], content[-1]
-    content_start = int(words[first].get("start_ms", s))
-    content_end = int(words[last].get("end_ms", e))
-    lead = max(0, content_start - s)
-    trail = max(0, e - content_end)
-    # Never eat into content: if the edges would meet, trim nothing.
-    if lead + trail >= (e - s):
-        return (0, 0)
-    return (lead, trail)
+    spans: List[Tuple[int, int]] = []
+
+    # Edges: dead air + filler run out to each boundary.
+    cs = int(words[first].get("start_ms", s))
+    ce = int(words[last].get("end_ms", e))
+    if cs > s:
+        spans.append((s, cs))
+    if e > ce:
+        spans.append((ce, e))
+
+    # Interior: fillers -> remove the word; everything else is "kept" and sets
+    # the natural-rhythm baseline for pause trimming.
+    kept: List[int] = []
+    for i in range(first, last + 1):
+        if i not in (first, last) and _pure_filler(words[i].get("text"), _INTERIOR_FILLER_TOKENS):
+            ws, we = int(words[i].get("start_ms")), int(words[i].get("end_ms"))
+            if we > ws:
+                spans.append((ws, we))
+        else:
+            kept.append(i)
+
+    # Interior pauses: excess over the speaker's median gap between kept words.
+    gaps = [(int(words[kept[j]].get("end_ms")), int(words[kept[j + 1]].get("start_ms")))
+            for j in range(len(kept) - 1)]
+    positive = [g1 - g0 for g0, g1 in gaps if g1 - g0 > 0]
+    if positive:
+        baseline = statistics.median(positive)
+        for g0, g1 in gaps:
+            excess = (g1 - g0) - baseline
+            if excess > 0:
+                keep = baseline / 2.0  # leave a natural beat on each side
+                rs, re_ = int(round(g0 + keep)), int(round(g1 - keep))
+                if re_ > rs:
+                    spans.append((rs, re_))
+
+    return _merge_spans(spans)
 
 
 @dataclass
@@ -333,7 +384,7 @@ def assemble_cut_records(
             natural_sound=cut.natural_sound,
         )
         if cut.kind == "speech":
-            pace.filler_trim = compute_speech_filler_trim(
+            pace.remove_spans = compute_speech_remove_spans(
                 lattices[cut.file_id].words, cut.word_span, s, e)
 
         out.append(CutRecord(

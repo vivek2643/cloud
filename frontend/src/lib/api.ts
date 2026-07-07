@@ -253,9 +253,10 @@ export interface Pace {
   levels: number[];
   energy_grade: string;
   natural_sound: boolean;
-  // [lead_ms, trail_ms] of edge filler/breath the dial may shave off a speech
-  // cut. Absent on runs ingested before the feature -> treated as [0, 0].
-  filler_trim?: [number, number];
+  // Removable dead-air + filler spans across a speech cut ([start_ms, end_ms],
+  // absolute source ms), for the dial to shave -- edge silence/fillers, interior
+  // disfluencies, pause-excess. Absent on pre-feature runs -> nothing to shave.
+  remove_spans?: [number, number][];
 }
 
 export interface Framing {
