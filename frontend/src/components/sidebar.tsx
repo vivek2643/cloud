@@ -1,7 +1,7 @@
 "use client";
 
 import Image from "next/image";
-import { Film, Palette, Captions, Sparkles, type LucideIcon } from "lucide-react";
+import { Film, Palette, Captions, type LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useDriveStore, type ProjectStage } from "@/stores/drive-store";
 
@@ -14,8 +14,7 @@ type NavItem = {
 
 const NAV_ITEMS: NavItem[] = [
   { label: "Media", stage: "media", icon: Film },
-  { label: "Cuts", stage: "cuts", logo: true },
-  { label: "Cuts v3", stage: "cuts-v3", icon: Sparkles },
+  { label: "Cuts", stage: "cuts-v3", logo: true },
   { label: "Colour grading", stage: "color", icon: Palette },
   { label: "Captions", stage: "captions", icon: Captions },
 ];

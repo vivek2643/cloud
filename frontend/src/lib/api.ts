@@ -242,56 +242,9 @@ export function getHeroCutsFeed(fileIds: string[], energy: number, token: string
   });
 }
 
-// --- Cuts v2 (deterministic non-overlapping partition) ---
-
-// One disjoint interval of a file's timeline, tagged with every capture channel
-// it serves. INVARIANT: no two cuts from the same file overlap in time -- the
-// row is a contiguous filmstrip. See cuts_v2.plan.md.
-export interface Cut {
-  file_id: string;
-  src_in_ms: number;
-  src_out_ms: number;
-  duration_ms: number;
-  // Subset of {said,done,shown}, always >=1, priority-ordered (said>done>shown).
-  tags: string[];
-  // The highest-priority tag -- drives the label and the primary badge colour.
-  primary: string;
-  label: string;
-  speaker: string | null;
-  // Representative frame instant for the thumbnail (peak / sharpest / midpoint).
-  peak_ms: number;
-  // Set later by tightness; null = play the whole span contiguously.
-  keep_spans?: [number, number][] | null;
-  // Base-cut boundary reasons: WHY this cut's left/right edges exist
-  // (shot_cut, speaker_change, speech_edge, long_pause, camera_move, settle,
-  // disturbance, clip_edge). Shown under the tile during base-cut bring-up.
-  reason_in?: string;
-  reason_out?: string;
-}
-
-export interface CutsResponse {
-  cuts: Cut[];
-  ready: boolean;
-}
-
-export function getCuts(fileId: string, energy: number, token: string) {
-  return request<CutsResponse>(`/api/files/${fileId}/cuts?energy=${energy}`, { token });
-}
-
-// One flat list of cuts across many clips; the client groups by file_id into
-// per-video horizontal rows. `energy` is the dial: tightness for all cuts +
-// windup/payoff granularity split for done/shown at the high end.
-export function getCutsFeed(fileIds: string[], energy: number, token: string) {
-  return request<CutsResponse>(`/api/files/cuts`, {
-    method: "POST",
-    token,
-    body: JSON.stringify({ file_ids: fileIds, energy }),
-  });
-}
-
-// --- Cuts v3 (LLM-grouped ingest over the deterministic lattice) ---
-// See cuts_v3.plan.md. Additive to v2 -- `/api/files/.../cuts` above is
-// untouched; this is a separate project-scoped pipeline + surface.
+// --- Cuts (LLM-grouped ingest over the deterministic lattice) ---
+// See cuts_v3.plan.md. The sole Cuts surface -- a project-scoped ingest
+// pipeline (the deterministic v2 file-scoped endpoint has been retired).
 
 export interface Pace {
   min_ms: number;
