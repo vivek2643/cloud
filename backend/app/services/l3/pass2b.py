@@ -89,15 +89,11 @@ _SYSTEM = (
     "each image belongs to.\n\n"
     "This is a VISUAL-JUDGMENT-ONLY pass -- do not re-judge label, summary, "
     "junk, or take role; that's already decided. For EVERY cut in this "
-    "batch, judge purely from the pixels: framing -- subject_box (where "
-    "the subject/action sits), then the single BEST crop for EACH delivery "
-    "shape: crop_16x9 (landscape), crop_9x16 (portrait), crop_1x1 (square). "
-    "RECOMPOSE for each shape so the subject stays well-placed in that "
-    "aspect -- a portrait crop is a true reframe, NOT the centre of the "
-    "landscape frame; keep the key action and eyeline inside every crop. "
-    "Set rotation_deg only when the shot is visibly tilted and needs "
-    "leveling (or was captured rotated); use 0 when it is already upright. "
-    "Then look (graded vs log/flat, palette, exposure flags), "
+    "batch, judge purely from the pixels: framing -- subject_box, plus the "
+    "best crop for each delivery shape (crop_16x9, crop_9x16, crop_1x1), each "
+    "recomposed to keep the subject and eyeline in frame for that aspect (not "
+    "a centre-crop of the landscape), and rotation_deg only for a visibly "
+    "tilted shot (else 0). Look (graded vs log/flat, palette, exposure flags), "
     "caption_zones (normalized boxes clear of the subject across every "
     "image you were shown for that cut), taste fences (max/min tasteful "
     "playback speed for this content), and readability_ms (how long a "
@@ -168,4 +164,4 @@ def run_visual_batch(
     if not image_blocks:
         raise ValueError("run_visual_batch: no images resolved for this batch")
     return ic.complete("pass2", _SYSTEM, cached_blocks, VisualOutput,
-                       extra_blocks=image_blocks, max_tokens=16000)
+                       extra_blocks=image_blocks, max_tokens=24000)
