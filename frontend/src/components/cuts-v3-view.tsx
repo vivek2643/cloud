@@ -140,7 +140,6 @@ export function CutsV3View() {
   const [pollGen, setPollGen] = useState(0);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [activeKey, setActiveKey] = useState<string | null>(null);
-  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [order, setOrder] = useState<string[]>([]);
   const urlCache = useRef<Record<string, Promise<string | null>>>({});
 
@@ -262,17 +261,11 @@ export function CutsV3View() {
     return byGroup;
   }, [cuts]);
 
-  // Non-winner "take" siblings never get their own tile -- they only appear
-  // fanned out from their winner's badge. Outlooks keep their own tile (they
-  // are different content, per the plan).
-  const hiddenAsSibling = useMemo(() => {
-    const hidden = new Set<string>();
-    for (const group of Object.values(takeGroups)) {
-      if (!group.some((c) => c.take_role === "winner")) continue;
-      for (const c of group) if (c.take_role === "take") hidden.add(c.id);
-    }
-    return hidden;
-  }, [takeGroups]);
+  // Every take is shown -- we do NOT pick a "best" one. take_group_id still
+  // tags which cuts are the same beat captured more than once (a retake or
+  // another angle), surfaced as a passive badge so the editor can see the
+  // repeats; a future deterministic algorithm will choose among them. Nothing
+  // is hidden as a sibling.
 
   // Junk is binary + recoverable (deterministic-keep): the model flags what
   // isn't part of the piece (camera cues, pre-roll, dead air) BY MEANING, and
@@ -285,10 +278,7 @@ export function CutsV3View() {
 
   const rows = useMemo(() => {
     const present = cuts.filter(
-      (c) =>
-        filesById[c.file_id] &&
-        !hiddenAsSibling.has(c.id) &&
-        (showDiscarded || !c.junk)
+      (c) => filesById[c.file_id] && (showDiscarded || !c.junk)
     );
     const byFile: Record<string, CutRecord[]> = {};
     for (const c of present) (byFile[c.file_id] ??= []).push(c);
@@ -299,7 +289,7 @@ export function CutsV3View() {
         cuts: [...list].sort((a, b) => a.src_in_ms - b.src_in_ms),
       }))
       .sort((a, b) => a.fileName.localeCompare(b.fileName));
-  }, [cuts, filesById, hiddenAsSibling, showDiscarded]);
+  }, [cuts, filesById, showDiscarded]);
 
   useEffect(() => {
     setOrder((prev) => {
@@ -322,15 +312,6 @@ export function CutsV3View() {
       const next = new Set(prev);
       if (next.has(key)) next.delete(key);
       else next.add(key);
-      return next;
-    });
-  }, []);
-
-  const toggleGroup = useCallback((groupId: string) => {
-    setExpandedGroups((prev) => {
-      const next = new Set(prev);
-      if (next.has(groupId)) next.delete(groupId);
-      else next.add(groupId);
       return next;
     });
   }, []);
@@ -484,14 +465,12 @@ export function CutsV3View() {
                       weldableNeighbor(next) &&
                       selected.has(cutKey(next)) &&
                       c.src_out_ms === next.src_in_ms;
-                    const siblingCount = c.take_group_id
-                      ? (takeGroups[c.take_group_id] ?? []).filter((g) => g.take_role === "take").length
+                    // Passive same-beat indicator: how many cuts (incl. this
+                    // one) share this beat. No hiding, no winner -- every take
+                    // is its own tile in timeline order.
+                    const groupSize = c.take_group_id
+                      ? (takeGroups[c.take_group_id] ?? []).length
                       : 0;
-                    const expanded = c.take_group_id ? expandedGroups.has(c.take_group_id) : false;
-                    const siblings =
-                      expanded && c.take_group_id
-                        ? (takeGroups[c.take_group_id] ?? []).filter((g) => g.take_role === "take")
-                        : [];
                     return (
                       <div key={cutKey(c)} className="flex shrink-0">
                         {c.junk ? (
@@ -511,34 +490,9 @@ export function CutsV3View() {
                             isActive={activeKey === cutKey(c)}
                             onActivate={() => setActiveKey(cutKey(c))}
                             onDeactivate={() => setActiveKey((k) => (k === cutKey(c) ? null : k))}
-                            takeCount={siblingCount}
-                            takeExpanded={expanded}
-                            onToggleTakes={
-                              siblingCount > 0 ? () => toggleGroup(c.take_group_id!) : undefined
-                            }
+                            takeGroupSize={groupSize}
                           />
                         )}
-                        {siblings.map((s) => (
-                          <CutCardV3
-                            key={cutKey(s)}
-                            file={filesById[s.file_id]}
-                            cut={s}
-                            energy={energy}
-                            getUrl={getUrl}
-                            aspect={aspect}
-                            debugMode={debugMode}
-                            selected={selected.has(cutKey(s))}
-                            weldLeft={false}
-                            weldRight={false}
-                            onToggle={() => toggle(cutKey(s))}
-                            isActive={activeKey === cutKey(s)}
-                            onActivate={() => setActiveKey(cutKey(s))}
-                            onDeactivate={() => setActiveKey((k) => (k === cutKey(s) ? null : k))}
-                            takeCount={0}
-                            takeExpanded={false}
-                            dimmed
-                          />
-                        ))}
                       </div>
                     );
                   })}
@@ -845,10 +799,7 @@ function CutCardV3({
   isActive,
   onActivate,
   onDeactivate,
-  takeCount,
-  takeExpanded,
-  onToggleTakes,
-  dimmed,
+  takeGroupSize,
 }: {
   file?: FileRecord;
   cut: CutRecord;
@@ -863,10 +814,7 @@ function CutCardV3({
   isActive: boolean;
   onActivate: () => void;
   onDeactivate: () => void;
-  takeCount: number;
-  takeExpanded: boolean;
-  onToggleTakes?: () => void;
-  dimmed?: boolean;
+  takeGroupSize: number;
 }) {
   const [playUrl, setPlayUrl] = useState<string | null>(null);
   const [muted, setMuted] = useState(false);
@@ -988,7 +936,7 @@ function CutCardV3({
 
   return (
     <div
-      style={{ width: CARD_W[aspect], marginLeft: weldLeft ? 0 : 10, opacity: dimmed ? 0.6 : 1 }}
+      style={{ width: CARD_W[aspect], marginLeft: weldLeft ? 0 : 10 }}
       className="shrink-0 first:ml-0"
     >
       <div
@@ -1029,25 +977,19 @@ function CutCardV3({
           />
         )}
 
-        {/* take-role badge (top-left) */}
-        {(cut.take_role || takeCount > 0) && (
+        {/* same-beat indicator (top-left): passive -- every take is its own
+            tile; this just flags that N cuts capture the same beat. */}
+        {(takeGroupSize > 1 || cut.take_role === "outlook") && (
           <div className="absolute left-2 top-2 z-20 flex items-center gap-1">
-            {cut.take_role === "winner" && takeCount > 0 && (
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onToggleTakes?.();
-                }}
+            {takeGroupSize > 1 && (
+              <span
                 className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-semibold"
                 style={{ background: "rgba(255,255,255,0.92)", color: "#000" }}
+                title={`One of ${takeGroupSize} takes of the same beat`}
               >
                 <Layers size={11} />
-                {takeCount + 1} takes
-                <ChevronDown
-                  size={11}
-                  style={{ transform: takeExpanded ? "rotate(180deg)" : undefined }}
-                />
-              </button>
+                {takeGroupSize} takes
+              </span>
             )}
             {cut.take_role === "outlook" && (
               <span
