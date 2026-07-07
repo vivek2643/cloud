@@ -52,6 +52,7 @@ class Pass2Cut(BaseModel):
     natural_sound: bool = False
     take_group_id: str | None = None
     take_role: str | None = None    # "take" | "outlook" | "winner"
+    channel: str | None = None      # "said" | "done" | "shown" (video: done|shown)
 
 
 class Pass2Output(BaseModel):
@@ -83,6 +84,7 @@ def merge_identity_and_visual(
             taste_fences=visual.taste_fences, readability_ms=visual.readability_ms,
             natural_sound=identity.natural_sound,
             take_group_id=identity.take_group_id, take_role=identity.take_role,
+            channel=identity.channel,
         ))
     return Pass2Output(cuts=cuts)
 

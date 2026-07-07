@@ -299,7 +299,7 @@ def test_one_winner_per_take_group_backstop():
             file_id=fid, src_in_ms=s, src_out_ms=e, kind="speech", word_span=(0, 4),
             atom_ids=None, label="line", summary="", speaker=None, on_camera=None,
             junk=False, junk_reason=None, framing={}, look={}, caption_zones=[],
-            hero_ts_ms=s, pace=None, take_group_id="tg1", take_role=role)
+            hero_ts_ms=s, pace=None, take_group_id="tg1", take_role=role, channel="said")
     recs = [rec("f1", 0, 3000, "winner"), rec("f2", 0, 2000, "winner"),
             rec("f3", 0, 2500, "outlook")]
     post._enforce_one_winner_per_take_group(recs)

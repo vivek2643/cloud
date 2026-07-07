@@ -67,6 +67,7 @@ class CutRecord:
     pace: PaceEnvelope
     take_group_id: Optional[str]
     take_role: Optional[str]
+    channel: str                           # "said" | "done" | "shown"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -80,6 +81,7 @@ class CutRecord:
             "caption_zones": [list(z) for z in self.caption_zones],
             "hero_ts_ms": self.hero_ts_ms, "pace": self.pace.to_dict(),
             "take_group_id": self.take_group_id, "take_role": self.take_role,
+            "channel": self.channel,
         }
 
 
@@ -284,6 +286,12 @@ def assemble_cut_records(
             framing=cut.framing.model_dump(), look=cut.look.model_dump(),
             caption_zones=list(cut.caption_zones), hero_ts_ms=hero_ts, pace=pace,
             take_group_id=cut.take_group_id, take_role=cut.take_role,
+            # Channel is a SEMANTIC category the model owns: speech is always
+            # "said" (code owns that fact); a video cut is "done" (an action is
+            # performed/demonstrated) or "shown" (b-roll/display). Missing/unknown
+            # on a video cut resolves to the conservative "shown".
+            channel=("said" if cut.kind == "speech"
+                     else (cut.channel if cut.channel in ("done", "shown") else "shown")),
         ))
     _enforce_one_winner_per_take_group(out)
     return out

@@ -65,6 +65,17 @@ _KIND_ALIASES = {
     "speech_cut": "speech", "speech_group": "speech", "spoken": "speech",
 }
 
+# channel = the delivery CATEGORY (the model's call): "said" (spoken), "done"
+# (an action is performed/demonstrated on screen), "shown" (b-roll / an object /
+# scenery / a display, no performed action). Fold common synonyms rather than
+# burn a re-ask on a naming choice; unknown values default to "shown" in post.
+_CHANNEL_ALIASES = {
+    "speech": "said", "spoken": "said", "dialogue": "said", "talking": "said",
+    "action": "done", "demo": "done", "demonstration": "done", "performed": "done",
+    "b-roll": "shown", "broll": "shown", "b_roll": "shown", "insert": "shown",
+    "display": "shown", "scenery": "shown", "object": "shown",
+}
+
 
 class IdentityCut(BaseModel):
     source_ref: str                 # e.g. "speech_cut[2]" / "video_group[0]" -- joins back to pass 1
@@ -81,6 +92,7 @@ class IdentityCut(BaseModel):
     natural_sound: bool = False
     take_group_id: str | None = None
     take_role: str | None = None    # "take" | "outlook" | "winner"
+    channel: str | None = None      # "said" | "done" | "shown"
 
     @field_validator("take_role", mode="before")
     @classmethod
@@ -88,6 +100,14 @@ class IdentityCut(BaseModel):
         if isinstance(v, str):
             key = v.strip().lower()
             return _TAKE_ROLE_ALIASES.get(key, key)
+        return v
+
+    @field_validator("channel", mode="before")
+    @classmethod
+    def _normalize_channel(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            key = v.strip().lower()
+            return _CHANNEL_ALIASES.get(key, key)
         return v
 
     @field_validator("kind", mode="before")
@@ -152,8 +172,13 @@ _SYSTEM = (
     "value.\n\n"
     "Per cut, judge from the pixels: label, summary (a best guess from image "
     "+ transcript is fine, and expected), on_camera (does the visible person "
-    "match the diarized speaker), junk (+reason), and natural_sound (does the "
-    "cut carry sound worth keeping). JUNK is BINARY and by MEANING: set "
+    "match the diarized speaker), channel, junk (+reason), and natural_sound "
+    "(does the cut carry sound worth keeping). CHANNEL is the delivery category: "
+    "for a video cut set \"done\" when an action is performed / demonstrated on "
+    "screen (a swing, a catch, pouring, assembling, a gesture that IS the "
+    "content) or \"shown\" when it is b-roll / an object / scenery / a display "
+    "with no performed action (speech cuts are always \"said\" -- you may omit "
+    "channel for them). JUNK is BINARY and by MEANING: set "
     "junk=true ONLY when the cut is clearly not part of the piece (a camera "
     "cue like 'and go'/'3-2-1'/'take three', pre-roll setup, obvious dead "
     "air). Junk is recoverable -- it's hidden into a Discarded tray, not "

@@ -332,6 +332,10 @@ export interface CutRecord {
   on_camera: boolean | null;
   take_group_id: string | null;
   take_role: TakeRole | null;
+  // Delivery channel (LLM-owned category): "said" (spoken), "done" (an action
+  // performed/demonstrated), "shown" (b-roll/display). Optional for older runs
+  // ingested before the field existed -- the view falls back to kind.
+  channel?: "said" | "done" | "shown" | null;
   junk: boolean;
   junk_reason: string | null;
   framing: Framing;
