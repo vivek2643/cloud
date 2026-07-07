@@ -93,12 +93,19 @@ const STATUS_LABEL: Record<IngestStatus, string> = {
   failed: "Failed",
 };
 
-// The energy dial as pure view-math (cuts_v3_boundaries_v2.plan.md §D). Trims
-// the played span INWARD toward the cut's anchor (hero_ts_ms) as energy rises --
-// "negative padding". energy 0 -> the full grounded span; energy 1 -> pace.min_ms
-// (the anchor-protected floor computed in post.py, so the payoff frame is never
-// trimmed away). Speech cuts have min_ms == natural, so they don't tighten.
+// The energy dial as pure view-math (cuts_v3_boundaries_v2.plan.md §D).
+//
+// VIDEO: trims the played span INWARD toward the cut's anchor (hero_ts_ms) as
+// energy rises -- "negative padding". energy 0 -> the full grounded span;
+// energy 1 -> pace.min_ms (the anchor-protected floor, so the payoff frame is
+// never trimmed away).
+//
+// SPEECH: doesn't shrink toward a peak (a spoken beat isn't a peak). Instead the
+// dial shaves the deterministically-detected EDGE filler/breath (pace.filler_trim
+// from post.speechFillerTrim), scaled by energy -- see speechTightenedSpan. This
+// is the separate, tunable "filler removal" path; kept gentle by construction.
 function tightenedSpan(cut: CutRecord, energy: number): { inMs: number; outMs: number } {
+  if (cut.kind === "speech") return speechTightenedSpan(cut, energy);
   const inMs0 = cut.src_in_ms;
   const outMs0 = cut.src_out_ms;
   const naturalDur = outMs0 - inMs0;
@@ -110,6 +117,26 @@ function tightenedSpan(cut: CutRecord, energy: number): { inMs: number; outMs: n
   let outMs = inMs + targetDur;
   if (inMs < inMs0) { inMs = inMs0; outMs = inMs + targetDur; }
   if (outMs > outMs0) { outMs = outMs0; inMs = outMs - targetDur; }
+  return { inMs, outMs };
+}
+
+// How hard the dial leans on filler removal. Even at max energy we only remove a
+// fraction of the detected edge filler so speech never feels clipped ("not
+// intense"); raise toward 1 to make the dial more aggressive. Tunable knob.
+const FILLER_TRIM_MAX = 0.85;
+
+// Speech dial: shave up to FILLER_TRIM_MAX of the detected leading/trailing
+// filler+breath, proportional to energy. Deterministic + edge-only, so the
+// content is untouched; energy 0 keeps the full span.
+function speechTightenedSpan(cut: CutRecord, energy: number): { inMs: number; outMs: number } {
+  const inMs0 = cut.src_in_ms;
+  const outMs0 = cut.src_out_ms;
+  const [lead = 0, trail = 0] = cut.pace?.filler_trim ?? [0, 0];
+  if (lead <= 0 && trail <= 0) return { inMs: inMs0, outMs: outMs0 };
+  const k = energy * FILLER_TRIM_MAX;
+  const inMs = Math.round(inMs0 + lead * k);
+  const outMs = Math.round(outMs0 - trail * k);
+  if (outMs - inMs < 200) return { inMs: inMs0, outMs: outMs0 }; // safety: never collapse
   return { inMs, outMs };
 }
 

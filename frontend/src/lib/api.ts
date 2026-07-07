@@ -300,6 +300,9 @@ export interface Pace {
   levels: number[];
   energy_grade: string;
   natural_sound: boolean;
+  // [lead_ms, trail_ms] of edge filler/breath the dial may shave off a speech
+  // cut. Absent on runs ingested before the feature -> treated as [0, 0].
+  filler_trim?: [number, number];
 }
 
 export interface Framing {

@@ -291,6 +291,36 @@ def test_assemble_allows_a_project_file_with_zero_cuts():
     print("ok  test_assemble_allows_a_project_file_with_zero_cuts")
 
 
+def test_speech_filler_trim_shaves_leading_and_trailing():
+    words = [
+        {"start_ms": 0, "end_ms": 300, "text": "Um,"},
+        {"start_ms": 300, "end_ms": 600, "text": "so"},
+        {"start_ms": 600, "end_ms": 1200, "text": "the"},
+        {"start_ms": 1200, "end_ms": 1800, "text": "product"},
+        {"start_ms": 1800, "end_ms": 2200, "text": "ships."},
+        {"start_ms": 2200, "end_ms": 2500, "text": "you"},
+        {"start_ms": 2500, "end_ms": 2800, "text": "know"},
+    ]
+    lead, trail = post.compute_speech_filler_trim(words, (0, 6), 0, 2800)
+    assert lead == 600, lead    # content ('the') starts at 600
+    assert trail == 600, trail  # content ends at 'ships.' @2200; 2800-2200
+    print("ok  test_speech_filler_trim_shaves_leading_and_trailing")
+
+
+def test_speech_filler_trim_none_when_clean():
+    words = [{"start_ms": 0, "end_ms": 500, "text": "Hello"},
+             {"start_ms": 500, "end_ms": 1000, "text": "world."}]
+    assert post.compute_speech_filler_trim(words, (0, 1), 0, 1000) == (0, 0)
+    print("ok  test_speech_filler_trim_none_when_clean")
+
+
+def test_speech_filler_trim_all_filler_left_whole():
+    words = [{"start_ms": 0, "end_ms": 300, "text": "um"},
+             {"start_ms": 300, "end_ms": 600, "text": "uh"}]
+    assert post.compute_speech_filler_trim(words, (0, 1), 0, 600) == (0, 0)
+    print("ok  test_speech_filler_trim_all_filler_left_whole")
+
+
 def test_one_winner_per_take_group_backstop():
     # Two clips of one take, both crowned "winner" by pass 2 -> the longest stays
     # winner, the shorter is demoted to "take"; an outlook is untouched.
@@ -309,6 +339,9 @@ def test_one_winner_per_take_group_backstop():
 
 
 def main():
+    test_speech_filler_trim_shaves_leading_and_trailing()
+    test_speech_filler_trim_none_when_clean()
+    test_speech_filler_trim_all_filler_left_whole()
     test_one_winner_per_take_group_backstop()
     test_hero_ts_prefers_anchor_over_sharp()
     test_hero_ts_falls_back_to_sharpest()

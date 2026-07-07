@@ -18,7 +18,8 @@ nothing new to build or store here for that bullet.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.services.l3.lattice import Lattice, _anchors_in, resolve_speech_span_ms
@@ -39,11 +40,65 @@ class PaceEnvelope:
     levels: List[float]
     energy_grade: str
     natural_sound: bool
+    # (lead_ms, trail_ms) of edge disfluency + edge silence that the dial MAY
+    # shave off a speech cut -- see compute_speech_filler_trim. (0, 0) for video
+    # or a clean speech edge. The dial scales how much is applied (view-math).
+    filler_trim: Tuple[int, int] = (0, 0)
 
     def to_dict(self) -> Dict[str, Any]:
         return {"min_ms": self.min_ms, "natural_ms": self.natural_ms, "max_ms": self.max_ms,
                 "levels": list(self.levels), "energy_grade": self.energy_grade,
-                "natural_sound": self.natural_sound}
+                "natural_sound": self.natural_sound, "filler_trim": list(self.filler_trim)}
+
+
+# Edge disfluencies + discourse markers that are safe to shave from the START or
+# END of a spoken beat (never the interior). Tunable -- this set plus how the
+# dial scales the trim is the whole knob. Kept deliberately small/conservative
+# ("not intense"): clear fillers + a few leading/trailing markers.
+_FILLER_EDGE_TOKENS = {
+    "um", "uh", "umm", "uhm", "erm", "er", "ah", "ahh", "hmm", "mm", "mmm", "uhh",
+    "so", "well", "okay", "ok", "like", "right", "yeah", "anyway", "basically",
+    "actually", "literally", "you", "know", "i", "mean",
+}
+_FILLER_WORD_RE = re.compile(r"[a-z']+")
+
+
+def _is_filler_word(text: Optional[str]) -> bool:
+    """A word is pure filler only if EVERY alphabetic token in it is a filler
+    token (so 'um,' counts, but 'important' never does)."""
+    toks = _FILLER_WORD_RE.findall((text or "").lower())
+    return bool(toks) and all(t in _FILLER_EDGE_TOKENS for t in toks)
+
+
+def compute_speech_filler_trim(
+    words: List[dict], word_span: Optional[Tuple[int, int]], s: int, e: int
+) -> Tuple[int, int]:
+    """Deterministic EDGE filler/breath trim for a speech cut: how many ms of
+    leading and trailing disfluency ('um', 'so', 'you know') PLUS the edge
+    silence around them could be shaved. The dial decides how much of this is
+    actually applied (0 = keep everything, 1 = shave it all) -- this only
+    reports the budget, it never trims here. Conservative by construction: only
+    whole EDGE words that are pure fillers, never an interior word, and it always
+    leaves a non-empty content span. Returns (lead_ms, trail_ms)."""
+    if not words or word_span is None:
+        return (0, 0)
+    a, b = int(word_span[0]), int(word_span[1])
+    a = max(0, a)
+    b = min(len(words) - 1, b)
+    if a > b:
+        return (0, 0)
+    content = [i for i in range(a, b + 1) if not _is_filler_word(words[i].get("text"))]
+    if not content:
+        return (0, 0)  # an all-filler span is left whole (likely junk, handled elsewhere)
+    first, last = content[0], content[-1]
+    content_start = int(words[first].get("start_ms", s))
+    content_end = int(words[last].get("end_ms", e))
+    lead = max(0, content_start - s)
+    trail = max(0, e - content_end)
+    # Never eat into content: if the edges would meet, trim nothing.
+    if lead + trail >= (e - s):
+        return (0, 0)
+    return (lead, trail)
 
 
 @dataclass
@@ -277,6 +332,9 @@ def assemble_cut_records(
             min_tasteful_speed=cut.taste_fences.min_tasteful_speed,
             natural_sound=cut.natural_sound,
         )
+        if cut.kind == "speech":
+            pace.filler_trim = compute_speech_filler_trim(
+                lattices[cut.file_id].words, cut.word_span, s, e)
 
         out.append(CutRecord(
             file_id=cut.file_id, src_in_ms=s, src_out_ms=e, kind=cut.kind,
