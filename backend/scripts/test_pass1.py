@@ -499,6 +499,54 @@ def test_beat_merge_does_not_touch_untagged_neighbours():
     print("ok  test_beat_merge_does_not_touch_untagged_neighbours")
 
 
+def test_silent_trailing_word_is_folded_into_its_beat():
+    # Real-data artifact: a zero-duration trailing word ("you." timed
+    # end==start) left uncovered by the model, sitting flush against an atom.
+    # Recovered as [2,2] it would resolve to a point (src_out==src_in) the DB
+    # rejects -- enforce must fold it into the word-adjacent same-speaker beat.
+    words = [
+        {"start_ms": 0, "end_ms": 200, "text": "Thank", "speaker": "S1"},
+        {"start_ms": 200, "end_ms": 500, "text": "you", "speaker": "S1"},
+        {"start_ms": 500, "end_ms": 500, "text": "you.", "speaker": "S1"},  # zero-duration
+    ]
+    atoms = [Atom(atom_id=0, file_id="f1", start_ms=500, end_ms=1500,
+                  state_in="speech_edge", state_out="clip_edge",
+                  action_energy=0.1, coherence=1.0)]
+    lat = Lattice(file_id="f1", duration_ms=1500, words=words, turns=[], hints=[], atoms=atoms)
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [{"file_id": "f1", "word_span": [0, 1], "label": "thanks"}],
+        "video_tentative_groups": [{"file_id": "f1", "atom_ids": [0]}],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    spans = sorted(tuple(sc.word_span) for sc in fixed.speech_cuts)
+    assert spans == [(0, 2)], spans   # the silent [2,2] folded in, no degenerate cut
+    print("ok  test_silent_trailing_word_is_folded_into_its_beat")
+
+
+def test_isolated_silent_word_is_dropped():
+    # A zero-duration word with no word-adjacent neighbour has no audible span
+    # and nothing to fold into -> dropped (nothing lost), never a point-span cut.
+    words = [
+        {"start_ms": 0, "end_ms": 300, "text": "Hi", "speaker": "S1"},
+        {"start_ms": 900, "end_ms": 900, "text": "x", "speaker": "S1"},  # isolated + silent
+    ]
+    atoms = [Atom(atom_id=0, file_id="f1", start_ms=300, end_ms=900,
+                  state_in="speech_edge", state_out="speech_edge",
+                  action_energy=0.1, coherence=1.0),
+             Atom(atom_id=1, file_id="f1", start_ms=900, end_ms=1500,
+                  state_in="speech_edge", state_out="clip_edge",
+                  action_energy=0.1, coherence=1.0)]
+    lat = Lattice(file_id="f1", duration_ms=1500, words=words, turns=[], hints=[], atoms=atoms)
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [{"file_id": "f1", "word_span": [0, 0], "label": "hi"}],
+        "video_tentative_groups": [{"file_id": "f1", "atom_ids": [0, 1]}],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    spans = sorted(tuple(sc.word_span) for sc in fixed.speech_cuts)
+    assert spans == [(0, 0)], spans   # the isolated silent word dropped
+    print("ok  test_isolated_silent_word_is_dropped")
+
+
 def test_no_overlapping_speech_cuts():
     bad = pass1.Pass1Output.model_validate({
         "speech_cuts": [
@@ -561,6 +609,8 @@ def main():
     test_beat_merge_fuses_same_beat_neighbours_across_weldable_seam()
     test_beat_merge_respects_the_seam_guard()
     test_beat_merge_does_not_touch_untagged_neighbours()
+    test_silent_trailing_word_is_folded_into_its_beat()
+    test_isolated_silent_word_is_dropped()
     test_no_overlapping_speech_cuts()
     test_pass1_output_rejects_an_unexpected_wrapper_key()
     print("\nall pass1 tests passed")

@@ -393,6 +393,70 @@ def _merge_beats(
     return out, absorbed
 
 
+def _fold_silent_speech_cuts(cuts: List[SpeechCut], lattice: Lattice) -> List[SpeechCut]:
+    """Fold any speech cut whose words carry ZERO audible duration into a
+    word-adjacent same-speaker neighbour. A zero-duration transcript word (a
+    trailing 'you.' timed end==start) that ends up alone in a cut has no audible
+    span AND sits flush against the next atom, so its resolved (src_in, src_out)
+    collapses to a point -- a degenerate cut the DB rejects (src_out > src_in).
+    Rather than invent time an atom already owns, we re-attach the silent word to
+    the spoken beat it belongs to (previous cut if word-touching, else next); an
+    isolated silent word with no neighbour is dropped (no audio, nothing lost).
+    Deterministic + clip-relative: 'audible' is the word's own end>start, never a
+    tuned floor."""
+    words = lattice.words
+    if not words:
+        return cuts
+
+    def _silent(sc: SpeechCut) -> bool:
+        a, b = sc.word_span
+        return all(int(words[k].get("end_ms", 0)) <= int(words[k].get("start_ms", 0))
+                   for k in range(max(0, a), min(len(words), b + 1)))
+
+    atoms = lattice.atoms
+
+    def _bare_gap(i: int) -> bool:
+        """No atom sits in the inter-word gap between words i and i+1 -- a bare
+        pause/touch across which folding cannot swallow a video atom."""
+        gap_lo = int(words[i].get("end_ms", 0))
+        gap_hi = int(words[i + 1].get("start_ms", 0))
+        if gap_hi <= gap_lo:
+            return True
+        return not any(gap_lo <= (at.start_ms + at.end_ms) // 2 < gap_hi for at in atoms)
+
+    ordered = sorted(cuts, key=lambda s: s.word_span[0])
+    out: List[SpeechCut] = []
+    for pos, sc in enumerate(ordered):
+        if not _silent(sc):
+            out.append(sc)
+            continue
+        a, b = sc.word_span
+        spk = words[a].get("speaker") if 0 <= a < len(words) else None
+        prev = out[-1] if out else None
+        if (prev is not None and prev.word_span[1] + 1 == a
+                and (words[prev.word_span[1]].get("speaker") == spk)
+                and _bare_gap(prev.word_span[1])):
+            out[-1] = SpeechCut(file_id=prev.file_id, word_span=(prev.word_span[0], b),
+                                label=prev.label, speaker_ids=list(prev.speaker_ids),
+                                beat_id=prev.beat_id)
+            logger.info("pass1 enforce: folded silent words[%d-%d] into preceding beat %r",
+                        a, b, prev.label)
+            continue
+        nxt = ordered[pos + 1] if pos + 1 < len(ordered) else None
+        if (nxt is not None and b + 1 == nxt.word_span[0]
+                and (words[nxt.word_span[0]].get("speaker") == spk)
+                and _bare_gap(b)):
+            ordered[pos + 1] = SpeechCut(file_id=nxt.file_id, word_span=(a, nxt.word_span[1]),
+                                         label=nxt.label, speaker_ids=list(nxt.speaker_ids),
+                                         beat_id=nxt.beat_id)
+            logger.info("pass1 enforce: folded silent words[%d-%d] into following beat %r",
+                        a, b, nxt.label)
+            continue
+        logger.info("pass1 enforce: dropping isolated silent words[%d-%d] (no audible span)",
+                    a, b)
+    return out
+
+
 def _contiguous_atom_runs(lattice: Lattice, atom_ids: List[int]) -> List[List[int]]:
     """``atom_ids`` split into time-contiguous runs (next.start_ms ==
     cur.end_ms). Unknown ids are dropped. A video group must be one
@@ -522,6 +586,9 @@ def enforce_lattice_partition(output: Pass1Output, lattices: Dict[str, Lattice])
                 absorbed_atoms.setdefault(file_id, set()).update(merged_absorbed)
                 logger.info("pass1 enforce: merged same-beat neighbours in %s, absorbing "
                             "%d atom(s)", file_id, len(merged_absorbed))
+            # Fold any zero-audible-duration cut into its neighbour so no speech
+            # cut resolves to a degenerate (src_out <= src_in) span downstream.
+            file_cuts = _fold_silent_speech_cuts(file_cuts, lattice)
         merged_cuts.extend(file_cuts)
     new_cuts = merged_cuts
 
