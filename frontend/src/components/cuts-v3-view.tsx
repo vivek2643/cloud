@@ -212,6 +212,10 @@ export function CutsV3View() {
   const files = useDriveStore((s) => s.files);
   const [aspect, setAspect] = useState<Aspect>("landscape");
   const [fit, setFit] = useState<"adjusted" | "original">("adjusted");
+  // Pace: "adjusted" plays every VIDEO cut at its mid pace level (pace.levels[2],
+  // the neutral target-velocity), normalizing speed across clips. Speech is never
+  // sped/slowed (its levels are all 1.0), so this is a no-op on speech.
+  const [paceMode, setPaceMode] = useState<"adjusted" | "original">("original");
   const [filter, setFilter] = useState<FilterKey>("all");
   const [showDiscarded, setShowDiscarded] = useState(false);
   const [showMicro, setShowMicro] = useState(false);
@@ -486,6 +490,11 @@ export function CutsV3View() {
             value={fit === "adjusted" ? "Frame Adjusted" : "Original"}
             onChange={(v) => setFit(v === "Original" ? "original" : "adjusted")}
           />
+          <PillDropdown
+            options={["Pace Adjusted", "Original"]}
+            value={paceMode === "adjusted" ? "Pace Adjusted" : "Original"}
+            onChange={(v) => setPaceMode(v === "Pace Adjusted" ? "adjusted" : "original")}
+          />
           <TrayToggle
             active={showDiscarded}
             onClick={() => setShowDiscarded((v) => !v)}
@@ -618,6 +627,7 @@ export function CutsV3View() {
                             getUrl={getUrl}
                             aspect={aspect}
                             fit={fit}
+                            paceMode={paceMode}
                             selected={isSel}
                             weldLeft={weldLeft}
                             weldRight={weldRight}
@@ -999,6 +1009,7 @@ function CutCardV3({
   getUrl,
   aspect,
   fit,
+  paceMode,
   selected,
   weldLeft,
   weldRight,
@@ -1014,6 +1025,7 @@ function CutCardV3({
   getUrl: (fileId: string) => Promise<string | null>;
   aspect: Aspect;
   fit: "adjusted" | "original";
+  paceMode: "adjusted" | "original";
   selected: boolean;
   weldLeft: boolean;
   weldRight: boolean;
@@ -1039,6 +1051,17 @@ function CutCardV3({
   useEffect(() => {
     segsRef.current = segments;
   }, [segments]);
+  // Pace-adjusted playback speed: video plays at its mid pace level (the neutral
+  // target-velocity); speech is NEVER sped/slowed (levels are all 1.0 anyway, but
+  // guard explicitly). "Original" = native speed.
+  const rate =
+    paceMode === "adjusted" && cut.kind !== "speech"
+      ? Math.min(4, Math.max(0.25, cut.pace?.levels?.[2] ?? 1))
+      : 1;
+  useEffect(() => {
+    const v = videoRef.current;
+    if (v) v.playbackRate = rate;
+  }, [rate, playUrl]);
   // "Frame Adjusted" applies the per-aspect crop (fill the tile); "Original"
   // shows the whole source frame letterboxed (contain), no crop -- only the
   // rotation is honoured either way.
@@ -1070,6 +1093,7 @@ function CutCardV3({
     const v = videoRef.current;
     if (!v) return;
     v.muted = muted;
+    v.playbackRate = rate;
     segIdxRef.current = 0;
     const startSec = segsRef.current[0].inMs / 1000;
     const play = () => v.play().catch(() => {});
@@ -1088,7 +1112,7 @@ function CutCardV3({
       v.removeEventListener("seeked", onSeeked);
       play();
     }
-  }, [inSec, muted]);
+  }, [inSec, muted, rate]);
 
   // Dial moved (segments changed) while hovering: restart from the new first
   // segment so the preview always reflects the current tightness.
