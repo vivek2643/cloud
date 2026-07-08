@@ -448,8 +448,8 @@ function EmptyState() {
       <Sparkles size={30} style={{ color: "var(--accent)" }} />
       <p className="mt-3 text-sm font-semibold">Chat about your footage</p>
       <p className="mt-1 max-w-[18rem] text-xs" style={{ color: "var(--muted)" }}>
-        Ask about your clips, talk through ideas, or describe an edit. EDSO only
-        changes the timeline after it proposes a cut and you say go.
+        Ask about your clips, talk through ideas, or describe an edit. EDSO
+        edits the timeline directly as it works -- you can always undo.
       </p>
     </div>
   );

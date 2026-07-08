@@ -29,9 +29,8 @@ import {
 } from "lucide-react";
 import { EditButton } from "./search-edit-bar";
 
-// Category filter, matching the original Cuts tab. v3 cuts carry a delivery
-// CHANNEL (said / done / shown); a cut appears under a filter when its channel
-// matches. "All" shows everything.
+// Category filter. Cuts carry a delivery CHANNEL (said / done / shown); a cut
+// appears under a filter when its channel matches. "All" shows everything.
 type FilterKey = "all" | "said" | "done" | "shown";
 const FILTERS: { key: FilterKey; label: string }[] = [
   { key: "all", label: "All" },
@@ -65,8 +64,7 @@ const energyLabel = (e: number) => ENERGY_LABELS[Math.min(4, Math.round(e * 4))]
 // final speech/video grouping, cross-clip takes, and every per-cut judgment
 // (framing/look/summary). This view is READ-ONLY over `cut_records` -- it
 // never groups/tightens/filters content; the dial's view-math (section 9)
-// lands separately. Additive to v2 (`cuts-view.tsx`): that surface, its
-// `/api/files/.../cuts` endpoint, and its data are untouched by this file.
+// lands separately.
 
 type Aspect = "landscape" | "portrait" | "square";
 const ASPECT_LABEL: Record<Aspect, string> = {
@@ -757,14 +755,13 @@ function IngestBanner({
     );
   }
 
-  // Ready: no banner. The project summary is intentionally not shown (the view
-  // matches the original Cuts tab); re-run lives in the top toolbar.
+  // Ready: no banner. The project summary is intentionally not shown; re-run
+  // lives in the top toolbar.
   return null;
 }
 
-// Copied from the main Cuts view's EnergyBar (cuts-view.tsx) so the two
-// surfaces share one look + snap behaviour. Snaps to 5 stops (Broad..Sharp);
-// v3 reads the continuous value as tightening view-math (tightenedSpan).
+// Snaps to 5 stops (Broad..Sharp); reads the continuous value as tightening
+// view-math (tightenedSpan).
 function EnergyBar({ value, onChange }: { value: number; onChange: (v: number) => void }) {
   const trackRef = useRef<HTMLDivElement>(null);
   const valueRef = useRef(value);
@@ -1239,7 +1236,7 @@ function CutCardV3({
       content: cut.label,
       speaker: cut.speaker,
     });
-    e.dataTransfer.setData("application/x-hero-cut", payload);
+    e.dataTransfer.setData("application/x-cut", payload);
     e.dataTransfer.setData("text/plain", payload);
     e.dataTransfer.effectAllowed = "copy";
   }

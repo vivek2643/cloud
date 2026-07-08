@@ -37,7 +37,7 @@ const LABEL_W = 44;
 const LANE_GAP = 8; // matches the gap-2 between a lane label and its track
 const TRACK_LEFT = LABEL_W + LANE_GAP;
 
-/** A clip dragged from the Hero Cuts / Dialogues bins (see their onDragStart). */
+/** A cut dragged from the Cuts view (see its onDragStart). */
 interface DropPayload {
   file_id: string;
   in_ms: number;
@@ -47,8 +47,7 @@ interface DropPayload {
 
 function parseDrop(e: React.DragEvent): DropPayload | null {
   const raw =
-    e.dataTransfer.getData("application/x-hero-cut") ||
-    e.dataTransfer.getData("application/x-dialogue-segment") ||
+    e.dataTransfer.getData("application/x-cut") ||
     e.dataTransfer.getData("text/plain");
   if (!raw) return null;
   try {
@@ -272,7 +271,7 @@ export function TimelineEditor({
     window.addEventListener("pointerup", onUp);
   }
 
-  // --- drag clips IN from the Hero Cuts / Dialogues bins ---
+  // --- drag cuts IN from the Cuts view ---
   // Base video lane (V1) = insert a spine cut at the drop index; an upper video
   // lane (V2+) = a placed cutaway; an audio lane = a placed bed — all at the drop time.
   const [dropTrack, setDropTrack] = useState<string | null>(null);
@@ -511,7 +510,7 @@ export function TimelineEditor({
                       className="pointer-events-none absolute inset-0 flex items-center justify-center text-[11px]"
                       style={{ color: "var(--muted)" }}
                     >
-                      Drag clips here from Hero Cuts or Dialogues to build your edit
+                      Drag cuts here to build your edit
                     </div>
                   )}
                   {trackClips.map((clip) => {
