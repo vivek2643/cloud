@@ -149,19 +149,6 @@ def _specs() -> List[Dict[str, Any]]:
     ]
 
 
-def _snap_prog(ctx: EditContext, ms: Any) -> Any:
-    """Snap a PROGRAM-clock anchor (V2 from_ms, split window edge) to the program
-    field when one exists (e.g. a music beat grid). None field -> pass-through,
-    which is the common case until a program-side source lands."""
-    if ms is None or ctx.program_field is None:
-        return ms
-    try:
-        from app.services.l3.program_clock import snap_program_ms
-        return snap_program_ms(ctx.program_field, int(ms))
-    except (TypeError, ValueError):
-        return ms
-
-
 def _resolve_file(ctx: EditContext, ref: Any) -> str:
     """Resolve a brain-supplied clip id to a full file_id. Accepts a full id or
     the 8-char 'CLIP <file8>' prefix shown in the beat index. Falls back to the
@@ -216,7 +203,7 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
         if name == "place":
             new = act.place(doc, ctx.index, args["ref"], level=args.get("level", "balanced"),
                             channel=args.get("channel", "V1"), at=args.get("at"),
-                            from_ms=_snap_prog(ctx, args.get("from_ms")),
+                            from_ms=args.get("from_ms"),
                             audio=args.get("audio"), reason=args.get("reason", ""))
         elif name == "trim":
             new = act.trim(doc, args["target_id"], in_ms=args.get("in_ms"), out_ms=args.get("out_ms"),
@@ -249,8 +236,7 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
             new = act.split_screen(doc, ctx.index, args.get("ref"),
                                    file=sc_file, in_ms=sc_in, out_ms=sc_out,
                                    template=args.get("template", "split_h"),
-                                   from_ms=_snap_prog(ctx, args.get("from_ms")),
-                                   to_ms=_snap_prog(ctx, args.get("to_ms")),
+                                   from_ms=args.get("from_ms"), to_ms=args.get("to_ms"),
                                    level=args.get("level", "balanced"),
                                    audio=args.get("audio"), reason=args.get("reason", ""))
         else:

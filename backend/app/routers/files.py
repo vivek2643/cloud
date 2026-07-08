@@ -49,11 +49,6 @@ def _with_progress(f: dict) -> dict:
     return f
 
 
-class HeroCutsFeedRequest(BaseModel):
-    file_ids: List[str] = Field(default_factory=list)
-    energy: float = Field(0.5, ge=0.0, le=1.0)
-
-
 class CutsFeedRequest(BaseModel):
     file_ids: List[str] = Field(default_factory=list)
     energy: float = Field(0.5, ge=0.0, le=1.0)
@@ -96,9 +91,9 @@ def reanalyze_file(
 ):
     """Force a fresh L2 perception run for ONE owned clip (on-demand backfill).
 
-    Re-running L2 cascades: it re-defers thought segmentation + the hero-cuts
-    precompute, so the footage map rebuilds off the fresh perception (e.g. to
-    pick up a new schema tag like `valence`)."""
+    Re-running L2 cascades: it re-defers thought segmentation, so downstream
+    passes rebuild off the fresh perception (e.g. to pick up a new schema tag
+    like `valence`)."""
     sb = get_supabase()
     owned = sb.table("files").select("id").eq("id", file_id).eq("user_id", user_id).execute()
     if not owned.data:
@@ -262,59 +257,11 @@ def get_dialogues(
     return {"sentence": sentence, "topic": topic, "ready": bool(row.data)}
 
 
-@router.get("/{file_id}/hero-cuts")
-def get_hero_cuts(
-    file_id: str,
-    energy: float = Query(0.5, ge=0.0, le=1.0, description="0=broad/calm .. 1=sharp/punchy"),
-    user_id: str = Depends(get_current_user_id),
-):
-    """Return the ranked hero-cuts feed for a file (the V1 product surface).
-
-    Compute-on-read over already-persisted L1/L2/L3 artifacts (dialogue
-    segments + clip_perception + motion grids); deterministic given `energy`.
-    `ready` is false when none of the source artifacts exist yet."""
-    sb = get_supabase()
-    owns = sb.table("files").select("id").eq("id", file_id).eq("user_id", user_id).execute()
-    if not owns.data:
-        raise HTTPException(status_code=404, detail="File not found")
-
-    from app.services.l3.hero_store import get_hero_feed
-
-    heroes = get_hero_feed([file_id], energy=energy)
-    return {"heroes": heroes, "energy": energy, "ready": bool(heroes)}
-
-
-@router.post("/hero-cuts")
-def get_hero_cuts_feed(
-    payload: HeroCutsFeedRequest,
-    user_id: str = Depends(get_current_user_id),
-):
-    """One combined hero-cuts feed across many clips, so repeated takes of the
-    same content stack across files (best in front). Ownership is verified for
-    every requested file; unknown/foreign ids are dropped."""
-    file_ids = list(dict.fromkeys(payload.file_ids or []))
-    if not file_ids:
-        return {"heroes": [], "energy": payload.energy, "ready": False}
-
-    sb = get_supabase()
-    owned = (
-        sb.table("files").select("id").eq("user_id", user_id).in_("id", file_ids).execute()
-    )
-    owned_ids = [r["id"] for r in (owned.data or [])]
-    if not owned_ids:
-        raise HTTPException(status_code=404, detail="No matching files")
-
-    from app.services.l3.hero_store import get_hero_feed
-
-    heroes = get_hero_feed(owned_ids, energy=payload.energy)
-    return {"heroes": heroes, "energy": payload.energy, "ready": bool(heroes)}
-
-
 # --------------------------------------------------------------------------
-# Cuts v2 (parallel to /hero-cuts): the deterministic non-overlapping
-# partition, served as one contiguous filmstrip per file. See cuts_v2.plan.md
-# (Phase B4). Compute-on-read over the same L1/L3 artifacts; no VLM, no energy
-# ladder -- the row is a contiguous, non-overlapping partition by construction.
+# Cuts v2: the deterministic non-overlapping partition, served as one
+# contiguous filmstrip per file. See cuts_v2.plan.md (Phase B4). Compute-on
+# -read over the same L1/L3 artifacts; no VLM, no energy ladder -- the row is
+# a contiguous, non-overlapping partition by construction.
 # --------------------------------------------------------------------------
 
 def _build_cuts_for(file_ids: List[str], energy: float = 0.5) -> List[dict]:

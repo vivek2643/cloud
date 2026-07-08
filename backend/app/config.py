@@ -106,18 +106,6 @@ class Settings(BaseSettings):
     # Leave False to skip the coverage pass (no V2 cutaway ops); flip True to let
     # it lay B-roll / reaction cutaways as V2 over the V1 spine.
     autoedit_coverage: bool = False
-    # Conversational arranger (edit-thread brain) version.
-    #   "v1" -- the original MOMENT-framed loop: clips are a bag of pre-scored
-    #           speech moments; place/split_screen only. Kept for fallback.
-    #   "v2" -- the CONTINUOUS-SOURCE loop, WORKFLOW-framed: same senses/verbs as
-    #           v3 but the prompt prescribes "lay the spoken spine, then lift
-    #           reactions via place_span". Kept for A/B against v3.
-    #   "v3" -- the BLIND-EDITOR loop (default): identical awareness + tools, but
-    #           NO workflow prescription. The brain is told who it is, given a
-    #           plan-first discipline (look -> picture the finished piece -> plan
-    #           -> pin -> execute -> check), and reads the senses/verbs as neutral
-    #           capabilities -- the material and the craft are its to decide.
-    autoedit_arranger_version: str = "v3"
 
     # --- L3 thought segmentation (the speech primitive) ------------------
     # A post-L2 pass that splits a clip's speaker-tagged transcript into generic
@@ -159,15 +147,6 @@ class Settings(BaseSettings):
     # Prompt-cache TTL headroom: pass-2 shards must run back-to-back within
     # this window to keep reading the pass-1 prefix at the cheap cache rate.
     ingest_cache_ttl_seconds: int = 300
-
-    # --- L3 footage source: what the agentic editor's footage map reads -----
-    # "cut_records" (default) -- the cuts-v3 substrate (`cut_records`), the
-    #   same rows the Cuts tab reads. The brain's moment-tree is projected from
-    #   them (see `cutrecord_map.py`); the beat it places IS the beat the
-    #   editor sees.
-    # "hero" -- the legacy hero-cut precompute (`hero_cuts_cache`). Safety
-    #   switch back to pre-cuts_v3-integration behavior.
-    footage_source: str = "cut_records"
 
     @property
     def r2_endpoint(self) -> str:

@@ -326,11 +326,6 @@ def l2_perception(file_id: str) -> None:
             thought_segments.defer_thoughts(file_id)
         except Exception:
             logger.exception("L2: failed to enqueue thought pass for %s", file_id)
-        try:
-            from app.services.l3 import hero_store
-            hero_store.defer_precompute(file_id)
-        except Exception:
-            logger.exception("L2: failed to enqueue hero-cuts precompute for %s", file_id)
         return
 
     _set_l2_status(file_id, "running")
@@ -393,15 +388,6 @@ def l2_perception(file_id: str) -> None:
             thought_segments.defer_thoughts(file_id)
         except Exception:
             logger.exception("L2: failed to enqueue thought pass for %s", file_id)
-
-        # Precompute the hero-cuts feed for all five energy bands now that every
-        # input (L1 + L2) exists, so the product surface is always ready. Best-
-        # effort: enqueued on this same l2 queue; a failure must not fail L2.
-        try:
-            from app.services.l3 import hero_store
-            hero_store.defer_precompute(file_id)
-        except Exception:
-            logger.exception("L2: failed to enqueue hero-cuts precompute for %s", file_id)
         logger.info(
             "L2 complete for %s (%d persons, %d atoms, %d tok out)",
             file_id,

@@ -33,7 +33,6 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import get_settings
-from app.services.l3 import hero_cuts as hc
 from app.services.l3.energy import default_energy_for
 
 logger = logging.getLogger(__name__)
@@ -356,17 +355,12 @@ def _tree_version(sig: str) -> str:
 
 
 def _source_signatures(file_ids: List[str], run_id: Optional[str] = None) -> Dict[str, Optional[str]]:
-    """Per-file content signature from whichever footage source is active
-    (``settings.footage_source``): the cuts-v3 ``cut_records`` substrate
-    (default) or the legacy hero-cut precompute. Either way, a change in the
-    signature is what tells ``get_trees`` to rebuild that file's cached tree.
-    ``run_id`` pins the thread's covering ingest run (cut_records mode only;
-    ignored by the hero path, which has no runs)."""
-    if get_settings().footage_source == "cut_records":
-        from app.services.l3 import cutrecord_map
-        return cutrecord_map.signatures_for(file_ids, run_id=run_id)
-    from app.services.l3 import hero_store
-    return hero_store.signatures_for(file_ids)
+    """Per-file content signature from the cuts-v3 ``cut_records`` substrate.
+    A change in the signature is what tells ``get_trees`` to rebuild that
+    file's cached tree. ``run_id`` pins the thread's covering ingest run (see
+    migration 028)."""
+    from app.services.l3 import cutrecord_map
+    return cutrecord_map.signatures_for(file_ids, run_id=run_id)
 
 
 def get_trees(file_ids: List[str], run_id: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
@@ -434,18 +428,12 @@ def get_trees(file_ids: List[str], run_id: Optional[str] = None) -> Dict[str, Di
 def _build_trees(file_ids: List[str], sigs: Dict[str, Optional[str]],
                  run_id: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
     """Build moment-trees for a set of files from their cuts + headers. Cuts
-    come from cuts-v3 ``cut_records`` (default) or the legacy hero-cut
-    precompute, gated by ``settings.footage_source`` -- a safety switch back to
-    today's behavior (see cuts_v3_to_brain.plan.md). ``run_id`` pins the
-    thread's covering ingest run (cut_records mode only)."""
+    come from cuts-v3 ``cut_records``. ``run_id`` pins the thread's covering
+    ingest run (migration 028)."""
     from app.services.l3.auto_edit import _clip_cards
+    from app.services.l3 import cutrecord_map
 
-    if get_settings().footage_source == "cut_records":
-        from app.services.l3 import cutrecord_map
-        cuts_by_file = cutrecord_map.cut_dicts_for_files(file_ids, run_id=run_id)
-    else:
-        from app.services.l3 import hero_store
-        cuts_by_file = hero_store.get_anchor_cuts(file_ids)
+    cuts_by_file = cutrecord_map.cut_dicts_for_files(file_ids, run_id=run_id)
     headers = _clip_cards(file_ids)
     out: Dict[str, Dict[str, Any]] = {}
     for fid in file_ids:
@@ -741,38 +729,19 @@ def _clip_block(tree: Dict[str, Any], *, compact: bool = False,
 # Cross-clip duplicate linking (same line delivered as multiple takes/angles)
 # --------------------------------------------------------------------------
 
-def _best_overlap_moment(
-    moments: List[Dict[str, Any]], start_ms: int, end_ms: int
-) -> Optional[Dict[str, Any]]:
-    """The moment that best CORRESPONDS to [start_ms, end_ms] by temporal IoU
-    (intersection over union), not raw overlap. IoU is what stops a whole-clip
-    establishing/b-roll moment (e.g. a 400s "person at desk" shown-atom) from
-    swallowing every speech attempt: it overlaps all of them but its IoU is tiny,
-    while the aligned speech moment scores ~1.0. Returns None if nothing overlaps."""
-    best: Optional[Dict[str, Any]] = None
-    best_iou = 0.0
-    for m in moments:
-        mi, mo = int(m["in_ms"]), int(m["out_ms"])
-        ov = _overlap_ms(mi, mo, start_ms, end_ms)
-        if ov <= 0:
-            continue
-        union = max(mo, end_ms) - min(mi, start_ms)
-        iou = ov / union if union > 0 else 0.0
-        if iou > best_iou:
-            best_iou, best = iou, m
-    return best
+def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Link moments that deliver the SAME content across clips/angles.
 
-
-def _annotate_dups_from_take_groups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """cut_records mode: dup_groups read DIRECTLY off each moment's persisted
-    ``take_group_id``/``take_role`` (pass 2 already resolved cross-clip takes
-    from the pixels + transcript; ``post._enforce_one_winner_per_take_group``
-    guarantees a single winner) -- no token-overlap recompute, no IoU matching
-    needed since the group id already lives on the exact moment it belongs to.
-    Mirrors the hero-substrate summary shape (``group_id``/``members``/
-    ``member_facts``/``text``) so ``observe.diagnose``/``affordances`` keep
-    working unchanged. Fail-open: a moment with no take_group_id is simply not
-    linked."""
+    dup_groups read DIRECTLY off each moment's persisted ``take_group_id``/
+    ``take_role`` (pass 2 already resolved cross-clip takes from the pixels +
+    transcript; ``post._enforce_one_winner_per_take_group`` guarantees a
+    single winner) -- no token-overlap recompute, no IoU matching needed
+    since the group id already lives on the exact moment it belongs to. Tags
+    each linked moment in place with its ``dup_group`` plus ``alt_pic`` (Fact
+    #2 folded onto the beat: every OTHER member's raw facts, so
+    ``_moment_line`` can render this beat's alternates without a separate
+    lookup). No winner is crowned -- the brain compares the members and
+    decides. Fail-open: a moment with no take_group_id is simply not linked."""
     by_group: Dict[str, List[Dict[str, Any]]] = {}
     for t in trees:
         for m in t.get("moments", []) or []:
@@ -811,92 +780,6 @@ def _annotate_dups_from_take_groups(trees: List[Dict[str, Any]]) -> List[Dict[st
             "members": [m["moment_id"] for m in members],
             "member_facts": member_facts,
             "text": (members[0].get("gist") or "").strip(),
-        })
-    return summary
-
-
-def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Link moments that deliver the SAME content across clips/angles.
-
-    Reconciles cross-clip take groups onto the moment-tree, tags each linked
-    moment in place with its ``dup_group`` (and ``dup_restart`` for an
-    abandoned take) plus ``alt_pic`` (Fact #2 folded onto the beat: every OTHER
-    member's raw facts, so ``_moment_line`` can render this beat's alternates
-    without a separate lookup), and returns a render-ready summary. No winner
-    is crowned -- the brain compares the members and decides. This is
-    cross-set dependent (it changes with the file set), so it is computed per
-    request and never baked into the per-file tree cache. Fail-open: any error
-    yields no links.
-
-    cuts-v3 mode reads the persisted ``take_group_id``/``take_role`` straight
-    off each moment (``_annotate_dups_from_take_groups``) -- pass 2 already did
-    the cross-clip resolution. The legacy hero path recomputes groups via
-    token-overlap (``takes.build_take_groups``) + best temporal IoU.
-    """
-    file_ids = [t["file_id"] for t in trees]
-    if len(file_ids) < 1:
-        return []
-    if get_settings().footage_source == "cut_records":
-        return _annotate_dups_from_take_groups(trees)
-    try:
-        from app.services.l3 import takes  # lazy: keep footage_map import-light
-        groups = takes.build_take_groups(file_ids)
-    except Exception:
-        logger.exception("footage map: take grouping failed; no dup links")
-        return []
-
-    by_file = {t["file_id"]: t.get("moments", []) for t in trees}
-    summary: List[Dict[str, Any]] = []
-    for g in groups:
-        linked: Dict[str, Dict[str, Any]] = {}   # moment_id -> moment
-        file_by_mid: Dict[str, str] = {}
-        restart_ids: set = set()
-        for a in g.attempts:
-            m = _best_overlap_moment(by_file.get(a.file_id, []), a.start_ms, a.end_ms)
-            if m is None:
-                continue
-            linked.setdefault(m["moment_id"], m)
-            file_by_mid[m["moment_id"]] = a.file_id
-            if a.is_restart:
-                restart_ids.add(m["moment_id"])
-        # A real choice needs >= 2 DISTINCT moments (one moment alone is not a
-        # take decision -- the engine already collapsed its own bands).
-        if len(linked) < 2:
-            continue
-        # No winner is crowned: members are tagged as the SAME beat and left for
-        # the brain to compare (by reading text + quality) and place. An abandoned
-        # (restart) take is flagged so the brain can see it, not auto-dropped.
-        for mid, m in linked.items():
-            m["dup_group"] = g.group_id
-            if mid in restart_ids:
-                m["dup_restart"] = True
-        # Per-member facts so the brain can compare deliveries WITHOUT re-reading
-        # the whole index: who (voice, aliased to a global person at render),
-        # shot size, and quality score. Facts, not a verdict.
-        member_facts = [{
-            "moment_id": mid,
-            "file": file_by_mid.get(mid, ""),
-            # the RAW voice/person handle (not the display label) so it resolves
-            # to a global person at render -- see `_speaker_handle`.
-            "voice": _speaker_handle(m),
-            "framing": _framing_tag(m),
-            "score": float(m.get("score", 0.0)),
-            "restart": mid in restart_ids,
-        } for mid, m in linked.items()]
-        # Fold coverage ONTO each beat: every OTHER member's raw facts, so the
-        # beat line renders its own `alt-PIC` without a separate lookup/block.
-        # `shows` (whose FACE a delivery is on-camera) is resolved at RENDER time
-        # from the reconciled shoot cast -- kept out of these cached facts
-        # because it is cross-set (identity) dependent, like the aliased speaker.
-        for f in member_facts:
-            linked[f["moment_id"]]["alt_pic"] = [
-                g for g in member_facts if g["moment_id"] != f["moment_id"]
-            ]
-        summary.append({
-            "group_id": g.group_id,
-            "members": list(linked.keys()),     # moment_ids (consumers key on this)
-            "member_facts": member_facts,
-            "text": (g.attempts[0].text or "").strip(),
         })
     return summary
 

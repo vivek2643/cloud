@@ -101,19 +101,18 @@ def start_thread(user_id: str, file_ids: List[str], brief: str) -> str:
     ``converse.respond`` + the /messages route). A non-empty ``brief`` is seeded
     as the user's opening message so the conversation has a start.
 
-    In Cuts v3 mode we PIN the thread to the covering ingest run at creation
-    (migration 028) so a re-ingest mid-thread can't swap the beat universe under
-    an active edit. Resolve fails open: no covering run yet => null => the turn
-    falls back to live "latest run" resolution."""
+    We PIN the thread to the covering ingest run at creation (migration 028)
+    so a re-ingest mid-thread can't swap the beat universe under an active
+    edit. Resolve fails open: no covering run yet => null => the turn falls
+    back to live "latest run" resolution."""
     from app.services.l3 import store
 
     ingest_run_id: Optional[str] = None
-    if get_settings().footage_source == "cut_records":
-        try:
-            from app.services.l3 import cuts_v3_read
-            ingest_run_id = cuts_v3_read.latest_run_for_files(file_ids)
-        except Exception:
-            logger.exception("start_thread: run pin resolve failed (continuing unpinned)")
+    try:
+        from app.services.l3 import cuts_v3_read
+        ingest_run_id = cuts_v3_read.latest_run_for_files(file_ids)
+    except Exception:
+        logger.exception("start_thread: run pin resolve failed (continuing unpinned)")
 
     thread_id = store.create_thread(user_id, file_ids, brief, ingest_run_id=ingest_run_id)
     if brief.strip():

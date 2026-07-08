@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the reconciled shoot cast (l3.relations) and the program clock field
-(l3.program_clock).
+"""Tests for the reconciled shoot cast (l3.relations).
 
 Identity fuses TWO signals, each doing its own job: SPEECH clusters voices
 (label-agnostic line matching -> per-pair one-to-one, dominance-gated), APPEARANCE
@@ -19,7 +18,6 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.services.l3 import program_clock as pc  # noqa: E402
 from app.services.l3 import relations as rel  # noqa: E402
 from app.services.l3.takes import Attempt  # noqa: E402
 
@@ -242,29 +240,8 @@ def test_validate_catches_structural_corruption():
     print("ok  invariant check catches two-faces and shared-voice corruption")
 
 
-# --------------------------------------------------------------------------
-# PROGRAM CLOCK: the second field
-# --------------------------------------------------------------------------
-
-def test_program_field_none_without_sources():
-    assert pc.build_program_field(duration_ms=60000) is None
-    assert pc.snap_program_ms(None, 1234) == 1234       # no opinion -> pass-through
-    assert pc.snap_program_ms(None, None) is None
-    print("ok  no program-side sources -> no field, anchors pass through")
-
-
-def test_program_field_snaps_to_downbeat():
-    fld = pc.build_program_field(duration_ms=10000,
-                                 beats_ms=[500, 1000, 1500, 2000],
-                                 downbeats_ms=[2000])
-    assert fld is not None
-    assert pc.snap_program_ms(fld, 1800) == 2000
-    assert abs(pc.snap_program_ms(fld, 5000) - 5000) <= pc.PROGRAM_SNAP_WIN_MS
-    print("ok  program anchors snap to the beat grid within the window")
-
-
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
             fn()
-    print("\nall relations + program-clock tests passed")
+    print("\nall relations tests passed")

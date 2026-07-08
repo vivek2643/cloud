@@ -312,46 +312,6 @@ def test_validate_flags_orphaned_split_cell():
     print("ok  validate flags an orphaned split cell, not a normal cutaway")
 
 
-def test_scan_source_cross_clip_within_and_global():
-    """scan_source spans the whole shoot (file='*'), resolves a global person id
-    per clip, and honors a within_ms window."""
-    from app.services.l3.clip_timeline import TimelineInputs, build_clip_timeline
-    fa, fb = "aaaaaaaa-1", "bbbbbbbb-2"
-    tla = build_clip_timeline(TimelineInputs(
-        file_id=fa, duration_ms=8000, persons=[{"local_id": "p2"}],
-        presence_lane=[{"start_ms": 0, "end_ms": 4000, "present": ["p2"]},
-                       {"start_ms": 4000, "end_ms": 8000, "present": []}]))
-    tlb = build_clip_timeline(TimelineInputs(
-        file_id=fb, duration_ms=8000, persons=[{"local_id": "p5"}],
-        presence_lane=[{"start_ms": 2000, "end_ms": 8000, "present": ["p5"]},
-                       {"start_ms": 0, "end_ms": 2000, "present": []}]))
-    ctx = observe.EditContext(
-        file_ids=[fa, fb], index=_MapIndex({"clips": []}), map_struct={"clips": []},
-        durations={fa: 8000, fb: 8000}, valence_by_file={},
-        relations={"identities": [{"global_id": "G2", "members": [
-            {"file": fa, "person": "p2", "voice": "S0"},
-            {"file": fb, "person": "p5", "voice": "S1"}]}]})
-    ctx.tl_cache[fa] = tla
-    ctx.tl_cache[fb] = tlb
-
-    # G2 across the whole shoot: resolves to p2 in A, p5 in B.
-    res = observe.scan_source(ctx, "*", "presence:G2", {"state": "on"})
-    files = {h["file"] for h in res["hits"]}
-    assert files == {fa[:8], fb[:8]}, res
-    assert res["file"] == "*" and set(res["files"]) == {fa[:8], fb[:8]}, res
-
-    # within_ms limits hits to a window (clip B, only after 4000ms).
-    res2 = observe.scan_source(ctx, fb, "presence:G2", {"state": "on"},
-                               within_ms=[4000, 8000])
-    assert res2["hits"] and all(h["out_ms"] > 4000 for h in res2["hits"]), res2
-
-    # a global id not present in a clip simply yields no hits there (not an error).
-    ctx.relations["identities"][0]["members"][1]["person"] = None
-    res3 = observe.scan_source(ctx, fb, "presence:G2", {"state": "on"})
-    assert res3["hits"] == [], res3
-    print("ok  scan_source spans the shoot, resolves globals, honors within_ms")
-
-
 def test_solve_layout_templates():
     assert layers.solve_layout("split_v")["bottom"] == {"x": 0.0, "y": 0.5, "w": 1.0, "h": 0.5}
     assert layers.solve_layout("pip")["inset"]["w"] < 0.5
@@ -372,66 +332,6 @@ def test_affordances_menu():
     assert "place" in aff["verbs"] and "place_span" not in aff["verbs"], aff
     assert "source_awareness" not in aff["senses"] and "scan_source" not in aff["senses"], aff
     print("ok  affordances lists retake levels + channels + cut-centric verbs")
-
-
-def test_source_awareness_and_scan_source_via_cache():
-    """observe.source_awareness + scan_source read the continuous timeline. Seed
-    the per-turn cache so no DB is needed (the store path is exercised live)."""
-    from app.services.l3.clip_timeline import TimelineInputs, build_clip_timeline
-    struct = _map()
-    ctx = _ctx(struct)
-    tl = build_clip_timeline(TimelineInputs(
-        file_id="ffffffff-1111", duration_ms=8000,
-        persons=[{"local_id": "p1"}, {"local_id": "p2"}],
-        presence_lane=[{"start_ms": 0, "end_ms": 5000, "present": ["p1", "p2"]},
-                       {"start_ms": 5000, "end_ms": 8000, "present": ["p2"]}],
-        speaking=[{"start_ms": 1000, "end_ms": 4000, "subject": "p1"}],
-        activity_lane=[{"start_ms": 5000, "end_ms": 8000, "mode": "held",
-                        "subject": "person", "actor": "p2", "label": "listens, silent",
-                        "peak_ms": 6500, "confidence": 0.7}]))
-    ctx.tl_cache["ffffffff-1111"] = tl
-
-    text = observe.source_awareness(ctx)
-    assert "CLIP" in text and "listens, silent" in text, text
-
-    # "where is p2 on screen?" -> and each hit shows who is speaking (facets)
-    res = observe.scan_source(ctx, "ffffffff", "presence:p2", {"state": "on"})
-    assert res["hits"] and res["hits"][0]["in_ms"] == 0, res
-    assert "facets" in res["hits"][0] and "speaking" in res["hits"][0]["facets"], res
-    # the silent held reaction (5-8s) is queryable on the action lane
-    act_hits = observe.scan_source(ctx, "ffffffff", "action", {"channel": "shown"})
-    assert act_hits["hits"] and act_hits["hits"][0]["label"] == "listens, silent", act_hits
-    print("ok  source_awareness + scan_source read continuous lanes (cache path)")
-
-
-def test_scan_source_is_forgiving_and_self_correcting():
-    """A slightly-wrong scan self-corrects instead of dead-ending: a guessed facet
-    name is IGNORED (not silently zeroing the hits) and reported alongside the
-    lane's real vocabulary; a wrong lane name names the available lanes."""
-    from app.services.l3.clip_timeline import TimelineInputs, build_clip_timeline
-    struct = _map()
-    ctx = _ctx(struct)
-    tl = build_clip_timeline(TimelineInputs(
-        file_id="ffffffff-1111", duration_ms=8000,
-        persons=[{"local_id": "p1"}, {"local_id": "p2"}],
-        speaking=[{"start_ms": 1000, "end_ms": 4000, "subject": "p1"}],
-        activity_lane=[{"start_ms": 5000, "end_ms": 8000, "mode": "held",
-                        "subject": "person", "actor": "p2", "label": "listens, silent",
-                        "peak_ms": 6500, "confidence": 0.7}]))
-    ctx.tl_cache["ffffffff-1111"] = tl
-
-    # Guessed facet ('state' isn't an action-lane key) -> ignored + vocab shown,
-    # and the lane's spans still come back (each with facets) rather than [].
-    res = observe.scan_source(ctx, "ffffffff", "action", {"state": "shown"})
-    assert res["hits"], res                          # not dead-ended
-    assert res.get("ignored_match") == ["state"], res
-    assert "channel" in res.get("lane_vocab", {}), res
-
-    # Wrong lane name -> no hits, but the real lanes are advertised.
-    bad = observe.scan_source(ctx, "ffffffff", "actions")
-    assert bad["hits"] == [] and "action" in bad.get("lanes_available", []), bad
-    assert "not on this clip" in bad.get("note", ""), bad
-    print("ok  scan_source is forgiving (ignores guessed keys, names lanes)")
 
 
 def test_place_span_arbitrary_main_line():
@@ -672,11 +572,8 @@ def main():
     test_remove_tears_down_region()
     test_remove_region_tears_down_its_op()
     test_validate_flags_orphaned_split_cell()
-    test_scan_source_cross_clip_within_and_global()
     test_solve_layout_templates()
     test_affordances_menu()
-    test_source_awareness_and_scan_source_via_cache()
-    test_scan_source_is_forgiving_and_self_correcting()
     test_place_span_arbitrary_main_line()
     test_place_span_v2_cutaway_and_bad_span_noop()
     test_split_screen_snaps_to_seam_via_dispatch()

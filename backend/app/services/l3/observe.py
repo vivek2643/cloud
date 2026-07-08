@@ -22,9 +22,8 @@ Feel is delegated to ``feel.simulate`` (also pure). Nothing here renders.
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import psycopg
 
@@ -48,20 +47,12 @@ class EditContext:
     valence_by_file: Dict[str, str]    # file_id -> clip valence
     dup_groups: List[dict] = field(default_factory=list)
     # Cross-clip relations derived from existing perception (same-event time
-    # offsets between clips + one person identity across files). Rendered into
-    # source_awareness; empty when clips share nothing.
+    # offsets between clips + one person identity across files).
     relations: dict = field(default_factory=dict)
-    # The PROGRAM clock's cut field (program_clock.build_program_field) -- None
-    # until a program-side source (e.g. a music bed's beat grid) populates it.
-    # Consumers treat None as "no opinion".
-    program_field: Optional[object] = None
-    # Lazily-built continuous Clip Timelines (source-only, edit-independent), so
-    # source_awareness/scan_source don't re-fuse a clip within the same turn.
-    tl_cache: Dict[str, object] = field(default_factory=dict)
     # The Cuts v3 ingest run this turn is resolved against -- the thread's pinned
     # run (migration 028) or the live "latest covering run", resolved ONCE here so
     # every projection in the turn (the map struct + the re-assembled BEAT INDEX
-    # text) reads the SAME snapshot. None in hero mode / when nothing is ingested.
+    # text) reads the SAME snapshot. None when nothing is ingested yet.
     run_id: Optional[str] = None
 
     @property
@@ -97,7 +88,7 @@ def build_context(file_ids: List[str], run_id: Optional[str] = None) -> EditCont
     map struct and the re-assembled BEAT INDEX text agree within the turn (and a
     re-ingest mid-turn can't swap the snapshot between the two reads)."""
     eff_run = run_id
-    if eff_run is None and file_ids and get_settings().footage_source == "cut_records":
+    if eff_run is None and file_ids:
         try:
             from app.services.l3 import cuts_v3_read
             eff_run = cuts_v3_read.latest_run_for_files(file_ids)
@@ -564,234 +555,3 @@ def _idx(level: Optional[str]) -> int:
         return _LEVELS.index(level)
     except (ValueError, TypeError):
         return _LEVELS.index("balanced")
-
-
-# --------------------------------------------------------------------------
-# 6. source_awareness (the continuous, fully-addressable source)
-# --------------------------------------------------------------------------
-
-def _timeline(ctx: EditContext, file_id: str):
-    """Lazily build + cache the continuous Clip Timeline for one clip (None if its
-    L1/L2 inputs aren't materialized). Cached on ctx for the turn."""
-    if file_id in ctx.tl_cache:
-        return ctx.tl_cache[file_id]
-    tl = None
-    try:
-        from app.services.l3 import clip_timeline_store as cts
-        tl = cts.load_clip_timeline(file_id)
-    except Exception:
-        logger.exception("observe: clip timeline build failed for %s", file_id)
-    ctx.tl_cache[file_id] = tl
-    return tl
-
-
-# Disclosure tiers: how much per-clip detail the shoot digest carries. The
-# brain must NEVER lose awareness silently -- as the clip count grows the
-# digests get shorter, the header SAYS so, and scan_source/source_awareness
-# recover any elided detail on demand.
-_FULL_DETAIL_MAX_CLIPS = 6      # <= this many clips: full digest each
-_COMPACT_DETAIL_MAX_CLIPS = 14  # <= this many: compact digest each; above: summary lines
-
-
-def source_awareness(ctx: EditContext) -> str:
-    """The CONTINUOUS clip timeline for every clip in scope: change-point lanes
-    (who is present / who is speaking on camera / gaze / shot / action over the
-    whole clock), the cleanest seams, the impact/reveal peaks, and a scored cut
-    INDEX. Unlike ``affordances`` (which lists the pre-baked cuts), this exposes
-    the clip as a fully-addressable source: any span the brain can describe can
-    be placed with ``place_span``, seam-snapped to a clean boundary. Read-only.
-
-    Scales by PROGRESSIVE DISCLOSURE, never silent truncation: few clips get
-    full digests, many clips get compact ones, very many get one-line summaries
-    -- and the header states the tier so the brain knows to drill down with
-    scan_source. The shoot's PEOPLE (one global person across clips) lead the
-    digest, since the per-clip blocks after them reference those ids.
-
-    Degrades to a short notice (never raises) when the continuous store or its
-    L1/L2 inputs are unavailable, so the loop is unaffected."""
-    try:
-        from app.services.l3.clip_timeline import render_awareness, render_summary
-        n = len(ctx.file_ids)
-        detail = ("full" if n <= _FULL_DETAIL_MAX_CLIPS
-                  else "compact" if n <= _COMPACT_DETAIL_MAX_CLIPS
-                  else "summary")
-        blocks: List[str] = []
-        if n > 1:
-            note = {"full": "full detail per clip",
-                    "compact": ("compact detail per clip -- every section is present "
-                                "but shortened; scan_source recovers anything elided"),
-                    "summary": ("ONE LINE per clip -- drill into any clip with "
-                                "scan_source (lanes/facets) before cutting from it"),
-                    }[detail]
-            blocks.append(f"SHOOT: {n} clips. Disclosure tier: {note}.")
-        try:
-            from app.services.l3.relations import render_relations
-            rel = render_relations(ctx.relations)
-            if rel:
-                blocks.append(rel)
-        except Exception:
-            logger.exception("observe: relations render failed (continuing)")
-        for fid in ctx.file_ids:
-            tl = _timeline(ctx, fid)
-            if tl is None:
-                continue
-            blocks.append(render_summary(tl) if detail == "summary"
-                          else render_awareness(tl, detail=detail))
-        body = "\n\n".join(blocks)
-        return body if any(b.startswith("CLIP") for b in blocks) else \
-            "(no continuous timeline available for these clips yet)"
-    except Exception:
-        logger.exception("observe: source_awareness failed (continuing)")
-        return "(continuous timeline unavailable)"
-
-
-_GLOBAL_RE = re.compile(r"^G\d+$")
-
-
-def _parse_window(within_ms: object) -> Optional[Tuple[int, int]]:
-    """Normalize a caller-supplied time window to (lo, hi) ms, or None. Accepts
-    [a, b], (a, b), or {in_ms, out_ms}."""
-    if not within_ms:
-        return None
-    try:
-        if isinstance(within_ms, dict):
-            a, b = int(within_ms.get("in_ms")), int(within_ms.get("out_ms"))
-        else:
-            a, b = int(within_ms[0]), int(within_ms[1])
-        return (min(a, b), max(a, b)) if b > a else (a, a)
-    except (TypeError, ValueError, IndexError, KeyError):
-        return None
-
-
-def _resolve_global(ctx: EditContext, fid: str, token: object) -> Tuple[object, bool]:
-    """Map a shoot-wide person id (G1, G2, ...) to its LOCAL handle in file
-    ``fid`` (person id, else voice). Returns (resolved, ok): a non-global token
-    passes through unchanged (ok=True); a global id not present in this file
-    yields (None, False) so the caller can skip the clip without erroring."""
-    if token is None or not _GLOBAL_RE.match(str(token)):
-        return token, True
-    try:
-        from app.services.l3 import relations as relations_mod
-        m = relations_mod.local_of(ctx.relations, fid, str(token))
-    except Exception:
-        logger.exception("scan_source: global id resolution failed")
-        return None, False
-    if not m:
-        return None, False
-    local = m.get("person") or m.get("voice")
-    return (local, True) if local else (None, False)
-
-
-def _scan_one(ctx: EditContext, fid: str, lane: str,
-              match: Optional[Dict[str, object]],
-              win: Optional[Tuple[int, int]], cap: int) -> Tuple[List[dict], dict]:
-    """Scan one clip, resolving any global person id in the lane suffix or match
-    values to that clip's local handle first. Returns (hits, meta) where meta
-    reports the resolved lane, which match keys were APPLIED vs. IGNORED (a
-    guessed facet name the lane doesn't carry), and the lane's real query
-    vocabulary -- so a slightly-wrong query self-corrects instead of dead-ending.
-    ([], {}) when the clip has no timeline or the referenced person isn't in it."""
-    tl = _timeline(ctx, fid)
-    if tl is None:
-        return [], {}
-    prefix, sep, suf = lane.partition(":")
-    lane_name = lane
-    if sep:
-        rt, ok = _resolve_global(ctx, fid, suf)
-        if not ok:
-            return [], {}
-        lane_name = f"{prefix}:{rt}"
-    rmatch: Dict[str, object] = {}
-    for k, v in (match or {}).items():
-        rt, ok = _resolve_global(ctx, fid, v)
-        if not ok:
-            return [], {}
-        rmatch[k] = rt
-    known = tl.lane_value_keys(lane_name)
-    meta: dict = {}
-    if tl.lane(lane_name) is None:
-        meta["missing_lane"] = lane_name
-    elif rmatch:
-        ignored = sorted(k for k in rmatch if k not in known)
-        if ignored:                                  # guessed facet name(s)
-            meta["ignored_match"] = ignored
-            meta["lane_vocab"] = tl.lane_vocab(lane_name)
-    hits: List[dict] = []
-    for it in tl.scan(lane_name, **rmatch):
-        if win and not (it.start_ms < win[1] and it.end_ms > win[0]):
-            continue
-        mid = (it.start_ms + it.end_ms) // 2
-        hits.append({"file": fid[:8], "in_ms": it.start_ms, "out_ms": it.end_ms,
-                     **it.value, "facets": tl.facet_at(mid)})
-        if len(hits) >= cap:
-            break
-    return hits, meta
-
-
-def scan_source(ctx: EditContext, file_ref: str, lane: str,
-                match: Optional[Dict[str, object]] = None,
-                within_ms: object = None) -> dict:
-    """Facet QUERY over the continuous timeline -- ONE clip or the WHOLE shoot.
-
-    ``lane`` (e.g. 'presence:p2', 'speaking', 'shot', 'action') + optional
-    ``match`` (e.g. {state:'on'} or {subject:'p1'}). Each hit carries the full
-    ``facets`` at its midpoint, so a compound question ("p2 present AND silent")
-    is answered by scanning presence:p2 and reading each hit's facets.
-
-    CROSS-CLIP: ``file_ref`` of '*'/'all' (or empty) scans every clip in scope;
-    a full id or 'CLIP <file8>' prefix scans just that one. A global PERSON id
-    (G1, G2, ...) in the lane suffix or a match value is resolved to each clip's
-    local handle automatically, so "where is G2 on screen anywhere" is one call.
-
-    ``within_ms`` ([a,b] or {in_ms,out_ms}) constrains hits to a time window --
-    e.g. take a coverage-group member's own window and scan a co-delivered clip
-    near it for a plausible reaction, without any shoot-wide clock.
-
-    Returns {file, lane, hits:[{file,in_ms,out_ms,<value>,facets}], files}.
-    Read-only; empty hits when the lane/clip/person is unknown."""
-    ref = str(file_ref or "").strip()
-    if ref in ("", "*", "all", "any", "CLIP"):
-        targets = list(ctx.file_ids)
-    else:
-        targets = [f for f in ctx.file_ids
-                   if f == ref or f.startswith(ref) or ref.startswith(f[:8])][:1] \
-            or [f for f in ctx.file_ids if f[:8] == ref[:8]]
-    if not targets:
-        return {"file": file_ref, "lane": lane, "hits": [],
-                "note": "no such clip in scope", "files": []}
-    win = _parse_window(within_ms)
-    multi = len(targets) > 1
-    cap = 40 if not multi else max(4, 40 // len(targets))
-    hits: List[dict] = []
-    scanned: List[str] = []
-    meta: dict = {}
-    for fid in targets:
-        fh, fmeta = _scan_one(ctx, fid, lane, match, win, cap)
-        if _timeline(ctx, fid) is not None:
-            scanned.append(fid[:8])
-        hits.extend(fh)
-        if fmeta and not meta:                       # first informative clip wins
-            meta = fmeta
-    out: dict = {"file": (targets[0][:8] if not multi else "*"),
-                 "lane": lane, "hits": hits[:60], "files": scanned}
-    # Always advertise the lanes so a mistaken lane name (the common cause of an
-    # empty scan) self-corrects; ditto the applied-vs-ignored match keys + the
-    # lane's real value vocabulary when a guessed facet name was dropped.
-    lanes_here: List[str] = []
-    for fid in (targets if multi else targets[:1]):
-        tl = _timeline(ctx, fid)
-        if tl is not None:
-            lanes_here = sorted({*lanes_here, *(ln.name for ln in tl.lanes)})
-    if lanes_here:
-        out["lanes_available"] = lanes_here
-    elif not multi:
-        out["note"] = "no continuous timeline for this clip"
-    if meta.get("missing_lane"):
-        out["note"] = (f"lane '{meta['missing_lane']}' not on this clip -- see "
-                       f"lanes_available")
-    if meta.get("ignored_match"):
-        out["ignored_match"] = meta["ignored_match"]
-        out["lane_vocab"] = meta["lane_vocab"]
-        out["note"] = ("some match keys aren't facets of this lane (ignored); "
-                       "query the keys in lane_vocab, or read each hit's facets")
-    return out
