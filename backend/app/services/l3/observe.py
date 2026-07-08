@@ -4,9 +4,9 @@ Observe: the brain's deterministic SENSES over an edit -- no VLM, no LLM.
 Where ``act`` mutates the document, ``observe`` reads it and reports, so the
 agentic loop can perceive -> act -> re-perceive cheaply (a coding agent reading
 the repo before/after an edit). Every function is a pure projection of the
-document + a per-turn ``EditContext`` (footage map, source durations, clip
-valence) assembled ONCE by ``build_context`` -- the only place that touches the
-DB. The five senses:
+document + a per-turn ``EditContext`` (footage map, source durations) assembled
+ONCE by ``build_context`` -- the only place that touches the DB. The five
+senses:
 
   * read_state  -- what the edit IS now (cuts, channels, duration, feel).
   * predict     -- what a proposed change WOULD do (e.g. length after tightening)
@@ -25,9 +25,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-import psycopg
-
-from app.config import get_settings
 from app.services.l3 import feel, footage_map, framing, layers
 from app.services.l3.arrange import _MapIndex, _weld_segments
 
@@ -44,11 +41,7 @@ class EditContext:
     index: _MapIndex
     map_struct: dict
     durations: Dict[str, int]          # file_id -> ms
-    valence_by_file: Dict[str, str]    # file_id -> clip valence
     dup_groups: List[dict] = field(default_factory=list)
-    # Cross-clip relations derived from existing perception (same-event time
-    # offsets between clips + one person identity across files).
-    relations: dict = field(default_factory=dict)
     # The Cuts v3 ingest run this turn is resolved against -- the thread's pinned
     # run (migration 028) or the live "latest covering run", resolved ONCE here so
     # every projection in the turn (the map struct + the re-assembled BEAT INDEX
@@ -61,26 +54,9 @@ class EditContext:
         return self.index.moments
 
 
-def _valence_by_file(file_ids: List[str]) -> Dict[str, str]:
-    if not file_ids:
-        return {}
-    try:
-        with psycopg.connect(get_settings().database_url, autocommit=True) as conn:
-            rows = conn.execute(
-                "select file_id::text, perception->>'valence' "
-                "from clip_perception where file_id = any(%s::uuid[])",
-                (file_ids,),
-            ).fetchall()
-        return {fid: v for fid, v in rows if v}
-    except Exception:
-        logger.exception("observe: valence lookup failed (continuing without)")
-        return {}
-
-
 def build_context(file_ids: List[str], run_id: Optional[str] = None) -> EditContext:
-    """Assemble the per-turn context once (footage map + durations + valence +
-    cross-clip relations). All DB reads live here; the sense functions stay pure
-    over the result.
+    """Assemble the per-turn context once (footage map + durations). All DB reads
+    live here; the sense functions stay pure over the result.
 
     ``run_id`` is the thread's pinned Cuts v3 ingest run (migration 028). We
     resolve the EFFECTIVE run once here -- pinned when given, else the latest
@@ -94,21 +70,7 @@ def build_context(file_ids: List[str], run_id: Optional[str] = None) -> EditCont
             eff_run = cuts_v3_read.latest_run_for_files(file_ids)
         except Exception:
             logger.exception("observe: run resolve failed (continuing live)")
-    # Identities first: the footage map aliases per-clip voices to global people.
-    rels: dict = {}
-    try:
-        from app.services.l3 import relations as relations_mod
-        rels = relations_mod.build_relations(list(file_ids))
-        # Safety net: catch any structural corruption in the reconciled cast and
-        # surface it honestly (as a warning the brain will read) rather than let
-        # it silently mislead the edit.
-        violations = relations_mod.validate(rels)
-        if violations:
-            logger.warning("observe: identity invariant violations: %s", violations)
-            rels.setdefault("warnings", []).extend(violations)
-    except Exception:
-        logger.exception("observe: relations build failed (continuing without)")
-    fmap = footage_map.assemble_map(file_ids, relations=rels, run_id=eff_run) if file_ids else {}
+    fmap = footage_map.assemble_map(file_ids, run_id=eff_run) if file_ids else {}
     map_struct = fmap.get("struct") or {"clips": []}
     durations: Dict[str, int] = {}
     try:
@@ -121,9 +83,7 @@ def build_context(file_ids: List[str], run_id: Optional[str] = None) -> EditCont
         index=_MapIndex(map_struct),
         map_struct=map_struct,
         durations=durations,
-        valence_by_file=_valence_by_file(file_ids),
         dup_groups=fmap.get("dup_groups") or [],
-        relations=rels,
         run_id=eff_run,
     )
 
@@ -249,7 +209,7 @@ def read_state(document: dict, ctx: EditContext) -> dict:
     the feel narration. This is the brain's primary 'look at the timeline'."""
     timeline = document.get("timeline") or []
     ops = document.get("operations") or []
-    report = feel.simulate(timeline, ctx.meta_by_ref, ctx.valence_by_file)
+    report = feel.simulate(timeline, ctx.meta_by_ref)
 
     cuts = []
     prog = 0
@@ -456,7 +416,7 @@ def diagnose(document: dict, ctx: EditContext) -> List[dict]:
     findings: List[dict] = []
     if not timeline:
         return findings
-    report = feel.simulate(timeline, ctx.meta_by_ref, ctx.valence_by_file)
+    report = feel.simulate(timeline, ctx.meta_by_ref)
 
     for lo, hi in feel._same_speaker_runs(report.cuts):
         findings.append({"severity": "warn", "anchor": f"cuts {lo}-{hi}",

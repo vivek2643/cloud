@@ -144,7 +144,8 @@ def test_run_ingest_calls_pass2a_per_shard_and_pass2b_per_batch():
 
     recorded = {}
 
-    def fake_assemble(pass2_output, lattices, motion_by_file, silences_by_file, junk_suspects=None):
+    def fake_assemble(pass2_output, lattices, motion_by_file, silences_by_file,
+                      junk_suspects=None, audio_by_file=None):
         recorded["cuts"] = list(pass2_output.cuts)
         return []
 

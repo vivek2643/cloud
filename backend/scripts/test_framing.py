@@ -119,65 +119,15 @@ def test_resolve_attaches_transform() -> None:
 # Phase 2: perception-grounded focus + orientation
 # --------------------------------------------------------------------------
 
-def test_focus_priority_and_centers() -> None:
-    """Speaking region wins over events/motion/person; center = box midpoint."""
+def test_focus_from_motion_centroid_only() -> None:
+    """Focus resolves purely from the subject-motion centroid; empty -> None."""
     from app.services.l3 import framing
 
-    perc = {
-        "speaking": [{"start_ms": 0, "end_ms": 3000, "subject": "p1",
-                      "region": {"x": 0.5, "y": 0.1, "w": 0.4, "h": 0.8}}],
-        "events": [{"start_ms": 0, "end_ms": 3000, "description": "p1 waves",
-                    "region": {"x": 0.0, "y": 0.0, "w": 0.2, "h": 0.2}}],
-        "persons": [{"local_id": "p1", "role": "main subject",
-                     "frame_region": {"x": 0.0, "y": 0.0, "w": 0.1, "h": 0.1}}],
-    }
-    f = framing.focus_for_range(perc, [], 0, 3000)
-    assert f["source"] == "speaking" and abs(f["cx"] - 0.7) < 1e-6, f  # 0.5 + 0.4/2
-
-    # No speaking/event regions -> motion centroid average.
     pts = [{"ts_ms": 500, "centroid": [0.2, 0.8]}, {"ts_ms": 1500, "centroid": [0.4, 0.6]}]
-    f = framing.focus_for_range({"persons": []}, pts, 0, 2000)
+    f = framing.focus_for_range(pts, 0, 2000)
     assert f["source"] == "motion" and abs(f["cx"] - 0.3) < 1e-6, f
-
-    # Nothing spatial -> main person's frame_region (role 'main' ranked first).
-    perc2 = {"persons": [
-        {"local_id": "p2", "role": "passerby", "frame_region": {"x": 0, "y": 0, "w": 0.2, "h": 0.2}},
-        {"local_id": "p1", "role": "main subject", "frame_region": {"x": 0.6, "y": 0.2, "w": 0.3, "h": 0.6}},
-    ]}
-    f = framing.focus_for_range(perc2, [], 0, 1000)
-    assert f["source"] == "person" and abs(f["cx"] - 0.75) < 1e-6, f
-
-    # Truly empty -> no focus (centered fallback).
-    assert framing.focus_for_range({}, [], 0, 1000) is None
-    print("  OK  focus priority speaking>event>motion>person; centers + empty fallback")
-
-
-def test_orientation_mapping_and_annotate() -> None:
-    """frame_orientation -> clockwise rotate; annotate bakes focus+rotate onto segs."""
-    from app.services.l3 import framing
-
-    assert framing.orientation_rotate({"frame_orientation": "rotate_cw90"}) == 90
-    assert framing.orientation_rotate({"frame_orientation": "rotate_ccw90"}) == 270
-    assert framing.orientation_rotate({"frame_orientation": "rotate_180"}) == 180
-    assert framing.orientation_rotate({"frame_orientation": "upright"}) == 0
-    assert framing.orientation_rotate({}) == 0
-
-    perc = {
-        "frame_orientation": "rotate_cw90",
-        "speaking": [{"start_ms": 0, "end_ms": 2000, "subject": "p1",
-                      "region": {"x": 0.55, "y": 0.1, "w": 0.4, "h": 0.8}}],
-    }
-    orig = framing._load_perceptions
-    framing._load_perceptions = lambda fids: {"f1": perc}
-    try:
-        doc = {"format": {"aspect": "portrait"},
-               "timeline": [{"seg_id": "s1", "file_id": "f1", "in_ms": 0, "out_ms": 2000}]}
-        framing.annotate_document(doc)
-    finally:
-        framing._load_perceptions = orig
-    tr = doc["timeline"][0]["transform"]
-    assert tr["rotate"] == 90 and abs(tr["focus"]["cx"] - 0.75) < 1e-6, tr
-    print("  OK  orientation->rotate; annotate bakes focus+rotate onto segments")
+    assert framing.focus_for_range([], 0, 1000) is None  # nothing -> centered
+    print("  OK  focus from motion centroid; empty -> None")
 
 
 def test_focus_builds_quoted_crop_expr() -> None:
@@ -252,19 +202,14 @@ def test_motion_annotate_idempotent() -> None:
     """annotate bakes motion under the chosen style and clears it when back to static."""
     from app.services.l3 import framing
 
-    orig = framing._load_perceptions
-    framing._load_perceptions = lambda fids: {}
-    try:
-        doc = {"format": {"aspect": "portrait", "motion_style": "push_in", "motion_feel": "glide"},
-               "timeline": [{"seg_id": "s1", "file_id": "f1", "in_ms": 0, "out_ms": 3000}]}
-        framing.annotate_document(doc)
-        assert "motion" in doc["timeline"][0]["transform"], doc
-        # Switch back to static: the prior motion must be cleared.
-        doc["format"]["motion_style"] = "static"
-        framing.annotate_document(doc)
-        assert "motion" not in (doc["timeline"][0].get("transform") or {}), doc
-    finally:
-        framing._load_perceptions = orig
+    doc = {"format": {"aspect": "portrait", "motion_style": "push_in", "motion_feel": "glide"},
+           "timeline": [{"seg_id": "s1", "file_id": "f1", "in_ms": 0, "out_ms": 3000}]}
+    framing.annotate_document(doc)
+    assert "motion" in doc["timeline"][0]["transform"], doc
+    # Switch back to static: the prior motion must be cleared.
+    doc["format"]["motion_style"] = "static"
+    framing.annotate_document(doc)
+    assert "motion" not in (doc["timeline"][0].get("transform") or {}), doc
     print("  OK  annotate bakes motion; clears it when style returns to static")
 
 
@@ -276,8 +221,7 @@ def main() -> None:
     test_override_clamping()
     test_resolve_attaches_transform()
     print("geometric framing (Phase 2) regression:")
-    test_focus_priority_and_centers()
-    test_orientation_mapping_and_annotate()
+    test_focus_from_motion_centroid_only()
     test_focus_builds_quoted_crop_expr()
     print("geometric framing (Phase 3) regression:")
     test_motion_normalize_and_sample()

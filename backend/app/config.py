@@ -62,32 +62,6 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-opus-4-8"
 
-    # --- L2: VLM perception layer (Gemini) -------------------------------
-    # A single Gemini pass over the whole clip that produces the rich, single-
-    # take "footage log" (clip-level look/setting, person identities, an event
-    # timeline, and semantic cut-cost events). Runs after L1 completes.
-    enable_l2_perception: bool = True
-    # Cost/latency scale ~linearly with duration, so we gate the deep pass by
-    # length. Tunable; temporarily raised to 60 min (we'll split long videos
-    # later instead of just gating them).
-    l2_max_duration_seconds: int = 3600
-    # Reuses gemini_api_key. Flash is fast/cheap and plenty for perception;
-    # bump to a pro model here if quality needs it.
-    l2_gemini_model: str = "gemini-2.5-flash"
-    # Frame sampling rate Gemini uses to read the video. 1 fps is Gemini's
-    # default and is enough for single-take footage logging; raise for fast
-    # action at a roughly linear token cost.
-    l2_video_fps: float = 1.0
-    # Per-frame token budget: "low" (~64 tok/frame), "default", or "high".
-    l2_media_resolution: str = "default"
-    # Rich logs for a few minutes of footage can be large; give the model room.
-    # gemini-2.5-flash supports up to 65536 output tokens; long/dense clips
-    # (>10 min) overflow 32768 and return truncated, unparseable JSON.
-    l2_max_output_tokens: int = 65536
-    # Files API upload poll: how long to wait for Gemini to finish ingesting the
-    # uploaded video before giving up.
-    l2_file_active_timeout_seconds: int = 300
-
     # --- L3: prompt-driven auto-editor (OpenAI) --------------------------
     # A simple, deterministic 3-call pipeline (Director -> Editor -> Coverage)
     # that turns a one-line brief into a full Edit Document: guess the energy,

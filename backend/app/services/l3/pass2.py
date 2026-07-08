@@ -53,6 +53,10 @@ class Pass2Cut(BaseModel):
     take_group_id: str | None = None
     take_role: str | None = None    # "take" | "outlook" | "winner"
     channel: str | None = None      # "said" | "done" | "shown" (video: done|shown)
+    # Per-person visual fingerprints (pass 2b) -- appearance descriptors used
+    # to recognise the same person across cuts. List of {description, position,
+    # speaking}. See pass2b.PersonLook.
+    people: List[dict] = Field(default_factory=list)
 
 
 class Pass2Output(BaseModel):
@@ -85,6 +89,7 @@ def merge_identity_and_visual(
             natural_sound=identity.natural_sound,
             take_group_id=identity.take_group_id, take_role=identity.take_role,
             channel=identity.channel,
+            people=[p.model_dump() for p in visual.people],
         ))
     return Pass2Output(cuts=cuts)
 

@@ -30,7 +30,7 @@ def _record(file_id="f1", take_group_id=None):
                      speaker=None, on_camera=None, junk=False, junk_reason="",
                      framing={}, look={}, caption_zones=[], hero_ts_ms=50,
                      pace=_pace(), take_group_id=take_group_id, take_role=None,
-                     channel="said")
+                     channel="said", speech_quality=0.8, total_quality=0.8)
 
 
 def test_take_group_uuid_map_assigns_one_uuid_per_distinct_string_id():

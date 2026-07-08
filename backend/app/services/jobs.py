@@ -55,7 +55,6 @@ def register_tasks() -> None:
     # Local imports avoid circular dependency at module load. Each import
     # registers @app.task decorators as a side-effect.
     from app.services.l1 import pipeline  # noqa: F401
-    from app.services.l2 import perception  # noqa: F401
     from app.services.l3 import auto_edit  # noqa: F401
     from app.services.l3 import ingest  # noqa: F401
     from app.services.render import tasks as render_tasks  # noqa: F401

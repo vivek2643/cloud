@@ -48,11 +48,10 @@ class FileResponse(BaseModel):
     height: Optional[int]
     status: str
     l1_status: Optional[str] = None
-    l2_status: Optional[str] = None
     # Coarse, monotonic analysis progress (0..1) + a short phase label, derived
-    # from status/l1_status/l2_status so the UI can show a determinate bar
-    # instead of a perpetual "Processing…". Defaults to done for responses that
-    # don't compute it (the file list/get endpoints do).
+    # from status/l1_status so the UI can show a determinate bar instead of a
+    # perpetual "Processing…". Defaults to done for responses that don't compute
+    # it (the file list/get endpoints do).
     analysis_progress: float = 1.0
     analysis_phase: str = "ready"
     created_at: datetime

@@ -1,18 +1,17 @@
 """
 Feel simulator: a PURE, VLM-free read of how the current edit FEELS.
 
-The agentic brain (Phase 3) shouldn't need an expensive VLM pass to know whether
-its cut drags, races, or jump-cuts. Almost everything about "feel" is a free
-projection of the edit's OWN structure -- shot lengths, speaking pace, who is on
-screen, and the one emotional-tone tag (``valence``) L2 supplies per clip. This
+The agentic brain (Phase 3) shouldn't need an expensive pass to know whether its
+cut drags, races, or jump-cuts. Everything about "feel" is a free projection of
+the edit's OWN structure -- shot lengths, speaking pace, who is on screen. This
 module computes those dimensions deterministically from the timeline + a little
-map/valence context, and narrates them back in anchored prose the brain can act
-on ("energy sags cuts 4-6; two same-speaker cuts back-to-back at cut 7").
+map context, and narrates them back in anchored prose the brain can act on
+("energy sags cuts 4-6; two same-speaker cuts back-to-back at cut 7").
 
 Design:
-  * PURE. Inputs are the timeline segments + read-only lookups (moment meta by
-    ref, valence by file). No DB, no LLM, no network -- safe to call every loop
-    turn. The context builder (``observe.build_context``) does the DB reads once.
+  * PURE. Inputs are the timeline segments + a read-only lookup (moment meta by
+    ref). No DB, no LLM, no network -- safe to call every loop turn. The context
+    builder (``observe.build_context``) does the DB reads once.
   * Honest, not prescriptive. It reports what IS (pace, rhythm, tone), it does
     not decide what SHOULD change -- the brain does. Numbers are anchored to cut
     positions so the brain can point its edits.
@@ -42,7 +41,6 @@ class CutFeel:
     is_speech: bool
     speaker: Optional[str]
     channel: Optional[str]   # said | done | shown | None
-    valence: Optional[str]   # clip emotional tone (positive/neutral/.../somber)
     energy: float            # 0..1 proxy (short + fast -> high; long + slow -> low)
 
 
@@ -56,14 +54,6 @@ class FeelReport:
     def avg_pace(self) -> float:
         spoken = [c.pace_wps for c in self.cuts if c.is_speech and c.pace_wps > 0]
         return round(sum(spoken) / len(spoken), 2) if spoken else 0.0
-
-    @property
-    def dominant_valence(self) -> Optional[str]:
-        counts: Dict[str, int] = {}
-        for c in self.cuts:
-            if c.valence:
-                counts[c.valence] = counts.get(c.valence, 0) + 1
-        return max(counts, key=counts.get) if counts else None
 
     def narrate(self) -> str:
         """Anchored prose: what the edit feels like, pointed at cut positions."""
@@ -86,11 +76,6 @@ class FeelReport:
             spk = self.cuts[lo - 1].speaker or "one speaker"
             parts.append(f"cuts {lo}-{hi} stay on {spk} back-to-back (jump-cut risk)")
 
-        dv = self.dominant_valence
-        if dv:
-            shift = _valence_shift(self.cuts)
-            parts.append(f"tone is mostly {dv}" + (f", shifting to {shift[1]} around cut {shift[0]}"
-                                                    if shift else ""))
         return "; ".join(parts) + "."
 
     def to_dict(self) -> dict:
@@ -98,11 +83,10 @@ class FeelReport:
             "total_ms": self.total_ms,
             "cut_count": len(self.cuts),
             "avg_pace_wps": self.avg_pace,
-            "dominant_valence": self.dominant_valence,
             "narration": self.narrate(),
             "cuts": [
                 {"pos": c.pos, "ref": c.ref, "dur_ms": c.dur_ms, "pace_wps": c.pace_wps,
-                 "channel": c.channel, "speaker": c.speaker, "valence": c.valence,
+                 "channel": c.channel, "speaker": c.speaker,
                  "energy": round(c.energy, 2)}
                 for c in self.cuts
             ],
@@ -112,14 +96,11 @@ class FeelReport:
 def simulate(
     timeline: List[dict],
     meta_by_ref: Optional[Dict[str, dict]] = None,
-    valence_by_file: Optional[Dict[str, str]] = None,
 ) -> FeelReport:
     """Compute the feel of a timeline. ``meta_by_ref`` maps a segment's map ref
-    to its moment node (for speaker/channel); ``valence_by_file`` maps a source
-    file to its clip valence. Both optional -- feel degrades gracefully to what
-    the timeline alone reveals (pace + rhythm)."""
+    to its moment node (for speaker/channel). Optional -- feel degrades
+    gracefully to what the timeline alone reveals (pace + rhythm)."""
     meta_by_ref = meta_by_ref or {}
-    valence_by_file = valence_by_file or {}
     cuts: List[CutFeel] = []
     total = 0
     for i, seg in enumerate(timeline):
@@ -142,7 +123,6 @@ def simulate(
             is_speech=is_speech,
             speaker=meta.get("speaker"),
             channel=meta.get("channel") or ("said" if is_speech else None),
-            valence=valence_by_file.get(str(seg.get("file_id") or "")),
             energy=0.0,  # filled below (needs the whole set for normalisation)
         ))
     _score_energy(cuts)
@@ -205,18 +185,6 @@ def _same_speaker_runs(cuts: List[CutFeel]) -> List[tuple[int, int]]:
         else:
             i += 1
     return out
-
-
-def _valence_shift(cuts: List[CutFeel]) -> Optional[tuple[int, str]]:
-    """The first position where valence changes from the opening tone, if any."""
-    tones = [(c.pos, c.valence) for c in cuts if c.valence]
-    if len(tones) < 2:
-        return None
-    first = tones[0][1]
-    for pos, v in tones:
-        if v != first:
-            return (pos, v)
-    return None
 
 
 def _runs(positions: List[int], min_len: int) -> List[tuple[int, int]]:

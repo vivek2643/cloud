@@ -187,10 +187,11 @@ def synth_ladder(row: Dict[str, Any], score: float) -> List[Dict[str, Any]]:
 # cut_record row -> the cut-dict shape build_clip_tree consumes
 # --------------------------------------------------------------------------
 
-def _score_for(row: Dict[str, Any]) -> float:
-    """Deterministic 0..1 rank key from the cut's OWN duration + how centered
-    its anchor sits within its span -- no LLM number, no absolute constants
-    beyond a soft duration normalizer."""
+def _legacy_score_for(row: Dict[str, Any]) -> float:
+    """Fallback rank key for a cut ingested BEFORE deterministic total_quality
+    existed (migration 031): the cut's OWN duration + how centered its anchor
+    sits in its span. Re-ingested runs carry a real total_quality and never
+    reach this."""
     s, e = int(row["src_in_ms"]), int(row["src_out_ms"])
     dur = max(1, e - s)
     hero = row.get("hero_ts_ms")
@@ -203,11 +204,28 @@ def _score_for(row: Dict[str, Any]) -> float:
     return round(0.5 * anchor_frac + 0.5 * dur_frac, 3)
 
 
+def _score_for(row: Dict[str, Any]) -> float:
+    """The cut's deterministic rank score: the real total_quality stamped at
+    ingest (post.compute_total_quality), or the legacy geometric fallback for
+    rows predating it."""
+    tq = row.get("total_quality")
+    return float(tq) if tq else _legacy_score_for(row)
+
+
 def _people_for(row: Dict[str, Any]) -> List[dict]:
+    """The people on screen for this cut: the diarized speaker (voice identity)
+    plus the pass-2 appearance fingerprints (characteristics) so the brain can
+    recognise the same person across cuts by description, not just voice id."""
+    chars = row.get("characteristics") or []
     speaker = row.get("speaker")
-    if not speaker:
+    if not speaker and not chars:
         return []
-    return [{"person_id": speaker, "voice_speaker_id": speaker, "on_camera": row.get("on_camera")}]
+    return [{
+        "person_id": speaker,
+        "voice_speaker_id": speaker,
+        "on_camera": row.get("on_camera"),
+        "characteristics": chars,
+    }]
 
 
 def _audio_mute_for(channel: str, row: Dict[str, Any]) -> Tuple[Optional[str], bool, List[str]]:
@@ -245,6 +263,12 @@ def _to_cut_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "play_ms": int(row["src_out_ms"]) - int(row["src_in_ms"]),
         "keep_spans": None,
         "score": score,
+        # The two deterministic quality scores (post.py) surfaced verbatim so
+        # the brain can arrange on them: speech_quality (delivery, camera-
+        # independent -> same across simultaneous angles) and total_quality
+        # (speech + visual; the on-camera close-up of a beat ranks highest).
+        "speech_quality": row.get("speech_quality"),
+        "total_quality": row.get("total_quality"),
         "flags": flags,
         "audio": audio,
         "mute": mute,

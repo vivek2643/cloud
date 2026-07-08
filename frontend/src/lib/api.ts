@@ -83,7 +83,6 @@ export interface FileRecord {
   height: number | null;
   status: "uploading" | "processing" | "ready" | "failed";
   l1_status?: "pending" | "running" | "ready" | "failed" | "skipped" | null;
-  l2_status?: "pending" | "queued" | "running" | "ready" | "failed" | "skipped" | null;
   // Coarse analysis progress (0..1) + short phase label from the server.
   analysis_progress?: number;
   analysis_phase?: string;
@@ -120,22 +119,6 @@ export function deleteFile(id: string, token: string) {
   return request<void>(`/api/files/${id}`, { method: "DELETE", token });
 }
 
-/** Force a fresh L2 perception run for one clip (on-demand backfill). */
-export function reanalyzeFile(id: string, token: string) {
-  return request<{ file_id: string; state: string }>(
-    `/api/files/${id}/reanalyze`,
-    { method: "POST", token }
-  );
-}
-
-/** Re-enqueue L2 for every clip whose perception predates the current schema. */
-export function reanalyzeStale(token: string) {
-  return request<{ candidates: number; queued: number; results: Record<string, string> }>(
-    `/api/files/reanalyze-stale`,
-    { method: "POST", token }
-  );
-}
-
 export function getFilePlaybackUrl(id: string, token: string) {
   return request<{ url: string }>(`/api/files/${id}/playback`, { token });
 }
@@ -161,12 +144,27 @@ export interface Pace {
   remove_spans?: [number, number][];
 }
 
+export type ShotSize =
+  | "extreme_close_up" | "close_up" | "medium_close_up" | "medium"
+  | "medium_wide" | "wide" | "extreme_wide" | "unsure";
+
 export interface Framing {
   subject_box?: [number, number, number, number] | null;
   crop_16x9?: [number, number, number, number] | null;
   crop_9x16?: [number, number, number, number] | null;
   crop_1x1?: [number, number, number, number] | null;
   rotation_deg?: number;
+  // How tight the frame is on the subject (pass 2 image judgment). Feeds the
+  // visual half of total_quality. Absent on pre-migration runs.
+  shot_size?: ShotSize;
+}
+
+// One person visible in a cut, described well enough to recognise across cuts
+// (pass 2 image LLM). Appearance only -- never a name or a score.
+export interface PersonLook {
+  description: string;
+  position?: string | null;
+  speaking?: boolean | null;
 }
 
 export interface Look {
@@ -221,6 +219,14 @@ export interface CutRecord {
   transition_in: string | null;
   transition_out: string | null;
   continuity: Continuity;
+  // Deterministic 0..1 quality scores (post.py). speech_quality is delivery-
+  // only (null for cuts with no speech); total_quality blends speech + visual
+  // and crowns the winner within a same-setting take cluster. Absent/0 on
+  // pre-migration runs.
+  speech_quality?: number | null;
+  total_quality?: number | null;
+  // Per-person appearance fingerprints from the pass 2 image LLM.
+  characteristics?: PersonLook[];
 }
 
 export type IngestStatus = "pending" | "pass1" | "images" | "pass2" | "post" | "ready" | "failed";

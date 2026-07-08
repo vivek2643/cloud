@@ -291,6 +291,13 @@ def build_clip_tree(
             "audio": cut.get("audio"),
             "mute": bool(cut.get("mute")),
             "score": float(cut.get("score", 0.0)),
+            # Deterministic quality scores (post.py) carried through untouched:
+            # speech_quality (delivery, ~equal across simultaneous angles) and
+            # total_quality (speech + visual; the `score` above == total_quality
+            # for a re-ingested cut). Let the brain "show the speaker" by ranking
+            # a beat's alternate angles on visual presentation.
+            "speech_quality": cut.get("speech_quality"),
+            "total_quality": cut.get("total_quality"),
             "in_ms": anchor["in_ms"],
             "out_ms": anchor["out_ms"],
             "play_ms": anchor["play_ms"],
@@ -774,10 +781,12 @@ def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Link moments that deliver the SAME content across clips/angles.
 
     dup_groups read DIRECTLY off each moment's persisted ``take_group_id``/
-    ``take_role`` (pass 2 already resolved cross-clip takes from the pixels +
-    transcript; ``post._enforce_one_winner_per_take_group`` guarantees a
-    single winner) -- no token-overlap recompute, no IoU matching needed
-    since the group id already lives on the exact moment it belongs to. Tags
+    ``take_role`` (pass 2 resolved cross-clip takes from the pixels +
+    transcript, then ``post._enforce_take_winner`` re-crowned the winner
+    deterministically by total_quality -- and only within a same-setting take
+    cluster, never among outlook angles) -- no token-overlap recompute, no IoU
+    matching needed since the group id already lives on the exact moment it
+    belongs to. Tags
     each linked moment in place with its ``dup_group`` plus ``alt_pic`` (Fact
     #2 folded onto the beat: every OTHER member's raw facts, so
     ``_moment_line`` can render this beat's alternates without a separate
@@ -826,7 +835,6 @@ def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def assemble_map(file_ids: List[str], *, compact: bool = False,
-                 relations: Optional[dict] = None,
                  run_id: Optional[str] = None) -> Dict[str, Any]:
     """The Tier-0 footage index for the arranger.
 
@@ -837,23 +845,13 @@ def assemble_map(file_ids: List[str], *, compact: bool = False,
     path; resident mode emits the full line. Moments are tagged in place with
     cross-clip duplicate links -- coverage reads INLINE on each beat as
     ``·alt-PIC`` (no separate coverage block: dedupe the information, not the
-    sequence). When ``relations`` (the shoot identity registry) is supplied,
-    per-line and alt-PIC speakers are aliased to their global person id so the
-    same human reads consistently across clips.
+    sequence). Speakers read as their per-clip diarized id (each clip's own
+    ``PIC``/``SND`` handles).
     """
-    alias: Optional[Dict[Any, str]] = None
-    oncam: Optional[Dict[str, str]] = None
-    if relations:
-        try:
-            from app.services.l3 import relations as relations_mod
-            alias = relations_mod.identity_index(relations)
-            oncam = relations_mod.oncam_global_by_file(relations)
-        except Exception:
-            logger.exception("footage map: identity index failed (continuing)")
     trees = get_trees(file_ids, run_id=run_id)
     ordered = [trees[fid] for fid in file_ids if fid in trees]
     dups = _annotate_dups(ordered)   # tags moments in `ordered` in place
-    text = "\n\n".join(_clip_block(t, compact=compact, alias=alias, oncam=oncam)
+    text = "\n\n".join(_clip_block(t, compact=compact)
                        for t in ordered)
     n_moments = sum(t["moment_count"] for t in ordered)
     return {
@@ -887,10 +885,10 @@ _DETAIL_PAD_MS = 1200
 
 def _span_detail(file_id: str, in_ms: int, out_ms: int) -> Dict[str, Any]:
     """The RAW source detail overlapping a moment's span -- the brain's Tier-1
-    'open the file and read' depth: the VLM detection atoms (channel/subject/peak)
-    and the verbatim transcript window. Kept OUT of the resident prompt; loaded on
-    demand only when the brain inspects a candidate. Best-effort -- a missing
-    artifact simply yields fewer fields."""
+    'open the file and read' depth: the verbatim transcript window (L1 dialogue
+    segments). Kept OUT of the resident prompt; loaded on demand only when the
+    brain inspects a candidate. Best-effort -- a missing artifact simply yields
+    fewer fields."""
     lo, hi = in_ms - _DETAIL_PAD_MS, out_ms + _DETAIL_PAD_MS
 
     def _ov(a0: Any, a1: Any) -> bool:
@@ -899,15 +897,11 @@ def _span_detail(file_id: str, in_ms: int, out_ms: int) -> Dict[str, Any]:
         except Exception:
             return False
 
-    out: Dict[str, Any] = {"atoms": [], "transcript": []}
+    out: Dict[str, Any] = {"transcript": []}
     try:
         with _pg_conn() as conn:
             row = conn.execute(
-                "select cp.perception, ds.segments "
-                "from files f "
-                "left join clip_perception cp on cp.file_id = f.id "
-                "left join dialogue_segments ds on ds.file_id = f.id "
-                "where f.id = %s",
+                "select segments from dialogue_segments where file_id = %s",
                 (file_id,),
             ).fetchone()
     except Exception:
@@ -915,18 +909,7 @@ def _span_detail(file_id: str, in_ms: int, out_ms: int) -> Dict[str, Any]:
         return out
     if not row:
         return out
-    perception, segments = _as_doc(row[0]), _as_doc(row[1])
-
-    # cuts-v2 substrate: the VLM's detection atoms over the span (channel /
-    # subject / peak / confidence / gist). The brain's primary Tier-1 read.
-    out["atoms"] = [
-        {"channel": a.get("channel"), "subject": a.get("subject"),
-         "start_ms": a.get("start_ms"), "end_ms": a.get("end_ms"),
-         "peak_ms": a.get("peak_ms"), "confidence": a.get("confidence"),
-         "label": a.get("label"), "summary": a.get("summary")}
-        for a in (perception.get("atoms") or [])
-        if _ov(a.get("start_ms", 0), a.get("end_ms", 0))
-    ]
+    segments = _as_doc(row[0])
 
     # Verbatim transcript window (sentence granularity) -- the words actually
     # spoken across the span, so the brain reads the line, not just the gist.

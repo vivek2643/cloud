@@ -144,7 +144,7 @@ def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
             select integrated_lufs, true_peak_db,
                    is_musical, bpm,
                    onsets_ms, silence_intervals,
-                   prosody_hop_ms
+                   prosody_hop_ms, rms_db
               from audio_features where file_id = %s
             """,
             (file_id,),
@@ -160,6 +160,7 @@ def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
                 "silence_interval_count": len(af["silence_intervals"] or []),
                 "silence_intervals": af["silence_intervals"],
                 "prosody_hop_ms": af["prosody_hop_ms"],
+                "rms_db": af["rms_db"],
             }
 
         # Motion dynamics (action + camera/distortion) -- video-derived, own table.

@@ -230,8 +230,7 @@ def _context_block(file_ids: List[str], document: Optional[dict],
         logger.exception("converse: project overview failed (continuing without it)")
     try:
         text = (footage_map.assemble_map(
-            file_ids, relations=getattr(ctx, "relations", None),
-            run_id=getattr(ctx, "run_id", None)).get("text") or ""
+            file_ids, run_id=getattr(ctx, "run_id", None)).get("text") or ""
         ) if file_ids else ""
         if len(text) > _INDEX_CHAR_CAP:
             text = (text[:_INDEX_CHAR_CAP] +

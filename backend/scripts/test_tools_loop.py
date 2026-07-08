@@ -41,7 +41,7 @@ def _struct():
 def _ctx(struct):
     return observe.EditContext(
         file_ids=["ffffffff-1111"], index=_MapIndex(struct), map_struct=struct,
-        durations={"ffffffff-1111": 8000}, valence_by_file={}, dup_groups=[])
+        durations={"ffffffff-1111": 8000}, dup_groups=[])
 
 
 def _seed_doc():

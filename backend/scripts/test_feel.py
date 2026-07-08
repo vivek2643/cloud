@@ -70,23 +70,12 @@ def test_same_speaker_jump_cut_risk():
     print("ok  adjacent same-speaker cuts flagged as jump-cut risk")
 
 
-def test_valence_dominant_and_shift():
-    tl = [_seg(f"s{i}", "f1" if i < 2 else "f2", i * 2000, i * 2000 + 2000,
-               content="words here now", ref=f"x:m{i:02d}") for i in range(3)]
-    r = feel.simulate(tl, valence_by_file={"f1": "positive", "f2": "tense"})
-    assert r.dominant_valence == "positive", r.dominant_valence
-    txt = r.narrate().lower()
-    assert "positive" in txt and "tense" in txt, txt
-    print("ok  dominant valence + shift narrated")
-
-
 def main():
     test_empty_timeline()
     test_pace_and_totals()
     test_video_cut_has_no_pace()
     test_fast_run_flagged()
     test_same_speaker_jump_cut_risk()
-    test_valence_dominant_and_shift()
     print("\nall feel tests passed")
 
 

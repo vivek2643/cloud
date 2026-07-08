@@ -9,11 +9,11 @@ cuts_v3.plan.md section 6 and cuts_v3_boundaries_v2.plan.md.
 
 Note on "framing motion" (plan sec. 6, the subject-centroid-follows-crop
 bullet): that machinery already exists in ``app.services.l3.framing``
-(``focus_for_range``), reading straight off ``motion_dynamics``/
-``clip_perception`` for an arbitrary ``(file_id, src_in_ms, src_out_ms)``
-span at ARRANGE time. A cut_record's own ``file_id``/``src_in_ms``/
-``src_out_ms`` are already everything that machinery needs, so there is
-nothing new to build or store here for that bullet.
+(``focus_for_range``), reading straight off ``motion_dynamics`` for an
+arbitrary ``(file_id, src_in_ms, src_out_ms)`` span at ARRANGE time. A
+cut_record's own ``file_id``/``src_in_ms``/``src_out_ms`` are already
+everything that machinery needs, so there is nothing new to build or store
+here for that bullet.
 """
 from __future__ import annotations
 
@@ -154,6 +154,102 @@ def compute_speech_remove_spans(
     return _merge_spans(spans)
 
 
+# --------------------------------------------------------------------------
+# Quality scores -- two deterministic 0..1 numbers stamped on every cut (no
+# LLM number, no magic threshold on a raw measurement):
+#   * speech_quality -- delivery ONLY (crispness + loudness). Camera-
+#     independent: the same words spoken once score the same regardless of
+#     which simultaneous angle filmed them. None for a cut with no speech.
+#   * total_quality  -- speech (if any) blended with visual presentation
+#     (on-camera, shot tightness, sharpness, look). Biases toward on-camera
+#     close-ups; this is the number that crowns the winner WITHIN a same-
+#     setting take cluster (never across outlook angles -- see
+#     _enforce_take_winner).
+# Every continuous term is normalised against the CLIP's OWN min/max so there
+# are no absolute dB/pixel constants; the one category->rank map (_SHOT_TIGHTNESS)
+# is a fixed, interpretable ordinal scale, not a tuned threshold.
+# --------------------------------------------------------------------------
+
+_SHOT_TIGHTNESS = {
+    "extreme_close_up": 1.0, "close_up": 0.9, "medium_close_up": 0.75,
+    "medium": 0.6, "medium_wide": 0.45, "wide": 0.3, "extreme_wide": 0.15,
+}
+
+
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
+
+
+def _mean(vals: List[float]) -> Optional[float]:
+    return sum(vals) / len(vals) if vals else None
+
+
+def _series_lohi(arr: List[float]) -> Tuple[Optional[float], Optional[float]]:
+    """Min/max of a signal series (ignoring None), for clip-relative
+    normalisation. (None, None) when there's nothing usable."""
+    vals = [float(v) for v in (arr or []) if v is not None]
+    return (min(vals), max(vals)) if vals else (None, None)
+
+
+def _norm_in_clip(value: Optional[float], lo: Optional[float], hi: Optional[float]) -> Optional[float]:
+    if value is None or lo is None or hi is None or hi <= lo:
+        return None
+    return _clamp01((value - lo) / (hi - lo))
+
+
+def compute_speech_quality(
+    rms_db: List[float], hop_ms: int, s: int, e: int, remove_budget_ms: int,
+    rms_lo: Optional[float], rms_hi: Optional[float],
+) -> float:
+    """Delivery quality of a spoken beat, 0..1: how much of it is clean speech
+    (fluency = 1 - removable dead-air/filler fraction) blended with how present
+    the voice is (loudness, normalised against the clip's own rms range).
+    Camera-independent by construction -- fluency comes from word timings and
+    loudness from the source audio, both shared by simultaneous angles."""
+    dur = max(1, e - s)
+    fluency = _clamp01(1.0 - remove_budget_ms / dur)
+    terms = [fluency]
+    loudness = _norm_in_clip(_mean_in_span(rms_db, hop_ms, s, e), rms_lo, rms_hi) if rms_db else None
+    if loudness is not None:
+        terms.append(loudness)
+    return round(_mean(terms) or 0.0, 3)
+
+
+def compute_visual_score(
+    on_camera: Optional[bool], framing: Dict[str, Any], look: Dict[str, Any],
+    blur: List[float], hop_ms: int, s: int, e: int,
+    blur_lo: Optional[float], blur_hi: Optional[float],
+) -> Optional[float]:
+    """Presentation quality of the pixels, 0..1 (mean of whatever terms are
+    available): subject on camera, framing tightness (shot_size ordinal),
+    sharpness (clip-relative, since blur is unitless), and a clean/graded look.
+    None when NOTHING visual is known (e.g. a bare speech cut with no framing)."""
+    terms: List[float] = []
+    if on_camera is not None:
+        terms.append(1.0 if on_camera else 0.0)
+    tight = _SHOT_TIGHTNESS.get((framing or {}).get("shot_size"))
+    if tight is not None:
+        terms.append(tight)
+    blur_norm = _norm_in_clip(_mean_in_span(blur, hop_ms, s, e), blur_lo, blur_hi) if blur else None
+    if blur_norm is not None:
+        terms.append(1.0 - blur_norm)  # least-blurred in the clip -> sharpest -> 1.0
+    if look:
+        clean = not (look.get("exposure_flags") or [])
+        terms.append(1.0 if (bool(look.get("graded")) and clean) else (0.7 if clean else 0.4))
+    return _mean(terms)
+
+
+def compute_total_quality(kind: str, speech_quality: Optional[float],
+                          visual_score: Optional[float]) -> float:
+    """The single rank number for take selection + arrangement, 0..1. Speech
+    cuts blend delivery and presentation equally (so among identical-audio
+    angles the on-camera close-up wins); video cuts are visual-only."""
+    if kind == "speech":
+        terms = [t for t in (speech_quality, visual_score) if t is not None]
+        return round(_mean(terms) or 0.0, 3)
+    return round(visual_score if visual_score is not None else 0.0, 3)
+
+
 @dataclass
 class CutRecord:
     file_id: str
@@ -176,6 +272,15 @@ class CutRecord:
     take_group_id: Optional[str]
     take_role: Optional[str]
     channel: str                           # "said" | "done" | "shown"
+    # Two deterministic 0..1 quality scores (see the scoring section above).
+    # speech_quality is None for a cut with no speech; total_quality is always
+    # set and is what crowns a same-setting take group's winner.
+    speech_quality: Optional[float]
+    total_quality: float
+    # Per-person appearance fingerprints from pass 2b (list of {description,
+    # position, speaking}) -- lets take/outlook grouping + "show the speaker"
+    # arrange logic recognise the same person across cuts by eye.
+    characteristics: List[Dict[str, Any]] = field(default_factory=list)
     # Deterministic per-cut continuity (cuts_v3_continuity.plan.md): this cut's
     # 1-based ordinal + total among ALL cuts on its clip (incl. junk -- a gap in
     # the numbering IS the signal a junk beat sits there) and whether each
@@ -198,6 +303,8 @@ class CutRecord:
             "hero_ts_ms": self.hero_ts_ms, "pace": self.pace.to_dict(),
             "take_group_id": self.take_group_id, "take_role": self.take_role,
             "channel": self.channel, "continuity": self.continuity,
+            "speech_quality": self.speech_quality, "total_quality": self.total_quality,
+            "characteristics": self.characteristics,
         }
 
 
@@ -419,6 +526,7 @@ def assemble_cut_records(
     motion_by_file: Dict[str, Dict[str, Any]],
     silences_by_file: Dict[str, List[dict]],
     junk_suspects: Optional[List[JunkSuspect]] = None,
+    audio_by_file: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[CutRecord]:
     """Resolve every judged cut to its final ms span (word/atom edges only,
     by construction), enforce zero-overlap per file (gaps are legal -- cuts are
@@ -433,6 +541,12 @@ def assemble_cut_records(
     junk_by_file: Dict[str, List[JunkSuspect]] = {}
     for js in (junk_suspects or []):
         junk_by_file.setdefault(js.file_id, []).append(js)
+
+    audio_by_file = audio_by_file or {}
+    # Clip-relative normalisers for the quality scores: each signal is ranked
+    # against its OWN clip's spread, so there are no absolute dB/pixel constants.
+    rms_lohi = {fid: _series_lohi((a or {}).get("rms_db") or []) for fid, a in audio_by_file.items()}
+    blur_lohi = {fid: _series_lohi((m or {}).get("blur") or []) for fid, m in motion_by_file.items()}
 
     resolved: List[Tuple[Pass2Cut, int, int, List[int]]] = []
     for cut in pass2_output.cuts:
@@ -497,18 +611,34 @@ def assemble_cut_records(
             min_tasteful_speed=cut.taste_fences.min_tasteful_speed,
             natural_sound=cut.natural_sound,
         )
+        speech_quality: Optional[float] = None
         if cut.kind == "speech":
             pace.remove_spans = compute_speech_remove_spans(
                 lattices[cut.file_id].words, cut.word_span, s, e)
+            remove_budget = sum(b - a for a, b in pace.remove_spans)
+            audio = audio_by_file.get(cut.file_id) or {}
+            rms_lo, rms_hi = rms_lohi.get(cut.file_id, (None, None))
+            speech_quality = compute_speech_quality(
+                audio.get("rms_db") or [], int(audio.get("hop_ms") or 0),
+                s, e, remove_budget, rms_lo, rms_hi)
+
+        framing_dict = cut.framing.model_dump()
+        look_dict = cut.look.model_dump()
+        blur_lo, blur_hi = blur_lohi.get(cut.file_id, (None, None))
+        visual_score = compute_visual_score(
+            cut.on_camera, framing_dict, look_dict, blur, hop_ms, s, e, blur_lo, blur_hi)
+        total_quality = compute_total_quality(cut.kind, speech_quality, visual_score)
 
         out.append(CutRecord(
             file_id=cut.file_id, src_in_ms=s, src_out_ms=e, kind=cut.kind,
             word_span=cut.word_span, atom_ids=cut.atom_ids, label=cut.label, summary=cut.summary,
             speaker=cut.speaker, on_camera=cut.on_camera,
             junk=cut.junk, junk_reason=cut.junk_reason,
-            framing=cut.framing.model_dump(), look=cut.look.model_dump(),
+            framing=framing_dict, look=look_dict,
             caption_zones=list(cut.caption_zones), hero_ts_ms=hero_ts, pace=pace,
             take_group_id=cut.take_group_id, take_role=cut.take_role,
+            speech_quality=speech_quality, total_quality=total_quality,
+            characteristics=list(cut.people or []),
             # Channel is a SEMANTIC category the model owns: speech is always
             # "said" (code owns that fact); a video cut is "done" (an action is
             # performed/demonstrated) or "shown" (b-roll/display). Missing/unknown
@@ -517,29 +647,39 @@ def assemble_cut_records(
                      else (cut.channel if cut.channel in ("done", "shown") else "shown")),
             continuity=continuity_by_idx.get(idx, {}),
         ))
-    _enforce_one_winner_per_take_group(out)
+    _enforce_take_winner(out)
     return out
 
 
-def _enforce_one_winner_per_take_group(records: List[CutRecord]) -> None:
-    """Exactly one winner per take group (in place). Pass 2 resolves takes and
-    can crown two winners in a group (each member looked like the keeper), which
-    the same-line guard in pass 1 mostly prevents but can't fully guarantee. This
-    is the deterministic backstop: within each group keep the longest cut as the
-    single winner (most complete take) and demote the other winners to plain
-    'take'; a lone winner or a winner-less group is left as is. Outlooks
-    (different-angle members) are never touched."""
+def _enforce_take_winner(records: List[CutRecord]) -> None:
+    """Deterministically crown the winner of every take group (in place),
+    replacing pass 2's own winner call entirely -- the model owns the semantic
+    grouping (which cuts are takes of one beat, which are outlook angles), code
+    owns the numeric pick.
+
+    A "winner" only ever means the best of a SAME-SETTING take cluster (retries
+    of the same shot). Within that cluster the highest total_quality wins (ties
+    to the longest, most complete take); the rest become plain 'take'. OUTLOOKS
+    -- different-angle members of the group -- are never a winner: they are peer
+    angles the arranger chooses between per beat using total_quality, not a
+    crowned keeper. So if a group's only same-setting members number just one
+    (no genuine retry) it is treated as another angle and left winner-less."""
     from collections import defaultdict
     groups: Dict[str, List[CutRecord]] = defaultdict(list)
     for r in records:
         if r.take_group_id:
             groups[r.take_group_id].append(r)
     for gid, members in groups.items():
-        winners = [m for m in members if m.take_role == "winner"]
-        if len(winners) <= 1:
-            continue
-        winners.sort(key=lambda m: m.src_out_ms - m.src_in_ms, reverse=True)
-        for m in winners[1:]:
-            m.take_role = "take"
-        logger.info("post: take group %s had %d winners -> kept the longest, demoted %d to 'take'",
-                    gid, len(winners), len(winners) - 1)
+        # winner/take == same-setting cluster; outlook == alternate angle.
+        cluster = [m for m in members if m.take_role in ("winner", "take")]
+        has_outlooks = any(m.take_role == "outlook" for m in members)
+        if len(cluster) >= 2:
+            best = max(cluster, key=lambda m: (m.total_quality, m.src_out_ms - m.src_in_ms))
+            for m in cluster:
+                m.take_role = "winner" if m is best else "take"
+        elif len(cluster) == 1:
+            # A lone same-setting member is not a take contest. If real outlook
+            # angles sit alongside it, it IS just another angle -> demote to
+            # outlook so no winner is named among peer angles. Otherwise leave it.
+            cluster[0].take_role = "outlook" if has_outlooks else cluster[0].take_role
+        # outlooks are never touched -> never a winner.

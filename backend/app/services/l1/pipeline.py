@@ -665,29 +665,15 @@ def _run_stage(
 # `dialogue_cut` is NOT in a track: it needs transcript + diarization + audio
 # features, so it runs after the tracks join.
 
-def _enqueue_l2(file_id: str, duration_s: float) -> None:
-    """Best-effort defer of L2 (Gemini) perception. L2 is its own task so a VLM
-    hiccup retries independently of the L1 index; eligibility + idempotency are
-    enforced inside enqueue_l2_if_eligible."""
-    try:
-        from app.services.l2.perception import enqueue_l2_if_eligible
-        enqueue_l2_if_eligible(file_id, duration_s)
-    except Exception:
-        logger.exception("L1: enqueuing L2 failed for %s", file_id)
-
-
 def _track_speech(file_id: str, wav_path: str, duration_s: float) -> None:
     """transcript (Whisper) -> diarization -> dialogue_segments. The heaviest
-    track. Once it lands we fire L2 (Phase D): L2 needs proxy A plus exactly this
-    speech scaffolding, so enqueuing here overlaps it with the audio + motion
-    tracks instead of waiting for the whole L1 join."""
+    track."""
     with _pg_conn() as conn:
         _run_stage(conn, file_id, "transcript", _stage2_transcript, file_id, wav_path, conn)
         _run_stage(conn, file_id, "diarization", _stage6_diarization, file_id, wav_path, conn)
         # Dialogues lens: needs the diarized words + the WAV (for silence-snapped
         # cuts), both in hand here, so it rides the speech track after diarization.
         _run_stage(conn, file_id, "dialogue_segments", _stage_dialogue_segments, file_id, wav_path, conn)
-    _enqueue_l2(file_id, duration_s)
 
 
 def _track_audio(file_id: str, wav_path: str, duration_s: float) -> None:
@@ -721,9 +707,6 @@ def _run_deep_stages_parallel(
     if has_audio:
         tracks.append((_track_speech, (file_id, wav_path, duration_s)))
         tracks.append((_track_audio, (file_id, wav_path, duration_s)))
-    else:
-        # No speech track to gate on -> fire visual-only L2 now, overlapping motion.
-        _enqueue_l2(file_id, duration_s)
 
     with ThreadPoolExecutor(max_workers=len(tracks)) as ex:
         futs = [ex.submit(fn, *args) for fn, args in tracks]
@@ -738,9 +721,8 @@ def _run_deep_stages_parallel(
 
 def _orchestrate_audio(file_id: str, r2_key: str, settings) -> None:
     """L1 for a standalone music/audio upload. No video proxy, no motion, no
-    speech tools, no L2 (Gemini video perception). Runs: playable proxy +
-    waveform thumb, audio_features (loudness/BPM/onsets). Stages are
-    idempotent via processing_jobs."""
+    speech tools. Runs: playable proxy + waveform thumb, audio_features
+    (loudness/BPM/onsets). Stages are idempotent via processing_jobs."""
     _set_l1_status(file_id, "running")
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -869,7 +851,7 @@ def _prepare_from_client_proxies(
 ) -> tuple[float, bool, str]:
     """Fast path: analysis runs entirely off the two tiny client proxies and
     never touches the multi-GB raw. Proxy A (480p@1fps + audio) feeds the whole
-    speech/audio stack (WAV demux) and L2; proxy B (160x90@10fps) feeds motion.
+    speech/audio stack (WAV demux); proxy B (160x90@10fps) feeds motion.
     The 1080p editing proxy + real width/height/thumbnail are produced
     separately by `l1_editing_proxy` when the raw finishes uploading. Returns
     (duration_s, has_audio, motion_source)."""
@@ -885,9 +867,9 @@ def _prepare_from_client_proxies(
     if not has_audio:
         logger.info("File %s proxy A has no audio; skipping transcript/audio.", file_id)
 
-    # Record duration now so the deep-stage guardrail and L2 eligibility don't
-    # wait on the editing-proxy task. width/height/thumbnail/status come from the
-    # raw in l1_editing_proxy.
+    # Record duration now so the deep-stage guardrail doesn't wait on the
+    # editing-proxy task. width/height/thumbnail/status come from the raw in
+    # l1_editing_proxy.
     try:
         get_supabase().table("files").update(
             {"duration_seconds": duration_s}
@@ -974,8 +956,7 @@ def l1_orchestrate(file_id: str, r2_key: str) -> None:
                 return
 
             # Deep stages run as three concurrent tracks (speech / audio / video),
-            # overlapping the two heaviest stages (Whisper + optical flow). L2 is
-            # fired from inside as soon as the speech track lands (Phase D).
+            # overlapping the two heaviest stages (Whisper + optical flow).
             _run_deep_stages_parallel(
                 file_id, wav_path, video_source, duration_s, has_audio,
             )

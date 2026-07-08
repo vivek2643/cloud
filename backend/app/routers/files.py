@@ -15,29 +15,21 @@ router = APIRouter(prefix="/api/files", tags=["files"])
 def _analysis_progress(f: dict) -> tuple[float, str]:
     """Coarse, monotonic (progress, phase) for a file, from its lifecycle flags.
 
-    Tracks the full analysis (L1 + optional L2), not the raw upload -- in the
-    client-proxy fast path L1 runs on the proxies while the raw is still
-    uploading. L2 is only awaited when it was actually enqueued (l2_status set);
-    audio / ineligible clips have l2_status=None and finish at L1. The final
-    100% is gated on status=='ready' so the bar completes only once the file is
-    actually playable (editing proxy done)."""
+    Tracks L1 analysis, not the raw upload -- in the client-proxy fast path L1
+    runs on the proxies while the raw is still uploading. The final 100% is
+    gated on status=='ready' so the bar completes only once the file is actually
+    playable (editing proxy done)."""
     if f.get("file_type") not in ("video", "audio"):
         return 1.0, "ready"
     status = f.get("status")
     l1 = f.get("l1_status") or "pending"
-    l2 = f.get("l2_status")
     if l1 == "failed":
         return 1.0, "failed"
     if l1 == "pending":
         return (0.03, "uploading") if status == "uploading" else (0.08, "queued")
     if l1 == "running":
         return 0.4, "analyzing"
-    # L1 done (ready/skipped) -> optional Gemini (L2) phase.
-    if l2 == "queued":
-        return 0.72, "perceiving"
-    if l2 == "running":
-        return 0.85, "perceiving"
-    # Analysis complete (l2 None/ready/skipped/failed).
+    # L1 done (ready/skipped) -> waiting on the editing proxy for playback.
     return (1.0, "ready") if status == "ready" else (0.95, "finishing")
 
 
@@ -76,41 +68,6 @@ def get_file(
     if not result.data:
         raise HTTPException(status_code=404, detail="File not found")
     return _with_progress(result.data[0])
-
-
-@router.post("/{file_id}/reanalyze")
-def reanalyze_file(
-    file_id: str,
-    user_id: str = Depends(get_current_user_id),
-):
-    """Force a fresh L2 perception run for ONE owned clip (on-demand backfill).
-
-    Re-running L2 cascades: it re-defers thought segmentation, so downstream
-    passes rebuild off the fresh perception (e.g. to pick up a new schema tag
-    like `valence`)."""
-    sb = get_supabase()
-    owned = sb.table("files").select("id").eq("id", file_id).eq("user_id", user_id).execute()
-    if not owned.data:
-        raise HTTPException(status_code=404, detail="File not found")
-    from app.services.l2.perception import reenqueue_l2
-
-    state = reenqueue_l2(file_id)
-    return {"file_id": file_id, "state": state}
-
-
-@router.post("/reanalyze-stale")
-def reanalyze_stale(
-    user_id: str = Depends(get_current_user_id),
-):
-    """Backfill: re-enqueue L2 for every owned clip whose stored perception
-    predates the current schema (or was never perceived). Idempotent enough to
-    call repeatedly -- a clip already at the current schema is not listed."""
-    from app.services.l2.perception import reenqueue_l2, stale_perception_file_ids
-
-    stale = stale_perception_file_ids(user_id)
-    results = {fid: reenqueue_l2(fid) for fid in stale}
-    queued = sum(1 for s in results.values() if s == "queued")
-    return {"candidates": len(stale), "queued": queued, "results": results}
 
 
 @router.patch("/{file_id}", response_model=FileResponse)

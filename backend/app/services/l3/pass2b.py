@@ -38,12 +38,25 @@ from app.services.llm.base import image_block, text_block
 # and pass 2b assemble into)
 # --------------------------------------------------------------------------
 
+# Ordinal shot-size vocabulary, tightest -> widest (+ "unsure"). A CATEGORY
+# the model owns (deterministic-keep rule); code turns it into the ordinal
+# tightness term of total_quality (post._shot_tightness). Kept as a closed set
+# so that ranking is well-defined; anything off-list reads as "unsure".
+SHOT_SIZES = (
+    "extreme_close_up", "close_up", "medium_close_up", "medium",
+    "medium_wide", "wide", "extreme_wide", "unsure",
+)
+
+
 class Framing(BaseModel):
     subject_box: Tuple[float, float, float, float] | None = None   # normalized x,y,w,h
     crop_16x9: Tuple[float, float, float, float] | None = None
     crop_9x16: Tuple[float, float, float, float] | None = None
     crop_1x1: Tuple[float, float, float, float] | None = None
     rotation_deg: float = 0.0
+    # How tight the framing is on the subject -- one of SHOT_SIZES. Purely a
+    # category from the pixels; code (not the model) maps it to a number.
+    shot_size: str = "unsure"
 
 
 class Look(BaseModel):
@@ -57,6 +70,18 @@ class TasteFences(BaseModel):
     min_tasteful_speed: float = 1.0
 
 
+class PersonLook(BaseModel):
+    """A concise visual fingerprint of one person visible in the cut -- enough
+    to recognise the same person across cuts by eye, never an identity claim.
+    Categorical/descriptive only (the model owns appearance; it never assigns
+    scores or ids)."""
+    model_config = ConfigDict(extra="forbid")
+
+    description: str                       # e.g. "man, short dark hair, beard, grey hoodie"
+    position: str | None = None            # rough frame position: "left" | "center" | "right"
+    speaking: bool | None = None           # mouth visibly moving in these frames
+
+
 class VisualJudgment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -66,6 +91,10 @@ class VisualJudgment(BaseModel):
     caption_zones: List[Tuple[float, float, float, float]] = Field(default_factory=list)
     taste_fences: TasteFences = Field(default_factory=TasteFences)
     readability_ms: int = 0
+    # Every person visible in this cut, described well enough to re-identify by
+    # eye across cuts (for take/outlook grouping + "show the speaker" arrange
+    # decisions). Empty for a cut with no people on screen.
+    people: List[PersonLook] = Field(default_factory=list)
 
 
 class VisualOutput(BaseModel):
@@ -92,12 +121,22 @@ _SYSTEM = (
     "batch, judge purely from the pixels: framing -- subject_box, plus the "
     "best crop for each delivery shape (crop_16x9, crop_9x16, crop_1x1), each "
     "recomposed to keep the subject and eyeline in frame for that aspect (not "
-    "a centre-crop of the landscape), and rotation_deg only for a visibly "
-    "tilted shot (else 0). Look (graded vs log/flat, palette, exposure flags), "
+    "a centre-crop of the landscape), rotation_deg only for a visibly "
+    "tilted shot (else 0), and shot_size -- how tight the frame is on the "
+    "subject, exactly one of: extreme_close_up, close_up, medium_close_up, "
+    "medium, medium_wide, wide, extreme_wide (use unsure only if there is no "
+    "clear subject). Look (graded vs log/flat, palette, exposure flags), "
     "caption_zones (normalized boxes clear of the subject across every "
     "image you were shown for that cut), taste fences (max/min tasteful "
     "playback speed for this content), and readability_ms (how long a "
     "viewer needs to read this frame if it holds as a still).\n\n"
+    "Also list `people`: every person visible in the cut with a concise "
+    "description that would let someone recognise them again across cuts "
+    "(apparent gender/age, hair, facial hair, clothing/colour, anything "
+    "distinctive), their rough frame position (left/center/right), and "
+    "whether their mouth is visibly moving (speaking). No people on screen "
+    "-> empty list. Describe appearance only; never guess names or assign "
+    "any score.\n\n"
     "Reference every judgment by cut_index, the integer given in the CUT "
     "list and image captions -- one judgment per cut in this batch, no "
     "more, no fewer."

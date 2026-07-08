@@ -53,16 +53,23 @@ from app.services.processing import _download_from_r2, _upload_to_r2
 logger = logging.getLogger(__name__)
 
 
-def _load_signals(file_ids: List[str]) -> Tuple[Dict[str, dict], Dict[str, dict], Dict[str, list]]:
+def _load_signals(
+    file_ids: List[str],
+) -> Tuple[Dict[str, dict], Dict[str, dict], Dict[str, list], Dict[str, dict]]:
     motion_by_file: Dict[str, dict] = {}
     scene_by_file: Dict[str, dict] = {}
     silences_by_file: Dict[str, list] = {}
+    audio_by_file: Dict[str, dict] = {}
     for fid in file_ids:
         snap = build_l1_snapshot(fid)
         motion_by_file[fid] = snap.get("motion_dynamics") or {}
         scene_by_file[fid] = snap.get("scene_cuts") or {}
-        silences_by_file[fid] = (snap.get("audio_features") or {}).get("silence_intervals") or []
-    return motion_by_file, scene_by_file, silences_by_file
+        af = snap.get("audio_features") or {}
+        silences_by_file[fid] = af.get("silence_intervals") or []
+        # rms_db (dB energy envelope) + its hop feed the speech_quality loudness
+        # term in post.assemble_cut_records; empty when a clip has no audio_features.
+        audio_by_file[fid] = {"rms_db": af.get("rms_db") or [], "hop_ms": af.get("prosody_hop_ms") or 0}
+    return motion_by_file, scene_by_file, silences_by_file, audio_by_file
 
 
 def _proxy_keys_for_files(file_ids: List[str]) -> Dict[str, str]:
@@ -108,7 +115,7 @@ def run_ingest(project_id: str) -> str:
             raise ValueError(f"project {project_id} has no ingest-ready files")
         lattices: Dict[str, Lattice] = {fid: lat for fid, _name, _dur, lat in file_rows}
         file_ids = list(lattices.keys())
-        motion_by_file, scene_by_file, silences_by_file = _load_signals(file_ids)
+        motion_by_file, scene_by_file, silences_by_file, audio_by_file = _load_signals(file_ids)
         proxy_keys = _proxy_keys_for_files(file_ids)
 
         store.set_status(ingest_run_id, "pass1")
@@ -181,7 +188,8 @@ def run_ingest(project_id: str) -> str:
 
         store.set_status(ingest_run_id, "post")
         records = post.assemble_cut_records(pass2_output, lattices, motion_by_file, silences_by_file,
-                                            junk_suspects=pass1_output.junk_suspects)
+                                            junk_suspects=pass1_output.junk_suspects,
+                                            audio_by_file=audio_by_file)
 
         store.delete_cut_records_for_run(ingest_run_id)
         record_ids = store.insert_cut_records(ingest_run_id, records)
@@ -195,22 +203,22 @@ def run_ingest(project_id: str) -> str:
     return ingest_run_id
 
 
-@app.task(name="l3_cuts_v3_ingest", queue="l2", retry=False)
+@app.task(name="l3_cuts_v3_ingest", queue="ingest", retry=False)
 def l3_cuts_v3_ingest(project_id: str) -> None:
     run_ingest(project_id)
 
 
 def defer_ingest(project_id: str) -> None:
-    """Enqueue a cuts-v3 ingest run on the l2 procrastinate queue (same
-    queue L2 perception / hero-cut precompute run on). Not auto-retried:
-    each attempt is a real, costed API call, and a failure here is almost
-    always a schema/prompt problem worth looking at, not a transient one."""
+    """Enqueue a cuts-v3 ingest run on the network-bound ``ingest`` procrastinate
+    queue (its own worker, decoupled from GPU ingest). Not auto-retried: each
+    attempt is a real, costed API call, and a failure here is almost always a
+    schema/prompt problem worth looking at, not a transient one."""
     from procrastinate import App, PsycopgConnector
 
     enqueue_app = App(connector=PsycopgConnector(
         conninfo=get_settings().database_url, min_size=1, max_size=2))
     with enqueue_app.open():
-        enqueue_app.configure_task("l3_cuts_v3_ingest", queue="l2").defer(project_id=project_id)
+        enqueue_app.configure_task("l3_cuts_v3_ingest", queue="ingest").defer(project_id=project_id)
 
 
 def run_many(project_ids: List[str], max_workers: int = 4) -> Dict[str, Any]:

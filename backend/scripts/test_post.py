@@ -479,21 +479,73 @@ def test_remove_spans_all_filler_left_whole():
     print("ok  test_remove_spans_all_filler_left_whole")
 
 
-def test_one_winner_per_take_group_backstop():
-    # Two clips of one take, both crowned "winner" by pass 2 -> the longest stays
-    # winner, the shorter is demoted to "take"; an outlook is untouched.
-    def rec(fid, s, e, role):
-        return post.CutRecord(
-            file_id=fid, src_in_ms=s, src_out_ms=e, kind="speech", word_span=(0, 4),
-            atom_ids=None, label="line", summary="", speaker=None, on_camera=None,
-            junk=False, junk_reason=None, framing={}, look={}, caption_zones=[],
-            hero_ts_ms=s, pace=None, take_group_id="tg1", take_role=role, channel="said")
-    recs = [rec("f1", 0, 3000, "winner"), rec("f2", 0, 2000, "winner"),
-            rec("f3", 0, 2500, "outlook")]
-    post._enforce_one_winner_per_take_group(recs)
+def test_speech_quality_fluency_and_loudness():
+    # A clean, tight beat with nothing removable and no audio -> pure fluency 1.
+    assert post.compute_speech_quality([], 0, 0, 1000, 0, None, None) == 1.0
+    # Half the span removable (dead air/fillers) halves fluency.
+    assert post.compute_speech_quality([], 0, 0, 1000, 500, None, None) == 0.5
+    # Loudness blends in, normalised against the clip's own rms range: a -30dB
+    # cut sits halfway in a [-40,-20] clip -> loudness 0.5, fluency 1.0 -> 0.75.
+    rms = [-30.0] * 12  # hop 100ms across the [0,1000) window
+    q = post.compute_speech_quality(rms, 100, 0, 1000, 0, -40.0, -20.0)
+    assert abs(q - 0.75) < 1e-6, q
+    print("ok  test_speech_quality_fluency_and_loudness")
+
+
+def test_visual_score_prefers_oncam_closeup():
+    hi = post.compute_visual_score(
+        True, {"shot_size": "close_up"}, {"graded": True, "exposure_flags": []},
+        [], 0, 0, 1000, None, None)
+    lo = post.compute_visual_score(
+        False, {"shot_size": "wide"}, {"graded": False, "exposure_flags": []},
+        [], 0, 0, 1000, None, None)
+    assert hi is not None and lo is not None and hi > lo, (hi, lo)
+    # Nothing visual known at all -> None (so total_quality can fall back).
+    assert post.compute_visual_score(None, {}, {}, [], 0, 0, 1000, None, None) is None
+    print("ok  test_visual_score_prefers_oncam_closeup")
+
+
+def test_total_quality_blends_speech_and_video_is_visual_only():
+    # Speech blends the two equally.
+    assert post.compute_total_quality("speech", 0.8, 0.4) == 0.6
+    # A speech cut with no visual falls back to speech alone.
+    assert post.compute_total_quality("speech", 0.8, None) == 0.8
+    # Video is visual-only (speech_quality is None for it).
+    assert post.compute_total_quality("video", None, 0.5) == 0.5
+    print("ok  test_total_quality_blends_speech_and_video_is_visual_only")
+
+
+def _tg_rec(fid, s, e, role, tq):
+    return post.CutRecord(
+        file_id=fid, src_in_ms=s, src_out_ms=e, kind="speech", word_span=(0, 4),
+        atom_ids=None, label="line", summary="", speaker=None, on_camera=None,
+        junk=False, junk_reason=None, framing={}, look={}, caption_zones=[],
+        hero_ts_ms=s, pace=None, take_group_id="tg1", take_role=role, channel="said",
+        speech_quality=None, total_quality=tq)
+
+
+def test_take_winner_is_highest_total_quality():
+    # Same-setting cluster (two takes) -> highest total_quality wins regardless
+    # of length; the outlook angle is never touched, never a winner.
+    recs = [_tg_rec("f1", 0, 3000, "winner", 0.4), _tg_rec("f2", 0, 2000, "take", 0.8),
+            _tg_rec("f3", 0, 2500, "outlook", 0.9)]
+    post._enforce_take_winner(recs)
     roles = {r.file_id: r.take_role for r in recs}
-    assert roles == {"f1": "winner", "f2": "take", "f3": "outlook"}, roles
-    print("ok  test_one_winner_per_take_group_backstop")
+    assert roles == {"f1": "take", "f2": "winner", "f3": "outlook"}, roles
+    print("ok  test_take_winner_is_highest_total_quality")
+
+
+def test_no_winner_for_outlook_only_group():
+    # A podcast beat filmed by 3 cameras: pass 2 crowned one "winner" + 2
+    # "outlook", but there's no same-setting RETRY -> no winner is named; the
+    # lone same-setting member joins the peer angles as an outlook.
+    recs = [_tg_rec("cam1", 0, 3000, "winner", 0.9), _tg_rec("cam2", 0, 3000, "outlook", 0.7),
+            _tg_rec("cam3", 0, 3000, "outlook", 0.5)]
+    post._enforce_take_winner(recs)
+    roles = {r.file_id: r.take_role for r in recs}
+    assert roles == {"cam1": "outlook", "cam2": "outlook", "cam3": "outlook"}, roles
+    assert not any(r.take_role == "winner" for r in recs)
+    print("ok  test_no_winner_for_outlook_only_group")
 
 
 def main():
@@ -501,7 +553,11 @@ def main():
     test_remove_spans_interior_filler_and_pause()
     test_remove_spans_none_when_clean_and_tight()
     test_remove_spans_all_filler_left_whole()
-    test_one_winner_per_take_group_backstop()
+    test_speech_quality_fluency_and_loudness()
+    test_visual_score_prefers_oncam_closeup()
+    test_total_quality_blends_speech_and_video_is_visual_only()
+    test_take_winner_is_highest_total_quality()
+    test_no_winner_for_outlook_only_group()
     test_hero_ts_prefers_anchor_over_sharp()
     test_hero_ts_falls_back_to_sharpest()
     test_hero_ts_falls_back_to_midpoint_with_no_blur()

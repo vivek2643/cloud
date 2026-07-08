@@ -7,17 +7,18 @@
 #   - GPU_WORKERS processes pull the "gpu" queue (L1 ingest), each pinned
 #     round-robin to a physical GPU via CUDA_VISIBLE_DEVICES so they don't all
 #     pile onto GPU 0.
-#   - One L2 worker pulls the "l2" queue (Gemini perception). L2 is a network/
-#     API call, not GPU compute, so it runs at high concurrency in a single
-#     process and never competes for VRAM with the ingest workers.
+#   - One ingest worker pulls the "ingest" queue (Cuts v3 ingest -- Anthropic
+#     image/text calls). It's a network/API call, not GPU compute, so it runs
+#     at high concurrency in a single process and never competes for VRAM with
+#     the L1 ingest workers.
 #   - CPU_WORKERS processes pull the "cpu" queue (ffmpeg renders); no GPU.
 #
 # Env:
-#   GPU_WORKERS        default = number of detected GPUs (min 1)
-#   CPU_WORKERS        default = 2
-#   NUM_GPUS           override GPU count (else auto-detected via nvidia-smi)
-#   WORKER_CONCURRENCY per-process concurrency (default 1; safe for VRAM)
-#   L2_CONCURRENCY     concurrent Gemini calls in the L2 worker (default 6)
+#   GPU_WORKERS         default = number of detected GPUs (min 1)
+#   CPU_WORKERS         default = 2
+#   NUM_GPUS            override GPU count (else auto-detected via nvidia-smi)
+#   WORKER_CONCURRENCY  per-process concurrency (default 1; safe for VRAM)
+#   INGEST_CONCURRENCY  concurrent Cuts v3 ingest calls (default 6)
 #
 # Usage:
 #   cd backend && ./run_workers.sh
@@ -39,10 +40,10 @@ fi
 
 GPU_WORKERS="${GPU_WORKERS:-$NUM_GPUS}"
 CPU_WORKERS="${CPU_WORKERS:-2}"
-L2_CONCURRENCY="${L2_CONCURRENCY:-6}"
+INGEST_CONCURRENCY="${INGEST_CONCURRENCY:-6}"
 export WORKER_CONCURRENCY="${WORKER_CONCURRENCY:-1}"
 
-echo "Fleet: NUM_GPUS=$NUM_GPUS GPU_WORKERS=$GPU_WORKERS CPU_WORKERS=$CPU_WORKERS concurrency=$WORKER_CONCURRENCY l2_concurrency=$L2_CONCURRENCY"
+echo "Fleet: NUM_GPUS=$NUM_GPUS GPU_WORKERS=$GPU_WORKERS CPU_WORKERS=$CPU_WORKERS concurrency=$WORKER_CONCURRENCY ingest_concurrency=$INGEST_CONCURRENCY"
 
 pids=()
 cleanup() { echo "Stopping fleet..."; kill "${pids[@]}" 2>/dev/null || true; }
@@ -58,12 +59,12 @@ for ((i = 0; i < GPU_WORKERS; i++)); do
   sleep 2
 done
 
-# --- L2 worker: Gemini perception (network-bound, no GPU) ----------------
-# One process serves the "l2" queue with internal concurrency so many clips'
-# Gemini calls overlap. Decoupled from the "gpu" queue so it never contends
-# for VRAM with L1 ingest.
-echo "  l2-worker -> queue=l2 concurrency=$L2_CONCURRENCY"
-CUDA_VISIBLE_DEVICES="" WORKER_QUEUES="l2" WORKER_CONCURRENCY="$L2_CONCURRENCY" python worker.py &
+# --- Ingest worker: Cuts v3 ingest (network-bound Anthropic calls, no GPU) --
+# One process serves the "ingest" queue with internal concurrency so many
+# projects' image/text calls overlap. Decoupled from the "gpu" queue so it
+# never contends for VRAM with L1 ingest.
+echo "  ingest-worker -> queue=ingest concurrency=$INGEST_CONCURRENCY"
+CUDA_VISIBLE_DEVICES="" WORKER_QUEUES="ingest" WORKER_CONCURRENCY="$INGEST_CONCURRENCY" python worker.py &
 pids+=($!)
 
 # --- CPU workers: L3 auto-editor (network-bound OpenAI calls) -------------

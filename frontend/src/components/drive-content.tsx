@@ -76,7 +76,7 @@ export function DriveContent({ onFileContextMenu, onFolderContextMenu }: DriveCo
     setFileMenu(null);
     if (!session?.access_token) return;
     const ok = window.confirm(
-      `Delete "${file.name}"?\n\nThis permanently removes the video and all of its L1/L2 analysis. This cannot be undone.`,
+      `Delete "${file.name}"?\n\nThis permanently removes the video and all of its analysis. This cannot be undone.`,
     );
     if (!ok) return;
     setDeletingId(file.id);
@@ -596,7 +596,7 @@ function VideoCard({
 
         {/* Dark analysis overlay only until the clip becomes playable; once the
             editing proxy is ready we let the user scrub while any tail-end
-            perception finishes (the thin bar below keeps tracking it). */}
+            analysis finishes (the thin bar below keeps tracking it). */}
         {analyzing && !canPlay && !deleting && (
           <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-black/40">
             <Loader2 size={20} className="animate-spin text-white" />

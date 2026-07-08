@@ -115,7 +115,8 @@ def test_audio_mute_rule():
 def test_people_from_speaker():
     assert cm._people_for(_row(speaker=None)) == []
     people = cm._people_for(_row(speaker="S0", on_camera=True))
-    assert people == [{"person_id": "S0", "voice_speaker_id": "S0", "on_camera": True}]
+    assert people == [{"person_id": "S0", "voice_speaker_id": "S0", "on_camera": True,
+                        "characteristics": []}]
     print("ok  test_people_from_speaker")
 
 

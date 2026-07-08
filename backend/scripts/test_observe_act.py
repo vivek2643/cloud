@@ -50,7 +50,7 @@ def _map():
 def _ctx(struct):
     return observe.EditContext(
         file_ids=["ffffffff-1111"], index=_MapIndex(struct), map_struct=struct,
-        durations={"ffffffff-1111": 8000}, valence_by_file={"ffffffff-1111": "tense"},
+        durations={"ffffffff-1111": 8000},
         dup_groups=[])
 
 
@@ -533,7 +533,7 @@ def test_split_screen_snaps_to_seam_via_dispatch():
 
 def test_seams_for_file_fails_open_with_no_run_id():
     ctx = observe.EditContext(file_ids=["f1"], index=None, map_struct={},
-                              durations={}, valence_by_file={})
+                              durations={})
     assert observe._seams_for_file(ctx, "f1") == []
     print("ok  _seams_for_file fails open with no pinned/resolved run")
 
