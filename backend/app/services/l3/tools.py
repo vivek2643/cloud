@@ -112,11 +112,27 @@ def _specs() -> List[Dict[str, Any]]:
           obj({"seam_seg_id": {"type": "string"},
                "audio_offset_ms": {"type": "integer"}},
               ["seam_seg_id", "audio_offset_ms"])),
-        S("tighten", "Re-take main-line cut(s) at a different energy `level` for "
-          "pacing. With seg_id -> just that cut; without -> every cut that has that "
-          "level. Tighter = shorter/punchier.",
+        S("tighten", "Re-take main-line cut(s) at a different energy `level`: how "
+          "MUCH of the beat you keep around its peak (broad = the full run-up, "
+          "sharp = just the core). With seg_id -> just that cut; without -> every "
+          "cut that has that level. This is the SPACE axis -- for pacing (SPEED / "
+          "dead-air), use `retime`.",
           obj({"seg_id": {"type": "string"}, "level": {"type": "string", "enum": list(observe._LEVELS)}},
               ["level"])),
+        S("retime", "Set a cut's PLAYBACK PACE -- a different axis from `tighten`. "
+          "The effect depends on the cut and is deliberate: a VIDEO cut PLAYS at "
+          "that speed (levels are normalized across clips so the same step stays "
+          "smooth vs neighbours; 'natural'~=1x, 'faster' speeds the motion up and "
+          "shortens it) -- but the render doesn't bake speed yet, so it's RECORDED "
+          "and shown in read_state, not yet in the export length. A SPEECH cut is "
+          "NEVER pitched/sped (that reads amateur); instead 'faster'/'much_faster' "
+          "shave removable DEAD-AIR + FILLERS to tighten the delivery (applies "
+          "now), while 'natural'/'slower' keep every pause. Check a cut's pace room "
+          "in the beat index (pace:LO-HIx for video, trim<=Xs for speech). With "
+          "seg_id -> just that cut; without -> the whole main line.",
+          obj({"seg_id": {"type": "string"},
+               "pace": {"type": "string", "enum": list(act._PACE_STEPS)}},
+              ["pace"])),
         S("split_screen", "Show the MAIN LINE and a second source at the same time "
           "over the window [from_ms, to_ms]: template 'split_h' (side-by-side), "
           "'split_v' (stacked), or 'pip' (inset over the main line). The added cell "
@@ -219,6 +235,8 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
                                  audio_offset_ms=args.get("audio_offset_ms", 0))
         elif name == "tighten":
             new = act.tighten(doc, ctx.index, seg_id=args.get("seg_id"), level=args.get("level", "tight"))
+        elif name == "retime":
+            new = act.retime(doc, ctx.index, seg_id=args.get("seg_id"), pace=args.get("pace", "natural"))
         elif name == "split_screen":
             # A cell source is a map ref OR a raw (file, in, out) window. The
             # window path seam-snaps to the clean cut-boundary points from

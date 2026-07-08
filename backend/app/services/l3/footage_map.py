@@ -269,6 +269,10 @@ def build_clip_tree(
             # orthogonal SUBJECT tag (person|place|object|graphic). The honest
             # what-was-captured the brain keys on.
             "channel": cut.get("channel"),
+            # speech | video -- the pacing axis this cut lives on (video =
+            # playback speed; speech = dead-air trim). Carried for the pace tag
+            # + the retime verb.
+            "kind": cut.get("kind"),
             "subject": cut.get("subject"),
             # Gist of an information-dense graphic (what it conveys), when present.
             "summary": cut.get("summary"),
@@ -303,6 +307,10 @@ def build_clip_tree(
             "junk": bool(cut.get("junk")),
             "junk_reason": cut.get("junk_reason"),
             "continuity": cut.get("continuity") or {},
+            # Pace envelope (min/natural/max ms, cross-clip-normalized speed
+            # levels, removable dead-air/filler spans) -- the pacing ROOM the
+            # brain reads + `retime` acts on. {} for legacy hero cuts.
+            "pace": cut.get("pace") or {},
             "variants": variants,
             "atoms": [],
         })
@@ -648,6 +656,38 @@ def _weld_mark(contiguous: bool, reason: Optional[str]) -> str:
     return "↔" if contiguous else "⋯"
 
 
+def _pace_tag(m: Dict[str, Any]) -> str:
+    """The cut's PACING room, read straight off its persisted pace envelope --
+    so the brain knows what `retime` can do here before it tries:
+      * SPEECH -> ``trim<=X.Xs``: total removable dead-air/filler budget (retime
+        shortens the delivery by shaving this; it NEVER changes pitch/speed).
+      * VIDEO  -> ``pace:LO-HIx``: the reachable playback-speed range (levels
+        cross-clip-normalized so the same rung looks smooth against neighbors),
+        shown only when there is real speed room.
+    '' when there is no room (a clean speech beat / a video cut pinned to 1x) or
+    for a legacy hero-cut moment with no envelope."""
+    pace = m.get("pace") or {}
+    is_speech = m.get("kind") == "speech" or m.get("channel") == "said"
+    if is_speech:
+        budget = 0
+        for sp in pace.get("remove_spans") or []:
+            try:
+                budget += int(sp[1]) - int(sp[0])
+            except (IndexError, TypeError, ValueError):
+                continue
+        return f" · trim\u2264{budget / 1000:.1f}s" if budget > 0 else ""
+    levels = pace.get("levels") or []
+    if len(levels) < 2:
+        return ""
+    try:
+        lo, hi = float(min(levels)), float(max(levels))
+    except (TypeError, ValueError):
+        return ""
+    if hi - lo < 0.05:                      # pinned to a single speed -> no room
+        return ""
+    return f" · pace:{lo:.2g}-{hi:.2g}x"
+
+
 def _continuity_tag(m: Dict[str, Any]) -> str:
     """This beat's position within its clip's full cut sequence (incl. junk --
     a gap in cut_no IS the signal a junk beat sits there) + weld marks toward
@@ -700,10 +740,11 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False,
     if m.get("run_id"):
         run = f" · run:{m['run_id']}"
     cut_tag = _continuity_tag(m)
+    pace_tag = _pace_tag(m)
     alt = _alt_pic_segment(m, alias, oncam)
     return (f"  {m['moment_id'].split(':')[-1]} {_capture_tag(m)} {pic} {snd} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])} {_dur_tag(m)}] "
-            f"\"{gist}\"{gloss} · nrg:{nrg}{cut_tag}{run}{alt}")
+            f"\"{gist}\"{gloss} · nrg:{nrg}{pace_tag}{cut_tag}{run}{alt}")
 
 
 def _clip_block(tree: Dict[str, Any], *, compact: bool = False,

@@ -233,6 +233,9 @@ def _to_cut_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "hero_id": row["id"],
         "file_id": row["file_id"],
         "channel": channel,
+        # speech | video -- lets the brain (and the pace tag / retime verb) know
+        # whether pacing means playback SPEED (video) or dead-air TRIM (speech).
+        "kind": row.get("kind"),
         "subject": _SUBJECT_BY_CHANNEL.get(channel, "object"),
         "label": row.get("label") or "",
         "summary": row.get("summary"),
@@ -248,6 +251,11 @@ def _to_cut_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "people": _people_for(row),
         "framing": row.get("framing"),
         "quality": row.get("look"),
+        # The full pace ENVELOPE (min_ms/natural_ms/max_ms/levels/remove_spans/
+        # natural_sound), carried through untouched so the brain sees the pacing
+        # ROOM per cut -- video speed levels (cross-clip normalized) or a speech
+        # cut's removable dead-air/filler budget -- and `retime` can act on it.
+        "pace": row.get("pace") or {},
         "ladder": synth_ladder(row, score),
         # Carried through for Phase 3 (footage_map._annotate_dups reads these
         # directly off the built moment instead of recomputing take groups).

@@ -259,7 +259,7 @@ def read_state(document: dict, ctx: EditContext) -> dict:
         snippet = (seg.get("content") or "").replace("\n", " ").strip()
         if len(snippet) > 60:
             snippet = snippet[:57] + "..."
-        cuts.append({
+        cut = {
             "pos": i + 1,
             "seg_id": seg.get("seg_id"),
             "ref": seg.get("ref"),
@@ -272,7 +272,16 @@ def read_state(document: dict, ctx: EditContext) -> dict:
             "speaker": meta.get("speaker"),
             "muted": bool(seg.get("mute")),
             "text": snippet,
-        })
+        }
+        # Pacing state (from `retime`): the chosen step, and for a VIDEO cut the
+        # recorded playback speed -- flagged, since the render doesn't bake speed
+        # yet (the on-screen dur_ms above is still the 1x length).
+        if seg.get("pace_level"):
+            cut["pace_level"] = seg.get("pace_level")
+            if seg.get("speed") is not None:
+                cut["speed"] = seg.get("speed")
+                cut["speed_note"] = "recorded; not yet applied to the export length"
+        cuts.append(cut)
         prog += dur
 
     channels = ["V1", "A1"] if timeline else []
@@ -508,7 +517,7 @@ def affordances(document: dict, ctx: EditContext) -> dict:
         tighter = [L for L in _LEVELS if L in variants and _idx(L) > _idx(cur)]
         wider = [L for L in _LEVELS if L in variants and _idx(L) < _idx(cur)]
         is_video = (meta.get("channel") in ("done", "shown")) or seg.get("axis") == "any"
-        per_cut.append({
+        entry = {
             "pos": i + 1,
             "seg_id": seg.get("seg_id"),
             "ref": ref,
@@ -516,7 +525,9 @@ def affordances(document: dict, ctx: EditContext) -> dict:
             "can_widen_to": wider,
             "alternate_takes": group_members.get(ref or "", []),
             "can_toggle_audio": bool(is_video),
-        })
+        }
+        entry.update(_pace_affordance(meta, is_video))
+        per_cut.append(entry)
 
     # Video moments in the library not already on the main line -> cutaway pool.
     # Junk is skip-by-default (cuts_v3_continuity.plan.md) -- kept out of the
@@ -545,9 +556,40 @@ def affordances(document: dict, ctx: EditContext) -> dict:
         # from the tool loop; the beat index + its continuity block is the only
         # source of awareness now).
         "verbs": ["place", "trim", "remove", "move", "set_audio",
-                  "tighten", "split_screen"],
+                  "tighten", "retime", "split_screen"],
         "senses": ["read_state", "predict", "validate", "diagnose", "affordances"],
     }
+
+
+# Pacing steps the brain can pass to `retime` (mirrors act._PACE_STEPS).
+_PACE_STEPS = ("much_slower", "slower", "natural", "faster", "much_faster")
+
+
+def _pace_affordance(meta: dict, is_video: bool) -> dict:
+    """What `retime` can do to this cut, read off its pace envelope:
+      * VIDEO -> the reachable playback SPEED per step (levels[0..4]); empty when
+        the cut is pinned to one speed (no room).
+      * SPEECH -> the removable dead-air/filler budget in ms ('faster' shaves it;
+        speed/pitch never change).
+    Always lists the ``retime`` steps so the brain knows the verb applies here."""
+    pace = meta.get("pace") or {}
+    if is_video:
+        levels = pace.get("levels") or []
+        try:
+            speeds = [round(float(x), 2) for x in levels]
+        except (TypeError, ValueError):
+            speeds = []
+        has_room = len(set(speeds)) > 1
+        return {"retime_kind": "video_speed", "retime_steps": list(_PACE_STEPS),
+                "speed_by_step": (dict(zip(_PACE_STEPS, speeds)) if has_room and len(speeds) == 5 else {})}
+    budget = 0
+    for sp in pace.get("remove_spans") or []:
+        try:
+            budget += int(sp[1]) - int(sp[0])
+        except (IndexError, TypeError, ValueError):
+            continue
+    return {"retime_kind": "speech_trim", "retime_steps": list(_PACE_STEPS),
+            "trim_budget_ms": budget}
 
 
 def _idx(level: Optional[str]) -> int:

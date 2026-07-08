@@ -6,7 +6,8 @@ EMPTY frame and room to think -- the same way it does when you just hand it the
 footage and ask. So the brain works like a coding agent over a repo: it SEES the
 whole shoot (footage map) and the current edit, and it has TOOLS -- deterministic
 SENSES (``observe``: read_state / predict / validate / diagnose / affordances)
-and edit VERBS (``act``: place / trim / remove / move / set_audio / tighten).
+and edit VERBS (``act``: place / trim / remove / move / set_audio / tighten /
+retime).
 
 Each user turn runs a bounded perceive -> act -> re-perceive loop (``tools``):
 the brain looks, edits the WORKING document, checks its work, and ends with a
@@ -21,6 +22,7 @@ change, so a turn never hard-fails.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -47,75 +49,73 @@ class ConverseResult:
     trace: List[dict] = field(default_factory=list)
 
 
-# The blind editor -- CUT-CENTRIC, plan-first, no prescribed workflow. States
-# WHO the brain is (a blind editor with faithful senses), gives it a plan-first
-# discipline (look -> picture the finished piece -> plan -> pin -> execute ->
-# check), and lists the senses/verbs as neutral CAPABILITIES + mechanics only.
-# It never says "use X for Y" and never enumerates what to notice -- the
-# material and the craft are the brain's to read.
-#
-# cuts_v3_continuity.plan.md: the brain reasons over CUTS only, each carrying
-# rich per-cut data (framing/pace/look/channel/take-group) plus a
-# deterministic per-cut `continuity` -- its position among its clip's cuts and
-# whether each neighbor is a weldable continuation of the same shot -- so it
-# still understands ordering/adjacency without ever reading raw footage. There
-# is no raw-footage scan (see tools.py) and no other prompt version -- this is
-# simply the prompt.
+# Edso -- the blind editor. Identity + workflow are the user's own draft; the
+# general CRAFT is inline here (universal, so it belongs to who the editor IS,
+# not to a reference), while format-specific STYLES live in the guidance doc
+# (appended below at prompt-build time). Senses/verbs are neutral capabilities +
+# the mechanics needed to read a beat line; it never enumerates what to notice.
 _LOOP_SYSTEM = (
-    "You are EDSO, a BLIND editor. You cannot see or hear the footage directly "
-    "-- but below you have complete, faithful SENSES that describe it, and real "
-    "TOOLS to cut it. Trust the senses; when you need more detail than is already "
-    "in front of you, query them.\n\n"
-    "WHEN ASKED TO BUILD OR CHANGE AN EDIT:\n"
-    "  1. Look at what you have.\n"
-    "  2. Picture, at a high level, how the finished piece should turn out once a "
-    "professional editor has cut this.\n"
-    "  3. Write a short high-level plan for how you'd get there with your senses "
-    "and tools.\n"
-    "  4. Pin the details.\n"
-    "  5. Execute with the verbs, then re-observe to check your work.\n"
+    "You are EDSO, a BLIND video editor. You cannot see or hear the footage -- "
+    "you make the best call at every turn from faithful text SENSES. We have "
+    "divided all the raw clips into CUTS and given each a rich description; your "
+    "job is to understand what the user needs and use those cuts to edit.\n\n"
+    "WORKFLOW (when asked to build or change an edit):\n"
+    "  1. Understand what the user wants. If it's genuinely ambiguous and truly "
+    "theirs to decide, ask; otherwise proceed on a sensible read.\n"
+    "  2. Read the PROJECT OVERVIEW -- the high-level summary of the raw clips.\n"
+    "  3. Make a rough plan for how to get there with the cuts you have. Consult "
+    "FORMAT GUIDANCE for the style that fits this material (blend/override when "
+    "the footage or the user says otherwise).\n"
+    "  4. Go through the cuts (BEAT INDEX) and edit to realize the plan with the "
+    "verbs; re-observe to check your work.\n"
     "When the user just wants to talk or asks a question, answer in prose and "
     "DON'T touch the edit.\n\n"
-    "YOUR SENSES (read-only; call any of them, any time):\n"
-    "  - read_state -- the current edit: ordered cuts (pos, id, ref, duration, "
-    "channel, speaker, muted, text), channels in use, total length, a feel "
-    "narration.\n"
-    "  - the BEAT INDEX (below) -- every usable cut across the shoot, in SOURCE "
-    "ORDER per clip. Each line leads with PIC (what's on screen: a face or a "
-    "scene, framing, quality), then SND (what's heard: a named speaker + "
-    "'speaking', or the shot's own audio -- silence / ambient / talk), then the "
-    "words or action -- read PIC before SND, a beat's picture is not necessarily "
-    "its speaker. `·alt-PIC` on a beat states a fact: the SAME sound is also "
-    "available as a picture from another camera or take, with its own ref -- "
-    "never a suggestion of which to use. `· cut:N/of` is this cut's position "
-    "among ALL cuts on its clip (a gap in the numbering means a JUNK beat sits "
-    "there); a `↔` right before/after it means that NEIGHBOR is a WELDABLE "
-    "continuation of the same shot -- place two ↔-adjacent beats back to back "
-    "for one continuous take with no visible cut; `⋯` means a real break (a "
-    "different shot, speaker, or scene) -- don't expect beats on either side of "
-    "a ⋯ to read as continuous even placed adjacently. A `[JUNK: reason]` line "
-    "(a camera cue, a false start, dead air) is SKIP-BY-DEFAULT -- don't place "
-    "it unless you deliberately need it as a connective bridge between two real "
-    "beats; it's still a normal ref if you do. Each clip is headed 'CLIP "
-    "<file8>'.\n"
-    "  - diagnose / validate / predict / affordances -- editorial problems worth "
-    "fixing, structural checks, the projected length under a proposed change, and "
-    "the menu of what you can do to each cut.\n\n"
+    "CRAFT (how good work reads):\n"
+    "  - Open on the strongest hook; earn attention in the first beat. End with "
+    "intent (a payoff/button), don't just stop.\n"
+    "  - Keep one clear through-line; every cut earns its place. Cut what doesn't.\n"
+    "  - Respect continuity: place ↔-weldable neighbours together for a seamless "
+    "take; treat ⋯ as a real break and don't expect it to read continuous.\n"
+    "  - Two pacing axes, kept separate: `tighten` = how much of a beat you KEEP "
+    "(space); `retime` = the PLAYBACK pace. Default to natural pace and retime "
+    "ON PURPOSE (match energy across a montage, lift a slow stretch) -- bad "
+    "retiming is the fastest way to look amateur, and SPEECH is never sped, only "
+    "trimmed of dead-air.\n"
+    "  - You are blind: never invent a face or speaker you aren't told about. "
+    "When unsure, make the safe honest choice and say what you assumed.\n\n"
+    "READING A BEAT LINE. The BEAT INDEX lists every usable cut in SOURCE ORDER "
+    "per clip (each clip headed 'CLIP <file8>'). A line leads with PIC (what's on "
+    "screen: a face or scene + framing + quality), then SND (what's heard: a "
+    "named speaker 'speaking', or the shot's own audio -- silence/ambient/talk) "
+    "-- read PIC before SND, a beat's picture is not necessarily its speaker. "
+    "Then the words/action, then tags: `nrg:` the energy takes you can `tighten` "
+    "to; `pace:LO-HIx` a video cut's playback-speed room / `trim<=Xs` a speech "
+    "cut's removable dead-air budget (what `retime` can do); `cut:N/of` this "
+    "cut's position among ALL its clip's cuts (a gap in the numbering means a "
+    "JUNK beat sits there), with `↔` = that neighbour welds into one continuous "
+    "shot and `⋯` = a real break; `·alt-PIC` = the SAME sound is also available "
+    "as a picture from another camera/take (its own ref) -- a fact, not a "
+    "suggestion. A `[JUNK: reason]` line (camera cue, false start, dead air) is "
+    "SKIP-BY-DEFAULT -- place it only as a deliberate connective bridge.\n"
+    "Also call read_state / affordances / diagnose / validate / predict any time "
+    "to see the current edit, the menu per cut, problems, checks, or a projected "
+    "length.\n\n"
     "YOUR VERBS (each mutates the edit directly):\n"
-    "  - place <ref> -- add a cut from the beat index, any channel (speech, "
-    "action, or a graphic). channel V1 = the MAIN LINE (picture+sound) at index "
-    "`at`; V2 = a SILENT video layer over the ongoing audio at program `from_ms`. "
-    "`level` picks the energy take.\n"
-    "  - trim / remove / move / set_audio / tighten -- adjust a cut's source in/"
-    "out, drop it, reorder it, mute or unmute its sound, or re-take it at another "
-    "energy level.\n"
-    "  - split_edit -- decouple the AUDIO edge from the PICTURE edge at a seam (a "
-    "J/L cut): audio_offset_ms < 0 leads the next cut's sound in early, > 0 lets "
-    "the previous sound linger. Keep it subtle (200-800ms).\n"
-    "  - split_screen -- show the main line AND a second source at the same time "
-    "over a program window [from_ms, to_ms]: template split_h (side-by-side) / "
-    "split_v (stacked) / pip (inset). The added cell is a map `ref`, silent "
-    "unless audio:'keep'.\n\n"
+    "  - place <ref> -- add a cut from the beat index. channel V1 = the MAIN LINE "
+    "(picture+sound) at index `at`; V2 = a SILENT video layer over the ongoing "
+    "audio at program `from_ms`. `level` picks the energy take.\n"
+    "  - tighten -- re-take cut(s) at another ENERGY level (how much of the beat "
+    "you keep).\n"
+    "  - retime -- set PLAYBACK pace: a video cut plays faster/slower (recorded, "
+    "not yet baked into the export length); a speech cut is never sped -- "
+    "'faster' shaves its dead-air/fillers instead.\n"
+    "  - trim / remove / move / set_audio -- nudge a cut's source in/out, drop "
+    "it, reorder it, mute or unmute its sound.\n"
+    "  - split_edit -- decouple the AUDIO edge from the PICTURE edge at a seam "
+    "(J/L cut): audio_offset_ms < 0 leads the next sound in early, > 0 lets the "
+    "previous sound linger. Keep it subtle (200-800ms).\n"
+    "  - split_screen -- show the main line AND a second source at once over "
+    "[from_ms, to_ms]: split_h / split_v / pip. Silent unless audio:'keep'.\n\n"
     "CHANNELS: the main line is V1 video + A1 audio in sequence; V2 is a silent "
     "video layer over A1; A2 is a music/SFX bed.\n\n"
     "HOW EDITS LAND. Your edits apply DIRECTLY -- the user watches the timeline "
@@ -128,18 +128,106 @@ _LOOP_SYSTEM = (
 )
 
 
+# --------------------------------------------------------------------------
+# Format guidance (reference-only style doc, cached with the system prompt)
+# --------------------------------------------------------------------------
+
+_GUIDANCE_PATH = os.path.join(os.path.dirname(__file__), "guidance_doc.md")
+_guidance_cache: Optional[str] = None
+
+
+def _load_guidance() -> str:
+    """The format-guidance doc (guidance_doc.md), read once and cached. It's a
+    reference of format-specific editing STYLES the brain consults while
+    planning -- appended to the system prompt (so it's part of the cached
+    prefix). HTML comments (the authoring notes) are stripped so only the
+    guidance itself reaches the model. Empty/missing -> no guidance block."""
+    global _guidance_cache
+    if _guidance_cache is not None:
+        return _guidance_cache
+    text = ""
+    try:
+        with open(_GUIDANCE_PATH, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        logger.exception("converse: guidance doc read failed (continuing without)")
+    import re
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL).strip()
+    _guidance_cache = text
+    return text
+
+
+def _guidance_block() -> str:
+    doc = _load_guidance()
+    return ("\n\nFORMAT GUIDANCE (reference -- pick/blend the style that fits "
+            "this material; it never overrides the user or the footage):\n" + doc) if doc else ""
+
+
 # The beat index can be long; give it real headroom.
 _INDEX_CHAR_CAP = 110_000
+
+
+def _fmt_dur(ms: int) -> str:
+    s = max(0, int(ms)) // 1000
+    return f"{s // 60}m{s % 60:02d}s" if s >= 60 else f"{s}s"
+
+
+def _project_overview(ctx: "observe.EditContext") -> str:
+    """The high-level summary of the raw clips (workflow step 2), synthesized
+    deterministically from each clip tree's header -- what KIND of material this
+    is, how much of it, who's in it, and a one-line logline per clip -- so the
+    brain plans against the shoot as a whole before reading individual beats.
+    '' when nothing is ingested yet."""
+    clips = (ctx.map_struct or {}).get("clips") or []
+    if not clips:
+        return ""
+    total = sum(int(c.get("duration_ms") or 0) for c in clips)
+    kinds: List[str] = []
+    people: List[str] = []
+    for c in clips:
+        ct = c.get("content_type")
+        if ct and ct not in kinds:
+            kinds.append(ct)
+        for p in c.get("people") or []:
+            if p not in people:
+                people.append(p)
+    head = f"PROJECT OVERVIEW ({len(clips)} clip{'s' if len(clips) != 1 else ''}, ~{_fmt_dur(total)} total"
+    if kinds:
+        head += f"; {', '.join(kinds)}"
+    if people:
+        head += f"; people: {', '.join(people[:8])}"
+    head += "):"
+    lines = [head]
+    for c in clips:
+        bits = [_fmt_dur(int(c.get("duration_ms") or 0))]
+        if c.get("content_type"):
+            bits.append(c["content_type"])
+        if c.get("primary_axis"):
+            bits.append(f"axis:{c['primary_axis']}")
+        n = c.get("moment_count") or len(c.get("moments") or [])
+        bits.append(f"{n} cuts")
+        logline = (c.get("logline") or "").strip().replace("\n", " ")
+        tail = f" -- {logline}" if logline else ""
+        lines.append(f"  CLIP {c['file_id'][:8]} \"{c.get('name') or c['file_id'][:8]}\" · "
+                     + " · ".join(bits) + tail)
+    return "\n".join(lines)
 
 
 def _context_block(file_ids: List[str], document: Optional[dict],
                    ctx: "observe.EditContext") -> str:
     """CUT-CENTRIC context (cuts_v3_continuity.plan.md): no raw-footage
-    continuous-source scan. Just the BEAT INDEX (every cut, PIC then SND then
-    the words/action, each with a ref, plus its continuity -- position among
-    its clip's cuts and whether each neighbor welds; junk cuts are labeled and
-    skip-by-default) and the current timeline."""
+    continuous-source scan. A PROJECT OVERVIEW (the high-level clip summary the
+    workflow reads first), then the BEAT INDEX (every cut, PIC then SND then
+    the words/action, each with a ref, its pacing room + continuity -- position
+    among its clip's cuts and whether each neighbor welds; junk cuts are labeled
+    and skip-by-default) and the current timeline."""
     parts: List[str] = []
+    try:
+        overview = _project_overview(ctx)
+        if overview:
+            parts.append(overview)
+    except Exception:
+        logger.exception("converse: project overview failed (continuing without it)")
     try:
         text = (footage_map.assemble_map(
             file_ids, relations=getattr(ctx, "relations", None),
@@ -204,7 +292,8 @@ def respond(thread_id: str, *, llm: Optional[LLMClient] = None) -> ConverseResul
     max_tokens = settings.autoedit_max_output_tokens
     try:
         ctx = observe.build_context(file_ids, run_id=pinned_run)
-        system = _LOOP_SYSTEM + "\n\n" + _context_block(file_ids, document, ctx)
+        system = (_LOOP_SYSTEM + _guidance_block()
+                  + "\n\n" + _context_block(file_ids, document, ctx))
         result = tools.run_edit_loop(llm, system=system, messages=messages,
                                      ctx=ctx, document=working, max_tokens=max_tokens)
     except Exception:

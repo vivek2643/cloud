@@ -19,12 +19,22 @@ unchanged (the caller diagnoses), never an exception that could crash a turn.
 """
 from __future__ import annotations
 
-import copy
 import uuid
 from typing import List, Optional
 
-from app.services.l3 import layers
+from app.services.l3 import cutrecord_map, layers
 from app.services.l3.arrange import Placement, ResolvedCut, _MapIndex
+
+# Pacing scale for `retime`, broad..sharp (index 0..4). Maps onto a video cut's
+# cross-clip-normalized ``pace.levels`` (idx 2 = the cut's ~natural 1x); for a
+# speech cut, where playback speed is NEVER touched, the same ordinal instead
+# sets how aggressively removable dead-air/filler is shaved (only the "faster"
+# end trims -- speech can be tightened, never slowed). See ``retime``.
+_PACE_STEPS = ("much_slower", "slower", "natural", "faster", "much_faster")
+# Fraction of a speech cut's removable dead-air/filler budget to shave per step
+# (mirrors the dial: 0.85 == cutrecord_map._SPEECH_TRIM_MAX at the sharpest).
+_SPEECH_TRIM_FRAC = {"much_slower": 0.0, "slower": 0.0, "natural": 0.0,
+                     "faster": 0.5, "much_faster": 0.85}
 
 
 def _clone(document: dict) -> dict:
@@ -449,6 +459,100 @@ def tighten(document: dict, index: _MapIndex, *,
                     changed = True
                     continue
         new_tl.append(seg)
+    if not changed:
+        return document
+    doc["timeline"] = new_tl
+    return doc
+
+
+def retime(document: dict, index: _MapIndex, *,
+           seg_id: Optional[str] = None, pace: str = "natural") -> dict:
+    """Set the PLAYBACK PACE of main-line cut(s) -- a DIFFERENT axis from
+    ``tighten`` (which chooses how much of the beat to keep). What it does
+    depends on the cut's kind, and the effect on the content is explicit:
+
+      * VIDEO cut -> plays at that SPEED (``pace.levels`` cross-clip-normalized
+        so the same step reads smoothly against its neighbors; 'natural' ~= 1x,
+        'faster' compresses time / speeds motion, 'slower' stretches it). This
+        changes how the shot MOVES and how long it runs. NOTE: the render engine
+        does not apply speed yet, so the chosen ``speed`` is recorded on the cut
+        (and surfaced in read_state) but the exported length is unchanged until
+        the retime render pass lands -- the brain should know it's queued, not
+        yet baked.
+      * SPEECH cut -> pitch and speed are NEVER touched (sped-up speech reads
+        amateur). The pacing lever instead shaves removable DEAD-AIR + FILLERS
+        inside the cut: 'faster'/'much_faster' tighten the delivery (fewer/shorter
+        pauses, 'um's dropped) by re-slicing into a jump-cut keep-list;
+        'natural'/'slower' keep every pause. This applies TODAY (it's just tighter
+        source spans).
+
+    With ``seg_id`` -> just that cut; without -> every main-line cut. A cut whose
+    ref/pace envelope is unknown is left as-is. Unknown ``pace`` -> unchanged."""
+    if pace not in _PACE_STEPS:
+        return document
+    idx = _PACE_STEPS.index(pace)
+    tl = document.get("timeline") or []
+    focus = None
+    if seg_id is not None:
+        focus = next((s for s in tl if s.get("seg_id") == seg_id), None)
+        if focus is None:
+            return document
+    focus_ref = focus.get("ref") if focus is not None else None
+
+    doc = _clone(document)
+    changed = False
+    rebuilt_speech: set = set()          # speech refs already re-derived this pass
+    new_tl: List[dict] = []
+    for seg in doc["timeline"]:
+        ref = seg.get("ref")
+        m = index.moments.get(ref or "")
+        # A seg is in scope when retiming the whole line (m known) or when it
+        # shares the focus cut's ref (so a multi-slice speech cut retimes whole).
+        in_scope = m is not None and (seg_id is None or ref == focus_ref)
+        if not in_scope:
+            new_tl.append(seg)
+            continue
+        env = m.get("pace") or {}
+        is_speech = (m.get("kind") == "speech" or m.get("channel") == "said"
+                     or seg.get("axis") == "speech")
+        if not is_speech:
+            # VIDEO: stamp the recorded playback speed on THIS seg (per-seg). The
+            # render honors it in the retime render pass -- program geometry
+            # stays 1x until then, so preview == export.
+            if seg_id is not None and seg.get("seg_id") != seg_id:
+                new_tl.append(seg)
+                continue
+            levels = env.get("levels") or []
+            speed = float(levels[idx]) if idx < len(levels) and levels[idx] else 1.0
+            nseg = dict(seg)
+            nseg["pace_level"], nseg["speed"] = pace, speed
+            new_tl.append(nseg)
+            changed = True
+            continue
+
+        # SPEECH: never sped -- re-derive the dead-air/filler trim from the cut's
+        # FULL grounded span every time (idempotent, exactly like the dial: a
+        # lower step widens back, a higher step tightens), so the whole cut is
+        # replaced by its jump-cut keep-list at this pace. Later slices of an
+        # already-rebuilt cut are dropped (folded into the rebuild).
+        if ref in rebuilt_speech:
+            changed = True
+            continue
+        rebuilt_speech.add(ref)
+        base_in, base_out = int(m.get("in_ms", seg["in_ms"])), int(m.get("out_ms", seg["out_ms"]))
+        frac = _SPEECH_TRIM_FRAC.get(pace, 0.0)
+        rem = [(int(a), int(b)) for a, b in (env.get("remove_spans") or []) if int(b) > int(a)]
+        chosen = cutrecord_map._chosen_remove_spans(rem, frac) if (frac > 0 and rem) else []
+        kept = cutrecord_map._kept_segments(base_in, base_out, chosen)
+        for j, (a, b) in enumerate(kept):
+            slc = {k: v for k, v in seg.items() if k not in ("speed", "pace_level")}
+            slc["in_ms"], slc["out_ms"] = int(a), int(b)
+            if frac > 0:
+                slc["pace_level"] = pace
+            if j > 0:
+                slc["seg_id"] = _new_seg_id()
+            new_tl.append(slc)
+        changed = True
     if not changed:
         return document
     doc["timeline"] = new_tl

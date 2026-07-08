@@ -555,6 +555,104 @@ def test_snap_span_to_seams_pure_logic():
     print("ok  snap_span_to_seams: nearest-boundary snap + sovereignty cap")
 
 
+# --------------------------------------------------------------------------
+# retime (pacing verb) + pace surfacing
+# --------------------------------------------------------------------------
+
+def _paced_struct():
+    """A map with one VIDEO cut (speed room) + one SPEECH cut (dead-air budget),
+    carrying real pace envelopes -- the shape cutrecord_map hands the tree."""
+    return {"clips": [{
+        "file_id": "ffffffff-1111", "name": "clipA", "duration_ms": 60000,
+        "content_type": "reel", "primary_axis": "action", "people": ["G1"],
+        "moment_count": 2,
+        "moments": [
+            {"moment_id": "ffffffff:m00", "file_id": "ffffffff-1111", "kind": "video",
+             "channel": "shown", "in_ms": 1000, "out_ms": 5000, "play_ms": 4000,
+             "variants": {"balanced": {"level": "balanced", "in_ms": 1000, "out_ms": 5000,
+                                       "play_ms": 4000, "keep_spans": None}},
+             "pace": {"levels": [0.5, 0.8, 1.0, 1.3, 1.8], "remove_spans": [], "min_ms": 1500}},
+            {"moment_id": "ffffffff:m01", "file_id": "ffffffff-1111", "kind": "speech",
+             "channel": "said", "speaker": "G1", "in_ms": 10000, "out_ms": 18000, "play_ms": 8000,
+             "variants": {"balanced": {"level": "balanced", "in_ms": 10000, "out_ms": 18000,
+                                       "play_ms": 8000, "keep_spans": None}},
+             "pace": {"levels": [1.0] * 5, "remove_spans": [[12000, 13000], [15000, 15500]]}},
+        ]}]}
+
+
+def _paced_doc(struct):
+    idx = _MapIndex(struct)
+    doc = {"format": {"aspect": "landscape"}, "timeline": [], "operations": []}
+    doc = act.place(doc, idx, "ffffffff:m00", level="balanced", channel="V1")
+    doc = act.place(doc, idx, "ffffffff:m01", level="balanced", channel="V1")
+    return doc
+
+
+def test_retime_video_stamps_speed_not_span():
+    struct = _paced_struct()
+    idx = _MapIndex(struct)
+    doc = _paced_doc(struct)
+    vid = next(s for s in doc["timeline"] if s["ref"] == "ffffffff:m00")
+    span0 = (vid["in_ms"], vid["out_ms"])
+    d2 = act.retime(doc, idx, seg_id=vid["seg_id"], pace="faster")
+    v = next(s for s in d2["timeline"] if s["ref"] == "ffffffff:m00")
+    assert v["speed"] == 1.3 and v["pace_level"] == "faster", v      # levels[3]
+    assert (v["in_ms"], v["out_ms"]) == span0, v                     # span untouched (phase-2 render)
+    assert doc is not d2 and "speed" not in vid                      # immutable
+    print("ok  retime video stamps cross-clip speed, leaves the span alone")
+
+
+def test_retime_speech_trims_dead_air_and_is_idempotent():
+    struct = _paced_struct()
+    idx = _MapIndex(struct)
+    doc = _paced_doc(struct)
+    sid = next(s for s in doc["timeline"] if s["ref"] == "ffffffff:m01")["seg_id"]
+
+    def spans(d):
+        return [(s["in_ms"], s["out_ms"]) for s in d["timeline"] if s.get("ref") == "ffffffff:m01"]
+
+    d = act.retime(doc, idx, seg_id=sid, pace="much_faster")
+    assert spans(d) == [(10000, 12000), (13000, 15000), (15500, 18000)], spans(d)  # both gaps cut
+    assert all("speed" not in s for s in d["timeline"] if s.get("ref") == "ffffffff:m01")
+    d = act.retime(d, idx, seg_id=sid, pace="faster")
+    assert spans(d) == [(10000, 12000), (13000, 18000)], spans(d)     # only the longest gap
+    d = act.retime(d, idx, seg_id=sid, pace="natural")
+    assert spans(d) == [(10000, 18000)], spans(d)                     # full delivery restored
+    print("ok  retime speech trims dead-air into jump-cuts, idempotent widen/restore")
+
+
+def test_retime_unknown_pace_is_noop():
+    struct = _paced_struct()
+    idx = _MapIndex(struct)
+    doc = _paced_doc(struct)
+    assert act.retime(doc, idx, pace="turbo") is doc
+    print("ok  retime with an unknown pace is a no-op")
+
+
+def test_pace_tag_and_affordances_surface_room():
+    struct = _paced_struct()
+    m_vid, m_spe = struct["clips"][0]["moments"]
+    assert fm._pace_tag(m_vid) == " · pace:0.5-1.8x", fm._pace_tag(m_vid)
+    assert fm._pace_tag(m_spe) == " · trim\u22641.5s", fm._pace_tag(m_spe)
+
+    ctx = _ctx(struct)
+    doc = _paced_doc(struct)
+    aff = observe.affordances(doc, ctx)
+    assert "retime" in aff["verbs"], aff["verbs"]
+    by_ref = {c["ref"]: c for c in aff["cuts"]}
+    assert by_ref["ffffffff:m00"]["retime_kind"] == "video_speed"
+    assert by_ref["ffffffff:m00"]["speed_by_step"]["faster"] == 1.3
+    assert by_ref["ffffffff:m01"]["retime_kind"] == "speech_trim"
+    assert by_ref["ffffffff:m01"]["trim_budget_ms"] == 1500
+
+    d = act.retime(doc, _MapIndex(struct),
+                   seg_id=by_ref["ffffffff:m00"]["seg_id"], pace="faster")
+    st = observe.read_state(d, ctx)
+    vcut = next(c for c in st["cuts"] if c["ref"] == "ffffffff:m00")
+    assert vcut["pace_level"] == "faster" and vcut["speed"] == 1.3 and "speed_note" in vcut, vcut
+    print("ok  pace tag + affordances + read_state surface the pacing room")
+
+
 def main():
     test_read_state_reports_cuts_and_feel()
     test_place_adds_main_line_cut()
@@ -585,6 +683,10 @@ def main():
     test_split_screen_snap_off_places_raw()
     test_seams_for_file_fails_open_with_no_run_id()
     test_snap_span_to_seams_pure_logic()
+    test_retime_video_stamps_speed_not_span()
+    test_retime_speech_trims_dead_air_and_is_idempotent()
+    test_retime_unknown_pace_is_noop()
+    test_pace_tag_and_affordances_surface_room()
     print("\nall observe/act tests passed")
 
 
