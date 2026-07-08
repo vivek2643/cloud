@@ -20,8 +20,8 @@ different people's "yeah exactly" from colliding.
 
 Only groups with >= 2 attempts are returned -- the same beat captured more than
 once. This module only finds *what is the same beat as what*; it does NOT crown
-a "best" or tell the brain to drop anything. Quality scoring lives in
-`score_span`, and the placement decision is the brain's.
+a "best" or tell the brain to drop anything -- quality judgment and the
+placement decision are the brain's.
 """
 from __future__ import annotations
 

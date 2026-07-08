@@ -44,8 +44,8 @@ _WELD_TOL_MS = 120
 @dataclass
 class Placement:
     """One arranger choice: a map id taken at a level, placed on a track."""
-    ref: str                       # moment_id or atom_id (validated against map)
-    level: str = "balanced"        # energy level (moments only; atoms ignore it)
+    ref: str                       # moment_id (validated against map)
+    level: str = "balanced"        # energy level
     track: int = _MAIN_TRACK       # 0 = V1 main line; >=1 = V2+ cutaway lane
     from_ms: Optional[int] = None  # V2+ cutaway anchor on the program clock (track>=1)
     reason: str = ""
@@ -116,34 +116,19 @@ def _resolve_mute(default_mute: bool, audio_override: Optional[str]) -> bool:
 
 
 class _MapIndex:
-    """Fast lookup over an ``assemble_map`` struct: moment_id -> moment, and
-    atom_id -> (moment, atom). Owns the resolution of a (ref, level) to a span."""
+    """Fast lookup over an ``assemble_map`` struct: moment_id -> moment. Owns
+    the resolution of a (ref, level) to a span."""
 
     def __init__(self, map_struct: Dict[str, Any]) -> None:
         self.moments: Dict[str, dict] = {}
-        self.atoms: Dict[str, Tuple[dict, dict]] = {}
         for clip in (map_struct or {}).get("clips", []) or []:
             for m in clip.get("moments", []) or []:
                 self.moments[m["moment_id"]] = m
-                for a in m.get("atoms", []) or []:
-                    if a.get("atom_id"):
-                        self.atoms[a["atom_id"]] = (m, a)
 
     def has(self, ref: str) -> bool:
-        return ref in self.moments or ref in self.atoms
+        return ref in self.moments
 
     def resolve(self, p: Placement) -> Optional[ResolvedCut]:
-        if p.ref in self.atoms:
-            m, a = self.atoms[p.ref]
-            return ResolvedCut(
-                file_id=m["file_id"], src_in_ms=int(a["in_ms"]),
-                src_out_ms=int(a["out_ms"]), keep_spans=_norm_keep_spans(a.get("keep_spans")),
-                channel=a.get("channel") or m.get("channel"),
-                label=a.get("gist") or m.get("gist") or "",
-                track=p.track, from_ms=p.from_ms, reason=p.reason,
-                ref=p.ref, level="atom",
-                mute=_resolve_mute(bool(m.get("mute")), p.audio),
-            )
         m = self.moments.get(p.ref)
         if m is None:
             return None

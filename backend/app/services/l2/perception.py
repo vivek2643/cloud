@@ -320,12 +320,6 @@ def l2_perception(file_id: str) -> None:
             file_id, duration_s, settings.l2_max_duration_seconds,
         )
         _set_l2_status(file_id, "skipped")
-        # No perception, but L1 dialogue still yields speech cuts -> precompute.
-        try:
-            from app.services.l3 import thought_segments
-            thought_segments.defer_thoughts(file_id)
-        except Exception:
-            logger.exception("L2: failed to enqueue thought pass for %s", file_id)
         return
 
     _set_l2_status(file_id, "running")
@@ -380,14 +374,6 @@ def l2_perception(file_id: str) -> None:
         with _pg_conn() as conn:
             _stage_done(conn, file_id)
 
-        # Segment the transcript into thoughts (the speech primitive the energy
-        # bands cut from) now that L1+L2 exist, so the cache is warm before the
-        # feed is read. Best-effort on the same l2 queue.
-        try:
-            from app.services.l3 import thought_segments
-            thought_segments.defer_thoughts(file_id)
-        except Exception:
-            logger.exception("L2: failed to enqueue thought pass for %s", file_id)
         logger.info(
             "L2 complete for %s (%d persons, %d atoms, %d tok out)",
             file_id,
