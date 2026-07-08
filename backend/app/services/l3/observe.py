@@ -58,6 +58,11 @@ class EditContext:
     # Lazily-built continuous Clip Timelines (source-only, edit-independent), so
     # source_awareness/scan_source don't re-fuse a clip within the same turn.
     tl_cache: Dict[str, object] = field(default_factory=dict)
+    # The Cuts v3 ingest run this turn is resolved against -- the thread's pinned
+    # run (migration 028) or the live "latest covering run", resolved ONCE here so
+    # every projection in the turn (the map struct + the re-assembled BEAT INDEX
+    # text) reads the SAME snapshot. None in hero mode / when nothing is ingested.
+    run_id: Optional[str] = None
 
     @property
     def meta_by_ref(self) -> Dict[str, dict]:
@@ -81,10 +86,23 @@ def _valence_by_file(file_ids: List[str]) -> Dict[str, str]:
         return {}
 
 
-def build_context(file_ids: List[str]) -> EditContext:
+def build_context(file_ids: List[str], run_id: Optional[str] = None) -> EditContext:
     """Assemble the per-turn context once (footage map + durations + valence +
     cross-clip relations). All DB reads live here; the sense functions stay pure
-    over the result."""
+    over the result.
+
+    ``run_id`` is the thread's pinned Cuts v3 ingest run (migration 028). We
+    resolve the EFFECTIVE run once here -- pinned when given, else the latest
+    covering run -- and thread that concrete id through every projection so the
+    map struct and the re-assembled BEAT INDEX text agree within the turn (and a
+    re-ingest mid-turn can't swap the snapshot between the two reads)."""
+    eff_run = run_id
+    if eff_run is None and file_ids and get_settings().footage_source == "cut_records":
+        try:
+            from app.services.l3 import cuts_v3_read
+            eff_run = cuts_v3_read.latest_run_for_files(file_ids)
+        except Exception:
+            logger.exception("observe: run resolve failed (continuing live)")
     # Identities first: the footage map aliases per-clip voices to global people.
     rels: dict = {}
     try:
@@ -99,7 +117,7 @@ def build_context(file_ids: List[str]) -> EditContext:
             rels.setdefault("warnings", []).extend(violations)
     except Exception:
         logger.exception("observe: relations build failed (continuing without)")
-    fmap = footage_map.assemble_map(file_ids, relations=rels) if file_ids else {}
+    fmap = footage_map.assemble_map(file_ids, relations=rels, run_id=eff_run) if file_ids else {}
     map_struct = fmap.get("struct") or {"clips": []}
     durations: Dict[str, int] = {}
     try:
@@ -115,6 +133,7 @@ def build_context(file_ids: List[str]) -> EditContext:
         valence_by_file=_valence_by_file(file_ids),
         dup_groups=fmap.get("dup_groups") or [],
         relations=rels,
+        run_id=eff_run,
     )
 
 

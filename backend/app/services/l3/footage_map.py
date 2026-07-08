@@ -96,7 +96,11 @@ logger = logging.getLogger(__name__)
 # v17: audio facet is speech|sound|silent -- a shot mutes ANY uncontrolled audio
 # by default (talk OR off-mic/crew/action sound); the line shows 'muted(talk)' vs
 # 'muted(sound)' so the brain knows when to `audio:keep` an action's own sound.
-TREE_VERSION = 17
+# v18: moments carry `take_group_id`/`take_role`, passed through from the cut
+# dict when present (cuts-v3 substrate only; legacy hero cuts leave them None) --
+# lets `_annotate_dups` read persisted take groups directly instead of
+# recomputing them (see cuts_v3_to_brain.plan.md Phase 3).
+TREE_VERSION = 18
 
 # Two moments are one continuous source run when the next starts within this gap
 # of where the previous ended (back-to-back in the original footage). Loose
@@ -283,6 +287,10 @@ def build_clip_tree(
             "people": cut.get("people") or [],
             "framing": cut.get("framing"),
             "quality": cut.get("quality"),
+            # Cuts-v3 take grouping, carried straight through when the cut
+            # carries it (None for legacy hero cuts) -- see _annotate_dups.
+            "take_group_id": cut.get("take_group_id"),
+            "take_role": cut.get("take_role"),
             "variants": variants,
             "atoms": [],
         })
@@ -334,16 +342,30 @@ def _tree_version(sig: str) -> str:
     return f"{sig}:t{TREE_VERSION}"
 
 
-def get_trees(file_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+def _source_signatures(file_ids: List[str], run_id: Optional[str] = None) -> Dict[str, Optional[str]]:
+    """Per-file content signature from whichever footage source is active
+    (``settings.footage_source``): the cuts-v3 ``cut_records`` substrate
+    (default) or the legacy hero-cut precompute. Either way, a change in the
+    signature is what tells ``get_trees`` to rebuild that file's cached tree.
+    ``run_id`` pins the thread's covering ingest run (cut_records mode only;
+    ignored by the hero path, which has no runs)."""
+    if get_settings().footage_source == "cut_records":
+        from app.services.l3 import cutrecord_map
+        return cutrecord_map.signatures_for(file_ids, run_id=run_id)
+    from app.services.l3 import hero_store
+    return hero_store.signatures_for(file_ids)
+
+
+def get_trees(file_ids: List[str], run_id: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
     """``{file_id: clip_tree}`` for the given clips, served from the per-file
     cache and lazily (re)built for any file whose signature changed. Files with
     no usable artifacts yet are simply absent from the result. Fail-open: a
-    cache error degrades to a live build for the affected files."""
+    cache error degrades to a live build for the affected files.
+    ``run_id`` pins the thread's covering ingest run (see migration 028)."""
     if not file_ids:
         return {}
 
-    from app.services.l3 import hero_store
-    sigs = hero_store.signatures_for(file_ids)
+    sigs = _source_signatures(file_ids, run_id=run_id)
     usable = [fid for fid in file_ids if sigs.get(fid)]
     if not usable:
         return {}
@@ -373,7 +395,7 @@ def get_trees(file_ids: List[str]) -> Dict[str, Dict[str, Any]]:
         out = {}
 
     if missing:
-        built = _build_trees(missing, sigs)
+        built = _build_trees(missing, sigs, run_id=run_id)
         try:
             with _pg_conn() as conn:
                 _ensure_table(conn)
@@ -396,17 +418,26 @@ def get_trees(file_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     return {fid: out[fid] for fid in file_ids if fid in out}
 
 
-def _build_trees(file_ids: List[str], sigs: Dict[str, Optional[str]]) -> Dict[str, Dict[str, Any]]:
-    """Build moment-trees for a set of files from their band cuts + headers."""
+def _build_trees(file_ids: List[str], sigs: Dict[str, Optional[str]],
+                 run_id: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """Build moment-trees for a set of files from their cuts + headers. Cuts
+    come from cuts-v3 ``cut_records`` (default) or the legacy hero-cut
+    precompute, gated by ``settings.footage_source`` -- a safety switch back to
+    today's behavior (see cuts_v3_to_brain.plan.md). ``run_id`` pins the
+    thread's covering ingest run (cut_records mode only)."""
     from app.services.l3.auto_edit import _clip_cards
-    from app.services.l3 import hero_store
 
-    anchor_cuts = hero_store.get_anchor_cuts(file_ids)
+    if get_settings().footage_source == "cut_records":
+        from app.services.l3 import cutrecord_map
+        cuts_by_file = cutrecord_map.cut_dicts_for_files(file_ids, run_id=run_id)
+    else:
+        from app.services.l3 import hero_store
+        cuts_by_file = hero_store.get_anchor_cuts(file_ids)
     headers = _clip_cards(file_ids)
     out: Dict[str, Dict[str, Any]] = {}
     for fid in file_ids:
         header = headers.get(fid) or {"name": fid, "duration_ms": 0}
-        tree = build_clip_tree(fid, header, anchor_cuts.get(fid, []))
+        tree = build_clip_tree(fid, header, cuts_by_file.get(fid, []))
         if tree["moments"]:
             out[fid] = tree
     return out
@@ -686,22 +717,78 @@ def _best_overlap_moment(
     return best
 
 
+def _annotate_dups_from_take_groups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """cut_records mode: dup_groups read DIRECTLY off each moment's persisted
+    ``take_group_id``/``take_role`` (pass 2 already resolved cross-clip takes
+    from the pixels + transcript; ``post._enforce_one_winner_per_take_group``
+    guarantees a single winner) -- no token-overlap recompute, no IoU matching
+    needed since the group id already lives on the exact moment it belongs to.
+    Mirrors the hero-substrate summary shape (``group_id``/``members``/
+    ``member_facts``/``text``) so ``observe.diagnose``/``affordances`` keep
+    working unchanged. Fail-open: a moment with no take_group_id is simply not
+    linked."""
+    by_group: Dict[str, List[Dict[str, Any]]] = {}
+    for t in trees:
+        for m in t.get("moments", []) or []:
+            gid = m.get("take_group_id")
+            if gid:
+                by_group.setdefault(gid, []).append(m)
+
+    summary: List[Dict[str, Any]] = []
+    for gid, members in by_group.items():
+        # A real choice needs >= 2 DISTINCT moments, exactly like the hero path.
+        if len(members) < 2:
+            continue
+        for m in members:
+            m["dup_group"] = gid
+        member_facts = [{
+            "moment_id": m["moment_id"],
+            "file": m["file_id"],
+            "voice": _speaker_handle(m),
+            "framing": _framing_tag(m),
+            "score": float(m.get("score", 0.0)),
+            # cuts-v3 has no restart concept at the take-group level (that's a
+            # same-clip mid-attempt retry, judged inside pass 2); never fabricated.
+            "restart": False,
+            "take_role": m.get("take_role"),
+        } for m in members]
+        by_mid = {m["moment_id"]: m for m in members}
+        for f in member_facts:
+            by_mid[f["moment_id"]]["alt_pic"] = [
+                g for g in member_facts if g["moment_id"] != f["moment_id"]
+            ]
+        summary.append({
+            "group_id": gid,
+            "members": [m["moment_id"] for m in members],
+            "member_facts": member_facts,
+            "text": (members[0].get("gist") or "").strip(),
+        })
+    return summary
+
+
 def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Link moments that deliver the SAME content across clips/angles.
 
-    Reconciles cross-clip take groups (``takes.build_take_groups``) onto the
-    moment-tree by best temporal IoU, tags each linked moment in place with its
-    ``dup_group`` (and ``dup_restart`` for an abandoned take) plus ``alt_pic``
-    (Fact #2 folded onto the beat: every OTHER member's raw facts, so
-    ``_moment_line`` can render this beat's alternates without a separate
-    lookup), and returns a render-ready summary. No winner is crowned -- the
-    brain compares the members and decides. This is cross-set dependent (it
-    changes with the file set), so it is computed per request and never baked
-    into the per-file tree cache. Fail-open: any error yields no links.
+    Reconciles cross-clip take groups onto the moment-tree, tags each linked
+    moment in place with its ``dup_group`` (and ``dup_restart`` for an
+    abandoned take) plus ``alt_pic`` (Fact #2 folded onto the beat: every OTHER
+    member's raw facts, so ``_moment_line`` can render this beat's alternates
+    without a separate lookup), and returns a render-ready summary. No winner
+    is crowned -- the brain compares the members and decides. This is
+    cross-set dependent (it changes with the file set), so it is computed per
+    request and never baked into the per-file tree cache. Fail-open: any error
+    yields no links.
+
+    cuts-v3 mode reads the persisted ``take_group_id``/``take_role`` straight
+    off each moment (``_annotate_dups_from_take_groups``) -- pass 2 already did
+    the cross-clip resolution. The legacy hero path recomputes groups via
+    token-overlap (``takes.build_take_groups``) + best temporal IoU.
     """
     file_ids = [t["file_id"] for t in trees]
     if len(file_ids) < 1:
         return []
+    if get_settings().footage_source == "cut_records":
+        return _annotate_dups_from_take_groups(trees)
     try:
         from app.services.l3 import takes  # lazy: keep footage_map import-light
         groups = takes.build_take_groups(file_ids)
@@ -766,7 +853,8 @@ def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def assemble_map(file_ids: List[str], *, compact: bool = False,
-                 relations: Optional[dict] = None) -> Dict[str, Any]:
+                 relations: Optional[dict] = None,
+                 run_id: Optional[str] = None) -> Dict[str, Any]:
     """The Tier-0 footage index for the arranger.
 
     Returns ``{"text", "struct", "clip_count", "moment_count", "dup_groups"}``
@@ -789,7 +877,7 @@ def assemble_map(file_ids: List[str], *, compact: bool = False,
             oncam = relations_mod.oncam_global_by_file(relations)
         except Exception:
             logger.exception("footage map: identity index failed (continuing)")
-    trees = get_trees(file_ids)
+    trees = get_trees(file_ids, run_id=run_id)
     ordered = [trees[fid] for fid in file_ids if fid in trees]
     dups = _annotate_dups(ordered)   # tags moments in `ordered` in place
     text = "\n\n".join(_clip_block(t, compact=compact, alias=alias, oncam=oncam)

@@ -27,15 +27,20 @@ def _pg_conn() -> psycopg.Connection:
 
 # --- Threads ---------------------------------------------------------------
 
-def create_thread(user_id: str, file_ids: List[str], brief: str, title: Optional[str] = None) -> str:
+def create_thread(user_id: str, file_ids: List[str], brief: str, title: Optional[str] = None,
+                  ingest_run_id: Optional[str] = None) -> str:
+    """``ingest_run_id`` pins the thread to the Cuts v3 footage snapshot it was
+    opened against (migration 028); None => resolve the latest covering run live
+    each turn (older threads / pre-ingest projects)."""
     with _pg_conn() as conn:
         row = conn.execute(
             """
-            insert into edit_threads (user_id, file_ids, brief, title, status)
-            values (%s, %s::uuid[], %s, %s, 'drafting')
+            insert into edit_threads (user_id, file_ids, brief, title, status, ingest_run_id)
+            values (%s, %s::uuid[], %s, %s, 'drafting', %s)
             returning id::text
             """,
-            (user_id, file_ids, brief, title or (brief[:80] if brief else "Untitled edit")),
+            (user_id, file_ids, brief, title or (brief[:80] if brief else "Untitled edit"),
+             ingest_run_id),
         ).fetchone()
     return row[0]
 
@@ -45,7 +50,7 @@ def get_thread(thread_id: str) -> Optional[dict]:
         row = conn.execute(
             """
             select id::text, user_id::text, title, file_ids::text[], brief, status,
-                   created_at, updated_at
+                   created_at, updated_at, ingest_run_id::text
               from edit_threads where id = %s
             """,
             (thread_id,),
@@ -56,6 +61,7 @@ def get_thread(thread_id: str) -> Optional[dict]:
         "id": row[0], "user_id": row[1], "title": row[2], "file_ids": row[3],
         "brief": row[4], "status": row[5],
         "created_at": row[6].isoformat(), "updated_at": row[7].isoformat(),
+        "ingest_run_id": row[8],
     }
 
 

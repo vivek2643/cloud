@@ -160,6 +160,15 @@ class Settings(BaseSettings):
     # this window to keep reading the pass-1 prefix at the cheap cache rate.
     ingest_cache_ttl_seconds: int = 300
 
+    # --- L3 footage source: what the agentic editor's footage map reads -----
+    # "cut_records" (default) -- the cuts-v3 substrate (`cut_records`), the
+    #   same rows the Cuts tab reads. The brain's moment-tree is projected from
+    #   them (see `cutrecord_map.py`); the beat it places IS the beat the
+    #   editor sees.
+    # "hero" -- the legacy hero-cut precompute (`hero_cuts_cache`). Safety
+    #   switch back to pre-cuts_v3-integration behavior.
+    footage_source: str = "cut_records"
+
     @property
     def r2_endpoint(self) -> str:
         return f"https://{self.r2_account_id}.r2.cloudflarestorage.com"

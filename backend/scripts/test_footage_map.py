@@ -291,10 +291,18 @@ def test_speaker_resolves_from_raw_handle_not_label():
     print("ok  test_speaker_resolves_from_raw_handle_not_label")
 
 
+class _FakeSettings:
+    def __init__(self, footage_source: str):
+        self.footage_source = footage_source
+
+
 def test_annotate_dups_folds_alt_pic_onto_each_beat():
     """`_annotate_dups` folds Fact #2 onto each linked beat as `alt_pic` -- every
     OTHER member's raw facts, in place, no separate lookup table -- so
-    `_moment_line` can render a beat's alternates on its own."""
+    `_moment_line` can render a beat's alternates on its own. Exercises the
+    LEGACY hero path (token-overlap take grouping via `takes.build_take_groups`);
+    the cut_records-mode path is covered by
+    test_annotate_dups_cut_records_mode_reads_take_group_id below."""
     from app.services.l3 import takes
 
     cut_a = _cut("48c93cef:mA", 1000, 4000, "that freedom he gave you", channel="said",
@@ -312,18 +320,50 @@ def test_annotate_dups_folds_alt_pic_onto_each_beat():
         takes.Attempt("a2", "1aedb093-bbb", "u1", 1000, 4000, "said", "k",
                       "that freedom he gave you", speaker="S9"),
     ])
-    orig = takes.build_take_groups
+    orig_build = takes.build_take_groups
+    orig_settings = fm.get_settings
     takes.build_take_groups = lambda file_ids: [group]
+    fm.get_settings = lambda: _FakeSettings("hero")
     try:
         summary = fm._annotate_dups([tree_a, tree_b])
     finally:
-        takes.build_take_groups = orig
+        takes.build_take_groups = orig_build
+        fm.get_settings = orig_settings
 
     assert len(summary) == 1, summary
     ma, mb = tree_a["moments"][0], tree_b["moments"][0]
     assert ma["alt_pic"][0]["moment_id"] == mb["moment_id"], ma["alt_pic"]
     assert mb["alt_pic"][0]["moment_id"] == ma["moment_id"], mb["alt_pic"]
     print("ok  test_annotate_dups_folds_alt_pic_onto_each_beat")
+
+
+def test_annotate_dups_cut_records_mode_reads_take_group_id():
+    """cut_records mode (the default) reads dup_groups DIRECTLY off each
+    moment's persisted `take_group_id`/`take_role` -- no token-overlap
+    recompute, no IoU matching (see cuts_v3_to_brain.plan.md Phase 3)."""
+    cut_a = _cut("48c93cef:mA", 1000, 4000, "that freedom he gave you", channel="said",
+                speaker="S2", score=0.6,
+                ladder=[_rung("balanced", 1000, 4000, "that freedom he gave you", 0.6)],
+                take_group_id="tg1", take_role="winner")
+    cut_b = _cut("1aedb093:mB", 1000, 4000, "that freedom he gave you", channel="said",
+                speaker="S9", score=0.73,
+                ladder=[_rung("balanced", 1000, 4000, "that freedom he gave you", 0.73)],
+                take_group_id="tg1", take_role="take")
+    tree_a = fm.build_clip_tree("48c93cef-aaa", {"name": "A", "duration_ms": 8000}, [cut_a])
+    tree_b = fm.build_clip_tree("1aedb093-bbb", {"name": "B", "duration_ms": 8000}, [cut_b])
+
+    assert fm.get_settings().footage_source == "cut_records"   # exercise the real default
+    summary = fm._annotate_dups([tree_a, tree_b])
+
+    assert len(summary) == 1, summary
+    g = summary[0]
+    assert g["group_id"] == "tg1", g
+    ma, mb = tree_a["moments"][0], tree_b["moments"][0]
+    assert ma["dup_group"] == "tg1" and mb["dup_group"] == "tg1"
+    assert ma["alt_pic"][0]["moment_id"] == mb["moment_id"], ma["alt_pic"]
+    assert mb["alt_pic"][0]["moment_id"] == ma["moment_id"], mb["alt_pic"]
+    assert {mf["take_role"] for mf in g["member_facts"]} == {"winner", "take"}, g["member_facts"]
+    print("ok  test_annotate_dups_cut_records_mode_reads_take_group_id")
 
 
 def test_moment_line_aliases_global_speaker():
@@ -365,6 +405,7 @@ def main():
     test_done_beat_pic_first_parity_and_snd_silence()
     test_speaker_resolves_from_raw_handle_not_label()
     test_annotate_dups_folds_alt_pic_onto_each_beat()
+    test_annotate_dups_cut_records_mode_reads_take_group_id()
     test_moment_line_aliases_global_speaker()
     test_source_contiguous_beats_form_a_run_channel_agnostic()
     test_default_energy_from_genre()

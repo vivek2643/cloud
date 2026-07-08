@@ -294,7 +294,8 @@ def _assemble_source_context(file_ids: List[str], document: Optional[dict],
         logger.exception("converse: source_awareness build failed (continuing)")
     try:
         text = (footage_map.assemble_map(
-            file_ids, relations=getattr(ctx, "relations", None)).get("text") or ""
+            file_ids, relations=getattr(ctx, "relations", None),
+            run_id=getattr(ctx, "run_id", None)).get("text") or ""
         ) if file_ids else ""
         if len(text) > _INDEX_CHAR_CAP:
             text = (text[:_INDEX_CHAR_CAP] +
@@ -369,6 +370,7 @@ def respond(thread_id: str, *, llm: Optional[LLMClient] = None) -> ConverseResul
 
     thread = store.get_thread(thread_id)
     file_ids = (thread or {}).get("file_ids") or []
+    pinned_run = (thread or {}).get("ingest_run_id")
     document, _ = store.latest_document(thread_id)
     messages = store.load_messages(thread_id)
     if not messages:
@@ -378,7 +380,7 @@ def respond(thread_id: str, *, llm: Optional[LLMClient] = None) -> ConverseResul
     max_tokens = settings.autoedit_max_output_tokens
     version = (settings.autoedit_arranger_version or "v3").strip().lower()
     try:
-        ctx = observe.build_context(file_ids)
+        ctx = observe.build_context(file_ids, run_id=pinned_run)
         if version == "v3":
             system = _LOOP_SYSTEM_V3 + "\n\n" + _context_block_v3(file_ids, document, ctx)
         elif version == "v2":
