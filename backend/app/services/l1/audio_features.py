@@ -5,9 +5,8 @@ L1 Stage 5: Whole-file audio features.
   - silence intervals via pydub
   - musicality detection via spectral flatness and onset-envelope variance
   - if musical: beat-track BPM + onset grid via librosa
-  - coarse prosody: RMS energy envelope + pitch/f0 track (cuts_v2_boundaries.plan
-    Phase C2), on the SAME hop, for grading a speech boundary by more than
-    transcript/gap-length alone
+  - coarse prosody: RMS energy envelope, sampled on a bounded hop, for grading
+    a speech boundary by more than transcript/gap-length alone
 """
 from __future__ import annotations
 
@@ -29,16 +28,10 @@ class AudioFeatures:
     bpm: float = 0.0
     onsets_ms: List[int] = field(default_factory=list)
     silence_intervals: List[dict] = field(default_factory=list)
-    # Coarse energy envelope (dB) for cut-timing: the dialogue cut grid snaps a
-    # cut toward the quietest instant in a gap. Sampled every prosody_hop_ms.
+    # Coarse energy envelope (dB), sampled every prosody_hop_ms -- grades a
+    # speech boundary's cleanliness by more than transcript/gap-length alone.
     rms_db: List[float] = field(default_factory=list)
     prosody_hop_ms: int = 0
-    # Coarse pitch/f0 track (Hz), SAME hop as rms_db (0.0 = unvoiced/silent, not
-    # NaN). cuts_v2_boundaries.plan Phase C2: a falling-pitch + dropping-energy
-    # tail into a gap grades that gap as a real speech boundary; a sustained or
-    # rising tail grades it as an intentional pause (bridge it). Empty on any
-    # clip indexed before this landed -- needs a re-analyze to populate.
-    f0_hz: List[float] = field(default_factory=list)
 
 
 def _ffmpeg_loudnorm_pass1(wav_path: str) -> tuple[float, float]:
@@ -113,65 +106,15 @@ def _detect_musicality(wav_path: str) -> tuple[bool, float, List[int]]:
 PROSODY_MAX_POINTS = 600
 
 
-# Human voice fundamental-frequency range (Hz) the pitch tracker searches
-# within -- wide enough to cover low male voices through high female/child
-# voices without wasting search range on non-voice bands.
-F0_MIN_HZ = 65.0
-F0_MAX_HZ = 400.0
-
-# Voicing gate: yin (unlike pyin) has no voiced probability, so we treat a
-# frame as unvoiced/silent when its energy is this many dB below the clip's
-# loudest frame. That zeroes silent gaps -- which is all the speech-boundary
-# grader needs (voiced-pitch vs pause), not a per-frame voicing decision.
-_F0_VOICED_GATE_DB = 40.0
-
-
-def _compute_f0(y, sr: int, hop: int, hop_ms: int, dur_ms: float) -> List[float]:
-    """Coarse pitch track (Hz) via librosa.yin, on the SAME native hop as the
-    RMS envelope so a caller can read pitch and energy at matching instants.
-
-    yin is used over pyin deliberately: pyin's per-frame candidate search plus
-    a whole-clip Viterbi decode is ~real-time-or-slower (minutes per clip on
-    CPU), while yin is ~10-50x faster and 'coarse' pitch is all the speech-
-    boundary grader needs (the falling-vs-sustained SHAPE, not cents-accurate
-    pitch). yin has no voicing output, so silent/unvoiced frames are zeroed by
-    an energy gate. Best-effort: any failure returns an empty list (the grader
-    degrades to RMS + gap-length alone, per plan)."""
-    import librosa
-    import numpy as np
-
-    try:
-        f0 = librosa.yin(y, fmin=F0_MIN_HZ, fmax=F0_MAX_HZ, sr=sr, hop_length=hop)
-    except Exception:
-        logger.exception("Prosody: pitch (yin) failed")
-        return []
-    if f0 is None or len(f0) == 0:
-        return []
-    f0 = np.nan_to_num(f0, nan=0.0, posinf=0.0, neginf=0.0)
-    # Energy gate for voicing: zero frames far below the loudest frame.
-    try:
-        rms = librosa.feature.rms(y=y, frame_length=hop * 2, hop_length=hop)[0]
-        n = min(len(f0), len(rms))
-        f0, rms = f0[:n], rms[:n]
-        rms_db = 20.0 * np.log10(rms + 1e-6)
-        if rms_db.size:
-            f0[rms_db < (rms_db.max() - _F0_VOICED_GATE_DB)] = 0.0
-    except Exception:
-        logger.exception("Prosody: pitch voicing-gate failed; keeping raw yin")
-    times_ms = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=hop) * 1000
-    return _resample_series(f0, times_ms, hop_ms, dur_ms)
-
-
 def _compute_prosody(wav_path: str) -> dict:
-    """Coarse RMS energy envelope (dB) + pitch/f0 track, both at the SAME
-    bounded hop -- the prosody signals the cut-cost grids and the speech-
-    boundary grader consume. All librosa, CPU, single load of the 16k WAV.
-    Returns plain lists ready for JSONB storage.
+    """Coarse RMS energy envelope (dB), sampled on a bounded hop -- a prosody
+    signal the speech-boundary grader consumes. All librosa, CPU, single load
+    of the 16k WAV. Returns plain lists ready for JSONB storage.
     """
     import librosa
     import numpy as np
 
-    out = {"rms_db": [], "prosody_hop_ms": 0, "f0_hz": []}
+    out = {"rms_db": [], "prosody_hop_ms": 0}
     try:
         y, sr = librosa.load(wav_path, sr=16000, mono=True)
     except Exception:
@@ -192,7 +135,6 @@ def _compute_prosody(wav_path: str) -> dict:
     hop_ms = max(100, int(np.ceil((dur_ms / PROSODY_MAX_POINTS))) if dur_ms else 100)
     out["prosody_hop_ms"] = hop_ms
     out["rms_db"] = _resample_series(rms_db, times_ms, hop_ms, dur_ms)
-    out["f0_hz"] = _compute_f0(y, sr, hop, hop_ms, dur_ms)
     return out
 
 
@@ -219,5 +161,4 @@ def compute_audio_features(wav_path: str) -> AudioFeatures:
         silence_intervals=silences,
         rms_db=prosody["rms_db"],
         prosody_hop_ms=prosody["prosody_hop_ms"],
-        f0_hz=prosody["f0_hz"],
     )

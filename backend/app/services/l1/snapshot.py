@@ -27,8 +27,7 @@ def _row_to_dict(row) -> Optional[Dict[str, Any]]:
 
 
 _L1_STAGES = ("proxy", "transcript", "audio_features", "diarization",
-              "dialogue_cut", "beat_cut", "motion_dynamics", "dialogue_segments",
-              "audio_proxy", "music_structure",
+              "motion_dynamics", "dialogue_segments", "audio_proxy",
               "scene_detect")  # cuts-v2, additive -- see STAGES_V2
 
 
@@ -145,17 +144,13 @@ def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
             select integrated_lufs, true_peak_db,
                    is_musical, bpm,
                    onsets_ms, silence_intervals,
-                   dialogue_cut_cost, dialogue_cut_hop_ms, dialogue_cut_points,
-                   beat_cut_cost, beat_cut_hop_ms, beat_cut_points,
-                   prosody_hop_ms, f0_hz
+                   prosody_hop_ms
               from audio_features where file_id = %s
             """,
             (file_id,),
         )
         af = cur.fetchone()
         if af:
-            cut_cost = af["dialogue_cut_cost"] or []
-            cut_points = af["dialogue_cut_points"] or []
             out["audio_features"] = {
                 "integrated_lufs": af["integrated_lufs"],
                 "true_peak_db": af["true_peak_db"],
@@ -164,22 +159,7 @@ def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
                 "onset_count": len(af["onsets_ms"] or []),
                 "silence_interval_count": len(af["silence_intervals"] or []),
                 "silence_intervals": af["silence_intervals"],
-                # Dialogue cut-cost grid (0=ideal seam .. 1=forbidden). The full
-                # curve is included for visualization; "safe to cut" = 1 - cost.
-                "dialogue_cut_hop_ms": af["dialogue_cut_hop_ms"],
-                "dialogue_cut_cost": cut_cost,
-                "dialogue_cut_points": cut_points,
-                "dialogue_cut_point_count": len(cut_points),
-                # Beat/music cut grid (0=on a beat/ideal .. 1=off-beat). Empty
-                # for non-musical files. "Safe to cut" = 1 - cost.
-                "beat_cut_hop_ms": af["beat_cut_hop_ms"],
-                "beat_cut_cost": af["beat_cut_cost"] or [],
-                "beat_cut_points": af["beat_cut_points"] or [],
-                "beat_cut_point_count": len(af["beat_cut_points"] or []),
-                # Pitch/f0 track (cuts-v2 Phase C2), same hop as rms_db. Empty
-                # on a clip indexed before this landed (needs a re-analyze).
                 "prosody_hop_ms": af["prosody_hop_ms"],
-                "f0_hz": af["f0_hz"] or [],
             }
 
         # Motion dynamics (action + camera/distortion) -- video-derived, own table.
@@ -229,35 +209,6 @@ def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
                 "shot_point_count": len(sc["shot_points"] or []),
                 "composition_points": sc["composition_points"] or [],
                 "composition_point_count": len(sc["composition_points"] or []),
-            }
-
-        # Music structure (audio-only uploads) -- own table, music-derived.
-        cur = conn.execute(
-            """
-            select bpm, music_key, beat_times_ms, downbeat_times_ms,
-                   sections, energy_hop_ms, energy,
-                   phrase_cut_hop_ms, phrase_cut_cost, phrase_cut_points
-              from music_structure where file_id = %s
-            """,
-            (file_id,),
-        )
-        mus = cur.fetchone()
-        if mus:
-            out["music_structure"] = {
-                "bpm": mus["bpm"],
-                "key": mus["music_key"],
-                "beat_count": len(mus["beat_times_ms"] or []),
-                "downbeat_times_ms": mus["downbeat_times_ms"] or [],
-                "downbeat_count": len(mus["downbeat_times_ms"] or []),
-                "sections": mus["sections"] or [],
-                "section_count": len(mus["sections"] or []),
-                "energy_hop_ms": mus["energy_hop_ms"],
-                "energy": mus["energy"] or [],
-                # Phrase cut grid (0=on a downbeat/section boundary .. 1=avoid).
-                "phrase_cut_hop_ms": mus["phrase_cut_hop_ms"],
-                "phrase_cut_cost": mus["phrase_cut_cost"] or [],
-                "phrase_cut_points": mus["phrase_cut_points"] or [],
-                "phrase_cut_point_count": len(mus["phrase_cut_points"] or []),
             }
 
         # Per-stage processing job rows

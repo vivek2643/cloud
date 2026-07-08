@@ -1,5 +1,5 @@
 """
-Tuning knobs for ALL L1 cut-grid channels, in one place.
+Tuning knobs for the L1 motion cut-grid channel.
 
 These are HEURISTIC defaults, deliberately NOT empirically tuned yet. They were
 chosen for interpretability (linear ramps, round numbers, percentile
@@ -8,37 +8,11 @@ are parked here so we can re-tune them at the END of the project against real
 clips -- not now. Nothing is read from the environment on purpose: keep one
 reviewable source of truth until we have a validation harness.
 
-Channels (all share the convention: cost 0 = ideal seam .. 1 = avoid):
-  - DIALOGUE : cut in speech gaps          (avoid-curve; dips in word gaps)
-  - BEAT     : cut on musical beats        (hit-curve; dips at each onset)
+Channels (share the convention: cost 0 = ideal seam .. 1 = avoid):
   - ACTION   : cut on motion impacts       (hit-curve; dips at each motion peak)
   - CAMERA   : cut when the camera is calm (avoid-curve; high during moves/blur)
 """
 from __future__ import annotations
-
-# =========================================================================
-# DIALOGUE (cut_cost.py)
-# =========================================================================
-HOP_MS = 100              # grid resolution = minimum expected cut granularity
-HANDLE_MS = 80            # protected breathing room next to each word edge
-SILENCE_FULL_MS = 700     # gap >= this bottoms the seam cost out to ~0
-SENTENCE_GAP_MS = 600     # a gap this long reads as a structural/sentence break
-MIN_SEAM_MS = 120         # don't emit discrete points for sub-this micro-gaps
-WORD_COST = 1.0           # cost inside a word (forbidden)
-
-# Boundary-type multipliers (stack multiplicatively; lower = cheaper cut).
-SPEAKER_CHANGE_MULT = 0.35   # cutting on a speaker handoff is a strong seam
-SENTENCE_END_MULT = 0.5      # cutting at a sentence boundary is clean
-FILLER_EDGE_MULT = 0.3       # we WANT to cut around "um"/"uh"
-
-TERMINAL_PUNCT = ".?!…"
-
-# =========================================================================
-# BEAT (beat_cost.py)
-# =========================================================================
-BEAT_HOP_MS = 100         # grid resolution for the beat cost curve
-BEAT_TOL_MS = 70          # +/- window around a beat that reads as "on the beat"
-# Beats come straight from audio_features.onsets_ms (librosa) -- no new compute.
 
 # =========================================================================
 # MOTION: ACTION + CAMERA/DISTORTION (motion_dynamics.py)

@@ -25,12 +25,9 @@ from app.config import get_settings
 from app.services import audit_log
 from app.services.jobs import app
 from app.services.l1 import audio_features as af_mod
-from app.services.l1 import beat_cost as beat_mod
-from app.services.l1 import cut_cost as cutcost_mod
 from app.services.l1 import diarization as diar_mod
 from app.services.l1 import dialogue_segments as dlg_mod
 from app.services.l1 import motion_dynamics as motion_mod
-from app.services.l1 import music_structure as music_mod
 from app.services.l1 import scene_cuts as scene_mod
 from app.services.l1 import transcript as tr_mod
 from app.services.l1.snapshot import build_l1_snapshot
@@ -39,13 +36,13 @@ from app.services.supabase_client import get_supabase
 
 logger = logging.getLogger(__name__)
 
-STAGES = ("proxy", "transcript", "audio_features", "diarization", "dialogue_cut", "beat_cut", "motion_dynamics", "dialogue_segments")
+STAGES = ("proxy", "transcript", "audio_features", "diarization", "motion_dynamics", "dialogue_segments")
 # cuts-v2: additive on top of STAGES (old tuple kept as-is; nothing that reads
 # STAGES needs to change). Runs in parallel with the v1 pipeline until v2 is
 # validated -- see cuts_v2.plan.md.
 STAGES_V2 = STAGES + ("scene_detect",)
 # Audio-only uploads (music) run a different, video-free set of stages.
-AUDIO_STAGES = ("audio_proxy", "audio_features", "beat_cut", "music_structure")
+AUDIO_STAGES = ("audio_proxy", "audio_features")
 
 
 def _pg_conn() -> psycopg.Connection:
@@ -339,20 +336,6 @@ def _demux_wav(raw_path: str, out_path: str) -> None:
     )
 
 
-def _demux_music_wav(raw_path: str, out_path: str) -> None:
-    """22.05 kHz mono wav for the musical-structure pass (chroma/segmentation
-    want more bandwidth than the 16k speech wav)."""
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-i", raw_path,
-            "-ac", "1", "-ar", str(music_mod.MUSIC_SR),
-            "-c:a", "pcm_s16le",
-            out_path,
-        ],
-        check=True, capture_output=True, timeout=FFMPEG_TIMEOUT_S,
-    )
-
-
 # --- Audio-only (music) stages -------------------------------------------
 
 # Waveform thumbnail dimensions (also stored as the file's width/height so the
@@ -411,52 +394,6 @@ def _stage_audio_proxy(file_id: str, raw_path: str, tmpdir: str) -> float:
     return duration
 
 
-def _stage_music_structure(
-    file_id: str, music_wav: str, duration_s: float, conn: psycopg.Connection
-) -> None:
-    """Persist the deep musical-structure analysis (bar/downbeat grid, sections,
-    energy envelope, key, phrase cut grid). Best-effort columns: a failed
-    sub-feature is stored empty by the analyzer."""
-    ms = music_mod.compute_music_structure(
-        music_wav, duration_ms=int((duration_s or 0) * 1000)
-    )
-    if not ms.has_music:
-        return
-    conn.execute(
-        """
-        insert into music_structure (
-            file_id, bpm, music_key, beat_times_ms, downbeat_times_ms,
-            sections, energy_hop_ms, energy,
-            phrase_cut_hop_ms, phrase_cut_cost, phrase_cut_points
-        ) values (%s, %s, %s, %s::jsonb, %s::jsonb,
-                  %s::jsonb, %s, %s::jsonb,
-                  %s, %s::jsonb, %s::jsonb)
-        on conflict (file_id) do update set
-            bpm               = excluded.bpm,
-            music_key         = excluded.music_key,
-            beat_times_ms     = excluded.beat_times_ms,
-            downbeat_times_ms = excluded.downbeat_times_ms,
-            sections          = excluded.sections,
-            energy_hop_ms     = excluded.energy_hop_ms,
-            energy            = excluded.energy,
-            phrase_cut_hop_ms = excluded.phrase_cut_hop_ms,
-            phrase_cut_cost   = excluded.phrase_cut_cost,
-            phrase_cut_points = excluded.phrase_cut_points
-        """,
-        (
-            file_id, ms.bpm, ms.key,
-            json.dumps(ms.beat_times_ms), json.dumps(ms.downbeat_times_ms),
-            json.dumps(ms.sections), ms.energy_hop_ms, json.dumps(ms.energy),
-            ms.phrase_cut_hop_ms, json.dumps(ms.phrase_cut_cost),
-            json.dumps(ms.phrase_cut_points),
-        ),
-    )
-    logger.info(
-        "Music structure: %s -> bpm=%.1f key=%s sections=%d downbeats=%d",
-        file_id, ms.bpm, ms.key, len(ms.sections), len(ms.downbeat_times_ms),
-    )
-
-
 # --- Stage 2: transcript -------------------------------------------------
 
 def _stage2_transcript(file_id: str, wav_path: str, conn: psycopg.Connection) -> None:
@@ -490,8 +427,8 @@ def _stage5_audio(file_id: str, wav_path: str, conn: psycopg.Connection) -> None
         insert into audio_features (
             file_id, integrated_lufs, true_peak_db,
             is_musical, bpm, onsets_ms, silence_intervals,
-            rms_db, prosody_hop_ms, f0_hz
-        ) values (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s::jsonb)
+            rms_db, prosody_hop_ms
+        ) values (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s)
         on conflict (file_id) do update set
             integrated_lufs = excluded.integrated_lufs,
             true_peak_db = excluded.true_peak_db,
@@ -500,8 +437,7 @@ def _stage5_audio(file_id: str, wav_path: str, conn: psycopg.Connection) -> None
             onsets_ms = excluded.onsets_ms,
             silence_intervals = excluded.silence_intervals,
             rms_db = excluded.rms_db,
-            prosody_hop_ms = excluded.prosody_hop_ms,
-            f0_hz = excluded.f0_hz
+            prosody_hop_ms = excluded.prosody_hop_ms
         """,
         (
             file_id,
@@ -511,7 +447,6 @@ def _stage5_audio(file_id: str, wav_path: str, conn: psycopg.Connection) -> None
             json.dumps(af.silence_intervals),
             json.dumps(af.rms_db),
             af.prosody_hop_ms,
-            json.dumps(af.f0_hz),
         ),
     )
 
@@ -612,97 +547,6 @@ def _stage_dialogue_segments(file_id: str, wav_path: str, conn: psycopg.Connecti
     logger.info(
         "Dialogue segments: %s -> %d sentence, %d topic",
         file_id, len(result.get("sentence", [])), len(result.get("topic", [])),
-    )
-
-
-def _stage7_dialogue_cut(file_id: str, duration_s: float, conn: psycopg.Connection) -> None:
-    """Derive the dialogue cut-cost grid from the transcript words + audio
-    pause/energy signals written by the earlier stages, and persist it onto the
-    file's audio_features row. Pure arithmetic -- no model, no GPU.
-
-    Soft signal: a missing transcript / audio_features row just no-ops.
-    """
-    row = conn.execute(
-        "select segments from transcripts where file_id = %s", (file_id,)
-    ).fetchone()
-    if not row or not row[0]:
-        return
-    words = _flatten_words(row[0])
-    if not words:
-        return
-
-    af = conn.execute(
-        "select rms_db, prosody_hop_ms from audio_features where file_id = %s",
-        (file_id,),
-    ).fetchone()
-    rms_db = (af[0] if af else None) or []
-    prosody_hop_ms = (af[1] if af else 0) or 0
-
-    grid = cutcost_mod.compute_dialogue_cut_grid(
-        words=words,
-        rms_db=rms_db,
-        prosody_hop_ms=prosody_hop_ms,
-        duration_ms=int((duration_s or 0) * 1000),
-    )
-    if not grid.has_dialogue:
-        return
-
-    conn.execute(
-        """
-        update audio_features
-           set dialogue_cut_cost   = %s::jsonb,
-               dialogue_cut_hop_ms = %s,
-               dialogue_cut_points = %s::jsonb
-         where file_id = %s
-        """,
-        (
-            json.dumps(grid.cost_payload()),
-            grid.hop_ms,
-            json.dumps(grid.points_payload()),
-            file_id,
-        ),
-    )
-    logger.info(
-        "Dialogue cut grid: %s -> %d hops, %d cut points",
-        file_id, len(grid.cut_cost), len(grid.cut_points),
-    )
-
-
-def _stage8_beat_cut(file_id: str, duration_s: float, conn: psycopg.Connection) -> None:
-    """Derive the beat/music cut grid from the librosa onsets/bpm already on the
-    file's audio_features row. Free -- pure arithmetic, no new decode.
-
-    Non-musical files leave the columns empty.
-    """
-    af = conn.execute(
-        "select is_musical, bpm, onsets_ms from audio_features where file_id = %s",
-        (file_id,),
-    ).fetchone()
-    if not af:
-        return
-
-    grid = beat_mod.compute_beat_grid(
-        is_musical=bool(af[0]),
-        bpm=float(af[1] or 0.0),
-        onsets_ms=af[2] or [],
-        duration_ms=int((duration_s or 0) * 1000),
-    )
-    if not grid.has_beat:
-        return
-
-    conn.execute(
-        """
-        update audio_features
-           set beat_cut_cost   = %s::jsonb,
-               beat_cut_hop_ms = %s,
-               beat_cut_points = %s::jsonb
-         where file_id = %s
-        """,
-        (json.dumps(grid.cost), grid.hop_ms, json.dumps(grid.points), file_id),
-    )
-    logger.info(
-        "Beat cut grid: %s -> %d hops, %d beats (bpm=%.1f)",
-        file_id, len(grid.cost), len(grid.points), grid.bpm,
     )
 
 
@@ -847,10 +691,9 @@ def _track_speech(file_id: str, wav_path: str, duration_s: float) -> None:
 
 
 def _track_audio(file_id: str, wav_path: str, duration_s: float) -> None:
-    """audio_features (librosa) -> beat_cut (arithmetic)."""
+    """audio_features (librosa)."""
     with _pg_conn() as conn:
         _run_stage(conn, file_id, "audio_features", _stage5_audio, file_id, wav_path, conn)
-        _run_stage(conn, file_id, "beat_cut", _stage8_beat_cut, file_id, duration_s, conn)
 
 
 def _track_motion(file_id: str, video_source: str, duration_s: float) -> None:
@@ -867,7 +710,7 @@ def _track_motion(file_id: str, video_source: str, duration_s: float) -> None:
 def _run_deep_stages_parallel(
     file_id: str, wav_path: str, video_source: str, duration_s: float, has_audio: bool
 ) -> None:
-    """Run the speech / audio / video tracks concurrently, then dialogue_cut.
+    """Run the speech / audio / video tracks concurrently.
 
     Waits for ALL tracks before returning (so no orphan thread keeps writing
     after the task ends), then re-raises the first track error. Idempotency and
@@ -890,26 +733,19 @@ def _run_deep_stages_parallel(
         if exc is not None:
             raise exc
 
-    # Joins the speech (transcript+diarization) and audio (audio_features) tracks.
-    if has_audio:
-        with _pg_conn() as conn:
-            _run_stage(conn, file_id, "dialogue_cut",
-                       _stage7_dialogue_cut, file_id, duration_s, conn)
-
 
 # --- Audio-only (music) orchestrator -------------------------------------
 
 def _orchestrate_audio(file_id: str, r2_key: str, settings) -> None:
     """L1 for a standalone music/audio upload. No video proxy, no motion, no
     speech tools, no L2 (Gemini video perception). Runs: playable proxy +
-    waveform thumb, audio_features (loudness/BPM/onsets), beat cut grid, and the
-    deep musical-structure pass. Stages are idempotent via processing_jobs."""
+    waveform thumb, audio_features (loudness/BPM/onsets). Stages are
+    idempotent via processing_jobs."""
     _set_l1_status(file_id, "running")
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             raw_path = os.path.join(tmpdir, "raw")
             wav_path = os.path.join(tmpdir, "audio.wav")        # 16k for features
-            music_wav = os.path.join(tmpdir, "music.wav")        # 22.05k for structure
             logger.info("L1(audio): downloading %s for file %s", r2_key, file_id)
             _download_from_r2(r2_key, raw_path)
 
@@ -933,14 +769,9 @@ def _orchestrate_audio(file_id: str, r2_key: str, settings) -> None:
                     return
 
                 _demux_wav(raw_path, wav_path)
-                _demux_music_wav(raw_path, music_wav)
 
                 _run_stage(conn, file_id, "audio_features",
                            _stage5_audio, file_id, wav_path, conn)
-                _run_stage(conn, file_id, "beat_cut",
-                           _stage8_beat_cut, file_id, duration_s, conn)
-                _run_stage(conn, file_id, "music_structure",
-                           _stage_music_structure, file_id, music_wav, duration_s, conn)
 
         _set_l1_status(file_id, "ready")
         logger.info("L1(audio) complete for %s", file_id)
