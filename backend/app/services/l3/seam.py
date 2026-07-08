@@ -37,7 +37,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 # The atom boundary-reason strings that mark a real break: a hard shot cut
-# (base_cuts.R_SHOT) or a transition (lattice.R_WIPE / R_DEGENERATE). An
+# (lattice.R_SHOT) or a transition (lattice.R_WIPE / R_DEGENERATE). An
 # energy-regime edge (R_ACTION) or a speech/clip edge is NOT a break -- the
 # footage is continuous across them. Kept as literals (matching those R_*
 # values) so this module stays import-cycle-free; pass 1 matches atom

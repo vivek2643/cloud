@@ -2,7 +2,6 @@ from __future__ import annotations
 import logging
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
 from app.auth import get_current_user_id
 from app.services.supabase_client import get_supabase
 from app.services.r2 import generate_presigned_get
@@ -47,11 +46,6 @@ def _with_progress(f: dict) -> dict:
     f["analysis_progress"] = p
     f["analysis_phase"] = phase
     return f
-
-
-class CutsFeedRequest(BaseModel):
-    file_ids: List[str] = Field(default_factory=list)
-    energy: float = Field(0.5, ge=0.0, le=1.0)
 
 
 @router.get("", response_model=List[FileResponse])
@@ -255,94 +249,6 @@ def get_dialogues(
     if level == "topic":
         return {"topic": topic, "ready": bool(row.data)}
     return {"sentence": sentence, "topic": topic, "ready": bool(row.data)}
-
-
-# --------------------------------------------------------------------------
-# Cuts v2: the deterministic non-overlapping partition, served as one
-# contiguous filmstrip per file. See cuts_v2.plan.md (Phase B4). Compute-on
-# -read over the same L1/L3 artifacts; no VLM, no energy ladder -- the row is
-# a contiguous, non-overlapping partition by construction.
-# --------------------------------------------------------------------------
-
-def _build_cuts_for(file_ids: List[str], energy: float = 0.5) -> List[dict]:
-    """Partition every file into its non-overlapping BASE cuts (the robust,
-    deterministic skeleton -- shot cut / speaker change / speech edge / long
-    pause / camera move / disturbance; no dial, no actions, no junk). ``energy``
-    is accepted for API compatibility but currently unused (base layer is
-    energy-independent). Best-effort per file: a failure yields no cuts for that
-    file, never a 500."""
-    from app.services.l3.base_cuts import build_base_cuts
-
-    out: List[dict] = []
-    for fid in file_ids:
-        try:
-            cuts = build_base_cuts(fid)
-        except Exception:
-            logger.exception("cuts v2: base partition failed for %s", fid)
-            continue
-        for c in cuts:
-            primary = "said" if c.kind == "speech" else "shown"
-            d = {
-                "file_id": c.file_id,
-                "src_in_ms": c.start_ms,
-                "src_out_ms": c.end_ms,
-                "tags": [primary],
-                "primary": primary,
-                # Surface WHY each edge exists so boundary quality is visible on
-                # the tile (temporary, for the base-cuts bring-up).
-                "label": f"{c.reason_in} \u2192 {c.reason_out}",
-                "reason_in": c.reason_in,
-                "reason_out": c.reason_out,
-                "speaker": c.speaker,
-                "peak_ms": (c.start_ms + c.end_ms) // 2,
-                "keep_spans": None,
-            }
-            d["duration_ms"] = c.end_ms - c.start_ms
-            out.append(d)
-    out.sort(key=lambda d: (d["file_id"], d["src_in_ms"]))
-    return out
-
-
-@router.get("/{file_id}/cuts")
-def get_cuts(
-    file_id: str,
-    energy: float = Query(0.5, ge=0.0, le=1.0, description="0=broad/loose .. 1=tight/split"),
-    user_id: str = Depends(get_current_user_id),
-):
-    """The cuts-v2 partition for ONE file -- a non-overlapping, tag-bearing
-    filmstrip in ``src_in_ms`` order. Deterministic given ``energy``; `ready`
-    is false when the file has no usable L1 artifacts yet."""
-    sb = get_supabase()
-    owns = sb.table("files").select("id").eq("id", file_id).eq("user_id", user_id).execute()
-    if not owns.data:
-        raise HTTPException(status_code=404, detail="File not found")
-
-    cuts = _build_cuts_for([file_id], energy)
-    return {"cuts": cuts, "energy": energy, "ready": bool(cuts)}
-
-
-@router.post("/cuts")
-def get_cuts_feed(
-    payload: CutsFeedRequest,
-    user_id: str = Depends(get_current_user_id),
-):
-    """The cuts-v2 partition across many files -- one flat list the client
-    groups into per-file rows. Ownership is verified; foreign/unknown ids are
-    dropped."""
-    file_ids = list(dict.fromkeys(payload.file_ids or []))
-    if not file_ids:
-        return {"cuts": [], "energy": payload.energy, "ready": False}
-
-    sb = get_supabase()
-    owned = (
-        sb.table("files").select("id").eq("user_id", user_id).in_("id", file_ids).execute()
-    )
-    owned_ids = [r["id"] for r in (owned.data or [])]
-    if not owned_ids:
-        raise HTTPException(status_code=404, detail="No matching files")
-
-    cuts = _build_cuts_for(owned_ids, payload.energy)
-    return {"cuts": cuts, "energy": payload.energy, "ready": bool(cuts)}
 
 
 @router.get("/{file_id}/l1")

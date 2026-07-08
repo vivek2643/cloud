@@ -1,7 +1,7 @@
 """
 Cuts v3 -- the LATTICE: the deterministic substrate the LLM ingest reasons
-over. ``base_cuts.py`` evolves into this module (kept untouched itself until
-cutover -- see cuts_v3.plan.md, section 2).
+over. Evolved from the cuts-v2 ``base_cuts.py`` (see cuts_v3.plan.md, section
+2), which has since been retired (cleanup.plan.md B3).
 
 Two sides, two different shapes, because they need different things from the
 model:
@@ -42,21 +42,20 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.services.l3.base_cuts import (
-    R_CLIP,
-    R_DISTURB,
-    R_SHOT,
-    _shot_marks,
-)
-from app.services.l3.base_cuts_params import LONG_PAUSE_MS, SNAP_MS
 from app.services.l3.diarize import Turn
-from app.services.l3.lattice_params import MIN_ATOM_MS
+from app.services.l3.lattice_params import LONG_PAUSE_MS, MIN_ATOM_MS, SNAP_MS
 
 logger = logging.getLogger(__name__)
 
-# cuts-v3 transition-point reasons (not in base_cuts.py -- that module predates
-# transition_points). Ranked alongside base_cuts' reasons for the same
-# "several signals, one instant -> report the strongest" collapsing.
+# Boundary reason tags this module owns outright now (extracted from the
+# retired base_cuts.py -- cuts_v3.plan.md section 2 / cleanup.plan.md B3).
+R_CLIP = "clip_edge"
+R_SHOT = "shot_cut"
+R_DISTURB = "disturbance"
+
+# cuts-v3 transition-point reasons (base_cuts.py predates transition_points).
+# Ranked alongside the reasons above for the same "several signals, one
+# instant -> report the strongest" collapsing.
 R_WIPE = "wipe"
 R_DEGENERATE = "degenerate"
 R_ACTION = "action"             # this edge is a quiet<->active energy-regime crossing (Otsu)
@@ -64,10 +63,9 @@ R_SPEECH_EDGE = "speech_edge"   # this atom's own edge borders a speech turn
 
 # Only GROUNDED events are atom boundaries now (boundaries-v2): hard shot cut,
 # wipe/degenerate transition, ACTION window edge, and the speech/clip edges
-# bounding the remainder. Camera move/settle (section B) and disturbance jitter
-# (boundaries-v2) are LABELS, not edges. R_DISTURB is retained in the rank only
-# so any legacy/base_cuts caller that still passes one collapses sanely; the
-# lattice itself no longer emits disturbance marks.
+# bounding the remainder. Camera move/settle and disturbance jitter are
+# LABELS, not edges -- R_DISTURB is retained in the rank for completeness
+# only; this module never emits a disturbance mark itself.
 _REASON_RANK = {
     R_SHOT: 0, R_DISTURB: 1, R_WIPE: 1, R_DEGENERATE: 1,
     R_ACTION: 2, R_SPEECH_EDGE: 3, R_CLIP: 4,
@@ -128,6 +126,14 @@ class Lattice:
 # --------------------------------------------------------------------------
 # Video side: atoms over the non-speech remainder
 # --------------------------------------------------------------------------
+
+def _shot_marks(scene: Optional[dict]) -> List[Tuple[int, str]]:
+    """Hard SHOT CUT marks from scene detection (extracted from the retired
+    base_cuts.py -- cleanup.plan.md B3)."""
+    return [(int(p["ts_ms"]), R_SHOT)
+            for p in ((scene or {}).get("shot_points") or [])
+            if isinstance(p, dict) and "ts_ms" in p]
+
 
 def _transition_marks(motion: Optional[dict]) -> List[Tuple[int, str]]:
     """``transition_points`` (Phase B) as atom-edge marks -- a wipe or a

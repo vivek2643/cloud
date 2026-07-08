@@ -5,8 +5,8 @@ L2 used to assume "one continuous take" per clip -- fine for a single-camera
 interview, dishonest for real multi-shot footage (an edited screen recording, a
 sizzle reel, cutaway b-roll spliced into a raw file). This module supplies the
 one genuinely NEW signal cuts-v2 needs: where the footage actually changes shot
-or composition, so `shown` boundaries (l3.partition) land on real visual
-changes instead of an arbitrary window.
+or composition, so video atom boundaries (``l3.lattice._shot_marks``) land on
+real visual changes instead of an arbitrary window.
 
 How it works
 ------------

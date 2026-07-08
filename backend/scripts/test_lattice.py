@@ -13,8 +13,16 @@ if BACKEND not in sys.path:
     sys.path.insert(0, BACKEND)
 
 from app.services.l3 import lattice as lt  # noqa: E402
-from app.services.l3.base_cuts import R_CLIP, R_DISTURB, R_MOVE, R_SETTLE, R_SHOT  # noqa: E402
+from app.services.l3.lattice import R_CLIP, R_DISTURB, R_SHOT  # noqa: E402
 from app.services.l3.lattice import Atom, R_SPEECH_EDGE  # noqa: E402
+
+# Camera move/settle reason tags: fixture-only here (the retired cuts-v2
+# base_cuts.py owned these; lattice.py deliberately never ranks them as
+# boundaries -- see the module docstring). Any two values NOT in lattice's
+# own _REASON_RANK serve the same fixture purpose, so these are plain local
+# strings, not an import of removed code.
+R_MOVE = "camera_move"
+R_SETTLE = "settle"
 
 
 def _flat_motion(n, hop=100, stability=0.95, camera_motion=0.02, action=0.05, coherence=0.95):

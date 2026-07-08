@@ -21,9 +21,9 @@ drop into a prompt whole. This module is the breakdown + map + retrieval layer:
   * ``moment_detail``     returns the full record for one moment on demand
     (Tier-1: what the model retrieves when it wants to inspect a candidate).
 
-Caching mirrors ``hero_store``: a clip's tree is deterministic given its L1/L2
-artifacts, so it is keyed by the same content signature (plus a tree-logic
-version) and rebuilt only when the signature changes. Best-effort throughout:
+A clip's tree is deterministic given its resolved ``cut_records`` ingest run,
+so it is keyed by that run's content signature (plus a tree-logic version)
+and rebuilt only when the signature changes. Best-effort throughout:
 a missing artifact for a file simply yields fewer (or no) moments.
 """
 from __future__ import annotations

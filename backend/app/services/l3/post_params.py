@@ -4,7 +4,11 @@ cuts_v3.plan.md, section 6.
 """
 from __future__ import annotations
 
-from app.services.l3.partition_params import ANCHOR_PAD_MS  # noqa: F401  (re-exported; shared v2/v3 concept)
+# Breathing room kept on each side of a video cut's anchor envelope (so a hit
+# isn't clipped flush at frame zero -- keeps the wind-up / follow-through
+# readable). Extracted from the retired cuts-v2 partition_params.py
+# (cleanup.plan.md B3); a shared v2/v3 concept.
+ANCHOR_PAD_MS = 250
 
 # How much an action_energy sample must move from a cut's own end-of-span
 # value to count as "something new is happening" -- below this, extending

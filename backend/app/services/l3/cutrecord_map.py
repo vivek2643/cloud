@@ -1,18 +1,19 @@
 """
 Cuts v3 (``cut_records``) -> clip-tree projection for the agentic editor.
 
-The brain's footage map (``footage_map.build_clip_tree``) was built against the
-legacy hero-cut substrate (``hero_store.get_anchor_cuts``): one cut dict per
-beat, each owning a broad..sharp zoom LADDER. Cuts v3's ``cut_records`` are the
-current source of truth (what the Cuts tab reads), but they carry no ladder --
-just one span (``src_in_ms``/``src_out_ms``), a ``hero_ts_ms`` anchor, and a
-``pace`` envelope (``min_ms``/``natural_ms``/``max_ms``/``levels``/
-``remove_spans``). This module is the bridge: it maps each ``cut_record`` row
-to the exact cut-dict shape ``build_clip_tree`` already consumes, synthesizing
-the ladder deterministically in code -- mirroring the frontend energy dial's
-own math (``cuts-v3-view.tsx``'s ``tightenedSpan``/``chosenRemoveSpans``) --
-so the brain's tightening matches what the editor shows. No LLM numbers
-involved anywhere in this module; code owns every derived value.
+``footage_map.build_clip_tree`` expects one cut dict per beat, each owning a
+broad..sharp zoom LADDER (the shape the retired hero-cut substrate used to
+hand it -- see cuts_v3_to_brain.plan.md and cleanup.plan.md B2). Cuts v3's
+``cut_records`` are the current source of truth (what the Cuts tab reads),
+but they carry no ladder -- just one span (``src_in_ms``/``src_out_ms``), a
+``hero_ts_ms`` anchor, and a ``pace`` envelope (``min_ms``/``natural_ms``/
+``max_ms``/``levels``/``remove_spans``). This module is the bridge: it maps
+each ``cut_record`` row to the exact cut-dict shape ``build_clip_tree``
+consumes, synthesizing the ladder deterministically in code -- mirroring the
+frontend energy dial's own math (``cuts-v3-view.tsx``'s ``tightenedSpan``/
+``chosenRemoveSpans``) -- so the brain's tightening matches what the editor
+shows. No LLM numbers involved anywhere in this module; code owns every
+derived value.
 
 See cuts_v3_to_brain.plan.md.
 """
@@ -32,8 +33,8 @@ logger = logging.getLogger(__name__)
 # continuity block, per cuts_v3_continuity.plan.md.
 CUTRECORD_MAP_VERSION = 2
 
-# broad -> sharp, matching footage_map._LEVEL_NAMES and hero_cuts.BAND_ENERGIES
-# (the same five band centers the old substrate ladders zoom at).
+# broad -> sharp, matching footage_map._LEVEL_NAMES; the same five band
+# centers the (now-retired) hero-cut ladders used to zoom at.
 _LEVELS = ("broad", "calm", "balanced", "tight", "sharp")
 _BAND_ENERGIES = (0.1, 0.3, 0.5, 0.7, 0.9)
 
@@ -63,9 +64,8 @@ def _pg_conn():
 def signatures_for(file_ids: List[str], run_id: Optional[str] = None) -> Dict[str, Optional[str]]:
     """Public content signature per file for the ``cut_records`` source: the
     covering ingest run id + row count, so ``footage_map.get_trees`` busts its
-    cache on re-ingest exactly like it does for the hero substrate
-    (``hero_store.signatures_for``). None when the file has no cut_records in
-    the resolved run yet.
+    cache on re-ingest. None when the file has no cut_records in the resolved
+    run yet.
 
     ``run_id`` pins the thread's covering run (migration 028); None resolves the
     latest covering run live. Because the signature embeds the run id, a pinned
@@ -279,7 +279,7 @@ def cut_dicts_for_files(file_ids: List[str], run_id: Optional[str] = None) -> Di
     connective bridge), never silently deleted. The frontend still hides junk
     in its tray by default -- display != what the brain sees. Fail-open: a
     file with no cut_records in the resolved run is simply absent -- no
-    fabrication, matching ``hero_store.get_anchor_cuts``'s contract."""
+    fabrication."""
     if not file_ids:
         return {}
     from app.services.l3 import cuts_v3_read
