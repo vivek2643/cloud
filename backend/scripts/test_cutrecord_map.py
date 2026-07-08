@@ -42,7 +42,7 @@ def test_to_cut_dict_maps_exact_keys_build_clip_tree_reads():
     for key in ("hero_id", "file_id", "channel", "subject", "label", "summary",
                 "speaker", "src_in_ms", "src_out_ms", "play_ms", "keep_spans",
                 "score", "flags", "audio", "mute", "people", "framing", "quality",
-                "ladder", "take_group_id", "take_role"):
+                "ladder", "take_group_id", "take_role", "junk", "junk_reason", "continuity"):
         assert key in d, f"missing {key}"
     assert d["hero_id"] == "cut-1"
     assert d["channel"] == "shown"
@@ -70,6 +70,25 @@ def test_to_cut_dict_feeds_build_clip_tree_end_to_end():
     assert set(m0["variants"].keys()) == {"broad", "calm", "balanced", "tight", "sharp"}
     assert m1["channel"] == "said" and m1["subject"] == "person"
     print("ok  test_to_cut_dict_feeds_build_clip_tree_end_to_end")
+
+
+def test_junk_and_continuity_ride_through_unfiltered():
+    """cuts_v3_continuity.plan.md: junk is KEPT (labeled), not dropped, and its
+    persisted continuity block rides straight through onto the cut dict."""
+    cont = {"clip": "ffffffff-1111", "cut_no": 2, "of": 5,
+            "prev_contiguous": True, "next_contiguous": False,
+            "seam_reason_prev": "continuous take",
+            "seam_reason_next": "a flagged production break (cue/reset/dead air) in the gap"}
+    row = _row(junk=True, junk_reason="camera cue", continuity=cont)
+    d = cm._to_cut_dict(row)
+    assert d["junk"] is True
+    assert d["junk_reason"] == "camera cue"
+    assert d["continuity"] == cont
+    # A non-junk row with no continuity yet (pre-migration backfill '{}')
+    # degrades to an empty dict, never a crash.
+    plain = cm._to_cut_dict(_row(junk=False, continuity=None))
+    assert plain["junk"] is False and plain["continuity"] == {}
+    print("ok  test_junk_and_continuity_ride_through_unfiltered")
 
 
 def test_subject_derivation():
@@ -214,6 +233,7 @@ def test_unpinned_falls_back_to_latest_run():
 def main():
     test_to_cut_dict_maps_exact_keys_build_clip_tree_reads()
     test_to_cut_dict_feeds_build_clip_tree_end_to_end()
+    test_junk_and_continuity_ride_through_unfiltered()
     test_subject_derivation()
     test_audio_mute_rule()
     test_people_from_speaker()

@@ -17,6 +17,7 @@ if BACKEND not in sys.path:
     sys.path.insert(0, BACKEND)
 
 from app.services.l3 import footage_map as fm  # noqa: E402
+from app.services.l3.arrange import _MapIndex  # noqa: E402
 
 
 def _rung(level, in_ms, out_ms, text="", score=0.5, spans=None):
@@ -366,6 +367,95 @@ def test_annotate_dups_cut_records_mode_reads_take_group_id():
     print("ok  test_annotate_dups_cut_records_mode_reads_take_group_id")
 
 
+def test_junk_moment_renders_terse_line_not_the_rich_one():
+    """A junk moment (kept in the map, labeled -- cuts_v3_continuity.plan.md)
+    renders a terse one-liner: id, reason, continuity, span -- never the full
+    PIC/SND/gist line, so keeping it visible doesn't bloat the index."""
+    cont = {"clip": "ffffffff-1111", "cut_no": 2, "of": 3,
+            "prev_contiguous": True, "next_contiguous": False,
+            "seam_reason_prev": "continuous take",
+            "seam_reason_next": "shot/scene boundary or transition inside the gap"}
+    cut = _cut("f:junk", 1000, 1600, "and go", channel="shown", subject="object",
+               speaker=None, score=0.1, ladder=[_rung("balanced", 1000, 1600, "and go", 0.1)],
+               junk=True, junk_reason="camera cue", continuity=cont)
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    m = tree["moments"][0]
+    assert m["junk"] is True and m["junk_reason"] == "camera cue"
+    line = fm._moment_line(m)
+    assert line.strip().startswith("m00 [JUNK: camera cue]"), line
+    assert "↔cut:2/3⋯" in line, line
+    assert "PIC:" not in line and "SND:" not in line and "nrg:" not in line, line
+    print("ok  test_junk_moment_renders_terse_line_not_the_rich_one")
+
+
+def test_junk_moment_still_resolves_in_map_index():
+    """Junk stays independently PLACEABLE -- its ref must still resolve through
+    _MapIndex (skip-by-default in the prompt framing, never un-referenceable)."""
+    cut = _cut("f:junk", 1000, 1600, "and go", channel="shown", speaker=None,
+               ladder=[_rung("balanced", 1000, 1600, "and go", 0.1)], junk=True,
+               junk_reason="camera cue")
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    idx = _MapIndex({"clips": [tree]})
+    mid = tree["moments"][0]["moment_id"]
+    assert idx.has(mid)
+    from app.services.l3.arrange import Placement
+    resolved = idx.resolve(Placement(ref=mid))
+    assert resolved is not None and resolved.src_in_ms == 1000 and resolved.src_out_ms == 1600
+    print("ok  test_junk_moment_still_resolves_in_map_index")
+
+
+def test_non_junk_moment_shows_continuity_position_and_weld_marks():
+    cont = {"clip": "ffffffff-1111", "cut_no": 4, "of": 9,
+            "prev_contiguous": True, "next_contiguous": True,
+            "seam_reason_prev": "continuous take", "seam_reason_next": "continuous take"}
+    cut = _cut("f:c4", 1000, 4000, "the line", score=0.6,
+               ladder=[_rung("balanced", 1000, 4000, "the line", 0.6)], continuity=cont)
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "↔cut:4/9↔" in line, line
+    print("ok  test_non_junk_moment_shows_continuity_position_and_weld_marks")
+
+
+def test_first_cut_has_no_prev_weld_mark():
+    """No neighbor on that side (seam_reason unset) -> no fabricated mark."""
+    cont = {"clip": "ffffffff-1111", "cut_no": 1, "of": 2,
+            "prev_contiguous": False, "next_contiguous": False,
+            "seam_reason_prev": None, "seam_reason_next": "speaker change across the seam"}
+    cut = _cut("f:c1", 0, 1000, "first", score=0.6,
+               ladder=[_rung("balanced", 0, 1000, "first", 0.6)], continuity=cont)
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "· cut:1/2⋯" in line, line   # no ↔/⋯ BEFORE cut: (no prev neighbor)
+    print("ok  test_first_cut_has_no_prev_weld_mark")
+
+
+def test_legacy_hero_cut_has_no_continuity_tag():
+    """A legacy hero-cut moment (no continuity block) renders exactly as
+    before -- no 'cut:N/of' tag fabricated from nothing."""
+    cut = _cut("f:legacy", 0, 3000, "held wide shot")
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 3000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "cut:" not in line, line
+    print("ok  test_legacy_hero_cut_has_no_continuity_tag")
+
+
+def test_take_group_excludes_junk_member():
+    """A junk cut is kept OUT of take-group linking even if it carries a
+    take_group_id (defensive -- cuts_v3_continuity.plan.md keeps junk out of
+    the recommended/take-group set)."""
+    cut_a = _cut("a:mA", 1000, 4000, "the same line", channel="said", speaker="S0",
+                score=0.6, ladder=[_rung("balanced", 1000, 4000, "the same line", 0.6)],
+                take_group_id="tg1", take_role="winner")
+    cut_b = _cut("b:mB", 1000, 4000, "the same line", channel="said", speaker="S1",
+                score=0.5, ladder=[_rung("balanced", 1000, 4000, "the same line", 0.5)],
+                take_group_id="tg1", take_role="take", junk=True, junk_reason="false start")
+    tree_a = fm.build_clip_tree("aaaaaaaa-aaaa", {"name": "A", "duration_ms": 8000}, [cut_a])
+    tree_b = fm.build_clip_tree("bbbbbbbb-bbbb", {"name": "B", "duration_ms": 8000}, [cut_b])
+    summary = fm._annotate_dups_from_take_groups([tree_a, tree_b])
+    assert summary == [], summary   # only one non-junk member -- not a real choice
+    print("ok  test_take_group_excludes_junk_member")
+
+
 def test_moment_line_aliases_global_speaker():
     """A per-line speaker is shown as its global person id when the registry
     linked it; without the alias it falls back to the raw voice."""
@@ -406,6 +496,12 @@ def main():
     test_speaker_resolves_from_raw_handle_not_label()
     test_annotate_dups_folds_alt_pic_onto_each_beat()
     test_annotate_dups_cut_records_mode_reads_take_group_id()
+    test_junk_moment_renders_terse_line_not_the_rich_one()
+    test_junk_moment_still_resolves_in_map_index()
+    test_non_junk_moment_shows_continuity_position_and_weld_marks()
+    test_first_cut_has_no_prev_weld_mark()
+    test_legacy_hero_cut_has_no_continuity_tag()
+    test_take_group_excludes_junk_member()
     test_moment_line_aliases_global_speaker()
     test_source_contiguous_beats_form_a_run_channel_agnostic()
     test_default_energy_from_genre()

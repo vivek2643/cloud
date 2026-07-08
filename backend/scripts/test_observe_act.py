@@ -367,8 +367,11 @@ def test_affordances_menu():
     assert "tight" in cut["can_tighten_to"], cut
     assert "broad" in cut["can_widen_to"], cut
     assert aff["verbs"] and "V2" in aff["can_add_channel"]
-    assert "place_span" in aff["verbs"] and "source_awareness" in aff["senses"], aff
-    print("ok  affordances lists retake levels + channels + continuous verbs")
+    # cuts_v3_continuity.plan.md: the cut-centric loop drops the raw-footage
+    # verbs/senses (source_awareness/scan_source/place_span) from the menu.
+    assert "place" in aff["verbs"] and "place_span" not in aff["verbs"], aff
+    assert "source_awareness" not in aff["senses"] and "scan_source" not in aff["senses"], aff
+    print("ok  affordances lists retake levels + channels + cut-centric verbs")
 
 
 def test_source_awareness_and_scan_source_via_cache():
@@ -538,9 +541,12 @@ def test_weld_remaps_split_edit_seams():
     print("ok  weld remaps surviving split seams and drops welded-away ones")
 
 
-def test_place_span_snap_cap_keeps_edge_and_suggests():
+def test_split_screen_snap_cap_keeps_edge_and_suggests():
     """Snap sovereignty: an edge whose nearest seam is beyond the cap stays
-    where the brain put it; the seam arrives as a suggestion instead."""
+    where the brain put it; the seam arrives as a suggestion instead. cuts_v3
+    _continuity.plan.md retired place_span from the tool loop -- split_screen's
+    raw-window cell is now the only dispatch-level path onto this same
+    fused-seam snapper, so this test moved onto it (same snap mechanism)."""
     import json as _json_mod
 
     from app.services.l1.fused_seams import FusedField
@@ -558,19 +564,20 @@ def test_place_span_snap_cap_keeps_edge_and_suggests():
         field=FusedField(hop_ms=100, cost=cost, seams=[])))
     doc = _doc(struct, [("ffffffff:m00", "balanced")])
     obs, new, changed = tools._dispatch(
-        "place_span",
-        {"file": "ffffffff", "in_ms": 2000, "out_ms": 3000, "channel": "V1"},
+        "split_screen",
+        {"file": "ffffffff", "in_ms": 2000, "out_ms": 3000,
+         "template": "pip", "from_ms": 0, "to_ms": 2000},
         ctx, doc)
     assert changed
-    seg = new["timeline"][-1]
-    assert seg["in_ms"] == 2000, seg           # kept: seam was 700ms away (> cap)
-    assert seg["out_ms"] == 3100, seg          # snapped: 100ms move (< cap)
+    op = new["operations"][-1]
+    assert op["src_in_ms"] == 2000, op          # kept: seam was 700ms away (> cap)
+    assert op["src_out_ms"] == 3100, op         # snapped: 100ms move (< cap)
     payload = _json_mod.loads(obs)
     assert payload["snap"]["in_suggested_ms"] == 1300, payload
     print("ok  snap cap keeps the brain's edge and only SUGGESTS the far seam")
 
 
-def test_place_span_snap_off_places_raw():
+def test_split_screen_snap_off_places_raw():
     from app.services.l1.fused_seams import FusedField
     from app.services.l3 import tools
     from app.services.l3.clip_timeline import TimelineInputs, build_clip_timeline
@@ -584,19 +591,19 @@ def test_place_span_snap_off_places_raw():
         field=FusedField(hop_ms=100, cost=cost, seams=[])))
     doc = _doc(struct, [("ffffffff:m00", "balanced")])
     _, new, changed = tools._dispatch(
-        "place_span",
-        {"file": "ffffffff", "in_ms": 1150, "out_ms": 3000, "channel": "V1",
-         "snap": "off"},
+        "split_screen",
+        {"file": "ffffffff", "in_ms": 1150, "out_ms": 3000,
+         "template": "pip", "from_ms": 0, "to_ms": 2000, "snap": "off"},
         ctx, doc)
     assert changed
-    seg = new["timeline"][-1]
-    assert (seg["in_ms"], seg["out_ms"]) == (1150, 3000), seg   # untouched
+    op = new["operations"][-1]
+    assert (op["src_in_ms"], op["src_out_ms"]) == (1150, 3000), op   # untouched
     print("ok  snap:'off' places the raw span (deliberate mid-motion edge)")
 
 
-def test_place_span_snaps_to_seam_via_dispatch():
-    """place_span through the tool loop snaps its raw window to the fused seam
-    field (the same snapper the cut index uses) and reports the snap deltas."""
+def test_split_screen_snaps_to_seam_via_dispatch():
+    """split_screen's raw-window cell, through the tool loop, snaps to the fused
+    seam field (the same snapper the cut index uses) and reports the deltas."""
     import json as _json_mod
 
     from app.services.l1.fused_seams import FusedField
@@ -613,19 +620,20 @@ def test_place_span_snaps_to_seam_via_dispatch():
         field=FusedField(hop_ms=100, cost=cost, seams=[])))
 
     doc = _doc(struct, [("ffffffff:m00", "balanced")])
-    n0 = len(doc["timeline"])
+    n0 = len(doc["operations"])
     obs, new, changed = tools._dispatch(
-        "place_span",
-        {"file": "ffffffff", "in_ms": 1000, "out_ms": 3000, "channel": "V1"},
+        "split_screen",
+        {"file": "ffffffff", "in_ms": 1000, "out_ms": 3000,
+         "template": "pip", "from_ms": 0, "to_ms": 2500},
         ctx, doc)
-    assert changed and len(new["timeline"]) == n0 + 1, new["timeline"]
-    seg = new["timeline"][-1]
-    assert (seg["in_ms"], seg["out_ms"]) == (1200, 3200), seg   # snapped, not 1000/3000
+    assert changed and len(new["operations"]) == n0 + 1, new["operations"]
+    op = new["operations"][-1]
+    assert (op["src_in_ms"], op["src_out_ms"]) == (1200, 3200), op   # snapped, not 1000/3000
     payload = _json_mod.loads(obs)
     assert payload.get("snap"), payload
     assert payload["snap"]["in_delta_ms"] == 200 and payload["snap"]["out_delta_ms"] == 200, payload
     assert payload["snap"]["in_q"] == 1.0 and payload["snap"]["out_q"] == 1.0, payload
-    print("ok  place_span snaps to the fused seam field through the tool loop")
+    print("ok  split_screen snaps to the fused seam field through the tool loop")
 
 
 def main():
@@ -652,13 +660,13 @@ def main():
     test_scan_source_is_forgiving_and_self_correcting()
     test_place_span_arbitrary_main_line()
     test_place_span_v2_cutaway_and_bad_span_noop()
-    test_place_span_snaps_to_seam_via_dispatch()
+    test_split_screen_snaps_to_seam_via_dispatch()
     test_split_edit_add_replace_clear_and_guards()
     test_split_edit_resolves_decoupled_audio()
     test_validate_flags_bad_split_edit()
     test_weld_remaps_split_edit_seams()
-    test_place_span_snap_cap_keeps_edge_and_suggests()
-    test_place_span_snap_off_places_raw()
+    test_split_screen_snap_cap_keeps_edge_and_suggests()
+    test_split_screen_snap_off_places_raw()
     print("\nall observe/act tests passed")
 
 

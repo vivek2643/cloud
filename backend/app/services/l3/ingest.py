@@ -180,7 +180,8 @@ def run_ingest(project_id: str) -> str:
         pass2_output = pass2.apply_junk_suspects(pass2_output, pass1_output)
 
         store.set_status(ingest_run_id, "post")
-        records = post.assemble_cut_records(pass2_output, lattices, motion_by_file, silences_by_file)
+        records = post.assemble_cut_records(pass2_output, lattices, motion_by_file, silences_by_file,
+                                            junk_suspects=pass1_output.junk_suspects)
 
         store.delete_cut_records_for_run(ingest_run_id)
         record_ids = store.insert_cut_records(ingest_run_id, records)

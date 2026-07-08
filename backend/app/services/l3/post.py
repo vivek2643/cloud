@@ -24,10 +24,12 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.services.l3.lattice import Lattice, _anchors_in, resolve_speech_span_ms
+from app.services.l3.pass1 import JunkSuspect
 from app.services.l3.pass2 import Pass2Cut, Pass2Output
 from app.services.l3.post_params import (
     ANCHOR_PAD_MS, ENERGY_GRADE_BANDS, FLATLINE_BAND, PACE_LEVEL_TARGETS, SPEED_CEIL, SPEED_FLOOR,
 )
+from app.services.l3.seam import BREAK_BOUNDARY_REASONS, Seam, classify_seam
 from app.services.l3.video_segments import _sharpest_ms
 
 logger = logging.getLogger(__name__)
@@ -174,6 +176,14 @@ class CutRecord:
     take_group_id: Optional[str]
     take_role: Optional[str]
     channel: str                           # "said" | "done" | "shown"
+    # Deterministic per-cut continuity (cuts_v3_continuity.plan.md): this cut's
+    # 1-based ordinal + total among ALL cuts on its clip (incl. junk -- a gap in
+    # the numbering IS the signal a junk beat sits there) and whether each
+    # neighbor is a weldable continuation (seam.classify_seam) or a hard cut.
+    # {clip, cut_no, of, prev_contiguous, next_contiguous, seam_reason_prev,
+    #  seam_reason_next}. Computed ONCE here (the ingest signals are richest);
+    # read paths (brain + UI) just read the block.
+    continuity: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -187,7 +197,7 @@ class CutRecord:
             "caption_zones": [list(z) for z in self.caption_zones],
             "hero_ts_ms": self.hero_ts_ms, "pace": self.pace.to_dict(),
             "take_group_id": self.take_group_id, "take_role": self.take_role,
-            "channel": self.channel,
+            "channel": self.channel, "continuity": self.continuity,
         }
 
 
@@ -300,6 +310,98 @@ def _validate_no_overlap(file_id: str, spans: List[Tuple[int, int]], duration_ms
 
 
 # --------------------------------------------------------------------------
+# Continuity (cuts_v3_continuity.plan.md): cut_no/of + weldable-neighbor flags,
+# computed ONCE here (at ingest) from the same lattice/atom signals pass 1's
+# own word-gap seam test reads (`pass1._gap_seam`) -- generalized from a
+# word-to-word seam to a CUT-to-cut seam on the same clip.
+# --------------------------------------------------------------------------
+
+def _junk_suspect_spans(junk_suspects: List[JunkSuspect], lattice: Lattice) -> List[Tuple[int, int]]:
+    """Every pass-1 junk suspect for one clip, resolved to its ms span (word or
+    atom edges -- the same resolution ``assemble_cut_records`` uses for a real
+    cut). Unresolvable suspects (a bad index) are skipped, not fabricated."""
+    out: List[Tuple[int, int]] = []
+    words = lattice.words
+    atoms_by_id = {a.atom_id: a for a in lattice.atoms}
+    for js in junk_suspects:
+        if js.word_span is not None:
+            a, b = js.word_span
+            if 0 <= a <= b < len(words):
+                out.append((int(words[a].get("start_ms", 0)), int(words[b].get("end_ms", 0))))
+            continue
+        if js.atom_ids:
+            members = [atoms_by_id[i] for i in js.atom_ids if i in atoms_by_id]
+            if members:
+                out.append((min(m.start_ms for m in members), max(m.end_ms for m in members)))
+    return out
+
+
+def _has_scene_or_transition(atoms: List, gap_lo: int, gap_hi: int) -> bool:
+    """A break-type atom boundary (shot cut / wipe / degenerate -- never an
+    energy-regime edge) lands AT the seam's two boundary points (the common
+    case: the cuts touch, ``gap_lo == gap_hi``) or strictly inside a nonzero
+    gap between them. Mirrors ``pass1._gap_seam``'s break-edge test."""
+    for a in atoms:
+        if a.end_ms == gap_lo and a.state_out in BREAK_BOUNDARY_REASONS:
+            return True
+        if a.start_ms == gap_hi and a.state_in in BREAK_BOUNDARY_REASONS:
+            return True
+    if gap_hi > gap_lo:
+        for a in atoms:
+            if ((a.state_in in BREAK_BOUNDARY_REASONS and gap_lo < a.start_ms < gap_hi)
+                    or (a.state_out in BREAK_BOUNDARY_REASONS and gap_lo < a.end_ms < gap_hi)):
+                return True
+    return False
+
+
+def _has_flagged_break(junk_spans: List[Tuple[int, int]], gap_lo: int, gap_hi: int) -> bool:
+    """A pass-1 junk suspect (production cue, false start, dead air) overlaps
+    the gap -- or, for a zero-width gap (the cuts touch), contains the seam
+    point exactly."""
+    for s, e in junk_spans:
+        if gap_hi > gap_lo:
+            if max(s, gap_lo) < min(e, gap_hi):
+                return True
+        elif s <= gap_lo <= e:
+            return True
+    return False
+
+
+def _clip_continuity(
+    file_id: str, idxs: List[int],
+    resolved: List[Tuple[Pass2Cut, int, int, List[int]]],
+    lattice: Lattice, junk_spans: List[Tuple[int, int]],
+) -> Dict[int, Dict[str, Any]]:
+    """cut_no/of/prev_contiguous/next_contiguous/seam_reason_* for every cut on
+    one clip, in source order over ALL cuts (incl. junk). One seam verdict per
+    adjacent pair fills BOTH sides (cur's next_contiguous, next's
+    prev_contiguous) so the two always agree. ``idxs`` must already be sorted
+    by src_in_ms. Returns ``{resolved_idx: continuity_dict}``."""
+    n = len(idxs)
+    conts = [{
+        "clip": file_id, "cut_no": pos + 1, "of": n,
+        "prev_contiguous": False, "next_contiguous": False,
+        "seam_reason_prev": None, "seam_reason_next": None,
+    } for pos in range(n)]
+    for pos in range(n - 1):
+        cur_cut, cs, ce, _ = resolved[idxs[pos]]
+        nxt_cut, ns, ne, _ = resolved[idxs[pos + 1]]
+        verdict = classify_seam(Seam(
+            same_clip=True,
+            same_speaker=(cur_cut.speaker == nxt_cut.speaker),
+            gap_ms=max(0, ns - ce),
+            bridged_speech_ms=(ce - cs) + (ne - ns),
+            has_scene_or_transition=_has_scene_or_transition(lattice.atoms, ce, ns),
+            has_flagged_break=_has_flagged_break(junk_spans, ce, ns),
+        ))
+        conts[pos]["next_contiguous"] = verdict.weldable
+        conts[pos]["seam_reason_next"] = verdict.reason
+        conts[pos + 1]["prev_contiguous"] = verdict.weldable
+        conts[pos + 1]["seam_reason_prev"] = verdict.reason
+    return {idxs[pos]: conts[pos] for pos in range(n)}
+
+
+# --------------------------------------------------------------------------
 # Assembly
 #
 # No action-protection override here any more (deterministic-keep): it used
@@ -316,13 +418,22 @@ def assemble_cut_records(
     lattices: Dict[str, Lattice],
     motion_by_file: Dict[str, Dict[str, Any]],
     silences_by_file: Dict[str, List[dict]],
+    junk_suspects: Optional[List[JunkSuspect]] = None,
 ) -> List[CutRecord]:
     """Resolve every judged cut to its final ms span (word/atom edges only,
     by construction), enforce zero-overlap per file (gaps are legal -- cuts are
     a selection, not a partition), then compute hero_ts_ms + the pace envelope
-    for each. Raises ``ValueError`` (stage ``post``, per the plan's "no
-    fallback" rule) on any invariant violation -- the caller marks the ingest
-    run ``failed`` for re-run."""
+    + continuity (cut_no/of + weldable-neighbor flags, over ALL cuts incl.
+    junk) for each. ``junk_suspects`` (pass 1's, post-enforcement) feeds the
+    continuity seam test's flagged-break signal; omit for a caller that has
+    none (continuity then just never reports a flagged break). Raises
+    ``ValueError`` (stage ``post``, per the plan's "no fallback" rule) on any
+    invariant violation -- the caller marks the ingest run ``failed`` for
+    re-run."""
+    junk_by_file: Dict[str, List[JunkSuspect]] = {}
+    for js in (junk_suspects or []):
+        junk_by_file.setdefault(js.file_id, []).append(js)
+
     resolved: List[Tuple[Pass2Cut, int, int, List[int]]] = []
     for cut in pass2_output.cuts:
         lattice = lattices.get(cut.file_id)
@@ -360,6 +471,7 @@ def assemble_cut_records(
                         "pass-2 omission worth checking", sorted(missing))
 
     next_start: Dict[int, int] = {}
+    continuity_by_idx: Dict[int, Dict[str, Any]] = {}
     for file_id, idxs in by_file.items():
         idxs.sort(key=lambda i: resolved[i][1])
         duration_ms = lattices[file_id].duration_ms
@@ -367,6 +479,8 @@ def assemble_cut_records(
         _validate_no_overlap(file_id, spans, duration_ms)
         for pos, i in enumerate(idxs):
             next_start[i] = resolved[idxs[pos + 1]][1] if pos + 1 < len(idxs) else duration_ms
+        junk_spans = _junk_suspect_spans(junk_by_file.get(file_id, []), lattices[file_id])
+        continuity_by_idx.update(_clip_continuity(file_id, idxs, resolved, lattices[file_id], junk_spans))
 
     out: List[CutRecord] = []
     for idx, (cut, s, e, anchors) in enumerate(resolved):
@@ -401,6 +515,7 @@ def assemble_cut_records(
             # on a video cut resolves to the conservative "shown".
             channel=("said" if cut.kind == "speech"
                      else (cut.channel if cut.channel in ("done", "shown") else "shown")),
+            continuity=continuity_by_idx.get(idx, {}),
         ))
     _enforce_one_winner_per_take_group(out)
     return out

@@ -62,7 +62,7 @@ def rows_for_run(run_id: str, file_ids: Optional[List[str]] = None) -> List[Dict
         "select id::text, file_id::text, src_in_ms, src_out_ms, kind, word_span, atom_ids,\n"
         "       label, summary, speaker, on_camera, take_group_id::text, take_role, channel,\n"
         "       junk, junk_reason, junk_confidence, framing, look, caption_zones, pace,\n"
-        "       hero_ts_ms, hero_key, transition_in, transition_out\n"
+        "       hero_ts_ms, hero_key, transition_in, transition_out, continuity\n"
         "  from cut_records where ingest_run_id = %s"
     )
     params: List[Any] = [run_id]

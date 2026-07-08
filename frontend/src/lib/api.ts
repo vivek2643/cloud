@@ -275,6 +275,21 @@ export interface Look {
 
 export type TakeRole = "take" | "outlook" | "winner";
 
+// Cuts v3 continuity (cuts_v3_continuity.plan.md): this cut's position among
+// ALL cuts on its clip (incl. junk -- a gap in cut_no is the signal a junk
+// beat sits there) + whether each neighbor is a weldable continuation of the
+// same shot (seam.classify_seam, computed once at ingest). Absent/empty ({})
+// on a pre-migration run -> no continuity to show, never fabricated.
+export interface Continuity {
+  clip?: string;
+  cut_no?: number;
+  of?: number;
+  prev_contiguous?: boolean;
+  next_contiguous?: boolean;
+  seam_reason_prev?: string | null;
+  seam_reason_next?: string | null;
+}
+
 export interface CutRecord {
   id: string;
   file_id: string;
@@ -303,6 +318,7 @@ export interface CutRecord {
   hero_key: string | null;
   transition_in: string | null;
   transition_out: string | null;
+  continuity: Continuity;
 }
 
 export type IngestStatus = "pending" | "pass1" | "images" | "pass2" | "post" | "ready" | "failed";

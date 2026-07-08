@@ -163,7 +163,7 @@ _LOOP_SYSTEM_V2 = (
 )
 
 
-# --- v3: the blind editor -- 100% awareness + tools, plan-first, NO workflow ---
+# --- v3: the blind editor -- CUT-CENTRIC, plan-first, NO workflow ------------
 # v2 prescribed WHEN to reach for each verb ("way 1: place the spoken spine; way
 # 2: place_span reactions") -- a workflow that biased every edit into a talking
 # -head spine with bolted-on garnish. v3 removes the prescription entirely: it
@@ -172,6 +172,14 @@ _LOOP_SYSTEM_V2 = (
 # -> check), and lists the senses/verbs as neutral CAPABILITIES + mechanics only.
 # It never says "use X for Y" and never enumerates what to notice -- the material
 # and the craft are the brain's to read.
+# cuts_v3_continuity.plan.md (supersedes the deferred Phase 4 of
+# cuts_v3_to_brain.plan.md): the brain no longer scans raw, whole-clip footage
+# (source_awareness/scan_source/place_span are retired from the tool loop --
+# see tools.py). It reasons over CUTS only, each carrying rich per-cut data
+# (framing/pace/look/channel/take-group) plus a deterministic per-cut
+# `continuity` -- its position among its clip's cuts and whether each neighbor
+# is a weldable continuation of the same shot -- so it still understands
+# ordering/adjacency without ever reading raw footage.
 _LOOP_SYSTEM_V3 = (
     "You are EDSO, a BLIND editor. You cannot see or hear the footage directly "
     "-- but below you have complete, faithful SENSES that describe it, and real "
@@ -191,40 +199,32 @@ _LOOP_SYSTEM_V3 = (
     "  - read_state -- the current edit: ordered cuts (pos, id, ref, duration, "
     "channel, speaker, muted, text), channels in use, total length, a feel "
     "narration.\n"
-    "  - source_awareness -- each clip as a fully-addressable timeline: change"
-    "-point lanes (who is present / who is speaking on camera / gaze / shot size "
-    "/ action over the whole clock), its cleanest seams, its impact/reveal PEAKS, "
-    "and a scored cut INDEX. Each clip is headed 'CLIP <file8>'.\n"
-    "  - the BEAT INDEX (below) -- every usable beat across the shoot. Each line "
-    "leads with PIC (what's on screen: a face or a scene, framing, quality), then "
-    "SND (what's heard: a named speaker + 'speaking', or the shot's own audio -- "
-    "silence / ambient / talk), then the words or action -- read PIC before SND, "
-    "a beat's picture is not necessarily its speaker. `·alt-PIC` on a beat states "
-    "a fact: the SAME sound is also available as a picture from another camera or "
-    "take, with its own ref -- never a suggestion of which to use.\n"
-    "  - scan_source -- query that timeline for spans matching a facet: a `lane` "
-    "(e.g. 'presence:G2', 'speaking', 'shot', 'speech', 'action') + optional "
-    "`match` (e.g. {state:'on'}); each hit carries its full facets at its "
-    "midpoint. `file` is a 'CLIP <file8>' id or '*' to scan EVERY clip at once; a "
-    "global person id (G1, G2, ...) in the lane/match resolves per clip; optional "
-    "`within_ms` ([a,b]) limits hits to a window. It is forgiving: a wrong lane "
-    "name returns `lanes_available` and a guessed match key is ignored and "
-    "reported with the lane's real `lane_vocab` -- read the result and re-query "
-    "rather than assuming a token.\n"
+    "  - the BEAT INDEX (below) -- every usable cut across the shoot, in SOURCE "
+    "ORDER per clip. Each line leads with PIC (what's on screen: a face or a "
+    "scene, framing, quality), then SND (what's heard: a named speaker + "
+    "'speaking', or the shot's own audio -- silence / ambient / talk), then the "
+    "words or action -- read PIC before SND, a beat's picture is not necessarily "
+    "its speaker. `·alt-PIC` on a beat states a fact: the SAME sound is also "
+    "available as a picture from another camera or take, with its own ref -- "
+    "never a suggestion of which to use. `· cut:N/of` is this cut's position "
+    "among ALL cuts on its clip (a gap in the numbering means a JUNK beat sits "
+    "there); a `↔` right before/after it means that NEIGHBOR is a WELDABLE "
+    "continuation of the same shot -- place two ↔-adjacent beats back to back "
+    "for one continuous take with no visible cut; `⋯` means a real break (a "
+    "different shot, speaker, or scene) -- don't expect beats on either side of "
+    "a ⋯ to read as continuous even placed adjacently. A `[JUNK: reason]` line "
+    "(a camera cue, a false start, dead air) is SKIP-BY-DEFAULT -- don't place "
+    "it unless you deliberately need it as a connective bridge between two real "
+    "beats; it's still a normal ref if you do. Each clip is headed 'CLIP "
+    "<file8>'.\n"
     "  - diagnose / validate / predict / affordances -- editorial problems worth "
     "fixing, structural checks, the projected length under a proposed change, and "
     "the menu of what you can do to each cut.\n\n"
     "YOUR VERBS (each mutates the edit directly):\n"
-    "  - place <ref> -- add a pre-scored beat from the beat index, any channel "
-    "(speech, action, or a graphic). channel V1 = the MAIN LINE (picture+sound) "
-    "at index `at`; V2 = a SILENT video layer over the ongoing audio at program "
-    "`from_ms`. `level` picks the energy take.\n"
-    "  - place_span <file, in_ms, out_ms> -- add ANY source window (the SOURCE ms "
-    "into a 'CLIP <file8>'), not just a said-line. Same channels. Edges auto-snap "
-    "to the nearest clean seam (word gap / silence / impact; never mid-word) "
-    "within ~400ms -- nominate an approximate window and read the result's `snap` "
-    "field; an edge whose nearest seam is further stays put, and snap:'off' "
-    "places it raw.\n"
+    "  - place <ref> -- add a cut from the beat index, any channel (speech, "
+    "action, or a graphic). channel V1 = the MAIN LINE (picture+sound) at index "
+    "`at`; V2 = a SILENT video layer over the ongoing audio at program `from_ms`. "
+    "`level` picks the energy take.\n"
     "  - trim / remove / move / set_audio / tighten -- adjust a cut's source in/"
     "out, drop it, reorder it, mute or unmute its sound, or re-take it at another "
     "energy level.\n"
@@ -233,9 +233,8 @@ _LOOP_SYSTEM_V3 = (
     "the previous sound linger. Keep it subtle (200-800ms).\n"
     "  - split_screen -- show the main line AND a second source at the same time "
     "over a program window [from_ms, to_ms]: template split_h (side-by-side) / "
-    "split_v (stacked) / pip (inset). The added cell is a map `ref` OR a raw "
-    "`file`+`in_ms`+`out_ms` window (seam-snaps like place_span), silent unless "
-    "audio:'keep'.\n\n"
+    "split_v (stacked) / pip (inset). The added cell is a map `ref`, silent "
+    "unless audio:'keep'.\n\n"
     "CHANNELS: the main line is V1 video + A1 audio in sequence; V2 is a silent "
     "video layer over A1; A2 is a music/SFX bed.\n\n"
     "HOW EDITS LAND. Your edits apply DIRECTLY -- the user watches the timeline "
@@ -326,15 +325,31 @@ def _context_block_v2(file_ids: List[str], document: Optional[dict],
 
 def _context_block_v3(file_ids: List[str], document: Optional[dict],
                       ctx: "observe.EditContext") -> str:
-    """v3 context: identical awareness, NEUTRAL headers -- they describe what each
-    block IS and how to reference it, with no 'lay the spine' / 'garnish' framing."""
-    return _assemble_source_context(
-        file_ids, document, ctx,
-        aware_header=("CONTINUOUS SOURCE (each clip as a fully-addressable timeline "
-                      "-- change-point lanes, cleanest seams, impact peaks, and a "
-                      "scored cut index):"),
-        index_header=("BEAT INDEX (every usable beat -- PIC then SND then the "
-                      "words/action -- each with a ref you can place):"))
+    """v3 context (cuts_v3_continuity.plan.md): CUT-CENTRIC -- no raw-footage
+    continuous-source scan. Just the BEAT INDEX (every cut, PIC then SND then
+    the words/action, each with a ref, plus its continuity -- position among
+    its clip's cuts and whether each neighbor welds; junk cuts are labeled and
+    skip-by-default) and the current timeline."""
+    parts: List[str] = []
+    try:
+        text = (footage_map.assemble_map(
+            file_ids, relations=getattr(ctx, "relations", None),
+            run_id=getattr(ctx, "run_id", None)).get("text") or ""
+        ) if file_ids else ""
+        if len(text) > _INDEX_CHAR_CAP:
+            text = (text[:_INDEX_CHAR_CAP] +
+                    "\n[TRUNCATED: the beat index exceeded its budget here -- beats "
+                    "after this point are MISSING above.]")
+        if text:
+            parts.append(
+                "BEAT INDEX (every cut, in SOURCE ORDER per clip -- PIC then SND "
+                "then the words/action, each with a ref you can place):\n" + text)
+    except Exception:
+        logger.exception("converse: map build failed (continuing without it)")
+    tl_text = arrange.render_timeline(document)
+    parts.append("CURRENT TIMELINE:\n" + tl_text if tl_text
+                 else "CURRENT TIMELINE: (empty -- no edit drafted yet)")
+    return "\n\n".join(parts)
 
 
 def _seed_document(file_ids: List[str]) -> dict:

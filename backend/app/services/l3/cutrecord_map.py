@@ -28,7 +28,9 @@ logger = logging.getLogger(__name__)
 # Bump to force footage_trees cache rebuilds when this module's projection or
 # ladder-synthesis logic changes, independent of TREE_VERSION (which governs
 # the shared moment-tree shape in footage_map.py).
-CUTRECORD_MAP_VERSION = 1
+# v2: junk cuts are no longer dropped -- carried through (labeled) with their
+# continuity block, per cuts_v3_continuity.plan.md.
+CUTRECORD_MAP_VERSION = 2
 
 # broad -> sharp, matching footage_map._LEVEL_NAMES and hero_cuts.BAND_ENERGIES
 # (the same five band centers the old substrate ladders zoom at).
@@ -68,7 +70,9 @@ def signatures_for(file_ids: List[str], run_id: Optional[str] = None) -> Dict[st
     ``run_id`` pins the thread's covering run (migration 028); None resolves the
     latest covering run live. Because the signature embeds the run id, a pinned
     thread and an unpinned one key the ``footage_trees`` cache independently --
-    no cross-contamination."""
+    no cross-contamination. Counts ALL rows (junk included -- cuts_v3_continuity
+    .plan.md keeps junk in the brain's map, so a junk-only edit must also bust
+    the cache)."""
     out: Dict[str, Optional[str]] = {fid: None for fid in file_ids}
     if not file_ids:
         return out
@@ -78,8 +82,6 @@ def signatures_for(file_ids: List[str], run_id: Optional[str] = None) -> Dict[st
         return out
     counts: Dict[str, int] = {}
     for row in cuts_v3_read.rows_for_run(run_id, file_ids):
-        if row.get("junk"):
-            continue
         counts[row["file_id"]] = counts.get(row["file_id"], 0) + 1
     for fid, n in counts.items():
         payload = json.dumps({"run": run_id, "n": n, "v": CUTRECORD_MAP_VERSION}, sort_keys=True)
@@ -251,6 +253,14 @@ def _to_cut_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         # directly off the built moment instead of recomputing take groups).
         "take_group_id": row.get("take_group_id"),
         "take_role": row.get("take_role"),
+        # cuts_v3_continuity.plan.md: junk is KEPT (labeled), not dropped, so
+        # numbering + contiguity stay honest and a junk beat can still be
+        # placed deliberately as a bridge. The persisted continuity block
+        # (cut_no/of/prev_contiguous/next_contiguous/seam_reason_*) rides
+        # straight through -- computed once at ingest, never re-derived.
+        "junk": bool(row.get("junk")),
+        "junk_reason": row.get("junk_reason"),
+        "continuity": row.get("continuity") or {},
     }
 
 
@@ -261,10 +271,15 @@ def _to_cut_dict(row: Dict[str, Any]) -> Dict[str, Any]:
 def cut_dicts_for_files(file_ids: List[str], run_id: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
     """``{file_id: [cut_dict, ...]}`` for the given clips, resolved off a
     ``cut_records`` ingest run. ``run_id`` pins the thread's covering run
-    (migration 028); None resolves the latest covering run live. Junk cuts are
-    dropped (hidden in the UI too). Fail-open: a file with no cut_records in the
-    resolved run is simply absent -- no fabrication, matching
-    ``hero_store.get_anchor_cuts``'s contract."""
+    (migration 028); None resolves the latest covering run live.
+
+    Junk cuts are KEPT (labeled), not dropped -- cuts_v3_continuity.plan.md:
+    the ordered sequence must stay honest for cut_no/of numbering + contiguity,
+    and a junk beat is recoverable (the brain can place it deliberately as a
+    connective bridge), never silently deleted. The frontend still hides junk
+    in its tray by default -- display != what the brain sees. Fail-open: a
+    file with no cut_records in the resolved run is simply absent -- no
+    fabrication, matching ``hero_store.get_anchor_cuts``'s contract."""
     if not file_ids:
         return {}
     from app.services.l3 import cuts_v3_read
@@ -273,7 +288,5 @@ def cut_dicts_for_files(file_ids: List[str], run_id: Optional[str] = None) -> Di
         return {}
     out: Dict[str, List[Dict[str, Any]]] = {}
     for row in cuts_v3_read.rows_for_run(run_id, file_ids):
-        if row.get("junk"):
-            continue
         out.setdefault(row["file_id"], []).append(_to_cut_dict(row))
     return out

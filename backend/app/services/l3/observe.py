@@ -467,11 +467,14 @@ def affordances(document: dict, ctx: EditContext) -> dict:
         })
 
     # Video moments in the library not already on the main line -> cutaway pool.
+    # Junk is skip-by-default (cuts_v3_continuity.plan.md) -- kept out of the
+    # RECOMMENDED pool, though still placeable by ref if the brain chooses to.
     on_line = {s.get("ref") for s in timeline}
     cutaway_pool = [
         m["moment_id"] for clip in ctx.map_struct.get("clips", [])
         for m in clip.get("moments", []) or []
         if m.get("channel") in ("done", "shown") and m["moment_id"] not in on_line
+        and not m.get("junk")
     ]
     channels = ["V1", "A1"] if timeline else []
     if any(o.get("type") == "place_video" for o in (document.get("operations") or [])):
@@ -485,10 +488,13 @@ def affordances(document: dict, ctx: EditContext) -> dict:
         "can_add_channel": ["V2", "A2"],
         "cutaway_pool": cutaway_pool[:50],
         "layout_templates": ["split_h", "split_v", "pip"],
-        "verbs": ["place", "place_span", "trim", "remove", "move", "set_audio",
+        # cuts_v3_continuity.plan.md: the cut-centric loop places by ref only --
+        # no raw-footage scan (source_awareness/scan_source/place_span retired
+        # from the tool loop; the beat index + its continuity block is the only
+        # source of awareness now).
+        "verbs": ["place", "trim", "remove", "move", "set_audio",
                   "tighten", "split_screen"],
-        "senses": ["read_state", "predict", "validate", "diagnose", "affordances",
-                   "source_awareness", "scan_source"],
+        "senses": ["read_state", "predict", "validate", "diagnose", "affordances"],
     }
 
 

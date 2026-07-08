@@ -192,6 +192,23 @@ function playSegments(cut: CutRecord, energy: number): Segment[] {
   return keptSegments(cut.src_in_ms, cut.src_out_ms, removed);
 }
 
+// Auto-join adjacent PICKED cuts (cuts_v3_continuity.plan.md): `cur` welds
+// visually onto `prev` only when they are TRUE immediate neighbors in the full
+// per-clip cut sequence (cut_no differs by exactly 1 -- so a hidden junk cut
+// between them, which IS real dropped footage, never gets papered over) AND
+// the persisted seam verdict says that neighbor is a weldable continuation of
+// the same shot. Falls back to the old physical-touch heuristic (spans
+// literally abut, neither is junk) for a pre-migration run with no continuity
+// yet -- never fabricates a weld the backend hasn't verified.
+function isConsecutiveAndWeldable(cur: CutRecord, prev?: CutRecord): boolean {
+  if (!prev || prev.junk || cur.junk || prev.file_id !== cur.file_id) return false;
+  const cc = cur.continuity, pc = prev.continuity;
+  if (cc?.cut_no != null && pc?.cut_no != null) {
+    return cc.cut_no === pc.cut_no + 1 && !!cc.prev_contiguous;
+  }
+  return prev.src_out_ms === cur.src_in_ms;
+}
+
 function fmtDur(ms: number): string {
   const s = ms / 1000;
   if (s < 60) return `${s.toFixed(1)}s`;
@@ -622,17 +639,10 @@ export function CutsV3View() {
                     const prev = visible[i - 1];
                     const next = visible[i + 1];
                     const isSel = selected.has(cutKey(c));
-                    const weldableNeighbor = (n?: CutRecord) => !!n && !n.junk && !c.junk;
                     const weldLeft =
-                      isSel &&
-                      weldableNeighbor(prev) &&
-                      selected.has(cutKey(prev)) &&
-                      prev.src_out_ms === c.src_in_ms;
+                      isSel && !!prev && selected.has(cutKey(prev)) && isConsecutiveAndWeldable(c, prev);
                     const weldRight =
-                      isSel &&
-                      weldableNeighbor(next) &&
-                      selected.has(cutKey(next)) &&
-                      c.src_out_ms === next.src_in_ms;
+                      isSel && !!next && selected.has(cutKey(next)) && isConsecutiveAndWeldable(next, c);
                     // Same-beat labels: a group mixes same-setting retakes
                     // ("take"/"winner") with different-angle "outlook"s. Count
                     // ONLY the take-class here so an outlook is never badged as
@@ -1353,11 +1363,17 @@ function CutCardV3({
         </div>
       </div>
 
-      {/* label only (no summary) */}
+      {/* label + this cut's position among ALL cuts on its clip (subtle, grey --
+          a gap vs. its neighbor's number is a hidden junk beat in between) */}
       <div className="mt-2 px-0.5">
         <p className="truncate text-xs font-semibold" style={{ color: "var(--foreground)" }}>
           {cut.label || "—"}
         </p>
+        {cut.continuity?.cut_no != null && cut.continuity?.of != null && (
+          <p className="mt-0.5 text-[10px]" style={{ color: "var(--muted)" }}>
+            cut {cut.continuity.cut_no}/{cut.continuity.of}
+          </p>
+        )}
       </div>
     </div>
   );

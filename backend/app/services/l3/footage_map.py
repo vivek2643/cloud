@@ -100,7 +100,14 @@ logger = logging.getLogger(__name__)
 # dict when present (cuts-v3 substrate only; legacy hero cuts leave them None) --
 # lets `_annotate_dups` read persisted take groups directly instead of
 # recomputing them (see cuts_v3_to_brain.plan.md Phase 3).
-TREE_VERSION = 18
+# v19: moments carry `junk`/`junk_reason`/`continuity` (cuts-v3 substrate only).
+# Junk is no longer dropped upstream -- it rides in the map, labeled, so the
+# ordered sequence + cut_no/of numbering stay honest and a junk beat stays
+# placeable as a deliberate connective bridge; the resident line renders it as
+# a terse one-liner instead of the full rich line. Non-junk moments show their
+# own `cut:N/of` position + weld marks (↔ weldable / ⋯ hard) to each neighbor,
+# read off the persisted `continuity` (see cuts_v3_continuity.plan.md).
+TREE_VERSION = 19
 
 # Two moments are one continuous source run when the next starts within this gap
 # of where the previous ended (back-to-back in the original footage). Loose
@@ -291,6 +298,12 @@ def build_clip_tree(
             # carries it (None for legacy hero cuts) -- see _annotate_dups.
             "take_group_id": cut.get("take_group_id"),
             "take_role": cut.get("take_role"),
+            # Cuts-v3 continuity (cuts_v3_continuity.plan.md): junk stays IN
+            # the map, labeled, and its persisted position/weld-to-neighbor
+            # facts ride straight through (False/{} for legacy hero cuts).
+            "junk": bool(cut.get("junk")),
+            "junk_reason": cut.get("junk_reason"),
+            "continuity": cut.get("continuity") or {},
             "variants": variants,
             "atoms": [],
         })
@@ -637,9 +650,41 @@ def _alt_pic_segment(m: Dict[str, Any], alias: Optional[Dict[Any, str]],
     return f" ·alt-PIC:{', '.join(parts)}" if parts else ""
 
 
+def _weld_mark(contiguous: bool, reason: Optional[str]) -> str:
+    """↔ (weldable continuation) / ⋯ (hard cut) toward one neighbor, read off
+    the persisted continuity seam verdict. '' when there IS no neighbor on
+    that side (clip start/end, ``seam_reason`` unset) -- never a fabricated
+    edge."""
+    if reason is None:
+        return ""
+    return "↔" if contiguous else "⋯"
+
+
+def _continuity_tag(m: Dict[str, Any]) -> str:
+    """This beat's position within its clip's full cut sequence (incl. junk --
+    a gap in cut_no IS the signal a junk beat sits there) + weld marks toward
+    each neighbor. '' for a legacy hero-cut moment (no continuity block)."""
+    cont = m.get("continuity") or {}
+    cut_no, of = cont.get("cut_no"), cont.get("of")
+    if not cut_no or not of:
+        return ""
+    prev = _weld_mark(bool(cont.get("prev_contiguous")), cont.get("seam_reason_prev"))
+    nxt = _weld_mark(bool(cont.get("next_contiguous")), cont.get("seam_reason_next"))
+    return f" · {prev}cut:{cut_no}/{of}{nxt}"
+
+
 def _moment_line(m: Dict[str, Any], *, compact: bool = False,
                  alias: Optional[Dict[Any, str]] = None,
                  oncam: Optional[Dict[str, str]] = None) -> str:
+    # Junk stays IN the map (labeled), never dropped, so numbering/contiguity
+    # stay honest and the brain can still place it as a deliberate bridge --
+    # but it renders as a terse one-liner (id + reason + position + span) so
+    # keeping it visible doesn't bloat the index with a full rich line for
+    # content that's skip-by-default.
+    if m.get("junk"):
+        reason = (m.get("junk_reason") or "").strip() or "unspecified"
+        return (f"  {m['moment_id'].split(':')[-1]} [JUNK: {reason}]{_continuity_tag(m)} "
+                f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])} {_dur_tag(m)}]")
     levels = list(m["variants"].keys())
     nrg = "|".join(L for L in _LEVEL_NAMES if L in levels)
     # Resolve the speaker off the RAW handle (people facet), not the display
@@ -666,10 +711,11 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False,
     run = ""
     if m.get("run_id"):
         run = f" · run:{m['run_id']}"
+    cut_tag = _continuity_tag(m)
     alt = _alt_pic_segment(m, alias, oncam)
     return (f"  {m['moment_id'].split(':')[-1]} {_capture_tag(m)} {pic} {snd} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])} {_dur_tag(m)}] "
-            f"\"{gist}\"{gloss} · nrg:{nrg}{run}{alt}")
+            f"\"{gist}\"{gloss} · nrg:{nrg}{cut_tag}{run}{alt}")
 
 
 def _clip_block(tree: Dict[str, Any], *, compact: bool = False,
@@ -731,7 +777,10 @@ def _annotate_dups_from_take_groups(trees: List[Dict[str, Any]]) -> List[Dict[st
     for t in trees:
         for m in t.get("moments", []) or []:
             gid = m.get("take_group_id")
-            if gid:
+            # Junk is skip-by-default -- keep it OUT of the take-group /
+            # coverage set even if pass 2 somehow tagged one (cuts_v3_continuity
+            # .plan.md); it stays independently placeable via its own ref.
+            if gid and not m.get("junk"):
                 by_group.setdefault(gid, []).append(m)
 
     summary: List[Dict[str, Any]] = []

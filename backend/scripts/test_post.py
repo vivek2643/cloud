@@ -16,6 +16,7 @@ if BACKEND not in sys.path:
 
 from app.services.l3 import post  # noqa: E402
 from app.services.l3.lattice import Atom, Lattice  # noqa: E402
+from app.services.l3.pass1 import JunkSuspect  # noqa: E402
 from app.services.l3.pass2 import Pass2Cut, Pass2Output  # noqa: E402
 
 
@@ -202,7 +203,145 @@ def test_assemble_cut_records_end_to_end():
     assert video.pace.min_ms == 500, video.pace   # anchor-span floor: 0 + 2*250 (single anchor)
     assert video.pace.max_ms == 1200, video.pace   # last cut in file -> capped at natural span
     assert speech.pace.levels == [1.0] * 5
+    # Continuity: the two cuts touch (gap 0), same (unset) speaker on both
+    # sides, no break-type atom boundary at the shared edge -> weldable, and
+    # each edge case (first/last) reads False.
+    assert speech.continuity == {
+        "clip": "f1", "cut_no": 1, "of": 2,
+        "prev_contiguous": False, "next_contiguous": True,
+        "seam_reason_prev": None, "seam_reason_next": "continuous take",
+    }, speech.continuity
+    assert video.continuity == {
+        "clip": "f1", "cut_no": 2, "of": 2,
+        "prev_contiguous": True, "next_contiguous": False,
+        "seam_reason_prev": "continuous take", "seam_reason_next": None,
+    }, video.continuity
     print("ok  test_assemble_cut_records_end_to_end")
+
+
+# --------------------------------------------------------------------------
+# continuity (cuts_v3_continuity.plan.md)
+# --------------------------------------------------------------------------
+
+def test_continuity_numbers_all_cuts_including_junk():
+    """cut_no/of count over ALL cuts on the clip, junk included -- a gap in the
+    numbering IS the signal a junk beat sits there once junk is filtered out
+    downstream."""
+    atoms = [Atom(atom_id=0, file_id="f1", start_ms=1000, end_ms=1500, state_in="clip_edge",
+                  state_out="clip_edge", action_energy=0.1, coherence=0.9)]
+    lat = Lattice(file_id="f1", duration_ms=3000, words=[], turns=[], hints=[], atoms=atoms)
+    motion = {"hop_ms": 100, "blur": [0.5] * 30, "action_energy": [0.1] * 30, "action_points": []}
+    p2 = Pass2Output(cuts=[
+        Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1", atom_ids=[0],
+                label="a", summary="a"),
+    ])
+    # A second, separate clip's cuts must never leak into f1's numbering.
+    atoms2 = [Atom(atom_id=1, file_id="f2", start_ms=0, end_ms=500, state_in="clip_edge",
+                   state_out="clip_edge", action_energy=0.1, coherence=0.9)]
+    lat2 = Lattice(file_id="f2", duration_ms=500, words=[], turns=[], hints=[], atoms=atoms2)
+    p2.cuts.append(Pass2Cut(source_ref="video_group[1]", kind="video", file_id="f2",
+                            atom_ids=[1], label="b", summary="b"))
+    records = post.assemble_cut_records(p2, {"f1": lat, "f2": lat2},
+                                        {"f1": motion, "f2": motion}, {})
+    f1 = next(r for r in records if r.file_id == "f1")
+    f2 = next(r for r in records if r.file_id == "f2")
+    assert f1.continuity["cut_no"] == 1 and f1.continuity["of"] == 1, f1.continuity
+    assert f2.continuity["cut_no"] == 1 and f2.continuity["of"] == 1, f2.continuity
+    print("ok  test_continuity_numbers_all_cuts_including_junk")
+
+
+def test_continuity_hard_break_on_shot_cut_boundary():
+    """A break-type atom boundary (shot_cut) exactly at the shared edge between
+    two adjacent cuts makes the seam HARD, even though nothing else about it
+    looks like a break (same speaker, zero gap)."""
+    atoms = [
+        Atom(atom_id=0, file_id="f1", start_ms=0, end_ms=1000, state_in="clip_edge",
+             state_out="shot_cut", action_energy=0.1, coherence=0.9),
+        Atom(atom_id=1, file_id="f1", start_ms=1000, end_ms=2000, state_in="shot_cut",
+             state_out="clip_edge", action_energy=0.1, coherence=0.9),
+    ]
+    lat = Lattice(file_id="f1", duration_ms=2000, words=[], turns=[], hints=[], atoms=atoms)
+    motion = {"hop_ms": 100, "blur": [0.5] * 20, "action_energy": [0.1] * 20, "action_points": []}
+    p2 = Pass2Output(cuts=[
+        Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1", atom_ids=[0],
+                label="a", summary="a"),
+        Pass2Cut(source_ref="video_group[1]", kind="video", file_id="f1", atom_ids=[1],
+                label="b", summary="b"),
+    ])
+    records = post.assemble_cut_records(p2, {"f1": lat}, {"f1": motion}, {})
+    first, second = records
+    assert first.continuity["next_contiguous"] is False, first.continuity
+    assert "shot" in first.continuity["seam_reason_next"], first.continuity
+    assert second.continuity["prev_contiguous"] is False, second.continuity
+    assert first.continuity["seam_reason_next"] == second.continuity["seam_reason_prev"]
+    print("ok  test_continuity_hard_break_on_shot_cut_boundary")
+
+
+def test_continuity_hard_break_on_speaker_change():
+    words = [
+        {"start_ms": 0, "end_ms": 500, "text": "hello", "speaker": "S0"},
+        {"start_ms": 500, "end_ms": 1000, "text": "hi", "speaker": "S1"},
+    ]
+    lat = Lattice(file_id="f1", duration_ms=1000, words=words, turns=[], hints=[], atoms=[])
+    p2 = Pass2Output(cuts=[
+        Pass2Cut(source_ref="speech_cut[0]", kind="speech", file_id="f1", word_span=(0, 0),
+                label="a", summary="a", speaker="S0"),
+        Pass2Cut(source_ref="speech_cut[1]", kind="speech", file_id="f1", word_span=(1, 1),
+                label="b", summary="b", speaker="S1"),
+    ])
+    records = post.assemble_cut_records(p2, {"f1": lat}, {"f1": {}}, {})
+    first, second = records
+    assert first.continuity["next_contiguous"] is False, first.continuity
+    assert "speaker" in first.continuity["seam_reason_next"], first.continuity
+    print("ok  test_continuity_hard_break_on_speaker_change")
+
+
+def test_continuity_flagged_junk_suspect_in_the_gap_is_hard():
+    """A pass-1 junk suspect (e.g. a camera cue) sitting in the dropped
+    connective tissue between two cuts hard-splits the seam, even with no
+    atom-level break and the same speaker either side."""
+    words = [
+        {"start_ms": 0, "end_ms": 500, "text": "hello", "speaker": "S0"},
+        {"start_ms": 600, "end_ms": 900, "text": "cut", "speaker": "S0"},   # the cue itself
+        {"start_ms": 1000, "end_ms": 1500, "text": "again", "speaker": "S0"},
+    ]
+    lat = Lattice(file_id="f1", duration_ms=1500, words=words, turns=[], hints=[], atoms=[])
+    p2 = Pass2Output(cuts=[
+        Pass2Cut(source_ref="speech_cut[0]", kind="speech", file_id="f1", word_span=(0, 0),
+                label="a", summary="a", speaker="S0"),
+        Pass2Cut(source_ref="speech_cut[1]", kind="speech", file_id="f1", word_span=(2, 2),
+                label="b", summary="b", speaker="S0"),
+    ])
+    suspects = [JunkSuspect(file_id="f1", word_span=(1, 1), reason="camera cue")]
+    records = post.assemble_cut_records(p2, {"f1": lat}, {"f1": {}}, {}, junk_suspects=suspects)
+    first, second = records
+    assert first.continuity["next_contiguous"] is False, first.continuity
+    assert "flagged" in first.continuity["seam_reason_next"], first.continuity
+    print("ok  test_continuity_flagged_junk_suspect_in_the_gap_is_hard")
+
+
+def test_continuity_first_and_last_edges_are_false():
+    atoms = [
+        Atom(atom_id=0, file_id="f1", start_ms=0, end_ms=1000, state_in="clip_edge",
+             state_out="energy_shift", action_energy=0.1, coherence=0.9),
+        Atom(atom_id=1, file_id="f1", start_ms=1000, end_ms=2000, state_in="energy_shift",
+             state_out="clip_edge", action_energy=0.1, coherence=0.9),
+    ]
+    lat = Lattice(file_id="f1", duration_ms=2000, words=[], turns=[], hints=[], atoms=atoms)
+    motion = {"hop_ms": 100, "blur": [0.5] * 20, "action_energy": [0.1] * 20, "action_points": []}
+    p2 = Pass2Output(cuts=[
+        Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1", atom_ids=[0],
+                label="a", summary="a"),
+        Pass2Cut(source_ref="video_group[1]", kind="video", file_id="f1", atom_ids=[1],
+                label="b", summary="b"),
+    ])
+    records = post.assemble_cut_records(p2, {"f1": lat}, {"f1": motion}, {})
+    first, second = records
+    assert first.continuity["prev_contiguous"] is False and first.continuity["seam_reason_prev"] is None
+    assert second.continuity["next_contiguous"] is False and second.continuity["seam_reason_next"] is None
+    # An energy-regime edge (not a break-type reason) is continuous footage.
+    assert first.continuity["next_contiguous"] is True, first.continuity
+    print("ok  test_continuity_first_and_last_edges_are_false")
 
 
 def test_junk_flag_is_preserved_verbatim():
@@ -386,6 +525,11 @@ def main():
     test_assemble_raises_on_unresolvable_atom_ids()
     test_assemble_raises_on_overlap_between_cuts()
     test_assemble_allows_a_project_file_with_zero_cuts()
+    test_continuity_numbers_all_cuts_including_junk()
+    test_continuity_hard_break_on_shot_cut_boundary()
+    test_continuity_hard_break_on_speaker_change()
+    test_continuity_flagged_junk_suspect_in_the_gap_is_hard()
+    test_continuity_first_and_last_edges_are_false()
     print("\nall post tests passed")
 
 

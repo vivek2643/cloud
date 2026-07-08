@@ -95,11 +95,12 @@ from persisted `take_group_id` / `take_role` (winner/take/outlook) instead of
 `takes.build_take_groups()` token-overlap recompute. One winner per group is already enforced
 in `post._enforce_one_winner_per_take_group`, so this is a direct read.
 
-### Phase 4 — continuous source (`source_awareness`) [optional / second pass]
-`clip_timeline_store` still derives the "CONTINUOUS SOURCE" digest from hero-cut lineage
-(`hero_cuts._load_inputs` + atoms). Leave as-is for v1 (it is orthogonal, lattice/atom based),
-and note it as a follow-up to reconcile the continuous view with the v3 lattice so both blocks
-agree. Not required to make the brain place v3 cuts.
+### Phase 4 — continuous source (`source_awareness`)  [SUPERSEDED → cuts_v3_continuity.plan.md]
+Originally: reconcile the "CONTINUOUS SOURCE" digest (still hero-cut/atom lineage via
+`clip_timeline_store`) with the v3 lattice. **Decision changed:** rather than migrate the raw
+whole-clip view, we are **removing** it from the brain and replacing it with a deterministic
+per-cut **continuity** parameter (clip + cut number + weldable-neighbor flag via
+`seam.classify_seam`), keeping junk visible-but-labeled. See `cuts_v3_continuity.plan.md`.
 
 ### Phase 5 — thread creation carries the run  [IMPLEMENTED]
 Store `ingest_run_id` on the thread at `auto_edit.start_thread` (resolve once via

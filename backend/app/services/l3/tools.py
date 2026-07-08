@@ -27,8 +27,9 @@ from app.services.llm import LLMClient, tool_result_block, tool_spec, user_messa
 logger = logging.getLogger(__name__)
 
 _MAX_TURNS = 12
-# Snap sovereignty: the seam-snapper may move a place_span edge at most this far.
-# Further than this, the brain's edge is kept and the seam is only SUGGESTED.
+# Snap sovereignty: the seam-snapper may move a split_screen raw-window edge at
+# most this far. Further than this, the brain's edge is kept and the seam is
+# only SUGGESTED.
 _SNAP_CAP_MS = 400
 
 
@@ -76,61 +77,16 @@ def _specs() -> List[Dict[str, Any]]:
         S("affordances", "The menu of what you CAN do and to what: per-cut retake "
           "levels (tighter/wider), alternate takes, audio toggles, channels in use, "
           "and a pool of video moments you could add as cutaways.", obj({})),
-        S("source_awareness", "See the clips as a CONTINUOUS, fully-addressable "
-          "source: change-point lanes (who is present / speaking on camera / gaze / "
-          "shot size / action over the whole clock), the cleanest seams, the "
-          "impact/reveal peaks, and a scored cut INDEX per clip. Use this when you "
-          "need a span that ISN'T a pre-baked cut -- e.g. a silent window / b-roll. "
-          "(The OTHER angle of a spoken beat is already a coverage-group member -- "
-          "read it there; you don't need to hunt for it here.) Each clip is headed "
-          "'CLIP <file8>'.",
-          obj({})),
-        S("scan_source", "ESCAPE HATCH for open-ended source questions the index "
-          "doesn't already answer (a silent window, b-roll, where a shot changes). "
-          "You usually DON'T need this to show a reaction/other angle -- that's a "
-          "coverage-group member, read declaratively. Query a `lane` (e.g. "
-          "'presence:p2', 'speaking', 'shot', 'speech', 'action') + optional `match` "
-          "(e.g. {state:'on'}). Each hit carries full facets at its midpoint. It is "
-          "FORGIVING: a wrong lane name returns `lanes_available`, and a guessed "
-          "match key is ignored and reported with the lane's real `lane_vocab` -- so "
-          "read the result and re-query rather than assuming a token. `file` is a "
-          "'CLIP <file8>' id, or '*' to scan EVERY clip; a global id (G1, G2, ...) in "
-          "the lane/match resolves per clip. `within_ms` ([a,b]) limits the window.",
-          obj({"file": {"type": "string"}, "lane": {"type": "string"},
-               "match": {"type": "object"},
-               "within_ms": {"type": "array", "items": {"type": "integer"}}},
-              ["file", "lane"])),
         # --- ACT (edit verbs; each mutates the working document) ---
-        S("place", "Add a cut from a map ref. channel 'V1' inserts on the MAIN LINE "
-          "(picture+sound) at index `at` (default append); 'V2' lays a SILENT video "
-          "cutaway over the ongoing audio at `from_ms` (add audio:'keep' to play its "
-          "own sound). `level` sets the energy take.",
+        S("place", "Add a cut from the beat index by its ref. channel 'V1' inserts "
+          "on the MAIN LINE (picture+sound) at index `at` (default append); 'V2' "
+          "lays a SILENT video cutaway over the ongoing audio at `from_ms` (add "
+          "audio:'keep' to play its own sound). `level` sets the energy take.",
           obj({"ref": {"type": "string"}, "level": {"type": "string", "enum": list(observe._LEVELS)},
                "channel": {"type": "string", "enum": ["V1", "V2"]},
                "at": {"type": "integer"}, "from_ms": {"type": "integer"},
                "audio": {"type": "string", "enum": ["keep", "mute"]},
                "reason": {"type": "string"}}, ["ref"])),
-        S("place_span", "Place an ARBITRARY source span (from source_awareness) -- "
-          "not just a pre-baked cut. `file` is the 'CLIP <file8>' id; in_ms/out_ms "
-          "are SOURCE ms into that clip. channel 'V1' = main line (picture+sound) at "
-          "index `at`; 'V2' = video cutaway at program `from_ms`. axis:'speech' marks "
-          "it audio-load-bearing; audio 'keep'/'mute' sets its sound. Use this to lift "
-          "a silent reaction or any window the lanes revealed. Edges are AUTO-SNAPPED "
-          "to the nearest clean seam (word gap / silence / impact; never mid-word) "
-          "within ~400ms -- nominate an approximate window and the result's `snap` "
-          "field reports how far each edge moved and its seam quality. An edge whose "
-          "nearest seam is FURTHER than that stays exactly where you put it (the seam "
-          "arrives as in/out_suggested_ms instead). snap:'off' places raw, for "
-          "deliberate mid-motion edges like a match-cut.",
-          obj({"file": {"type": "string"}, "in_ms": {"type": "integer"},
-               "out_ms": {"type": "integer"},
-               "channel": {"type": "string", "enum": ["V1", "V2"]},
-               "at": {"type": "integer"}, "from_ms": {"type": "integer"},
-               "axis": {"type": "string", "enum": ["speech", "any"]},
-               "audio": {"type": "string", "enum": ["keep", "mute"]},
-               "snap": {"type": "string", "enum": ["auto", "off"]},
-               "content": {"type": "string"}, "reason": {"type": "string"}},
-              ["file", "in_ms", "out_ms"])),
         S("trim", "Nudge a cut's SOURCE in/out. Absolute (in_ms/out_ms) or relative "
           "(delta_in_ms/delta_out_ms, e.g. delta_in_ms:200 starts 200ms later). "
           "Targets a main-line seg_id or a V2 op_id.",
@@ -166,9 +122,9 @@ def _specs() -> List[Dict[str, Any]]:
           "'split_v' (stacked), or 'pip' (inset over the main line). The added cell "
           "source is EITHER a map `ref` (e.g. the coverage-group member that SHOWS "
           "the other person during this beat) OR a raw window `file`+`in_ms`+`out_ms` "
-          "(from source_awareness), which seam-snaps like place_span. The added cell "
-          "is silent unless audio:'keep'. "
-          "This is a user-owned look -- ask_user first. from_ms/to_ms are PROGRAM ms.",
+          "into a clip you already know about, seam-snapped to the nearest clean "
+          "boundary. The added cell is silent unless audio:'keep'. This is a "
+          "user-owned look -- ask_user first. from_ms/to_ms are PROGRAM ms.",
           obj({"ref": {"type": "string"},
                "file": {"type": "string"},
                "in_ms": {"type": "integer"}, "out_ms": {"type": "integer"},
@@ -208,7 +164,7 @@ def _snap_prog(ctx: EditContext, ms: Any) -> Any:
 
 def _resolve_file(ctx: EditContext, ref: Any) -> str:
     """Resolve a brain-supplied clip id to a full file_id. Accepts a full id or
-    the 8-char 'CLIP <file8>' prefix shown in source_awareness. Falls back to the
+    the 8-char 'CLIP <file8>' prefix shown in the beat index. Falls back to the
     raw value (validate/act will no-op on a bad id)."""
     s = str(ref or "").strip()
     if not s:
@@ -255,12 +211,6 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
             return _json({"findings": observe.diagnose(doc, ctx)}), doc, False
         if name == "affordances":
             return _json(observe.affordances(doc, ctx)), doc, False
-        if name == "source_awareness":
-            return observe.source_awareness(ctx)[:12000], doc, False
-        if name == "scan_source":
-            return _json(observe.scan_source(ctx, args.get("file"), args.get("lane"),
-                                             args.get("match"),
-                                             args.get("within_ms"))), doc, False
 
         # ACT (mutate)
         if name == "place":
@@ -268,26 +218,6 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
                             channel=args.get("channel", "V1"), at=args.get("at"),
                             from_ms=_snap_prog(ctx, args.get("from_ms")),
                             audio=args.get("audio"), reason=args.get("reason", ""))
-        elif name == "place_span":
-            fid = _resolve_file(ctx, args.get("file"))
-            in_ms, out_ms = args.get("in_ms"), args.get("out_ms")
-            # Snap the brain's arbitrary window to the SAME fused seam field the
-            # cut index uses (word gaps / silence / impacts, mid-word veto), so a
-            # nominated span lands on a clean cut. SOVEREIGN: snap:'off' skips it,
-            # and an edge whose nearest seam is beyond the cap stays put (the
-            # seam is only SUGGESTED back). No field -> unchanged no-op.
-            tl = (observe._timeline(ctx, fid)
-                  if fid and args.get("snap") != "off" else None)
-            if tl is not None and in_ms is not None and out_ms is not None:
-                snap_info = tl.snap_span(in_ms, out_ms, max_move_ms=_SNAP_CAP_MS)
-                if snap_info.get("snapped"):
-                    in_ms, out_ms = snap_info["in_ms"], snap_info["out_ms"]
-            new = act.place_span(doc, fid, in_ms=in_ms, out_ms=out_ms,
-                                 channel=args.get("channel", "V1"), at=args.get("at"),
-                                 from_ms=_snap_prog(ctx, args.get("from_ms")),
-                                 audio=args.get("audio"),
-                                 axis=args.get("axis", "any"), content=args.get("content", ""),
-                                 reason=args.get("reason", ""))
         elif name == "trim":
             new = act.trim(doc, args["target_id"], in_ms=args.get("in_ms"), out_ms=args.get("out_ms"),
                            delta_in_ms=args.get("delta_in_ms"), delta_out_ms=args.get("delta_out_ms"))
@@ -304,8 +234,8 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
             new = act.tighten(doc, ctx.index, seg_id=args.get("seg_id"), level=args.get("level", "tight"))
         elif name == "split_screen":
             # A cell source is a map ref OR a raw (file, in, out) window. The
-            # window path seam-snaps like place_span so a nominated cell lands on
-            # a clean boundary; the ref path is already a minted cut.
+            # window path seam-snaps to the fused seam field so a nominated cell
+            # lands on a clean boundary; the ref path is already a minted cut.
             sc_file = _resolve_file(ctx, args.get("file")) if args.get("file") else None
             sc_in, sc_out = args.get("in_ms"), args.get("out_ms")
             if (sc_file and sc_in is not None and sc_out is not None
@@ -330,9 +260,10 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
         result = {"applied": changed, "state": observe.read_state(new, ctx)}
         if not changed:
             result["note"] = "no-op (unknown id or illegal argument)"
-        # Tell the brain how far its place_span edges were seam-snapped (+ the
-        # quality of the boundary it landed on), or which seam was SUGGESTED when
-        # an edge was kept under the sovereignty cap, so it can judge/adjust.
+        # Tell the brain how far a split_screen window's edges were seam-snapped
+        # (+ the quality of the boundary it landed on), or which seam was
+        # SUGGESTED when an edge was kept under the sovereignty cap, so it can
+        # judge/adjust.
         if (changed and snap_info.get("snapped")
                 and (snap_info.get("in_delta_ms") or snap_info.get("out_delta_ms")
                      or "in_suggested_ms" in snap_info or "out_suggested_ms" in snap_info)):
