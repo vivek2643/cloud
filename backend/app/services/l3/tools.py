@@ -234,17 +234,18 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
             new = act.tighten(doc, ctx.index, seg_id=args.get("seg_id"), level=args.get("level", "tight"))
         elif name == "split_screen":
             # A cell source is a map ref OR a raw (file, in, out) window. The
-            # window path seam-snaps to the fused seam field so a nominated cell
-            # lands on a clean boundary; the ref path is already a minted cut.
+            # window path seam-snaps to the clean cut-boundary points from
+            # cut_records (v3-native -- see observe._seams_for_file) so a
+            # nominated cell lands on a clean edge; the ref path is already a
+            # minted cut.
             sc_file = _resolve_file(ctx, args.get("file")) if args.get("file") else None
             sc_in, sc_out = args.get("in_ms"), args.get("out_ms")
             if (sc_file and sc_in is not None and sc_out is not None
                     and args.get("snap") != "off"):
-                tl = observe._timeline(ctx, sc_file)
-                if tl is not None:
-                    snap_info = tl.snap_span(sc_in, sc_out, max_move_ms=_SNAP_CAP_MS)
-                    if snap_info.get("snapped"):
-                        sc_in, sc_out = snap_info["in_ms"], snap_info["out_ms"]
+                points = observe._seams_for_file(ctx, sc_file)
+                snap_info = observe.snap_span_to_seams(points, sc_in, sc_out, max_move_ms=_SNAP_CAP_MS)
+                if snap_info.get("snapped"):
+                    sc_in, sc_out = snap_info["in_ms"], snap_info["out_ms"]
             new = act.split_screen(doc, ctx.index, args.get("ref"),
                                    file=sc_file, in_ms=sc_in, out_ms=sc_out,
                                    template=args.get("template", "split_h"),

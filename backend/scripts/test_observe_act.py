@@ -542,53 +542,47 @@ def test_weld_remaps_split_edit_seams():
 
 
 def test_split_screen_snap_cap_keeps_edge_and_suggests():
-    """Snap sovereignty: an edge whose nearest seam is beyond the cap stays
-    where the brain put it; the seam arrives as a suggestion instead. cuts_v3
-    _continuity.plan.md retired place_span from the tool loop -- split_screen's
-    raw-window cell is now the only dispatch-level path onto this same
-    fused-seam snapper, so this test moved onto it (same snap mechanism)."""
+    """Snap sovereignty: an edge whose nearest cut-boundary is beyond the cap
+    stays where the brain put it; the boundary arrives as a suggestion
+    instead. The v3-native seam source (cleanup.plan.md B1) is the clean
+    src_in_ms/src_out_ms edges from cut_records, not the old hero-substrate
+    fused seam field."""
     import json as _json_mod
 
-    from app.services.l1.fused_seams import FusedField
-    from app.services.l3 import tools
-    from app.services.l3.clip_timeline import TimelineInputs, build_clip_timeline
+    from app.services.l3 import cuts_v3_read, tools
 
     struct = _map()
     ctx = _ctx(struct)
-    cost = [1.0] * 80
-    cost[13] = 0.0             # clean seam at 1300ms -- 700ms from the raw in
-    #                            (inside the snapper's window, beyond the 400 cap)
-    cost[31] = 0.0             # clean seam at 3100ms -- 100ms from the raw out
-    ctx.tl_cache["ffffffff-1111"] = build_clip_timeline(TimelineInputs(
-        file_id="ffffffff-1111", duration_ms=8000,
-        field=FusedField(hop_ms=100, cost=cost, seams=[])))
-    doc = _doc(struct, [("ffffffff:m00", "balanced")])
-    obs, new, changed = tools._dispatch(
-        "split_screen",
-        {"file": "ffffffff", "in_ms": 2000, "out_ms": 3000,
-         "template": "pip", "from_ms": 0, "to_ms": 2000},
-        ctx, doc)
+    ctx.run_id = "run-1"
+    orig = cuts_v3_read.rows_for_run
+    cuts_v3_read.rows_for_run = lambda run_id, file_ids: [
+        {"src_in_ms": 0, "src_out_ms": 1300},      # boundary at 1300ms -- 700ms
+        #                                             from the raw in (beyond the 400 cap)
+        {"src_in_ms": 3100, "src_out_ms": 8000},   # boundary at 3100ms -- 100ms from raw out
+    ]
+    try:
+        doc = _doc(struct, [("ffffffff:m00", "balanced")])
+        obs, new, changed = tools._dispatch(
+            "split_screen",
+            {"file": "ffffffff", "in_ms": 2000, "out_ms": 3000,
+             "template": "pip", "from_ms": 0, "to_ms": 2000},
+            ctx, doc)
+    finally:
+        cuts_v3_read.rows_for_run = orig
     assert changed
     op = new["operations"][-1]
-    assert op["src_in_ms"] == 2000, op          # kept: seam was 700ms away (> cap)
+    assert op["src_in_ms"] == 2000, op          # kept: boundary was 700ms away (> cap)
     assert op["src_out_ms"] == 3100, op         # snapped: 100ms move (< cap)
     payload = _json_mod.loads(obs)
     assert payload["snap"]["in_suggested_ms"] == 1300, payload
-    print("ok  snap cap keeps the brain's edge and only SUGGESTS the far seam")
+    print("ok  snap cap keeps the brain's edge and only SUGGESTS the far boundary")
 
 
 def test_split_screen_snap_off_places_raw():
-    from app.services.l1.fused_seams import FusedField
     from app.services.l3 import tools
-    from app.services.l3.clip_timeline import TimelineInputs, build_clip_timeline
 
     struct = _map()
     ctx = _ctx(struct)
-    cost = [1.0] * 80
-    cost[12] = 0.0
-    ctx.tl_cache["ffffffff-1111"] = build_clip_timeline(TimelineInputs(
-        file_id="ffffffff-1111", duration_ms=8000,
-        field=FusedField(hop_ms=100, cost=cost, seams=[])))
     doc = _doc(struct, [("ffffffff:m00", "balanced")])
     _, new, changed = tools._dispatch(
         "split_screen",
@@ -602,30 +596,31 @@ def test_split_screen_snap_off_places_raw():
 
 
 def test_split_screen_snaps_to_seam_via_dispatch():
-    """split_screen's raw-window cell, through the tool loop, snaps to the fused
-    seam field (the same snapper the cut index uses) and reports the deltas."""
+    """split_screen's raw-window cell, through the tool loop, snaps to the
+    clean cut-boundary points from cut_records (the v3-native seam source)
+    and reports the deltas."""
     import json as _json_mod
 
-    from app.services.l1.fused_seams import FusedField
-    from app.services.l3 import tools
-    from app.services.l3.clip_timeline import TimelineInputs, build_clip_timeline
+    from app.services.l3 import cuts_v3_read, tools
 
     struct = _map()
     ctx = _ctx(struct)
-    cost = [1.0] * 80          # unsafe everywhere...
-    cost[12] = 0.0             # ...clean seam at 1200ms
-    cost[32] = 0.0             # ...clean seam at 3200ms
-    ctx.tl_cache["ffffffff-1111"] = build_clip_timeline(TimelineInputs(
-        file_id="ffffffff-1111", duration_ms=8000,
-        field=FusedField(hop_ms=100, cost=cost, seams=[])))
-
-    doc = _doc(struct, [("ffffffff:m00", "balanced")])
-    n0 = len(doc["operations"])
-    obs, new, changed = tools._dispatch(
-        "split_screen",
-        {"file": "ffffffff", "in_ms": 1000, "out_ms": 3000,
-         "template": "pip", "from_ms": 0, "to_ms": 2500},
-        ctx, doc)
+    ctx.run_id = "run-1"
+    orig = cuts_v3_read.rows_for_run
+    cuts_v3_read.rows_for_run = lambda run_id, file_ids: [
+        {"src_in_ms": 0, "src_out_ms": 1200},      # boundary at 1200ms
+        {"src_in_ms": 3200, "src_out_ms": 8000},   # boundary at 3200ms
+    ]
+    try:
+        doc = _doc(struct, [("ffffffff:m00", "balanced")])
+        n0 = len(doc["operations"])
+        obs, new, changed = tools._dispatch(
+            "split_screen",
+            {"file": "ffffffff", "in_ms": 1000, "out_ms": 3000,
+             "template": "pip", "from_ms": 0, "to_ms": 2500},
+            ctx, doc)
+    finally:
+        cuts_v3_read.rows_for_run = orig
     assert changed and len(new["operations"]) == n0 + 1, new["operations"]
     op = new["operations"][-1]
     assert (op["src_in_ms"], op["src_out_ms"]) == (1200, 3200), op   # snapped, not 1000/3000
@@ -633,7 +628,31 @@ def test_split_screen_snaps_to_seam_via_dispatch():
     assert payload.get("snap"), payload
     assert payload["snap"]["in_delta_ms"] == 200 and payload["snap"]["out_delta_ms"] == 200, payload
     assert payload["snap"]["in_q"] == 1.0 and payload["snap"]["out_q"] == 1.0, payload
-    print("ok  split_screen snaps to the fused seam field through the tool loop")
+    print("ok  split_screen snaps to the cut-boundary seam source through the tool loop")
+
+
+def test_seams_for_file_fails_open_with_no_run_id():
+    ctx = observe.EditContext(file_ids=["f1"], index=None, map_struct={},
+                              durations={}, valence_by_file={})
+    assert observe._seams_for_file(ctx, "f1") == []
+    print("ok  _seams_for_file fails open with no pinned/resolved run")
+
+
+def test_snap_span_to_seams_pure_logic():
+    # no boundaries -> unchanged no-op
+    assert observe.snap_span_to_seams([], 100, 200) == {"in_ms": 100, "out_ms": 200, "snapped": False}
+    # empty/inverted span -> unchanged no-op
+    assert observe.snap_span_to_seams([500], 200, 200) == {"in_ms": 200, "out_ms": 200, "snapped": False}
+    # snaps each edge to its nearest boundary; every boundary is quality 1.0
+    r = observe.snap_span_to_seams([1200, 3200], 1000, 3000, max_move_ms=400)
+    assert r["in_ms"] == 1200 and r["out_ms"] == 3200, r
+    assert r["in_delta_ms"] == 200 and r["out_delta_ms"] == 200, r
+    assert r["in_q"] == 1.0 and r["out_q"] == 1.0, r
+    # beyond the cap -> kept + suggested, never inverted
+    r2 = observe.snap_span_to_seams([1300, 3100], 2000, 3000, max_move_ms=400)
+    assert r2["in_ms"] == 2000 and r2["in_suggested_ms"] == 1300, r2
+    assert r2["out_ms"] == 3100 and "out_suggested_ms" not in r2, r2
+    print("ok  snap_span_to_seams: nearest-boundary snap + sovereignty cap")
 
 
 def main():
@@ -667,6 +686,8 @@ def main():
     test_weld_remaps_split_edit_seams()
     test_split_screen_snap_cap_keeps_edge_and_suggests()
     test_split_screen_snap_off_places_raw()
+    test_seams_for_file_fails_open_with_no_run_id()
+    test_snap_span_to_seams_pure_logic()
     print("\nall observe/act tests passed")
 
 

@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg
 
@@ -182,6 +182,67 @@ def _remap_split_edits(document: dict, old_ids: List[Optional[str]],
         o["seam_seg_id"] = new_id
         kept.append(o)
     document["operations"] = kept
+
+
+# --------------------------------------------------------------------------
+# Seam snapping (v3-native): clean cut-boundary points from cut_records, for
+# split_screen's raw-window cell. Not the old hero/cuts-v2 fused seam field --
+# just the edges the ingest pipeline already snapped to a word/atom edge (see
+# cleanup.plan.md B1).
+# --------------------------------------------------------------------------
+
+def _seams_for_file(ctx: EditContext, file_id: str) -> List[int]:
+    """Clean cut-boundary ms points for one clip, read straight off its
+    resolved cut_records run -- every cut's src_in_ms/src_out_ms (already
+    word/atom-snapped by the ingest pipeline, so each is a genuine clean edit
+    point). Empty when the file has no cut_records in scope (fail-open -- the
+    caller's snap then degrades to a no-op)."""
+    if ctx.run_id is None:
+        return []
+    try:
+        from app.services.l3 import cuts_v3_read
+        rows = cuts_v3_read.rows_for_run(ctx.run_id, [file_id])
+    except Exception:
+        logger.exception("observe: seam points lookup failed for %s", file_id)
+        return []
+    pts = {int(r["src_in_ms"]) for r in rows} | {int(r["src_out_ms"]) for r in rows}
+    return sorted(pts)
+
+
+def snap_span_to_seams(points: List[int], in_ms: Any, out_ms: Any, *,
+                       max_move_ms: Optional[int] = None) -> Dict[str, Any]:
+    """Snap ``[in_ms, out_ms]`` to the nearest boundary in ``points`` on each
+    edge. Mirrors the sovereignty-cap contract the old fused-seam-field
+    snapper used: with ``max_move_ms`` set, an edge whose nearest boundary
+    sits FURTHER than the cap stays where the caller put it, reported as
+    ``in_suggested_ms``/``out_suggested_ms`` instead. Every point in
+    ``points`` is already a verified cut edge (word/atom-snapped at ingest),
+    so a snap always reports quality 1.0 -- there is no gradation to make.
+    Degrades to an unchanged no-op (``snapped=False``) when there are no
+    boundaries."""
+    try:
+        a, b = int(in_ms), int(out_ms)
+    except (TypeError, ValueError):
+        return {"in_ms": in_ms, "out_ms": out_ms, "snapped": False}
+    if not points or b <= a:
+        return {"in_ms": a, "out_ms": b, "snapped": False}
+    si = min(points, key=lambda p: abs(p - a))
+    so = min(points, key=lambda p: abs(p - b))
+    out: Dict[str, Any] = {"snapped": True}
+    if max_move_ms is not None and abs(si - a) > int(max_move_ms):
+        out["in_suggested_ms"] = si
+        si = a
+    if max_move_ms is not None and abs(so - b) > int(max_move_ms):
+        out["out_suggested_ms"] = so
+        so = b
+    if so <= si:                       # capping one edge must not invert
+        si, so = a, b
+    out.update({
+        "in_ms": si, "out_ms": so,
+        "in_delta_ms": si - a, "out_delta_ms": so - b,
+        "in_q": 1.0, "out_q": 1.0,
+    })
+    return out
 
 
 # --------------------------------------------------------------------------
