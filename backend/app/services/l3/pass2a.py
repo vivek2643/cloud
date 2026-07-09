@@ -212,15 +212,48 @@ def build_identity_shard_blocks(
 
 
 # --------------------------------------------------------------------------
-# Sharding: whole clips per shard, take-group members co-located (hard
-# constraint -- take-vs-outlook needs direct visual comparison), bin-packed
-# to MAX_IMAGES_PER_SHARD / MAX_CUTS_PER_SHARD (soft -- an oversized cluster
-# gets its own shard rather than being split; co-location is never
-# negotiable, see cuts_v3.plan.md sec. 5).
+# Sharding: the packing unit is a single CUT (one image-bearing speech_cut[i]
+# / video_group[j]), NOT a whole clip. Take-candidate members are co-located
+# (hard constraint -- take-vs-outlook needs direct visual comparison), so a
+# take's member cuts travel together as one atomic bundle; every other cut
+# packs freely. Bin-packed to MAX_IMAGES_PER_SHARD / MAX_CUTS_PER_SHARD; a
+# single bundle bigger than the budget (a take with more members than a shard
+# holds -- rare) is sent oversized rather than split. Packing by cut instead
+# of by clip is what keeps a 3-angle take from dragging in all ~20 other cuts
+# of the three clips it happens to span (see cuts_v3.plan.md sec. 5).
 # --------------------------------------------------------------------------
 
-def _cluster_files(pass1: Pass1Output, file_ids: List[str]) -> List[List[str]]:
-    parent = {fid: fid for fid in file_ids}
+def _member_speech_refs(pass1: Pass1Output) -> List[List[str]]:
+    """For each take candidate, the speech_cut refs of its members. A member
+    is one whole speech_cut cited by (file_id, word_span), so it resolves to
+    exactly one speech_cut[i]. These refs must share a shard. (image_plan also
+    emits a take[group] comparison frame per member, but it is the SAME image
+    as that member's speech_cut[i] frame -- identical sharpest-ms of the same
+    span -- so co-locating the speech_cut refs already puts the takes
+    side-by-side; the duplicate take frames need no separate handling.)"""
+    by_member = {(sc.file_id, tuple(sc.word_span)): f"speech_cut[{i}]"
+                 for i, sc in enumerate(pass1.speech_cuts)}
+    groups: List[List[str]] = []
+    for tc in pass1.take_candidates:
+        refs = [by_member.get((m.file_id, tuple(m.word_span))) for m in tc.members]
+        groups.append([r for r in refs if r is not None])
+    return groups
+
+
+def build_identity_shards(pass1: Pass1Output, planned_frames: List[PlannedFrame]) -> List[List[str]]:
+    """Partition the image-bearing cuts into shards, each a list of source_refs
+    (speech_cut[i] / video_group[j]) the shard's pass-2a call is responsible
+    for. Take members co-locate; everything else bin-packs by image + cut
+    budget."""
+    images_by_ref: Dict[str, int] = {}
+    for f in planned_frames:
+        if f.ref.startswith("speech_cut[") or f.ref.startswith("video_group["):
+            images_by_ref[f.ref] = images_by_ref.get(f.ref, 0) + 1
+    cut_refs = list(images_by_ref)
+    if not cut_refs:
+        return []
+
+    parent = {r: r for r in cut_refs}
 
     def find(x: str) -> str:
         while parent[x] != x:
@@ -233,67 +266,39 @@ def _cluster_files(pass1: Pass1Output, file_ids: List[str]) -> List[List[str]]:
         if ra != rb:
             parent[ra] = rb
 
-    for tc in pass1.take_candidates:
-        members = [m.file_id for m in tc.members if m.file_id in parent]
-        for m in members[1:]:
-            union(members[0], m)
+    for refs in _member_speech_refs(pass1):
+        present = [r for r in refs if r in parent]
+        for r in present[1:]:
+            union(present[0], r)
 
-    clusters: Dict[str, List[str]] = {}
-    for fid in file_ids:
-        clusters.setdefault(find(fid), []).append(fid)
-    return list(clusters.values())
+    bundles: Dict[str, List[str]] = {}
+    for r in cut_refs:
+        bundles.setdefault(find(r), []).append(r)
 
+    def images_of(bundle: List[str]) -> int:
+        return sum(images_by_ref[r] for r in bundle)
 
-def _cut_counts_by_file(pass1: Pass1Output) -> Dict[str, int]:
-    """How many final IdentityCut records a file will need -- one per
-    speech_cut plus one per video_tentative_group. Independent of image
-    count, and the thing that actually drives a shard's OUTPUT size."""
-    counts: Dict[str, int] = {}
-    for sc in pass1.speech_cuts:
-        counts[sc.file_id] = counts.get(sc.file_id, 0) + 1
-    for vg in pass1.video_tentative_groups:
-        counts[vg.file_id] = counts.get(vg.file_id, 0) + 1
-    return counts
-
-
-def build_identity_shards(pass1: Pass1Output, planned_frames: List[PlannedFrame]) -> List[List[str]]:
-    image_counts: Dict[str, int] = {}
-    for f in planned_frames:
-        image_counts[f.file_id] = image_counts.get(f.file_id, 0) + 1
-    cut_counts = _cut_counts_by_file(pass1)
-    file_ids = list(image_counts.keys())
-    if not file_ids:
-        return []
-
-    clusters = _cluster_files(pass1, file_ids)
-
-    def images_of(cluster: List[str]) -> int:
-        return sum(image_counts.get(f, 0) for f in cluster)
-
-    def cuts_of(cluster: List[str]) -> int:
-        return sum(cut_counts.get(f, 0) for f in cluster)
-
-    sized = sorted(clusters, key=images_of, reverse=True)
+    sized = sorted(bundles.values(), key=images_of, reverse=True)
 
     shards: List[List[str]] = []
     shard_images: List[int] = []
     shard_cuts: List[int] = []
-    for cluster in sized:
-        images, cuts = images_of(cluster), cuts_of(cluster)
+    for bundle in sized:
+        images, cuts = images_of(bundle), len(bundle)
         placed = False
         for i, shard in enumerate(shards):
             if shard_images[i] + images <= MAX_IMAGES_PER_SHARD and shard_cuts[i] + cuts <= MAX_CUTS_PER_SHARD:
-                shard.extend(cluster)
+                shard.extend(bundle)
                 shard_images[i] += images
                 shard_cuts[i] += cuts
                 placed = True
                 break
         if not placed:
             if images > MAX_IMAGES_PER_SHARD or cuts > MAX_CUTS_PER_SHARD:
-                logger.warning("pass2a: take-group cluster (%d images, %d cuts) exceeds shard budget "
+                logger.warning("pass2a: take bundle (%d images, %d cuts) exceeds shard budget "
                                "(%d images, %d cuts) -- co-location is non-negotiable, sending oversized",
                                images, cuts, MAX_IMAGES_PER_SHARD, MAX_CUTS_PER_SHARD)
-            shards.append(list(cluster))
+            shards.append(list(bundle))
             shard_images.append(images)
             shard_cuts.append(cuts)
     return shards
@@ -527,37 +532,36 @@ def _resolved_file_id(cut: IdentityCut, pass1: Pass1Output) -> Optional[str]:
 
 
 def _drop_out_of_shard_cuts(output: IdentityOutput, pass1: Pass1Output,
-                            shard_files: set) -> Tuple[IdentityOutput, int]:
-    """Drop cuts that belong to a clip OUTSIDE this shard, returning
-    (filtered_output, n_dropped). The cached pass-1 render lists EVERY clip's
-    units, so a shard -- especially an oversized take-group cluster the model
-    can't hold in one call -- sometimes emits cuts for clips it wasn't shown.
-    Those clips are handled by their OWN shard, so the strays here are pure
-    duplicates: discarding them (rather than failing the whole call) is what
-    lets big multicam projects ingest, and still keeps post from ever seeing
-    cross-shard duplicate spans. Clip ownership is resolved from source_ref
-    (authoritative), falling back to the model's file_id if a ref doesn't
-    resolve. A kept cut whose model file_id disagrees with its source_ref is
-    corrected to the resolved clip so post attributes it correctly."""
+                            shard_refs: set) -> Tuple[IdentityOutput, int]:
+    """Drop cuts whose source_ref is OUTSIDE this shard, returning
+    (filtered_output, n_dropped). The cached pass-1 render lists EVERY cut, so
+    a shard sometimes emits cuts for refs it wasn't shown images for. Each ref
+    is handled by exactly one shard, so the strays here are pure duplicates:
+    discarding them (rather than failing the whole call) is what lets big
+    multicam projects ingest, and keeps post from seeing cross-shard duplicate
+    spans. Scoping by ref (not clip) is precise now that one clip's cuts can
+    land in different shards. A kept cut whose model file_id disagrees with the
+    clip its source_ref resolves to is corrected so post attributes it right."""
     kept: List[IdentityCut] = []
     for c in output.cuts:
-        owner = _resolved_file_id(c, pass1) or c.file_id
-        if owner not in shard_files:
+        if c.source_ref not in shard_refs:
             continue
-        kept.append(c if c.file_id == owner else c.model_copy(update={"file_id": owner}))
+        owner = _resolved_file_id(c, pass1)
+        kept.append(c if owner is None or c.file_id == owner
+                    else c.model_copy(update={"file_id": owner}))
     dropped = len(output.cuts) - len(kept)
     return output.model_copy(update={"cuts": kept}), dropped
 
 
 def _pass2a_semantic_checks(output: IdentityOutput, pass1: Pass1Output,
-                            lattices: Dict[str, Lattice], shard_files: set) -> Optional[str]:
+                            lattices: Dict[str, Lattice], shard_refs: set) -> Optional[str]:
     """Run against the BACKFILLED output (see backfill_locators) -- locator
     checks are meaningless before the deterministic fill. Out-of-shard strays
     are filtered out FIRST (see _drop_out_of_shard_cuts) so they can't trip a
     spurious re-ask; run_identity_shard applies the same filter to the
     persisted output."""
     output = backfill_locators(output, pass1)
-    output, _ = _drop_out_of_shard_cuts(output, pass1, shard_files)
+    output, _ = _drop_out_of_shard_cuts(output, pass1, shard_refs)
     return (_source_refs_exist(output, pass1)
            or _kind_matches_source_ref(output)
            or _locators_resolved(output)
@@ -577,29 +581,31 @@ def run_identity_shard(
     shard_frames: List[PlannedFrame],
     images_b64: Dict[Tuple[str, int], str],
 ) -> ic.Completion:
-    """One pass-2a shard call. ``file_rows`` + ``pass1_output`` render the
-    SAME cached prefix on every shard in a run (identical blocks -> cache
-    hits after the first); ``shard_frames``/``images_b64`` are this shard's
-    images only, appended uncached. Raises ``ValueError`` if the shard has
-    no resolvable images."""
-    cached_blocks = build_pass1_blocks(file_rows) + [text_block(render_pass1_output(pass1_output))]
+    """One pass-2a shard call. The cached prefix is SCOPED to this shard:
+    ``file_rows`` are the shard's clips only and the pass-1 render is trimmed
+    to the shard's refs (see render_pass1_output), so the model can only see --
+    and so only emit -- the cuts it was actually shown. ``shard_frames`` /
+    ``images_b64`` are this shard's images, appended uncached. Raises
+    ``ValueError`` if the shard has no resolvable images."""
+    shard_refs = {f.ref for f in shard_frames}
+    cached_blocks = build_pass1_blocks(file_rows) + [
+        text_block(render_pass1_output(pass1_output, shard_refs))]
     image_blocks = build_identity_shard_blocks(shard_frames, images_b64)
     if not image_blocks:
         raise ValueError("run_identity_shard: no images resolved for this shard")
     lattices = {fid: lattice for fid, _name, _dur, lattice in file_rows}
-    shard_files = {f.file_id for f in shard_frames}
     completion = ic.complete("pass2", _SYSTEM, cached_blocks, IdentityOutput,
                              extra_blocks=image_blocks, max_tokens=20000,
                              extra_check=lambda output: _pass2a_semantic_checks(
-                                 output, pass1_output, lattices, shard_files))
-    # The persisted output must carry ONLY this shard's clips. The semantic
+                                 output, pass1_output, lattices, shard_refs))
+    # The persisted output must carry ONLY this shard's refs. The semantic
     # check already filters strays before validating, but ic.complete returns
     # the model's RAW payload, so drop them here too -- otherwise post would
     # see the same cut from two shards as an identical-span overlap.
     filtered, dropped = _drop_out_of_shard_cuts(
-        IdentityOutput.model_validate(completion.data), pass1_output, shard_files)
+        IdentityOutput.model_validate(completion.data), pass1_output, shard_refs)
     if dropped:
-        logger.warning("pass2a: dropped %d out-of-shard cut(s) from a %d-clip shard "
-                       "(each handled by its own shard)", dropped, len(shard_files))
+        logger.warning("pass2a: dropped %d out-of-shard cut(s) from a %d-ref shard "
+                       "(each handled by its own shard)", dropped, len(shard_refs))
         completion.data = filtered.model_dump()
     return completion

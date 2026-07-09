@@ -822,33 +822,63 @@ def run_pass1_for_project(project_id: str) -> ic.Completion:
 # images ("IMG 12 = clip 3, 41.2s, speech_cut 7") point back at these lines.
 # --------------------------------------------------------------------------
 
-def render_pass1_output(pass1: Pass1Output) -> str:
+def render_pass1_output(pass1: Pass1Output, keep_refs: set | None = None) -> str:
+    """Render the pass-1 result for a pass-2a call. When ``keep_refs`` is given
+    (a set of "speech_cut[i]" / "video_group[gi]" strings), the render is
+    SCOPED to just those cuts -- ORIGINAL indices are preserved so a ref never
+    renumbers -- and take candidates, junk suspects and clip summaries are
+    trimmed to the same footprint. Scoping means a shard only ever sees (and
+    so only ever emits) its own refs; a take's members are always co-located
+    in one shard (see build_identity_shards), so every take still renders whole
+    for the shard that owns it. ``keep_refs=None`` renders everything."""
+    def keep_speech(i: int) -> bool:
+        return keep_refs is None or f"speech_cut[{i}]" in keep_refs
+
+    def keep_video(gi: int) -> bool:
+        return keep_refs is None or f"video_group[{gi}]" in keep_refs
+
+    kept_files: set = set()
     lines = ["=== PASS 1 RESULT (your own prior output -- final unless revised below) ==="]
 
     lines.append("SPEECH CUTS:")
     for i, sc in enumerate(pass1.speech_cuts):
+        if not keep_speech(i):
+            continue
+        kept_files.add(sc.file_id)
         speakers = ",".join(sc.speaker_ids) or "?"
         lines.append(f"  speech_cut[{i}]: file={sc.file_id} words[{sc.word_span[0]}-{sc.word_span[1]}] "
                      f"label=\"{sc.label}\" speakers={speakers}")
 
+    speech_ref_of = {(s.file_id, tuple(s.word_span)): j for j, s in enumerate(pass1.speech_cuts)}
     lines.append("TAKE CANDIDATES:")
     for tc in pass1.take_candidates:
+        if keep_refs is not None:
+            refs = [speech_ref_of.get((m.file_id, tuple(m.word_span))) for m in tc.members]
+            if not all(r is not None and f"speech_cut[{r}]" in keep_refs for r in refs):
+                continue
         members = "; ".join(f"{m.file_id} words[{m.word_span[0]}-{m.word_span[1]}]" for m in tc.members)
         lines.append(f"  take[{tc.group_id}]: {members}")
 
     lines.append("VIDEO TENTATIVE GROUPS:")
     for gi, vg in enumerate(pass1.video_tentative_groups):
+        if not keep_video(gi):
+            continue
+        kept_files.add(vg.file_id)
         atoms = ",".join(str(a) for a in vg.atom_ids)
         lines.append(f"  video_group[{gi}]: file={vg.file_id} atoms=[{atoms}]")
 
     lines.append("JUNK SUSPECTS:")
     for js in pass1.junk_suspects:
+        if keep_refs is not None and js.file_id not in kept_files:
+            continue
         where = f"words[{js.word_span[0]}-{js.word_span[1]}]" if js.word_span else f"atoms={js.atom_ids}"
         lines.append(f"  file={js.file_id} {where} reason=\"{js.reason}\"")
 
     lines.append(f"PROJECT SUMMARY: {pass1.project_summary}")
     lines.append("CLIP SUMMARIES:")
     for cs in pass1.clip_summaries:
+        if keep_refs is not None and cs.file_id not in kept_files:
+            continue
         lines.append(f"  file={cs.file_id}: {cs.summary}")
 
     return "\n".join(lines)

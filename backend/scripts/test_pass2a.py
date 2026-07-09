@@ -280,7 +280,7 @@ def test_pass2a_semantic_checks_combines_all_checks():
         pass2a.IdentityCut(source_ref="speech_cut[0]", kind="video", file_id="f1",
                           atom_ids=[0], label="a", summary="a"),
     ])
-    assert pass2a._pass2a_semantic_checks(kind_mismatch, p1, {}, {"f1"}) is not None
+    assert pass2a._pass2a_semantic_checks(kind_mismatch, p1, {}, {"speech_cut[0]"}) is not None
 
     # duplicate atoms are only possible within a SPLIT group now (backfill
     # overwrites an un-split group's atom_ids from pass 1 wholesale)
@@ -290,7 +290,7 @@ def test_pass2a_semantic_checks_combines_all_checks():
         pass2a.IdentityCut(source_ref="video_group[0]", kind="video", file_id="f1",
                           atom_ids=[0], label="b", summary="b"),
     ])
-    assert pass2a._pass2a_semantic_checks(dup_atoms, p1, {}, {"f1"}) is not None
+    assert pass2a._pass2a_semantic_checks(dup_atoms, p1, {}, {"video_group[0]"}) is not None
 
     # overlapping word spans can only originate in pass 1 now (backfill
     # copies pass 1's spans verbatim) -- caught here too, post-backfill
@@ -304,26 +304,23 @@ def test_pass2a_semantic_checks_combines_all_checks():
         pass2a.IdentityCut(source_ref="speech_cut[1]", kind="speech", file_id="f1",
                           label="b", summary="b"),
     ])
-    assert pass2a._pass2a_semantic_checks(dup_words, p1_overlap, {}, {"f1"}) is not None
+    assert pass2a._pass2a_semantic_checks(dup_words, p1_overlap, {},
+                                          {"speech_cut[0]", "speech_cut[1]"}) is not None
 
     clean = pass2a.IdentityOutput(cuts=[
         pass2a.IdentityCut(source_ref="speech_cut[0]", kind="speech", file_id="f1",
                           word_span=(0, 1), label="a", summary="a"),
     ])
-    assert pass2a._pass2a_semantic_checks(clean, p1, {}, {"f1"}) is None
+    assert pass2a._pass2a_semantic_checks(clean, p1, {}, {"speech_cut[0]"}) is None
 
-    # a cut for a clip OUTSIDE this shard is FILTERED OUT (not an error) --
-    # its own shard emits it, so the stray here is a pure duplicate. p1b has
-    # speech_cut[1] on f2; a shard of {f1} must silently drop it.
-    p1b = Pass1Output(speech_cuts=[
-        SpeechCut(file_id="f1", word_span=(0, 1), label="a"),
-        SpeechCut(file_id="f2", word_span=(0, 1), label="b"),
-    ])
+    # a cut whose ref is OUTSIDE this shard is FILTERED OUT (not an error) --
+    # its own shard emits it, so the stray here is a pure duplicate. The shard
+    # owns speech_cut[0]; a stray speech_cut[1] must be silently dropped.
     out_of_scope = pass2a.IdentityOutput(cuts=[
-        pass2a.IdentityCut(source_ref="speech_cut[1]", kind="speech", file_id="f2",
-                          word_span=(0, 1), label="b", summary="b"),
+        pass2a.IdentityCut(source_ref="speech_cut[1]", kind="speech", file_id="f1",
+                          word_span=(1, 2), label="b", summary="b"),
     ])
-    assert pass2a._pass2a_semantic_checks(out_of_scope, p1b, {}, {"f1"}) is None
+    assert pass2a._pass2a_semantic_checks(out_of_scope, p1, {}, {"speech_cut[0]"}) is None
     print("ok  test_pass2a_semantic_checks_combines_all_checks")
 
 
@@ -336,14 +333,14 @@ def test_drop_out_of_shard_cuts_filters_strays_and_fixes_file_id():
         # in-shard, correct
         pass2a.IdentityCut(source_ref="speech_cut[0]", kind="speech", file_id="f1",
                           word_span=(0, 1), label="a", summary="a"),
-        # out-of-shard (source_ref resolves to f2) -> dropped
+        # ref outside this shard -> dropped
         pass2a.IdentityCut(source_ref="speech_cut[1]", kind="speech", file_id="f2",
                           word_span=(0, 1), label="b", summary="b"),
         # in-shard but model mislabeled file_id -> kept, file_id corrected to f1
         pass2a.IdentityCut(source_ref="speech_cut[0]", kind="speech", file_id="f9",
                           word_span=(0, 1), label="c", summary="c"),
     ])
-    filtered, dropped = pass2a._drop_out_of_shard_cuts(out, p1, {"f1"})
+    filtered, dropped = pass2a._drop_out_of_shard_cuts(out, p1, {"speech_cut[0]"})
     assert dropped == 1, dropped
     assert [c.source_ref for c in filtered.cuts] == ["speech_cut[0]", "speech_cut[0]"]
     assert all(c.file_id == "f1" for c in filtered.cuts), [c.file_id for c in filtered.cuts]
@@ -423,28 +420,35 @@ def test_single_file_one_shard():
     frames = [PlannedFrame("f1", 100, "speech_cut", "speech_cut[0]"),
              PlannedFrame("f1", 200, "speech_cut", "speech_cut[1]")]
     shards = pass2a.build_identity_shards(Pass1Output(), frames)
-    assert shards == [["f1"]], shards
+    assert len(shards) == 1 and set(shards[0]) == {"speech_cut[0]", "speech_cut[1]"}, shards
     print("ok  test_single_file_one_shard")
 
 
-def test_unrelated_files_pack_into_one_shard_when_small():
+def test_unrelated_cuts_pack_into_one_shard_when_small():
+    # Two clips' cuts (distinct global refs) with no take link pack together.
     frames = [PlannedFrame("f1", 100, "speech_cut", "speech_cut[0]"),
-             PlannedFrame("f2", 100, "speech_cut", "speech_cut[0]")]
+             PlannedFrame("f2", 100, "speech_cut", "speech_cut[1]")]
     shards = pass2a.build_identity_shards(Pass1Output(), frames)
     assert len(shards) == 1, shards
-    assert set(shards[0]) == {"f1", "f2"}, shards
-    print("ok  test_unrelated_files_pack_into_one_shard_when_small")
+    assert set(shards[0]) == {"speech_cut[0]", "speech_cut[1]"}, shards
+    print("ok  test_unrelated_cuts_pack_into_one_shard_when_small")
 
 
 def test_take_group_forces_co_location_across_files():
-    frames = [PlannedFrame("f1", 100, "take_member", "take[tg1]"),
-             PlannedFrame("f2", 100, "take_member", "take[tg1]")]
-    pass1 = Pass1Output(take_candidates=[TakeCandidate(group_id="tg1", members=[
-        TakeMember(file_id="f1", word_span=(0, 1)),
-        TakeMember(file_id="f2", word_span=(0, 1)),
-    ])])
+    # Members resolve to speech_cut[0]/[1]; those refs must co-locate. (The
+    # duplicate take[] frame is ignored -- the member's speech_cut frame is the
+    # same image.)
+    frames = [PlannedFrame("f1", 100, "speech_cut", "speech_cut[0]"),
+             PlannedFrame("f2", 100, "speech_cut", "speech_cut[1]")]
+    pass1 = Pass1Output(
+        speech_cuts=[SpeechCut(file_id="f1", word_span=(0, 1), label="a"),
+                     SpeechCut(file_id="f2", word_span=(0, 1), label="b")],
+        take_candidates=[TakeCandidate(group_id="tg1", members=[
+            TakeMember(file_id="f1", word_span=(0, 1)),
+            TakeMember(file_id="f2", word_span=(0, 1)),
+        ])])
     shards = pass2a.build_identity_shards(pass1, frames)
-    assert len(shards) == 1 and set(shards[0]) == {"f1", "f2"}, shards
+    assert len(shards) == 1 and set(shards[0]) == {"speech_cut[0]", "speech_cut[1]"}, shards
     print("ok  test_take_group_forces_co_location_across_files")
 
 
@@ -452,57 +456,82 @@ def test_bin_packing_splits_when_over_budget():
     orig = pass2a.MAX_IMAGES_PER_SHARD
     pass2a.MAX_IMAGES_PER_SHARD = 2
     try:
-        frames = ([PlannedFrame("f1", i, "speech_cut", f"speech_cut[{i}]") for i in range(2)] +
-                 [PlannedFrame("f2", i, "speech_cut", f"speech_cut[{i}]") for i in range(2)])
+        frames = [PlannedFrame("f1", i, "speech_cut", f"speech_cut[{i}]") for i in range(4)]
         shards = pass2a.build_identity_shards(Pass1Output(), frames)
     finally:
         pass2a.MAX_IMAGES_PER_SHARD = orig
     assert len(shards) == 2, shards
-    all_files = {f for shard in shards for f in shard}
-    assert all_files == {"f1", "f2"}
+    all_refs = {r for shard in shards for r in shard}
+    assert all_refs == {f"speech_cut[{i}]" for i in range(4)}, shards
     print("ok  test_bin_packing_splits_when_over_budget")
 
 
 def test_bin_packing_splits_on_cut_count_even_when_images_fit():
-    # Two unrelated files, plenty of shared image budget, but together they
-    # have too many cuts for one shard -- added after real ingest runs
-    # showed the model getting unreliable on very large single-call outputs
-    # (~40-80 cuts) independent of image count.
+    # Plenty of shared image budget, but too many cuts for one shard -- added
+    # after real ingest runs showed the model getting unreliable on very large
+    # single-call outputs (~40-80 cuts) independent of image count.
     orig = pass2a.MAX_CUTS_PER_SHARD
     pass2a.MAX_CUTS_PER_SHARD = 2
     try:
-        frames = [PlannedFrame("f1", 0, "speech_cut", "speech_cut[0]"),
-                 PlannedFrame("f2", 0, "speech_cut", "speech_cut[0]")]
-        pass1 = Pass1Output(speech_cuts=[
-            SpeechCut(file_id="f1", word_span=(0, 1), label="a"),
-            SpeechCut(file_id="f1", word_span=(2, 3), label="b"),
-            SpeechCut(file_id="f2", word_span=(0, 1), label="c"),
-            SpeechCut(file_id="f2", word_span=(2, 3), label="d"),
-        ])
-        shards = pass2a.build_identity_shards(pass1, frames)
+        frames = [PlannedFrame("f1", i, "speech_cut", f"speech_cut[{i}]") for i in range(4)]
+        shards = pass2a.build_identity_shards(Pass1Output(), frames)
     finally:
         pass2a.MAX_CUTS_PER_SHARD = orig
     assert len(shards) == 2, shards
-    assert {f for shard in shards for f in shard} == {"f1", "f2"}
+    assert {r for shard in shards for r in shard} == {f"speech_cut[{i}]" for i in range(4)}
+    assert all(len(shard) <= 2 for shard in shards), shards
     print("ok  test_bin_packing_splits_on_cut_count_even_when_images_fit")
 
 
-def test_oversized_take_cluster_is_not_split():
+def test_oversized_take_bundle_is_not_split():
     orig = pass2a.MAX_IMAGES_PER_SHARD
     pass2a.MAX_IMAGES_PER_SHARD = 1
     try:
-        frames = [PlannedFrame("f1", 0, "take_member", "take[tg1]"),
-                 PlannedFrame("f2", 0, "take_member", "take[tg1]")]
-        pass1 = Pass1Output(take_candidates=[TakeCandidate(group_id="tg1", members=[
-            TakeMember(file_id="f1", word_span=(0, 1)),
-            TakeMember(file_id="f2", word_span=(0, 1)),
-        ])])
+        frames = [PlannedFrame("f1", 0, "speech_cut", "speech_cut[0]"),
+                 PlannedFrame("f2", 0, "speech_cut", "speech_cut[1]")]
+        pass1 = Pass1Output(
+            speech_cuts=[SpeechCut(file_id="f1", word_span=(0, 1), label="a"),
+                         SpeechCut(file_id="f2", word_span=(0, 1), label="b")],
+            take_candidates=[TakeCandidate(group_id="tg1", members=[
+                TakeMember(file_id="f1", word_span=(0, 1)),
+                TakeMember(file_id="f2", word_span=(0, 1)),
+            ])])
         shards = pass2a.build_identity_shards(pass1, frames)
     finally:
         pass2a.MAX_IMAGES_PER_SHARD = orig
     assert len(shards) == 1, shards
-    assert set(shards[0]) == {"f1", "f2"}
-    print("ok  test_oversized_take_cluster_is_not_split")
+    assert set(shards[0]) == {"speech_cut[0]", "speech_cut[1]"}
+    print("ok  test_oversized_take_bundle_is_not_split")
+
+
+def test_non_take_cuts_of_a_member_file_pack_freely():
+    # The real regression: a take spans a few clips, but only the MEMBER cuts
+    # co-locate -- the member files' OTHER cuts are free to pack elsewhere,
+    # instead of dragging the whole clip into the (over-budget) take shard.
+    orig = pass2a.MAX_CUTS_PER_SHARD
+    pass2a.MAX_CUTS_PER_SHARD = 2
+    try:
+        frames = [PlannedFrame("f1", 0, "speech_cut", "speech_cut[0]"),   # take member
+                 PlannedFrame("f2", 0, "speech_cut", "speech_cut[1]"),    # take member
+                 PlannedFrame("f1", 5, "speech_cut", "speech_cut[2]"),    # f1's other cut
+                 PlannedFrame("f2", 5, "speech_cut", "speech_cut[3]")]    # f2's other cut
+        pass1 = Pass1Output(
+            speech_cuts=[SpeechCut(file_id="f1", word_span=(0, 1), label="a"),
+                         SpeechCut(file_id="f2", word_span=(0, 1), label="b"),
+                         SpeechCut(file_id="f1", word_span=(2, 3), label="c"),
+                         SpeechCut(file_id="f2", word_span=(2, 3), label="d")],
+            take_candidates=[TakeCandidate(group_id="tg1", members=[
+                TakeMember(file_id="f1", word_span=(0, 1)),
+                TakeMember(file_id="f2", word_span=(0, 1)),
+            ])])
+        shards = pass2a.build_identity_shards(pass1, frames)
+    finally:
+        pass2a.MAX_CUTS_PER_SHARD = orig
+    # the two members ride together; the non-member cuts don't get pulled in
+    member_shard = next(s for s in shards if "speech_cut[0]" in s)
+    assert set(member_shard) == {"speech_cut[0]", "speech_cut[1]"}, shards
+    assert {r for s in shards for r in s} == {f"speech_cut[{i}]" for i in range(4)}
+    print("ok  test_non_take_cuts_of_a_member_file_pack_freely")
 
 
 def test_empty_frames_yield_no_shards():
@@ -602,11 +631,12 @@ def main():
     test_no_cross_kind_ms_overlap_passes_when_disjoint()
     test_no_cross_kind_ms_overlap_catches_a_speech_and_video_cut_overlapping()
     test_single_file_one_shard()
-    test_unrelated_files_pack_into_one_shard_when_small()
+    test_unrelated_cuts_pack_into_one_shard_when_small()
     test_take_group_forces_co_location_across_files()
     test_bin_packing_splits_when_over_budget()
     test_bin_packing_splits_on_cut_count_even_when_images_fit()
-    test_oversized_take_cluster_is_not_split()
+    test_oversized_take_bundle_is_not_split()
+    test_non_take_cuts_of_a_member_file_pack_freely()
     test_empty_frames_yield_no_shards()
     test_shard_blocks_skip_unresolved_images()
     test_shard_blocks_ordered_by_file_then_ts()

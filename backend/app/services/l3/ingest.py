@@ -141,10 +141,11 @@ def run_ingest(project_id: str) -> str:
         store.set_status(ingest_run_id, "pass2")
         identity_shards = pass2a.build_identity_shards(pass1_output, planned_frames)
         shard_args = []
-        for shard_files in identity_shards:
-            shard_set = set(shard_files)
-            shard_frames = [f for f in planned_frames if f.file_id in shard_set]
-            shard_file_rows = [row for row in file_rows if row[0] in shard_set]
+        for shard_refs in identity_shards:
+            ref_set = set(shard_refs)
+            shard_frames = [f for f in planned_frames if f.ref in ref_set]
+            shard_file_ids = {f.file_id for f in shard_frames}
+            shard_file_rows = [row for row in file_rows if row[0] in shard_file_ids]
             shard_args.append((shard_file_rows, shard_frames))
 
         all_identity_cuts: List[pass2a.IdentityCut] = []

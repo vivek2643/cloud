@@ -20,6 +20,7 @@ if BACKEND not in sys.path:
     sys.path.insert(0, BACKEND)
 
 from app.services.l3 import ingest  # noqa: E402
+from app.services.l3.image_plan import PlannedFrame  # noqa: E402
 from app.services.l3.lattice import Lattice  # noqa: E402
 from app.services.llm import client as ic  # noqa: E402
 from app.services.llm.client import IngestFailure  # noqa: E402
@@ -151,7 +152,13 @@ def test_run_ingest_calls_pass2a_per_shard_and_pass2b_per_batch():
 
     p = _Patcher()
     _basic_patches(p, fake_store, file_rows)
-    p.set(ingest.pass2a, "build_identity_shards", lambda *a, **k: [["f1"], ["f2"]])
+    # shards are ref-lists now; one cut per file, so ref-based frame selection
+    # maps each shard back to its clip.
+    p.set(ingest.ip, "build_image_plan", lambda *a, **k: [
+        PlannedFrame("f1", 0, "speech_cut", "speech_cut[0]"),
+        PlannedFrame("f2", 0, "speech_cut", "speech_cut[1]")])
+    p.set(ingest.pass2a, "build_identity_shards",
+          lambda *a, **k: [["speech_cut[0]"], ["speech_cut[1]"]])
     p.set(ingest.pass2a, "run_identity_shard", fake_run_identity_shard)
     p.set(ingest.pass2b, "run_visual_batch", fake_run_visual_batch)
     p.set(ingest.post, "assemble_cut_records", fake_assemble)
@@ -234,7 +241,10 @@ def test_run_ingest_runs_pass2a_shards_concurrently_not_sequentially():
 
     p = _Patcher()
     _basic_patches(p, fake_store, file_rows)
-    p.set(ingest.pass2a, "build_identity_shards", lambda *a, **k: [[f"f{i}"] for i in range(4)])
+    p.set(ingest.ip, "build_image_plan", lambda *a, **k: [
+        PlannedFrame(f"f{i}", 0, "speech_cut", f"speech_cut[{i}]") for i in range(4)])
+    p.set(ingest.pass2a, "build_identity_shards",
+          lambda *a, **k: [[f"speech_cut[{i}]"] for i in range(4)])
     p.set(ingest.pass2a, "run_identity_shard", fake_run_identity_shard)
     p.set(ingest.pass2b, "run_visual_batch", fake_run_visual_batch)
     p.set(ingest.post, "assemble_cut_records", lambda *a, **k: [])
