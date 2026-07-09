@@ -227,6 +227,10 @@ export interface CutRecord {
   total_quality?: number | null;
   // Per-person appearance fingerprints from the pass 2 image LLM.
   characteristics?: PersonLook[];
+  // A plain camera-move phrase for the shot ("static", "pan left"/"pan right",
+  // "tilt up"/"tilt down", "zoom in"/"zoom out", "follow subject", "shaky").
+  // Deterministic from L1 camera velocity; "unknown" on pre-migration runs.
+  camera?: string;
 }
 
 export type IngestStatus = "pending" | "pass1" | "images" | "pass2" | "post" | "ready" | "failed";

@@ -30,3 +30,25 @@ PACE_LEVEL_TARGETS = (0.5, 0.8, 1.0, 1.3, 1.8)
 # energy_grade band upper bounds (mean action_energy over the cut's span);
 # anything above the last band's bound reads as "high".
 ENERGY_GRADE_BANDS = (("calm", 0.2), ("active", 0.5))
+
+# --------------------------------------------------------------------------
+# Camera-move label (post._classify_camera_move). These are ABSOLUTE, physical
+# rates against the SIGNED camera-velocity series (camera_dx/dy in fractions of
+# the frame per second, camera_zoom in scale-change per second) -- a pan is a
+# pan regardless of a clip's own spread, so unlike the cut-structure signals
+# these are fixed, interpretable thresholds, not clip-relative.
+# --------------------------------------------------------------------------
+# A translation (pan/tilt) counts as a real move once the NET displacement over
+# the cut sweeps at least this fraction of the frame per second.
+CAMERA_PAN_RATE = 0.06
+# A zoom counts once the NET scale change reaches this much per second.
+CAMERA_ZOOM_RATE = 0.04
+# Below the move thresholds, the shot is "static" unless there's appreciable
+# per-hop jitter with a near-zero net path (hand-held wobble) AND the global
+# model doesn't hold together -- then it's "shaky".
+CAMERA_SHAKE_RATE = 0.10        # summed |per-hop| travel / sec that reads as agitated
+CAMERA_SHAKE_COHERENCE = 0.5    # mean coherence below this = not one rigid move
+# A translation-dominant move where the subject is also busy and the frame
+# holds together reads as the camera FOLLOWING the subject, not a free pan.
+CAMERA_FOLLOW_ACTION = 0.35     # mean action_energy (file-normalized) over the span
+CAMERA_FOLLOW_COHERENCE = 0.6

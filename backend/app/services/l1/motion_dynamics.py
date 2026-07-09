@@ -92,6 +92,14 @@ class MotionDynamics:
     camera_coherence: List[float] = field(default_factory=list)  # 1 = rigid global move
     camera_stability: List[float] = field(default_factory=list)  # 1 = steady/sustained
     blur: List[float] = field(default_factory=list)              # 1 = fully blurred/distorted
+    # SIGNED per-hop camera velocity (absolute, NOT file-normalized -- so a pan
+    # is a pan regardless of the clip's own spread), used only for the direction
+    # of a cut's camera-move label (post._classify_camera_move). Sign convention
+    # is scene-flow: +dx = scene moves right = camera pans LEFT; +dy = scene
+    # moves down = camera tilts UP; +zoom = scene expands = camera zooms IN.
+    camera_dx: List[float] = field(default_factory=list)   # translation x, fraction of frame width / hop
+    camera_dy: List[float] = field(default_factory=list)   # translation y, fraction of frame height / hop
+    camera_zoom: List[float] = field(default_factory=list)  # scale-1 / hop (+ in, - out)
     # Derived cut-cost channels (0 = ideal seam .. 1 = avoid).
     action_cut_cost: List[float] = field(default_factory=list)
     camera_cut_cost: List[float] = field(default_factory=list)
@@ -111,6 +119,9 @@ class MotionDynamics:
             "camera_coherence": self.camera_coherence,
             "camera_stability": self.camera_stability,
             "blur": self.blur,
+            "camera_dx": self.camera_dx,
+            "camera_dy": self.camera_dy,
+            "camera_zoom": self.camera_zoom,
             "action_cut_cost": self.action_cut_cost,
             "camera_cut_cost": self.camera_cut_cost,
             "action_points": self.action_points,
@@ -344,6 +355,15 @@ def compute_motion_dynamics(
             return arr[:n]
         return arr + [0.0] * (n - len(arr))
 
+    # SIGNED camera velocity per hop, in frame-relative units, straight off the
+    # fitted model params (tx, ty, R*theta, R*(scale-1)). Absolute (un-normalized)
+    # so the move-direction classifier can use physical thresholds; see the
+    # sign convention on the dataclass fields.
+    R = math.hypot(MOTION_W, MOTION_H) / 2.0
+    cam_dx = [round(p[0] / MOTION_W, 5) for p in params]
+    cam_dy = [round(p[1] / MOTION_H, 5) for p in params]
+    cam_zoom = [round(p[3] / R, 5) for p in params] if R > 0 else [0.0] * len(params)
+
     return MotionDynamics(
         has_motion=True,
         hop_ms=hop_ms,
@@ -352,6 +372,9 @@ def compute_motion_dynamics(
         camera_coherence=_fit([round(c, 3) for c in coherence]),
         camera_stability=_fit(stability),
         blur=_fit(blur),
+        camera_dx=_fit(cam_dx),
+        camera_dy=_fit(cam_dy),
+        camera_zoom=_fit(cam_zoom),
         action_cut_cost=action_cut_cost or [1.0] * n,
         camera_cut_cost=camera_cut_cost,
         action_points=action_points,

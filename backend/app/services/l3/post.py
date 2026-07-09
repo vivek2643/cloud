@@ -27,7 +27,9 @@ from app.services.l3.lattice import Lattice, _anchors_in, resolve_speech_span_ms
 from app.services.l3.pass1 import JunkSuspect
 from app.services.l3.pass2 import Pass2Cut, Pass2Output
 from app.services.l3.post_params import (
-    ANCHOR_PAD_MS, ENERGY_GRADE_BANDS, FLATLINE_BAND, PACE_LEVEL_TARGETS, SPEED_CEIL, SPEED_FLOOR,
+    ANCHOR_PAD_MS, CAMERA_FOLLOW_ACTION, CAMERA_FOLLOW_COHERENCE, CAMERA_PAN_RATE,
+    CAMERA_SHAKE_COHERENCE, CAMERA_SHAKE_RATE, CAMERA_ZOOM_RATE, ENERGY_GRADE_BANDS,
+    FLATLINE_BAND, PACE_LEVEL_TARGETS, SPEED_CEIL, SPEED_FLOOR,
 )
 from app.services.l3.seam import BREAK_BOUNDARY_REASONS, Seam, classify_seam
 from app.services.l3.video_segments import _sharpest_ms
@@ -250,6 +252,72 @@ def compute_total_quality(kind: str, speech_quality: Optional[float],
     return round(visual_score if visual_score is not None else 0.0, 3)
 
 
+# --------------------------------------------------------------------------
+# Camera-move label: one plain phrase per cut the brain can read directly
+# (static | pan left | pan right | tilt up | tilt down | zoom in | zoom out |
+#  follow subject | shaky | unknown). Deterministic, from the SIGNED camera
+# velocity L1 already fits per hop -- no model call, no per-frame guessing.
+# --------------------------------------------------------------------------
+
+def _span_slice(arr: List[float], hop_ms: int, s: int, e: int) -> List[float]:
+    if not arr or hop_ms <= 0:
+        return []
+    lo = max(0, s // hop_ms)
+    hi = min(len(arr) - 1, max(lo, (e - 1) // hop_ms))
+    return arr[lo:hi + 1]
+
+
+def classify_camera_move(motion: Dict[str, Any], s: int, e: int) -> str:
+    """The camera's behaviour over ``[s, e)`` as a single phrase. Reads the
+    signed per-hop velocity (camera_dx/dy = frame-fraction travel, camera_zoom =
+    scale change) plus coherence/action to name the dominant move. Sign
+    convention (from scene flow): +dx = camera pans LEFT, +dy = tilts UP,
+    +zoom = zooms IN. 'unknown' when there's no motion signal for the span."""
+    hop_ms = int(motion.get("hop_ms") or 0)
+    dx = _span_slice(motion.get("camera_dx") or [], hop_ms, s, e)
+    dy = _span_slice(motion.get("camera_dy") or [], hop_ms, s, e)
+    dz = _span_slice(motion.get("camera_zoom") or [], hop_ms, s, e)
+    if not dx and not dy and not dz:
+        return "unknown"
+    dur_s = max(1e-3, (e - s) / 1000.0)
+
+    # Net (signed) travel per second along each axis -> is this a real move?
+    rate_x = sum(dx) / dur_s
+    rate_y = sum(dy) / dur_s
+    rate_z = sum(dz) / dur_s
+
+    # Strength of each candidate, normalised to its own threshold so the axes
+    # are comparable; the biggest wins.
+    cands = {
+        "zoom": abs(rate_z) / CAMERA_ZOOM_RATE,
+        "pan": abs(rate_x) / CAMERA_PAN_RATE,
+        "tilt": abs(rate_y) / CAMERA_PAN_RATE,
+    }
+    axis, strength = max(cands.items(), key=lambda kv: kv[1])
+
+    if strength < 1.0:
+        # No directed move. Agitated frame with a near-zero net path + a model
+        # that won't hold = hand-held shake; otherwise a locked-off static shot.
+        jitter = (sum(abs(v) for v in dx) + sum(abs(v) for v in dy)) / dur_s
+        coh = _mean(_span_slice(motion.get("camera_coherence") or [], hop_ms, s, e)) or 1.0
+        if jitter >= CAMERA_SHAKE_RATE and coh < CAMERA_SHAKE_COHERENCE:
+            return "shaky"
+        return "static"
+
+    if axis == "zoom":
+        return "zoom in" if rate_z > 0 else "zoom out"
+
+    # A translation move that also tracks a busy subject in a coherent frame is
+    # the camera FOLLOWING, not a free pan across a scene.
+    action = _mean(_span_slice(motion.get("action_energy") or [], hop_ms, s, e)) or 0.0
+    coh = _mean(_span_slice(motion.get("camera_coherence") or [], hop_ms, s, e)) or 0.0
+    if action >= CAMERA_FOLLOW_ACTION and coh >= CAMERA_FOLLOW_COHERENCE:
+        return "follow subject"
+    if axis == "pan":
+        return "pan left" if rate_x > 0 else "pan right"
+    return "tilt up" if rate_y > 0 else "tilt down"
+
+
 @dataclass
 class CutRecord:
     file_id: str
@@ -289,6 +357,10 @@ class CutRecord:
     #  seam_reason_next}. Computed ONCE here (the ingest signals are richest);
     # read paths (brain + UI) just read the block.
     continuity: Dict[str, Any] = field(default_factory=dict)
+    # A single plain-language camera-move phrase for the span (static, pan
+    # left/right, tilt up/down, zoom in/out, follow subject, shaky, unknown) --
+    # so the brain knows how a shot moves without reading raw motion signals.
+    camera: str = "unknown"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -304,7 +376,7 @@ class CutRecord:
             "take_group_id": self.take_group_id, "take_role": self.take_role,
             "channel": self.channel, "continuity": self.continuity,
             "speech_quality": self.speech_quality, "total_quality": self.total_quality,
-            "characteristics": self.characteristics,
+            "characteristics": self.characteristics, "camera": self.camera,
         }
 
 
@@ -646,6 +718,7 @@ def assemble_cut_records(
             channel=("said" if cut.kind == "speech"
                      else (cut.channel if cut.channel in ("done", "shown") else "shown")),
             continuity=continuity_by_idx.get(idx, {}),
+            camera=classify_camera_move(motion, s, e),
         ))
     _enforce_take_winner(out)
     return out

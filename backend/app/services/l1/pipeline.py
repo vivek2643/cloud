@@ -567,9 +567,9 @@ def _stage9_motion_dynamics(
         insert into motion_dynamics
             (file_id, hop_ms, action_energy, camera_motion, camera_coherence,
              camera_stability, blur, action_cut_cost, camera_cut_cost, action_points,
-             transition_points)
+             transition_points, camera_dx, camera_dy, camera_zoom)
         values (%s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb,
-                %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb)
+                %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb)
         on conflict (file_id) do update set
             hop_ms             = excluded.hop_ms,
             action_energy      = excluded.action_energy,
@@ -580,7 +580,10 @@ def _stage9_motion_dynamics(
             action_cut_cost    = excluded.action_cut_cost,
             camera_cut_cost    = excluded.camera_cut_cost,
             action_points      = excluded.action_points,
-            transition_points  = excluded.transition_points
+            transition_points  = excluded.transition_points,
+            camera_dx          = excluded.camera_dx,
+            camera_dy          = excluded.camera_dy,
+            camera_zoom        = excluded.camera_zoom
         """,
         (
             file_id, md.hop_ms,
@@ -589,6 +592,7 @@ def _stage9_motion_dynamics(
             json.dumps(md.blur), json.dumps(md.action_cut_cost),
             json.dumps(md.camera_cut_cost), json.dumps(md.action_points),
             json.dumps(md.transition_points),
+            json.dumps(md.camera_dx), json.dumps(md.camera_dy), json.dumps(md.camera_zoom),
         ),
     )
     logger.info(

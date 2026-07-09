@@ -274,6 +274,10 @@ def build_clip_tree(
             # + the retime verb.
             "kind": cut.get("kind"),
             "subject": cut.get("subject"),
+            # Plain camera-move phrase for the shot (static / pan / tilt / zoom /
+            # follow subject / shaky) -- surfaced in the beat line so the brain
+            # knows how the shot moves.
+            "camera": cut.get("camera") or "unknown",
             # Gist of an information-dense graphic (what it conveys), when present.
             "summary": cut.get("summary"),
             # True when speech overlaps this span -- the gist is redundant in the
@@ -748,10 +752,14 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False,
         run = f" · run:{m['run_id']}"
     cut_tag = _continuity_tag(m)
     pace_tag = _pace_tag(m)
+    # Camera move, only when there's something to say (a static/unknown shot
+    # adds no signal and would just bloat every line).
+    cam = (m.get("camera") or "").strip()
+    cam_tag = f" cam:{cam.replace(' ', '-')}" if cam and cam not in ("static", "unknown") else ""
     alt = _alt_pic_segment(m, alias, oncam)
     return (f"  {m['moment_id'].split(':')[-1]} {_capture_tag(m)} {pic} {snd} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])} {_dur_tag(m)}] "
-            f"\"{gist}\"{gloss} · nrg:{nrg}{pace_tag}{cut_tag}{run}{alt}")
+            f"\"{gist}\"{gloss} · nrg:{nrg}{pace_tag}{cam_tag}{cut_tag}{run}{alt}")
 
 
 def _clip_block(tree: Dict[str, Any], *, compact: bool = False,

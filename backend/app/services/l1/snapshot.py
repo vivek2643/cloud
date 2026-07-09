@@ -168,7 +168,7 @@ def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
             """
             select hop_ms, action_energy, camera_motion, camera_coherence,
                    camera_stability, blur, action_cut_cost, camera_cut_cost,
-                   action_points, transition_points
+                   action_points, transition_points, camera_dx, camera_dy, camera_zoom
               from motion_dynamics where file_id = %s
             """,
             (file_id,),
@@ -184,6 +184,11 @@ def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
                 "camera_coherence": md["camera_coherence"] or [],
                 "camera_stability": md["camera_stability"] or [],
                 "blur": md["blur"] or [],
+                # SIGNED camera velocity per hop (absolute), for the per-cut
+                # camera-move label. See motion_dynamics sign convention.
+                "camera_dx": md["camera_dx"] or [],
+                "camera_dy": md["camera_dy"] or [],
+                "camera_zoom": md["camera_zoom"] or [],
                 # Derived cut-cost channels (0=ideal seam .. 1=avoid).
                 "action_cut_cost": md["action_cut_cost"] or [],
                 "camera_cut_cost": md["camera_cut_cost"] or [],

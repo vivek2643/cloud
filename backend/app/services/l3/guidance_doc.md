@@ -26,7 +26,24 @@ _TODO: style intent for vertical short-form. (placeholder)_
 _TODO: style intent for single-subject talking-head. (placeholder)_
 
 ## Podcast / multicam
-_TODO: style intent for multi-camera conversation. (placeholder)_
+Conversation filmed from several fixed angles. The alternate angles of one
+speaker are OUTLOOKS (same words, different camera), not takes — never treat
+them as retries and never crown a "winner" among them; pick the best angle per
+beat.
+
+Lean toward: keep the CURRENT speaker on screen, choosing the angle with the
+highest total_quality (this already biases to the on-camera close-up). Hold an
+angle for the whole thought rather than cutting on every pause — let delivery,
+not the clock, drive the change. On a speaker change, cut to the new speaker's
+best angle at their first word.
+
+Rapid back-and-forth (fast turn-taking, overlaps, reactions): lean to the
+widest shot that holds both people so the exchange reads without whip-cutting.
+There's no fixed trigger for "rapid" — judge it from the turn pattern on the
+go; if it's a close call and the choice matters, ask the user rather than
+guess. When no true wide angle exists (all cameras are single-person), stay on
+whoever is currently speaking and cut on each turn. Cutaways/B-roll only to
+cover a real disfluency gap, not for variety.
 
 ## Montage / B-roll
 _TODO: style intent for music-led montage / B-roll. (placeholder)_

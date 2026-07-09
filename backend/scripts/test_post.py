@@ -116,6 +116,45 @@ def test_energy_grade_bands():
     print("ok  test_energy_grade_bands")
 
 
+def _cam_motion(dx=None, dy=None, dz=None, action=None, coherence=None, hop_ms=100, n=10):
+    z = [0.0] * n
+    return {
+        "hop_ms": hop_ms,
+        "camera_dx": dx if dx is not None else list(z),
+        "camera_dy": dy if dy is not None else list(z),
+        "camera_zoom": dz if dz is not None else list(z),
+        "action_energy": action if action is not None else list(z),
+        "camera_coherence": coherence if coherence is not None else [1.0] * n,
+    }
+
+
+def test_classify_camera_move():
+    span = (0, 1000)  # 10 hops @ 100ms -> dur 1.0s
+    # No signal at all -> unknown (never fabricate a move).
+    assert post.classify_camera_move({}, *span) == "unknown"
+    # Flat -> static.
+    assert post.classify_camera_move(_cam_motion(), *span) == "static"
+    # Sign convention: +dx = scene right = camera pans LEFT; -dx = pans RIGHT.
+    assert post.classify_camera_move(_cam_motion(dx=[0.02] * 10), *span) == "pan left"
+    assert post.classify_camera_move(_cam_motion(dx=[-0.02] * 10), *span) == "pan right"
+    # +dy = scene down = tilt UP; -dy = tilt DOWN.
+    assert post.classify_camera_move(_cam_motion(dy=[0.02] * 10), *span) == "tilt up"
+    assert post.classify_camera_move(_cam_motion(dy=[-0.02] * 10), *span) == "tilt down"
+    # +zoom = scene expands = zoom IN; - = OUT.
+    assert post.classify_camera_move(_cam_motion(dz=[0.01] * 10), *span) == "zoom in"
+    assert post.classify_camera_move(_cam_motion(dz=[-0.01] * 10), *span) == "zoom out"
+    # A pan tracking a busy subject in a coherent frame reads as following.
+    assert post.classify_camera_move(
+        _cam_motion(dx=[0.02] * 10, action=[0.6] * 10, coherence=[0.9] * 10), *span
+    ) == "follow subject"
+    # Big per-hop jitter, near-zero net, incoherent -> shaky, not static.
+    jitter = [0.05, -0.05, 0.05, -0.05, 0.05, -0.05, 0.05, -0.05, 0.05, -0.05]
+    assert post.classify_camera_move(
+        _cam_motion(dx=jitter, coherence=[0.2] * 10), *span
+    ) == "shaky"
+    print("ok  test_classify_camera_move")
+
+
 # --------------------------------------------------------------------------
 # coverage/overlap invariant
 # --------------------------------------------------------------------------
@@ -568,6 +607,7 @@ def main():
     test_pace_levels_partial_saturation_repeats_nearest_reachable()
     test_pace_levels_zero_intrinsic_velocity_maxes_every_level()
     test_energy_grade_bands()
+    test_classify_camera_move()
     test_validate_no_overlap_passes_exact_coverage()
     test_validate_no_overlap_allows_start_gap()
     test_validate_no_overlap_allows_end_gap()

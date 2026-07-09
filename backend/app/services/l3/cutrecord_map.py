@@ -293,6 +293,9 @@ def _to_cut_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "junk": bool(row.get("junk")),
         "junk_reason": row.get("junk_reason"),
         "continuity": row.get("continuity") or {},
+        # A plain camera-move phrase (static / pan / tilt / zoom / follow /
+        # shaky) so the brain knows how the shot moves without raw signals.
+        "camera": row.get("camera") or "unknown",
     }
 
 
