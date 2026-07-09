@@ -312,15 +312,42 @@ def test_pass2a_semantic_checks_combines_all_checks():
     ])
     assert pass2a._pass2a_semantic_checks(clean, p1, {}, {"f1"}) is None
 
-    # a cut for a file OUTSIDE this shard is rejected (observed: a shard
-    # emitting cuts for another shard's clips -> identical-span dupes in post)
-    out_of_scope = pass2a.IdentityOutput(cuts=[
-        pass2a.IdentityCut(source_ref="speech_cut[0]", kind="speech", file_id="f2",
-                          word_span=(0, 1), label="a", summary="a"),
+    # a cut for a clip OUTSIDE this shard is FILTERED OUT (not an error) --
+    # its own shard emits it, so the stray here is a pure duplicate. p1b has
+    # speech_cut[1] on f2; a shard of {f1} must silently drop it.
+    p1b = Pass1Output(speech_cuts=[
+        SpeechCut(file_id="f1", word_span=(0, 1), label="a"),
+        SpeechCut(file_id="f2", word_span=(0, 1), label="b"),
     ])
-    err = pass2a._pass2a_semantic_checks(out_of_scope, p1, {}, {"f1"})
-    assert err is not None and "NOT part of this call" in err, err
+    out_of_scope = pass2a.IdentityOutput(cuts=[
+        pass2a.IdentityCut(source_ref="speech_cut[1]", kind="speech", file_id="f2",
+                          word_span=(0, 1), label="b", summary="b"),
+    ])
+    assert pass2a._pass2a_semantic_checks(out_of_scope, p1b, {}, {"f1"}) is None
     print("ok  test_pass2a_semantic_checks_combines_all_checks")
+
+
+def test_drop_out_of_shard_cuts_filters_strays_and_fixes_file_id():
+    p1 = Pass1Output(speech_cuts=[
+        SpeechCut(file_id="f1", word_span=(0, 1), label="a"),
+        SpeechCut(file_id="f2", word_span=(0, 1), label="b"),
+    ])
+    out = pass2a.IdentityOutput(cuts=[
+        # in-shard, correct
+        pass2a.IdentityCut(source_ref="speech_cut[0]", kind="speech", file_id="f1",
+                          word_span=(0, 1), label="a", summary="a"),
+        # out-of-shard (source_ref resolves to f2) -> dropped
+        pass2a.IdentityCut(source_ref="speech_cut[1]", kind="speech", file_id="f2",
+                          word_span=(0, 1), label="b", summary="b"),
+        # in-shard but model mislabeled file_id -> kept, file_id corrected to f1
+        pass2a.IdentityCut(source_ref="speech_cut[0]", kind="speech", file_id="f9",
+                          word_span=(0, 1), label="c", summary="c"),
+    ])
+    filtered, dropped = pass2a._drop_out_of_shard_cuts(out, p1, {"f1"})
+    assert dropped == 1, dropped
+    assert [c.source_ref for c in filtered.cuts] == ["speech_cut[0]", "speech_cut[0]"]
+    assert all(c.file_id == "f1" for c in filtered.cuts), [c.file_id for c in filtered.cuts]
+    print("ok  test_drop_out_of_shard_cuts_filters_strays_and_fixes_file_id")
 
 
 def test_source_refs_exist_rejects_an_invented_ref():
@@ -570,6 +597,7 @@ def main():
     test_no_overlapping_word_spans_catches_a_duplicate_span()
     test_no_overlapping_word_spans_ignores_different_files()
     test_pass2a_semantic_checks_combines_all_checks()
+    test_drop_out_of_shard_cuts_filters_strays_and_fixes_file_id()
     test_source_refs_exist_rejects_an_invented_ref()
     test_no_cross_kind_ms_overlap_passes_when_disjoint()
     test_no_cross_kind_ms_overlap_catches_a_speech_and_video_cut_overlapping()

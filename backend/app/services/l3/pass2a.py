@@ -511,27 +511,54 @@ def _no_cross_kind_ms_overlap(output: IdentityOutput, lattices: Dict[str, Lattic
     return None
 
 
-def _cuts_only_for_shard_files(output: IdentityOutput, shard_files: set) -> Optional[str]:
-    """Observed against the real API on a multi-shard project: the cached
-    pass-1 render lists EVERY file's units, so a shard also emitted cuts for
-    files belonging to OTHER shards -- and since per-shard checks can't see
-    across shards, the duplicates only surfaced as an identical-span overlap
-    in post. Every shard must emit cuts ONLY for its own files."""
-    for cut in output.cuts:
-        if cut.file_id not in shard_files:
-            return (f"{cut.source_ref!r} is for clip {cut.file_id}, which is NOT part of "
-                    f"this call -- emit cuts ONLY for the clips whose images you were "
-                    f"shown here; other clips are handled in separate calls")
+def _resolved_file_id(cut: IdentityCut, pass1: Pass1Output) -> Optional[str]:
+    """The clip a cut TRULY belongs to, resolved from its source_ref against
+    pass 1 -- authoritative, since the model's own file_id field can be wrong.
+    None when the ref doesn't resolve to a pass-1 unit."""
+    if cut.kind == "speech":
+        i = _ref_index(cut.source_ref, "speech_cut[")
+        if i is not None and i < len(pass1.speech_cuts):
+            return pass1.speech_cuts[i].file_id
+    elif cut.kind == "video":
+        gi = _ref_index(cut.source_ref, "video_group[")
+        if gi is not None and gi < len(pass1.video_tentative_groups):
+            return pass1.video_tentative_groups[gi].file_id
     return None
+
+
+def _drop_out_of_shard_cuts(output: IdentityOutput, pass1: Pass1Output,
+                            shard_files: set) -> Tuple[IdentityOutput, int]:
+    """Drop cuts that belong to a clip OUTSIDE this shard, returning
+    (filtered_output, n_dropped). The cached pass-1 render lists EVERY clip's
+    units, so a shard -- especially an oversized take-group cluster the model
+    can't hold in one call -- sometimes emits cuts for clips it wasn't shown.
+    Those clips are handled by their OWN shard, so the strays here are pure
+    duplicates: discarding them (rather than failing the whole call) is what
+    lets big multicam projects ingest, and still keeps post from ever seeing
+    cross-shard duplicate spans. Clip ownership is resolved from source_ref
+    (authoritative), falling back to the model's file_id if a ref doesn't
+    resolve. A kept cut whose model file_id disagrees with its source_ref is
+    corrected to the resolved clip so post attributes it correctly."""
+    kept: List[IdentityCut] = []
+    for c in output.cuts:
+        owner = _resolved_file_id(c, pass1) or c.file_id
+        if owner not in shard_files:
+            continue
+        kept.append(c if c.file_id == owner else c.model_copy(update={"file_id": owner}))
+    dropped = len(output.cuts) - len(kept)
+    return output.model_copy(update={"cuts": kept}), dropped
 
 
 def _pass2a_semantic_checks(output: IdentityOutput, pass1: Pass1Output,
                             lattices: Dict[str, Lattice], shard_files: set) -> Optional[str]:
     """Run against the BACKFILLED output (see backfill_locators) -- locator
-    checks are meaningless before the deterministic fill."""
+    checks are meaningless before the deterministic fill. Out-of-shard strays
+    are filtered out FIRST (see _drop_out_of_shard_cuts) so they can't trip a
+    spurious re-ask; run_identity_shard applies the same filter to the
+    persisted output."""
     output = backfill_locators(output, pass1)
-    return (_cuts_only_for_shard_files(output, shard_files)
-           or _source_refs_exist(output, pass1)
+    output, _ = _drop_out_of_shard_cuts(output, pass1, shard_files)
+    return (_source_refs_exist(output, pass1)
            or _kind_matches_source_ref(output)
            or _locators_resolved(output)
            or _split_groups_partition_atoms(output, pass1)
@@ -561,7 +588,18 @@ def run_identity_shard(
         raise ValueError("run_identity_shard: no images resolved for this shard")
     lattices = {fid: lattice for fid, _name, _dur, lattice in file_rows}
     shard_files = {f.file_id for f in shard_frames}
-    return ic.complete("pass2", _SYSTEM, cached_blocks, IdentityOutput,
-                       extra_blocks=image_blocks, max_tokens=20000,
-                       extra_check=lambda output: _pass2a_semantic_checks(
-                           output, pass1_output, lattices, shard_files))
+    completion = ic.complete("pass2", _SYSTEM, cached_blocks, IdentityOutput,
+                             extra_blocks=image_blocks, max_tokens=20000,
+                             extra_check=lambda output: _pass2a_semantic_checks(
+                                 output, pass1_output, lattices, shard_files))
+    # The persisted output must carry ONLY this shard's clips. The semantic
+    # check already filters strays before validating, but ic.complete returns
+    # the model's RAW payload, so drop them here too -- otherwise post would
+    # see the same cut from two shards as an identical-span overlap.
+    filtered, dropped = _drop_out_of_shard_cuts(
+        IdentityOutput.model_validate(completion.data), pass1_output, shard_files)
+    if dropped:
+        logger.warning("pass2a: dropped %d out-of-shard cut(s) from a %d-clip shard "
+                       "(each handled by its own shard)", dropped, len(shard_files))
+        completion.data = filtered.model_dump()
+    return completion
