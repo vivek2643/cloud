@@ -410,8 +410,9 @@ def _seg_span_total(document: dict) -> int:
 # --------------------------------------------------------------------------
 
 def diagnose(document: dict, ctx: EditContext) -> List[dict]:
-    """Editorial findings the brain may want to act on. Each: {severity, message,
-    anchor?}. Derived from feel + the map -- opinion-free about the fix."""
+    """Editorial findings computed from the edit. Each: {severity, message,
+    anchor?}. Derived from feel + the map -- OBSERVATIONS only, no suggested
+    fix (the brain decides what, if anything, to do)."""
     timeline = document.get("timeline") or []
     findings: List[dict] = []
     if not timeline:
@@ -420,10 +421,10 @@ def diagnose(document: dict, ctx: EditContext) -> List[dict]:
 
     for lo, hi in feel._same_speaker_runs(report.cuts):
         findings.append({"severity": "warn", "anchor": f"cuts {lo}-{hi}",
-                         "message": "same speaker back-to-back (jump-cut risk); consider a cutaway or reorder"})
+                         "message": "same speaker back-to-back (jump-cut risk)"})
     for lo, hi in feel._low_energy_runs(report.cuts):
         findings.append({"severity": "info", "anchor": f"cuts {lo}-{hi}",
-                         "message": "energy sags; consider tightening or trimming"})
+                         "message": "low-energy run"})
 
     # Target length (from the brief) vs current.
     target_s = (document.get("brief") or {}).get("target_duration_s")
@@ -431,10 +432,10 @@ def diagnose(document: dict, ctx: EditContext) -> List[dict]:
         cur = report.total_ms / 1000.0
         if cur > target_s * 1.15:
             findings.append({"severity": "warn", "anchor": "whole",
-                             "message": f"over target: {cur:.1f}s vs {target_s:.1f}s (tighten or drop)"})
+                             "message": f"over target: {cur:.1f}s vs {target_s:.1f}s"})
         elif cur < target_s * 0.7:
             findings.append({"severity": "info", "anchor": "whole",
-                             "message": f"under target: {cur:.1f}s vs {target_s:.1f}s (widen or add)"})
+                             "message": f"under target: {cur:.1f}s vs {target_s:.1f}s"})
 
     # Redundant takes: two main-line cuts from the same dup group.
     group_of: Dict[str, str] = {}
@@ -446,7 +447,7 @@ def diagnose(document: dict, ctx: EditContext) -> List[dict]:
         gid = group_of.get(seg.get("ref") or "")
         if gid and gid in seen_groups:
             findings.append({"severity": "warn", "anchor": f"cuts {seen_groups[gid]+1} & {i+1}",
-                             "message": "same-beat takes both on the main line (redundant); keep the stronger"})
+                             "message": "same-beat takes both on the main line"})
         elif gid:
             seen_groups[gid] = i
     return findings
@@ -489,9 +490,8 @@ def affordances(document: dict, ctx: EditContext) -> dict:
         entry.update(_pace_affordance(meta, is_video))
         per_cut.append(entry)
 
-    # Video moments in the library not already on the main line -> cutaway pool.
-    # Junk is skip-by-default (cuts_v3_continuity.plan.md) -- kept out of the
-    # RECOMMENDED pool, though still placeable by ref if the brain chooses to.
+    # Video moments in the library not already on the main line. Junk is left
+    # out of this pool (still placeable by ref if the brain chooses to).
     on_line = {s.get("ref") for s in timeline}
     cutaway_pool = [
         m["moment_id"] for clip in ctx.map_struct.get("clips", [])

@@ -58,89 +58,83 @@ def _specs() -> List[Dict[str, Any]]:
         "type": "object", "properties": props, "required": required or []}
     return [
         # --- OBSERVE (read-only senses) ---
-        S("read_state", "Look at the current edit: ordered cuts (pos, seg_id, ref, "
+        S("read_state", "Returns the current edit: ordered cuts (pos, seg_id, ref, "
           "duration, channel, speaker, muted, text), channels in use, total length, "
-          "and a feel narration. Call this first, and again after edits, to see "
-          "what you changed.", obj({})),
-        S("predict", "Project the program LENGTH under a proposed change WITHOUT "
-          "applying it -- e.g. how long the edit would run if every cut were taken "
-          "at 'tight', or after dropping/adding cuts. Use to hit a target length.",
+          "and a feel narration.", obj({})),
+        S("predict", "Returns the program LENGTH under a proposed change without "
+          "applying it: set_level re-takes every main-line cut at that level, drop "
+          "removes those seg_ids, add appends [{ref, level}] cuts. Gives "
+          "current_ms, projected_ms, delta_ms.",
           obj({"set_level": {"type": "string", "enum": list(observe._LEVELS)},
                "drop": {"type": "array", "items": {"type": "string"}},
                "add": {"type": "array", "items": {"type": "object", "properties": {
                    "ref": {"type": "string"}, "level": {"type": "string"}}}}})),
-        S("validate", "Check the edit for STRUCTURAL problems (spans out of range, "
-          "empty cuts, bad V2 cutaways/layouts). Empty result means clean.", obj({})),
-        S("diagnose", "Editorial problems worth fixing (jump-cut risk, energy sags, "
-          "over/under target length, redundant same-beat takes). Advice, not orders.",
+        S("validate", "Returns STRUCTURAL problems in the edit (spans out of range, "
+          "empty cuts, malformed V2 cutaways/layouts). Empty result means clean.", obj({})),
+        S("diagnose", "Returns editorial findings computed from the edit (same-speaker "
+          "runs, low-energy runs, distance from any target length, same-beat takes "
+          "that are both on the main line). Observations only.",
           obj({})),
-        S("affordances", "The menu of what you CAN do and to what: per-cut retake "
-          "levels (tighter/wider), alternate takes, audio toggles, channels in use, "
-          "and a pool of video moments you could add as cutaways.", obj({})),
+        S("affordances", "Returns what is POSSIBLE: per cut the retake levels "
+          "(tighter/wider), alternate takes, whether audio can toggle, and the pace "
+          "steps; globally the channels in use, addable channels, layout templates, "
+          "and the video moments not currently on the main line.", obj({})),
         # --- ACT (edit verbs; each mutates the working document) ---
-        S("place", "Add a cut from the beat index by its ref. channel 'V1' inserts "
-          "on the MAIN LINE (picture+sound) at index `at` (default append); 'V2' "
-          "lays a SILENT video cutaway over the ongoing audio at `from_ms` (add "
-          "audio:'keep' to play its own sound). `level` sets the energy take.",
+        S("place", "Adds a cut by its ref. channel 'V1' inserts on the main line "
+          "(picture+sound) at index `at` (default append); 'V2' lays a silent video "
+          "layer over the ongoing audio at program `from_ms` (audio:'keep' plays its "
+          "own sound). `level` selects the energy take.",
           obj({"ref": {"type": "string"}, "level": {"type": "string", "enum": list(observe._LEVELS)},
                "channel": {"type": "string", "enum": ["V1", "V2"]},
                "at": {"type": "integer"}, "from_ms": {"type": "integer"},
                "audio": {"type": "string", "enum": ["keep", "mute"]},
                "reason": {"type": "string"}}, ["ref"])),
-        S("trim", "Nudge a cut's SOURCE in/out. Absolute (in_ms/out_ms) or relative "
-          "(delta_in_ms/delta_out_ms, e.g. delta_in_ms:200 starts 200ms later). "
-          "Targets a main-line seg_id or a V2 op_id.",
+        S("trim", "Changes a cut's SOURCE in/out. Absolute (in_ms/out_ms) or relative "
+          "(delta_in_ms/delta_out_ms; delta_in_ms:200 starts 200ms later). Targets a "
+          "main-line seg_id or a V2 op_id.",
           obj({"target_id": {"type": "string"},
                "in_ms": {"type": "integer"}, "out_ms": {"type": "integer"},
                "delta_in_ms": {"type": "integer"}, "delta_out_ms": {"type": "integer"}},
               ["target_id"])),
-        S("remove", "Drop a main-line cut (seg_id) or an operation (op_id).",
+        S("remove", "Removes a main-line cut (seg_id) or an operation (op_id).",
           obj({"target_id": {"type": "string"}}, ["target_id"])),
-        S("move", "Reorder a main-line cut to a new 0-based index.",
+        S("move", "Reorders a main-line cut to a new 0-based index.",
           obj({"seg_id": {"type": "string"}, "to_index": {"type": "integer"}},
               ["seg_id", "to_index"])),
-        S("set_audio", "Mute or unmute a cut's SOURCE audio, keeping its picture. "
-          "mute:true silences (e.g. a b-roll cutaway); mute:false plays its sound.",
+        S("set_audio", "Mutes or unmutes a cut's SOURCE audio, keeping its picture "
+          "(mute:true silences, mute:false plays its sound).",
           obj({"target_id": {"type": "string"}, "mute": {"type": "boolean"}},
               ["target_id", "mute"])),
-        S("split_edit", "J/L cut: decouple the AUDIO edge from the VIDEO edge at the "
-          "seam just BEFORE main-line cut `seam_seg_id`. audio_offset_ms < 0 (J-cut): "
-          "the incoming cut's audio LEADS under the previous picture (e.g. -400 = hear "
-          "the next speaker 400ms before seeing them). > 0 (L-cut): the previous cut's "
-          "audio lingers over the new picture. 0 clears the split at that seam. One "
-          "split per seam (re-issuing replaces). Keep offsets subtle (200-800ms).",
+        S("split_edit", "Decouples the AUDIO edge from the VIDEO edge at the seam just "
+          "before main-line cut `seam_seg_id` (J/L cut). audio_offset_ms < 0: the "
+          "incoming cut's audio leads under the previous picture; > 0: the previous "
+          "cut's audio lingers over the new picture; 0 clears the split. One split "
+          "per seam (re-issuing replaces).",
           obj({"seam_seg_id": {"type": "string"},
                "audio_offset_ms": {"type": "integer"}},
               ["seam_seg_id", "audio_offset_ms"])),
-        S("tighten", "Re-take main-line cut(s) at a different energy `level`: how "
-          "MUCH of the beat you keep around its peak (broad = the full run-up, "
-          "sharp = just the core). With seg_id -> just that cut; without -> every "
-          "cut that has that level. This is the SPACE axis -- for pacing (SPEED / "
-          "dead-air), use `retime`.",
+        S("tighten", "Re-takes main-line cut(s) at a different energy `level` = how "
+          "much of the beat is kept around its peak (broad = the full run-up, sharp = "
+          "just the core). With seg_id -> that cut; without -> every cut that has "
+          "that level.",
           obj({"seg_id": {"type": "string"}, "level": {"type": "string", "enum": list(observe._LEVELS)}},
               ["level"])),
-        S("retime", "Set a cut's PLAYBACK PACE -- a different axis from `tighten`. "
-          "The effect depends on the cut and is deliberate: a VIDEO cut PLAYS at "
-          "that speed (levels are normalized across clips so the same step stays "
-          "smooth vs neighbours; 'natural'~=1x, 'faster' speeds the motion up and "
-          "shortens it) -- but the render doesn't bake speed yet, so it's RECORDED "
-          "and shown in read_state, not yet in the export length. A SPEECH cut is "
-          "NEVER pitched/sped (that reads amateur); instead 'faster'/'much_faster' "
-          "shave removable DEAD-AIR + FILLERS to tighten the delivery (applies "
-          "now), while 'natural'/'slower' keep every pause. Check a cut's pace room "
-          "in the beat index (pace:LO-HIx for video, trim<=Xs for speech). With "
-          "seg_id -> just that cut; without -> the whole main line.",
+        S("retime", "Sets a cut's PLAYBACK PACE. A VIDEO cut plays at that speed "
+          "(levels are normalized across clips so a step stays consistent between "
+          "neighbours; 'natural'~=1x); this is RECORDED and shown in read_state but "
+          "the render does not bake speed into the export length yet. A SPEECH cut "
+          "is never pitched/sped: 'faster'/'much_faster' shave removable dead-air + "
+          "fillers, 'natural'/'slower' keep every pause. With seg_id -> that cut; "
+          "without -> the whole main line.",
           obj({"seg_id": {"type": "string"},
                "pace": {"type": "string", "enum": list(act._PACE_STEPS)}},
               ["pace"])),
-        S("split_screen", "Show the MAIN LINE and a second source at the same time "
-          "over the window [from_ms, to_ms]: template 'split_h' (side-by-side), "
-          "'split_v' (stacked), or 'pip' (inset over the main line). The added cell "
-          "source is EITHER a map `ref` (e.g. the coverage-group member that SHOWS "
-          "the other person during this beat) OR a raw window `file`+`in_ms`+`out_ms` "
-          "into a clip you already know about, seam-snapped to the nearest clean "
-          "boundary. The added cell is silent unless audio:'keep'. This is a "
-          "user-owned look -- ask_user first. from_ms/to_ms are PROGRAM ms.",
+        S("split_screen", "Shows the MAIN LINE and a second source at once over the "
+          "window [from_ms, to_ms] (program ms): template 'split_h' (side-by-side), "
+          "'split_v' (stacked), or 'pip' (inset over the main line). The second cell "
+          "source is either a map `ref` or a raw window `file`+`in_ms`+`out_ms` "
+          "(seam-snapped to the nearest clean boundary). The second cell is silent "
+          "unless audio:'keep'.",
           obj({"ref": {"type": "string"},
                "file": {"type": "string"},
                "in_ms": {"type": "integer"}, "out_ms": {"type": "integer"},
@@ -152,11 +146,9 @@ def _specs() -> List[Dict[str, Any]]:
                "reason": {"type": "string"}},
               ["template", "from_ms", "to_ms"])),
         # --- ASK (pause the turn for a user-owned decision) ---
-        S("ask_user", "Pause and ask the user when a choice is genuinely THEIRS -- "
-          "a split-screen/PiP layout, the delivery aspect/framing, or a big pacing "
-          "tradeoff. Give each question 2+ CONCRETE options (they can also type "
-          "their own). Calling this ENDS your turn; you resume when they answer. "
-          "Don't ask about things you can reasonably decide yourself.",
+        S("ask_user", "Pauses the turn and asks the user one or more multiple-choice "
+          "questions (each needs 2+ concrete options; they can also type their own). "
+          "Calling this ENDS your turn; you resume when they answer.",
           obj({"questions": {"type": "array", "items": {"type": "object", "properties": {
               "prompt": {"type": "string"},
               "options": {"type": "array", "items": {"type": "string"}},
