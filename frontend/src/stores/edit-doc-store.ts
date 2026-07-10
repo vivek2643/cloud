@@ -42,16 +42,16 @@ function sameOps(a: EditOperation[], b: EditOperation[]): boolean {
 interface Snapshot {
   timeline: EditSegment[];
   operations: EditOperation[];
-  selected: string | null;
+  selectedIds: string[];
 }
 
 const MAX_HISTORY = 100;
 
-function snapshotOf(st: { timeline: EditSegment[]; operations: EditOperation[]; selected: string | null }): Snapshot {
+function snapshotOf(st: { timeline: EditSegment[]; operations: EditOperation[]; selectedIds: string[] }): Snapshot {
   return {
     timeline: st.timeline.map((s) => ({ ...s })),
     operations: st.operations.map((o) => ({ ...o })),
-    selected: st.selected,
+    selectedIds: [...st.selectedIds],
   };
 }
 
@@ -68,7 +68,8 @@ interface EditDocState {
   durations: Durations;
   /** Delivery frame shape for the preview/render (from the document format). */
   aspect: EditAspect;
-  selected: string | null;
+  /** Multi-select: `ProjectClip.id`-shaped ("seg:<seg_id>" | "op:<op_id>"). */
+  selectedIds: string[];
 
   /** Seed/replace baseline + working state from an authoritative document. */
   seed: (threadId: string, version: number, doc: EditDocument | null) => void;
@@ -82,7 +83,11 @@ interface EditDocState {
   isDirty: () => boolean;
   setDurations: (d: Durations) => void;
   mergeDurations: (d: Durations) => void;
-  select: (segId: string | null) => void;
+  /** Replace the selection outright (plain click / marquee / programmatic). */
+  select: (ids: string[]) => void;
+  /** Add/remove one id from the selection (shift-click). */
+  toggleSelect: (id: string) => void;
+  clearSelection: () => void;
 
   // --- undo / redo (separate from revert-to-baseline) ---
   past: Snapshot[];
@@ -96,7 +101,7 @@ interface EditDocState {
   canUndo: () => boolean;
   canRedo: () => boolean;
 
-  // --- timeline mutators ---
+  // --- timeline (spine) mutators ---
   trim: (segId: string, edge: "in" | "out", absMs: number) => void;
   nudge: (segId: string, edge: "in" | "out", delta: number) => void;
   move: (segId: string, dir: -1 | 1) => void;
@@ -104,13 +109,15 @@ interface EditDocState {
   reorderSeg: (segId: string, toIndex: number) => void;
   /** Split at an absolute ms (defaults to the segment's midpoint). */
   split: (segId: string, atMs?: number) => void;
+  /** Spine is gapless, so removing a segment always ripples (no "lift" for
+   * the spine — there's no gap primitive in the document schema). */
   remove: (segId: string) => void;
   /** Insert a spine cut from a dragged clip (default: append). Selects it. */
   addSegment: (
     seg: { file_id: string; in_ms: number; out_ms: number },
     atIndex?: number
   ) => void;
-  /** Add a placed V2 video cutaway / A2 audio bed from a dragged clip. */
+  /** Add a placed V2 video cutaway / A2 audio bed from a dragged clip. Selects it. */
   addOp: (op: {
     type: "place_video" | "place_audio";
     source_file_id: string;
@@ -124,7 +131,14 @@ interface EditDocState {
 
   // --- operation mutators ---
   setGain: (opId: string, gainDb: number) => void;
+  /** "Lift" delete — removes the op, leaving its slot empty (no shift). */
   removeOp: (opId: string) => void;
+  /** "Ripple" delete — removes the op and shifts every LATER op on the same
+   * track (video: same z; audio: same role) left by its duration. */
+  rippleRemoveOp: (opId: string) => void;
+  /** Split a placed op into two at an absolute PROGRAM ms (1:1 program->source
+   * mapping, matching the op's own from_ms/to_ms domain). */
+  splitOp: (opId: string, atProgMs: number) => void;
   /** Reposition a placed clip (place_video/place_audio) on the
    * program clock, keeping its duration. `maxMs` clamps the end to the base. */
   setOpFrom: (opId: string, fromMs: number, maxMs: number) => void;
@@ -145,7 +159,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
   layoutRegions: [],
   durations: {},
   aspect: "landscape",
-  selected: null,
+  selectedIds: [],
   past: [],
   future: [],
 
@@ -161,7 +175,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       operations: operations.map((o) => ({ ...o })),
       layoutRegions: doc?.layout_regions ?? [],
       aspect: docAspect(doc),
-      selected: null,
+      selectedIds: [],
       past: [],
       future: [],
     });
@@ -177,7 +191,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       operations: [],
       layoutRegions: [],
       aspect: "landscape",
-      selected: null,
+      selectedIds: [],
       past: [],
       future: [],
     }),
@@ -204,7 +218,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       future: [],
       timeline: st.baselineTimeline.map((s) => ({ ...s })),
       operations: st.baselineOperations.map((o) => ({ ...o })),
-      selected: null,
+      selectedIds: [],
     })),
 
   pushHistory: () =>
@@ -222,7 +236,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
         future: [...st.future, snapshotOf(st)].slice(-MAX_HISTORY),
         timeline: prev.timeline,
         operations: prev.operations,
-        selected: prev.selected,
+        selectedIds: prev.selectedIds,
       };
     }),
 
@@ -235,7 +249,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
         past: [...st.past, snapshotOf(st)].slice(-MAX_HISTORY),
         timeline: next.timeline,
         operations: next.operations,
-        selected: next.selected,
+        selectedIds: next.selectedIds,
       };
     }),
 
@@ -248,7 +262,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
     set({
       timeline: timeline.map((s) => ({ ...s })),
       operations: operations.map((o) => ({ ...o })),
-      selected: null,
+      selectedIds: [],
       past: [],
       future: [],
     }),
@@ -263,7 +277,14 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
 
   setDurations: (d) => set({ durations: d }),
   mergeDurations: (d) => set((st) => ({ durations: { ...st.durations, ...d } })),
-  select: (segId) => set({ selected: segId }),
+  select: (ids) => set({ selectedIds: ids }),
+  toggleSelect: (id) =>
+    set((st) => ({
+      selectedIds: st.selectedIds.includes(id)
+        ? st.selectedIds.filter((x) => x !== id)
+        : [...st.selectedIds, id],
+    })),
+  clearSelection: () => set({ selectedIds: [] }),
 
   trim: (segId, edge, absMs) =>
     set((st) => ({
@@ -324,15 +345,16 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       const b = { ...s, seg_id: rid("se"), in_ms: mid };
       const next = [...st.timeline];
       next.splice(i, 1, a, b);
-      return { timeline: next };
+      return { timeline: next, selectedIds: [`seg:${a.seg_id}`, `seg:${b.seg_id}`] };
     }),
 
   remove: (segId) =>
     set((st) => {
       if (st.timeline.length <= 1) return {};
+      const clipId = `seg:${segId}`;
       return {
         timeline: st.timeline.filter((s) => s.seg_id !== segId),
-        selected: st.selected === segId ? null : st.selected,
+        selectedIds: st.selectedIds.filter((id) => id !== clipId),
       };
     }),
 
@@ -350,7 +372,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       const idx =
         atIndex == null ? next.length : Math.max(0, Math.min(Math.round(atIndex), next.length));
       next.splice(idx, 0, newSeg);
-      return { timeline: next, selected: newSeg.seg_id };
+      return { timeline: next, selectedIds: [`seg:${newSeg.seg_id}`] };
     }),
 
   addOp: (op) =>
@@ -384,7 +406,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
               audio_kind: op.audio_kind ?? "bed",
               gain_db: 0,
             };
-      return { operations: [...st.operations, newOp] };
+      return { operations: [...st.operations, newOp], selectedIds: [`op:${newOp.op_id}`] };
     }),
 
   setGain: (opId, gainDb) =>
@@ -395,7 +417,60 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
     })),
 
   removeOp: (opId) =>
-    set((st) => ({ operations: st.operations.filter((o) => o.op_id !== opId) })),
+    set((st) => ({
+      operations: st.operations.filter((o) => o.op_id !== opId),
+      selectedIds: st.selectedIds.filter((id) => id !== `op:${opId}`),
+    })),
+
+  rippleRemoveOp: (opId) =>
+    set((st) => {
+      const removed = st.operations.find((o) => o.op_id === opId);
+      if (!removed || removed.from_ms == null || removed.to_ms == null) {
+        return {
+          operations: st.operations.filter((o) => o.op_id !== opId),
+          selectedIds: st.selectedIds.filter((id) => id !== `op:${opId}`),
+        };
+      }
+      const removedFrom = removed.from_ms;
+      const dur = removed.to_ms - removedFrom;
+      const sameTrack = (o: EditOperation) =>
+        removed.type === "place_video"
+          ? o.type === "place_video" && Math.round(o.z ?? 10) === Math.round(removed.z ?? 10)
+          : o.type === "place_audio" && (o.role ?? "music") === (removed.role ?? "music");
+      const operations = st.operations
+        .filter((o) => o.op_id !== opId)
+        .map((o) => {
+          if (!sameTrack(o) || o.from_ms == null || o.to_ms == null || o.from_ms < removedFrom) return o;
+          return { ...o, from_ms: o.from_ms - dur, to_ms: o.to_ms - dur };
+        });
+      return {
+        operations,
+        selectedIds: st.selectedIds.filter((id) => id !== `op:${opId}`),
+      };
+    }),
+
+  splitOp: (opId, atProgMs) =>
+    set((st) => {
+      const i = st.operations.findIndex((o) => o.op_id === opId);
+      if (i < 0) return {};
+      const o = st.operations[i];
+      if (o.from_ms == null || o.to_ms == null) return {};
+      const at = Math.round(atProgMs);
+      if (at - o.from_ms < MIN_SEG_MS || o.to_ms - at < MIN_SEG_MS) return {};
+      const srcIn = Math.round(o.src_in_ms ?? 0);
+      // 1:1 program->source mapping (ops never change playback speed).
+      const splitSrc = srcIn + (at - o.from_ms);
+      const a: EditOperation = { ...o, to_ms: at, src_out_ms: splitSrc };
+      const b: EditOperation = {
+        ...o,
+        op_id: rid(o.type === "place_video" ? "pv" : "pa"),
+        from_ms: at,
+        src_in_ms: splitSrc,
+      };
+      const next = [...st.operations];
+      next.splice(i, 1, a, b);
+      return { operations: next, selectedIds: [`op:${a.op_id}`, `op:${b.op_id}`] };
+    }),
 
   setOpFrom: (opId, fromMs, maxMs) =>
     set((st) => ({

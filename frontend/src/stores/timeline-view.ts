@@ -26,6 +26,16 @@ function clampZoom(v: number): number {
   return Math.max(MIN_PX_PER_SEC, Math.min(MAX_PX_PER_SEC, v));
 }
 
+/** A copied clip's descriptor — source + kind + a track hint for paste, per
+ * timeline_nle.plan.md P0.3 ("source file + src in/out + kind + track hint"). */
+export interface ClipboardEntry {
+  kind: "video" | "audio";
+  sourceFileId: string;
+  srcInMs: number;
+  srcOutMs: number;
+  trackHint?: { z?: number; role?: string };
+}
+
 interface TimelineViewState {
   pxPerSec: number;
   scrollLeftPx: number;
@@ -39,6 +49,8 @@ interface TimelineViewState {
   outMarkMs: number | null;
   /** Session-only markers (P2 will add doc persistence + a marker list panel). */
   markers: number[];
+  /** Editor-local clipboard for copy/cut/paste/duplicate (P0.3). */
+  clipboard: ClipboardEntry[];
 
   setZoom: (pxPerSec: number) => void;
   zoomIn: () => void;
@@ -53,6 +65,7 @@ interface TimelineViewState {
   setOutMark: (ms: number | null) => void;
   addMarker: (ms: number) => void;
   removeMarker: (ms: number) => void;
+  setClipboard: (entries: ClipboardEntry[]) => void;
 }
 
 export const useTimelineView = create<TimelineViewState>((set) => ({
@@ -65,6 +78,7 @@ export const useTimelineView = create<TimelineViewState>((set) => ({
   inMarkMs: null,
   outMarkMs: null,
   markers: [],
+  clipboard: [],
 
   setZoom: (pxPerSec) => set({ pxPerSec: clampZoom(pxPerSec) }),
   zoomIn: () => set((s) => ({ pxPerSec: clampZoom(s.pxPerSec * 1.4) })),
@@ -101,4 +115,5 @@ export const useTimelineView = create<TimelineViewState>((set) => ({
       return { markers: [...s.markers, rounded].sort((a, b) => a - b) };
     }),
   removeMarker: (ms) => set((s) => ({ markers: s.markers.filter((m) => m !== ms) })),
+  setClipboard: (entries) => set({ clipboard: entries }),
 }));
