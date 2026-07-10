@@ -8,7 +8,7 @@
  */
 import { create } from "zustand";
 
-export type TimelineTool = "select" | "blade";
+export type TimelineTool = "select" | "blade" | "slip" | "slide";
 
 export const MIN_PX_PER_SEC = 2;
 export const MAX_PX_PER_SEC = 400;
@@ -51,6 +51,12 @@ interface TimelineViewState {
   markers: number[];
   /** Editor-local clipboard for copy/cut/paste/duplicate (P0.3). */
   clipboard: ClipboardEntry[];
+  /** Insert (ripple, the default) vs overwrite for new drops/pastes (P1.2). */
+  insertMode: "insert" | "overwrite";
+  /** Per-spine-segment A/V link (P1.5), keyed by seg_id; absent = linked
+   * (the default). The video/dialogue clips share one segment's in/out — see
+   * timeline-editor.tsx's selectClip for what "unlinked" actually changes. */
+  unlinkedSegIds: Record<string, boolean>;
 
   setZoom: (pxPerSec: number) => void;
   zoomIn: () => void;
@@ -66,6 +72,8 @@ interface TimelineViewState {
   addMarker: (ms: number) => void;
   removeMarker: (ms: number) => void;
   setClipboard: (entries: ClipboardEntry[]) => void;
+  toggleInsertMode: () => void;
+  toggleLinked: (segId: string) => void;
 }
 
 export const useTimelineView = create<TimelineViewState>((set) => ({
@@ -79,6 +87,8 @@ export const useTimelineView = create<TimelineViewState>((set) => ({
   outMarkMs: null,
   markers: [],
   clipboard: [],
+  insertMode: "insert",
+  unlinkedSegIds: {},
 
   setZoom: (pxPerSec) => set({ pxPerSec: clampZoom(pxPerSec) }),
   zoomIn: () => set((s) => ({ pxPerSec: clampZoom(s.pxPerSec * 1.4) })),
@@ -116,4 +126,9 @@ export const useTimelineView = create<TimelineViewState>((set) => ({
     }),
   removeMarker: (ms) => set((s) => ({ markers: s.markers.filter((m) => m !== ms) })),
   setClipboard: (entries) => set({ clipboard: entries }),
+  toggleInsertMode: () => set((s) => ({ insertMode: s.insertMode === "insert" ? "overwrite" : "insert" })),
+  toggleLinked: (segId) =>
+    set((s) => ({
+      unlinkedSegIds: { ...s.unlinkedSegIds, [segId]: !s.unlinkedSegIds[segId] },
+    })),
 }));

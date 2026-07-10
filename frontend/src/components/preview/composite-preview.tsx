@@ -14,9 +14,54 @@ import {
 } from "lucide-react";
 import { getFile, getFilePlaybackUrl, type ResolvedTimeline } from "@/lib/api";
 import { resolveTimeline } from "@/lib/resolve-timeline";
+import { documentToProject } from "@/lib/edit-project";
 import { useEditDocStore } from "@/stores/edit-doc-store";
+import { useTimelineView, type TrackMeta } from "@/stores/timeline-view";
 import { useTransport, FRAME_MS, formatTimecode } from "@/stores/transport-store";
 import { useProgramPlayer } from "./use-program-player";
+
+/**
+ * Preview-ONLY track mute/solo, applied AFTER `resolveTimeline` so the
+ * backend-parity resolver itself never sees this ephemeral, session-only UI
+ * state (mute/solo/lock live in stores/timeline-view.ts, never the document).
+ * Video-track mute hides that layer outright ("view-only" per the plan);
+ * audio-track mute already flows through as a real gain_db on the document
+ * (timeline-editor.tsx's toggleTrackMute), so only SOLO needs handling here:
+ * when any track is soloed, every non-soloed audio layer is silenced.
+ */
+function applyTrackMeta(
+  resolved: ResolvedTimeline,
+  trackMeta: Record<string, TrackMeta>,
+  project: ReturnType<typeof documentToProject>
+): ResolvedTimeline {
+  const anyMeta = Object.keys(trackMeta).length > 0;
+  if (!anyMeta) return resolved;
+
+  const videoTrackIdByZ = new Map<number, string>();
+  const audioTrackIdByRole = new Map<string, string>();
+  let baseAudioTrackId: string | null = null;
+  for (const t of project.tracks) {
+    if (t.kind === "video") videoTrackIdByZ.set(t.z, t.id);
+    else if (t.isBase) baseAudioTrackId = t.id;
+    else if (t.role) audioTrackIdByRole.set(t.role, t.id);
+  }
+  const anySolo = project.tracks.some((t) => trackMeta[t.id]?.solo);
+
+  const video_layers = resolved.video_layers.filter((v) => {
+    const trackId = videoTrackIdByZ.get(v.z);
+    return !(trackId && trackMeta[trackId]?.mute);
+  });
+
+  const audio_layers = !anySolo
+    ? resolved.audio_layers
+    : resolved.audio_layers.map((a) => {
+        const trackId = a.kind === "spine" ? baseAudioTrackId : audioTrackIdByRole.get(a.role);
+        const soloed = trackId ? trackMeta[trackId]?.solo : false;
+        return soloed ? a : { ...a, gain_db: -120 };
+      });
+
+  return { ...resolved, video_layers, audio_layers };
+}
 
 /**
  * Program monitor. Reads the LIVE working document from the edit store, resolves
@@ -34,16 +79,20 @@ export function CompositePreview({ token }: { token: string | undefined }) {
   const aspect = useEditDocStore((s) => s.aspect);
   const mergeDurations = useEditDocStore((s) => s.mergeDurations);
 
-  const resolved: ResolvedTimeline | null = useMemo(
-    () =>
-      timeline.length
-        ? resolveTimeline(
-            { timeline, operations, layout_regions: layoutRegions, format: { aspect } },
-            durations
-          )
-        : null,
-    [timeline, operations, layoutRegions, durations, aspect]
+  const trackMeta = useTimelineView((s) => s.trackMeta);
+  const project = useMemo(
+    () => documentToProject(timeline, operations, aspect),
+    [timeline, operations, aspect]
   );
+
+  const resolved: ResolvedTimeline | null = useMemo(() => {
+    if (!timeline.length) return null;
+    const r = resolveTimeline(
+      { timeline, operations, layout_regions: layoutRegions, format: { aspect } },
+      durations
+    );
+    return applyTrackMeta(r, trackMeta, project);
+  }, [timeline, operations, layoutRegions, durations, aspect, trackMeta, project]);
 
   // Frame box ratio for the program monitor, matching the delivery aspect.
   const frameRatio =
