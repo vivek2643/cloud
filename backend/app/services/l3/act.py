@@ -24,6 +24,8 @@ from typing import List, Optional
 
 from app.services.l3 import cutrecord_map, layers
 from app.services.l3.grade.arc import ARC_INTENTS
+from app.services.l3.grade.cdl import Grade, compose
+from app.services.l3.grade.steer import solve_steer_grade
 from app.services.l3.arrange import Placement, ResolvedCut, _MapIndex
 
 # Pacing scale for `retime`, broad..sharp (index 0..4). Maps onto a video cut's
@@ -365,6 +367,50 @@ def set_arc_intent(document: dict, target_id: str, *, intent: str) -> dict:
     if op is None:
         return document
     op["arc_intent"] = intent
+    return doc
+
+
+def set_grade(
+    document: dict,
+    target_id: Optional[str],
+    *,
+    warmth: Optional[float] = None,
+    tint: Optional[float] = None,
+    brightness: Optional[float] = None,
+    contrast: Optional[float] = None,
+    saturation: Optional[float] = None,
+) -> dict:
+    """NL steering (color_grading.plan.md SS10): "warmer", "less teal", "more
+    contrast" -> named, bounded dials (-1..1, unset = 0) -> a deterministic
+    CDL delta (grade.steer.solve_steer_grade), composed onto whatever grade
+    override the target already has (stacks with earlier steers instead of
+    replacing them). With target_id -> that cut; without -> every main-line
+    cut (a whole-document steer). A no-op (identical dials) or an unknown
+    target_id is a no-op, matching every other verb's contract."""
+    delta = solve_steer_grade(
+        warmth=warmth, tint=tint, brightness=brightness, contrast=contrast, saturation=saturation,
+    )
+    if delta == Grade():
+        return document
+
+    doc = _clone(document)
+    if target_id:
+        seg = next((s for s in doc["timeline"] if s.get("seg_id") == target_id), None)
+        targets: List[dict] = [seg] if seg is not None else []
+        if not targets:
+            op = next((o for o in doc["operations"]
+                       if o.get("op_id") == target_id and o.get("type") == "place_video"), None)
+            targets = [op] if op is not None else []
+        if not targets:
+            return document
+    else:
+        targets = list(doc["timeline"]) + [o for o in doc["operations"] if o.get("type") == "place_video"]
+    if not targets:
+        return document
+
+    for t in targets:
+        existing = Grade.from_dict(t.get("grade"))
+        t["grade"] = compose(existing, delta, 1.0).to_dict()
     return doc
 
 

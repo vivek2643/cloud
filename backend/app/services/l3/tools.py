@@ -60,8 +60,9 @@ def _specs() -> List[Dict[str, Any]]:
     return [
         # --- OBSERVE (read-only senses) ---
         S("read_state", "Returns the current edit: ordered cuts (pos, seg_id, ref, "
-          "duration, channel, speaker, muted, text), channels in use, total length, "
-          "and a feel narration.", obj({})),
+          "duration, channel, speaker, muted, text, and a plain-language grade summary "
+          "when a cut has one), channels in use, total length, and a feel narration.",
+          obj({})),
         S("predict", "Returns the program LENGTH under a proposed change without "
           "applying it: set_level re-takes every main-line cut at that level, drop "
           "removes those seg_ids, add appends [{ref, level}] cuts. Gives "
@@ -112,6 +113,15 @@ def _specs() -> List[Dict[str, Any]]:
           obj({"target_id": {"type": "string"},
                "intent": {"type": "string", "enum": list(ARC_INTENTS)}},
               ["target_id", "intent"])),
+        S("set_grade", "Nudges color via named dials, each -1..1 (0/omitted = no "
+          "change): warmth (+warmer/-cooler), tint (+magenta/-green), brightness, "
+          "contrast, saturation. A deterministic mapping turns the dials into the "
+          "actual color numbers. With target_id -> that cut only; without -> every "
+          "main-line cut. Stacks onto whatever grade that cut already has.",
+          obj({"target_id": {"type": "string"},
+               "warmth": {"type": "number"}, "tint": {"type": "number"},
+               "brightness": {"type": "number"}, "contrast": {"type": "number"},
+               "saturation": {"type": "number"}}, [])),
         S("split_edit", "Decouples the AUDIO edge from the VIDEO edge at the seam just "
           "before main-line cut `seam_seg_id` (J/L cut). audio_offset_ms < 0: the "
           "incoming cut's audio leads under the previous picture; > 0: the previous "
@@ -231,6 +241,13 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
             new = act.set_audio(doc, args["target_id"], mute=bool(args.get("mute")))
         elif name == "tag_arc_intent":
             new = act.set_arc_intent(doc, args["target_id"], intent=args.get("intent", ""))
+        elif name == "set_grade":
+            new = act.set_grade(
+                doc, args.get("target_id"),
+                warmth=args.get("warmth"), tint=args.get("tint"),
+                brightness=args.get("brightness"), contrast=args.get("contrast"),
+                saturation=args.get("saturation"),
+            )
         elif name == "split_edit":
             new = act.split_edit(doc, args["seam_seg_id"],
                                  audio_offset_ms=args.get("audio_offset_ms", 0))

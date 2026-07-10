@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 
 from app.services.l3 import feel, footage_map, framing, layers
 from app.services.l3.arrange import _MapIndex, _weld_segments
+from app.services.l3.grade.steer import explain_grade
 
 logger = logging.getLogger(__name__)
 
@@ -219,6 +220,14 @@ def read_state(document: dict, ctx: EditContext) -> dict:
     ops = document.get("operations") or []
     report = feel.simulate(timeline, ctx.meta_by_ref)
 
+    # Grade summaries (color_grading.plan.md SS10 "explain the grade") read
+    # from the LAST resolve's snapshot -- same staleness as everything else
+    # read_state reports, and avoids a full re-resolve just to describe it.
+    grade_by_layer_id = {
+        v.get("layer_id"): v.get("grade")
+        for v in ((document.get("resolved") or {}).get("video_layers") or [])
+    }
+
     cuts = []
     prog = 0
     for i, seg in enumerate(timeline):
@@ -241,6 +250,11 @@ def read_state(document: dict, ctx: EditContext) -> dict:
             "muted": bool(seg.get("mute")),
             "text": snippet,
         }
+        grade = grade_by_layer_id.get(f"v_{seg.get('seg_id')}")
+        if grade and grade.get("cdl"):
+            summary = explain_grade(grade["cdl"])
+            if "No change" not in summary:
+                cut["grade"] = summary
         # Pacing state (from `retime`): the chosen step, and for a VIDEO cut the
         # recorded playback speed -- flagged, since the render doesn't bake speed
         # yet (the on-screen dur_ms above is still the 1x length).
