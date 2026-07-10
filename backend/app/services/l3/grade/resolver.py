@@ -11,9 +11,13 @@ Stack order (SS3): Measure -> Correct -> Match -> Look -> Arc -> Soft-local
 into:
   - SS5 (correct) is wired: `grade.correct.solve_correct_grade` composes
     onto the stack first, using the file's `color_stats` row.
-  - SS6 (match) / SS7 (look) / SS8 (arc) still no-op (identity) until their
-    own build steps land -- each will compose here in the same fixed order,
-    ahead of the explicit override.
+  - SS6 (match) is wired: a pre-computed per-file delta (see
+    `grade.match.solve_match_deltas`, computed ONCE per document resolve in
+    `layers.resolve` since grade-groups are a whole-document clustering, not
+    a per-clip decision) composes next.
+  - SS7 (look) / SS8 (arc) still no-op (identity) until their own build
+    steps land -- each will compose here in the same fixed order, ahead of
+    the explicit override.
   - The explicit per-clip override (`item["grade"]`, an NL trim or manual
     dial) is a DELTA composed on top of the whole stack via `cdl.compose`
     (SS8's amplitude-scaling semantics), not a replacement -- nudging
@@ -41,6 +45,7 @@ def resolve_clip_grade(
     color_stats: Optional[Dict[str, Any]] = None,
     sequence_look: Optional[Dict[str, Any]] = None,
     already_graded: bool = False,
+    match_delta: Optional[Grade] = None,
 ) -> Dict[str, Any]:
     """Resolve ONE clip's (spine segment or op) final grade descriptor.
 
@@ -51,11 +56,15 @@ def resolve_clip_grade(
     already-graded footage") -- not yet wired to a real per-segment
     cut_records lookup (mapping an arbitrary trimmed EditSegment span back
     to its source cut is its own piece of work), so it defaults to False;
-    callers that have it available should pass it through.
+    callers that have it available should pass it through. `match_delta` is
+    this clip's SS6 grade-groups delta (this file's nudge toward its group's
+    anchor), already resolved once for the whole document by the caller.
     """
     stack = solve_correct_grade(color_stats, already_graded=already_graded)
-    # SS6 (match) / SS7 (look) / SS8 (arc) compose here next, in that order,
-    # once their build steps land.
+    if match_delta is not None:
+        stack = compose(stack, match_delta, 1.0)
+    # SS7 (look) / SS8 (arc) compose here next, in that order, once their
+    # own build steps land.
 
     override = Grade.from_dict(item.get("grade")) if item.get("grade") else None
     resolved = compose(stack, override, 1.0) if override is not None else stack

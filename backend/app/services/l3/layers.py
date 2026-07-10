@@ -26,6 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from app.services.l3.grade.match import solve_match_deltas
 from app.services.l3.grade.resolver import resolve_clip_grade
 
 # Z bands so layer kinds stack predictably regardless of insertion order.
@@ -534,6 +535,9 @@ def resolve(
     operations = document.get("operations") or []
     spans, total = spine_spans(timeline)
     sequence_look = document.get("look")
+    # SS6 match layer: grade-groups are a whole-document clustering decision,
+    # so resolve every file's delta ONCE here rather than per-clip.
+    match_deltas = solve_match_deltas(color_stats) if color_stats else {}
 
     video: List[VideoLayer] = []
     audio: List[AudioLayer] = []
@@ -549,7 +553,8 @@ def resolve(
             z=Z_SPINE_VIDEO, kind="spine",
             transform=solve_transform(document, seg.get("transform")),
             grade=resolve_clip_grade(
-                seg, color_stats=color_stats.get(seg["file_id"]), sequence_look=sequence_look
+                seg, color_stats=color_stats.get(seg["file_id"]), sequence_look=sequence_look,
+                match_delta=match_deltas.get(seg["file_id"]),
             ),
         ))
         audio.append(AudioLayer(
@@ -582,7 +587,8 @@ def resolve(
                 kind="coverage", op_id=op["op_id"],
                 transform=solve_transform(document, op.get("transform")),
                 grade=resolve_clip_grade(
-                    op, color_stats=color_stats.get(op["source_file_id"]), sequence_look=sequence_look
+                    op, color_stats=color_stats.get(op["source_file_id"]), sequence_look=sequence_look,
+                    match_delta=match_deltas.get(op["source_file_id"]),
                 ),
             ))
         elif t == "place_audio":
