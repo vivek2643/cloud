@@ -32,9 +32,12 @@ import type {
   DestRect,
   EditAspect,
   LayerTransform,
+  ResolvedGrade,
   ResolvedTimeline,
 } from "@/lib/api";
 import { isRect, sampleMotion } from "@/lib/resolve-timeline";
+import { createLutRenderer, type LutRenderer } from "./lut-gl";
+import { getGradeCube, gradeCubeUrl } from "./grade-cube-client";
 
 const POOL_SIZE = 6;
 const DRIFT_S = 0.18; // re-seek a free-running element only past this much drift
@@ -58,6 +61,7 @@ interface Clip {
   dest: DestRect | null;
   hasAudio: boolean;
   gainDb: number; // base + duck, already summed (constant per layer)
+  grade?: ResolvedGrade;
 }
 
 interface Slot {
@@ -67,6 +71,10 @@ interface Slot {
   needsSeek: boolean;
   wantSec: number | null; // last requested park position (applied once loadable)
   queuedSeek: number | null; // coalesced seek target while mid-seek
+  // Lazily created on first graded clip -- most projects never touch grading,
+  // so most slots never pay for a WebGL context.
+  lutRenderer: LutRenderer | null;
+  lutUrl: string | null; // gradeCubeUrl of whatever's currently loaded, for the setLut cache-key check
 }
 
 export interface ProgramPlayerHandle {
@@ -133,6 +141,7 @@ function buildClips(resolved: ResolvedTimeline | null): Clip[] {
       dest: isRect(v.transform?.dest) ? v.transform!.dest : null,
       hasAudio: !!a,
       gainDb: a ? a.gain_db + a.duck_db : 0,
+      grade: v.grade,
     });
   }
   audio.forEach((a, i) => {
@@ -153,9 +162,11 @@ function buildClips(resolved: ResolvedTimeline | null): Clip[] {
   return clips;
 }
 
-/** Position the element into its canvas cell: a split/PiP dest rect (percent
- * box) or the full frame. Mirrors the compositor's composite-into-dest step. */
-function applyDestGeometry(el: HTMLVideoElement, dest: DestRect | null) {
+/** Position an element into its canvas cell: a split/PiP dest rect (percent
+ * box) or the full frame. Mirrors the compositor's composite-into-dest step.
+ * Takes any styleable element so the WebGL LUT canvas can share this with
+ * the plain `<video>` path. */
+function applyDestGeometry(el: HTMLElement, dest: DestRect | null) {
   if (dest) {
     el.style.inset = "auto";
     el.style.left = `${dest.x * 100}%`;
@@ -171,40 +182,67 @@ function applyDestGeometry(el: HTMLVideoElement, dest: DestRect | null) {
   }
 }
 
-/** CSS framing for the visible element, mirroring the render transform chain
- * (rotate -> fit -> zoom) and the motion midpoint preview. */
-function applyFrameStyle(el: HTMLVideoElement, clip: Clip, aspect: EditAspect) {
+interface Framing {
+  fit: "cover" | "contain";
+  focusCx: number;
+  focusCy: number;
+  transformCss: string;
+}
+
+const ANCHOR_FRACTIONS: Record<string, { cx: number; cy: number }> = {
+  left: { cx: 0, cy: 0.5 },
+  right: { cx: 1, cy: 0.5 },
+  top: { cx: 0.5, cy: 0 },
+  bottom: { cx: 0.5, cy: 1 },
+  center: { cx: 0.5, cy: 0.5 },
+};
+
+/** Resolve fit/focus/CSS-transform ONCE, shared by both the plain `<video>`
+ * CSS path (applyFrameStyle) and the WebGL LUT canvas path (which has no
+ * native object-fit and must emulate it in the fragment shader) -- one
+ * source of truth for preview framing instead of two that could disagree. */
+function resolveFraming(clip: Clip, aspect: EditAspect): Framing {
   const t = clip.transform;
   const mid = t?.motion ? sampleMotion(t.motion, t.motion.dur_ms / 2) : null;
-  // A split/PiP cell fills its rect (cover); otherwise honor the transform fit.
   const fit = clip.dest ? "cover" : mid ? "cover" : t?.fit ?? (aspect === "landscape" ? "contain" : "cover");
-  const anchor = t?.anchor ?? "center";
-  const focus = mid ? { cx: mid.cx, cy: mid.cy } : t?.focus ?? null;
-  let objectPosition: string;
-  if (focus) {
-    const px = Math.round(Math.min(1, Math.max(0, focus.cx)) * 100);
-    const py = Math.round(Math.min(1, Math.max(0, focus.cy)) * 100);
-    objectPosition = `${px}% ${py}%`;
-  } else {
-    objectPosition =
-      anchor === "left"
-        ? "left center"
-        : anchor === "right"
-          ? "right center"
-          : anchor === "top"
-            ? "center top"
-            : anchor === "bottom"
-              ? "center bottom"
-              : "center";
-  }
+  const focusFrac = mid
+    ? { cx: mid.cx, cy: mid.cy }
+    : t?.focus
+      ? { cx: t.focus.cx, cy: t.focus.cy }
+      : ANCHOR_FRACTIONS[t?.anchor ?? "center"];
   const tf: string[] = [];
   if (t?.rotate) tf.push(`rotate(${t.rotate}deg)`);
   const scale = mid ? mid.scale : t?.zoom && t.zoom > 1 ? t.zoom : 1;
   if (scale > 1) tf.push(`scale(${scale})`);
-  el.style.objectFit = fit;
-  el.style.objectPosition = objectPosition;
-  el.style.transform = tf.join(" ");
+  return {
+    fit,
+    focusCx: Math.min(1, Math.max(0, focusFrac.cx)),
+    focusCy: Math.min(1, Math.max(0, focusFrac.cy)),
+    transformCss: tf.join(" "),
+  };
+}
+
+/** CSS framing for the visible element, mirroring the render transform chain
+ * (rotate -> fit -> zoom) and the motion midpoint preview. */
+function applyFrameStyle(el: HTMLVideoElement, clip: Clip, aspect: EditAspect) {
+  const f = resolveFraming(clip, aspect);
+  el.style.objectFit = f.fit;
+  el.style.objectPosition = `${Math.round(f.focusCx * 100)}% ${Math.round(f.focusCy * 100)}%`;
+  el.style.transform = f.transformCss;
   applyDestGeometry(el, clip.dest);
+}
+
+function isIdentityGrade(grade: ResolvedGrade | undefined): boolean {
+  if (!grade) return true;
+  if (grade.creative_lut_ref) return false;
+  const { slope, offset, power, sat } = grade.cdl;
+  const eps = 1e-9;
+  return (
+    slope.every((v) => Math.abs(v - 1) < eps) &&
+    offset.every((v) => Math.abs(v) < eps) &&
+    power.every((v) => Math.abs(v - 1) < eps) &&
+    Math.abs(sat - 1) < eps
+  );
 }
 
 export function useProgramPlayer(
@@ -279,6 +317,8 @@ export function useProgramPlayer(
           needsSeek: false,
           wantSec: null,
           queuedSeek: null,
+          lutRenderer: null,
+          lutUrl: null,
         };
         el.addEventListener("seeked", () => {
           if (slot.queuedSeek != null) {
@@ -341,6 +381,45 @@ export function useProgramPlayer(
     slot.wantSec = null;
   };
 
+  /** Draw (or hide) a slot's graded-preview canvas for the current frame.
+   * Lazily creates the WebGL renderer on first use; falls back to showing
+   * the plain (ungraded) `<video>` if WebGL2 is unavailable or the cube
+   * hasn't loaded yet, so grading is a pure enhancement, never a blocker. */
+  const updateLutOverlay = (slot: Slot, clip: Clip, visible: boolean): boolean => {
+    const graded = visible && !isIdentityGrade(clip.grade);
+    if (!graded) {
+      if (slot.lutRenderer) slot.lutRenderer.canvas.style.opacity = "0";
+      return false;
+    }
+    const cube = getGradeCube(clip.grade);
+    if (!cube) return false; // still fetching -- caller shows the raw video meanwhile
+
+    if (!slot.lutRenderer) {
+      const renderer = createLutRenderer();
+      if (!renderer) return false; // no WebGL2 -- permanently fall back for this slot
+      const c = renderer.canvas;
+      c.style.position = "absolute";
+      c.style.pointerEvents = "none";
+      c.style.opacity = "0";
+      c.style.transition = "opacity 60ms linear";
+      containerRef.current?.appendChild(c);
+      slot.lutRenderer = renderer;
+    }
+    const renderer = slot.lutRenderer;
+    const url = clip.grade ? gradeCubeUrl(clip.grade) : null;
+    if (url && slot.lutUrl !== url) {
+      renderer.setLut(cube.grid, cube.size, url);
+      slot.lutUrl = url;
+    }
+    const framing = resolveFraming(clip, aspectRef.current);
+    applyDestGeometry(renderer.canvas, clip.dest);
+    renderer.canvas.style.transform = framing.transformCss;
+    renderer.canvas.style.zIndex = String(clip.z);
+    renderer.draw(slot.el, framing.fit, { cx: framing.focusCx, cy: framing.focusCy });
+    renderer.canvas.style.opacity = "1";
+    return true;
+  };
+
   /** Full per-frame reconcile: assign needed clips to slots, then drive each
    * slot's position/play/gain/visibility from the program time `t`. */
   const reconcile = useCallback((t: number, playing: boolean) => {
@@ -387,6 +466,7 @@ export function useProgramPlayer(
         if (!slot.el.paused) slot.el.pause();
         slot.gain.gain.setTargetAtTime(0, ctx.currentTime, GAIN_TC);
         slot.el.style.opacity = "0";
+        if (slot.lutRenderer) slot.lutRenderer.canvas.style.opacity = "0";
         continue;
       }
       const url = urlsRef.current[clip.fileId];
@@ -419,7 +499,8 @@ export function useProgramPlayer(
       const g = active_ && clip.hasAudio ? dbToGain(clip.gainDb) : 0;
       slot.gain.gain.setTargetAtTime(g, ctx.currentTime, GAIN_TC);
 
-      if (active_ && visibleIds.has(clip.id)) {
+      const isVisible = active_ && visibleIds.has(clip.id);
+      if (isVisible) {
         applyFrameStyle(slot.el, clip, aspectRef.current);
         // Stack cells by layer z (PiP inset over base); split cells don't overlap.
         slot.el.style.zIndex = String(clip.z);
@@ -427,6 +508,11 @@ export function useProgramPlayer(
       } else {
         slot.el.style.opacity = "0";
       }
+      // Graded clips paint through a WebGL LUT canvas on top; hides the raw
+      // video underneath only once the graded frame is actually ready, so a
+      // slow cube fetch never shows a black flash.
+      const showingGraded = updateLutOverlay(slot, clip, isVisible);
+      if (showingGraded) slot.el.style.opacity = "0";
     }
   }, [ensure]);
 
@@ -520,6 +606,7 @@ export function useProgramPlayer(
         /* ignore */
       }
       s.el.style.opacity = "0";
+      if (s.lutRenderer) s.lutRenderer.canvas.style.opacity = "0";
       const ctx = ctxRef.current;
       if (ctx) s.gain.gain.setTargetAtTime(0, ctx.currentTime, 0.005);
     }
@@ -545,6 +632,14 @@ export function useProgramPlayer(
           s.el.remove();
         } catch {
           /* ignore */
+        }
+        if (s.lutRenderer) {
+          try {
+            s.lutRenderer.dispose();
+            s.lutRenderer.canvas.remove();
+          } catch {
+            /* ignore */
+          }
         }
       }
       poolRef.current = [];

@@ -31,6 +31,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from app.services.l3.grade.cache import ensure_cube_file
+from app.services.l3.grade.cdl import is_identity, Grade
 from app.services.processing import _download_from_r2, _upload_to_r2
 from app.services.r2 import generate_presigned_get
 
@@ -196,18 +198,21 @@ def _render_spine_concat(
     src_cache: Dict[str, str] = {}
     segments: List[str] = []
     n = len(video)
+    cube_dir = os.path.join(tmp, "cubes")
     for i, v in enumerate(video):
         entry = file_lookup.get(v["source_file_id"])
         if entry is None:
             raise RuntimeError(f"no FileEntry for {v['source_file_id']}")
         in_ms, out_ms = int(v["src_in_ms"]), int(v["src_out_ms"])
         transform = v.get("transform") or {}
-        cache_path = _segment_cache_path(v["source_file_id"], in_ms, out_ms, cfg, transform)
+        grade = v.get("grade") or {}
+        cache_path = _segment_cache_path(v["source_file_id"], in_ms, out_ms, cfg, transform, grade)
         if not (os.path.exists(cache_path) and os.path.getsize(cache_path) > 0):
             src = _source_path(entry, cfg, tmp, src_cache)
+            cube_path = ensure_cube_file(grade, cube_dir)
             report(_pct(i, n, 8, 78), f"cut {i + 1}/{n}")
             _produce_segment(src=src, dst=cache_path, in_ms=in_ms, out_ms=out_ms,
-                             cfg=cfg, transform=transform)
+                             cfg=cfg, transform=transform, cube_path=cube_path)
         else:
             report(_pct(i, n, 8, 78), f"cut {i + 1}/{n} (cache)")
         segments.append(cache_path)
@@ -255,14 +260,32 @@ def _transform_key(transform: Optional[Dict[str, Any]]) -> str:
     return f"r{rotate}|{fit}|{anchor}|z{zoom}{fkey}{mkey}"
 
 
+def _grade_key(grade: Optional[Dict[str, Any]]) -> str:
+    """Stable cache token for a resolved grade; identity (no CDL, no creative
+    LUT) collapses to '' so ungraded segments keep their existing cache
+    entries, mirroring `_transform_key`'s identity-collapse contract."""
+    if not grade:
+        return ""
+    cdl = Grade.from_dict(grade.get("cdl"))
+    lut_ref = grade.get("creative_lut_ref")
+    if is_identity(cdl) and not lut_ref:
+        return ""
+    h = grade.get("grade_hash")
+    return f"g{h}" if h else ""
+
+
 def _segment_cache_path(
     file_id: str, in_ms: int, out_ms: int, cfg: Dict[str, Any],
     transform: Optional[Dict[str, Any]] = None,
+    grade: Optional[Dict[str, Any]] = None,
 ) -> str:
     key = f"{file_id}|{in_ms}|{out_ms}|{cfg['width']}x{cfg['height']}|{cfg['fps']}|{cfg['video_crf']}"
     tk = _transform_key(transform)
     if tk:
         key += f"|{tk}"
+    gk = _grade_key(grade)
+    if gk:
+        key += f"|{gk}"
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
     return os.path.join(CACHE_ROOT, f"{digest}.mp4")
 
@@ -331,11 +354,29 @@ def _zoompan(motion: Dict[str, Any], w: int, h: int, fps: int) -> str:
     return f"zoompan=z='{zexpr}':x='{xexpr}':y='{yexpr}':d=1:s={w}x{h}:fps={fps}"
 
 
-def _transform_vf(cfg: Dict[str, Any], transform: Optional[Dict[str, Any]] = None) -> str:
+def _lut3d_arg(cube_path: str) -> str:
+    """Escape a local cube path for ffmpeg's filter-argument syntax (colons
+    and backslashes are filtergraph metacharacters)."""
+    escaped = cube_path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    return f"lut3d=file='{escaped}':interp=trilinear"
+
+
+def _transform_vf(
+    cfg: Dict[str, Any],
+    transform: Optional[Dict[str, Any]] = None,
+    cube_path: Optional[str] = None,
+) -> str:
     """Filter chain that frames a source onto the canvas for ONE video layer,
-    in the canonical order rotate -> fit -> zoom-crop. An empty/None transform
-    is the identity (contain, no rotate, no zoom) -- byte-identical to the old
-    normalize so untouched edits keep their warm segment cache."""
+    in the canonical order rotate -> fit -> zoom-crop -> grade. An empty/None
+    transform is the identity (contain, no rotate, no zoom) -- byte-identical
+    to the old normalize so untouched edits keep their warm segment cache;
+    likewise `cube_path=None` (no grade) emits no color filter at all.
+
+    The LUT is applied in 8-bit RGB (`format=gbrp`), matching the WebGL
+    preview shader's own 8-bit texture sampling (browsers hand back 8-bit
+    frames from `<video>`/canvas) -- both sides are already precision-capped
+    by that 8-bit source, so matching bit depth here is what parity actually
+    requires, not a corner cut. See color_grading.plan.md SS4/SS16."""
     W, H, FPS = cfg["width"], cfg["height"], cfg["fps"]
     t = transform or {}
     rotate = int(t.get("rotate") or 0)
@@ -366,6 +407,10 @@ def _transform_vf(cfg: Dict[str, Any], transform: Optional[Dict[str, Any]] = Non
         if zoom > 1.0001:
             parts.append(f"scale=w={_even(W * zoom)}:h={_even(H * zoom)}")
             parts.append(_crop_to(W, H, anchor, focus))
+    if cube_path:
+        parts.append("format=gbrp")
+        parts.append(_lut3d_arg(cube_path))
+        parts.append("format=yuv420p")
     parts.append("setsar=1")
     parts.append(f"fps={FPS}")
     return ",".join(parts)
@@ -392,6 +437,7 @@ def _dest_px(transform: Optional[Dict[str, Any]], W: int, H: int) -> Optional[Tu
 def _produce_segment(
     *, src: str, dst: str, in_ms: int, out_ms: int, cfg: Dict[str, Any],
     transform: Optional[Dict[str, Any]] = None,
+    cube_path: Optional[str] = None,
 ) -> None:
     in_s = max(in_ms / 1000.0, 0.0)
     dur_s = max((out_ms - in_ms) / 1000.0, 0.05)
@@ -399,7 +445,7 @@ def _produce_segment(
     cmd = [
         "ffmpeg", "-y",
         "-ss", f"{in_s:.3f}", "-i", src, "-t", f"{dur_s:.3f}",
-        "-vf", _transform_vf(cfg, transform),
+        "-vf", _transform_vf(cfg, transform, cube_path=cube_path),
         "-c:v", cfg["video_codec"], "-preset", cfg["video_preset"], "-crf", str(cfg["video_crf"]),
         "-pix_fmt", "yuv420p",
         "-c:a", cfg["audio_codec"], "-b:a", cfg["audio_bitrate"], "-ar", "48000", "-ac", "2",
@@ -453,10 +499,11 @@ def _render_layers(
 
     inputs: List[str] = []          # ffmpeg -i paths, one per layer
     filt: List[str] = []
+    cube_dir = os.path.join(tmp, "cubes")
     # Black base canvas for the full program duration.
     filt.append(f"color=c=black:s={W}x{H}:r={FPS}:d={total_s:.3f},format=yuv420p[base]")
 
-    # --- video layers: trim -> normalize -> alpha -> shift to program start ---
+    # --- video layers: trim -> normalize -> grade -> alpha -> shift to program start ---
     cur = "[base]"
     for i, v in enumerate(video):
         entry = file_lookup.get(v["source_file_id"])
@@ -474,9 +521,10 @@ def _render_layers(
         cell = _dest_px(v.get("transform"), W, H)
         vf_cfg = {**cfg, "width": cell[2], "height": cell[3]} if cell else cfg
         ov_xy = f"x={cell[0]}:y={cell[1]}:" if cell else ""
+        cube_path = ensure_cube_file(v.get("grade"), cube_dir)
         chain = (
             f"[{idx}:v]trim=start={in_s:.3f}:end={out_s:.3f},setpts=PTS-STARTPTS,"
-            f"{_transform_vf(vf_cfg, v.get('transform'))},format=yuva420p"
+            f"{_transform_vf(vf_cfg, v.get('transform'), cube_path=cube_path)},format=yuva420p"
         )
         if opacity < 0.999:
             chain += f",colorchannelmixer=aa={max(0.0, min(1.0, opacity)):.3f}"

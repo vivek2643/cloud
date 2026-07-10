@@ -25,6 +25,7 @@ from app.config import get_settings
 from app.services import audit_log
 from app.services.jobs import app
 from app.services.l1 import audio_features as af_mod
+from app.services.l1 import color_stats as color_stats_mod
 from app.services.l1 import diarization as diar_mod
 from app.services.l1 import dialogue_segments as dlg_mod
 from app.services.l1 import motion_dynamics as motion_mod
@@ -41,6 +42,8 @@ STAGES = ("proxy", "transcript", "audio_features", "diarization", "motion_dynami
 # STAGES needs to change). Runs in parallel with the v1 pipeline until v2 is
 # validated -- see cuts_v2.plan.md.
 STAGES_V2 = STAGES + ("scene_detect",)
+# color grading: additive, independent of the cuts-v2 versioning above.
+STAGES_COLOR = STAGES_V2 + ("color_stats",)
 # Audio-only uploads (music) run a different, video-free set of stages.
 AUDIO_STAGES = ("audio_proxy", "audio_features")
 
@@ -635,6 +638,62 @@ def _stage_scene_detect(
     )
 
 
+def _stage_color_stats(
+    file_id: str, video_path: str, duration_s: float, conn: psycopg.Connection
+) -> None:
+    """color_grading.plan.md SS2.2: one sampled-frame pass over the proxy ->
+    deterministic per-file color measurement. Best-effort: a decode failure
+    no-ops without failing L1.
+    """
+    cs = color_stats_mod.compute_color_stats(
+        video_path, duration_ms=int((duration_s or 0) * 1000)
+    )
+    if not cs.has_stats:
+        return
+
+    conn.execute(
+        """
+        insert into color_stats
+            (file_id, schema_version, frames_sampled, luma_hist, black_point,
+             white_point, mid_gray, rgb_mean, rgb_median, lab_ab_cast,
+             wb_gray_world, wb_white_patch, clip_shadow_pct, clip_highlight_pct,
+             is_log_flat, skin_lab, palette)
+        values (%s, %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb,
+                %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb, %s::jsonb)
+        on conflict (file_id) do update set
+            schema_version     = excluded.schema_version,
+            frames_sampled     = excluded.frames_sampled,
+            luma_hist          = excluded.luma_hist,
+            black_point        = excluded.black_point,
+            white_point        = excluded.white_point,
+            mid_gray           = excluded.mid_gray,
+            rgb_mean           = excluded.rgb_mean,
+            rgb_median         = excluded.rgb_median,
+            lab_ab_cast        = excluded.lab_ab_cast,
+            wb_gray_world      = excluded.wb_gray_world,
+            wb_white_patch     = excluded.wb_white_patch,
+            clip_shadow_pct    = excluded.clip_shadow_pct,
+            clip_highlight_pct = excluded.clip_highlight_pct,
+            is_log_flat        = excluded.is_log_flat,
+            skin_lab           = excluded.skin_lab,
+            palette            = excluded.palette
+        """,
+        (
+            file_id, color_stats_mod.SCHEMA_VERSION, cs.frames_sampled,
+            json.dumps(cs.luma_hist), cs.black_point, cs.white_point, cs.mid_gray,
+            json.dumps(cs.rgb_mean), json.dumps(cs.rgb_median), json.dumps(cs.lab_ab_cast),
+            json.dumps(cs.wb_gray_world), json.dumps(cs.wb_white_patch),
+            cs.clip_shadow_pct, cs.clip_highlight_pct, cs.is_log_flat,
+            json.dumps(cs.skin_lab) if cs.skin_lab is not None else None,
+            json.dumps(cs.palette),
+        ),
+    )
+    logger.info(
+        "Color stats: %s -> %d frames sampled, log_flat=%s, clip shadow/highlight=%.3f/%.3f",
+        file_id, cs.frames_sampled, cs.is_log_flat, cs.clip_shadow_pct, cs.clip_highlight_pct,
+    )
+
+
 # --- Helpers -------------------------------------------------------------
 
 def _run_stage(
@@ -687,14 +746,17 @@ def _track_audio(file_id: str, wav_path: str, duration_s: float) -> None:
 
 
 def _track_motion(file_id: str, video_source: str, duration_s: float) -> None:
-    """motion_dynamics (optical flow) -> scene_detect (histogram drift).
-    Independent of all audio stages; scene_detect shares this track's proxy
-    (cuts-v2, additive -- see STAGES_V2)."""
+    """motion_dynamics (optical flow) -> scene_detect (histogram drift) ->
+    color_stats (sampled-frame color measurement). Independent of all audio
+    stages; scene_detect/color_stats share this track's proxy (additive --
+    see STAGES_V2/STAGES_COLOR)."""
     with _pg_conn() as conn:
         _run_stage(conn, file_id, "motion_dynamics",
                    _stage9_motion_dynamics, file_id, video_source, duration_s, conn)
         _run_stage(conn, file_id, "scene_detect",
                    _stage_scene_detect, file_id, video_source, duration_s, conn)
+        _run_stage(conn, file_id, "color_stats",
+                   _stage_color_stats, file_id, video_source, duration_s, conn)
 
 
 def _run_deep_stages_parallel(

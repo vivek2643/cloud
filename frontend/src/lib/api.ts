@@ -505,6 +505,49 @@ export interface LayerTransform {
   dest?: "full" | DestRect;
 }
 
+/** ASC CDL -- the steerable, round-trippable grade spine; mirrors backend
+ * `grade.cdl.Grade`. See color_grading.plan.md SS2.1. */
+export interface CdlGrade {
+  slope?: [number, number, number];
+  offset?: [number, number, number];
+  power?: [number, number, number];
+  sat?: number;
+}
+
+/** Per-timeline-item grade override (SS2.4) -- an explicit nudge on top of
+ * whatever the resolver would otherwise compute; same CDL shape as the
+ * resolved grade below. */
+export type ClipGrade = CdlGrade;
+
+/** Fully resolved per-clip grade descriptor; mirrors backend
+ * `grade.resolver.resolve_clip_grade`'s output. `grade_hash` is the
+ * BACKEND's cache key for the baked `.cube` -- present when this came from
+ * a server resolve, absent on a purely local (frontend) resolve, since the
+ * frontend never computes it itself (see resolve-timeline.ts): the cube
+ * endpoint takes the raw `cdl`/`creative_lut_ref`/`working_space` values
+ * and hashes/caches server-side, so two independent hash implementations
+ * never have to agree. */
+export interface ResolvedGrade {
+  cdl: Required<CdlGrade>;
+  creative_lut_ref?: string | null;
+  working_space: string;
+  grade_hash?: string;
+}
+
+/** Sequence-level look selection (SS2.4/SS7): one of three input modes
+ * (preset / reference-image / .cube upload) collapsing into the same CDL
+ * spine, plus the user's single arc intensity dial (SS8). */
+export type LookMode = "preset" | "reference" | "lut";
+
+export interface SequenceLook {
+  mode?: LookMode;
+  preset_id?: string | null;
+  reference_image_ref?: string | null;
+  lut_ref?: string | null;
+  match_strength?: number;     // reference-image mode: 0..1
+  arc_intensity?: number;      // 0 = flat, 1 = full arc (SS8)
+}
+
 /** A time-scoped spatial layout (split-screen / PiP): mirrors backend
  * `document.layout_regions`. Cells map a template slot to a layer selector
  * ("spine" for the main line, or a place_video op_id). */
@@ -524,6 +567,9 @@ export interface EditFormat {
   motion_style?: MotionStyle;
   motion_feel?: MotionFeel;
 }
+
+/** Per-project sequence-level color grade selection (SS2.4). */
+export type EditLook = SequenceLook;
 
 export interface EditBeat {
   beat_id: string;
@@ -561,6 +607,7 @@ export interface EditSegment {
   cut_out_cost?: number;
   warnings?: string[];
   transform?: LayerTransform;
+  grade?: ClipGrade;
 }
 
 export interface EditQuestion {
@@ -604,6 +651,7 @@ export interface EditOperation {
   z?: number;
   opacity?: number;
   transform?: LayerTransform;
+  grade?: ClipGrade;
   // place_audio
   role?: string;
   audio_kind?: string;
@@ -630,6 +678,7 @@ export interface ResolvedVideoLayer {
   kind: string;
   op_id?: string | null;
   transform?: LayerTransform;
+  grade?: ResolvedGrade;
 }
 
 export interface ResolvedAudioLayer {
@@ -656,6 +705,7 @@ export interface ResolvedTimeline {
 export interface EditDocument {
   brief?: EditBrief;
   format?: EditFormat;
+  look?: EditLook;
   spine?: EditSpine | null;
   operations?: EditOperation[];
   layout_regions?: LayoutRegion[];

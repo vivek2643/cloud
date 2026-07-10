@@ -28,7 +28,8 @@ def _row_to_dict(row) -> Optional[Dict[str, Any]]:
 
 _L1_STAGES = ("proxy", "transcript", "audio_features", "diarization",
               "motion_dynamics", "dialogue_segments", "audio_proxy",
-              "scene_detect")  # cuts-v2, additive -- see STAGES_V2
+              "scene_detect",  # cuts-v2, additive -- see STAGES_V2
+              "color_stats")  # color grading, additive -- see STAGES_COLOR
 
 
 def _iso(v) -> Optional[str]:
@@ -215,6 +216,35 @@ def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
                 "shot_point_count": len(sc["shot_points"] or []),
                 "composition_points": sc["composition_points"] or [],
                 "composition_point_count": len(sc["composition_points"] or []),
+            }
+
+        # Color stats (color grading foundation) -- video-derived, own table.
+        cur = conn.execute(
+            """
+            select frames_sampled, black_point, white_point, mid_gray,
+                   rgb_mean, lab_ab_cast, wb_gray_world, wb_white_patch,
+                   clip_shadow_pct, clip_highlight_pct, is_log_flat,
+                   skin_lab, palette
+              from color_stats where file_id = %s
+            """,
+            (file_id,),
+        )
+        cs = cur.fetchone()
+        if cs:
+            out["color_stats"] = {
+                "frames_sampled": cs["frames_sampled"],
+                "black_point": cs["black_point"],
+                "white_point": cs["white_point"],
+                "mid_gray": cs["mid_gray"],
+                "rgb_mean": cs["rgb_mean"] or [],
+                "lab_ab_cast": cs["lab_ab_cast"] or [],
+                "wb_gray_world": cs["wb_gray_world"] or [],
+                "wb_white_patch": cs["wb_white_patch"] or [],
+                "clip_shadow_pct": cs["clip_shadow_pct"],
+                "clip_highlight_pct": cs["clip_highlight_pct"],
+                "is_log_flat": cs["is_log_flat"],
+                "skin_lab": cs["skin_lab"],
+                "palette": cs["palette"] or [],
             }
 
         # Per-stage processing job rows

@@ -26,6 +26,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from app.services.l3.grade.resolver import resolve_clip_grade
+
 # Z bands so layer kinds stack predictably regardless of insertion order.
 Z_SPINE_VIDEO = 0
 Z_COVERAGE = 10        # a V2 cutaway painted above the V1 spine (full-frame or a cell)
@@ -266,6 +268,10 @@ class VideoLayer:
     op_id: Optional[str] = None  # operation that produced it (None = spine)
     # Geometric framing (rotate/fit/anchor/zoom/dest); see solve_transform.
     transform: dict = field(default_factory=dict)
+    # Resolved color grade ({cdl, creative_lut_ref, working_space, grade_hash});
+    # see grade.resolver.resolve_clip_grade. Applied identically in preview
+    # (WebGL LUT sample) and export (ffmpeg lut3d) -- see color_grading.plan.md SS4.
+    grade: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -281,6 +287,7 @@ class VideoLayer:
             "kind": self.kind,
             "op_id": self.op_id,
             "transform": self.transform or {},
+            "grade": self.grade or {},
         }
 
 
@@ -518,6 +525,7 @@ def resolve(document: dict, durations: Optional[Dict[str, int]] = None) -> Resol
     timeline = document.get("timeline") or []
     operations = document.get("operations") or []
     spans, total = spine_spans(timeline)
+    sequence_look = document.get("look")
 
     video: List[VideoLayer] = []
     audio: List[AudioLayer] = []
@@ -532,6 +540,7 @@ def resolve(document: dict, durations: Optional[Dict[str, int]] = None) -> Resol
             prog_start_ms=s.prog_start_ms, prog_end_ms=s.prog_end_ms,
             z=Z_SPINE_VIDEO, kind="spine",
             transform=solve_transform(document, seg.get("transform")),
+            grade=resolve_clip_grade(seg, sequence_look=sequence_look),
         ))
         audio.append(AudioLayer(
             layer_id=f"a_{seg['seg_id']}",
@@ -562,6 +571,7 @@ def resolve(document: dict, durations: Optional[Dict[str, int]] = None) -> Resol
                 opacity=float(op.get("opacity", 1.0)),
                 kind="coverage", op_id=op["op_id"],
                 transform=solve_transform(document, op.get("transform")),
+                grade=resolve_clip_grade(op, sequence_look=sequence_look),
             ))
         elif t == "place_audio":
             audio.append(AudioLayer(

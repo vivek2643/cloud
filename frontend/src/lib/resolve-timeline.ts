@@ -10,6 +10,7 @@
  * both sides and diff) protects against drift — see the backend parity fixture.
  */
 import type {
+  ClipGrade,
   DestRect,
   EditAspect,
   EditDocument,
@@ -22,8 +23,10 @@ import type {
   LayoutRegion,
   MotionPoint,
   ResolvedAudioLayer,
+  ResolvedGrade,
   ResolvedTimeline,
   ResolvedVideoLayer,
+  SequenceLook,
 } from "./api";
 
 // Z bands so layer kinds stack predictably regardless of insertion order.
@@ -231,6 +234,43 @@ function solveTransform(
   return t;
 }
 
+const IDENTITY_CDL: Required<ClipGrade> = {
+  slope: [1, 1, 1],
+  offset: [0, 0, 0],
+  power: [1, 1, 1],
+  sat: 1,
+};
+
+const DEFAULT_WORKING_SPACE = "rec709";
+
+/** Deterministic grade resolver -- mirrors `grade.resolver.resolve_clip_grade`
+ * (color_grading.plan.md SS3). Unlike `solveTransform`, this NEVER computes a
+ * `grade_hash`: hashing/caching the baked `.cube` is entirely server-side (the
+ * cube endpoint takes raw CDL values and hashes them itself), so the frontend
+ * never has to keep a second hash implementation in lockstep with Python's --
+ * one less way for preview and export to silently disagree. Correct/match/
+ * look/arc (SS5-SS8) all compose into this function's body as they land;
+ * today it's "explicit override, else identity," same as the backend. */
+function resolveClipGrade(
+  item: Pick<EditSegment, "grade"> | Pick<EditOperation, "grade">,
+  _sequenceLook?: SequenceLook
+): ResolvedGrade {
+  const override = item.grade;
+  const cdl: Required<ClipGrade> = override
+    ? {
+        slope: override.slope ?? IDENTITY_CDL.slope,
+        offset: override.offset ?? IDENTITY_CDL.offset,
+        power: override.power ?? IDENTITY_CDL.power,
+        sat: override.sat ?? IDENTITY_CDL.sat,
+      }
+    : IDENTITY_CDL;
+  return {
+    cdl,
+    creative_lut_ref: null,
+    working_space: DEFAULT_WORKING_SPACE,
+  };
+}
+
 // --- spatial layout: split-screen / PiP templates (mirror layers.py) ---
 const round4 = (v: number) => Math.round(v * 1e4) / 1e4;
 
@@ -340,7 +380,7 @@ function applyLayoutRegions(
 }
 
 export function resolveTimeline(
-  document: Pick<EditDocument, "timeline" | "operations" | "format" | "layout_regions">,
+  document: Pick<EditDocument, "timeline" | "operations" | "format" | "layout_regions" | "look">,
   durations: Durations = {}
 ): ResolvedTimeline {
   const timeline = document.timeline ?? [];
@@ -349,6 +389,7 @@ export function resolveTimeline(
   const aspect: EditAspect = a && ASPECTS.includes(a) ? a : "landscape";
   const formatFit = document.format?.fit;
   const { spans, total } = spineSpans(timeline);
+  const sequenceLook = document.look;
 
   const video: ResolvedVideoLayer[] = [];
   const audio: ResolvedAudioLayer[] = [];
@@ -369,6 +410,7 @@ export function resolveTimeline(
       kind: "spine",
       op_id: null,
       transform: solveTransform(aspect, formatFit, seg.transform),
+      grade: resolveClipGrade(seg, sequenceLook),
     });
     audio.push({
       layer_id: `a_${seg.seg_id}`,
@@ -402,6 +444,7 @@ export function resolveTimeline(
         kind: "coverage",
         op_id: op.op_id,
         transform: solveTransform(aspect, formatFit, op.transform),
+        grade: resolveClipGrade(op, sequenceLook),
       });
     } else if (op.type === "place_audio") {
       audio.push({
