@@ -37,6 +37,24 @@ function sameOps(a: EditOperation[], b: EditOperation[]): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+/** Undo/redo snapshot. Deep-ish copy (each mutator already returns fresh
+ * arrays/objects, so a shallow clone of the seg/op objects is enough). */
+interface Snapshot {
+  timeline: EditSegment[];
+  operations: EditOperation[];
+  selected: string | null;
+}
+
+const MAX_HISTORY = 100;
+
+function snapshotOf(st: { timeline: EditSegment[]; operations: EditOperation[]; selected: string | null }): Snapshot {
+  return {
+    timeline: st.timeline.map((s) => ({ ...s })),
+    operations: st.operations.map((o) => ({ ...o })),
+    selected: st.selected,
+  };
+}
+
 interface EditDocState {
   threadId: string | null;
   /** version the working doc is based on (for optimistic-concurrency saves). */
@@ -66,13 +84,26 @@ interface EditDocState {
   mergeDurations: (d: Durations) => void;
   select: (segId: string | null) => void;
 
+  // --- undo / redo (separate from revert-to-baseline) ---
+  past: Snapshot[];
+  future: Snapshot[];
+  /** Snapshot the CURRENT state onto the undo stack and clear redo. Call once
+   * per discrete edit (e.g. on pointer-down before a drag), not per intermediate
+   * mutation, so a drag collapses to one history step. */
+  pushHistory: () => void;
+  undo: () => void;
+  redo: () => void;
+  canUndo: () => boolean;
+  canRedo: () => boolean;
+
   // --- timeline mutators ---
   trim: (segId: string, edge: "in" | "out", absMs: number) => void;
   nudge: (segId: string, edge: "in" | "out", delta: number) => void;
   move: (segId: string, dir: -1 | 1) => void;
   /** Reorder a spine segment to an absolute index (drag-to-reorder). */
   reorderSeg: (segId: string, toIndex: number) => void;
-  split: (segId: string) => void;
+  /** Split at an absolute ms (defaults to the segment's midpoint). */
+  split: (segId: string, atMs?: number) => void;
   remove: (segId: string) => void;
   /** Insert a spine cut from a dragged clip (default: append). Selects it. */
   addSegment: (
@@ -115,6 +146,8 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
   durations: {},
   aspect: "landscape",
   selected: null,
+  past: [],
+  future: [],
 
   seed: (threadId, version, doc) => {
     const timeline = doc?.timeline ?? [];
@@ -129,6 +162,8 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       layoutRegions: doc?.layout_regions ?? [],
       aspect: docAspect(doc),
       selected: null,
+      past: [],
+      future: [],
     });
   },
 
@@ -143,6 +178,8 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       layoutRegions: [],
       aspect: "landscape",
       selected: null,
+      past: [],
+      future: [],
     }),
 
   commit: (version, doc) => {
@@ -156,15 +193,54 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       operations: operations.map((o) => ({ ...o })),
       layoutRegions: doc.layout_regions ?? [],
       aspect: docAspect(doc),
+      past: [],
+      future: [],
     });
   },
 
   revert: () =>
     set((st) => ({
+      past: [...st.past, snapshotOf(st)].slice(-MAX_HISTORY),
+      future: [],
       timeline: st.baselineTimeline.map((s) => ({ ...s })),
       operations: st.baselineOperations.map((o) => ({ ...o })),
       selected: null,
     })),
+
+  pushHistory: () =>
+    set((st) => ({
+      past: [...st.past, snapshotOf(st)].slice(-MAX_HISTORY),
+      future: [],
+    })),
+
+  undo: () =>
+    set((st) => {
+      if (st.past.length === 0) return {};
+      const prev = st.past[st.past.length - 1];
+      return {
+        past: st.past.slice(0, -1),
+        future: [...st.future, snapshotOf(st)].slice(-MAX_HISTORY),
+        timeline: prev.timeline,
+        operations: prev.operations,
+        selected: prev.selected,
+      };
+    }),
+
+  redo: () =>
+    set((st) => {
+      if (st.future.length === 0) return {};
+      const next = st.future[st.future.length - 1];
+      return {
+        future: st.future.slice(0, -1),
+        past: [...st.past, snapshotOf(st)].slice(-MAX_HISTORY),
+        timeline: next.timeline,
+        operations: next.operations,
+        selected: next.selected,
+      };
+    }),
+
+  canUndo: () => get().past.length > 0,
+  canRedo: () => get().future.length > 0,
 
   /** Replace only the WORKING state (baseline untouched) — e.g. loading an old
    * version to edit on top of the current head. */
@@ -173,6 +249,8 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       timeline: timeline.map((s) => ({ ...s })),
       operations: operations.map((o) => ({ ...o })),
       selected: null,
+      past: [],
+      future: [],
     }),
 
   isDirty: () => {
@@ -231,12 +309,16 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       return { timeline: next };
     }),
 
-  split: (segId) =>
+  split: (segId, atMs) =>
     set((st) => {
       const i = st.timeline.findIndex((s) => s.seg_id === segId);
       if (i < 0) return {};
       const s = st.timeline[i];
-      const mid = Math.round((s.in_ms + s.out_ms) / 2);
+      // `atMs` is in the same SOURCE-ms domain as in_ms/out_ms (matching trim's
+      // convention) — the caller maps a program-time click/playhead into this
+      // clip's source range before calling split. Defaults to the midpoint.
+      const at = atMs != null ? Math.round(atMs) : Math.round((s.in_ms + s.out_ms) / 2);
+      const mid = Math.max(s.in_ms, Math.min(s.out_ms, at));
       if (mid - s.in_ms < MIN_SEG_MS || s.out_ms - mid < MIN_SEG_MS) return {};
       const a = { ...s, out_ms: mid };
       const b = { ...s, seg_id: rid("se"), in_ms: mid };

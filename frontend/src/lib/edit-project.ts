@@ -30,6 +30,9 @@ export interface ProjectTrack {
   isBase: boolean;
   /** Video stacking band this track represents (higher paints on top). */
   z: number;
+  /** Semantic grouping key for a non-base AUDIO track ("music"/"sfx"/...);
+   * undefined for video tracks and the base audio track. */
+  role?: string;
 }
 
 export type ClipOrigin =
@@ -203,6 +206,7 @@ export function documentToProject(
       label: `A${i + 2}`,
       isBase: false,
       z: 0,
+      role,
     });
   });
   audioOps.forEach((op) => {
@@ -242,4 +246,51 @@ export function documentToProject(
   tracks.push(...upperVideo, baseVideo, baseAudio, ...bedAudio);
 
   return { tracks, clips, durationMs, aspect };
+}
+
+// --------------------------------------------------------------------------
+// Snapping (2.4): candidate program-ms targets + nearest-within-threshold.
+// --------------------------------------------------------------------------
+
+/** Every clip edge across every track, plus 0/total and any extra candidates
+ * (playhead, markers, in/out marks). Excludes one clip's own edges (the clip
+ * being dragged) so it never snaps to itself. */
+export function collectSnapTargets(
+  project: EditProject,
+  opts: { excludeClipId?: string; extra?: number[] } = {}
+): number[] {
+  const set = new Set<number>();
+  for (const c of project.clips) {
+    if (c.id === opts.excludeClipId) continue;
+    set.add(Math.round(c.progStartMs));
+    set.add(Math.round(c.progEndMs));
+  }
+  set.add(0);
+  set.add(Math.round(project.durationMs));
+  for (const e of opts.extra ?? []) set.add(Math.round(e));
+  return Array.from(set).sort((a, b) => a - b);
+}
+
+/** Nearest candidate within `thresholdPx` (screen space) of `ms`, else `ms`
+ * unchanged. `pxPerMs` converts the pixel threshold into the ms domain. */
+export function snapValue(
+  ms: number,
+  targets: number[],
+  pxPerMs: number,
+  thresholdPx = 8
+): { value: number; snappedTo: number | null } {
+  if (pxPerMs <= 0 || targets.length === 0) return { value: ms, snappedTo: null };
+  const thresholdMs = thresholdPx / pxPerMs;
+  let best = ms;
+  let bestDist = thresholdMs;
+  let snappedTo: number | null = null;
+  for (const t of targets) {
+    const d = Math.abs(t - ms);
+    if (d <= bestDist) {
+      bestDist = d;
+      best = t;
+      snappedTo = t;
+    }
+  }
+  return { value: best, snappedTo };
 }

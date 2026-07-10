@@ -14,6 +14,9 @@ import {
   Music,
   Scissors,
   SlidersHorizontal,
+  Save,
+  History,
+  RotateCcw,
 } from "lucide-react";
 import { useDriveStore } from "@/stores/drive-store";
 import { RenderBar } from "@/components/render-bar";
@@ -26,10 +29,14 @@ import {
   createEditThread,
   getEditThread,
   sendThreadMessage,
+  saveEditDocument,
+  listEditVersions,
+  getEditVersion,
   type ThreadQuestion,
   type EditThread,
   type EditThreadStatus,
   type EditOperation,
+  type EditVersionListItem,
 } from "@/lib/api";
 
 const POLL_MS = 2000;
@@ -122,6 +129,24 @@ export function AiEditPanel() {
   // Portal target for the bottom editor dock (program monitor + timeline) that
   // lives in the main area, pro-editor style.
   const [dockEl, setDockEl] = useState<HTMLElement | null>(null);
+
+  // Working-document save/history/revert — hosted here (not in the timeline
+  // dock itself) since this panel already owns threadId/token/ensureThread.
+  const wdTimeline = useEditDocStore((s) => s.timeline);
+  const wdOperations = useEditDocStore((s) => s.operations);
+  const wdBaseVersion = useEditDocStore((s) => s.baseVersion);
+  const wdCommit = useEditDocStore((s) => s.commit);
+  const wdRevert = useEditDocStore((s) => s.revert);
+  const wdSetWorking = useEditDocStore((s) => s.setWorking);
+  const wdIsDirty = useEditDocStore((s) => s.isDirty);
+  const dirty = useMemo(
+    () => wdIsDirty(),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [wdTimeline, wdOperations, wdBaseVersion]
+  );
+  const [saving, setSaving] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [versions, setVersions] = useState<EditVersionListItem[]>([]);
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -268,6 +293,80 @@ export function AiEditPanel() {
     }
   }, [threadId, token, aiScopeFileIds, scope]);
 
+  const doSave = useCallback(async () => {
+    if (!token || saving) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const id = threadId ?? (await ensureThread());
+      if (!id) {
+        setError("Could not start an edit session to save into.");
+        return;
+      }
+      const res = await saveEditDocument(
+        id,
+        { base_version: wdBaseVersion, timeline: wdTimeline, operations: wdOperations },
+        token
+      );
+      wdCommit(res.version, res.document);
+      setThread((prev) =>
+        prev ? { ...prev, document: res.document, document_version: res.version } : prev
+      );
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Save failed.";
+      setError(
+        msg.includes("stale") || msg.includes("409")
+          ? "The plan changed elsewhere (newer version exists). Revert to reload, then re-apply your edits."
+          : msg
+      );
+    } finally {
+      setSaving(false);
+    }
+  }, [token, saving, threadId, ensureThread, wdBaseVersion, wdTimeline, wdOperations, wdCommit]);
+
+  function doRevert() {
+    wdRevert();
+    setError(null);
+  }
+
+  async function openHistory() {
+    if (!threadId) return;
+    setShowHistory((v) => !v);
+    if (!showHistory && token) {
+      try {
+        const { versions } = await listEditVersions(threadId, token);
+        setVersions(versions);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  async function loadVersion(v: number) {
+    if (!token || !threadId) return;
+    try {
+      const { document } = await getEditVersion(threadId, v, token);
+      wdSetWorking(document.timeline ?? [], document.operations ?? []);
+      setShowHistory(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not load version.");
+    }
+  }
+
+  // ⌘/Ctrl+S saves the working doc (guarded against firing while typing).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const el = document.activeElement as HTMLElement | null;
+      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)) return;
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        void doSave();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [doSave]);
+
   function handleNewThread() {
     stopPolling();
     // A fresh start must also empty the LIVE preview/timeline + stop playback,
@@ -283,12 +382,6 @@ export function AiEditPanel() {
     setError(null);
     setBusy(false);
     setQuestions([]);
-  }
-
-  function handleSavedEdit(newVersion: number, newDoc: NonNullable<EditThread["document"]>) {
-    setThread((prev) =>
-      prev ? { ...prev, document: newDoc, document_version: newVersion } : prev
-    );
   }
 
   if (!aiPanelOpen) return null;
@@ -320,6 +413,37 @@ export function AiEditPanel() {
           >
             {aiScopeFileIds.length} clip{aiScopeFileIds.length === 1 ? "" : "s"}
           </span>
+          {threadId && (
+            <>
+              <button
+                onClick={openHistory}
+                className="rounded-lg p-1.5 transition-colors hover:bg-[var(--accent-soft)]"
+                title="Version history"
+              >
+                <History size={15} />
+              </button>
+              <button
+                onClick={doRevert}
+                disabled={!dirty || saving}
+                className="rounded-lg p-1.5 transition-colors hover:bg-[var(--accent-soft)] disabled:opacity-30"
+                title="Revert changes"
+              >
+                <RotateCcw size={15} />
+              </button>
+              <button
+                onClick={doSave}
+                disabled={!dirty || saving}
+                className="rounded-lg p-1.5 transition-opacity disabled:opacity-30"
+                title="Save (⌘S)"
+              >
+                {saving ? (
+                  <Loader2 size={15} className="animate-spin" />
+                ) : (
+                  <Save size={15} style={dirty ? { color: "var(--accent)" } : undefined} />
+                )}
+              </button>
+            </>
+          )}
           <button
             onClick={handleNewThread}
             className="rounded-lg p-1.5 transition-colors hover:bg-[var(--accent-soft)]"
@@ -336,6 +460,33 @@ export function AiEditPanel() {
           </button>
         </div>
       </div>
+
+      {threadId && showHistory && (
+        <div
+          className="border-b px-4 py-2 text-xs"
+          style={{ borderColor: "var(--border)" }}
+        >
+          <p className="mb-1 font-medium" style={{ color: "var(--muted)" }}>
+            Versions (load to edit on top of latest)
+          </p>
+          {versions.length === 0 ? (
+            <p style={{ color: "var(--muted)" }}>No versions yet.</p>
+          ) : (
+            <div className="flex flex-col gap-1">
+              {versions.map((v) => (
+                <button
+                  key={v.version}
+                  onClick={() => loadVersion(v.version)}
+                  className="flex items-center justify-between rounded px-1.5 py-1 text-left transition-colors hover:bg-[var(--accent-soft)]"
+                >
+                  <span>v{v.version} · {v.created_by}</span>
+                  <span style={{ color: "var(--muted)" }}>{new Date(v.created_at).toLocaleTimeString()}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Program monitor — reads the live working doc from the edit store */}
       <CompositePreview token={token} />
@@ -427,14 +578,9 @@ export function AiEditPanel() {
       createPortal(
         <div
           className="max-h-[40vh] min-h-[200px] w-full overflow-y-auto border-t p-3"
-          style={{ borderColor: "var(--border)", background: "var(--sidebar)" }}
+          style={{ borderColor: "var(--border)", background: "var(--background)" }}
         >
-          <TimelineEditor
-            threadId={threadId}
-            ensureThread={ensureThread}
-            token={token}
-            onSaved={handleSavedEdit}
-          />
+          <TimelineEditor ensureThread={ensureThread} />
         </div>,
         dockEl
       )}

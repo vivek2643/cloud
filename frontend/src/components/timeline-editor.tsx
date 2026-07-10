@@ -6,36 +6,49 @@ import {
   Trash2,
   ChevronLeft,
   ChevronRight,
-  Save,
-  RotateCcw,
-  History,
   Volume2,
   VolumeX,
-  Loader2,
-  AlertCircle,
   Play,
   Pause,
+  Undo2,
+  Redo2,
+  ZoomIn,
+  ZoomOut,
+  Maximize2,
+  MousePointer2,
+  Magnet,
+  Lock,
+  Unlock,
+  Headphones,
+  Bookmark,
 } from "lucide-react";
-import {
-  saveEditDocument,
-  listEditVersions,
-  getEditVersion,
-  type EditDocument,
-  type EditOperation,
-  type EditVersionListItem,
-} from "@/lib/api";
+import { type EditOperation } from "@/lib/api";
 import { useEditDocStore } from "@/stores/edit-doc-store";
 import { useTransport, formatTimecode, snapMs } from "@/stores/transport-store";
-import { documentToProject, type ProjectClip, type ProjectTrack } from "@/lib/edit-project";
+import {
+  useTimelineView,
+  MIN_PX_PER_SEC,
+  MAX_PX_PER_SEC,
+  type TrackMeta,
+} from "@/stores/timeline-view";
+import {
+  documentToProject,
+  collectSnapTargets,
+  snapValue,
+  type ProjectClip,
+} from "@/lib/edit-project";
 
 function fmt(ms: number) {
   const s = Math.max(0, Math.round(ms / 1000));
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
-const LABEL_W = 44;
-const LANE_GAP = 8; // matches the gap-2 between a lane label and its track
-const TRACK_LEFT = LABEL_W + LANE_GAP;
+const HEADER_W = 132;
+const RULER_H = 24;
+const DEFAULT_LANE_H = 36;
+const MIN_LANE_H = 26;
+const MAX_LANE_H = 96;
+const SNAP_THRESHOLD_PX = 8;
 
 /** A cut dragged from the Cuts view (see its onDragStart). */
 interface DropPayload {
@@ -59,21 +72,33 @@ function parseDrop(e: React.DragEvent): DropPayload | null {
   }
 }
 
-export function TimelineEditor({
-  threadId,
-  ensureThread,
-  token,
-  onSaved,
-}: {
-  threadId: string | null;
-  ensureThread: () => Promise<string | null>;
-  token: string | undefined;
-  onSaved: (version: number, document: EditDocument) => void;
-}) {
+/** One user-created empty lane waiting for a clip to land (tracks are
+ * DERIVED from ops, so an "empty track" only becomes real once an op with
+ * its z/role exists — see edit-project.ts + timeline_nle.plan.md §9). */
+interface PendingTrack {
+  key: string;
+  kind: "video" | "audio";
+  z?: number;
+  role?: string;
+}
+
+/** Unified shape for a rendered track row — either a real (derived) track or
+ * a not-yet-real pending placeholder, so the header/lane lists never need to
+ * branch on which kind of track they're drawing. */
+interface RenderTrack {
+  id: string;
+  kind: "video" | "audio";
+  label: string;
+  isBase: boolean;
+  z: number;
+  role?: string;
+  pending: boolean;
+}
+
+export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<string | null> }) {
   const timeline = useEditDocStore((s) => s.timeline);
   const operations = useEditDocStore((s) => s.operations);
   const selected = useEditDocStore((s) => s.selected);
-  const baseVersion = useEditDocStore((s) => s.baseVersion);
   const select = useEditDocStore((s) => s.select);
   const trimSeg = useEditDocStore((s) => s.trim);
   const nudgeSeg = useEditDocStore((s) => s.nudge);
@@ -88,34 +113,50 @@ export function TimelineEditor({
   const reorderSeg = useEditDocStore((s) => s.reorderSeg);
   const addSegment = useEditDocStore((s) => s.addSegment);
   const addOp = useEditDocStore((s) => s.addOp);
-  const revertStore = useEditDocStore((s) => s.revert);
-  const setWorking = useEditDocStore((s) => s.setWorking);
-  const commit = useEditDocStore((s) => s.commit);
-  const isDirty = useEditDocStore((s) => s.isDirty);
+  const pushHistory = useEditDocStore((s) => s.pushHistory);
+  const undo = useEditDocStore((s) => s.undo);
+  const redo = useEditDocStore((s) => s.redo);
+  const canUndo = useEditDocStore((s) => s.canUndo());
+  const canRedo = useEditDocStore((s) => s.canRedo());
 
-  const dirty = useMemo(
-    () => isDirty(),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [timeline, operations, baseVersion]
-  );
+  const pxPerSec = useTimelineView((s) => s.pxPerSec);
+  const scrollLeftPx = useTimelineView((s) => s.scrollLeftPx);
+  const tool = useTimelineView((s) => s.tool);
+  const snapEnabled = useTimelineView((s) => s.snapEnabled);
+  const snapGuideMs = useTimelineView((s) => s.snapGuideMs);
+  const trackMeta = useTimelineView((s) => s.trackMeta);
+  const inMarkMs = useTimelineView((s) => s.inMarkMs);
+  const outMarkMs = useTimelineView((s) => s.outMarkMs);
+  const markers = useTimelineView((s) => s.markers);
+  const setZoom = useTimelineView((s) => s.setZoom);
+  const zoomIn = useTimelineView((s) => s.zoomIn);
+  const zoomOut = useTimelineView((s) => s.zoomOut);
+  const zoomToFit = useTimelineView((s) => s.zoomToFit);
+  const setScrollLeft = useTimelineView((s) => s.setScrollLeft);
+  const setTool = useTimelineView((s) => s.setTool);
+  const toggleSnap = useTimelineView((s) => s.toggleSnap);
+  const setSnapGuide = useTimelineView((s) => s.setSnapGuide);
+  const setTrackMeta = useTimelineView((s) => s.setTrackMeta);
+  const setInMark = useTimelineView((s) => s.setInMark);
+  const setOutMark = useTimelineView((s) => s.setOutMark);
+  const addMarker = useTimelineView((s) => s.addMarker);
+  const removeMarker = useTimelineView((s) => s.removeMarker);
 
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [showHistory, setShowHistory] = useState(false);
-  const [versions, setVersions] = useState<EditVersionListItem[]>([]);
   const [selectedOp, setSelectedOp] = useState<string | null>(null);
-  const [trackW, setTrackW] = useState(600);
+  const [viewportW, setViewportW] = useState(600);
+  const [pendingTracks, setPendingTracks] = useState<PendingTrack[]>([]);
 
-  const trackRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const trackEls = useRef<Map<string, HTMLDivElement>>(new Map());
   const muteCache = useRef<Record<string, number>>({});
+  const trackAudioMuteCache = useRef<Record<string, Record<string, number>>>({});
 
   useEffect(() => {
-    const el = trackRef.current;
+    const el = scrollRef.current;
     if (!el) return;
-    const ro = new ResizeObserver(() => setTrackW(el.clientWidth || 600));
+    const ro = new ResizeObserver(() => setViewportW(el.clientWidth || 600));
     ro.observe(el);
-    setTrackW(el.clientWidth || 600);
+    setViewportW(el.clientWidth || 600);
     return () => ro.disconnect();
   }, []);
 
@@ -125,7 +166,44 @@ export function TimelineEditor({
     [timeline, operations, aspect]
   );
   const total = project.durationMs;
-  const pxPerMs = total > 0 ? trackW / total : 0;
+  const pxPerMs = pxPerSec / 1000;
+  const contentWidth = Math.max(1, total * pxPerMs);
+
+  // Drop pending-track placeholders once a real track with the same z/role
+  // exists (a clip landed there, so edit-project.ts now derives it for real).
+  useEffect(() => {
+    if (pendingTracks.length === 0) return;
+    setPendingTracks((cur) =>
+      cur.filter((p) =>
+        p.kind === "video"
+          ? !project.tracks.some((t) => t.kind === "video" && !t.isBase && t.z === p.z)
+          : !project.tracks.some((t) => t.kind === "audio" && !t.isBase && t.role === p.role)
+      )
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project.tracks]);
+
+  // Merge derived + pending tracks into one uniform shape for rendering
+  // (pending video slots before base video; pending audio appended after the
+  // real audio tracks). `pending: true` marks a not-yet-real placeholder lane.
+  const renderTracks: RenderTrack[] = useMemo(() => {
+    const baseIdx = project.tracks.findIndex((t) => t.kind === "video" && t.isBase);
+    const real: RenderTrack[] = project.tracks.map((t) => ({ ...t, pending: false }));
+    const pendingVideo: RenderTrack[] = pendingTracks
+      .filter((p) => p.kind === "video")
+      .map((p) => ({
+        id: p.key, kind: "video", label: `V${p.z ?? 0}`, isBase: false, z: p.z ?? 0, pending: true,
+      }));
+    const pendingAudio: RenderTrack[] = pendingTracks
+      .filter((p) => p.kind === "audio")
+      .map((p) => ({
+        id: p.key, kind: "audio", label: p.role ?? "audio", isBase: false, z: 0, role: p.role, pending: true,
+      }));
+    const out = [...real];
+    if (pendingVideo.length) out.splice(Math.max(0, baseIdx), 0, ...pendingVideo);
+    out.push(...pendingAudio);
+    return out;
+  }, [project.tracks, pendingTracks]);
 
   // Shared transport — playhead position + play state live in the same store the
   // program monitor reads, so the two surfaces are always in lockstep.
@@ -135,14 +213,74 @@ export function TimelineEditor({
   const step = useTransport((s) => s.step);
   const togglePlaying = useTransport((s) => s.togglePlaying);
 
-  const playheadPx = pxPerMs > 0 ? Math.min(Math.max(progMs * pxPerMs, 0), trackW) : 0;
+  const playheadPx = pxPerMs > 0 ? progMs * pxPerMs : 0;
 
-  // Keyboard transport: space = play/pause, ←/→ = step a frame (shift = 10).
+  // --- keep the DOM scroll position and the store in sync ---
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    if (Math.abs(el.scrollLeft - scrollLeftPx) > 0.5) el.scrollLeft = scrollLeftPx;
+  }, [scrollLeftPx]);
+
+  function onContentScroll() {
+    const el = scrollRef.current;
+    if (!el) return;
+    setScrollLeft(el.scrollLeft);
+  }
+
+  // --- auto-scroll to keep the playhead in view during playback ---
+  useEffect(() => {
+    if (!playing || pxPerMs <= 0) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    const EDGE_PAD = 24;
+    if (playheadPx > el.scrollLeft + viewportW - EDGE_PAD || playheadPx < el.scrollLeft) {
+      const next = Math.max(0, playheadPx - viewportW * 0.1);
+      el.scrollLeft = next;
+      setScrollLeft(next);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [progMs, playing]);
+
+  // --- Cmd/Ctrl + wheel = zoom centered on the cursor ---
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      e.preventDefault();
+      const rect = el.getBoundingClientRect();
+      const cursorX = e.clientX - rect.left;
+      const msAtCursor = (el.scrollLeft + cursorX) / (pxPerSec / 1000 || 1);
+      const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      const nextPxPerSec = Math.max(MIN_PX_PER_SEC, Math.min(MAX_PX_PER_SEC, pxPerSec * factor));
+      const nextPxPerMs = nextPxPerSec / 1000;
+      const nextScroll = Math.max(0, msAtCursor * nextPxPerMs - cursorX);
+      setZoom(nextPxPerSec);
+      setScrollLeft(nextScroll);
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [pxPerSec, setZoom, setScrollLeft]);
+
+  // --- keyboard: transport, undo/redo, tools, snap ---
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const el = document.activeElement as HTMLElement | null;
       if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable))
         return;
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        if (e.shiftKey) redo();
+        else undo();
+        return;
+      }
+      if (mod && e.key.toLowerCase() === "y") {
+        e.preventDefault();
+        redo();
+        return;
+      }
       if (e.code === "Space") {
         e.preventDefault();
         togglePlaying();
@@ -152,11 +290,42 @@ export function TimelineEditor({
       } else if (e.code === "ArrowRight") {
         e.preventDefault();
         step(e.shiftKey ? 10 : 1);
+      } else if (!mod && e.key.toLowerCase() === "v") {
+        setTool("select");
+      } else if (!mod && e.key.toLowerCase() === "b") {
+        setTool("blade");
+      } else if (!mod && e.key.toLowerCase() === "s") {
+        toggleSnap();
+      } else if (!mod && e.key.toLowerCase() === "m") {
+        addMarker(useTransport.getState().progMs);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlaying, step]);
+  }, [togglePlaying, step, undo, redo, setTool, toggleSnap, addMarker]);
+
+  // --- snapping helper shared by every drag gesture ---
+  const snapProgramMs = useCallback(
+    (rawMs: number, excludeClipId?: string): number => {
+      if (!snapEnabled) {
+        setSnapGuide(null);
+        return rawMs;
+      }
+      const extra = [progMs];
+      if (inMarkMs != null) extra.push(inMarkMs);
+      if (outMarkMs != null) extra.push(outMarkMs);
+      extra.push(...markers);
+      const targets = collectSnapTargets(project, { excludeClipId, extra });
+      const { value, snappedTo } = snapValue(rawMs, targets, pxPerMs, SNAP_THRESHOLD_PX);
+      setSnapGuide(snappedTo);
+      return value;
+    },
+    [snapEnabled, progMs, inMarkMs, outMarkMs, markers, project, pxPerMs, setSnapGuide]
+  );
+
+  function isLocked(trackId: string): boolean {
+    return !!trackMeta[trackId]?.lock;
+  }
 
   function selectClip(clip: ProjectClip) {
     if (clip.origin.kind === "spine") {
@@ -168,26 +337,42 @@ export function TimelineEditor({
     }
   }
 
-  // --- trim a clip's edge by dragging its handle (frame-snapped) ---
+  function clickToSplit(clip: ProjectClip, e: React.PointerEvent) {
+    if (clip.origin.kind !== "spine" || pxPerMs <= 0) return;
+    const el = trackEls.current.get(clip.trackId);
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const clickProgMs = (e.clientX - rect.left) / pxPerMs;
+    // Map the click's program-time position into this clip's SOURCE range
+    // (spine plays at native speed, so the offset is 1:1).
+    const srcMs = clip.srcInMs + (clickProgMs - clip.progStartMs);
+    pushHistory();
+    splitSeg(clip.origin.segId, srcMs);
+  }
+
+  // --- trim a clip's edge by dragging its handle (frame-snapped + snapped) ---
   function startTrim(clip: ProjectClip, edge: "in" | "out", e: React.PointerEvent) {
     e.preventDefault();
     e.stopPropagation();
-    if (pxPerMs <= 0 || !clip.trimmable) return;
+    if (pxPerMs <= 0 || !clip.trimmable || isLocked(clip.trackId)) return;
     selectClip(clip);
+    pushHistory();
     const startX = e.clientX;
     const onMove = (ev: PointerEvent) => {
       const dMs = (ev.clientX - startX) / pxPerMs;
       if (clip.origin.kind === "spine") {
-        // source-domain trim (in_ms/out_ms); the coupled audio follows.
         const base = edge === "in" ? clip.srcInMs : clip.srcOutMs;
-        trimSeg(clip.origin.segId, edge, snapMs(base + dMs));
+        const progBase = edge === "in" ? clip.progStartMs : clip.progEndMs;
+        const snappedProg = snapProgramMs(progBase + dMs, clip.id);
+        trimSeg(clip.origin.segId, edge, snapMs(base + (snappedProg - progBase)));
       } else {
-        // program-domain trim on a placed op.
-        const base = edge === "in" ? clip.progStartMs : clip.progEndMs;
-        setOpEdge(clip.origin.opId, edge, snapMs(base + dMs), total);
+        const progBase = edge === "in" ? clip.progStartMs : clip.progEndMs;
+        const snappedProg = snapProgramMs(progBase + dMs, clip.id);
+        setOpEdge(clip.origin.opId, edge, snapMs(snappedProg), total);
       }
     };
     const onUp = () => {
+      setSnapGuide(null);
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
     };
@@ -197,7 +382,7 @@ export function TimelineEditor({
 
   /** Which rendered track the pointer is currently over (vertical hit-test). */
   function trackAtY(clientY: number) {
-    for (const track of project.tracks) {
+    for (const track of renderTracks) {
       const el = trackEls.current.get(track.id);
       if (!el) continue;
       const r = el.getBoundingClientRect();
@@ -208,19 +393,21 @@ export function TimelineEditor({
 
   // --- move a placed clip freely along the program clock + across video
   //     layers (horizontal = reposition, vertical = restack onto another
-  //     video track's z). Frame-snapped. ---
+  //     video track's z). Frame-snapped + edge-snapped. ---
   function startMove(clip: ProjectClip, e: React.PointerEvent) {
-    if (!clip.movable || clip.origin.kind !== "op") return;
+    if (!clip.movable || clip.origin.kind !== "op" || isLocked(clip.trackId)) return;
     e.preventDefault();
     e.stopPropagation();
     if (pxPerMs <= 0) return;
     selectClip(clip);
+    pushHistory();
     const opId = clip.origin.opId;
     const startX = e.clientX;
     const startFrom = clip.progStartMs;
     const onMove = (ev: PointerEvent) => {
       const dMs = (ev.clientX - startX) / pxPerMs;
-      setOpFrom(opId, snapMs(startFrom + dMs), total);
+      const snappedFrom = snapProgramMs(startFrom + dMs, clip.id);
+      setOpFrom(opId, snapMs(snappedFrom), total);
       // Cross-track: only V2+ video cutaways restack, only onto another non-base
       // video layer (never onto the spine or an audio track).
       if (clip.kind === "video") {
@@ -231,6 +418,7 @@ export function TimelineEditor({
       }
     };
     const onUp = () => {
+      setSnapGuide(null);
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
     };
@@ -240,18 +428,19 @@ export function TimelineEditor({
 
   // --- drag a base (spine) video clip to reorder it within the spine ---
   function startReorder(clip: ProjectClip, e: React.PointerEvent) {
-    if (clip.origin.kind !== "spine" || clip.kind !== "video") return;
+    if (clip.origin.kind !== "spine" || clip.kind !== "video" || isLocked(clip.trackId)) return;
     e.preventDefault();
     e.stopPropagation();
     if (pxPerMs <= 0) return;
     selectClip(clip);
+    pushHistory();
     const segId = clip.origin.segId;
     const baseId = clip.trackId;
     const onMove = (ev: PointerEvent) => {
       const el = trackEls.current.get(baseId);
       if (!el) return;
       const rect = el.getBoundingClientRect();
-      const progMs = (ev.clientX - rect.left) / pxPerMs;
+      const atMs = (ev.clientX - rect.left) / pxPerMs;
       // Insertion index among the OTHER base clips (count whose midpoint is
       // left of the cursor) — matches reorderSeg's post-removal splice index.
       const others = project.clips.filter(
@@ -259,7 +448,7 @@ export function TimelineEditor({
       );
       let idx = 0;
       for (const c of others) {
-        if (progMs > (c.progStartMs + c.progEndMs) / 2) idx++;
+        if (atMs > (c.progStartMs + c.progEndMs) / 2) idx++;
       }
       reorderSeg(segId, idx);
     };
@@ -280,7 +469,9 @@ export function TimelineEditor({
     const el = trackEls.current.get(trackId);
     if (!el || pxPerMs <= 0) return progMs;
     const rect = el.getBoundingClientRect();
-    return Math.max(0, snapMs((clientX - rect.left) / pxPerMs));
+    const raw = (clientX - rect.left) / pxPerMs;
+    const snapped = snapEnabled ? snapValue(raw, collectSnapTargets(project), pxPerMs, SNAP_THRESHOLD_PX).value : raw;
+    return Math.max(0, snapMs(snapped));
   }
 
   function spineIndexAtX(trackId: string, clientX: number): number {
@@ -295,17 +486,20 @@ export function TimelineEditor({
     return idx;
   }
 
-  function onLaneDragOver(track: ProjectTrack, e: React.DragEvent) {
+  function onLaneDragOver(track: RenderTrack, e: React.DragEvent) {
+    if (isLocked(track.id)) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = "copy";
     if (dropTrack !== track.id) setDropTrack(track.id);
   }
 
-  function onLaneDrop(track: ProjectTrack, e: React.DragEvent) {
+  function onLaneDrop(track: RenderTrack, e: React.DragEvent) {
     e.preventDefault();
     setDropTrack(null);
+    if (isLocked(track.id)) return;
     const p = parseDrop(e);
     if (!p) return;
+    pushHistory();
     if (track.kind === "video" && track.isBase) {
       addSegment(
         { file_id: p.file_id, in_ms: p.in_ms, out_ms: p.out_ms },
@@ -327,7 +521,7 @@ export function TimelineEditor({
         src_in_ms: p.in_ms,
         src_out_ms: p.out_ms,
         from_ms: progMsAtX(track.id, e.clientX),
-        role: "music",
+        role: track.role,
       });
     }
     // Make sure an edit session exists so the build can be saved later.
@@ -335,6 +529,7 @@ export function TimelineEditor({
   }
 
   function toggleMute(op: EditOperation) {
+    pushHistory();
     const muted = (op.gain_db ?? 0) <= -119;
     if (muted) setGain(op.op_id, muteCache.current[op.op_id] ?? 0);
     else {
@@ -343,119 +538,83 @@ export function TimelineEditor({
     }
   }
 
-  // --- save / revert / history ---
-  const save = useCallback(async () => {
-    if (!token || saving) return;
-    setSaving(true);
-    setError(null);
-    try {
-      const id = threadId ?? (await ensureThread());
-      if (!id) {
-        setError("Could not start an edit session to save into.");
-        return;
-      }
-      const res = await saveEditDocument(
-        id,
-        { base_version: baseVersion, timeline, operations },
-        token
-      );
-      commit(res.version, res.document);
-      onSaved(res.version, res.document);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "Save failed.";
-      setError(
-        msg.includes("stale") || msg.includes("409")
-          ? "The plan changed elsewhere (newer version exists). Revert to reload, then re-apply your edits."
-          : msg
-      );
-    } finally {
-      setSaving(false);
-    }
-  }, [token, saving, threadId, ensureThread, baseVersion, timeline, operations, commit, onSaved]);
-
-  function revert() {
-    revertStore();
-    setSelectedOp(null);
-    setError(null);
+  // --- track header actions (2.5 scaffolding) ---
+  function toggleTrackLock(trackId: string) {
+    setTrackMeta(trackId, { lock: !trackMeta[trackId]?.lock });
   }
-
-  async function openHistory() {
-    if (!threadId) return;
-    setShowHistory((v) => !v);
-    if (!showHistory && token) {
-      try {
-        const { versions } = await listEditVersions(threadId, token);
-        setVersions(versions);
-      } catch {
-        /* ignore */
+  function toggleTrackSolo(trackId: string) {
+    // View/playback flag only — coordinating the preview mixer to actually
+    // silence other tracks is P1 item 4 (use-program-player integration).
+    setTrackMeta(trackId, { solo: !trackMeta[trackId]?.solo });
+  }
+  function toggleTrackMute(track: RenderTrack) {
+    const nextMuted = !trackMeta[track.id]?.mute;
+    setTrackMeta(track.id, { mute: nextMuted });
+    if (track.kind !== "audio" || track.pending) return; // video mute is view-only (P1)
+    // Audio track mute maps onto every op on the track's gain_db, mirroring
+    // the existing per-clip mute path.
+    pushHistory();
+    const opIds: string[] = [];
+    for (const c of project.clips) {
+      if (c.trackId === track.id && c.origin.kind === "op") opIds.push(c.origin.opId);
+    }
+    if (nextMuted) {
+      const cache: Record<string, number> = {};
+      for (const opId of opIds) {
+        const op = operations.find((o) => o.op_id === opId);
+        cache[opId] = op?.gain_db ?? 0;
+        setGain(opId, -120);
+      }
+      trackAudioMuteCache.current[track.id] = cache;
+    } else {
+      const cache = trackAudioMuteCache.current[track.id] ?? {};
+      for (const opId of opIds) {
+        setGain(opId, cache[opId] ?? 0);
       }
     }
   }
+  function startResize(trackId: string, e: React.PointerEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    const startY = e.clientY;
+    const startH = trackMeta[trackId]?.heightPx ?? DEFAULT_LANE_H;
+    const onMove = (ev: PointerEvent) => {
+      setTrackMeta(trackId, {
+        heightPx: Math.max(MIN_LANE_H, Math.min(MAX_LANE_H, startH + (ev.clientY - startY))),
+      });
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
 
-  async function loadVersion(v: number) {
-    if (!token || !threadId) return;
-    try {
-      const { document } = await getEditVersion(threadId, v, token);
-      setWorking(document.timeline ?? [], document.operations ?? []);
-      setShowHistory(false);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not load version.");
-    }
+  function addVideoTrack() {
+    const usedZ = new Set(project.tracks.filter((t) => t.kind === "video" && !t.isBase).map((t) => t.z));
+    pendingTracks.filter((p) => p.kind === "video").forEach((p) => usedZ.add(p.z ?? 0));
+    let z = 10;
+    while (usedZ.has(z)) z += 1;
+    setPendingTracks((cur) => [...cur, { key: `pend-v${z}`, kind: "video", z }]);
+  }
+  function addAudioTrack() {
+    const used = new Set(
+      project.tracks.filter((t) => t.kind === "audio" && !t.isBase).map((t) => t.role ?? "")
+    );
+    pendingTracks.filter((p) => p.kind === "audio").forEach((p) => used.add(p.role ?? ""));
+    let n = 1;
+    while (used.has(`bed${n}`)) n += 1;
+    const role = `bed${n}`;
+    setPendingTracks((cur) => [...cur, { key: `pend-a${role}`, kind: "audio", role }]);
   }
 
   const selSeg = selected ? timeline.find((s) => s.seg_id === selected) : null;
   const selOp = selectedOp ? operations.find((o) => o.op_id === selectedOp) : null;
 
   return (
-    <div
-      className="space-y-3 rounded-2xl border p-3"
-      style={{ background: "var(--background)", borderColor: "var(--border)" }}
-    >
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-baseline gap-2">
-          <span className="text-sm font-semibold">Timeline</span>
-          <span className="text-[11px] tabular-nums" style={{ color: "var(--muted)" }}>
-            {timeline.length} cut{timeline.length === 1 ? "" : "s"} · {fmt(total)}
-          </span>
-        </div>
-        <div className="flex items-center gap-1">
-          <button onClick={openHistory} disabled={!threadId} className="rounded-lg p-1.5 transition-colors hover:bg-[var(--accent-soft)] disabled:opacity-30" title="Version history">
-            <History size={15} />
-          </button>
-          <button onClick={revert} disabled={!dirty || saving} className="rounded-lg p-1.5 transition-colors hover:bg-[var(--accent-soft)] disabled:opacity-30" title="Revert changes">
-            <RotateCcw size={15} />
-          </button>
-          <button
-            onClick={save}
-            disabled={!dirty || saving}
-            className="flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-opacity disabled:opacity-30"
-            style={{ background: "var(--accent)", color: "var(--background)" }}
-            title="Save as a new version"
-          >
-            {saving ? <Loader2 size={13} className="animate-spin" /> : <Save size={13} />}
-            Save
-          </button>
-        </div>
-      </div>
-
-      {showHistory && (
-        <div className="rounded-lg border p-2 text-xs" style={{ borderColor: "var(--border)" }}>
-          <p className="mb-1 font-medium" style={{ color: "var(--muted)" }}>
-            Versions (load to edit on top of latest)
-          </p>
-          <div className="flex flex-col gap-1">
-            {versions.map((v) => (
-              <button key={v.version} onClick={() => loadVersion(v.version)} className="flex items-center justify-between rounded px-1.5 py-1 text-left transition-colors hover:bg-[var(--accent-soft)]">
-                <span>v{v.version} · {v.created_by}</span>
-                <span style={{ color: "var(--muted)" }}>{new Date(v.created_at).toLocaleTimeString()}</span>
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Transport strip */}
+    <div className="space-y-2">
+      {/* Toolbar */}
       <div className="flex items-center gap-1">
         <button
           onClick={togglePlaying}
@@ -472,116 +631,241 @@ export function TimelineEditor({
         <IconBtn title="Next frame (→)" onClick={() => step(1)}>
           <ChevronRight size={14} />
         </IconBtn>
+
+        <Divider />
+
+        <IconBtn active={tool === "select"} title="Select (V)" onClick={() => setTool("select")}>
+          <MousePointer2 size={14} />
+        </IconBtn>
+        <IconBtn active={tool === "blade"} title="Blade (B)" onClick={() => setTool("blade")}>
+          <Scissors size={14} />
+        </IconBtn>
+        <IconBtn active={snapEnabled} title="Snap (S)" onClick={toggleSnap}>
+          <Magnet size={14} />
+        </IconBtn>
+
+        <Divider />
+
+        <IconBtn title="Zoom out" onClick={zoomOut}>
+          <ZoomOut size={14} />
+        </IconBtn>
+        <IconBtn title="Zoom to fit" onClick={() => zoomToFit(viewportW, total)}>
+          <Maximize2 size={14} />
+        </IconBtn>
+        <IconBtn title="Zoom in" onClick={zoomIn}>
+          <ZoomIn size={14} />
+        </IconBtn>
+
+        <Divider />
+
+        <IconBtn title="Undo (⌘Z)" onClick={undo} disabled={!canUndo}>
+          <Undo2 size={14} />
+        </IconBtn>
+        <IconBtn title="Redo (⌘⇧Z)" onClick={redo} disabled={!canRedo}>
+          <Redo2 size={14} />
+        </IconBtn>
+
+        <Divider />
+
+        <IconBtn title="Add video track" onClick={addVideoTrack}>
+          <TextTag>+V</TextTag>
+        </IconBtn>
+        <IconBtn title="Add audio track" onClick={addAudioTrack}>
+          <TextTag>+A</TextTag>
+        </IconBtn>
+        <IconBtn title="Add marker (M)" onClick={() => addMarker(progMs)}>
+          <Bookmark size={14} />
+        </IconBtn>
+        <IconBtn title="Set in point" onClick={() => setInMark(progMs)}>
+          <TextTag>I</TextTag>
+        </IconBtn>
+        <IconBtn title="Set out point" onClick={() => setOutMark(progMs)}>
+          <TextTag>O</TextTag>
+        </IconBtn>
+
         <span className="ml-auto text-[11px] tabular-nums" style={{ color: "var(--muted)" }}>
           {formatTimecode(progMs)} <span style={{ opacity: 0.5 }}>/ {formatTimecode(total)}</span>
         </span>
       </div>
 
-      {/* Ruler + lanes + playhead (shared time scale) */}
-      <div className="relative">
-        <TimeRuler total={total} pxPerMs={pxPerMs} onSeek={seek} />
-
-        {/* Tracks: generic NLE lanes (top → bottom), one Block per clip. */}
-        <div className="space-y-1">
-          {project.tracks.map((track) => {
-            const trackClips = project.clips.filter((c) => c.trackId === track.id);
-            const isWidthTrack = track.isBase && track.kind === "video";
-            const showDropHint =
-              isWidthTrack && trackClips.length === 0 && timeline.length === 0;
-            return (
-              <Lane
-                key={track.id}
-                label={track.label}
-                highlight={dropTrack === track.id}
-                onDragOver={(e) => onLaneDragOver(track, e)}
-                onDragLeave={() => setDropTrack(null)}
-                onDrop={(e) => onLaneDrop(track, e)}
-                innerRef={(el) => {
-                  const m = trackEls.current;
-                  if (el) m.set(track.id, el);
-                  else m.delete(track.id);
-                  if (isWidthTrack)
-                    (trackRef as React.MutableRefObject<HTMLDivElement | null>).current = el;
-                }}
-              >
-                <div className="relative h-full w-full">
-                  {showDropHint && (
-                    <div
-                      className="pointer-events-none absolute inset-0 flex items-center justify-center text-[11px]"
-                      style={{ color: "var(--muted)" }}
-                    >
-                      Drag cuts here to build your edit
-                    </div>
-                  )}
-                  {trackClips.map((clip) => {
-                    const selectedClip =
-                      clip.origin.kind === "spine"
-                        ? selected === clip.origin.segId
-                        : selectedOp === clip.origin.opId;
-                    const bodyDrag = clip.movable
-                      ? (e: React.PointerEvent) => startMove(clip, e)
-                      : clip.kind === "video" && clip.origin.kind === "spine"
-                        ? (e: React.PointerEvent) => startReorder(clip, e)
-                        : undefined;
-                    return (
-                      <Block
-                        key={clip.id}
-                        left={clip.progStartMs * pxPerMs}
-                        width={Math.max(8, (clip.progEndMs - clip.progStartMs) * pxPerMs)}
-                        selected={selectedClip}
-                        onClick={() => selectClip(clip)}
-                        onBodyPointerDown={bodyDrag}
-                        color={clip.color}
-                        muted={clip.muted}
-                        movable={!!bodyDrag}
-                        title={`${clip.label} · ${fmt(clip.progStartMs)}–${fmt(clip.progEndMs)}`}
-                      >
-                        {clip.trimmable && (
-                          <span
-                            onPointerDown={(e) => startTrim(clip, "in", e)}
-                            className="absolute left-0 top-0 h-full w-1.5 cursor-ew-resize"
-                            style={{ background: "rgba(0,0,0,0.35)" }}
-                          />
-                        )}
-                        <span className="pointer-events-none truncate px-2">{clip.label}</span>
-                        {clip.trimmable && (
-                          <span
-                            onPointerDown={(e) => startTrim(clip, "out", e)}
-                            className="absolute right-0 top-0 h-full w-1.5 cursor-ew-resize"
-                            style={{ background: "rgba(0,0,0,0.35)" }}
-                          />
-                        )}
-                      </Block>
-                    );
-                  })}
-                </div>
-              </Lane>
-            );
-          })}
+      {/* Header column (fixed) + scrollable ruler/lanes */}
+      <div className="flex items-stretch">
+        {/* Fixed track-header column */}
+        <div className="shrink-0" style={{ width: HEADER_W }}>
+          <div style={{ height: RULER_H }} />
+          {renderTracks.map((track) => (
+            <TrackHeaderRow
+              key={track.id}
+              track={track}
+              meta={trackMeta[track.id]}
+              onToggleMute={() => toggleTrackMute(track)}
+              onToggleSolo={() => toggleTrackSolo(track.id)}
+              onToggleLock={() => toggleTrackLock(track.id)}
+              onResizeStart={(e) => startResize(track.id, e)}
+            />
+          ))}
         </div>
 
-        {/* Playhead — spans the ruler + every lane */}
-        {pxPerMs > 0 && (
-          <div
-            className="pointer-events-none absolute bottom-0 z-10"
-            style={{ left: TRACK_LEFT + playheadPx, top: 0 }}
-          >
-            <div className="h-full" style={{ width: 2, background: "var(--foreground)" }} />
-            <div
-              className="absolute"
-              style={{
-                top: 0,
-                left: 1,
-                transform: "translateX(-50%)",
-                width: 0,
-                height: 0,
-                borderLeft: "4px solid transparent",
-                borderRight: "4px solid transparent",
-                borderTop: "6px solid var(--foreground)",
-              }}
+        {/* Scrollable content: ruler + lanes + playhead + snap guide + I/O band, one shared scroll */}
+        <div
+          ref={scrollRef}
+          onScroll={onContentScroll}
+          className="relative min-w-0 flex-1 overflow-x-auto overflow-y-hidden"
+          style={{ touchAction: "pan-x" }}
+        >
+          <div className="relative" style={{ width: Math.max(contentWidth, viewportW) }}>
+            <TimeRuler
+              total={total}
+              pxPerMs={pxPerMs}
+              onSeek={seek}
+              markers={markers}
+              onRemoveMarker={removeMarker}
             />
+
+            {/* In/out shaded band */}
+            {inMarkMs != null && outMarkMs != null && pxPerMs > 0 && (
+              <div
+                className="pointer-events-none absolute top-0"
+                style={{
+                  left: inMarkMs * pxPerMs,
+                  width: Math.max(1, (outMarkMs - inMarkMs) * pxPerMs),
+                  height: RULER_H,
+                  background: "var(--accent-soft)",
+                }}
+              />
+            )}
+
+            {/* Tracks */}
+            <div>
+              {renderTracks.map((track) => {
+                // A pending placeholder never has real clips (its id can't
+                // match any clip's trackId until a drop creates the op).
+                const trackClips = project.clips.filter((c) => c.trackId === track.id);
+                const isWidthTrack = track.kind === "video" && track.isBase;
+                const showDropHint = isWidthTrack && trackClips.length === 0 && timeline.length === 0;
+                const height = trackMeta[track.id]?.heightPx ?? DEFAULT_LANE_H;
+                const locked = !!trackMeta[track.id]?.lock;
+                return (
+                  <div
+                    key={track.id}
+                    onDragOver={(e) => onLaneDragOver(track, e)}
+                    onDragLeave={() => setDropTrack(null)}
+                    onDrop={(e) => onLaneDrop(track, e)}
+                    ref={(el) => {
+                      const m = trackEls.current;
+                      if (el) m.set(track.id, el);
+                      else m.delete(track.id);
+                    }}
+                    className="relative border-b"
+                    style={{
+                      height,
+                      borderColor: "var(--border)",
+                      background: dropTrack === track.id ? "var(--accent-soft)" : "transparent",
+                      outline: dropTrack === track.id ? "2px dashed var(--accent)" : "none",
+                      outlineOffset: -2,
+                      opacity: locked ? 0.55 : 1,
+                      cursor: tool === "blade" ? "crosshair" : undefined,
+                    }}
+                  >
+                    {showDropHint && (
+                      <div
+                        className="pointer-events-none absolute inset-0 flex items-center justify-center text-[11px]"
+                        style={{ color: "var(--muted)" }}
+                      >
+                        Drag cuts here to build your edit
+                      </div>
+                    )}
+                    {trackClips.map((clip) => {
+                      const selectedClip =
+                        clip.origin.kind === "spine"
+                          ? selected === clip.origin.segId
+                          : selectedOp === clip.origin.opId;
+                      const bladeClick =
+                        tool === "blade" && clip.origin.kind === "spine"
+                          ? (e: React.PointerEvent) => {
+                              e.stopPropagation();
+                              clickToSplit(clip, e);
+                            }
+                          : undefined;
+                      const bodyDrag =
+                        tool === "blade"
+                          ? bladeClick
+                          : clip.movable
+                          ? (e: React.PointerEvent) => startMove(clip, e)
+                          : clip.kind === "video" && clip.origin.kind === "spine"
+                          ? (e: React.PointerEvent) => startReorder(clip, e)
+                          : undefined;
+                      return (
+                        <Block
+                          key={clip.id}
+                          left={clip.progStartMs * pxPerMs}
+                          width={Math.max(8, (clip.progEndMs - clip.progStartMs) * pxPerMs)}
+                          selected={selectedClip}
+                          onClick={() => (tool === "select" ? selectClip(clip) : undefined)}
+                          onBodyPointerDown={bodyDrag}
+                          color={clip.color}
+                          muted={clip.muted}
+                          movable={tool === "select" && !!bodyDrag}
+                          title={`${clip.label} · ${fmt(clip.progStartMs)}–${fmt(clip.progEndMs)}`}
+                        >
+                          {tool === "select" && clip.trimmable && (
+                            <span
+                              onPointerDown={(e) => startTrim(clip, "in", e)}
+                              className="absolute left-0 top-0 h-full w-1.5 cursor-ew-resize"
+                              style={{ background: "rgba(0,0,0,0.35)" }}
+                            />
+                          )}
+                          <span className="pointer-events-none truncate px-2">{clip.label}</span>
+                          {tool === "select" && clip.trimmable && (
+                            <span
+                              onPointerDown={(e) => startTrim(clip, "out", e)}
+                              className="absolute right-0 top-0 h-full w-1.5 cursor-ew-resize"
+                              style={{ background: "rgba(0,0,0,0.35)" }}
+                            />
+                          )}
+                        </Block>
+                      );
+                    })}
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Snap guide */}
+            {snapGuideMs != null && pxPerMs > 0 && (
+              <div
+                className="pointer-events-none absolute top-0 z-20"
+                style={{
+                  left: snapGuideMs * pxPerMs,
+                  top: 0,
+                  bottom: 0,
+                  width: 1,
+                  background: "var(--accent)",
+                }}
+              />
+            )}
+
+            {/* Playhead — spans the ruler + every lane */}
+            {pxPerMs > 0 && (
+              <div className="pointer-events-none absolute bottom-0 z-10" style={{ left: playheadPx, top: 0 }}>
+                <div className="h-full" style={{ width: 2, background: "var(--foreground)" }} />
+                <div
+                  className="absolute"
+                  style={{
+                    top: 0,
+                    left: 1,
+                    transform: "translateX(-50%)",
+                    width: 0,
+                    height: 0,
+                    borderLeft: "4px solid transparent",
+                    borderRight: "4px solid transparent",
+                    borderTop: "6px solid var(--foreground)",
+                  }}
+                />
+              </div>
+            )}
           </div>
-        )}
+        </div>
       </div>
 
       {/* Inspector: selected clip (spine) or selected layer (op) */}
@@ -591,12 +875,12 @@ export function TimelineEditor({
             {selSeg.file_id.slice(0, 6)} · {fmt(selSeg.in_ms)}–{fmt(selSeg.out_ms)}
           </span>
           <div className="ml-auto flex items-center gap-1">
-            <Stepper label="in" onMinus={() => nudgeSeg(selSeg.seg_id, "in", -250)} onPlus={() => nudgeSeg(selSeg.seg_id, "in", 250)} />
-            <Stepper label="out" onMinus={() => nudgeSeg(selSeg.seg_id, "out", -250)} onPlus={() => nudgeSeg(selSeg.seg_id, "out", 250)} />
-            <IconBtn title="Move left" onClick={() => moveSeg(selSeg.seg_id, -1)}><ChevronLeft size={14} /></IconBtn>
-            <IconBtn title="Move right" onClick={() => moveSeg(selSeg.seg_id, 1)}><ChevronRight size={14} /></IconBtn>
-            <IconBtn title="Split at middle" onClick={() => splitSeg(selSeg.seg_id)}><Scissors size={13} /></IconBtn>
-            <IconBtn title="Delete cut" onClick={() => removeSeg(selSeg.seg_id)} danger><Trash2 size={13} /></IconBtn>
+            <Stepper label="in" onMinus={() => { pushHistory(); nudgeSeg(selSeg.seg_id, "in", -250); }} onPlus={() => { pushHistory(); nudgeSeg(selSeg.seg_id, "in", 250); }} />
+            <Stepper label="out" onMinus={() => { pushHistory(); nudgeSeg(selSeg.seg_id, "out", -250); }} onPlus={() => { pushHistory(); nudgeSeg(selSeg.seg_id, "out", 250); }} />
+            <IconBtn title="Move left" onClick={() => { pushHistory(); moveSeg(selSeg.seg_id, -1); }}><ChevronLeft size={14} /></IconBtn>
+            <IconBtn title="Move right" onClick={() => { pushHistory(); moveSeg(selSeg.seg_id, 1); }}><ChevronRight size={14} /></IconBtn>
+            <IconBtn title="Split at middle" onClick={() => { pushHistory(); splitSeg(selSeg.seg_id); }}><Scissors size={13} /></IconBtn>
+            <IconBtn title="Delete cut" onClick={() => { pushHistory(); removeSeg(selSeg.seg_id); }} danger><Trash2 size={13} /></IconBtn>
           </div>
         </div>
       )}
@@ -619,6 +903,7 @@ export function TimelineEditor({
                 max={6}
                 step={1}
                 value={(selOp.gain_db ?? 0) <= -119 ? -30 : Math.max(-30, Math.min(6, selOp.gain_db ?? 0))}
+                onPointerDown={() => pushHistory()}
                 onChange={(e) => setGain(selOp.op_id, Number(e.target.value))}
                 className="ml-auto w-24 accent-[var(--accent)]"
                 title="Gain (dB)"
@@ -628,31 +913,28 @@ export function TimelineEditor({
               </button>
             </>
           )}
-          <button onClick={() => { removeOpStore(selOp.op_id); setSelectedOp(null); }} title="Delete layer" className={`rounded p-1 hover:bg-[var(--accent-soft)] ${selOp.type === "place_video" ? "ml-auto" : ""}`}>
+          <button onClick={() => { pushHistory(); removeOpStore(selOp.op_id); setSelectedOp(null); }} title="Delete layer" className={`rounded p-1 hover:bg-[var(--accent-soft)] ${selOp.type === "place_video" ? "ml-auto" : ""}`}>
             <Trash2 size={13} style={{ color: "var(--danger)" }} />
           </button>
-        </div>
-      )}
-
-      {error && (
-        <div className="flex items-start gap-1.5 text-[11px]" style={{ color: "var(--danger)" }}>
-          <AlertCircle size={12} className="mt-0.5 shrink-0" />
-          <span>{error}</span>
         </div>
       )}
     </div>
   );
 }
 
-/** Clickable/scrubbable time ruler, aligned to the lane tracks. */
+/** Clickable/scrubbable time ruler + marker pips, aligned to the lane tracks. */
 function TimeRuler({
   total,
   pxPerMs,
   onSeek,
+  markers,
+  onRemoveMarker,
 }: {
   total: number;
   pxPerMs: number;
   onSeek: (ms: number) => void;
+  markers: number[];
+  onRemoveMarker: (ms: number) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const draggingRef = useRef(false);
@@ -709,60 +991,94 @@ function TimeRuler({
   }
 
   return (
-    <div className="mb-1 flex items-stretch gap-2">
-      <span className="shrink-0" style={{ width: LABEL_W }} />
-      <div
-        ref={ref}
-        onPointerDown={onPointerDown}
-        className="relative h-6 min-w-0 flex-1 cursor-pointer select-none"
-        style={{ touchAction: "none" }}
-        title="Click or drag to scrub"
-      >
-        {ticks}
-      </div>
+    <div
+      ref={ref}
+      onPointerDown={onPointerDown}
+      className="relative cursor-pointer select-none"
+      style={{ height: RULER_H, touchAction: "none" }}
+      title="Click or drag to scrub"
+    >
+      {ticks}
+      {pxPerMs > 0 &&
+        markers.map((ms) => (
+          <div
+            key={ms}
+            onPointerDown={(e) => {
+              e.stopPropagation();
+              onRemoveMarker(ms);
+            }}
+            title={`Marker @ ${formatTimecode(ms)} — click to remove`}
+            className="absolute bottom-0"
+            style={{ left: ms * pxPerMs - 3 }}
+          >
+            <div
+              style={{
+                width: 0,
+                height: 0,
+                borderLeft: "3px solid transparent",
+                borderRight: "3px solid transparent",
+                borderBottom: "5px solid var(--accent)",
+              }}
+            />
+          </div>
+        ))}
     </div>
   );
 }
 
-function Lane({
-  label,
-  children,
-  innerRef,
-  highlight,
-  onDragOver,
-  onDragLeave,
-  onDrop,
+function TrackHeaderRow({
+  track,
+  meta,
+  onToggleMute,
+  onToggleSolo,
+  onToggleLock,
+  onResizeStart,
 }: {
-  label: string;
-  children: React.ReactNode;
-  innerRef?: (el: HTMLDivElement | null) => void;
-  highlight?: boolean;
-  onDragOver?: (e: React.DragEvent) => void;
-  onDragLeave?: (e: React.DragEvent) => void;
-  onDrop?: (e: React.DragEvent) => void;
+  track: RenderTrack;
+  meta: TrackMeta | undefined;
+  onToggleMute: () => void;
+  onToggleSolo: () => void;
+  onToggleLock: () => void;
+  onResizeStart: (e: React.PointerEvent) => void;
 }) {
+  const height = meta?.heightPx ?? DEFAULT_LANE_H;
   return (
-    <div className="flex items-stretch gap-2">
-      <span
-        className="flex shrink-0 items-center justify-center rounded text-[10px] font-medium"
-        style={{ width: LABEL_W, color: "var(--muted)", background: "var(--accent-soft)" }}
-      >
-        {label}
+    <div
+      className="relative flex items-center gap-0.5 border-b pl-2 pr-1 text-[10px]"
+      style={{ height, borderColor: "var(--border)" }}
+    >
+      <span className="min-w-0 flex-1 truncate font-medium" style={{ color: "var(--muted)" }}>
+        {track.label}
       </span>
-      <div
-        ref={innerRef}
-        onDragOver={onDragOver}
-        onDragLeave={onDragLeave}
-        onDrop={onDrop}
-        className="relative h-9 min-w-0 flex-1 overflow-hidden rounded"
-        style={{
-          background: "var(--sidebar)",
-          outline: highlight ? "2px dashed var(--accent)" : "none",
-          outlineOffset: -2,
-        }}
+      <button
+        onClick={onToggleMute}
+        title={track.kind === "audio" ? (meta?.mute ? "Unmute" : "Mute") : "Hide in preview (view-only)"}
+        className="rounded p-0.5 hover:bg-[var(--accent-soft)]"
+        style={meta?.mute ? { color: "var(--accent)" } : undefined}
       >
-        {children}
-      </div>
+        {meta?.mute ? <VolumeX size={11} /> : <Volume2 size={11} />}
+      </button>
+      <button
+        onClick={onToggleSolo}
+        title={meta?.solo ? "Unsolo" : "Solo"}
+        className="rounded p-0.5 hover:bg-[var(--accent-soft)]"
+        style={meta?.solo ? { color: "var(--accent)" } : undefined}
+      >
+        <Headphones size={11} />
+      </button>
+      <button
+        onClick={onToggleLock}
+        title={meta?.lock ? "Unlock" : "Lock"}
+        className="rounded p-0.5 hover:bg-[var(--accent-soft)]"
+        style={meta?.lock ? { color: "var(--accent)" } : undefined}
+      >
+        {meta?.lock ? <Lock size={11} /> : <Unlock size={11} />}
+      </button>
+      <div
+        onPointerDown={onResizeStart}
+        className="absolute inset-x-0 bottom-0 h-1 cursor-row-resize"
+        title="Drag to resize"
+      />
     </div>
   );
 }
@@ -782,7 +1098,7 @@ function Block({
   left: number;
   width: number;
   selected: boolean;
-  onClick: () => void;
+  onClick?: () => void;
   onBodyPointerDown?: (e: React.PointerEvent) => void;
   color: string;
   title: string;
@@ -813,12 +1129,43 @@ function Block({
   );
 }
 
-function IconBtn({ children, onClick, title, danger }: { children: React.ReactNode; onClick: () => void; title: string; danger?: boolean }) {
+function IconBtn({
+  children,
+  onClick,
+  title,
+  danger,
+  active,
+  disabled,
+}: {
+  children: React.ReactNode;
+  onClick: () => void;
+  title: string;
+  danger?: boolean;
+  active?: boolean;
+  disabled?: boolean;
+}) {
   return (
-    <button onClick={onClick} title={title} className="rounded p-1 transition-colors hover:bg-[var(--accent-soft)]" style={danger ? { color: "var(--danger)" } : undefined}>
+    <button
+      onClick={onClick}
+      title={title}
+      disabled={disabled}
+      className="rounded p-1 transition-colors hover:bg-[var(--accent-soft)] disabled:cursor-default disabled:opacity-30 disabled:hover:bg-transparent"
+      style={{
+        color: danger ? "var(--danger)" : active ? "var(--accent)" : undefined,
+        background: active ? "var(--accent-soft)" : undefined,
+      }}
+    >
       {children}
     </button>
   );
+}
+
+function TextTag({ children }: { children: React.ReactNode }) {
+  return <span className="px-0.5 text-[10px] font-semibold">{children}</span>;
+}
+
+function Divider() {
+  return <div className="mx-1 h-4 w-px shrink-0" style={{ background: "var(--border)" }} />;
 }
 
 function Stepper({ label, onMinus, onPlus }: { label: string; onMinus: () => void; onPlus: () => void }) {
