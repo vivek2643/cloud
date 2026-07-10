@@ -21,13 +21,13 @@ import { useTransport, FRAME_MS, formatTimecode } from "@/stores/transport-store
 import { useProgramPlayer } from "./use-program-player";
 
 /**
- * Preview-ONLY track mute/solo, applied AFTER `resolveTimeline` so the
+ * Preview-ONLY track mute, applied AFTER `resolveTimeline` so the
  * backend-parity resolver itself never sees this ephemeral, session-only UI
- * state (mute/solo/lock live in stores/timeline-view.ts, never the document).
+ * state (mute lives in stores/timeline-view.ts, never the document).
  * Video-track mute hides that layer outright ("view-only" per the plan);
  * audio-track mute already flows through as a real gain_db on the document
- * (timeline-editor.tsx's toggleTrackMute), so only SOLO needs handling here:
- * when any track is soloed, every non-soloed audio layer is silenced.
+ * (timeline-editor.tsx's toggleTrackMute), so there's nothing more to do
+ * for audio here.
  */
 function applyTrackMeta(
   resolved: ResolvedTimeline,
@@ -38,29 +38,16 @@ function applyTrackMeta(
   if (!anyMeta) return resolved;
 
   const videoTrackIdByZ = new Map<number, string>();
-  const audioTrackIdByRole = new Map<string, string>();
-  let baseAudioTrackId: string | null = null;
   for (const t of project.tracks) {
     if (t.kind === "video") videoTrackIdByZ.set(t.z, t.id);
-    else if (t.isBase) baseAudioTrackId = t.id;
-    else if (t.role) audioTrackIdByRole.set(t.role, t.id);
   }
-  const anySolo = project.tracks.some((t) => trackMeta[t.id]?.solo);
 
   const video_layers = resolved.video_layers.filter((v) => {
     const trackId = videoTrackIdByZ.get(v.z);
     return !(trackId && trackMeta[trackId]?.mute);
   });
 
-  const audio_layers = !anySolo
-    ? resolved.audio_layers
-    : resolved.audio_layers.map((a) => {
-        const trackId = a.kind === "spine" ? baseAudioTrackId : audioTrackIdByRole.get(a.role);
-        const soloed = trackId ? trackMeta[trackId]?.solo : false;
-        return soloed ? a : { ...a, gain_db: -120 };
-      });
-
-  return { ...resolved, video_layers, audio_layers };
+  return { ...resolved, video_layers };
 }
 
 /**

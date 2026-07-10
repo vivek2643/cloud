@@ -17,17 +17,8 @@ import {
   ZoomIn,
   ZoomOut,
   Maximize2,
-  MousePointer2,
   Magnet,
-  Lock,
-  Unlock,
-  Headphones,
-  Bookmark,
   Copy,
-  ArrowLeftRight,
-  Move,
-  Link2,
-  Link2Off,
 } from "lucide-react";
 import { getFilePlaybackUrl, type EditOperation } from "@/lib/api";
 import { useEditDocStore } from "@/stores/edit-doc-store";
@@ -46,6 +37,7 @@ import {
   collectSnapTargets,
   snapValue,
   type ProjectClip,
+  type ProjectTrack,
 } from "@/lib/edit-project";
 
 function fmt(ms: number) {
@@ -71,8 +63,6 @@ function parseTimecode(text: string): number | null {
 const HEADER_W = 132;
 const RULER_H = 24;
 const DEFAULT_LANE_H = 36;
-const MIN_LANE_H = 26;
-const MAX_LANE_H = 96;
 const SNAP_THRESHOLD_PX = 8;
 const DUPLICATE_OFFSET_MS = 300;
 
@@ -98,29 +88,6 @@ function parseDrop(e: React.DragEvent): DropPayload | null {
   }
 }
 
-/** One user-created empty lane waiting for a clip to land (tracks are
- * DERIVED from ops, so an "empty track" only becomes real once an op with
- * its z/role exists — see edit-project.ts + timeline_nle.plan.md §9). */
-interface PendingTrack {
-  key: string;
-  kind: "video" | "audio";
-  z?: number;
-  role?: string;
-}
-
-/** Unified shape for a rendered track row — either a real (derived) track or
- * a not-yet-real pending placeholder, so the header/lane lists never need to
- * branch on which kind of track they're drawing. */
-interface RenderTrack {
-  id: string;
-  kind: "video" | "audio";
-  label: string;
-  isBase: boolean;
-  z: number;
-  role?: string;
-  pending: boolean;
-}
-
 interface Marquee {
   x0: number;
   y0: number;
@@ -137,21 +104,17 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
   const clearSelection = useEditDocStore((s) => s.clearSelection);
   const trimSeg = useEditDocStore((s) => s.trim);
   const moveSeg = useEditDocStore((s) => s.move);
-  const slipSeg = useEditDocStore((s) => s.slip);
   const splitSeg = useEditDocStore((s) => s.split);
   const removeSeg = useEditDocStore((s) => s.remove);
   const setGain = useEditDocStore((s) => s.setGain);
   const removeOpStore = useEditDocStore((s) => s.removeOp);
-  const rippleRemoveOp = useEditDocStore((s) => s.rippleRemoveOp);
   const splitOp = useEditDocStore((s) => s.splitOp);
-  const slipOp = useEditDocStore((s) => s.slipOp);
   const setOpFrom = useEditDocStore((s) => s.setOpFrom);
   const setOpEdge = useEditDocStore((s) => s.setOpEdge);
   const setOpZ = useEditDocStore((s) => s.setOpZ);
   const swapVideoZ = useEditDocStore((s) => s.swapVideoZ);
   const reorderSeg = useEditDocStore((s) => s.reorderSeg);
   const addSegment = useEditDocStore((s) => s.addSegment);
-  const overwriteSpine = useEditDocStore((s) => s.overwriteSpine);
   const addOp = useEditDocStore((s) => s.addOp);
   const pushHistory = useEditDocStore((s) => s.pushHistory);
   const undo = useEditDocStore((s) => s.undo);
@@ -171,35 +134,21 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
 
   const pxPerSec = useTimelineView((s) => s.pxPerSec);
   const scrollLeftPx = useTimelineView((s) => s.scrollLeftPx);
-  const tool = useTimelineView((s) => s.tool);
   const snapEnabled = useTimelineView((s) => s.snapEnabled);
   const snapGuideMs = useTimelineView((s) => s.snapGuideMs);
   const trackMeta = useTimelineView((s) => s.trackMeta);
-  const inMarkMs = useTimelineView((s) => s.inMarkMs);
-  const outMarkMs = useTimelineView((s) => s.outMarkMs);
-  const markers = useTimelineView((s) => s.markers);
   const clipboard = useTimelineView((s) => s.clipboard);
   const setZoom = useTimelineView((s) => s.setZoom);
   const zoomIn = useTimelineView((s) => s.zoomIn);
   const zoomOut = useTimelineView((s) => s.zoomOut);
   const zoomToFit = useTimelineView((s) => s.zoomToFit);
   const setScrollLeft = useTimelineView((s) => s.setScrollLeft);
-  const setTool = useTimelineView((s) => s.setTool);
   const toggleSnap = useTimelineView((s) => s.toggleSnap);
   const setSnapGuide = useTimelineView((s) => s.setSnapGuide);
   const setTrackMeta = useTimelineView((s) => s.setTrackMeta);
-  const setInMark = useTimelineView((s) => s.setInMark);
-  const setOutMark = useTimelineView((s) => s.setOutMark);
-  const addMarker = useTimelineView((s) => s.addMarker);
-  const removeMarker = useTimelineView((s) => s.removeMarker);
   const setClipboard = useTimelineView((s) => s.setClipboard);
-  const insertMode = useTimelineView((s) => s.insertMode);
-  const toggleInsertMode = useTimelineView((s) => s.toggleInsertMode);
-  const unlinkedSegIds = useTimelineView((s) => s.unlinkedSegIds);
-  const toggleLinked = useTimelineView((s) => s.toggleLinked);
 
   const [viewportW, setViewportW] = useState(600);
-  const [pendingTracks, setPendingTracks] = useState<PendingTrack[]>([]);
   const [marquee, setMarquee] = useState<Marquee | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -225,41 +174,6 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
   const pxPerMs = pxPerSec / 1000;
   const contentWidth = Math.max(1, total * pxPerMs);
 
-  // Drop pending-track placeholders once a real track with the same z/role
-  // exists (a clip landed there, so edit-project.ts now derives it for real).
-  useEffect(() => {
-    if (pendingTracks.length === 0) return;
-    setPendingTracks((cur) =>
-      cur.filter((p) =>
-        p.kind === "video"
-          ? !project.tracks.some((t) => t.kind === "video" && !t.isBase && t.z === p.z)
-          : !project.tracks.some((t) => t.kind === "audio" && !t.isBase && t.role === p.role)
-      )
-    );
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [project.tracks]);
-
-  // Merge derived + pending tracks into one uniform shape for rendering
-  // (pending video slots before base video; pending audio appended after the
-  // real audio tracks). `pending: true` marks a not-yet-real placeholder lane.
-  const renderTracks: RenderTrack[] = useMemo(() => {
-    const baseIdx = project.tracks.findIndex((t) => t.kind === "video" && t.isBase);
-    const real: RenderTrack[] = project.tracks.map((t) => ({ ...t, pending: false }));
-    const pendingVideo: RenderTrack[] = pendingTracks
-      .filter((p) => p.kind === "video")
-      .map((p) => ({
-        id: p.key, kind: "video", label: `V${p.z ?? 0}`, isBase: false, z: p.z ?? 0, pending: true,
-      }));
-    const pendingAudio: RenderTrack[] = pendingTracks
-      .filter((p) => p.kind === "audio")
-      .map((p) => ({
-        id: p.key, kind: "audio", label: p.role ?? "audio", isBase: false, z: 0, role: p.role, pending: true,
-      }));
-    const out = [...real];
-    if (pendingVideo.length) out.splice(Math.max(0, baseIdx), 0, ...pendingVideo);
-    out.push(...pendingAudio);
-    return out;
-  }, [project.tracks, pendingTracks]);
 
   // Shared transport — playhead position + play state live in the same store the
   // program monitor reads, so the two surfaces are always in lockstep.
@@ -319,10 +233,6 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
     return () => el.removeEventListener("wheel", onWheel);
   }, [pxPerSec, setZoom, setScrollLeft]);
 
-  function isLocked(trackId: string): boolean {
-    return !!trackMeta[trackId]?.lock;
-  }
-
   function clipsForIds(ids: string[]): ProjectClip[] {
     if (ids.length === 0) return [];
     const set = new Set(ids);
@@ -363,19 +273,15 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
     }
   }
 
-  // --- P0.2: ripple vs lift delete ---
-  function deleteSelected(ripple: boolean) {
+  // --- delete: one behavior. Spine always ripples (it's gapless by
+  // construction); ops always lift (removed, leaving their slot empty). ---
+  function deleteSelected() {
     const clips = clipsForIds(selectedIds);
     if (!clips.length) return;
     pushHistory();
     for (const c of clips) {
-      if (c.origin.kind === "spine") {
-        removeSeg(c.origin.segId); // spine is gapless -- always ripples (no lift primitive)
-      } else if (ripple) {
-        rippleRemoveOp(c.origin.opId);
-      } else {
-        removeOpStore(c.origin.opId);
-      }
+      if (c.origin.kind === "spine") removeSeg(c.origin.segId);
+      else removeOpStore(c.origin.opId);
     }
     clearSelection();
   }
@@ -417,10 +323,7 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
         entry.kind === "video"
           ? project.tracks.find((t) => t.kind === "video" && t.z === (entry.trackHint?.z ?? 10))?.id
           : project.tracks.find((t) => t.kind === "audio" && !t.isBase && t.role === entry.trackHint?.role)?.id;
-      if (trackId) {
-        if (insertMode === "insert") makeRoomInsert(trackId, progMs, dur);
-        else clearRoomOverwrite(trackId, progMs, dur);
-      }
+      if (trackId) makeRoomInsert(trackId, progMs, dur);
       addOp({
         type: entry.kind === "video" ? "place_video" : "place_audio",
         source_file_id: entry.sourceFileId,
@@ -513,7 +416,7 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
       }
       if (e.key === "Delete" || e.key === "Backspace") {
         e.preventDefault();
-        deleteSelected(e.shiftKey);
+        deleteSelected();
         return;
       }
       if (e.code === "Space") {
@@ -525,18 +428,8 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
       } else if (e.code === "ArrowRight") {
         e.preventDefault();
         step(e.shiftKey ? 10 : 1);
-      } else if (!mod && e.key.toLowerCase() === "v") {
-        setTool("select");
-      } else if (!mod && e.key.toLowerCase() === "b") {
-        setTool("blade");
-      } else if (!mod && e.key.toLowerCase() === "y") {
-        setTool("slip");
-      } else if (!mod && e.key.toLowerCase() === "u") {
-        setTool("slide");
       } else if (!mod && e.key.toLowerCase() === "s") {
         toggleSnap();
-      } else if (!mod && e.key.toLowerCase() === "m") {
-        addMarker(useTransport.getState().progMs);
       } else if (e.key === ",") {
         e.preventDefault();
         nudgeSelected(-1, e.shiftKey);
@@ -548,7 +441,7 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [togglePlaying, step, undo, redo, setTool, toggleSnap, addMarker, selectedIds, clipboard, progMs, project]);
+  }, [togglePlaying, step, undo, redo, toggleSnap, selectedIds, clipboard, progMs, project]);
 
   // --- snapping helper shared by every drag gesture ---
   const snapProgramMs = useCallback(
@@ -558,15 +451,12 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
         return rawMs;
       }
       const extra = [progMs];
-      if (inMarkMs != null) extra.push(inMarkMs);
-      if (outMarkMs != null) extra.push(outMarkMs);
-      extra.push(...markers);
       const targets = collectSnapTargets(project, { excludeClipId, extra });
       const { value, snappedTo } = snapValue(rawMs, targets, pxPerMs, SNAP_THRESHOLD_PX);
       setSnapGuide(snappedTo);
       return value;
     },
-    [snapEnabled, progMs, inMarkMs, outMarkMs, markers, project, pxPerMs, setSnapGuide]
+    [snapEnabled, progMs, project, pxPerMs, setSnapGuide]
   );
 
   /** The OTHER half of a spine segment's A/V pair ("seg:x" <-> "dlg:x"), or
@@ -578,12 +468,11 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
     return null;
   }
 
-  // P1.5: linked (the default) spine A/V selects together; unlinked, each
-  // half selects independently. See stores/timeline-view.ts's docstring for
-  // why this selection-level coupling is what "link" means here.
+  // The spine's video and its coupled dialogue always select together (a
+  // spine segment's A/V is never independently splittable -- see
+  // pairedClipId's own comment).
   function selectClip(clip: ProjectClip, e?: { shiftKey?: boolean }) {
-    const linked = clip.origin.kind === "spine" && !unlinkedSegIds[clip.origin.segId];
-    const pairId = linked ? pairedClipId(clip) : null;
+    const pairId = pairedClipId(clip);
     const ids = pairId && project.clips.some((c) => c.id === pairId) ? [clip.id, pairId] : [clip.id];
     if (e?.shiftKey) {
       const allIn = ids.every((id) => selectedIds.includes(id));
@@ -597,24 +486,11 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
     }
   }
 
-  function clickToSplit(clip: ProjectClip, e: React.PointerEvent) {
-    if (clip.origin.kind !== "spine" || pxPerMs <= 0) return;
-    const el = trackEls.current.get(clip.trackId);
-    if (!el) return;
-    const rect = el.getBoundingClientRect();
-    const clickProgMs = (e.clientX - rect.left) / pxPerMs;
-    // Map the click's program-time position into this clip's SOURCE range
-    // (spine plays at native speed, so the offset is 1:1).
-    const srcMs = clip.srcInMs + (clickProgMs - clip.progStartMs);
-    pushHistory();
-    splitSeg(clip.origin.segId, srcMs);
-  }
-
   // --- trim a clip's edge by dragging its handle (frame-snapped + snapped) ---
   function startTrim(clip: ProjectClip, edge: "in" | "out", e: React.PointerEvent) {
     e.preventDefault();
     e.stopPropagation();
-    if (pxPerMs <= 0 || !clip.trimmable || isLocked(clip.trackId)) return;
+    if (pxPerMs <= 0 || !clip.trimmable) return;
     selectClip(clip);
     pushHistory();
     const startX = e.clientX;
@@ -642,7 +518,7 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
 
   /** Which rendered track the pointer is currently over (vertical hit-test). */
   function trackAtY(clientY: number) {
-    for (const track of renderTracks) {
+    for (const track of project.tracks) {
       const el = trackEls.current.get(track.id);
       if (!el) continue;
       const r = el.getBoundingClientRect();
@@ -655,7 +531,7 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
   //     layers (horizontal = reposition, vertical = restack onto another
   //     video track's z). Frame-snapped + edge-snapped. ---
   function startMove(clip: ProjectClip, e: React.PointerEvent) {
-    if (!clip.movable || clip.origin.kind !== "op" || isLocked(clip.trackId)) return;
+    if (!clip.movable || clip.origin.kind !== "op") return;
     e.preventDefault();
     e.stopPropagation();
     if (pxPerMs <= 0) return;
@@ -688,7 +564,7 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
 
   // --- drag a base (spine) video clip to reorder it within the spine ---
   function startReorder(clip: ProjectClip, e: React.PointerEvent) {
-    if (clip.origin.kind !== "spine" || clip.kind !== "video" || isLocked(clip.trackId)) return;
+    if (clip.origin.kind !== "spine" || clip.kind !== "video") return;
     e.preventDefault();
     e.stopPropagation();
     if (pxPerMs <= 0) return;
@@ -720,97 +596,8 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
     window.addEventListener("pointerup", onUp);
   }
 
-  // --- P1.1 slip: drag the CONTENT inside a fixed-position/duration clip.
-  // Convention matches Premiere/FCP: dragging right reveals EARLIER source
-  // content (the footage moves with the cursor), so the in-point decreases. ---
-  function startSlip(clip: ProjectClip, e: React.PointerEvent) {
-    if (isLocked(clip.trackId) || pxPerMs <= 0) return;
-    e.preventDefault();
-    e.stopPropagation();
-    selectClip(clip);
-    pushHistory();
-    const startX = e.clientX;
-    const startIn = clip.srcInMs;
-    const onMove = (ev: PointerEvent) => {
-      const dMs = (ev.clientX - startX) / pxPerMs;
-      const targetIn = Math.round(startIn - dMs);
-      if (clip.origin.kind === "spine") slipSeg(clip.origin.segId, targetIn);
-      else slipOp(clip.origin.opId, targetIn);
-    };
-    const onUp = () => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-    };
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-  }
-
-  // --- P1.1 slide: move a placed op while any op TOUCHING its edges absorbs
-  // the difference by trimming its own edge, so adjacent ops on the same
-  // track stay gapless through the move (an op with no touching neighbor
-  // just moves freely, same as a plain drag). ---
-  function startSlide(clip: ProjectClip, e: React.PointerEvent) {
-    if (clip.origin.kind !== "op" || isLocked(clip.trackId) || pxPerMs <= 0) return;
-    e.preventDefault();
-    e.stopPropagation();
-    selectClip(clip);
-    pushHistory();
-    const opId = clip.origin.opId;
-    const startX = e.clientX;
-    const startFrom = clip.progStartMs;
-    const dur = clip.progEndMs - clip.progStartMs;
-    const TOUCH_EPS_MS = 2;
-    const siblings = project.clips.filter(
-      (c) => c.trackId === clip.trackId && c.id !== clip.id && c.origin.kind === "op"
-    );
-    const leftNeighbor = siblings.find((c) => Math.abs(c.progEndMs - clip.progStartMs) <= TOUCH_EPS_MS);
-    const rightNeighbor = siblings.find((c) => Math.abs(c.progStartMs - clip.progEndMs) <= TOUCH_EPS_MS);
-    const onMove = (ev: PointerEvent) => {
-      const dMs = (ev.clientX - startX) / pxPerMs;
-      const newFrom = Math.max(0, snapMs(startFrom + dMs));
-      setOpFrom(opId, newFrom, total);
-      if (leftNeighbor?.origin.kind === "op") setOpEdge(leftNeighbor.origin.opId, "out", newFrom, total);
-      if (rightNeighbor?.origin.kind === "op") setOpEdge(rightNeighbor.origin.opId, "in", newFrom + dur, total);
-    };
-    const onUp = () => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-    };
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-  }
-
-  // --- P1.1 roll: drag the shared cut point between two adjacent spine
-  // clips. No total-duration change: the left clip's out and the right
-  // clip's in both move by the SAME program-ms delta (1:1 in each clip's
-  // own source domain, since both play at native speed). ---
-  function startRoll(left: ProjectClip, right: ProjectClip, e: React.PointerEvent) {
-    if (left.origin.kind !== "spine" || right.origin.kind !== "spine") return;
-    if (isLocked(left.trackId) || pxPerMs <= 0) return;
-    e.preventDefault();
-    e.stopPropagation();
-    pushHistory();
-    const startX = e.clientX;
-    const leftSegId = left.origin.segId;
-    const rightSegId = right.origin.segId;
-    const leftOutStart = left.srcOutMs;
-    const rightInStart = right.srcInMs;
-    const onMove = (ev: PointerEvent) => {
-      const dMs = Math.round((ev.clientX - startX) / pxPerMs);
-      trimSeg(leftSegId, "out", leftOutStart + dMs);
-      trimSeg(rightSegId, "in", rightInStart + dMs);
-    };
-    const onUp = () => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-    };
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-  }
-
   // --- P0.4: marquee-select on empty lane space ---
   function startMarquee(e: React.PointerEvent) {
-    if (tool !== "select") return;
     if (e.target !== e.currentTarget) return; // bubbled from a clip Block, not empty space
     const startX = e.clientX;
     const startY = e.clientY;
@@ -880,57 +667,36 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
     return idx;
   }
 
-  function onLaneDragOver(track: RenderTrack, e: React.DragEvent) {
-    if (isLocked(track.id)) return;
+  function onLaneDragOver(track: ProjectTrack, e: React.DragEvent) {
     e.preventDefault();
     e.dataTransfer.dropEffect = "copy";
     if (dropTrack !== track.id) setDropTrack(track.id);
   }
 
-  // --- P1.2 insert vs overwrite (ops): "insert" pushes every later op on the
-  // SAME track right by the new clip's duration; "overwrite" clears the
-  // window first (drops anything fully covered, trims anything straddling an
-  // edge, and — simplification, see the plan's own note on this — drops
-  // rather than splits an existing op that fully SPANS the window). ---
+  // Ripple-insert: pushes every later op on the SAME track right by the new
+  // clip's duration.
   function makeRoomInsert(trackId: string, atMs: number, dur: number) {
     for (const c of project.clips) {
       if (c.trackId !== trackId || c.origin.kind !== "op") continue;
       if (c.progStartMs >= atMs) setOpFrom(c.origin.opId, c.progStartMs + dur, total + dur);
     }
   }
-  function clearRoomOverwrite(trackId: string, atMs: number, dur: number) {
-    const endMs = atMs + dur;
-    for (const c of project.clips) {
-      if (c.trackId !== trackId || c.origin.kind !== "op") continue;
-      if (!(c.progStartMs < endMs && c.progEndMs > atMs)) continue; // no overlap
-      if (c.progStartMs >= atMs && c.progEndMs <= endMs) removeOpStore(c.origin.opId);
-      else if (c.progStartMs < atMs && c.progEndMs > endMs) removeOpStore(c.origin.opId); // spans it -- dropped, not split
-      else if (c.progStartMs < atMs) setOpEdge(c.origin.opId, "out", atMs, total);
-      else setOpEdge(c.origin.opId, "in", endMs, total);
-    }
-  }
 
-  function onLaneDrop(track: RenderTrack, e: React.DragEvent) {
+  function onLaneDrop(track: ProjectTrack, e: React.DragEvent) {
     e.preventDefault();
     setDropTrack(null);
-    if (isLocked(track.id)) return;
     const p = parseDrop(e);
     if (!p) return;
     pushHistory();
     const dur = Math.max(0, p.out_ms - p.in_ms);
     if (track.kind === "video" && track.isBase) {
-      if (insertMode === "overwrite" && inMarkMs != null && outMarkMs != null) {
-        overwriteSpine(inMarkMs, outMarkMs, { file_id: p.file_id, in_ms: p.in_ms, out_ms: p.out_ms });
-      } else {
-        addSegment(
-          { file_id: p.file_id, in_ms: p.in_ms, out_ms: p.out_ms },
-          spineIndexAtX(track.id, e.clientX)
-        );
-      }
+      addSegment(
+        { file_id: p.file_id, in_ms: p.in_ms, out_ms: p.out_ms },
+        spineIndexAtX(track.id, e.clientX)
+      );
     } else if (track.kind === "video") {
       const at = progMsAtX(track.id, e.clientX);
-      if (insertMode === "insert") makeRoomInsert(track.id, at, dur);
-      else clearRoomOverwrite(track.id, at, dur);
+      makeRoomInsert(track.id, at, dur);
       addOp({
         type: "place_video",
         source_file_id: p.file_id,
@@ -941,8 +707,7 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
       });
     } else {
       const at = progMsAtX(track.id, e.clientX);
-      if (insertMode === "insert") makeRoomInsert(track.id, at, dur);
-      else clearRoomOverwrite(track.id, at, dur);
+      makeRoomInsert(track.id, at, dur);
       addOp({
         type: "place_audio",
         source_file_id: p.file_id,
@@ -967,18 +732,10 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
   }
 
   // --- track header actions (2.5 scaffolding) ---
-  function toggleTrackLock(trackId: string) {
-    setTrackMeta(trackId, { lock: !trackMeta[trackId]?.lock });
-  }
-  function toggleTrackSolo(trackId: string) {
-    // View/playback flag only — coordinating the preview mixer to actually
-    // silence other tracks is P1 item 4 (use-program-player integration).
-    setTrackMeta(trackId, { solo: !trackMeta[trackId]?.solo });
-  }
-  function toggleTrackMute(track: RenderTrack) {
+  function toggleTrackMute(track: ProjectTrack) {
     const nextMuted = !trackMeta[track.id]?.mute;
     setTrackMeta(track.id, { mute: nextMuted });
-    if (track.kind !== "audio" || track.pending) return; // video mute is view-only (P1)
+    if (track.kind !== "audio") return; // video mute is view-only (P1)
     // Audio track mute maps onto every op on the track's gain_db, mirroring
     // the existing per-clip mute path.
     pushHistory();
@@ -1000,41 +757,6 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
         setGain(opId, cache[opId] ?? 0);
       }
     }
-  }
-  function startResize(trackId: string, e: React.PointerEvent) {
-    e.preventDefault();
-    e.stopPropagation();
-    const startY = e.clientY;
-    const startH = trackMeta[trackId]?.heightPx ?? DEFAULT_LANE_H;
-    const onMove = (ev: PointerEvent) => {
-      setTrackMeta(trackId, {
-        heightPx: Math.max(MIN_LANE_H, Math.min(MAX_LANE_H, startH + (ev.clientY - startY))),
-      });
-    };
-    const onUp = () => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-    };
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-  }
-
-  function addVideoTrack() {
-    const usedZ = new Set(project.tracks.filter((t) => t.kind === "video" && !t.isBase).map((t) => t.z));
-    pendingTracks.filter((p) => p.kind === "video").forEach((p) => usedZ.add(p.z ?? 0));
-    let z = 10;
-    while (usedZ.has(z)) z += 1;
-    setPendingTracks((cur) => [...cur, { key: `pend-v${z}`, kind: "video", z }]);
-  }
-  function addAudioTrack() {
-    const used = new Set(
-      project.tracks.filter((t) => t.kind === "audio" && !t.isBase).map((t) => t.role ?? "")
-    );
-    pendingTracks.filter((p) => p.kind === "audio").forEach((p) => used.add(p.role ?? ""));
-    let n = 1;
-    while (used.has(`bed${n}`)) n += 1;
-    const role = `bed${n}`;
-    setPendingTracks((cur) => [...cur, { key: `pend-a${role}`, kind: "audio", role }]);
   }
 
   const selectedClips = clipsForIds(selectedIds);
@@ -1065,18 +787,6 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
 
         <Divider />
 
-        <IconBtn active={tool === "select"} title="Select (V)" onClick={() => setTool("select")}>
-          <MousePointer2 size={14} />
-        </IconBtn>
-        <IconBtn active={tool === "blade"} title="Blade (B)" onClick={() => setTool("blade")}>
-          <Scissors size={14} />
-        </IconBtn>
-        <IconBtn active={tool === "slip"} title="Slip (Y)" onClick={() => setTool("slip")}>
-          <ArrowLeftRight size={14} />
-        </IconBtn>
-        <IconBtn active={tool === "slide"} title="Slide (U)" onClick={() => setTool("slide")}>
-          <Move size={14} />
-        </IconBtn>
         <IconBtn active={snapEnabled} title="Snap (S)" onClick={toggleSnap}>
           <Magnet size={14} />
         </IconBtn>
@@ -1108,35 +818,6 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
           <Copy size={14} />
         </IconBtn>
 
-        <Divider />
-
-        <IconBtn title="Add video track" onClick={addVideoTrack}>
-          <TextTag>+V</TextTag>
-        </IconBtn>
-        <IconBtn title="Add audio track" onClick={addAudioTrack}>
-          <TextTag>+A</TextTag>
-        </IconBtn>
-        <IconBtn title="Add marker (M)" onClick={() => addMarker(progMs)}>
-          <Bookmark size={14} />
-        </IconBtn>
-        <IconBtn title="Set in point" onClick={() => setInMark(progMs)}>
-          <TextTag>I</TextTag>
-        </IconBtn>
-        <IconBtn title="Set out point" onClick={() => setOutMark(progMs)}>
-          <TextTag>O</TextTag>
-        </IconBtn>
-        <IconBtn
-          active={insertMode === "overwrite"}
-          title={
-            insertMode === "insert"
-              ? "Insert mode -- new drops/pastes ripple everything later on that track (click for Overwrite)"
-              : "Overwrite mode -- new drops/pastes replace what's in the way (click for Insert)"
-          }
-          onClick={toggleInsertMode}
-        >
-          <TextTag>{insertMode === "insert" ? "INS" : "OVR"}</TextTag>
-        </IconBtn>
-
         <span className="ml-auto text-[11px] tabular-nums" style={{ color: "var(--muted)" }}>
           {formatTimecode(progMs)} <span style={{ opacity: 0.5 }}>/ {formatTimecode(total)}</span>
         </span>
@@ -1147,24 +828,21 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
         {/* Fixed track-header column */}
         <div className="shrink-0" style={{ width: HEADER_W }}>
           <div style={{ height: RULER_H }} />
-          {renderTracks.map((track, i) => {
+          {project.tracks.map((track, i) => {
             // Upper video tracks render highest-z first (see edit-project.ts's
             // `upperVideo` sort) -- "move up" = swap with the track ABOVE (one
             // index earlier / higher z); "move down" = the one below.
-            const isReorderableVideo = track.kind === "video" && !track.isBase && !track.pending;
-            const above = isReorderableVideo ? renderTracks[i - 1] : undefined;
-            const below = isReorderableVideo ? renderTracks[i + 1] : undefined;
-            const canMoveUp = isReorderableVideo && above?.kind === "video" && !above.isBase && !above.pending;
-            const canMoveDown = isReorderableVideo && below?.kind === "video" && !below.isBase && !below.pending;
+            const isReorderableVideo = track.kind === "video" && !track.isBase;
+            const above = isReorderableVideo ? project.tracks[i - 1] : undefined;
+            const below = isReorderableVideo ? project.tracks[i + 1] : undefined;
+            const canMoveUp = isReorderableVideo && above?.kind === "video" && !above.isBase;
+            const canMoveDown = isReorderableVideo && below?.kind === "video" && !below.isBase;
             return (
               <TrackHeaderRow
                 key={track.id}
                 track={track}
                 meta={trackMeta[track.id]}
                 onToggleMute={() => toggleTrackMute(track)}
-                onToggleSolo={() => toggleTrackSolo(track.id)}
-                onToggleLock={() => toggleTrackLock(track.id)}
-                onResizeStart={(e) => startResize(track.id, e)}
                 onMoveUp={canMoveUp ? () => swapVideoZ(track.z, above!.z) : undefined}
                 onMoveDown={canMoveDown ? () => swapVideoZ(track.z, below!.z) : undefined}
               />
@@ -1172,7 +850,7 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
           })}
         </div>
 
-        {/* Scrollable content: ruler + lanes + playhead + snap guide + I/O band, one shared scroll */}
+        {/* Scrollable content: ruler + lanes + playhead + snap guide, one shared scroll */}
         <div
           ref={scrollRef}
           onScroll={onContentScroll}
@@ -1180,37 +858,14 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
           style={{ touchAction: "pan-x" }}
         >
           <div className="relative" style={{ width: Math.max(contentWidth, viewportW) }}>
-            <TimeRuler
-              total={total}
-              pxPerMs={pxPerMs}
-              onSeek={seek}
-              markers={markers}
-              onRemoveMarker={removeMarker}
-            />
-
-            {/* In/out shaded band */}
-            {inMarkMs != null && outMarkMs != null && pxPerMs > 0 && (
-              <div
-                className="pointer-events-none absolute top-0"
-                style={{
-                  left: inMarkMs * pxPerMs,
-                  width: Math.max(1, (outMarkMs - inMarkMs) * pxPerMs),
-                  height: RULER_H,
-                  background: "var(--accent-soft)",
-                }}
-              />
-            )}
+            <TimeRuler total={total} pxPerMs={pxPerMs} onSeek={seek} />
 
             {/* Tracks */}
             <div>
-              {renderTracks.map((track) => {
-                // A pending placeholder never has real clips (its id can't
-                // match any clip's trackId until a drop creates the op).
+              {project.tracks.map((track) => {
                 const trackClips = project.clips.filter((c) => c.trackId === track.id);
                 const isWidthTrack = track.kind === "video" && track.isBase;
                 const showDropHint = isWidthTrack && trackClips.length === 0 && timeline.length === 0;
-                const height = trackMeta[track.id]?.heightPx ?? DEFAULT_LANE_H;
-                const locked = !!trackMeta[track.id]?.lock;
                 return (
                   <div
                     key={track.id}
@@ -1225,13 +880,11 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
                     }}
                     className="relative border-b"
                     style={{
-                      height,
+                      height: DEFAULT_LANE_H,
                       borderColor: "var(--border)",
                       background: dropTrack === track.id ? "var(--accent-soft)" : "transparent",
                       outline: dropTrack === track.id ? "2px dashed var(--accent)" : "none",
                       outlineOffset: -2,
-                      opacity: locked ? 0.55 : 1,
-                      cursor: tool === "blade" ? "crosshair" : undefined,
                       touchAction: "none",
                     }}
                   >
@@ -1243,36 +896,10 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
                         Drag cuts here to build your edit
                       </div>
                     )}
-                    {isWidthTrack &&
-                      tool === "select" &&
-                      trackClips.slice(0, -1).map((clip, i) => (
-                        <div
-                          key={`roll:${clip.id}`}
-                          onPointerDown={(e) => startRoll(trackClips[i], trackClips[i + 1], e)}
-                          className="absolute top-0 z-10 h-full w-2 cursor-col-resize"
-                          style={{ left: clip.progEndMs * pxPerMs - 4 }}
-                          title="Roll (drag the shared cut point)"
-                        />
-                      ))}
                     {trackClips.map((clip) => {
                       const selectedClip = selectedIds.includes(clip.id);
-                      const bladeClick =
-                        tool === "blade" && clip.origin.kind === "spine"
-                          ? (e: React.PointerEvent) => {
-                              e.stopPropagation();
-                              clickToSplit(clip, e);
-                            }
-                          : undefined;
                       const bodyDrag =
-                        tool === "blade"
-                          ? bladeClick
-                          : tool === "slip"
-                          ? (e: React.PointerEvent) => startSlip(clip, e)
-                          : tool === "slide"
-                          ? clip.origin.kind === "op"
-                            ? (e: React.PointerEvent) => startSlide(clip, e)
-                            : (e: React.PointerEvent) => e.stopPropagation()
-                          : clip.movable
+                        clip.movable
                           ? (e: React.PointerEvent) => startMove(clip, e)
                           : clip.kind === "video" && clip.origin.kind === "spine"
                           ? (e: React.PointerEvent) => startReorder(clip, e)
@@ -1290,18 +917,14 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
                           left={clip.progStartMs * pxPerMs}
                           width={blockWidth}
                           selected={selectedClip}
-                          onClick={(e) => (tool !== "blade" ? selectClip(clip, e) : undefined)}
+                          onClick={(e) => selectClip(clip, e)}
                           onBodyPointerDown={bodyDrag}
                           color={clip.color}
                           muted={clip.muted}
-                          movable={
-                            tool === "slip" ||
-                            (tool === "select" && (clip.movable || (clip.kind === "video" && clip.origin.kind === "spine"))) ||
-                            (tool === "slide" && clip.origin.kind === "op")
-                          }
+                          movable={clip.movable || (clip.kind === "video" && clip.origin.kind === "spine")}
                           title={`${displayName} · ${fmt(clip.progStartMs)}–${fmt(clip.progEndMs)}`}
                         >
-                          {tool === "select" && clip.trimmable && (
+                          {clip.trimmable && (
                             <span
                               onPointerDown={(e) => startTrim(clip, "in", e)}
                               className="absolute left-0 top-0 h-full w-1.5 cursor-ew-resize"
@@ -1328,7 +951,7 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
                               {fmt(clip.progEndMs - clip.progStartMs)}
                             </span>
                           )}
-                          {tool === "select" && clip.trimmable && (
+                          {clip.trimmable && (
                             <span
                               onPointerDown={(e) => startTrim(clip, "out", e)}
                               className="absolute right-0 top-0 h-full w-1.5 cursor-ew-resize"
@@ -1401,7 +1024,7 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
           <span className="font-medium">{selectedClips.length} clips selected</span>
           <div className="ml-auto flex items-center gap-1">
             <IconBtn title="Duplicate (⌘D)" onClick={duplicateSelection}><Copy size={13} /></IconBtn>
-            <IconBtn title="Lift delete (Delete)" onClick={() => deleteSelected(false)} danger><Trash2 size={13} /></IconBtn>
+            <IconBtn title="Delete" onClick={deleteSelected} danger><Trash2 size={13} /></IconBtn>
           </div>
         </div>
       )}
@@ -1421,13 +1044,6 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
             />
           </span>
           <div className="ml-auto flex items-center gap-1">
-            <IconBtn
-              active={!unlinkedSegIds[selSeg.seg_id]}
-              title={unlinkedSegIds[selSeg.seg_id] ? "Unlinked -- click to link A/V selection" : "Linked -- click to unlink A/V selection"}
-              onClick={() => toggleLinked(selSeg.seg_id)}
-            >
-              {unlinkedSegIds[selSeg.seg_id] ? <Link2Off size={13} /> : <Link2 size={13} />}
-            </IconBtn>
             <IconBtn title="Move left" onClick={() => { pushHistory(); moveSeg(selSeg.seg_id, -1); }}><ChevronLeft size={14} /></IconBtn>
             <IconBtn title="Move right" onClick={() => { pushHistory(); moveSeg(selSeg.seg_id, 1); }}><ChevronRight size={14} /></IconBtn>
             <IconBtn title="Split at middle" onClick={() => { pushHistory(); splitSeg(selSeg.seg_id); }}><Scissors size={13} /></IconBtn>
@@ -1534,19 +1150,15 @@ function TcField({ ms, onCommit, title }: { ms: number; onCommit: (ms: number) =
   );
 }
 
-/** Clickable/scrubbable time ruler + marker pips, aligned to the lane tracks. */
+/** Clickable/scrubbable time ruler, aligned to the lane tracks. */
 function TimeRuler({
   total,
   pxPerMs,
   onSeek,
-  markers,
-  onRemoveMarker,
 }: {
   total: number;
   pxPerMs: number;
   onSeek: (ms: number) => void;
-  markers: number[];
-  onRemoveMarker: (ms: number) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const draggingRef = useRef(false);
@@ -1611,29 +1223,6 @@ function TimeRuler({
       title="Click or drag to scrub"
     >
       {ticks}
-      {pxPerMs > 0 &&
-        markers.map((ms) => (
-          <div
-            key={ms}
-            onPointerDown={(e) => {
-              e.stopPropagation();
-              onRemoveMarker(ms);
-            }}
-            title={`Marker @ ${formatTimecode(ms)} — click to remove`}
-            className="absolute bottom-0"
-            style={{ left: ms * pxPerMs - 3 }}
-          >
-            <div
-              style={{
-                width: 0,
-                height: 0,
-                borderLeft: "3px solid transparent",
-                borderRight: "3px solid transparent",
-                borderBottom: "5px solid var(--accent)",
-              }}
-            />
-          </div>
-        ))}
     </div>
   );
 }
@@ -1642,26 +1231,19 @@ function TrackHeaderRow({
   track,
   meta,
   onToggleMute,
-  onToggleSolo,
-  onToggleLock,
-  onResizeStart,
   onMoveUp,
   onMoveDown,
 }: {
-  track: RenderTrack;
+  track: ProjectTrack;
   meta: TrackMeta | undefined;
   onToggleMute: () => void;
-  onToggleSolo: () => void;
-  onToggleLock: () => void;
-  onResizeStart: (e: React.PointerEvent) => void;
   onMoveUp?: () => void;
   onMoveDown?: () => void;
 }) {
-  const height = meta?.heightPx ?? DEFAULT_LANE_H;
   return (
     <div
       className="relative flex items-center gap-0.5 border-b pl-2 pr-1 text-[10px]"
-      style={{ height, borderColor: "var(--border)" }}
+      style={{ height: DEFAULT_LANE_H, borderColor: "var(--border)" }}
     >
       <span className="min-w-0 flex-1 truncate font-medium" style={{ color: "var(--muted)" }}>
         {track.label}
@@ -1694,27 +1276,6 @@ function TrackHeaderRow({
       >
         {meta?.mute ? <VolumeX size={11} /> : <Volume2 size={11} />}
       </button>
-      <button
-        onClick={onToggleSolo}
-        title={meta?.solo ? "Unsolo" : "Solo"}
-        className="rounded p-0.5 hover:bg-[var(--accent-soft)]"
-        style={meta?.solo ? { color: "var(--accent)" } : undefined}
-      >
-        <Headphones size={11} />
-      </button>
-      <button
-        onClick={onToggleLock}
-        title={meta?.lock ? "Unlock" : "Lock"}
-        className="rounded p-0.5 hover:bg-[var(--accent-soft)]"
-        style={meta?.lock ? { color: "var(--accent)" } : undefined}
-      >
-        {meta?.lock ? <Lock size={11} /> : <Unlock size={11} />}
-      </button>
-      <div
-        onPointerDown={onResizeStart}
-        className="absolute inset-x-0 bottom-0 h-1 cursor-row-resize"
-        title="Drag to resize"
-      />
     </div>
   );
 }

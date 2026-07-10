@@ -105,10 +105,6 @@ interface EditDocState {
   trim: (segId: string, edge: "in" | "out", absMs: number) => void;
   nudge: (segId: string, edge: "in" | "out", delta: number) => void;
   move: (segId: string, dir: -1 | 1) => void;
-  /** Slip: move in_ms to an ABSOLUTE target (out_ms follows, keeping duration
-   * fixed) — content shifts, position/duration on the program clock don't.
-   * Clamped to the source's own room when its duration is known. */
-  slip: (segId: string, targetInMs: number) => void;
   /** Reorder a spine segment to an absolute index (drag-to-reorder). */
   reorderSeg: (segId: string, toIndex: number) => void;
   /** Split at an absolute ms (defaults to the segment's midpoint). */
@@ -120,12 +116,6 @@ interface EditDocState {
   addSegment: (
     seg: { file_id: string; in_ms: number; out_ms: number },
     atIndex?: number
-  ) => void;
-  /** Overwrite [fromMs, toMs) of the program clock with a new spine segment. */
-  overwriteSpine: (
-    fromMs: number,
-    toMs: number,
-    seg: { file_id: string; in_ms: number; out_ms: number }
   ) => void;
   /** Add a placed V2 video cutaway / A2 audio bed from a dragged clip. Selects it. */
   addOp: (op: {
@@ -141,18 +131,11 @@ interface EditDocState {
 
   // --- operation mutators ---
   setGain: (opId: string, gainDb: number) => void;
-  /** "Lift" delete — removes the op, leaving its slot empty (no shift). */
+  /** Removes the op, leaving its slot empty (no shift). */
   removeOp: (opId: string) => void;
-  /** "Ripple" delete — removes the op and shifts every LATER op on the same
-   * track (video: same z; audio: same role) left by its duration. */
-  rippleRemoveOp: (opId: string) => void;
   /** Split a placed op into two at an absolute PROGRAM ms (1:1 program->source
    * mapping, matching the op's own from_ms/to_ms domain). */
   splitOp: (opId: string, atProgMs: number) => void;
-  /** Slip: move src_in_ms to an ABSOLUTE target (src_out_ms follows, keeping
-   * duration fixed) — position/duration on the program clock stay fixed.
-   * Clamped to the source's own room when known. */
-  slipOp: (opId: string, targetSrcInMs: number) => void;
   /** Reposition a placed clip (place_video/place_audio) on the
    * program clock, keeping its duration. `maxMs` clamps the end to the base. */
   setOpFrom: (opId: string, fromMs: number, maxMs: number) => void;
@@ -334,21 +317,6 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       return { timeline: next };
     }),
 
-  slip: (segId, targetInMs) =>
-    set((st) => {
-      const i = st.timeline.findIndex((s) => s.seg_id === segId);
-      if (i < 0) return {};
-      const s = st.timeline[i];
-      const dur = s.out_ms - s.in_ms;
-      const room = st.durations[s.file_id];
-      const maxIn = room != null ? Math.max(0, room - dur) : Infinity;
-      const newIn = Math.max(0, Math.min(maxIn, Math.round(targetInMs)));
-      if (newIn === s.in_ms) return {};
-      const next = [...st.timeline];
-      next[i] = { ...s, in_ms: newIn, out_ms: newIn + dur };
-      return { timeline: next };
-    }),
-
   reorderSeg: (segId, toIndex) =>
     set((st) => {
       const from = st.timeline.findIndex((s) => s.seg_id === segId);
@@ -407,42 +375,6 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       return { timeline: next, selectedIds: [`seg:${newSeg.seg_id}`] };
     }),
 
-  /** Overwrite [fromMs, toMs) of the PROGRAM clock with a new spine segment:
-   * segments fully inside the window are dropped, a segment straddling either
-   * edge is trimmed to it (a segment spanning the WHOLE window is just
-   * dropped rather than split in two — see timeline_nle.plan.md P1.2). The
-   * new segment splices in where the window was. */
-  overwriteSpine: (fromMs, toMs, seg) =>
-    set((st) => {
-      const from = Math.max(0, Math.round(fromMs));
-      const to = Math.max(from, Math.round(toMs));
-      let t = 0;
-      const kept: EditSegment[] = [];
-      let insertIdx = -1;
-      for (const s of st.timeline) {
-        const dur = Math.max(0, s.out_ms - s.in_ms);
-        const ps = t;
-        const pe = t + dur;
-        t = pe;
-        if (pe <= from || ps >= to) {
-          if (insertIdx < 0 && ps >= from) insertIdx = kept.length;
-          kept.push(s);
-          continue;
-        }
-        const overlapStart = Math.max(ps, from);
-        const overlapEnd = Math.min(pe, to);
-        if (overlapStart > ps) kept.push({ ...s, out_ms: s.in_ms + (overlapStart - ps) });
-        if (insertIdx < 0) insertIdx = kept.length;
-        if (overlapEnd < pe) kept.push({ ...s, seg_id: rid("se"), in_ms: s.in_ms + (overlapEnd - ps) });
-      }
-      if (insertIdx < 0) insertIdx = kept.length;
-      const inMs = Math.max(0, Math.round(seg.in_ms));
-      const outMs = Math.max(inMs + MIN_SEG_MS, Math.round(seg.out_ms));
-      const inserted: EditSegment = { seg_id: rid("se"), file_id: seg.file_id, in_ms: inMs, out_ms: outMs };
-      kept.splice(insertIdx, 0, inserted);
-      return { timeline: kept, selectedIds: [`seg:${inserted.seg_id}`] };
-    }),
-
   addOp: (op) =>
     set((st) => {
       const srcIn = Math.max(0, Math.round(op.src_in_ms));
@@ -490,33 +422,6 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       selectedIds: st.selectedIds.filter((id) => id !== `op:${opId}`),
     })),
 
-  rippleRemoveOp: (opId) =>
-    set((st) => {
-      const removed = st.operations.find((o) => o.op_id === opId);
-      if (!removed || removed.from_ms == null || removed.to_ms == null) {
-        return {
-          operations: st.operations.filter((o) => o.op_id !== opId),
-          selectedIds: st.selectedIds.filter((id) => id !== `op:${opId}`),
-        };
-      }
-      const removedFrom = removed.from_ms;
-      const dur = removed.to_ms - removedFrom;
-      const sameTrack = (o: EditOperation) =>
-        removed.type === "place_video"
-          ? o.type === "place_video" && Math.round(o.z ?? 10) === Math.round(removed.z ?? 10)
-          : o.type === "place_audio" && (o.role ?? "music") === (removed.role ?? "music");
-      const operations = st.operations
-        .filter((o) => o.op_id !== opId)
-        .map((o) => {
-          if (!sameTrack(o) || o.from_ms == null || o.to_ms == null || o.from_ms < removedFrom) return o;
-          return { ...o, from_ms: o.from_ms - dur, to_ms: o.to_ms - dur };
-        });
-      return {
-        operations,
-        selectedIds: st.selectedIds.filter((id) => id !== `op:${opId}`),
-      };
-    }),
-
   splitOp: (opId, atProgMs) =>
     set((st) => {
       const i = st.operations.findIndex((o) => o.op_id === opId);
@@ -538,23 +443,6 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       const next = [...st.operations];
       next.splice(i, 1, a, b);
       return { operations: next, selectedIds: [`op:${a.op_id}`, `op:${b.op_id}`] };
-    }),
-
-  slipOp: (opId, targetSrcInMs) =>
-    set((st) => {
-      const i = st.operations.findIndex((o) => o.op_id === opId);
-      if (i < 0) return {};
-      const o = st.operations[i];
-      const srcIn = Math.round(o.src_in_ms ?? 0);
-      const srcOut = Math.round(o.src_out_ms ?? 0);
-      const dur = srcOut - srcIn;
-      const room = o.source_file_id != null ? st.durations[o.source_file_id] : undefined;
-      const maxIn = room != null ? Math.max(0, room - dur) : Infinity;
-      const newIn = Math.max(0, Math.min(maxIn, Math.round(targetSrcInMs)));
-      if (newIn === srcIn) return {};
-      const next = [...st.operations];
-      next[i] = { ...o, src_in_ms: newIn, src_out_ms: newIn + dur };
-      return { operations: next };
     }),
 
   setOpFrom: (opId, fromMs, maxMs) =>
