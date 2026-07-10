@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple
 
 from app.services.l3 import act, observe
+from app.services.l3.grade.arc import ARC_INTENTS
 from app.services.l3.observe import EditContext
 from app.services.llm import LLMClient, tool_result_block, tool_spec, user_message
 
@@ -105,6 +106,12 @@ def _specs() -> List[Dict[str, Any]]:
           "(mute:true silences, mute:false plays its sound).",
           obj({"target_id": {"type": "string"}, "mute": {"type": "boolean"}},
               ["target_id", "mute"])),
+        S("tag_arc_intent", "Tags a cut's position in the color arc: calm, build, peak, "
+          "or resolve. A deterministic table turns this into a color nudge, scaled by "
+          "the user's arc intensity dial (0 = no visible effect regardless of tags).",
+          obj({"target_id": {"type": "string"},
+               "intent": {"type": "string", "enum": list(ARC_INTENTS)}},
+              ["target_id", "intent"])),
         S("split_edit", "Decouples the AUDIO edge from the VIDEO edge at the seam just "
           "before main-line cut `seam_seg_id` (J/L cut). audio_offset_ms < 0: the "
           "incoming cut's audio leads under the previous picture; > 0: the previous "
@@ -222,6 +229,8 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
             new = act.move(doc, args["seg_id"], args["to_index"])
         elif name == "set_audio":
             new = act.set_audio(doc, args["target_id"], mute=bool(args.get("mute")))
+        elif name == "tag_arc_intent":
+            new = act.set_arc_intent(doc, args["target_id"], intent=args.get("intent", ""))
         elif name == "split_edit":
             new = act.split_edit(doc, args["seam_seg_id"],
                                  audio_offset_ms=args.get("audio_offset_ms", 0))

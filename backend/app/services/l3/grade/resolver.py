@@ -22,8 +22,10 @@ into:
     baked into the CDL delta -- it composes at bake time in `lut_bake.py`
     instead). No auto-pick: a document with no `look.mode` set gets no Look
     contribution at all, per the plan's explicit "no auto look-selection."
-  - SS8 (arc) still no-ops (identity) until its own build step lands; will
-    compose here next, ahead of the explicit override.
+  - SS8 (arc) is wired: `item["arc_intent"]` (set by the `tag_arc_intent`
+    verb, categorical only -- see `l3/act.py`) selects a delta from
+    `arc.py`'s deterministic table, scaled by `sequence_look.arc_intensity`
+    (0 = flat/invisible, the default, per the plan's "invisible by default").
   - The explicit per-clip override (`item["grade"]`, an NL trim or manual
     dial) is a DELTA composed on top of the whole stack via `cdl.compose`
     (SS8's amplitude-scaling semantics), not a replacement -- nudging
@@ -39,6 +41,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from app.services.l3.grade.arc import solve_arc_grade
 from app.services.l3.grade.cdl import Grade, compose, grade_hash
 from app.services.l3.grade.correct import solve_correct_grade
 from app.services.l3.grade.presets import get_preset
@@ -91,7 +94,8 @@ def resolve_clip_grade(
     if match_delta is not None:
         stack = compose(stack, match_delta, 1.0)
     stack = compose(stack, _solve_look(sequence_look, color_stats), 1.0)
-    # SS8 (arc) composes here next, once its build step lands.
+    arc_intensity = (sequence_look or {}).get("arc_intensity")
+    stack = compose(stack, solve_arc_grade(item.get("arc_intent"), arc_intensity), 1.0)
 
     override = Grade.from_dict(item.get("grade")) if item.get("grade") else None
     resolved = compose(stack, override, 1.0) if override is not None else stack

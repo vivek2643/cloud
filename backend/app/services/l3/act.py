@@ -23,6 +23,7 @@ import uuid
 from typing import List, Optional
 
 from app.services.l3 import cutrecord_map, layers
+from app.services.l3.grade.arc import ARC_INTENTS
 from app.services.l3.arrange import Placement, ResolvedCut, _MapIndex
 
 # Pacing scale for `retime`, broad..sharp (index 0..4). Maps onto a video cut's
@@ -344,6 +345,26 @@ def set_audio(document: dict, target_id: str, *, mute: bool) -> dict:
     if op is None:
         return document
     op["mute"] = bool(mute)
+    return doc
+
+
+def set_arc_intent(document: dict, target_id: str, *, intent: str) -> dict:
+    """Tag a main-line segment (A1) or a V2 cutaway with its position in the
+    emotional arc (one of ARC_INTENTS): calm/build/peak/resolve. Invisible
+    by default -- has no effect until the user's arc intensity dial is
+    raised above 0. An unrecognized intent is a no-op (the caller diagnoses)."""
+    if intent not in ARC_INTENTS:
+        return document
+    doc = _clone(document)
+    seg = next((s for s in doc["timeline"] if s.get("seg_id") == target_id), None)
+    if seg is not None:
+        seg["arc_intent"] = intent
+        return doc
+    op = next((o for o in doc["operations"]
+               if o.get("op_id") == target_id and o.get("type") == "place_video"), None)
+    if op is None:
+        return document
+    op["arc_intent"] = intent
     return doc
 
 
