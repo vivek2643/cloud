@@ -543,6 +543,10 @@ export interface SequenceLook {
   mode?: LookMode;
   preset_id?: string | null;
   reference_image_ref?: string | null;
+  /** Pre-computed mean/std of the reference image (see backend
+   * `grade.reference_transfer.compute_image_stats`), cached here once at
+   * upload time so the resolver never has to re-decode the image. */
+  reference_stats?: { rgb_mean: [number, number, number]; rgb_std: [number, number, number] } | null;
   lut_ref?: string | null;
   match_strength?: number;     // reference-image mode: 0..1
   arc_intensity?: number;      // 0 = flat, 1 = full arc (SS8)

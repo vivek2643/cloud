@@ -74,6 +74,7 @@ class ColorStats:
     mid_gray: float = 0.5                                       # 0..1 luma, median
     rgb_mean: List[float] = field(default_factory=list)         # [r,g,b] 0..1
     rgb_median: List[float] = field(default_factory=list)       # [r,g,b] 0..1
+    rgb_std: List[float] = field(default_factory=list)          # [r,g,b] 0..1, per-channel std dev (for reference-image transfer, SS7.2)
     lab_ab_cast: List[float] = field(default_factory=list)      # [a*, b*] mean, CIE Lab
     wb_gray_world: List[float] = field(default_factory=list)    # [r,g,b] multipliers to neutralize
     wb_white_patch: List[float] = field(default_factory=list)   # [r,g,b] multipliers from brightest patch
@@ -93,6 +94,7 @@ class ColorStats:
             "mid_gray": self.mid_gray,
             "rgb_mean": self.rgb_mean,
             "rgb_median": self.rgb_median,
+            "rgb_std": self.rgb_std,
             "lab_ab_cast": self.lab_ab_cast,
             "wb_gray_world": self.wb_gray_world,
             "wb_white_patch": self.wb_white_patch,
@@ -182,6 +184,7 @@ def _aggregate(frames) -> ColorStats:
     flat_rgb_u8 = stacked_u8.reshape(-1, 3)
     rgb_mean = flat_rgb.mean(axis=0).tolist()
     rgb_median = np.median(flat_rgb, axis=0).tolist()
+    rgb_std = flat_rgb.std(axis=0).tolist()
 
     lab_frames = [cv2.cvtColor(f, cv2.COLOR_RGB2LAB) for f in frames]
     lab_stacked = np.stack(lab_frames, axis=0).astype(np.float32)
@@ -243,6 +246,7 @@ def _aggregate(frames) -> ColorStats:
         mid_gray=mid_gray,
         rgb_mean=rgb_mean,
         rgb_median=rgb_median,
+        rgb_std=rgb_std,
         lab_ab_cast=[a_mean, b_mean],
         wb_gray_world=wb_gray_world,
         wb_white_patch=wb_white_patch,

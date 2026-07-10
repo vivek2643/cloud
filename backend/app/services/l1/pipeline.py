@@ -655,10 +655,10 @@ def _stage_color_stats(
         """
         insert into color_stats
             (file_id, schema_version, frames_sampled, luma_hist, black_point,
-             white_point, mid_gray, rgb_mean, rgb_median, lab_ab_cast,
+             white_point, mid_gray, rgb_mean, rgb_median, rgb_std, lab_ab_cast,
              wb_gray_world, wb_white_patch, clip_shadow_pct, clip_highlight_pct,
              is_log_flat, skin_lab, palette)
-        values (%s, %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb,
+        values (%s, %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb,
                 %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb, %s::jsonb)
         on conflict (file_id) do update set
             schema_version     = excluded.schema_version,
@@ -669,6 +669,7 @@ def _stage_color_stats(
             mid_gray           = excluded.mid_gray,
             rgb_mean           = excluded.rgb_mean,
             rgb_median         = excluded.rgb_median,
+            rgb_std            = excluded.rgb_std,
             lab_ab_cast        = excluded.lab_ab_cast,
             wb_gray_world      = excluded.wb_gray_world,
             wb_white_patch     = excluded.wb_white_patch,
@@ -681,7 +682,8 @@ def _stage_color_stats(
         (
             file_id, color_stats_mod.SCHEMA_VERSION, cs.frames_sampled,
             json.dumps(cs.luma_hist), cs.black_point, cs.white_point, cs.mid_gray,
-            json.dumps(cs.rgb_mean), json.dumps(cs.rgb_median), json.dumps(cs.lab_ab_cast),
+            json.dumps(cs.rgb_mean), json.dumps(cs.rgb_median), json.dumps(cs.rgb_std),
+            json.dumps(cs.lab_ab_cast),
             json.dumps(cs.wb_gray_world), json.dumps(cs.wb_white_patch),
             cs.clip_shadow_pct, cs.clip_highlight_pct, cs.is_log_flat,
             json.dumps(cs.skin_lab) if cs.skin_lab is not None else None,
