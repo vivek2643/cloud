@@ -59,10 +59,22 @@ class Framing(BaseModel):
     shot_size: str = "unsure"
 
 
+class WhiteReference(BaseModel):
+    """A candidate neutral object/region for white-balance anchoring
+    (color_grading.plan.md SS2.3). The model only PROPOSES this from the
+    pixels -- deterministic code in the correct layer verifies it actually
+    reads as neutral (low Lab a*/b* cast) before ever trusting it, same
+    "model proposes, code decides" split as `shot_size`."""
+    present: bool = False
+    region: Tuple[float, float, float, float] | None = None   # normalized x,y,w,h
+    object: str | None = None   # brief description, e.g. "white wall", "grey card", "white shirt"
+
+
 class Look(BaseModel):
     graded: bool = False
     palette: List[str] = Field(default_factory=list)
     exposure_flags: List[str] = Field(default_factory=list)
+    white_reference: WhiteReference = Field(default_factory=WhiteReference)
 
 
 class TasteFences(BaseModel):
@@ -126,6 +138,13 @@ _SYSTEM = (
     "subject, exactly one of: extreme_close_up, close_up, medium_close_up, "
     "medium, medium_wide, wide, extreme_wide (use unsure only if there is no "
     "clear subject). Look (graded vs log/flat, palette, exposure flags), "
+    "plus white_reference: if some object in frame is genuinely neutral-"
+    "colored (a white/grey wall, a grey card, white paper, a plain white "
+    "garment -- NOT skin, NOT anything colored or patterned) and evenly "
+    "lit, set present=true with its region (normalized x,y,w,h) and a short "
+    "object description; otherwise present=false and leave region/object "
+    "empty. Only propose it when genuinely confident -- this is a candidate "
+    "the code will verify, not a guess to force. "
     "caption_zones (normalized boxes clear of the subject across every "
     "image you were shown for that cut), taste fences (max/min tasteful "
     "playback speed for this content), and readability_ms (how long a "

@@ -53,7 +53,13 @@ def resolve_document(document: Dict[str, Any]) -> Dict[str, Any]:
         res.setdefault("aspect", layers.aspect_of(document))
         return res
     fids = list({s["file_id"] for s in (document.get("timeline") or [])})
-    return layers.resolve(document, _durations(fids)).to_dict()
+    color_stats: Dict[str, dict] = {}
+    try:
+        from app.services.l3.grade.measure import fetch_color_stats
+        color_stats = fetch_color_stats(fids)
+    except Exception:
+        logger.exception("resolve_document: color_stats lookup failed (continuing)")
+    return layers.resolve(document, _durations(fids), color_stats).to_dict()
 
 
 def _file_lookup(file_ids: List[str]) -> Dict[str, compositor.FileEntry]:

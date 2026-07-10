@@ -41,6 +41,7 @@ class EditContext:
     index: _MapIndex
     map_struct: dict
     durations: Dict[str, int]          # file_id -> ms
+    color_stats: Dict[str, dict] = field(default_factory=dict)  # file_id -> L1 color_stats row
     dup_groups: List[dict] = field(default_factory=list)
     # The Cuts v3 ingest run this turn is resolved against -- the thread's pinned
     # run (migration 028) or the live "latest covering run", resolved ONCE here so
@@ -78,11 +79,18 @@ def build_context(file_ids: List[str], run_id: Optional[str] = None) -> EditCont
         durations = _durations(file_ids)
     except Exception:
         logger.exception("observe: duration lookup failed (continuing)")
+    color_stats: Dict[str, dict] = {}
+    try:
+        from app.services.l3.grade.measure import fetch_color_stats
+        color_stats = fetch_color_stats(file_ids)
+    except Exception:
+        logger.exception("observe: color_stats lookup failed (continuing)")
     return EditContext(
         file_ids=list(file_ids),
         index=_MapIndex(map_struct),
         map_struct=map_struct,
         durations=durations,
+        color_stats=color_stats,
         dup_groups=fmap.get("dup_groups") or [],
         run_id=eff_run,
     )
@@ -105,7 +113,7 @@ def resolve_doc(document: dict, ctx: EditContext) -> dict:
         framing.annotate_document(document)
     except Exception:
         logger.exception("observe: framing annotation failed (continuing)")
-    document["resolved"] = layers.resolve(document, ctx.durations).to_dict()
+    document["resolved"] = layers.resolve(document, ctx.durations, ctx.color_stats).to_dict()
     return document
 
 

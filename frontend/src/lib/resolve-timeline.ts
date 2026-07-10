@@ -243,14 +243,22 @@ const IDENTITY_CDL: Required<ClipGrade> = {
 
 const DEFAULT_WORKING_SPACE = "rec709";
 
-/** Deterministic grade resolver -- mirrors `grade.resolver.resolve_clip_grade`
- * (color_grading.plan.md SS3). Unlike `solveTransform`, this NEVER computes a
- * `grade_hash`: hashing/caching the baked `.cube` is entirely server-side (the
- * cube endpoint takes raw CDL values and hashes them itself), so the frontend
- * never has to keep a second hash implementation in lockstep with Python's --
- * one less way for preview and export to silently disagree. Correct/match/
- * look/arc (SS5-SS8) all compose into this function's body as they land;
- * today it's "explicit override, else identity," same as the backend. */
+/** Deterministic grade resolver -- a PARTIAL mirror of
+ * `grade.resolver.resolve_clip_grade` (color_grading.plan.md SS3). Unlike
+ * `solveTransform`, this NEVER computes a `grade_hash`: hashing/caching the
+ * baked `.cube` is entirely server-side (the cube endpoint takes raw CDL
+ * values and hashes them itself), so the frontend never has to keep a
+ * second hash implementation in lockstep with Python's.
+ *
+ * It's also deliberately NOT a full mirror: the backend's correct/match/
+ * look/arc layers (SS5-SS8) read server-only data (L1 `color_stats`, cut
+ * records, LLM arc tags) the browser has no access to, so this function can
+ * only ever replicate "explicit override, else identity" -- same as
+ * `framing.py`'s motion-centroid focus baking, which the frontend also
+ * never recomputes, only passes through. In practice this means a clip's
+ * auto-correction appears once `document.resolved` comes back from a real
+ * server resolve (same as today's framing/transform baking), not from this
+ * function alone during a purely local, not-yet-synced edit. */
 function resolveClipGrade(
   item: Pick<EditSegment, "grade"> | Pick<EditOperation, "grade">,
   _sequenceLook?: SequenceLook

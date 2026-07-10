@@ -514,14 +514,22 @@ def _apply_layout_regions(video: List[VideoLayer], regions: List[dict]) -> List[
     return video
 
 
-def resolve(document: dict, durations: Optional[Dict[str, int]] = None) -> ResolvedTimeline:
+def resolve(
+    document: dict,
+    durations: Optional[Dict[str, int]] = None,
+    color_stats: Optional[Dict[str, dict]] = None,
+) -> ResolvedTimeline:
     """Compile the spine + operations into the flat resolved layer set.
 
     Pure layout: operations are assumed already compiled+validated (exact times,
     snapped) by the executor. `durations` (file_id -> ms) is used only to clamp
     split-edit audio extensions to real footage; missing entries skip the clamp.
+    `color_stats` (file_id -> L1 color_stats row, see grade.measure) feeds the
+    correct layer (SS5); a missing/absent entry just means that clip's grade
+    stays identity (never-worse: no measurement, no basis to change anything).
     """
     durations = durations or {}
+    color_stats = color_stats or {}
     timeline = document.get("timeline") or []
     operations = document.get("operations") or []
     spans, total = spine_spans(timeline)
@@ -540,7 +548,9 @@ def resolve(document: dict, durations: Optional[Dict[str, int]] = None) -> Resol
             prog_start_ms=s.prog_start_ms, prog_end_ms=s.prog_end_ms,
             z=Z_SPINE_VIDEO, kind="spine",
             transform=solve_transform(document, seg.get("transform")),
-            grade=resolve_clip_grade(seg, sequence_look=sequence_look),
+            grade=resolve_clip_grade(
+                seg, color_stats=color_stats.get(seg["file_id"]), sequence_look=sequence_look
+            ),
         ))
         audio.append(AudioLayer(
             layer_id=f"a_{seg['seg_id']}",
@@ -571,7 +581,9 @@ def resolve(document: dict, durations: Optional[Dict[str, int]] = None) -> Resol
                 opacity=float(op.get("opacity", 1.0)),
                 kind="coverage", op_id=op["op_id"],
                 transform=solve_transform(document, op.get("transform")),
-                grade=resolve_clip_grade(op, sequence_look=sequence_look),
+                grade=resolve_clip_grade(
+                    op, color_stats=color_stats.get(op["source_file_id"]), sequence_look=sequence_look
+                ),
             ))
         elif t == "place_audio":
             audio.append(AudioLayer(
