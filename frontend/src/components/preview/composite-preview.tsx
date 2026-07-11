@@ -86,6 +86,8 @@ export const CompositePreview = forwardRef<HTMLDivElement, CompositePreviewProps
   const look = useEditDocStore((s) => s.look);
   const mergeDurations = useEditDocStore((s) => s.mergeDurations);
 
+  const resolvedGrades = useEditDocStore((s) => s.resolvedGrades);
+
   const trackMeta = useTimelineView((s) => s.trackMeta);
   const gradeBypass = useTimelineView((s) => s.gradeBypass);
   const project = useMemo(
@@ -99,8 +101,21 @@ export const CompositePreview = forwardRef<HTMLDivElement, CompositePreviewProps
       { timeline, operations, layout_regions: layoutRegions, format: { aspect }, look },
       durations
     );
-    return applyTrackMeta(r, trackMeta, project, gradeBypass);
-  }, [timeline, operations, layoutRegions, durations, aspect, look, trackMeta, gradeBypass, project]);
+    // Overlay the SERVER-baked grade per layer (color_grading.plan.md SS3/SS4):
+    // the client resolver only yields identity/override, so without this the
+    // look/correct/match/arc stack the backend baked into `document.resolved`
+    // would never reach the WebGL LUT and grading would be invisible. Keyed by
+    // the shared layer_id (`v_<seg_id>` / `op_id`); falls back to the client
+    // grade for layers with no server grade yet (e.g. a just-added, unsaved cut).
+    const graded: ResolvedTimeline = {
+      ...r,
+      video_layers: r.video_layers.map((v) => {
+        const g = resolvedGrades[v.layer_id];
+        return g ? { ...v, grade: g } : v;
+      }),
+    };
+    return applyTrackMeta(graded, trackMeta, project, gradeBypass);
+  }, [timeline, operations, layoutRegions, durations, aspect, look, resolvedGrades, trackMeta, gradeBypass, project]);
 
   // Frame box ratio for the program monitor, matching the delivery aspect.
   const frameRatio =

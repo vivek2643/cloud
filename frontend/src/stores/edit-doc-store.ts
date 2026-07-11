@@ -8,12 +8,28 @@
  * version re-seeds the baseline.
  */
 import { create } from "zustand";
-import type { EditAspect, EditDocument, EditLook, EditOperation, EditSegment, LayoutRegion } from "@/lib/api";
+import type { EditAspect, EditDocument, EditLook, EditOperation, EditSegment, LayoutRegion, ResolvedGrade } from "@/lib/api";
 import type { Durations } from "@/lib/resolve-timeline";
 
 function docAspect(doc: EditDocument | null): EditAspect {
   const a = doc?.format?.aspect ?? doc?.brief?.aspect;
   return a === "portrait" || a === "square" ? a : "landscape";
+}
+
+/** Extract the server-baked per-clip grade map (layer_id -> grade) from an
+ * authoritative document's `resolved` snapshot. The backend's resolve applies
+ * the full correct/match/look/arc stack (color_grading.plan.md SS3) into
+ * `resolved.video_layers[].grade`; the client-side resolver deliberately can't
+ * (it has no access to server-only color_stats / cut records / arc tags), so
+ * the preview overlays these baked grades by layer_id instead of re-deriving
+ * an identity grade. Same "pass through the authoritative resolve" pattern the
+ * frontend already uses for framing/transform baking. */
+function gradesFromDoc(doc: EditDocument | null): Record<string, ResolvedGrade> {
+  const out: Record<string, ResolvedGrade> = {};
+  for (const l of doc?.resolved?.video_layers ?? []) {
+    if (l.grade) out[l.layer_id] = l.grade;
+  }
+  return out;
 }
 
 const MIN_SEG_MS = 200;
@@ -70,6 +86,12 @@ interface EditDocState {
   aspect: EditAspect;
   /** Sequence-level color grade selection (color_grading.plan.md SS2.4/SS7). */
   look: EditLook | undefined;
+  /** Server-baked per-clip grade (layer_id -> resolved grade) from the last
+   * authoritative document's `resolved` snapshot. The preview overlays these
+   * so grading is actually VISIBLE — the client resolver only knows
+   * identity/override, never the look/correct/match/arc layers. Refreshed on
+   * every seed/commit (i.e. after each save round-trip). */
+  resolvedGrades: Record<string, ResolvedGrade>;
   /** Multi-select: `ProjectClip.id`-shaped ("seg:<seg_id>" | "op:<op_id>"). */
   selectedIds: string[];
 
@@ -166,6 +188,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
   durations: {},
   aspect: "landscape",
   look: undefined,
+  resolvedGrades: {},
   selectedIds: [],
   past: [],
   future: [],
@@ -183,6 +206,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       layoutRegions: doc?.layout_regions ?? [],
       aspect: docAspect(doc),
       look: doc?.look,
+      resolvedGrades: gradesFromDoc(doc),
       selectedIds: [],
       past: [],
       future: [],
@@ -200,6 +224,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       layoutRegions: [],
       aspect: "landscape",
       look: undefined,
+      resolvedGrades: {},
       selectedIds: [],
       past: [],
       future: [],
@@ -217,6 +242,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       layoutRegions: doc.layout_regions ?? [],
       aspect: docAspect(doc),
       look: doc.look,
+      resolvedGrades: gradesFromDoc(doc),
       past: [],
       future: [],
     });
