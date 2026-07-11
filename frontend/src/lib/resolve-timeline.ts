@@ -261,7 +261,7 @@ const DEFAULT_WORKING_SPACE = "rec709";
  * function alone during a purely local, not-yet-synced edit. */
 function resolveClipGrade(
   item: Pick<EditSegment, "grade"> | Pick<EditOperation, "grade">,
-  _sequenceLook?: SequenceLook
+  sequenceLook?: SequenceLook
 ): ResolvedGrade {
   const override = item.grade;
   const cdl: Required<ClipGrade> = override
@@ -272,10 +272,22 @@ function resolveClipGrade(
         sat: override.sat ?? IDENTITY_CDL.sat,
       }
     : IDENTITY_CDL;
+
+  // SS9 soft-local: same center-anchored-only logic as the backend's
+  // grade.softlocal.solve_vignette (subject_box isn't wired into either
+  // side yet), safe to duplicate since it only reads the local dial, no
+  // server-only data.
+  const vignetteStrength = sequenceLook?.vignette_strength;
+  const soft_local =
+    vignetteStrength && vignetteStrength > 0
+      ? { vignette: { cx: 0.5, cy: 0.5, strength: Math.max(0, Math.min(1, vignetteStrength)) } }
+      : null;
+
   return {
     cdl,
     creative_lut_ref: null,
     working_space: DEFAULT_WORKING_SPACE,
+    soft_local,
   };
 }
 

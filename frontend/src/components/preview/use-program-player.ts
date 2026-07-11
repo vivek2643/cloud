@@ -235,6 +235,7 @@ function applyFrameStyle(el: HTMLVideoElement, clip: Clip, aspect: EditAspect) {
 function isIdentityGrade(grade: ResolvedGrade | undefined): boolean {
   if (!grade) return true;
   if (grade.creative_lut_ref) return false;
+  if (grade.soft_local?.vignette && grade.soft_local.vignette.strength > 0) return false;
   const { slope, offset, power, sat } = grade.cdl;
   const eps = 1e-9;
   return (
@@ -415,7 +416,10 @@ export function useProgramPlayer(
     applyDestGeometry(renderer.canvas, clip.dest);
     renderer.canvas.style.transform = framing.transformCss;
     renderer.canvas.style.zIndex = String(clip.z);
-    renderer.draw(slot.el, framing.fit, { cx: framing.focusCx, cy: framing.focusCy });
+    renderer.draw(
+      slot.el, framing.fit, { cx: framing.focusCx, cy: framing.focusCy },
+      clip.grade?.soft_local?.vignette
+    );
     renderer.canvas.style.opacity = "1";
     return true;
   };

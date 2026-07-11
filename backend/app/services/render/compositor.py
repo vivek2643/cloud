@@ -33,6 +33,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app.services.l3.grade.cache import ensure_cube_file
 from app.services.l3.grade.cdl import is_identity, Grade
+from app.services.l3.grade.softlocal import vignette_ffmpeg_filter
 from app.services.processing import _download_from_r2, _upload_to_r2
 from app.services.r2 import generate_presigned_get
 
@@ -210,9 +211,11 @@ def _render_spine_concat(
         if not (os.path.exists(cache_path) and os.path.getsize(cache_path) > 0):
             src = _source_path(entry, cfg, tmp, src_cache)
             cube_path = ensure_cube_file(grade, cube_dir)
+            vignette_filter = vignette_ffmpeg_filter((grade.get("soft_local") or {}).get("vignette"))
             report(_pct(i, n, 8, 78), f"cut {i + 1}/{n}")
             _produce_segment(src=src, dst=cache_path, in_ms=in_ms, out_ms=out_ms,
-                             cfg=cfg, transform=transform, cube_path=cube_path)
+                             cfg=cfg, transform=transform, cube_path=cube_path,
+                             vignette_filter=vignette_filter)
         else:
             report(_pct(i, n, 8, 78), f"cut {i + 1}/{n} (cache)")
         segments.append(cache_path)
@@ -262,13 +265,15 @@ def _transform_key(transform: Optional[Dict[str, Any]]) -> str:
 
 def _grade_key(grade: Optional[Dict[str, Any]]) -> str:
     """Stable cache token for a resolved grade; identity (no CDL, no creative
-    LUT) collapses to '' so ungraded segments keep their existing cache
-    entries, mirroring `_transform_key`'s identity-collapse contract."""
+    LUT, no soft-local) collapses to '' so ungraded segments keep their
+    existing cache entries, mirroring `_transform_key`'s identity-collapse
+    contract."""
     if not grade:
         return ""
     cdl = Grade.from_dict(grade.get("cdl"))
     lut_ref = grade.get("creative_lut_ref")
-    if is_identity(cdl) and not lut_ref:
+    soft_local = grade.get("soft_local")
+    if is_identity(cdl) and not lut_ref and not soft_local:
         return ""
     h = grade.get("grade_hash")
     return f"g{h}" if h else ""
@@ -365,18 +370,26 @@ def _transform_vf(
     cfg: Dict[str, Any],
     transform: Optional[Dict[str, Any]] = None,
     cube_path: Optional[str] = None,
+    vignette_filter: Optional[str] = None,
 ) -> str:
     """Filter chain that frames a source onto the canvas for ONE video layer,
-    in the canonical order rotate -> fit -> zoom-crop -> grade. An empty/None
-    transform is the identity (contain, no rotate, no zoom) -- byte-identical
-    to the old normalize so untouched edits keep their warm segment cache;
-    likewise `cube_path=None` (no grade) emits no color filter at all.
+    in the canonical order rotate -> fit -> zoom-crop -> grade -> soft-local.
+    An empty/None transform is the identity (contain, no rotate, no zoom) --
+    byte-identical to the old normalize so untouched edits keep their warm
+    segment cache; likewise `cube_path=None` (no grade) emits no color
+    filter and `vignette_filter=None` (no soft-local, SS9) emits no spatial
+    filter at all.
 
     The LUT is applied in 8-bit RGB (`format=gbrp`), matching the WebGL
     preview shader's own 8-bit texture sampling (browsers hand back 8-bit
     frames from `<video>`/canvas) -- both sides are already precision-capped
     by that 8-bit source, so matching bit depth here is what parity actually
-    requires, not a corner cut. See color_grading.plan.md SS4/SS16."""
+    requires, not a corner cut. See color_grading.plan.md SS4/SS16.
+
+    `vignette_filter` (from `grade.softlocal.vignette_ffmpeg_filter`) is
+    applied AFTER the LUT (a vignette is a final polish over the graded
+    picture) and is an approximate-parity effect by design -- see
+    `softlocal.py`'s module docstring."""
     W, H, FPS = cfg["width"], cfg["height"], cfg["fps"]
     t = transform or {}
     rotate = int(t.get("rotate") or 0)
@@ -411,6 +424,8 @@ def _transform_vf(
         parts.append("format=gbrp")
         parts.append(_lut3d_arg(cube_path))
         parts.append("format=yuv420p")
+    if vignette_filter:
+        parts.append(vignette_filter)
     parts.append("setsar=1")
     parts.append(f"fps={FPS}")
     return ",".join(parts)
@@ -438,6 +453,7 @@ def _produce_segment(
     *, src: str, dst: str, in_ms: int, out_ms: int, cfg: Dict[str, Any],
     transform: Optional[Dict[str, Any]] = None,
     cube_path: Optional[str] = None,
+    vignette_filter: Optional[str] = None,
 ) -> None:
     in_s = max(in_ms / 1000.0, 0.0)
     dur_s = max((out_ms - in_ms) / 1000.0, 0.05)
@@ -445,7 +461,7 @@ def _produce_segment(
     cmd = [
         "ffmpeg", "-y",
         "-ss", f"{in_s:.3f}", "-i", src, "-t", f"{dur_s:.3f}",
-        "-vf", _transform_vf(cfg, transform, cube_path=cube_path),
+        "-vf", _transform_vf(cfg, transform, cube_path=cube_path, vignette_filter=vignette_filter),
         "-c:v", cfg["video_codec"], "-preset", cfg["video_preset"], "-crf", str(cfg["video_crf"]),
         "-pix_fmt", "yuv420p",
         "-c:a", cfg["audio_codec"], "-b:a", cfg["audio_bitrate"], "-ar", "48000", "-ac", "2",
@@ -521,10 +537,12 @@ def _render_layers(
         cell = _dest_px(v.get("transform"), W, H)
         vf_cfg = {**cfg, "width": cell[2], "height": cell[3]} if cell else cfg
         ov_xy = f"x={cell[0]}:y={cell[1]}:" if cell else ""
-        cube_path = ensure_cube_file(v.get("grade"), cube_dir)
+        v_grade = v.get("grade") or {}
+        cube_path = ensure_cube_file(v_grade, cube_dir)
+        vignette_filter = vignette_ffmpeg_filter((v_grade.get("soft_local") or {}).get("vignette"))
         chain = (
             f"[{idx}:v]trim=start={in_s:.3f}:end={out_s:.3f},setpts=PTS-STARTPTS,"
-            f"{_transform_vf(vf_cfg, v.get('transform'), cube_path=cube_path)},format=yuva420p"
+            f"{_transform_vf(vf_cfg, v.get('transform'), cube_path=cube_path, vignette_filter=vignette_filter)},format=yuva420p"
         )
         if opacity < 0.999:
             chain += f",colorchannelmixer=aa={max(0.0, min(1.0, opacity)):.3f}"

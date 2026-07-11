@@ -46,6 +46,7 @@ from app.services.l3.grade.cdl import Grade, compose, grade_hash
 from app.services.l3.grade.correct import solve_correct_grade
 from app.services.l3.grade.presets import get_preset
 from app.services.l3.grade.reference_transfer import solve_reference_transfer
+from app.services.l3.grade.softlocal import solve_vignette
 
 DEFAULT_WORKING_SPACE = "rec709"
 
@@ -105,14 +106,28 @@ def resolve_clip_grade(
         creative_lut_ref = None
     working_space = item.get("working_space") or DEFAULT_WORKING_SPACE
 
+    # SS9 soft-local: opt-in only (never a surprise vignette on untouched
+    # footage) via sequence_look.vignette_strength; subject_box isn't wired
+    # in yet (needs the same segment->cut_records mapping already flagged
+    # as a follow-up for already_graded/white_reference), so it's always
+    # center-anchored for now.
+    vignette_strength = (sequence_look or {}).get("vignette_strength")
+    soft_local = (
+        {"vignette": solve_vignette(strength=float(vignette_strength))}
+        if vignette_strength
+        else None
+    )
+
     h = grade_hash(
         resolved,
         creative_lut_ref=creative_lut_ref,
         working_space=working_space,
+        soft_local=soft_local,
     )
     return {
         "cdl": resolved.to_dict(),
         "creative_lut_ref": creative_lut_ref,
         "working_space": working_space,
+        "soft_local": soft_local,
         "grade_hash": h,
     }

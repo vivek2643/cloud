@@ -527,10 +527,23 @@ export type ClipGrade = CdlGrade;
  * endpoint takes the raw `cdl`/`creative_lut_ref`/`working_space` values
  * and hashes/caches server-side, so two independent hash implementations
  * never have to agree. */
+/** Soft-local vignette descriptor (SS9) -- see backend `grade/softlocal.py`
+ * for why this is an approximate-parity effect, unlike the CDL/LUT itself. */
+export interface VignetteDescriptor {
+  cx: number;
+  cy: number;
+  strength: number;
+}
+
+export interface SoftLocalDescriptor {
+  vignette?: VignetteDescriptor | null;
+}
+
 export interface ResolvedGrade {
   cdl: Required<CdlGrade>;
   creative_lut_ref?: string | null;
   working_space: string;
+  soft_local?: SoftLocalDescriptor | null;
   grade_hash?: string;
 }
 
@@ -550,6 +563,7 @@ export interface SequenceLook {
   lut_ref?: string | null;
   match_strength?: number;     // reference-image mode: 0..1
   arc_intensity?: number;      // 0 = flat, 1 = full arc (SS8)
+  vignette_strength?: number;  // 0 = off (default), 1 = strongest (SS9)
 }
 
 /** A time-scoped spatial layout (split-screen / PiP): mirrors backend

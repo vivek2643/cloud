@@ -7,16 +7,19 @@
  * second hand-rolled interpolation implementation that could drift from
  * ffmpeg's `lut3d` filter.
  *
- * Scope note: this renders the CDL/creative-LUT color transform only. The
- * geometric framing (object-fit cover/contain + focus point) is emulated in
- * the fragment shader via `uFit`/`uFocus` (mirroring `applyFrameStyle`'s CSS
- * object-fit/object-position math, since a canvas has no native
- * object-fit); rotate/zoom stay a CSS transform on the canvas element
- * itself, identical to how the plain `<video>` path already does it. Preview
- * of an animated `motion` (zoompan) clip renders its static midpoint frame
- * rather than animating — the same simplification `applyFrameStyle` already
- * makes for `object-position` on a motion clip, just not (yet) animated in
- * WebGL. None of this affects export, which always uses the full transform.
+ * Scope note: this renders the CDL/creative-LUT color transform, plus an
+ * optional soft-local vignette (SS9 -- see backend `grade/softlocal.py` for
+ * why this is an approximate-parity effect by design, unlike the LUT
+ * itself). The geometric framing (object-fit cover/contain + focus point)
+ * is emulated in the fragment shader via `uFit`/`uFocus` (mirroring
+ * `applyFrameStyle`'s CSS object-fit/object-position math, since a canvas
+ * has no native object-fit); rotate/zoom stay a CSS transform on the canvas
+ * element itself, identical to how the plain `<video>` path already does
+ * it. Preview of an animated `motion` (zoompan) clip renders its static
+ * midpoint frame rather than animating — the same simplification
+ * `applyFrameStyle` already makes for `object-position` on a motion clip,
+ * just not (yet) animated in WebGL. None of this affects export, which
+ * always uses the full transform.
  */
 
 const VERTEX_SRC = `#version 300 es
@@ -43,6 +46,8 @@ uniform vec2 uVideoSize;
 uniform vec2 uCanvasSize;
 uniform vec2 uFocus;
 uniform int uFit;
+uniform vec2 uVignetteCenter;
+uniform float uVignetteStrength;
 
 void main() {
   float videoAspect = uVideoSize.x / max(uVideoSize.y, 1.0);
@@ -78,6 +83,20 @@ void main() {
   }
   vec4 src = texture(uVideo, clamp(uv, 0.0, 1.0));
   vec3 graded = texture(uLut, clamp(src.rgb, 0.0, 1.0)).rgb;
+
+  // Soft-local vignette (SS9): a feathered radial darkening in FRAME space
+  // (vUv, not source uv -- a vignette is a property of the delivered
+  // picture, not the source crop), aspect-corrected so the falloff is
+  // circular rather than stretched to the canvas's aspect ratio.
+  if (uVignetteStrength > 0.001) {
+    float canvasAspect = uCanvasSize.x / max(uCanvasSize.y, 1.0);
+    vec2 d = vUv - uVignetteCenter;
+    d.x *= canvasAspect;
+    float dist = length(d);
+    float falloff = 1.0 - uVignetteStrength * pow(clamp((dist - 0.3) / 0.6, 0.0, 1.0), 2.0);
+    graded *= falloff;
+  }
+
   outColor = vec4(graded, 1.0);
 }
 `;
@@ -94,13 +113,25 @@ function compileShader(gl: WebGL2RenderingContext, type: number, src: string): W
   return shader;
 }
 
+export interface VignetteParams {
+  cx: number;
+  cy: number;
+  strength: number;
+}
+
 export interface LutRenderer {
   /** Upload a new baked `.cube`'s grid (parsed by `parseCubeText`). No-op
    * (skips re-upload) if the same `cacheKey` is already loaded. */
   setLut: (grid: Float32Array, size: number, cacheKey: string) => void;
   /** Draw one frame: sample `videoEl`'s current picture through the loaded
-   * LUT, emulating `fit`/`focus` framing, into the renderer's canvas. */
-  draw: (videoEl: HTMLVideoElement, fit: "cover" | "contain", focus: { cx: number; cy: number }) => void;
+   * LUT, emulating `fit`/`focus` framing, into the renderer's canvas.
+   * `vignette` (SS9) is optional -- omitted/null draws with no vignette. */
+  draw: (
+    videoEl: HTMLVideoElement,
+    fit: "cover" | "contain",
+    focus: { cx: number; cy: number },
+    vignette?: VignetteParams | null
+  ) => void;
   dispose: () => void;
   readonly canvas: HTMLCanvasElement;
 }
@@ -193,6 +224,8 @@ export function createLutRenderer(): LutRenderer | null {
   const uCanvasSize = gl.getUniformLocation(program, "uCanvasSize");
   const uFocus = gl.getUniformLocation(program, "uFocus");
   const uFit = gl.getUniformLocation(program, "uFit");
+  const uVignetteCenter = gl.getUniformLocation(program, "uVignetteCenter");
+  const uVignetteStrength = gl.getUniformLocation(program, "uVignetteStrength");
 
   let loadedKey: string | null = null;
   let lutReady = false;
@@ -211,7 +244,7 @@ export function createLutRenderer(): LutRenderer | null {
     lutReady = true;
   };
 
-  const draw: LutRenderer["draw"] = (videoEl, fit, focus) => {
+  const draw: LutRenderer["draw"] = (videoEl, fit, focus, vignette) => {
     if (!lutReady) return;
     const w = videoEl.clientWidth || videoEl.videoWidth || 1;
     const h = videoEl.clientHeight || videoEl.videoHeight || 1;
@@ -239,6 +272,8 @@ export function createLutRenderer(): LutRenderer | null {
     gl.uniform2f(uCanvasSize, canvas.width, canvas.height);
     gl.uniform2f(uFocus, focus.cx, focus.cy);
     gl.uniform1i(uFit, fit === "contain" ? 1 : 0);
+    gl.uniform2f(uVignetteCenter, vignette?.cx ?? 0.5, vignette?.cy ?? 0.5);
+    gl.uniform1f(uVignetteStrength, vignette?.strength ?? 0);
 
     gl.drawArrays(gl.TRIANGLES, 0, 6);
   };
