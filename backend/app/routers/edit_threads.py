@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 from app.auth import get_current_user_id
 from app.services.l3 import auto_edit
 from app.services.l3 import store
+from app.services.l3.grade.cdl import Grade
 
 router = APIRouter(prefix="/api/edit/threads", tags=["edit"])
 
@@ -195,6 +196,58 @@ def put_document(
 
     version = store.save_document(thread_id, new_doc, created_by="user")
     return {"version": version, "document": new_doc}
+
+
+@router.get("/{thread_id}/grade-export")
+def grade_export(
+    thread_id: str,
+    export_format: str = "ccc",
+    user_id: str = Depends(get_current_user_id),
+):
+    """Export bundle (color_grading.plan.md SS11): the professional
+    round-trip out of EDSO's grade -- `.cdl`/`.ccc` (ASC CDL XML) or a
+    grade-carrying EDL (`*ASC_SOP`/`*ASC_SAT` comment convention), one entry
+    per currently-resolved graded video clip, in timeline order. `.cube`
+    export doesn't need a new endpoint -- GET /api/grade/cube already serves
+    the baked LUT for any clip's exact resolved CDL."""
+    from fastapi import Response
+
+    from app.services.l3.grade.export_bundle import ccc_xml, cdl_xml, edl_bundle
+
+    _owned_thread(thread_id, user_id)
+    doc, _head = store.latest_document(thread_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="No edit document yet")
+
+    resolved = (doc.get("resolved") or {})
+    video_layers = resolved.get("video_layers") or []
+    entries = [
+        {"id": v.get("layer_id"), "cdl": (v.get("grade") or {}).get("cdl")}
+        for v in video_layers
+        if (v.get("grade") or {}).get("cdl")
+    ]
+    working_space = next(
+        (v["grade"]["working_space"] for v in video_layers if v.get("grade")), "rec709"
+    )
+
+    if export_format == "cdl":
+        if not entries:
+            raise HTTPException(status_code=404, detail="No graded clips to export")
+        text = cdl_xml(Grade.from_dict(entries[0]["cdl"]), working_space=working_space)
+        media_type, filename = "application/xml", "grade.cdl"
+    elif export_format == "ccc":
+        text = ccc_xml(entries, working_space=working_space)
+        media_type, filename = "application/xml", "grade.ccc"
+    elif export_format == "edl":
+        text = edl_bundle(entries, title=f"EDSO_{thread_id[:8]}")
+        media_type, filename = "text/plain", "grade.edl"
+    else:
+        raise HTTPException(status_code=400, detail="format must be one of: cdl, ccc, edl")
+
+    return Response(
+        content=text, media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/{thread_id}/versions")

@@ -192,6 +192,30 @@ export function ColorGradeView() {
     }
   }
 
+  async function downloadExport(exportFormat: "cdl" | "ccc" | "edl") {
+    if (!threadId || !token) return;
+    setError(null);
+    try {
+      const res = await fetch(
+        `${API_URL}/api/edit/threads/${threadId}/grade-export?export_format=${exportFormat}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail || `Export failed (${res.status})`);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `grade.${exportFormat}`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Export failed.");
+    }
+  }
+
   async function sendSteer() {
     if (!threadId || !token || !nlInput.trim()) return;
     setSending(true);
@@ -315,6 +339,23 @@ export function ColorGradeView() {
       <section>
         <SectionLabel>Arc intensity</SectionLabel>
         <Dial value={look?.arc_intensity ?? 0} onChange={setArcIntensity} label="Arc intensity" />
+      </section>
+
+      {/* Export bundle -- the professional round-trip (SS11) */}
+      <section>
+        <SectionLabel>Export grade</SectionLabel>
+        <div className="flex gap-2">
+          {(["ccc", "cdl", "edl"] as const).map((f) => (
+            <button
+              key={f}
+              onClick={() => void downloadExport(f)}
+              className="rounded-lg border px-2.5 py-1.5 text-[11px] font-medium uppercase transition-colors"
+              style={{ borderColor: "var(--border)", color: "var(--muted)" }}
+            >
+              .{f}
+            </button>
+          ))}
+        </div>
       </section>
 
       {/* NL steering box */}
