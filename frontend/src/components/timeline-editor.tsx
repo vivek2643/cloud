@@ -1211,12 +1211,12 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
               />
             )}
 
-            {/* Playhead — spans the ruler + every lane. The single loud-accent
-                element in the timeline (editor_ui.plan.md SS1.7); against
-                neutral-grey clips it needs the accent to stay legible. */}
+            {/* Playhead — spans the ruler + every lane. The single orange element
+                in the otherwise-monochrome timeline; uses its own `--playhead`
+                token so it stays orange regardless of the (white) `--accent`. */}
             {pxPerMs > 0 && (
               <div className="pointer-events-none absolute bottom-0 z-10" style={{ left: playheadPx, top: 0 }}>
-                <div className="h-full" style={{ width: 2, background: "var(--accent)" }} />
+                <div className="h-full" style={{ width: 2, background: "var(--playhead)" }} />
                 <div
                   className="absolute"
                   style={{
@@ -1227,7 +1227,7 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
                     height: 0,
                     borderLeft: "4px solid transparent",
                     borderRight: "4px solid transparent",
-                    borderTop: "6px solid var(--accent)",
+                    borderTop: "6px solid var(--playhead)",
                   }}
                 />
               </div>
