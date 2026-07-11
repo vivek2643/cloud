@@ -21,7 +21,10 @@ from collections import Counter
 from typing import Any, Dict, List, Optional, Sequence
 
 from app.services.l3.captions.colour import vibrant_accent
-from app.services.l3.captions.styles import AnimationSpec, CaptionStyle, ColourSpec, PlacementSpec
+from app.services.l3.captions.styles import (
+    ACCENT_GREEN, ACCENT_PINK, ACCENT_YELLOW,
+    AnimationSpec, CaptionStyle, ColourSpec, PlacementSpec,
+)
 
 # Process-local cache (SS6.5 "cache per edit version"): mirrors
 # `grade.cache`'s "local disk cache, not shared across instances, fine
@@ -86,31 +89,39 @@ def _content_type_best_effort(file_ids: Sequence[str]) -> Optional[str]:
 # --------------------------------------------------------------------------
 
 def _auto(energy: str, aspect: str, speaker_count: int, content_type: Optional[str]) -> CaptionStyle:
-    if energy == "calm":
-        font_id, anim_preset, intensity, colour_source = "inter_tight", "fade", 0.4, "white"
-        mood = "calm"
-    elif energy == "high":
-        font_id, anim_preset, intensity, colour_source = "poppins_extrabold", "pop", 0.6, "high_contrast"
-        mood = "high"
-    else:
-        font_id, anim_preset, intensity, colour_source = "inter_tight", "karaoke", 0.5, "white"
-        mood = "active"
+    # All Auto variants sit LOWER-THIRD (the dependable default position); the
+    # energy only changes font/animation/colour, never the safe placement.
+    if energy == "high":
+        font_id, preset, intensity, fill, emph, case, mood = \
+            "anton", "pop", 0.8, "#ffffff", ACCENT_YELLOW, "upper", "high"
+    elif energy == "calm":
+        font_id, preset, intensity, fill, emph, case, mood = \
+            "inter_tight", "fade", 0.35, "#ffffff", "#ffffff", "as-is", "calm"
+    else:  # active (also the no-signal default)
+        font_id, preset, intensity, fill, emph, case, mood = \
+            "poppins_extrabold", "karaoke", 0.6, ACCENT_GREEN, ACCENT_GREEN, "as-is", "active"
     bits = [f"{mood} energy", f"{speaker_count} speaker(s)" if speaker_count else "no diarized speaker"]
     if content_type:
         bits.append(content_type)
     rationale = "Auto — " + ", ".join(bits) + "."
     return CaptionStyle(
         style_id="sugg_auto", label="Auto", tier="suggested", font_id=font_id,
-        animation=AnimationSpec(preset=anim_preset, intensity=intensity, emphasis="loudness"),
-        placement=PlacementSpec(anchor="dynamic"),
-        colour=ColourSpec(source=colour_source, fill="#ffffff", emphasis_fill="#ffffff"),
+        case=case, tracking=0.02 if case == "upper" else 0.0,
+        animation=AnimationSpec(
+            preset=preset, intensity=intensity,
+            emphasis=("none" if preset == "fade" else "loudness"),
+        ),
+        placement=PlacementSpec(anchor="lower_third"),
+        colour=ColourSpec(source="white", fill=fill, emphasis_fill=emph),
         rationale=rationale,
     )
 
 
+# alt: (font, colour source, base emphasis) -- source "white" keeps our yellow
+# emphasis; "palette_accent" instead pulls the pop colour from the footage.
 _BOLD_ALTS = [
-    {"font_id": "anton", "colour_source": "high_contrast"},
-    {"font_id": "poppins_extrabold", "colour_source": "palette_accent"},
+    {"font_id": "anton", "colour_source": "white", "emphasis": ACCENT_YELLOW},
+    {"font_id": "poppins_extrabold", "colour_source": "palette_accent", "emphasis": ACCENT_YELLOW},
 ]
 
 
@@ -119,18 +130,18 @@ def _bold_hype(seed: int, aspect: str, beat_sync_ok: bool) -> CaptionStyle:
     intensity = 0.85 if aspect in ("portrait", "square") else 0.7  # SS6.3 "format-gated"
     return CaptionStyle(
         style_id="sugg_bold", label="Bold / Hype", tier="suggested",
-        font_id=alt["font_id"], case="upper", tracking=0.02, max_chars_per_line=24,
+        font_id=alt["font_id"], case="upper", tracking=0.02, max_chars_per_line=22,
         animation=AnimationSpec(preset="pop", intensity=intensity, beat_sync=beat_sync_ok, emphasis="loudness"),
-        placement=PlacementSpec(anchor="dynamic"),
-        colour=ColourSpec(source=alt["colour_source"], fill="#ffffff", emphasis_fill="#ffe14d"),
+        placement=PlacementSpec(anchor="lower_third"),
+        colour=ColourSpec(source=alt["colour_source"], fill="#ffffff", emphasis_fill=alt["emphasis"]),
         rationale="Bold impact — condensed caps, beat-synced pop." if beat_sync_ok
-        else "Bold impact — condensed caps, high-contrast emphasis.",
+        else "Bold impact — condensed caps, colour-pop emphasis.",
     )
 
 
 _CLEAN_ALTS = [
-    {"font_id": "inter_tight", "anchor": "dynamic"},
     {"font_id": "inter_tight", "anchor": "lower_third"},
+    {"font_id": "inter_tight", "anchor": "dynamic"},
 ]
 
 
@@ -161,19 +172,21 @@ def _editorial_premium(seed: int, grade_label: Optional[str]) -> CaptionStyle:
 
 def _playful_kinetic(seed: int, beat_sync_ok: bool, has_vibrant_accent: bool) -> CaptionStyle:
     intensity = 0.75 if beat_sync_ok else 0.55
+    # Pull the pop colour from the footage's palette when there's a vibrant one;
+    # otherwise fall back to a fixed playful pink so the word still pops colour.
     colour_source = "palette_accent" if has_vibrant_accent else "white"
     mood = "kinetic" if beat_sync_ok else "rounded"
     rationale = (
         "Playful and kinetic — bouncy accents pulled from your footage's palette."
         if has_vibrant_accent
-        else f"Playful and {mood} — a soft, friendly caption style."
+        else f"Playful and {mood} — soft rounded font, colour-pop key words."
     )
     return CaptionStyle(
         style_id="sugg_playful", label="Playful / Kinetic", tier="suggested",
         font_id="nunito", max_chars_per_line=26,
         animation=AnimationSpec(preset="pop", intensity=intensity, beat_sync=beat_sync_ok, emphasis="loudness"),
         placement=PlacementSpec(anchor="dynamic"),
-        colour=ColourSpec(source=colour_source, fill="#ffffff", emphasis_fill="#ffffff"),
+        colour=ColourSpec(source=colour_source, fill="#ffffff", emphasis_fill=ACCENT_PINK),
         rationale=rationale,
     )
 

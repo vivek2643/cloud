@@ -20,7 +20,7 @@ import { useAuthStore } from "@/stores/auth-store";
 import {
   getCaptionCatalog, getCaptionSuggestions, saveEditDocument,
   type CaptionCatalog, type CaptionStyle, type CaptionWord,
-  type CaptionRepresentativeFrame, type EditCaptions,
+  type EditCaptions,
 } from "@/lib/api";
 
 function SectionLabel({ children }: { children: React.ReactNode }) {
@@ -113,10 +113,9 @@ function PeakPoseCaption({ style, words }: { style: CaptionStyle; words: Caption
 }
 
 function Tile({
-  style, frame, words, selected, onClick,
+  style, words, selected, onClick,
 }: {
   style: CaptionStyle;
-  frame: CaptionRepresentativeFrame | null;
   words: CaptionWord[];
   selected: boolean;
   onClick: () => void;
@@ -127,11 +126,10 @@ function Tile({
       className="group flex flex-col overflow-hidden rounded-lg border text-left transition-colors"
       style={{ borderColor: selected ? "var(--accent)" : "var(--border)" }}
     >
-      <div className="relative aspect-video w-full overflow-hidden" style={{ background: "var(--sidebar)" }}>
-        {frame?.url && (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img src={frame.url} alt="" className="absolute inset-0 h-full w-full object-cover" />
-        )}
+      {/* Solid black backdrop for every tile: all caption fills are light, so
+          black guarantees the style is visible regardless of colour (and it
+          doesn't depend on a representative frame existing). */}
+      <div className="relative aspect-video w-full overflow-hidden" style={{ background: "#000000" }}>
         {words.length > 0 && (
           <div
             className="absolute flex items-center justify-center"
@@ -171,7 +169,6 @@ export function CaptionsView() {
 
   const [catalog, setCatalog] = useState<CaptionCatalog | null>(null);
   const [suggestions, setSuggestions] = useState<CaptionStyle[]>([]);
-  const [repFrame, setRepFrame] = useState<CaptionRepresentativeFrame | null>(null);
   const [sampleWords, setSampleWords] = useState<CaptionWord[]>([]);
   const [reshuffleSeed, setReshuffleSeed] = useState(0);
   const [loadingSuggestions, setLoadingSuggestions] = useState(false);
@@ -191,7 +188,6 @@ export function CaptionsView() {
       .then((res) => {
         if (cancelled) return;
         setSuggestions(res.suggestions);
-        setRepFrame(res.representative_frame);
         setSampleWords(res.sample_words);
       })
       .catch((e) => !cancelled && setError(e instanceof Error ? e.message : "Could not load suggestions."))
@@ -329,7 +325,6 @@ export function CaptionsView() {
               <Tile
                 key={s.style_id}
                 style={s}
-                frame={repFrame}
                 words={sampleWords}
                 selected={selectedStyleId === s.style_id}
                 onClick={() => selectStyle(s)}
@@ -347,7 +342,6 @@ export function CaptionsView() {
               <Tile
                 key={s.style_id}
                 style={s}
-                frame={repFrame}
                 words={sampleWords}
                 selected={selectedStyleId === s.style_id}
                 onClick={() => selectStyle(s)}

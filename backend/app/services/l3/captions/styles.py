@@ -52,7 +52,7 @@ FONTS: Dict[str, Dict[str, Any]] = {
     },
     "nunito": {
         "family": "Nunito", "weight": 700, "archetype": "rounded_friendly",
-        "fallback_stack": "'Nunito', 'Comic Sans MS', 'Trebuchet MS', sans-serif",
+        "fallback_stack": "'Nunito', 'Trebuchet MS', 'Segoe UI', sans-serif",
         "license": "OFL",
     },
     "fraunces": {
@@ -273,48 +273,71 @@ def _standard(style_id: str, label: str, **kw: Any) -> CaptionStyle:
     )
 
 
+# Accent palette for coloured emphasis / active words (SS11). Kept small and
+# vivid -- these read well on almost any footage and clear the contrast floor
+# once colour.py's legibility check runs.
+ACCENT_YELLOW = "#ffd60a"
+ACCENT_GREEN = "#16e06a"
+ACCENT_PINK = "#ff2d78"
+
 STANDARDS: List[CaptionStyle] = [
+    # 1. THE default: a plain, dependable lower-third caption sitting DOWN out
+    # of the way. Clean white, heavy outline, gentle fade, no colour gimmick --
+    # the one you'd reach for most of the time (first tile in the gallery).
     _standard(
-        "std_clean_white", "Clean White", font_id="inter_tight", max_chars_per_line=32,
-        animation={"preset": "fade", "intensity": 0.4, "emphasis": "none"},
-        placement={"anchor": "dynamic"},
+        "std_standard", "Standard", font_id="inter_tight", max_chars_per_line=34,
+        animation={"preset": "fade", "intensity": 0.35, "emphasis": "none"},
+        placement={"anchor": "lower_third"},
         colour={"source": "white", "fill": "#ffffff", "emphasis_fill": "#ffffff",
                 "outline": "#000000", "shadow": "#000000"},
     ),
+    # 2. Bold Yellow (Hormozi-style): condensed caps, key word pops to yellow.
     _standard(
-        "std_bold_caps", "Bold Caps", font_id="anton", case="upper", tracking=0.02,
-        max_chars_per_line=24,
-        animation={"preset": "pop", "intensity": 0.8, "beat_sync": True, "emphasis": "loudness"},
-        placement={"anchor": "dynamic"},
-        colour={"source": "high_contrast", "fill": "#ffffff", "emphasis_fill": "#ffe14d",
+        "std_bold_yellow", "Bold Yellow", font_id="anton", case="upper", tracking=0.02,
+        max_chars_per_line=22,
+        animation={"preset": "pop", "intensity": 0.85, "beat_sync": True, "emphasis": "loudness"},
+        placement={"anchor": "lower_third"},
+        colour={"source": "white", "fill": "#ffffff", "emphasis_fill": ACCENT_YELLOW,
                 "outline": "#000000", "shadow": "#000000"},
     ),
+    # 3. Word Pop (CapCut/Submagic-style): each word fills to green as spoken.
     _standard(
-        "std_karaoke_box", "Karaoke Box", font_id="poppins_extrabold", max_chars_per_line=28,
+        "std_word_pop", "Word Pop", font_id="poppins_extrabold", max_chars_per_line=26,
         animation={"preset": "karaoke", "intensity": 0.6, "emphasis": "loudness"},
+        placement={"anchor": "lower_third"},
+        colour={"source": "white", "fill": ACCENT_GREEN, "emphasis_fill": ACCENT_GREEN,
+                "outline": "#000000", "shadow": "#000000"},
+    ),
+    # 4. Black Bar: white text on a solid black box -- always legible, podcast-safe.
+    _standard(
+        "std_black_bar", "Black Bar", font_id="inter_tight", max_chars_per_line=30,
+        animation={"preset": "fade", "intensity": 0.3, "emphasis": "none"},
         placement={"anchor": "lower_third"},
         colour={"source": "black_box", "fill": "#ffffff", "emphasis_fill": "#ffffff",
                 "outline": "#000000", "shadow": "#000000", "box": "#000000"},
     ),
+    # 5. Accent: emphasis colour pulled from the footage's own palette.
     _standard(
-        "std_editorial_serif", "Editorial Serif", font_id="fraunces", max_chars_per_line=36,
-        animation={"preset": "fade", "intensity": 0.3, "emphasis": "semantic"},
+        "std_accent", "Accent", font_id="poppins_extrabold", max_chars_per_line=26,
+        animation={"preset": "pop", "intensity": 0.7, "beat_sync": True, "emphasis": "loudness"},
+        placement={"anchor": "dynamic"},
+        colour={"source": "palette_accent", "fill": "#ffffff", "emphasis_fill": ACCENT_YELLOW,
+                "outline": "#000000", "shadow": "#000000"},
+    ),
+    # 6. Editorial: premium serif, tied to the clip's grade, quiet semantic fill.
+    _standard(
+        "std_editorial", "Editorial", font_id="fraunces", max_chars_per_line=36,
+        animation={"preset": "karaoke", "intensity": 0.4, "emphasis": "semantic"},
         placement={"anchor": "center"},
         colour={"source": "match_grade", "fill": "#ffffff", "emphasis_fill": "#ffffff",
                 "outline": "#000000", "shadow": "#000000"},
     ),
+    # 7. Marker: handwritten, slides up from the top -- playful B-roll captioning.
     _standard(
-        "std_playful_pop", "Playful Pop", font_id="nunito", max_chars_per_line=26,
-        animation={"preset": "pop", "intensity": 0.7, "beat_sync": True, "emphasis": "loudness"},
-        placement={"anchor": "dynamic"},
-        colour={"source": "palette_accent", "fill": "#ffffff", "emphasis_fill": "#ffffff",
-                "outline": "#000000", "shadow": "#000000"},
-    ),
-    _standard(
-        "std_marker_note", "Marker Note", font_id="permanent_marker", max_chars_per_line=22,
+        "std_marker", "Marker", font_id="permanent_marker", max_chars_per_line=22,
         animation={"preset": "slide", "intensity": 0.5, "emphasis": "none"},
         placement={"anchor": "top"},
-        colour={"source": "white", "fill": "#ffffff", "emphasis_fill": "#ffffff",
+        colour={"source": "white", "fill": "#ffffff", "emphasis_fill": ACCENT_PINK,
                 "outline": "#000000", "shadow": "#000000"},
     ),
 ]
