@@ -43,12 +43,13 @@ logger = logging.getLogger(__name__)
 CACHE_ROOT = os.environ.get("EDSO_RENDER_CACHE", "/tmp/edso_render_cache")
 RENDER_PREFIX = "renders"
 # Self-hosted caption font binaries for the ASS burn's `fontsdir=` (captions.
-# plan.md SS12/SS13). Mirrors `frontend/public/fonts/`'s own "path exists,
-# files dropped in later" precedent -- an empty/missing dir is NOT an error,
-# libass/fontconfig just falls back to whatever system font matches the
-# family name (same graceful degrade the frontend's own @font-face already
-# has). See captions/styles.py's module docstring.
-CAPTION_FONTS_DIR = os.environ.get("EDSO_CAPTION_FONTS_DIR", "/tmp/edso_caption_fonts")
+# plan.md SS12/SS13). Defaults to the fonts bundled in this repo (the same 6
+# families the frontend @font-face-registers from public/fonts, so the burn
+# matches the preview typographically); an env override still wins for a
+# custom deploy. An empty/missing dir is NOT an error -- libass/fontconfig
+# just falls back to whatever system font matches the family name.
+_BUNDLED_CAPTION_FONTS = os.path.join(os.path.dirname(__file__), "caption_fonts")
+CAPTION_FONTS_DIR = os.environ.get("EDSO_CAPTION_FONTS_DIR", _BUNDLED_CAPTION_FONTS)
 
 # `long_edge` is the quality tier; the actual W x H is derived from the edit's
 # delivery aspect so the SAME preset renders landscape, portrait, or square.
