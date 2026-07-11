@@ -21,6 +21,20 @@ export interface CubeEntry {
 const cache = new Map<string, CubeEntry>();
 const inFlight = new Map<string, Promise<CubeEntry | null>>();
 
+// Fired whenever an async cube fetch finishes and caches a new entry. The
+// paused preview subscribes to this: the rAF draw loop only runs during
+// playback, so without a repaint trigger a grade picked while paused would
+// stay invisible until the cube arrived on some later frame that never comes.
+const cubeLoadListeners = new Set<() => void>();
+
+/** Subscribe to "a new cube finished loading". Returns an unsubscribe fn. */
+export function subscribeCubeLoaded(cb: () => void): () => void {
+  cubeLoadListeners.add(cb);
+  return () => {
+    cubeLoadListeners.delete(cb);
+  };
+}
+
 export function gradeCubeUrl(grade: ResolvedGrade): string {
   const params = new URLSearchParams({
     cdl: JSON.stringify(grade.cdl),
@@ -49,6 +63,13 @@ export function getGradeCube(grade: ResolvedGrade | undefined): CubeEntry | null
         const parsed = parseCubeText(text);
         if (!parsed) return null;
         cache.set(url, parsed);
+        cubeLoadListeners.forEach((cb) => {
+          try {
+            cb();
+          } catch {
+            /* a listener throwing must not break the fetch chain */
+          }
+        });
         return parsed;
       })
       .catch(() => null)

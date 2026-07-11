@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 # Bump when the measurement logic/shape changes so cached rows recompute even
 # if the underlying proxy did not.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 COLOR_STATS_W = 320
 COLOR_STATS_H = 180
@@ -60,6 +60,7 @@ CLIP_LOW_8BIT = 2          # luma <= this (0..255) counts as shadow-clipped
 CLIP_HIGH_8BIT = 253       # luma >= this (0..255) counts as highlight-clipped
 LOG_FLAT_STD_MAX = 0.16    # normalized luma std-dev below this reads as flat
 LOG_FLAT_RANGE_MAX = 0.75  # (p99.5 - p0.5) luma range below this reads as flat
+LOG_FLAT_CLIP_MAX = 0.01   # true log/flat compresses everything mid-range: it barely clips
 PALETTE_K = 5
 PALETTE_SAMPLE_MAX = 20000
 
@@ -215,7 +216,18 @@ def _aggregate(frames) -> ColorStats:
         wb_white_patch = [1.0, 1.0, 1.0]
 
     spread = float(np.std(flat_luma))
-    is_log_flat = spread < LOG_FLAT_STD_MAX and (white_point - black_point) < LOG_FLAT_RANGE_MAX
+    # Flat/log footage rolls everything into the mid-range, so it should NOT be
+    # clipping at either end. Adding the clip guard rejects genuinely
+    # contrasty-but-narrow footage (or crushed-shadow footage) that happens to
+    # trip the std/range thresholds. This is a conservative reduction of false
+    # positives -- it cannot rescue a dim-but-correct clip whose histogram truly
+    # looks log (that ambiguity is handled downstream by correct.LEVELS_SLOPE_MAX).
+    is_log_flat = (
+        spread < LOG_FLAT_STD_MAX
+        and (white_point - black_point) < LOG_FLAT_RANGE_MAX
+        and clip_shadow_pct < LOG_FLAT_CLIP_MAX
+        and clip_highlight_pct < LOG_FLAT_CLIP_MAX
+    )
 
     # Skin sample: center-weighted geometric proxy (no face detector -- see
     # module docstring). A talking-head subject is usually framed here.

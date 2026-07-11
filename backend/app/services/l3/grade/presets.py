@@ -40,17 +40,17 @@ PRESETS: List[Preset] = [
     Preset(
         "cinematic_teal_orange", "Cinematic Teal & Orange",
         "Cool teal shadows, warm orange highlights/skin, punchier contrast.",
-        Grade(slope=(1.08, 1.0, 0.94), offset=(-0.015, 0.005, 0.02), power=(1.0, 1.0, 1.0), sat=1.12),
+        Grade(slope=(1.14, 1.0, 0.87), offset=(-0.025, 0.006, 0.035), power=(1.0, 1.0, 1.0), sat=1.18),
     ),
     Preset(
         "warm_film", "Warm Film",
         "Lifted, warm blacks and gently rolled-off highlights -- a soft film feel.",
-        Grade(slope=(1.02, 1.0, 0.95), offset=(0.02, 0.012, 0.0), power=(0.97, 1.0, 1.03), sat=0.94),
+        Grade(slope=(1.07, 1.0, 0.9), offset=(0.03, 0.016, -0.004), power=(0.96, 1.0, 1.04), sat=0.92),
     ),
     Preset(
         "cool_modern", "Cool Modern",
         "Clean, slightly cool, punchy contrast -- a contemporary commercial look.",
-        Grade(slope=(0.97, 1.0, 1.05), offset=(-0.008, 0.0, 0.012), power=(1.04, 1.02, 1.0), sat=1.05),
+        Grade(slope=(0.93, 1.0, 1.1), offset=(-0.014, 0.0, 0.022), power=(1.05, 1.02, 1.0), sat=1.1),
     ),
     Preset(
         "moody_desaturated", "Moody Desaturated",
@@ -70,12 +70,12 @@ PRESETS: List[Preset] = [
     Preset(
         "golden_hour", "Golden Hour",
         "Warm gold highlights and a gentle overall glow -- late-afternoon light.",
-        Grade(slope=(1.06, 1.01, 0.9), offset=(0.015, 0.008, -0.005), power=(0.98, 1.0, 1.0), sat=1.08),
+        Grade(slope=(1.11, 1.02, 0.83), offset=(0.025, 0.01, -0.012), power=(0.97, 1.0, 1.0), sat=1.13),
     ),
     Preset(
         "clean_corporate", "Clean Corporate",
         "Neutral with a light contrast lift -- crisp, professional, unobtrusive.",
-        Grade(slope=(1.0, 1.0, 1.0), offset=(0.0, 0.0, 0.0), power=(1.03, 1.03, 1.03), sat=1.03),
+        Grade(slope=(1.05, 1.05, 1.05), offset=(-0.012, -0.012, -0.012), power=(1.0, 1.0, 1.0), sat=1.06),
     ),
     Preset(
         "vibrant_vlog", "Vibrant Vlog",
@@ -90,7 +90,7 @@ PRESETS: List[Preset] = [
     Preset(
         "blue_hour", "Blue Hour",
         "Cool blue shadows and a moody, low-key overall cast -- night/dusk content.",
-        Grade(slope=(0.92, 0.97, 1.1), offset=(-0.01, -0.005, 0.02), power=(1.03, 1.02, 1.0), sat=0.9),
+        Grade(slope=(0.87, 0.95, 1.17), offset=(-0.016, -0.008, 0.032), power=(1.04, 1.02, 1.0), sat=0.88),
     ),
 ]
 

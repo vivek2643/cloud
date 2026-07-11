@@ -9,6 +9,7 @@ import { useEditDocStore } from "@/stores/edit-doc-store";
 import { useTimelineView, type TrackMeta } from "@/stores/timeline-view";
 import { useTransport, FRAME_MS } from "@/stores/transport-store";
 import { useProgramPlayer } from "./use-program-player";
+import { subscribeCubeLoaded } from "./grade-cube-client";
 import { RenderBar } from "@/components/render-bar";
 
 interface CompositePreviewProps {
@@ -255,6 +256,27 @@ export const CompositePreview = forwardRef<HTMLDivElement, CompositePreviewProps
     player.sync(seekTargetMs, playingNow);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [seekSeq]);
+
+  // Repaint the PAUSED frame when the resolved timeline changes (most
+  // importantly a grade edit — picking a look). The rAF loop only runs during
+  // playback, so without this a grade/trim applied while paused would keep
+  // showing the previous frame until the user scrubbed or played. sync() just
+  // re-runs one reconcile/draw at the parked position, so this is cheap.
+  useEffect(() => {
+    if (playing || !hasTimeline) return;
+    player.sync(progRef.current, false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resolved, playing, hasTimeline]);
+
+  // A cube fetch is async: the first draw after a grade change shows raw video
+  // (cube not cached yet), and while paused there's no rAF loop to retry. Repaint
+  // once the cube lands so the grade actually appears without needing to play.
+  useEffect(() => {
+    return subscribeCubeLoaded(() => {
+      if (!useTransport.getState().playing) player.sync(progRef.current, false);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [player]);
 
   // Reset to the start whenever the plan changes shape (segment count / ids).
   const shapeKey = useMemo(

@@ -44,5 +44,11 @@ def fetch_color_stats(file_ids: List[str]) -> Dict[str, dict]:
     out: Dict[str, dict] = {}
     for row in rows:
         d = dict(zip(_COLS, row))
-        out[d.pop("file_id")] = d
+        # psycopg returns a Postgres `uuid` column as a `uuid.UUID`, but every
+        # caller looks this dict up with a STRING file_id (from the document
+        # JSON: `color_stats.get(seg["file_id"])`). Keying by the raw UUID makes
+        # every `.get(str)` silently miss -> the correct + match layers get no
+        # data and collapse to identity (grading degrades to a flat global look
+        # on uncorrected footage). Normalize to str so the lookup actually hits.
+        out[str(d.pop("file_id"))] = d
     return out

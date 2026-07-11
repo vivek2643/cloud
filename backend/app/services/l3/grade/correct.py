@@ -50,7 +50,16 @@ MID_GRAY_PIVOT = 0.5
 MAX_CLIP_PCT_FOR_STRETCH = 0.08   # skip the levels stretch above this much existing clipping
 WB_MULTIPLIER_TRUST_MAX = 2.0     # a white-patch candidate this non-uniform isn't neutral
 WB_MULTIPLIER_CLAMP = 1.5         # cap any single-channel WB gain (never-worse: don't overcorrect)
-LOG_FLAT_PRE_LIFT = 1.10          # mild extra contrast on top of the levels stretch for flat input
+LOG_FLAT_PRE_LIFT = 1.06          # gentle extra contrast on top of the levels stretch for flat input
+# Hard ceiling on the levels-stretch contrast. Low-contrast-but-CORRECT footage
+# (e.g. a dim indoor podcast: black~0.15, white~0.65) is statistically almost
+# indistinguishable from true log, so `is_log_flat` will misfire on it. An
+# uncapped stretch to full [0.02, 0.97] range then produces a ~2.2x slope with a
+# big negative offset -> crushed shadows / blown highlights on footage that was
+# fine. Capping the slope (blacks stay anchored to target, highlights just relax
+# toward full range instead of snapping to it) makes the correction never-worse
+# regardless of whether the log/flat guess was right.
+LEVELS_SLOPE_MAX = 1.5
 
 
 def _compose(s1: float, o1: float, s2: float, o2: float) -> Tuple[float, float]:
@@ -90,6 +99,10 @@ def _solve_levels(color_stats: Dict[str, Any], clip_shadow: float, clip_highligh
     target_low = TARGET_BLACK if black > TARGET_BLACK else black
     target_high = TARGET_WHITE if white < TARGET_WHITE else white
     slope = (target_high - target_low) / max(1e-4, (white - black))
+    slope = min(slope, LEVELS_SLOPE_MAX)
+    # Re-anchor with the (possibly capped) slope so blacks still land on
+    # target_low; the highlight target simply relaxes below target_high rather
+    # than the stretch snapping the whole range open.
     offset = target_low - black * slope
     return slope, offset
 
@@ -111,6 +124,7 @@ def solve_correct_grade(
 
     clip_shadow = float(color_stats.get("clip_shadow_pct") or 0.0)
     clip_highlight = float(color_stats.get("clip_highlight_pct") or 0.0)
+    black = float(color_stats.get("black_point") if color_stats.get("black_point") is not None else 0.0)
 
     wb_r, wb_g, wb_b = _solve_wb(color_stats, white_reference_rgb)
     luma_slope, luma_offset = _solve_levels(color_stats, clip_shadow, clip_highlight)
@@ -121,6 +135,12 @@ def solve_correct_grade(
         lift_slope = LOG_FLAT_PRE_LIFT
         lift_offset = MID_GRAY_PIVOT * (1.0 - LOG_FLAT_PRE_LIFT)
         luma_slope, luma_offset = _compose(luma_slope, luma_offset, lift_slope, lift_offset)
+        # The lift composes ON TOP of the already-capped stretch, so the product
+        # can exceed the ceiling again -- re-clamp, re-anchoring blacks to target.
+        if luma_slope > LEVELS_SLOPE_MAX:
+            target_low = TARGET_BLACK if black > TARGET_BLACK else black
+            luma_slope = LEVELS_SLOPE_MAX
+            luma_offset = target_low - black * luma_slope
 
     slope = (wb_r * luma_slope, wb_g * luma_slope, wb_b * luma_slope)
     offset = (luma_offset, luma_offset, luma_offset)

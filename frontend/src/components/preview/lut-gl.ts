@@ -239,6 +239,10 @@ export function createLutRenderer(): LutRenderer | null {
       rgb8[i] = Math.max(0, Math.min(255, Math.round(grid[i] * 255)));
     }
     gl.bindTexture(gl.TEXTURE_3D, lutTex);
+    // The LUT grid must NOT be Y-flipped (unlike the video texture in draw()):
+    // its axes are color channels, not screen space. draw() sets FLIP_Y=true
+    // for the video, so reset it here or the LUT's green axis would invert.
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
     gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGB8, size, size, size, 0, gl.RGB, gl.UNSIGNED_BYTE, rgb8);
     loadedKey = cacheKey;
     lutReady = true;
@@ -261,6 +265,11 @@ export function createLutRenderer(): LutRenderer | null {
 
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, videoTex);
+    // A video's first row is its TOP, but the shader maps screen-bottom to
+    // texture v=0, so upload flipped to match the plain <video> orientation
+    // (otherwise the graded canvas renders upside down). setLut() resets this
+    // to false for the LUT upload.
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, videoEl);
     gl.uniform1i(uVideo, 0);
 
