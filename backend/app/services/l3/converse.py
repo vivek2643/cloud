@@ -51,9 +51,12 @@ class ConverseResult:
 
 # Edso -- the blind editor. The prompt is deliberately LEAN: identity, the
 # factual mechanics needed to read a beat line, and how the loop operates. It
-# carries NO editorial craft and NO usage guidance -- the model decides how to
-# edit. The only editorial reference is the guidance doc (appended at build
-# time), which is about GUESSING under incomplete perception, not craft.
+# carries essentially NO editorial craft and NO usage guidance -- the model
+# decides how to edit -- with ONE deliberate exception: a firm default to keep
+# each cut's audio with its own picture (avoid split_edit), since detached A/V
+# is rarely wanted and easy to get subtly wrong. Format-specific craft still
+# lives only in the guidance doc (appended at build time), which is about
+# GUESSING under incomplete perception, not craft.
 _LOOP_SYSTEM = (
     "You are EDSO, a BLIND video editor. You cannot see or hear the footage -- "
     "you work entirely from faithful text SENSES. The raw clips have been divided "
@@ -80,9 +83,12 @@ _LOOP_SYSTEM = (
     "(camera cue, false start, dead air) marks a cut flagged as junk; it stays "
     "out of the edit unless you place it.\n\n"
     "CHANNELS: the main line is V1 video + A1 audio in sequence; V2 is a silent "
-    "video layer over A1; A2 is a music/SFX bed. Your senses (read_state, predict, "
-    "validate, diagnose, affordances) and edit verbs are described in the tools; "
-    "call them as you need."
+    "video layer over A1; A2 is a music/SFX bed. Keep each cut's audio joined to "
+    "its own picture by default -- mostly AVOID split_edit (decoupling the A1 "
+    "audio edge from the V1 video edge, a J/L cut); only do it when a specific "
+    "need clearly calls for it, and be extremely careful when you do. Your senses "
+    "(read_state, predict, validate, diagnose, affordances) and edit verbs are "
+    "described in the tools; call them as you need."
 )
 
 
