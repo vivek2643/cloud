@@ -1,24 +1,27 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  Play,
-  Pause,
-  SkipBack,
-  SkipForward,
-  Volume2,
-  VolumeX,
-  Film,
-  Layers,
-  Music,
-} from "lucide-react";
+import { forwardRef, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Film, Layers, Music } from "lucide-react";
 import { getFile, getFilePlaybackUrl, type ResolvedTimeline } from "@/lib/api";
 import { resolveTimeline } from "@/lib/resolve-timeline";
 import { documentToProject } from "@/lib/edit-project";
 import { useEditDocStore } from "@/stores/edit-doc-store";
 import { useTimelineView, type TrackMeta } from "@/stores/timeline-view";
-import { useTransport, FRAME_MS, formatTimecode } from "@/stores/transport-store";
+import { useTransport, FRAME_MS } from "@/stores/transport-store";
 import { useProgramPlayer } from "./use-program-player";
+import { RenderBar } from "@/components/render-bar";
+
+interface CompositePreviewProps {
+  token: string | undefined;
+  /** Export overlay (SS2.3) needs the thread/version to render into; omitted
+   * (null) hides the overlay entirely (nothing to export into yet). */
+  threadId: string | null;
+  version: number | null;
+  /** Hover over the frame drives the external hover-morphing "Chat" bar
+   * (SS2.5) -- this component only reports the boolean, the controls
+   * themselves live in ai-edit-panel.tsx. */
+  onHoverChange?: (hovering: boolean) => void;
+}
 
 /**
  * Preview-ONLY track mute, applied AFTER `resolveTimeline` so the
@@ -66,8 +69,15 @@ function applyTrackMeta(
  * the audio, a slot pool shows/pre-warms the picture, and the AudioContext is
  * the master clock. Any timeline edit re-resolves and the preview reflects it on
  * the next frame — no save round-trip.
+ *
+ * Playback CONTROLS live outside this component now (editor_ui.plan.md
+ * SS2.5's hover-morphing "Chat" bar in ai-edit-panel.tsx) -- this component
+ * only hosts the picture, the Export overlay (SS2.3), and hover/fullscreen
+ * plumbing for that external control surface. `frameRef` is forwarded onto
+ * the frame div itself so the parent can call `requestFullscreen()` on it.
  */
-export function CompositePreview({ token }: { token: string | undefined }) {
+export const CompositePreview = forwardRef<HTMLDivElement, CompositePreviewProps>(
+  function CompositePreview({ token, threadId, version, onHoverChange }, frameRef) {
   const timeline = useEditDocStore((s) => s.timeline);
   const operations = useEditDocStore((s) => s.operations);
   const layoutRegions = useEditDocStore((s) => s.layoutRegions);
@@ -97,7 +107,6 @@ export function CompositePreview({ token }: { token: string | undefined }) {
     aspect === "portrait" ? "9 / 16" : aspect === "square" ? "1 / 1" : "16 / 9";
 
   const [urls, setUrls] = useState<Record<string, string>>({});
-  const [muted, setMuted] = useState(false);
 
   // Shared transport: the single source of truth for program time + play state,
   // read by both this monitor and the timeline so they stay in lockstep.
@@ -106,7 +115,6 @@ export function CompositePreview({ token }: { token: string | undefined }) {
   const seekSeq = useTransport((s) => s.seekSeq);
   const seekTargetMs = useTransport((s) => s.seekTargetMs);
   const setPlaying = useTransport((s) => s.setPlaying);
-  const togglePlaying = useTransport((s) => s.togglePlaying);
   const publish = useTransport((s) => s.publish);
   const seekTo = useTransport((s) => s.seek);
   const setDuration = useTransport((s) => s.setDuration);
@@ -233,15 +241,6 @@ export function CompositePreview({ token }: { token: string | undefined }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [seekSeq]);
 
-  function handleTogglePlay() {
-    if (!hasTimeline) return;
-    togglePlaying();
-  }
-
-  useEffect(() => {
-    player.setMuted(muted);
-  }, [muted, player]);
-
   // Reset to the start whenever the plan changes shape (segment count / ids).
   const shapeKey = useMemo(
     () => (resolved ? resolved.video_layers.map((v) => v.layer_id).join(",") : ""),
@@ -285,15 +284,18 @@ export function CompositePreview({ token }: { token: string | undefined }) {
     : 0;
 
   return (
-    <div className="border-b px-4 py-3" style={{ borderColor: "var(--border)" }}>
+    <div className="px-2 pt-2">
       <div className="flex w-full justify-center">
       <div
+        ref={frameRef}
+        onMouseEnter={() => onHoverChange?.(true)}
+        onMouseLeave={() => onHoverChange?.(false)}
         className="relative overflow-hidden rounded-lg"
         style={{
           background: "#000",
           aspectRatio: frameRatio,
           width: aspect === "landscape" ? "100%" : "auto",
-          height: aspect === "landscape" ? undefined : "min(70vh, 460px)",
+          height: aspect === "landscape" ? undefined : "min(75vh, 560px)",
           maxWidth: "100%",
         }}
       >
@@ -322,56 +324,17 @@ export function CompositePreview({ token }: { token: string | undefined }) {
             )}
           </div>
         )}
-      </div>
-      </div>
 
-      {hasTimeline && (
-        <>
-          <input
-            type="range"
-            min={0}
-            max={Math.max(1, duration)}
-            step={FRAME_MS}
-            value={Math.min(progMs, duration)}
-            onChange={(e) => seekTo(Number(e.target.value))}
-            className="mt-2 w-full accent-[var(--accent)]"
-          />
-          <div className="mt-1 flex items-center gap-2">
-            <button
-              onClick={() => seekTo(progMs - 5000)}
-              className="rounded p-1 transition-colors hover:bg-[var(--accent-soft)]"
-              title="Back 5s"
-            >
-              <SkipBack size={15} />
-            </button>
-            <button
-              onClick={handleTogglePlay}
-              className="rounded-full p-1.5"
-              style={{ background: "var(--accent)", color: "var(--background)" }}
-              title={playing ? "Pause" : "Play"}
-            >
-              {playing ? <Pause size={15} /> : <Play size={15} />}
-            </button>
-            <button
-              onClick={() => seekTo(progMs + 5000)}
-              className="rounded p-1 transition-colors hover:bg-[var(--accent-soft)]"
-              title="Forward 5s"
-            >
-              <SkipForward size={15} />
-            </button>
-            <button
-              onClick={() => setMuted((m) => !m)}
-              className="rounded p-1 transition-colors hover:bg-[var(--accent-soft)]"
-              title={muted ? "Unmute" : "Mute"}
-            >
-              {muted ? <VolumeX size={15} /> : <Volume2 size={15} />}
-            </button>
-            <span className="ml-auto text-xs tabular-nums" style={{ color: "var(--muted)" }}>
-              {formatTimecode(progMs)} / {formatTimecode(duration)}
-            </span>
+        {/* Export -- relocated on top of the monitor (editor_ui.plan.md SS2.3) */}
+        {threadId && (
+          <div className="absolute right-2 top-2">
+            <RenderBar threadId={threadId} version={version} token={token} disabled={!hasTimeline} />
           </div>
-        </>
-      )}
+        )}
+      </div>
+      </div>
     </div>
   );
-}
+});
+
+CompositePreview.displayName = "CompositePreview";

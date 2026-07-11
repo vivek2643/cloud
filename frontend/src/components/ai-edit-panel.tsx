@@ -17,13 +17,18 @@ import {
   Save,
   History,
   RotateCcw,
+  Play,
+  Pause,
+  SkipBack,
+  SkipForward,
+  Maximize2,
+  Minimize2,
 } from "lucide-react";
 import { useDriveStore } from "@/stores/drive-store";
-import { RenderBar } from "@/components/render-bar";
 import { TimelineEditor } from "@/components/timeline-editor";
 import { CompositePreview } from "@/components/preview/composite-preview";
 import { useEditDocStore } from "@/stores/edit-doc-store";
-import { useTransport } from "@/stores/transport-store";
+import { useTransport, FRAME_MS, formatTimecode } from "@/stores/transport-store";
 import { useAuthStore } from "@/stores/auth-store";
 import {
   createEditThread,
@@ -129,6 +134,11 @@ export function AiEditPanel() {
   // Portal target for the bottom editor dock (program monitor + timeline) that
   // lives in the main area, pro-editor style.
   const [dockEl, setDockEl] = useState<HTMLElement | null>(null);
+
+  // Monitor hover -> the ChatBar below morphs into player controls (SS2.5).
+  // The ref targets the Fullscreen API at the monitor's frame element.
+  const monitorRef = useRef<HTMLDivElement>(null);
+  const [monitorHovered, setMonitorHovered] = useState(false);
 
   // Working-document save/history/revert — hosted here (not in the timeline
   // dock itself) since this panel already owns threadId/token/ensureThread.
@@ -488,22 +498,23 @@ export function AiEditPanel() {
         </div>
       )}
 
-      {/* Program monitor — reads the live working doc from the edit store */}
-      <CompositePreview token={token} />
+      {/* Program monitor — reads the live working doc from the edit store.
+          Export now lives on top of it (SS2.3); playback controls live in
+          the ChatBar below, morphing in on hover (SS2.5). */}
+      <CompositePreview
+        ref={monitorRef}
+        token={token}
+        threadId={threadId}
+        version={thread?.document_version ?? null}
+        onHoverChange={setMonitorHovered}
+      />
 
-      {/* Export / render */}
-      {threadId && (
-        <RenderBar
-          threadId={threadId}
-          version={thread?.document_version ?? null}
-          token={token}
-          disabled={!doc?.timeline?.length}
-        />
-      )}
+      {/* "Chat" label at rest; morphs into player controls on monitor hover. */}
+      <ChatBar hovering={monitorHovered} monitorRef={monitorRef} hasTimeline={!!doc?.timeline?.length} />
 
       {/* Conversation */}
       <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto px-4 py-4">
-        {messages.length === 0 && !busy && <EmptyState />}
+        {messages.length === 0 && !busy && <GreetingBubble />}
 
         {messages.map((m, i) => (
           <Bubble key={`m${i}`} role={m.role}>
@@ -538,10 +549,10 @@ export function AiEditPanel() {
         )}
       </div>
 
-      {/* Composer */}
+      {/* Composer -- roomy, not a one-line strip (editor_ui.plan.md SS2.2) */}
       <div className="border-t px-3 py-3" style={{ borderColor: "var(--border)" }}>
         <div
-          className="flex items-end gap-2 rounded-xl border px-3 py-2"
+          className="flex items-end gap-2 rounded-xl border px-4 py-3"
           style={{ borderColor: "var(--border)", background: "var(--background)" }}
         >
           <textarea
@@ -553,14 +564,14 @@ export function AiEditPanel() {
                 handleSend();
               }
             }}
-            rows={1}
+            rows={3}
             placeholder="Message EDSO — ask anything, or describe an edit…"
-            className="max-h-32 min-h-[24px] flex-1 resize-none bg-transparent text-sm outline-none"
+            className="max-h-48 min-h-[64px] flex-1 resize-none bg-transparent text-sm outline-none"
           />
           <button
             onClick={() => handleSend()}
             disabled={!input.trim() || busy}
-            className="rounded-lg p-1.5 transition-opacity disabled:opacity-30"
+            className="rounded-lg p-1.5 transition-opacity disabled:opacity-70"
             style={{ background: "var(--accent)", color: "var(--background)" }}
             title="Send"
           >
@@ -588,16 +599,114 @@ export function AiEditPanel() {
   );
 }
 
-function EmptyState() {
+/**
+ * The strip between the monitor and the conversation (editor_ui.plan.md
+ * SS2.3/SS2.5): reads "Chat" at rest; on monitor hover it morphs into
+ * player controls (play/pause, ±10s, fullscreen) + a thin scrubber, freeing
+ * the always-on transport strip that used to live under the monitor. Both
+ * states stay mounted and cross-fade via opacity so the swap reads as a
+ * morph, not a jump.
+ */
+function ChatBar({
+  hovering,
+  monitorRef,
+  hasTimeline,
+}: {
+  hovering: boolean;
+  monitorRef: React.RefObject<HTMLDivElement | null>;
+  hasTimeline: boolean;
+}) {
+  const playing = useTransport((s) => s.playing);
+  const progMs = useTransport((s) => s.progMs);
+  const duration = useTransport((s) => s.durationMs);
+  const togglePlaying = useTransport((s) => s.togglePlaying);
+  const seek = useTransport((s) => s.seek);
+  const [fullscreen, setFullscreen] = useState(false);
+
+  useEffect(() => {
+    const onChange = () => setFullscreen(!!document.fullscreenElement);
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, []);
+
+  function toggleFullscreen() {
+    if (document.fullscreenElement) void document.exitFullscreen();
+    else void monitorRef.current?.requestFullscreen();
+  }
+
+  const showControls = hovering && hasTimeline;
+
   return (
-    <div className="flex flex-col items-center py-10 text-center">
-      <Sparkles size={30} style={{ color: "var(--accent)" }} />
-      <p className="mt-3 text-sm font-semibold">Chat about your footage</p>
-      <p className="mt-1 max-w-[18rem] text-xs" style={{ color: "var(--muted)" }}>
-        Ask about your clips, talk through ideas, or describe an edit. EDSO
-        edits the timeline directly as it works -- you can always undo.
-      </p>
+    <div className="relative h-8 border-b px-4" style={{ borderColor: "var(--border)" }}>
+      <div
+        className={`absolute inset-0 flex items-center px-4 text-[11px] font-medium uppercase tracking-wide transition-opacity duration-200 ${
+          showControls ? "pointer-events-none opacity-0" : "opacity-100"
+        }`}
+        style={{ color: "var(--muted)" }}
+      >
+        Chat
+      </div>
+      <div
+        className={`absolute inset-0 flex items-center gap-1.5 px-3 transition-opacity duration-200 ${
+          showControls ? "opacity-100" : "pointer-events-none opacity-0"
+        }`}
+      >
+        <button
+          onClick={() => seek(progMs - 10000)}
+          className="rounded p-1 transition-colors hover:bg-[var(--accent-soft)]"
+          title="Back 10s"
+        >
+          <SkipBack size={13} />
+        </button>
+        <button
+          onClick={togglePlaying}
+          className="rounded-full p-1"
+          style={{ background: "var(--accent)", color: "var(--background)" }}
+          title={playing ? "Pause" : "Play"}
+        >
+          {playing ? <Pause size={11} /> : <Play size={11} />}
+        </button>
+        <button
+          onClick={() => seek(progMs + 10000)}
+          className="rounded p-1 transition-colors hover:bg-[var(--accent-soft)]"
+          title="Forward 10s"
+        >
+          <SkipForward size={13} />
+        </button>
+        <input
+          type="range"
+          min={0}
+          max={Math.max(1, duration)}
+          step={FRAME_MS}
+          value={Math.min(progMs, duration)}
+          onChange={(e) => seek(Number(e.target.value))}
+          className="mx-1 h-1 flex-1 accent-[var(--accent)]"
+        />
+        <span className="text-[10px] tabular-nums" style={{ color: "var(--muted)" }}>
+          {formatTimecode(progMs)} / {formatTimecode(duration)}
+        </span>
+        <button
+          onClick={toggleFullscreen}
+          className="rounded p-1 transition-colors hover:bg-[var(--accent-soft)]"
+          title={fullscreen ? "Exit fullscreen" : "Fullscreen"}
+        >
+          {fullscreen ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+        </button>
+      </div>
     </div>
+  );
+}
+
+/** A UI-only assistant greeting on a fresh thread (editor_ui.plan.md SS2.1) --
+ * not a backend turn, never persisted as a real message. Replaces the old
+ * empty-state card with something that reads like the start of the actual
+ * conversation. */
+function GreetingBubble() {
+  return (
+    <Bubble role="assistant">
+      Hi, I&apos;m EDSO. Tell me what you&apos;re making and I&apos;ll start
+      building the edit — or ask me anything about your footage.
+    </Bubble>
   );
 }
 
