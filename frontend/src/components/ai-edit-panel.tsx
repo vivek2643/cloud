@@ -584,11 +584,16 @@ export function AiEditPanel() {
     {/* Editable timeline dock, pinned full-width to the bottom of the main area
         (left of the chat), pro-editor style. Always shown in edit mode so users
         can drag clips in to build a timeline from scratch — not only after the
-        AI produces cuts. The program monitor stays in the panel. */}
+        AI produces cuts. The program monitor stays in the panel.
+        Fixed (not max-) height: the focus accordion (editor_ui.plan.md SS1.1)
+        measures this and fits an N-track stack into it, so a fixed budget is
+        what lets it promise "never forces vertical scroll" -- a max-height
+        driven by content would make that circular. overflow-y-auto stays as
+        a defensive floor for pathological track counts only. */}
     {dockEl &&
       createPortal(
         <div
-          className="max-h-[40vh] min-h-[200px] w-full overflow-y-auto border-t p-3"
+          className="h-[38vh] min-h-[220px] w-full overflow-y-auto border-t p-3"
           style={{ borderColor: "var(--border)", background: "var(--background)" }}
         >
           <TimelineEditor ensureThread={ensureThread} />

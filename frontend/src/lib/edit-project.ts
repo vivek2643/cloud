@@ -67,11 +67,22 @@ export interface EditProject {
   aspect: EditAspect;
 }
 
-// Generic, non-semantic palette (no coverage/angle meaning attached).
-const COLOR_BASE_VIDEO = "var(--accent)";
-const COLOR_BASE_AUDIO = "#2bb673";
-const VIDEO_COLORS = ["#7c5cff", "#1f9ed1", "#9b6dff", "#4a8cff"];
-const AUDIO_COLORS = ["#3a86e0", "#e0883a", "#2bb6a8", "#c05ad1"];
+/** The default z a new cutaway/coverage clip lands on (also V2's z, so it's
+ * always the first upper video track -- editor_ui.plan.md SS1.6). */
+export const DEFAULT_CUTAWAY_Z = 10;
+
+// Generic, non-semantic palette (editor_ui.plan.md SS1.7): tokenised
+// neutral greys only -- video vs audio read by TONE, not hue. The playhead
+// (not clips) owns the accent; a selected clip gets a soft accent wash +
+// border instead of a full-accent fill (see timeline-editor.tsx's Block).
+const COLOR_BASE_VIDEO = "var(--clip-video-base)";
+const COLOR_BASE_AUDIO = "var(--clip-audio-base)";
+const VIDEO_COLORS = [
+  "var(--clip-video-1)", "var(--clip-video-2)", "var(--clip-video-3)", "var(--clip-video-4)",
+];
+const AUDIO_COLORS = [
+  "var(--clip-audio-1)", "var(--clip-audio-2)", "var(--clip-audio-3)", "var(--clip-audio-4)",
+];
 
 function spineDuration(seg: EditSegment): number {
   return Math.max(0, Math.round(seg.out_ms) - Math.round(seg.in_ms));
@@ -120,10 +131,13 @@ export function documentToProject(
   }
   const durationMs = t;
 
-  // --- upper video tracks: place_video ops, stacked by z ---
+  // --- upper video tracks: place_video ops, stacked by z. V2 (the default
+  // cutaway z) always renders even when empty (editor_ui.plan.md SS1.6 --
+  // "default tracks = V1 + A1 + V2" -- so a cutaway always has a home and
+  // the layout doesn't jump when the first one lands). ---
   const videoOps = operations.filter((o) => o.type === "place_video");
   const videoZs = Array.from(
-    new Set(videoOps.map((o) => Math.round(o.z ?? 10)))
+    new Set([...videoOps.map((o) => Math.round(o.z ?? DEFAULT_CUTAWAY_Z)), DEFAULT_CUTAWAY_Z])
   ).sort((a, b) => a - b);
   const zToTrack = new Map<number, ProjectTrack>();
   videoZs.forEach((z, i) => {

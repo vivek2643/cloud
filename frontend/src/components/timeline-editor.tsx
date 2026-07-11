@@ -14,11 +14,11 @@ import {
   Pause,
   Undo2,
   Redo2,
-  ZoomIn,
   ZoomOut,
-  Maximize2,
+  ZoomIn,
   Magnet,
   Copy,
+  Triangle,
 } from "lucide-react";
 import { getFilePlaybackUrl, type EditOperation } from "@/lib/api";
 import { useEditDocStore } from "@/stores/edit-doc-store";
@@ -60,9 +60,11 @@ function parseTimecode(text: string): number | null {
   return Math.max(0, Math.round((totalFrames * 1000) / PROJECT_FPS));
 }
 
-const HEADER_W = 132;
+const HEADER_W = 108;
+const GUTTER_W = 14;
 const RULER_H = 24;
 const DEFAULT_LANE_H = 36;
+const ADD_TRACK_ROW_H = 24;
 const SNAP_THRESHOLD_PX = 8;
 const DUPLICATE_OFFSET_MS = 300;
 
@@ -139,14 +141,17 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
   const trackMeta = useTimelineView((s) => s.trackMeta);
   const clipboard = useTimelineView((s) => s.clipboard);
   const setZoom = useTimelineView((s) => s.setZoom);
-  const zoomIn = useTimelineView((s) => s.zoomIn);
-  const zoomOut = useTimelineView((s) => s.zoomOut);
   const zoomToFit = useTimelineView((s) => s.zoomToFit);
   const setScrollLeft = useTimelineView((s) => s.setScrollLeft);
   const toggleSnap = useTimelineView((s) => s.toggleSnap);
   const setSnapGuide = useTimelineView((s) => s.setSnapGuide);
   const setTrackMeta = useTimelineView((s) => s.setTrackMeta);
   const setClipboard = useTimelineView((s) => s.setClipboard);
+  const focusedTrackIds = useTimelineView((s) => s.focusedTrackIds);
+  const viewMode = useTimelineView((s) => s.viewMode);
+  const setFocus = useTimelineView((s) => s.setFocus);
+  const togglePairFocus = useTimelineView((s) => s.togglePairFocus);
+  const setViewMode = useTimelineView((s) => s.setViewMode);
 
   const [viewportW, setViewportW] = useState(600);
   const [marquee, setMarquee] = useState<Marquee | null>(null);
@@ -174,6 +179,134 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
   const pxPerMs = pxPerSec / 1000;
   const contentWidth = Math.max(1, total * pxPerMs);
 
+  // --- add-track (editor_ui.plan.md SS1.6, reverses timeline_trim B3):
+  // V1+A1+V2 are always-real defaults (documentToProject); "+" adds a
+  // PLACEHOLDER beyond those, empty until a clip actually lands on it (no
+  // document mutation -- purely a UI affordance, same "pending until real"
+  // contract the pre-trim NLE build used). A pending entry is dropped once
+  // a real track with the same z/role appears (a clip landed there). ---
+  const [pendingTracks, setPendingTracks] = useState<ProjectTrack[]>([]);
+  const renderTracks = useMemo(() => {
+    const realVideoZs = new Set(project.tracks.filter((t) => t.kind === "video").map((t) => t.z));
+    const realAudioRoles = new Set(
+      project.tracks.filter((t) => t.kind === "audio" && !t.isBase).map((t) => t.role)
+    );
+    const stillPending = pendingTracks.filter((t) =>
+      t.kind === "video" ? !realVideoZs.has(t.z) : !realAudioRoles.has(t.role)
+    );
+    const upperVideo = [...project.tracks.filter((t) => t.kind === "video" && !t.isBase)];
+    const baseVideo = project.tracks.find((t) => t.kind === "video" && t.isBase);
+    const baseAudio = project.tracks.find((t) => t.kind === "audio" && t.isBase);
+    const bedAudio = [...project.tracks.filter((t) => t.kind === "audio" && !t.isBase)];
+    for (const t of stillPending) {
+      if (t.kind === "video") upperVideo.push(t);
+      else bedAudio.push(t);
+    }
+    upperVideo.sort((a, b) => b.z - a.z);
+    const out: ProjectTrack[] = [...upperVideo];
+    if (baseVideo) out.push(baseVideo);
+    if (baseAudio) out.push(baseAudio);
+    out.push(...bedAudio);
+    return out;
+  }, [project.tracks, pendingTracks]);
+
+  function addVideoTrack() {
+    const usedZs = renderTracks.filter((t) => t.kind === "video").map((t) => t.z);
+    const z = Math.max(0, ...usedZs) + 1;
+    setPendingTracks((prev) => [...prev, { id: `pending-v-${z}`, kind: "video", label: `V${renderTracks.filter((t) => t.kind === "video").length + 1}`, isBase: false, z }]);
+  }
+
+  function addAudioTrack() {
+    const usedRoles = new Set(renderTracks.filter((t) => t.kind === "audio" && !t.isBase).map((t) => t.role));
+    let n = renderTracks.filter((t) => t.kind === "audio").length + 1;
+    let role = `bed-${n}`;
+    while (usedRoles.has(role)) { n += 1; role = `bed-${n}`; }
+    setPendingTracks((prev) => [...prev, { id: `pending-a-${role}`, kind: "audio", label: `A${n}`, isBase: false, z: 0, role }]);
+  }
+
+  // --- focus accordion (editor_ui.plan.md SS1.1): row heights are derived
+  // from MEASURED available height, never a fixed px guess -- so an N-track
+  // stack can never force vertical scroll (the dock ancestor is a fixed
+  // height; see ai-edit-panel.tsx). "peek" is local/ephemeral (hover a
+  // sliver to preview it expanded) and never touches the committed
+  // `focusedTrackIds` in the store. ---
+  const MIN_SLIVER_H = 16;
+  const SLIVER_CONTENT_THRESHOLD = 28;
+  const [peekTrackId, setPeekTrackId] = useState<string | null>(null);
+  const tracksAreaRef = useRef<HTMLDivElement>(null);
+  const [tracksAreaH, setTracksAreaH] = useState(0);
+  useEffect(() => {
+    const el = tracksAreaRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setTracksAreaH(el.clientHeight || 0));
+    ro.observe(el);
+    setTracksAreaH(el.clientHeight || 0);
+    return () => ro.disconnect();
+  }, []);
+
+  const defaultFocusId =
+    renderTracks.find((t) => t.kind === "video" && t.isBase)?.id ?? renderTracks[0]?.id ?? null;
+  const committedFocusIds = focusedTrackIds.filter((id) => renderTracks.some((t) => t.id === id));
+  const activeFocusIds = committedFocusIds.length > 0 ? committedFocusIds : defaultFocusId ? [defaultFocusId] : [];
+  const effectiveFocusIds =
+    viewMode === "focus" && peekTrackId && !activeFocusIds.includes(peekTrackId)
+      ? [...activeFocusIds, peekTrackId]
+      : activeFocusIds;
+
+  // The header column's "+V/+A" row sits below the mapped tracks and has no
+  // lane-side counterpart -- budget for it up front so the accordion's
+  // computed row heights never push the header column past the measured
+  // (fixed) dock height.
+  const lanesAvailH = Math.max(0, tracksAreaH - RULER_H - ADD_TRACK_ROW_H);
+  const rowHeights: number[] = new Array(renderTracks.length).fill(DEFAULT_LANE_H);
+  if (renderTracks.length > 0 && lanesAvailH > 0) {
+    if (viewMode === "all") {
+      rowHeights.fill(lanesAvailH / renderTracks.length);
+    } else {
+      const focusIdx = renderTracks
+        .map((t, i) => (effectiveFocusIds.includes(t.id) ? i : -1))
+        .filter((i) => i >= 0);
+      if (focusIdx.length === 0) {
+        rowHeights.fill(lanesAvailH / renderTracks.length);
+      } else {
+        const othersCount = renderTracks.length - focusIdx.length;
+        const minBudget = othersCount * MIN_SLIVER_H;
+        let sliverH = MIN_SLIVER_H;
+        let focusedH: number;
+        if (othersCount === 0) {
+          focusedH = lanesAvailH / focusIdx.length;
+        } else if (lanesAvailH > minBudget) {
+          focusedH = (lanesAvailH - minBudget) / focusIdx.length;
+        } else {
+          // Floor case: even min-slivers don't fit -- equal-fit fallback
+          // (the dock's overflow-y-auto is the last-resort safety net).
+          sliverH = lanesAvailH / renderTracks.length;
+          focusedH = sliverH;
+        }
+        for (let i = 0; i < renderTracks.length; i++) {
+          rowHeights[i] = focusIdx.includes(i) ? focusedH : sliverH;
+        }
+      }
+    }
+  }
+  const rowOffsets: number[] = [];
+  {
+    let acc = 0;
+    for (const h of rowHeights) {
+      rowOffsets.push(acc);
+      acc += h;
+    }
+  }
+
+  /** Focus the track before/after the primary focused one in render order;
+   * clamped at the ends (no wrap). Used by both the gutter arrows and ↑/↓. */
+  function focusStep(dir: 1 | -1) {
+    if (renderTracks.length === 0) return;
+    const primary = activeFocusIds[0] ?? defaultFocusId;
+    const idx = Math.max(0, renderTracks.findIndex((t) => t.id === primary));
+    const next = Math.max(0, Math.min(renderTracks.length - 1, idx + dir));
+    setFocus(renderTracks[next].id);
+  }
 
   // Shared transport — playhead position + play state live in the same store the
   // program monitor reads, so the two surfaces are always in lockstep.
@@ -428,6 +561,13 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
       } else if (e.code === "ArrowRight") {
         e.preventDefault();
         step(e.shiftKey ? 10 : 1);
+      } else if (e.code === "ArrowUp") {
+        // Focus-nav (SS1.2): moves the accordion's focus, not selection.
+        e.preventDefault();
+        focusStep(-1);
+      } else if (e.code === "ArrowDown") {
+        e.preventDefault();
+        focusStep(1);
       } else if (!mod && e.key.toLowerCase() === "s") {
         toggleSnap();
       } else if (e.key === ",") {
@@ -518,7 +658,7 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
 
   /** Which rendered track the pointer is currently over (vertical hit-test). */
   function trackAtY(clientY: number) {
-    for (const track of project.tracks) {
+    for (const track of renderTracks) {
       const el = trackEls.current.get(track.id);
       if (!el) continue;
       const r = el.getBoundingClientRect();
@@ -766,88 +906,164 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
   const selOp = oneOrigin?.kind === "op" ? operations.find((o) => o.op_id === oneOrigin.opId) ?? null : null;
 
   return (
-    <div className="space-y-2">
-      {/* Toolbar */}
-      <div className="flex items-center gap-1">
-        <button
-          onClick={togglePlaying}
-          disabled={total <= 0}
-          className="rounded-full p-1.5 transition-opacity disabled:opacity-30"
-          style={{ background: "var(--accent)", color: "var(--background)" }}
-          title={playing ? "Pause (space)" : "Play (space)"}
-        >
-          {playing ? <Pause size={13} /> : <Play size={13} />}
-        </button>
-        <IconBtn title="Previous frame (←)" onClick={() => step(-1)}>
-          <ChevronLeft size={14} />
-        </IconBtn>
-        <IconBtn title="Next frame (→)" onClick={() => step(1)}>
-          <ChevronRight size={14} />
-        </IconBtn>
-
-        <Divider />
-
+    <div className="flex h-full flex-col gap-2">
+      {/* Toolbar -- left: snap/undo/redo/duplicate; center: transport + cut
+          (the most-used controls); right: focus mode + zoom + timecode
+          (editor_ui.plan.md SS1.3) */}
+      <div className="flex shrink-0 items-center gap-1">
         <IconBtn active={snapEnabled} title="Snap (S)" onClick={toggleSnap}>
           <Magnet size={14} />
         </IconBtn>
-
         <Divider />
-
-        <IconBtn title="Zoom out" onClick={zoomOut}>
-          <ZoomOut size={14} />
-        </IconBtn>
-        <IconBtn title="Zoom to fit" onClick={() => zoomToFit(viewportW, total)}>
-          <Maximize2 size={14} />
-        </IconBtn>
-        <IconBtn title="Zoom in" onClick={zoomIn}>
-          <ZoomIn size={14} />
-        </IconBtn>
-
-        <Divider />
-
         <IconBtn title="Undo (⌘Z)" onClick={undo} disabled={!canUndo}>
           <Undo2 size={14} />
         </IconBtn>
         <IconBtn title="Redo (⌘⇧Z)" onClick={redo} disabled={!canRedo}>
           <Redo2 size={14} />
         </IconBtn>
-        <IconBtn title="Split at playhead (⌘K)" onClick={splitAtPlayhead}>
-          <Scissors size={14} />
-        </IconBtn>
         <IconBtn title="Duplicate (⌘D)" onClick={duplicateSelection} disabled={selectedIds.length === 0}>
           <Copy size={14} />
         </IconBtn>
 
-        <span className="ml-auto text-[11px] tabular-nums" style={{ color: "var(--muted)" }}>
+        <div className="flex flex-1 items-center justify-center gap-1">
+          <IconBtn title="Previous frame (←)" onClick={() => step(-1)}>
+            <ChevronLeft size={14} />
+          </IconBtn>
+          <button
+            onClick={togglePlaying}
+            disabled={total <= 0}
+            className="rounded-full p-1.5 transition-opacity disabled:opacity-30"
+            style={{ background: "var(--accent)", color: "var(--background)" }}
+            title={playing ? "Pause (space)" : "Play (space)"}
+          >
+            {playing ? <Pause size={13} /> : <Play size={13} />}
+          </button>
+          <IconBtn title="Next frame (→)" onClick={() => step(1)}>
+            <ChevronRight size={14} />
+          </IconBtn>
+          <IconBtn title="Split at playhead (⌘K)" onClick={splitAtPlayhead}>
+            <Scissors size={14} />
+          </IconBtn>
+        </div>
+
+        <button
+          onClick={() => setViewMode(viewMode === "focus" ? "all" : "focus")}
+          title={
+            viewMode === "focus"
+              ? "Focus mode -- click for equal-height (All) view"
+              : "All (equal-height) -- click for Focus (accordion) view"
+          }
+          className="rounded border px-1.5 py-0.5 text-[10px] font-medium transition-colors"
+          style={{ borderColor: "var(--border)", color: "var(--muted)" }}
+        >
+          {viewMode === "focus" ? "Focus" : "All"}
+        </button>
+        <ZoomSlider pxPerSec={pxPerSec} onChange={setZoom} onFit={() => zoomToFit(viewportW, total)} />
+        <span className="text-[11px] tabular-nums" style={{ color: "var(--muted)" }}>
           {formatTimecode(progMs)} <span style={{ opacity: 0.5 }}>/ {formatTimecode(total)}</span>
         </span>
       </div>
 
       {/* Header column (fixed) + scrollable ruler/lanes */}
-      <div className="flex items-stretch">
+      <div ref={tracksAreaRef} className="flex min-h-0 flex-1 items-stretch">
+        {/* Focus-nav gutter (editor_ui.plan.md SS1.2): one ▲/▼ pair, fixed
+            x-position, that tracks the focused lane's Y offset -- distinct
+            from TrackHeaderRow's per-track reorder chevrons (filled
+            triangles here vs thin chevrons there). */}
+        <div className="relative shrink-0" style={{ width: GUTTER_W }}>
+          <div style={{ height: RULER_H }} />
+          <div className="relative" style={{ height: lanesAvailH || undefined }}>
+            {(() => {
+              const primaryId = activeFocusIds[0] ?? defaultFocusId;
+              const idx = renderTracks.findIndex((t) => t.id === primaryId);
+              if (idx < 0) return null;
+              return (
+                <div
+                  className="absolute left-0 flex flex-col items-center justify-center gap-1 transition-[top,height] duration-200"
+                  style={{ top: rowOffsets[idx], height: rowHeights[idx], width: GUTTER_W }}
+                >
+                  <div
+                    className="absolute left-0 top-0 h-full"
+                    style={{ width: 2, background: "var(--accent)" }}
+                  />
+                  <button
+                    onClick={() => focusStep(-1)}
+                    disabled={idx === 0}
+                    title="Focus previous track (↑)"
+                    className="rounded hover:bg-[var(--accent-soft)] disabled:opacity-20"
+                  >
+                    <Triangle size={7} fill="currentColor" stroke="none" style={{ color: "var(--muted)" }} />
+                  </button>
+                  <button
+                    onClick={() => focusStep(1)}
+                    disabled={idx === renderTracks.length - 1}
+                    title="Focus next track (↓)"
+                    className="rounded hover:bg-[var(--accent-soft)] disabled:opacity-20"
+                  >
+                    <Triangle
+                      size={7}
+                      fill="currentColor"
+                      stroke="none"
+                      className="rotate-180"
+                      style={{ color: "var(--muted)" }}
+                    />
+                  </button>
+                </div>
+              );
+            })()}
+          </div>
+        </div>
+
         {/* Fixed track-header column */}
         <div className="shrink-0" style={{ width: HEADER_W }}>
           <div style={{ height: RULER_H }} />
-          {project.tracks.map((track, i) => {
+          {renderTracks.map((track, i) => {
             // Upper video tracks render highest-z first (see edit-project.ts's
             // `upperVideo` sort) -- "move up" = swap with the track ABOVE (one
             // index earlier / higher z); "move down" = the one below.
             const isReorderableVideo = track.kind === "video" && !track.isBase;
-            const above = isReorderableVideo ? project.tracks[i - 1] : undefined;
-            const below = isReorderableVideo ? project.tracks[i + 1] : undefined;
+            const above = isReorderableVideo ? renderTracks[i - 1] : undefined;
+            const below = isReorderableVideo ? renderTracks[i + 1] : undefined;
             const canMoveUp = isReorderableVideo && above?.kind === "video" && !above.isBase;
             const canMoveDown = isReorderableVideo && below?.kind === "video" && !below.isBase;
+            const height = rowHeights[i];
+            const isSliver = height < SLIVER_CONTENT_THRESHOLD;
+            const isFocused = effectiveFocusIds.includes(track.id);
             return (
               <TrackHeaderRow
                 key={track.id}
                 track={track}
                 meta={trackMeta[track.id]}
+                height={height}
+                isSliver={isSliver}
+                isFocused={isFocused}
                 onToggleMute={() => toggleTrackMute(track)}
                 onMoveUp={canMoveUp ? () => swapVideoZ(track.z, above!.z) : undefined}
                 onMoveDown={canMoveDown ? () => swapVideoZ(track.z, below!.z) : undefined}
+                onFocus={(e) => (e.shiftKey ? togglePairFocus(track.id) : setFocus(track.id))}
+                onPeekStart={() => setPeekTrackId(track.id)}
+                onPeekEnd={() => setPeekTrackId((cur) => (cur === track.id ? null : cur))}
               />
             );
           })}
+          <div className="flex items-center gap-1 px-1.5" style={{ height: ADD_TRACK_ROW_H }}>
+            <button
+              onClick={addVideoTrack}
+              title="Add video track"
+              className="flex-1 rounded border text-[10px] transition-colors"
+              style={{ borderColor: "var(--border)", color: "var(--muted)", padding: "2px 0" }}
+            >
+              +V
+            </button>
+            <button
+              onClick={addAudioTrack}
+              title="Add audio track"
+              className="flex-1 rounded border text-[10px] transition-colors"
+              style={{ borderColor: "var(--border)", color: "var(--muted)", padding: "2px 0" }}
+            >
+              +A
+            </button>
+          </div>
         </div>
 
         {/* Scrollable content: ruler + lanes + playhead + snap guide, one shared scroll */}
@@ -862,14 +1078,19 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
 
             {/* Tracks */}
             <div>
-              {project.tracks.map((track) => {
+              {renderTracks.map((track, i) => {
                 const trackClips = project.clips.filter((c) => c.trackId === track.id);
                 const isWidthTrack = track.kind === "video" && track.isBase;
                 const showDropHint = isWidthTrack && trackClips.length === 0 && timeline.length === 0;
+                const height = rowHeights[i];
+                const isSliver = height < SLIVER_CONTENT_THRESHOLD;
                 return (
                   <div
                     key={track.id}
                     onPointerDown={startMarquee}
+                    onClick={() => isSliver && setFocus(track.id)}
+                    onMouseEnter={() => isSliver && setPeekTrackId(track.id)}
+                    onMouseLeave={() => setPeekTrackId((cur) => (cur === track.id ? null : cur))}
                     onDragOver={(e) => onLaneDragOver(track, e)}
                     onDragLeave={() => setDropTrack(null)}
                     onDrop={(e) => onLaneDrop(track, e)}
@@ -878,14 +1099,15 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
                       if (el) m.set(track.id, el);
                       else m.delete(track.id);
                     }}
-                    className="relative border-b"
+                    className="relative border-b transition-[height] duration-200"
                     style={{
-                      height: DEFAULT_LANE_H,
+                      height,
                       borderColor: "var(--border)",
                       background: dropTrack === track.id ? "var(--accent-soft)" : "transparent",
                       outline: dropTrack === track.id ? "2px dashed var(--accent)" : "none",
                       outlineOffset: -2,
                       touchAction: "none",
+                      cursor: isSliver ? "pointer" : undefined,
                     }}
                   >
                     {showDropHint && (
@@ -911,27 +1133,34 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
                       const isDlg = clip.kind === "audio" && clip.origin.kind === "spine";
                       const displayName = isDlg ? clip.label : fileNameFor(clip.sourceFileId);
                       const blockWidth = Math.max(8, (clip.progEndMs - clip.progStartMs) * pxPerMs);
+                      // Slivers show clips as thin blocks at true time position only
+                      // (editor_ui.plan.md SS1.1) -- no filmstrip/waveform/trim
+                      // handles/drag (a 16px lane can't host those meaningfully);
+                      // click focuses the track + selects, same as clicking the lane.
                       return (
                         <Block
                           key={clip.id}
                           left={clip.progStartMs * pxPerMs}
                           width={blockWidth}
                           selected={selectedClip}
-                          onClick={(e) => selectClip(clip, e)}
-                          onBodyPointerDown={bodyDrag}
+                          onClick={(e) => {
+                            if (isSliver) setFocus(track.id);
+                            selectClip(clip, e);
+                          }}
+                          onBodyPointerDown={isSliver ? undefined : bodyDrag}
                           color={clip.color}
                           muted={clip.muted}
-                          movable={clip.movable || (clip.kind === "video" && clip.origin.kind === "spine")}
+                          movable={!isSliver && (clip.movable || (clip.kind === "video" && clip.origin.kind === "spine"))}
                           title={`${displayName} · ${fmt(clip.progStartMs)}–${fmt(clip.progEndMs)}`}
                         >
-                          {clip.trimmable && (
+                          {!isSliver && clip.trimmable && (
                             <span
                               onPointerDown={(e) => startTrim(clip, "in", e)}
                               className="absolute left-0 top-0 h-full w-1.5 cursor-ew-resize"
                               style={{ background: "rgba(0,0,0,0.35)" }}
                             />
                           )}
-                          {clip.kind === "video" && !isDlg && (
+                          {!isSliver && clip.kind === "video" && !isDlg && (
                             <Filmstrip
                               fileId={clip.sourceFileId}
                               srcInMs={clip.srcInMs}
@@ -939,11 +1168,13 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
                               widthPx={blockWidth}
                             />
                           )}
-                          {clip.kind === "audio" && (
+                          {!isSliver && clip.kind === "audio" && (
                             <Waveform fileId={clip.sourceFileId} widthPx={blockWidth} />
                           )}
-                          <span className="pointer-events-none relative truncate px-2">{displayName}</span>
-                          {blockWidth > 64 && (
+                          {!isSliver && (
+                            <span className="pointer-events-none relative truncate px-2">{displayName}</span>
+                          )}
+                          {!isSliver && blockWidth > 64 && (
                             <span
                               className="pointer-events-none absolute right-1.5 shrink-0 text-[9px] tabular-nums"
                               style={{ color: "rgba(255,255,255,0.75)", textShadow: "0 1px 1px rgba(0,0,0,0.6)" }}
@@ -951,7 +1182,7 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
                               {fmt(clip.progEndMs - clip.progStartMs)}
                             </span>
                           )}
-                          {clip.trimmable && (
+                          {!isSliver && clip.trimmable && (
                             <span
                               onPointerDown={(e) => startTrim(clip, "out", e)}
                               className="absolute right-0 top-0 h-full w-1.5 cursor-ew-resize"
@@ -980,10 +1211,12 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
               />
             )}
 
-            {/* Playhead — spans the ruler + every lane */}
+            {/* Playhead — spans the ruler + every lane. The single loud-accent
+                element in the timeline (editor_ui.plan.md SS1.7); against
+                neutral-grey clips it needs the accent to stay legible. */}
             {pxPerMs > 0 && (
               <div className="pointer-events-none absolute bottom-0 z-10" style={{ left: playheadPx, top: 0 }}>
-                <div className="h-full" style={{ width: 2, background: "var(--foreground)" }} />
+                <div className="h-full" style={{ width: 2, background: "var(--accent)" }} />
                 <div
                   className="absolute"
                   style={{
@@ -994,7 +1227,7 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
                     height: 0,
                     borderLeft: "4px solid transparent",
                     borderRight: "4px solid transparent",
-                    borderTop: "6px solid var(--foreground)",
+                    borderTop: "6px solid var(--accent)",
                   }}
                 />
               </div>
@@ -1230,28 +1463,52 @@ function TimeRuler({
 function TrackHeaderRow({
   track,
   meta,
+  height,
+  isSliver,
+  isFocused,
   onToggleMute,
   onMoveUp,
   onMoveDown,
+  onFocus,
+  onPeekStart,
+  onPeekEnd,
 }: {
   track: ProjectTrack;
   meta: TrackMeta | undefined;
+  height: number;
+  isSliver: boolean;
+  isFocused: boolean;
   onToggleMute: () => void;
   onMoveUp?: () => void;
   onMoveDown?: () => void;
+  onFocus: (e: React.MouseEvent) => void;
+  onPeekStart: () => void;
+  onPeekEnd: () => void;
 }) {
   return (
     <div
-      className="relative flex items-center gap-0.5 border-b pl-2 pr-1 text-[10px]"
-      style={{ height: DEFAULT_LANE_H, borderColor: "var(--border)" }}
+      onClick={onFocus}
+      onMouseEnter={isSliver ? onPeekStart : undefined}
+      onMouseLeave={isSliver ? onPeekEnd : undefined}
+      className="relative flex items-center gap-0.5 border-b pl-2 pr-1 text-[10px] transition-[height] duration-200"
+      style={{
+        height,
+        borderColor: "var(--border)",
+        cursor: isSliver ? "pointer" : undefined,
+        background: isFocused && !isSliver ? "var(--accent-soft)" : undefined,
+      }}
     >
-      <span className="min-w-0 flex-1 truncate font-medium" style={{ color: "var(--muted)" }}>
+      <span className="min-w-0 max-w-[52px] shrink truncate font-medium" style={{ color: "var(--muted)" }}>
         {track.label}
       </span>
-      {(onMoveUp || onMoveDown) && (
+      {/* Reorder chevrons hidden on slivers -- the focus-nav gutter arrows
+          (thin filmed triangles, one pair for the whole timeline) own that
+          space at a sliver's height; these swap video-layer z and only
+          matter once a track is expanded (editor_ui.plan.md SS1.2). */}
+      {!isSliver && (onMoveUp || onMoveDown) && (
         <span className="flex flex-col">
           <button
-            onClick={onMoveUp}
+            onClick={(e) => { e.stopPropagation(); onMoveUp?.(); }}
             disabled={!onMoveUp}
             title="Move layer up"
             className="rounded hover:bg-[var(--accent-soft)] disabled:opacity-20"
@@ -1259,7 +1516,7 @@ function TrackHeaderRow({
             <ChevronUp size={9} />
           </button>
           <button
-            onClick={onMoveDown}
+            onClick={(e) => { e.stopPropagation(); onMoveDown?.(); }}
             disabled={!onMoveDown}
             title="Move layer down"
             className="rounded hover:bg-[var(--accent-soft)] disabled:opacity-20"
@@ -1269,7 +1526,7 @@ function TrackHeaderRow({
         </span>
       )}
       <button
-        onClick={onToggleMute}
+        onClick={(e) => { e.stopPropagation(); onToggleMute(); }}
         title={track.kind === "audio" ? (meta?.mute ? "Unmute" : "Mute") : "Hide in preview (view-only)"}
         className="rounded p-0.5 hover:bg-[var(--accent-soft)]"
         style={meta?.mute ? { color: "var(--accent)" } : undefined}
@@ -1314,9 +1571,12 @@ function Block({
       style={{
         left,
         width,
-        background: color,
+        // Selected: a soft accent wash layered over the clip's own neutral
+        // fill + an accent border -- NOT a full-accent fill (the playhead
+        // owns the loud accent; keeps the orange budget to ~2 spots/view).
+        background: selected ? `linear-gradient(var(--accent-soft), var(--accent-soft)), ${color}` : color,
         opacity: muted ? 0.45 : 1,
-        outline: selected ? "2px solid var(--foreground)" : "none",
+        outline: selected ? "2px solid var(--accent)" : "none",
         outlineOffset: -2,
         touchAction: "none",
       }}
@@ -1363,6 +1623,44 @@ function TextTag({ children }: { children: React.ReactNode }) {
 
 function Divider() {
   return <div className="mx-1 h-4 w-px shrink-0" style={{ background: "var(--border)" }} />;
+}
+
+/** Log-scaled horizontal zoom slider (editor_ui.plan.md SS1.4) -- maps
+ * pxPerSec [MIN,MAX] onto a linear [0,1] slider so equal drag distance
+ * feels like equal zoom "steps" across the whole range. Double-click = fit
+ * (⌘/Ctrl+wheel fine zoom is unchanged, handled elsewhere). */
+function ZoomSlider({
+  pxPerSec,
+  onChange,
+  onFit,
+}: {
+  pxPerSec: number;
+  onChange: (pxPerSec: number) => void;
+  onFit: () => void;
+}) {
+  const logRange = Math.log(MAX_PX_PER_SEC / MIN_PX_PER_SEC);
+  const t = Math.log(Math.max(MIN_PX_PER_SEC, pxPerSec) / MIN_PX_PER_SEC) / logRange;
+
+  function handleChange(v: number) {
+    onChange(MIN_PX_PER_SEC * Math.exp(v * logRange));
+  }
+
+  return (
+    <div className="flex items-center gap-1" title="Zoom (double-click to fit)">
+      <ZoomOut size={12} style={{ color: "var(--muted)" }} />
+      <input
+        type="range"
+        min={0}
+        max={1}
+        step={0.001}
+        value={t}
+        onChange={(e) => handleChange(Number(e.target.value))}
+        onDoubleClick={onFit}
+        className="h-1 w-20 cursor-pointer accent-[var(--accent)]"
+      />
+      <ZoomIn size={12} style={{ color: "var(--muted)" }} />
+    </div>
+  );
 }
 
 // --------------------------------------------------------------------------

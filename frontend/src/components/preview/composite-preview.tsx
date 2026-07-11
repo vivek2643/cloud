@@ -292,7 +292,7 @@ export const CompositePreview = forwardRef<HTMLDivElement, CompositePreviewProps
         onMouseLeave={() => onHoverChange?.(false)}
         className="relative overflow-hidden rounded-lg"
         style={{
-          background: "#000",
+          background: "var(--background)",
           aspectRatio: frameRatio,
           width: aspect === "landscape" ? "100%" : "auto",
           height: aspect === "landscape" ? undefined : "min(75vh, 560px)",
@@ -304,7 +304,7 @@ export const CompositePreview = forwardRef<HTMLDivElement, CompositePreviewProps
         {!hasTimeline && (
           <div
             className="absolute inset-0 flex h-full w-full items-center justify-center text-xs"
-            style={{ color: "#666" }}
+            style={{ color: "var(--muted)" }}
           >
             <Film size={28} />
           </div>

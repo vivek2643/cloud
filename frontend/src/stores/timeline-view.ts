@@ -45,6 +45,15 @@ interface TimelineViewState {
    * "ephemeral, never persisted" contract as everything else here. */
   gradeBypass: boolean;
 
+  /** Accordion focus (editor_ui.plan.md SS1.1): which track(s) render
+   * expanded. Usually one id; two when a pair is pinned (e.g. a video +
+   * its dialogue). Empty means "no explicit focus yet" -- the editor
+   * defaults to the base video track. Decoupled from clip SELECTION. */
+  focusedTrackIds: string[];
+  /** "focus" = accordion (one/two expanded, rest as slivers); "all" =
+   * equal fit-to-height, no accordion. */
+  viewMode: "focus" | "all";
+
   setZoom: (pxPerSec: number) => void;
   zoomIn: () => void;
   zoomOut: () => void;
@@ -55,6 +64,12 @@ interface TimelineViewState {
   setTrackMeta: (trackId: string, patch: Partial<TrackMeta>) => void;
   setClipboard: (entries: ClipboardEntry[]) => void;
   toggleGradeBypass: () => void;
+  /** Replace focus with a single track (the common case: click a clip/sliver). */
+  setFocus: (trackId: string) => void;
+  /** Pin a second track expanded alongside the current focus ("focus-a-pair");
+   * toggling an already-pinned id drops it back to single-focus. */
+  togglePairFocus: (trackId: string) => void;
+  setViewMode: (mode: "focus" | "all") => void;
 }
 
 export const useTimelineView = create<TimelineViewState>((set) => ({
@@ -65,6 +80,8 @@ export const useTimelineView = create<TimelineViewState>((set) => ({
   trackMeta: {},
   clipboard: [],
   gradeBypass: false,
+  focusedTrackIds: [],
+  viewMode: "focus",
 
   setZoom: (pxPerSec) => set({ pxPerSec: clampZoom(pxPerSec) }),
   zoomIn: () => set((s) => ({ pxPerSec: clampZoom(s.pxPerSec * 1.4) })),
@@ -83,4 +100,12 @@ export const useTimelineView = create<TimelineViewState>((set) => ({
     })),
   setClipboard: (entries) => set({ clipboard: entries }),
   toggleGradeBypass: () => set((s) => ({ gradeBypass: !s.gradeBypass })),
+  setFocus: (trackId) => set({ focusedTrackIds: [trackId] }),
+  togglePairFocus: (trackId) =>
+    set((s) => ({
+      focusedTrackIds: s.focusedTrackIds.includes(trackId)
+        ? s.focusedTrackIds.filter((id) => id !== trackId)
+        : [...s.focusedTrackIds, trackId].slice(-2),
+    })),
+  setViewMode: (mode) => set({ viewMode: mode }),
 }));

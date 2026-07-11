@@ -39,6 +39,22 @@
   --danger: #d4d4d4;
   --success: #fafafa;
   --font-brand: "Telegraf", system-ui, -apple-system, sans-serif;
+
+  /* Timeline clip fills (editor_ui.plan.md SS1.7): neutral grey only, video
+     vs audio differentiated by TONE (not hue) -- the playhead owns the
+     accent instead. Small per-kind arrays keep multiple simultaneous upper
+     tracks (V2/V3.../A2/A3...) visually distinguishable at a glance without
+     reading labels. */
+  --clip-video-base: #4a4a4a;
+  --clip-video-1: #3f3f3f;
+  --clip-video-2: #4a4a4a;
+  --clip-video-3: #555555;
+  --clip-video-4: #454545;
+  --clip-audio-base: #333333;
+  --clip-audio-1: #2e2e2e;
+  --clip-audio-2: #383838;
+  --clip-audio-3: #303030;
+  --clip-audio-4: #3a3a3a;
 }
 
 body {
