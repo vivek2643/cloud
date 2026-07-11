@@ -48,6 +48,11 @@ class EditDocumentBody(BaseModel):
     operations: List[dict] = []
     summary: Optional[str] = None
     notes: Optional[List[str]] = None
+    # Sequence-level color grade selection (color_grading.plan.md SS2.4/SS7):
+    # {mode, preset_id, reference_image_ref, reference_stats, lut_ref,
+    # match_strength, arc_intensity}. Optional so a plain timeline-edit save
+    # never has to know/care about grading.
+    look: Optional[dict] = None
 
 
 _ALLOWED_OP_TYPES = {"place_video", "place_audio", "split_edit", "level"}
@@ -183,6 +188,8 @@ def put_document(
         new_doc["summary"] = body.summary
     if body.notes is not None:
         new_doc["notes"] = body.notes
+    if body.look is not None:
+        new_doc["look"] = body.look
     new_doc.pop("resolved", None)  # force a fresh recompute below
     new_doc["resolved"] = resolve_document(new_doc)
 

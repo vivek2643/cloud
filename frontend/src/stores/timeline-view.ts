@@ -39,6 +39,11 @@ interface TimelineViewState {
   trackMeta: Record<string, TrackMeta>;
   /** Editor-local clipboard for copy/cut/paste/duplicate (P0.3). */
   clipboard: ClipboardEntry[];
+  /** Before/after preview toggle (color_grading.plan.md SS12): when true,
+   * the preview bypasses every clip's grade (shows the ungraded picture)
+   * without touching the document -- purely a view-state flag, same
+   * "ephemeral, never persisted" contract as everything else here. */
+  gradeBypass: boolean;
 
   setZoom: (pxPerSec: number) => void;
   zoomIn: () => void;
@@ -49,6 +54,7 @@ interface TimelineViewState {
   setSnapGuide: (ms: number | null) => void;
   setTrackMeta: (trackId: string, patch: Partial<TrackMeta>) => void;
   setClipboard: (entries: ClipboardEntry[]) => void;
+  toggleGradeBypass: () => void;
 }
 
 export const useTimelineView = create<TimelineViewState>((set) => ({
@@ -58,6 +64,7 @@ export const useTimelineView = create<TimelineViewState>((set) => ({
   snapGuideMs: null,
   trackMeta: {},
   clipboard: [],
+  gradeBypass: false,
 
   setZoom: (pxPerSec) => set({ pxPerSec: clampZoom(pxPerSec) }),
   zoomIn: () => set((s) => ({ pxPerSec: clampZoom(s.pxPerSec * 1.4) })),
@@ -75,4 +82,5 @@ export const useTimelineView = create<TimelineViewState>((set) => ({
       trackMeta: { ...s.trackMeta, [trackId]: { ...s.trackMeta[trackId], ...patch } },
     })),
   setClipboard: (entries) => set({ clipboard: entries }),
+  toggleGradeBypass: () => set((s) => ({ gradeBypass: !s.gradeBypass })),
 }));

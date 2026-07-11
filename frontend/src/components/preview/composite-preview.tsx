@@ -32,20 +32,29 @@ import { useProgramPlayer } from "./use-program-player";
 function applyTrackMeta(
   resolved: ResolvedTimeline,
   trackMeta: Record<string, TrackMeta>,
-  project: ReturnType<typeof documentToProject>
+  project: ReturnType<typeof documentToProject>,
+  gradeBypass: boolean
 ): ResolvedTimeline {
   const anyMeta = Object.keys(trackMeta).length > 0;
-  if (!anyMeta) return resolved;
+  if (!anyMeta && !gradeBypass) return resolved;
 
   const videoTrackIdByZ = new Map<number, string>();
   for (const t of project.tracks) {
     if (t.kind === "video") videoTrackIdByZ.set(t.z, t.id);
   }
 
-  const video_layers = resolved.video_layers.filter((v) => {
-    const trackId = videoTrackIdByZ.get(v.z);
-    return !(trackId && trackMeta[trackId]?.mute);
-  });
+  let video_layers = resolved.video_layers;
+  if (anyMeta) {
+    video_layers = video_layers.filter((v) => {
+      const trackId = videoTrackIdByZ.get(v.z);
+      return !(trackId && trackMeta[trackId]?.mute);
+    });
+  }
+  // Before/after (SS12): strip every layer's grade so the preview shows the
+  // ungraded picture, without touching the document at all.
+  if (gradeBypass) {
+    video_layers = video_layers.map((v) => (v.grade ? { ...v, grade: undefined } : v));
+  }
 
   return { ...resolved, video_layers };
 }
@@ -64,9 +73,11 @@ export function CompositePreview({ token }: { token: string | undefined }) {
   const layoutRegions = useEditDocStore((s) => s.layoutRegions);
   const durations = useEditDocStore((s) => s.durations);
   const aspect = useEditDocStore((s) => s.aspect);
+  const look = useEditDocStore((s) => s.look);
   const mergeDurations = useEditDocStore((s) => s.mergeDurations);
 
   const trackMeta = useTimelineView((s) => s.trackMeta);
+  const gradeBypass = useTimelineView((s) => s.gradeBypass);
   const project = useMemo(
     () => documentToProject(timeline, operations, aspect),
     [timeline, operations, aspect]
@@ -75,11 +86,11 @@ export function CompositePreview({ token }: { token: string | undefined }) {
   const resolved: ResolvedTimeline | null = useMemo(() => {
     if (!timeline.length) return null;
     const r = resolveTimeline(
-      { timeline, operations, layout_regions: layoutRegions, format: { aspect } },
+      { timeline, operations, layout_regions: layoutRegions, format: { aspect }, look },
       durations
     );
-    return applyTrackMeta(r, trackMeta, project);
-  }, [timeline, operations, layoutRegions, durations, aspect, trackMeta, project]);
+    return applyTrackMeta(r, trackMeta, project, gradeBypass);
+  }, [timeline, operations, layoutRegions, durations, aspect, look, trackMeta, gradeBypass, project]);
 
   // Frame box ratio for the program monitor, matching the delivery aspect.
   const frameRatio =

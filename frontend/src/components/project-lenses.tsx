@@ -2,10 +2,10 @@
 
 import { DriveContent } from "@/components/drive-content";
 import { CutsV3View } from "@/components/cuts-v3-view";
+import { ColorGradeView } from "@/components/color-grade-view";
 import { useDriveStore } from "@/stores/drive-store";
 
 const STAGE_LABELS: Record<string, string> = {
-  color: "Colour grading",
   captions: "Captions",
 };
 
@@ -13,13 +13,15 @@ const STAGE_LABELS: Record<string, string> = {
  * Renders the active project stage selected in the left sidebar. "Media" lists
  * every video in the project; "Cuts" surfaces the LLM-grouped ingest pipeline
  * (cuts_v3.plan.md) -- the sole Cuts surface now that the deterministic v2 view
- * has been retired. Remaining stages are placeholders for now.
+ * has been retired. "Colour grading" is color_grading.plan.md's Grade panel.
+ * Remaining stages are placeholders for now.
  */
 export function ProjectLenses() {
   const projectStage = useDriveStore((s) => s.projectStage);
 
   if (projectStage === "media") return <DriveContent />;
   if (projectStage === "cuts-v3") return <CutsV3View />;
+  if (projectStage === "color") return <ColorGradeView />;
   return <ComingSoon label={STAGE_LABELS[projectStage] ?? "Coming soon"} />;
 }
 

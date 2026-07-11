@@ -826,6 +826,7 @@ export interface SaveEditBody {
   operations?: EditOperation[];
   summary?: string;
   notes?: string[];
+  look?: EditLook;
 }
 
 export function saveEditDocument(id: string, body: SaveEditBody, token: string) {
@@ -833,6 +834,18 @@ export function saveEditDocument(id: string, body: SaveEditBody, token: string) 
     `/api/edit/threads/${id}/document`,
     { method: "PUT", body: JSON.stringify(body), token }
   );
+}
+
+// --- Color grading ---
+
+export interface GradePresetSummary {
+  preset_id: string;
+  label: string;
+  description: string;
+}
+
+export function getGradePresets(token: string) {
+  return request<GradePresetSummary[]>("/api/grade/presets", { token });
 }
 
 // --- Render / export ---

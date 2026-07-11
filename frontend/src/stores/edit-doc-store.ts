@@ -8,7 +8,7 @@
  * version re-seeds the baseline.
  */
 import { create } from "zustand";
-import type { EditAspect, EditDocument, EditOperation, EditSegment, LayoutRegion } from "@/lib/api";
+import type { EditAspect, EditDocument, EditLook, EditOperation, EditSegment, LayoutRegion } from "@/lib/api";
 import type { Durations } from "@/lib/resolve-timeline";
 
 function docAspect(doc: EditDocument | null): EditAspect {
@@ -68,6 +68,8 @@ interface EditDocState {
   durations: Durations;
   /** Delivery frame shape for the preview/render (from the document format). */
   aspect: EditAspect;
+  /** Sequence-level color grade selection (color_grading.plan.md SS2.4/SS7). */
+  look: EditLook | undefined;
   /** Multi-select: `ProjectClip.id`-shaped ("seg:<seg_id>" | "op:<op_id>"). */
   selectedIds: string[];
 
@@ -80,6 +82,10 @@ interface EditDocState {
   commit: (version: number, doc: EditDocument) => void;
   revert: () => void;
   setWorking: (timeline: EditSegment[], operations: EditOperation[]) => void;
+  /** Set the sequence-level look -- caller is responsible for persisting via
+   * saveEditDocument's `look` field (this only updates local working state,
+   * same "instant local, explicit save" contract as everything else here). */
+  setLook: (look: EditLook | undefined) => void;
   isDirty: () => boolean;
   setDurations: (d: Durations) => void;
   mergeDurations: (d: Durations) => void;
@@ -159,6 +165,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
   layoutRegions: [],
   durations: {},
   aspect: "landscape",
+  look: undefined,
   selectedIds: [],
   past: [],
   future: [],
@@ -175,6 +182,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       operations: operations.map((o) => ({ ...o })),
       layoutRegions: doc?.layout_regions ?? [],
       aspect: docAspect(doc),
+      look: doc?.look,
       selectedIds: [],
       past: [],
       future: [],
@@ -191,6 +199,7 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       operations: [],
       layoutRegions: [],
       aspect: "landscape",
+      look: undefined,
       selectedIds: [],
       past: [],
       future: [],
@@ -207,10 +216,13 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       operations: operations.map((o) => ({ ...o })),
       layoutRegions: doc.layout_regions ?? [],
       aspect: docAspect(doc),
+      look: doc.look,
       past: [],
       future: [],
     });
   },
+
+  setLook: (look) => set({ look }),
 
   revert: () =>
     set((st) => ({

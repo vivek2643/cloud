@@ -147,9 +147,13 @@ def parse_cube_text(text: str):
         except ValueError:
             continue
 
+    if not values:
+        raise ValueError(".cube parse error: no data rows found")
     if size is None:
         # Infer from row count if the header was missing/malformed.
         size = round(len(values) ** (1.0 / 3.0))
+    if size < 2:
+        raise ValueError(f".cube parse error: LUT_3D_SIZE must be >= 2, got {size}")
     expected = size ** 3
     if len(values) != expected:
         raise ValueError(
