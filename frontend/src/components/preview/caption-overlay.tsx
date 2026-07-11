@@ -15,6 +15,7 @@
  * so it costs nothing when captions are off (SS1.3): `resolvedCaptions` is
  * simply empty and this renders null.
  */
+import { useEffect, useRef, useState } from "react";
 import { useEditDocStore } from "@/stores/edit-doc-store";
 import { useTransport } from "@/stores/transport-store";
 import {
@@ -84,18 +85,20 @@ function Word({ word, ev, progMs }: { word: CaptionWord; ev: ResolvedCaptionEven
   );
 }
 
-export function CaptionOverlay() {
-  const resolvedCaptions = useEditDocStore((s) => s.resolvedCaptions);
-  const progMs = useTransport((s) => s.progMs);
-  const ev = activeCaptionEvent(resolvedCaptions, progMs);
-  if (!ev) return null;
-
+function CaptionEventView({
+  ev, progMs, frameH,
+}: { ev: ResolvedCaptionEvent; progMs: number; frameH: number }) {
   const opacity = eventOpacity(ev, progMs);
   if (opacity <= 0.001) return null;
   const slideOffset = eventSlideOffsetPx(ev, progMs);
   const [x, y, w, h] = ev.box;
   const font = ev.style.font;
   const box = ev.style.colour.box;
+  // Match the export metric exactly: ass_export.py sizes text at
+  // canvas_h * 0.045, so the preview uses the on-screen frame height * the
+  // same factor -> identical caption proportion in the monitor and the burn.
+  // Falls back to a viewport estimate only until the frame is first measured.
+  const fontSize = frameH > 0 ? `${frameH * 0.045}px` : "min(4.2vw, 32px)";
 
   return (
     <div
@@ -111,7 +114,7 @@ export function CaptionOverlay() {
           fontFamily: font.fallback_stack,
           fontWeight: font.weight,
           letterSpacing: `${font.tracking}em`,
-          fontSize: "min(4.2vw, 32px)",
+          fontSize,
           background: box || undefined,
           padding: box ? "0.15em 0.4em" : undefined,
           borderRadius: box ? 4 : undefined,
@@ -125,6 +128,36 @@ export function CaptionOverlay() {
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+export function CaptionOverlay() {
+  const resolvedCaptions = useEditDocStore((s) => s.resolvedCaptions);
+  const progMs = useTransport((s) => s.progMs);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [frameH, setFrameH] = useState(0);
+
+  const hasCaptions = !!resolvedCaptions && resolvedCaptions.length > 0;
+  // Measure the full-frame root (not the caption box) so the font can size off
+  // the frame height like the export does. A ResizeObserver keeps it correct
+  // as the monitor resizes; re-attaches when captions toggle on.
+  useEffect(() => {
+    const el = rootRef.current;
+    if (!el) return;
+    const measure = () => setFrameH(el.clientHeight);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [hasCaptions]);
+
+  if (!hasCaptions) return null;  // zero cost when captions are off (SS1.3)
+  const ev = activeCaptionEvent(resolvedCaptions, progMs);
+
+  return (
+    <div ref={rootRef} className="pointer-events-none absolute inset-0 overflow-hidden">
+      {ev ? <CaptionEventView ev={ev} progMs={progMs} frameH={frameH} /> : null}
     </div>
   );
 }

@@ -132,23 +132,42 @@ def _event_tags(ev: Dict[str, Any], an: int, px: int, py: int) -> str:
     return "{" + "".join(tags) + "}"
 
 
-def _line_text(line: Dict[str, Any], ev_start_ms: int, style_colour: Dict[str, Any], anim: Dict[str, Any]) -> str:
+def _line_text(
+    line: Dict[str, Any], ev_start_ms: int, style_colour: Dict[str, Any],
+    anim: Dict[str, Any], karaoke_cursor: List[int],
+) -> str:
+    """One line's text with per-word animation tags. `karaoke_cursor` is a
+    single-element mutable [prev_word_t_out_ms] threaded across ALL lines of
+    the event: ASS karaoke (\\k/\\kf) is cumulative over the whole Dialogue
+    line (\\N breaks included), so each word gets a leading empty \\k<gap>
+    syllable equal to the real pause since the previous word. Without it the
+    fill runs ahead of the actual speech -- and ahead of the DOM preview,
+    which fills each word over its absolute [t_in,t_out] (resolve-captions.ts
+    wordKaraokeFrac)."""
     preset = anim.get("preset", "fade")
     intensity = float(anim.get("intensity", 0.5))
     parts: List[str] = []
     for w in line["words"]:
         text = _escape_ass_text(w["text"])
         if preset == "karaoke":
-            cs = max(1, round((w["t_out_ms"] - w["t_in_ms"]) / 10))
-            parts.append(f"{{\\kf{cs}}}{text} ")
+            gap_cs = max(0, round((int(w["t_in_ms"]) - karaoke_cursor[0]) / 10))
+            dur_cs = max(1, round((w["t_out_ms"] - w["t_in_ms"]) / 10))
+            lead = f"\\k{gap_cs}" if gap_cs > 0 else ""  # empty (text-less) hold syllable
+            parts.append(f"{{{lead}\\kf{dur_cs}}}{text} ")
+            karaoke_cursor[0] = int(w["t_out_ms"])
         elif preset == "pop" and w.get("emphasized"):
             scale = round(100 + 35 * intensity)
             emph_colour = _hex_to_ass_bgr(style_colour["emphasis_fill"])
+            fill_colour = _hex_to_ass_bgr(style_colour["fill"])
             t_ms = max(1, w["t_in_ms"] - ev_start_ms)
             pop_dur = min(220, max(80, w["t_out_ms"] - w["t_in_ms"]))
+            # Ramp scale+colour up to the emphasis peak, then ramp BOTH back
+            # (colour included, \\c{fill}) so the word doesn't stay tinted for
+            # the rest of the event -- matches resolve-captions.ts wordPopStyle,
+            # which reverts to the fill colour once the pop window closes.
             parts.append(
                 f"{{\\t({t_ms},{t_ms + pop_dur},\\fscx{scale}\\fscy{scale}\\c{emph_colour})}}"
-                f"{text}{{\\t({t_ms + pop_dur},{t_ms + pop_dur + pop_dur},\\fscx100\\fscy100)}} "
+                f"{text}{{\\t({t_ms + pop_dur},{t_ms + pop_dur + pop_dur},\\fscx100\\fscy100\\c{fill_colour})}} "
             )
         else:
             parts.append(f"{text} ")
@@ -162,8 +181,12 @@ def _build_events_block(events: List[Dict[str, Any]], style_names: Dict[Tuple, s
         style_name = style_names[_style_key(style)]
         an, px, py = _anchor_for_box(ev["box"], canvas_w, canvas_h)
         tags = _event_tags(ev, an, px, py)
+        # Karaoke timing is cumulative over the whole Dialogue line, so the
+        # cursor must span all of this event's lines (not reset per line).
+        karaoke_cursor = [int(ev["prog_start_ms"])]
         line_texts = [
-            _line_text(line, ev["prog_start_ms"], style["colour"], ev["anim"]) for line in ev["lines"]
+            _line_text(line, ev["prog_start_ms"], style["colour"], ev["anim"], karaoke_cursor)
+            for line in ev["lines"]
         ]
         text = tags + "\\N".join(line_texts)
         start, end = _ms_to_ass_time(ev["prog_start_ms"]), _ms_to_ass_time(ev["prog_end_ms"])
