@@ -11,6 +11,7 @@ import { useTransport, FRAME_MS } from "@/stores/transport-store";
 import { useProgramPlayer } from "./use-program-player";
 import { subscribeCubeLoaded } from "./grade-cube-client";
 import { RenderBar } from "@/components/render-bar";
+import { CaptionOverlay } from "./caption-overlay";
 
 interface CompositePreviewProps {
   token: string | undefined;
@@ -338,6 +339,7 @@ export const CompositePreview = forwardRef<HTMLDivElement, CompositePreviewProps
       >
         {/* The program player appends its pooled <video> elements here. */}
         <div ref={player.attachContainer} className="absolute inset-0 h-full w-full" />
+        {hasTimeline && <CaptionOverlay />}
         {!hasTimeline && (
           <div
             className="absolute inset-0 flex h-full w-full items-center justify-center text-xs"

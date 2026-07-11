@@ -713,17 +713,108 @@ export interface ResolvedAudioLayer {
   op_id?: string | null;
 }
 
+// --- Captions (captions.plan.md SS3/SS5) -----------------------------------
+
+export type CaptionAnimationPreset = "fade" | "pop" | "karaoke" | "slide";
+export type CaptionEmphasisMode = "semantic" | "loudness" | "none";
+export type CaptionPlacementAnchor = "lower_third" | "center" | "top" | "dynamic" | "speaker";
+export type CaptionColourSource = "white" | "black_box" | "match_grade" | "palette_accent" | "high_contrast";
+
+export interface CaptionFont {
+  font_id: string;
+  family: string;
+  weight: number;
+  fallback_stack: string;
+  case: "as-is" | "upper";
+  tracking: number;
+  max_lines: number;
+  max_chars_per_line: number;
+}
+
+export interface CaptionAnimation {
+  preset: CaptionAnimationPreset;
+  intensity: number;
+  beat_sync: boolean;
+  emphasis: CaptionEmphasisMode;
+}
+
+export interface CaptionPlacement {
+  anchor: CaptionPlacementAnchor;
+  safe_area: boolean;
+  stability_ms: number;
+}
+
+export interface CaptionColour {
+  source: CaptionColourSource;
+  fill: string;
+  emphasis_fill: string;
+  outline: string;
+  shadow: string;
+  box?: string | null;
+  /** Set once a style has been contrast-resolved against real footage
+   * (resolved.captions / the suggestions endpoint's tiles) -- absent on the
+   * raw, footage-independent Standards catalog entries. */
+  strong_outline?: boolean;
+}
+
+/** A caption style bundle -- the thing one gallery tile represents (SS3). */
+export interface CaptionStyle {
+  style_id: string;
+  label: string;
+  tier: "suggested" | "standard";
+  font: CaptionFont;
+  animation: CaptionAnimation;
+  placement: CaptionPlacement;
+  colour: CaptionColour;
+  rationale?: string | null;
+}
+
+/** Persisted selection on the document (SS3), mirrors `look`'s shape. */
+export interface EditCaptions {
+  style_id?: string | null;
+  enabled: boolean;
+  /** A full style snapshot at selection time, so a Suggested pick stays
+   * resolvable even after the ephemeral suggestion cache regenerates. */
+  base_style?: CaptionStyle | null;
+  overrides?: Record<string, unknown> | null;
+}
+
+export interface CaptionWord {
+  text: string;
+  t_in_ms: number;
+  t_out_ms: number;
+  emphasized: boolean;
+}
+
+export interface CaptionLine {
+  words: CaptionWord[];
+}
+
+/** One resolved caption "card" -- `resolved.captions[]`, the ONE track both
+ * the preview overlay and the ASS export read (SS3/SS4). */
+export interface ResolvedCaptionEvent {
+  prog_start_ms: number;
+  prog_end_ms: number;
+  lines: CaptionLine[];
+  box: [number, number, number, number];
+  style_ref: string;
+  style: CaptionStyle;
+  anim: CaptionAnimation;
+}
+
 export interface ResolvedTimeline {
   duration_ms: number;
   video_layers: ResolvedVideoLayer[];
   audio_layers: ResolvedAudioLayer[];
   aspect?: EditAspect;
+  captions?: ResolvedCaptionEvent[];
 }
 
 export interface EditDocument {
   brief?: EditBrief;
   format?: EditFormat;
   look?: EditLook;
+  captions?: EditCaptions;
   spine?: EditSpine | null;
   operations?: EditOperation[];
   layout_regions?: LayoutRegion[];
@@ -841,6 +932,7 @@ export interface SaveEditBody {
   summary?: string;
   notes?: string[];
   look?: EditLook;
+  captions?: EditCaptions;
 }
 
 export function saveEditDocument(id: string, body: SaveEditBody, token: string) {
@@ -860,6 +952,48 @@ export interface GradePresetSummary {
 
 export function getGradePresets(token: string) {
   return request<GradePresetSummary[]>("/api/grade/presets", { token });
+}
+
+// --- Captions (captions.plan.md SS13) ---
+
+export interface CaptionFontSummary {
+  font_id: string;
+  family: string;
+  weight: number;
+  archetype: string;
+  fallback_stack: string;
+  license: string;
+}
+
+export interface CaptionCatalog {
+  fonts: CaptionFontSummary[];
+  standards: CaptionStyle[];
+}
+
+export function getCaptionCatalog(token: string) {
+  return request<CaptionCatalog>("/api/captions/catalog", { token });
+}
+
+export interface CaptionRepresentativeFrame {
+  url: string | null;
+  hero_ts_ms: number | null;
+  caption_zone: [number, number, number, number] | null;
+  subject_box: [number, number, number, number] | null;
+}
+
+export interface CaptionSuggestionsResponse {
+  suggestions: CaptionStyle[];
+  representative_frame: CaptionRepresentativeFrame | null;
+  sample_words: CaptionWord[];
+}
+
+export function getCaptionSuggestions(
+  threadId: string, token: string, opts: { version?: number; reshuffleSeed?: number } = {}
+) {
+  const params = new URLSearchParams({ thread_id: threadId });
+  if (opts.version != null) params.set("version", String(opts.version));
+  if (opts.reshuffleSeed != null) params.set("reshuffle_seed", String(opts.reshuffleSeed));
+  return request<CaptionSuggestionsResponse>(`/api/captions/suggestions?${params}`, { token });
 }
 
 // --- Render / export ---

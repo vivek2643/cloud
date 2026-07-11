@@ -8,7 +8,7 @@
  * version re-seeds the baseline.
  */
 import { create } from "zustand";
-import type { EditAspect, EditDocument, EditLook, EditOperation, EditSegment, LayoutRegion, ResolvedGrade } from "@/lib/api";
+import type { EditAspect, EditCaptions, EditDocument, EditLook, EditOperation, EditSegment, LayoutRegion, ResolvedCaptionEvent, ResolvedGrade } from "@/lib/api";
 import type { Durations } from "@/lib/resolve-timeline";
 
 function docAspect(doc: EditDocument | null): EditAspect {
@@ -30,6 +30,14 @@ function gradesFromDoc(doc: EditDocument | null): Record<string, ResolvedGrade> 
     if (l.grade) out[l.layer_id] = l.grade;
   }
   return out;
+}
+
+/** Server-baked resolved caption track (captions.plan.md SS3/SS4) -- same
+ * "the backend already computed this, the preview just overlays it" pattern
+ * as `gradesFromDoc`. Empty (not missing) when captions are off/unselected,
+ * so the overlay never has stale events to fall back to. */
+function captionsFromDoc(doc: EditDocument | null): ResolvedCaptionEvent[] {
+  return doc?.resolved?.captions ?? [];
 }
 
 const MIN_SEG_MS = 200;
@@ -92,6 +100,13 @@ interface EditDocState {
    * identity/override, never the look/correct/match/arc layers. Refreshed on
    * every seed/commit (i.e. after each save round-trip). */
   resolvedGrades: Record<string, ResolvedGrade>;
+  /** Caption style selection (captions.plan.md SS3): unset/`enabled:false`
+   * means the edit is not captioned (SS1.3 "no auto-apply"). */
+  captions: EditCaptions | undefined;
+  /** Server-baked resolved caption track (SS3/SS4) -- the overlay reads
+   * this directly, same "backend already computed it" contract as
+   * `resolvedGrades`. Refreshed on every seed/commit. */
+  resolvedCaptions: ResolvedCaptionEvent[];
   /** Multi-select: `ProjectClip.id`-shaped ("seg:<seg_id>" | "op:<op_id>"). */
   selectedIds: string[];
 
@@ -108,12 +123,18 @@ interface EditDocState {
    * silently wipe a user's pending cuts or their undo history (which the full
    * `commit` does, since it re-seeds working state from the server doc). */
   commitLook: (version: number, doc: EditDocument) => void;
+  /** Commit a CAPTIONS-ONLY save, same narrow "don't touch working
+   * timeline/undo" contract as `commitLook`. */
+  commitCaptions: (version: number, doc: EditDocument) => void;
   revert: () => void;
   setWorking: (timeline: EditSegment[], operations: EditOperation[]) => void;
   /** Set the sequence-level look -- caller is responsible for persisting via
    * saveEditDocument's `look` field (this only updates local working state,
    * same "instant local, explicit save" contract as everything else here). */
   setLook: (look: EditLook | undefined) => void;
+  /** Set the caption selection -- same "instant local, explicit save"
+   * contract as `setLook`. */
+  setCaptions: (captions: EditCaptions | undefined) => void;
   isDirty: () => boolean;
   setDurations: (d: Durations) => void;
   mergeDurations: (d: Durations) => void;
@@ -195,6 +216,8 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
   aspect: "landscape",
   look: undefined,
   resolvedGrades: {},
+  captions: undefined,
+  resolvedCaptions: [],
   selectedIds: [],
   past: [],
   future: [],
@@ -213,6 +236,8 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       aspect: docAspect(doc),
       look: doc?.look,
       resolvedGrades: gradesFromDoc(doc),
+      captions: doc?.captions,
+      resolvedCaptions: captionsFromDoc(doc),
       selectedIds: [],
       past: [],
       future: [],
@@ -231,6 +256,8 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       aspect: "landscape",
       look: undefined,
       resolvedGrades: {},
+      captions: undefined,
+      resolvedCaptions: [],
       selectedIds: [],
       past: [],
       future: [],
@@ -249,6 +276,8 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       aspect: docAspect(doc),
       look: doc.look,
       resolvedGrades: gradesFromDoc(doc),
+      captions: doc.captions,
+      resolvedCaptions: captionsFromDoc(doc),
       past: [],
       future: [],
     });
@@ -265,7 +294,17 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       resolvedGrades: gradesFromDoc(doc),
     }),
 
+  commitCaptions: (version, doc) =>
+    set({
+      baseVersion: version,
+      baselineTimeline: doc.timeline ?? [],
+      baselineOperations: doc.operations ?? [],
+      captions: doc.captions,
+      resolvedCaptions: captionsFromDoc(doc),
+    }),
+
   setLook: (look) => set({ look }),
+  setCaptions: (captions) => set({ captions }),
 
   revert: () =>
     set((st) => ({
