@@ -43,6 +43,15 @@ def _durations(file_ids: List[str]) -> Dict[str, int]:
     return {r[0]: int(float(r[1]) * 1000) for r in rows}
 
 
+def _resolve_captions(document: Dict[str, Any], resolved: Dict[str, Any]) -> List[Dict[str, Any]]:
+    try:
+        from app.services.l3.captions.resolver import resolve_captions_for_document
+        return resolve_captions_for_document(document, resolved, aspect=str(resolved.get("aspect") or "landscape"))
+    except Exception:
+        logger.exception("resolve_document: captions resolve failed (continuing without captions)")
+        return []
+
+
 def resolve_document(document: Dict[str, Any]) -> Dict[str, Any]:
     """The resolved layer set for a document. Prefer the snapshot the agent
     persisted; otherwise recompute deterministically from spine + operations."""
@@ -51,6 +60,11 @@ def resolve_document(document: Dict[str, Any]) -> Dict[str, Any]:
         # Snapshots predating the format field carry no aspect; backfill it from
         # the document so the render uses the declared delivery shape.
         res.setdefault("aspect", layers.aspect_of(document))
+        # Snapshots predating the captions feature (or a captions-off save)
+        # carry no captions key -- backfill so an old render still reflects
+        # the CURRENT captions selection (captions.plan.md SS4).
+        if "captions" not in res:
+            res["captions"] = _resolve_captions(document, res)
         return res
     fids = list({s["file_id"] for s in (document.get("timeline") or [])})
     color_stats: Dict[str, dict] = {}
@@ -59,7 +73,9 @@ def resolve_document(document: Dict[str, Any]) -> Dict[str, Any]:
         color_stats = fetch_color_stats(fids)
     except Exception:
         logger.exception("resolve_document: color_stats lookup failed (continuing)")
-    return layers.resolve(document, _durations(fids), color_stats).to_dict()
+    resolved = layers.resolve(document, _durations(fids), color_stats).to_dict()
+    resolved["captions"] = _resolve_captions(document, resolved)
+    return resolved
 
 
 def _file_lookup(file_ids: List[str]) -> Dict[str, compositor.FileEntry]:

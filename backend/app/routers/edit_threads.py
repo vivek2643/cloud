@@ -54,6 +54,10 @@ class EditDocumentBody(BaseModel):
     # match_strength, arc_intensity}. Optional so a plain timeline-edit save
     # never has to know/care about grading.
     look: Optional[dict] = None
+    # Caption style selection (captions.plan.md SS3): {style_id, enabled,
+    # base_style, overrides}. Optional + starts unset so a document is never
+    # captioned until the user explicitly picks a style (SS1.3 "no auto-apply").
+    captions: Optional[dict] = None
 
 
 _ALLOWED_OP_TYPES = {"place_video", "place_audio", "split_edit", "level"}
@@ -191,6 +195,8 @@ def put_document(
         new_doc["notes"] = body.notes
     if body.look is not None:
         new_doc["look"] = body.look
+    if body.captions is not None:
+        new_doc["captions"] = body.captions
     new_doc.pop("resolved", None)  # force a fresh recompute below
     new_doc["resolved"] = resolve_document(new_doc)
 

@@ -31,6 +31,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from app.services.l3.captions.ass_export import captions_to_ass
 from app.services.l3.grade.cache import ensure_cube_file
 from app.services.l3.grade.cdl import is_identity, Grade
 from app.services.l3.grade.softlocal import vignette_ffmpeg_filter
@@ -41,6 +42,13 @@ logger = logging.getLogger(__name__)
 
 CACHE_ROOT = os.environ.get("EDSO_RENDER_CACHE", "/tmp/edso_render_cache")
 RENDER_PREFIX = "renders"
+# Self-hosted caption font binaries for the ASS burn's `fontsdir=` (captions.
+# plan.md SS12/SS13). Mirrors `frontend/public/fonts/`'s own "path exists,
+# files dropped in later" precedent -- an empty/missing dir is NOT an error,
+# libass/fontconfig just falls back to whatever system font matches the
+# family name (same graceful degrade the frontend's own @font-face already
+# has). See captions/styles.py's module docstring.
+CAPTION_FONTS_DIR = os.environ.get("EDSO_CAPTION_FONTS_DIR", "/tmp/edso_caption_fonts")
 
 # `long_edge` is the quality tier; the actual W x H is derived from the edit's
 # delivery aspect so the SAME preset renders landscape, portrait, or square.
@@ -156,10 +164,11 @@ def render_resolved(
     )
 
     with tempfile.TemporaryDirectory(prefix="edso_render_") as tmp:
+        ass_path = _write_ass_file(resolved.get("captions") or [], cfg, tmp)
         if pure_spine and video:
-            out_key = _render_spine_concat(video, cfg, file_lookup, tmp, report)
+            out_key = _render_spine_concat(video, cfg, file_lookup, tmp, report, ass_path=ass_path)
         else:
-            out_key = _render_layers(video, audio, total_ms, cfg, file_lookup, tmp, report)
+            out_key = _render_layers(video, audio, total_ms, cfg, file_lookup, tmp, report, ass_path=ass_path)
     report(100, "done")
     return out_key, total_ms
 
@@ -194,6 +203,7 @@ def _render_spine_concat(
     file_lookup: Dict[str, FileEntry],
     tmp: str,
     report: Callable[[int, str], None],
+    ass_path: Optional[str] = None,
 ) -> str:
     report(4, "starting (spine)")
     src_cache: Dict[str, str] = {}
@@ -223,6 +233,9 @@ def _render_spine_concat(
     report(82, "concatenating")
     out_local = os.path.join(tmp, "out.mp4")
     _concat_segments(segments, out_local, cfg)
+    if ass_path:
+        report(88, "burning captions")
+        out_local = _burn_captions(out_local, ass_path, cfg)
     report(92, "uploading")
     out_key = f"{RENDER_PREFIX}/{uuid.uuid4().hex}.mp4"
     _upload_to_r2(out_local, out_key, "video/mp4")
@@ -366,6 +379,48 @@ def _lut3d_arg(cube_path: str) -> str:
     return f"lut3d=file='{escaped}':interp=trilinear"
 
 
+def _filter_path_arg(path: str) -> str:
+    """Same escaping `_lut3d_arg` uses, generalized -- colons/backslashes are
+    filtergraph metacharacters regardless of which filter's `file=`/
+    `fontsdir=` argument they're quoted into."""
+    return path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def _write_ass_file(captions: List[Dict[str, Any]], cfg: Dict[str, Any], tmp: str) -> Optional[str]:
+    """`resolved.captions` -> a local `.ass` file sized to this render's
+    canvas, or None when there's nothing to burn (SS1.3 "no auto-apply" --
+    an empty/absent captions track must add zero cost to a render, not even
+    an extra ffmpeg pass)."""
+    if not captions:
+        return None
+    ass_text = captions_to_ass(captions, canvas_w=cfg["width"], canvas_h=cfg["height"])
+    path = os.path.join(tmp, "captions.ass")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(ass_text)
+    return path
+
+
+def _burn_captions(video_path: str, ass_path: str, cfg: Dict[str, Any]) -> str:
+    """Burn `ass_path` onto `video_path` via libass, returning the new local
+    path. A separate, isolated final pass (not folded into the segment-cache
+    or filter_complex graph above) -- captions are a SEQUENCE-level overlay
+    spanning cut boundaries, not a per-segment/per-layer effect, so they
+    can't share those caches; keeping the burn as its own pass also means
+    the grading/compositing paths above are untouched when captions are off
+    (the common case pre-selection, SS1.3)."""
+    out_path = video_path.replace(".mp4", ".cap.mp4")
+    vf = f"ass='{_filter_path_arg(ass_path)}'"
+    if os.path.isdir(CAPTION_FONTS_DIR) and os.listdir(CAPTION_FONTS_DIR):
+        vf += f":fontsdir='{_filter_path_arg(CAPTION_FONTS_DIR)}'"
+    cmd = [
+        "ffmpeg", "-y", "-i", video_path, "-vf", vf,
+        "-c:v", cfg["video_codec"], "-preset", cfg["video_preset"], "-crf", str(cfg["video_crf"]),
+        "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", out_path,
+    ]
+    _run_ffmpeg(cmd, out_path, "caption burn")
+    return out_path
+
+
 def _transform_vf(
     cfg: Dict[str, Any],
     transform: Optional[Dict[str, Any]] = None,
@@ -507,6 +562,7 @@ def _render_layers(
     file_lookup: Dict[str, FileEntry],
     tmp: str,
     report: Callable[[int, str], None],
+    ass_path: Optional[str] = None,
 ) -> str:
     report(6, "preparing sources")
     src_cache: Dict[str, str] = {}
@@ -611,6 +667,9 @@ def _render_layers(
     cmd += ["-movflags", "+faststart", "-t", f"{total_s:.3f}", out_local]
 
     _run_ffmpeg(cmd, out_local, "filter_complex composite")
+    if ass_path:
+        report(88, "burning captions")
+        out_local = _burn_captions(out_local, ass_path, cfg)
     report(92, "uploading")
     out_key = f"{RENDER_PREFIX}/{uuid.uuid4().hex}.mp4"
     _upload_to_r2(out_local, out_key, "video/mp4")
