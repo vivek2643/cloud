@@ -45,3 +45,6 @@ Assets/
 
 # Separate trail — not part of this app
 website/
+
+# Remotion demo video — local only, not part of the app
+demo/

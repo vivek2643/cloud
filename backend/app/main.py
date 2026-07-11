@@ -9,7 +9,7 @@ from app.routers import folders, files, upload, logs as logs_router, edit_thread
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="AeroDrive API", version="0.1.0")
+app = FastAPI(title="Edso API", version="0.1.0")
 
 # Permissive CORS in dev so the browser can reach us from localhost / 127.0.0.1
 # / the LAN IP that Next.js prints on startup. The regex matches:

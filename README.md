@@ -1,4 +1,4 @@
-# AeroDrive
+# Edso
 
 AI-powered video drive and collaboration hub for the creator economy.
 

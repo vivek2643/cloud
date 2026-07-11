@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "AeroDrive",
+  title: "Edso",
   description: "AI-powered video drive for creators",
 };
 

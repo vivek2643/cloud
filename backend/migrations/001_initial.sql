@@ -1,5 +1,5 @@
 -- =============================================
--- AeroDrive Phase 0: Drive Schema
+-- Edso Phase 0: Drive Schema
 -- Run this in Supabase SQL Editor
 -- =============================================
 
