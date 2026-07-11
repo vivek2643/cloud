@@ -20,8 +20,13 @@ from typing import Any, Dict, Tuple
 from app.services.l3.grade.cdl import Grade
 
 DEFAULT_MATCH_STRENGTH = 0.6
-WB_MULTIPLIER_CLAMP = 1.6
-OFFSET_CLAMP = 0.3
+WB_MULTIPLIER_CLAMP = 1.5
+# A per-channel offset this large single-handedly crushes/floods a third of the
+# tonal range; 0.3 was only ever "safe" for a standalone transfer. Now that the
+# transfer composes on top of correct+match (solved against the corrected image,
+# see resolver._corrected_source_stats) a tight bound keeps the COMPOSED grade
+# in never-worse territory instead of stacking two big offsets.
+OFFSET_CLAMP = 0.15
 
 
 def compute_image_stats(rgb_pixels: Any) -> Dict[str, Any]:

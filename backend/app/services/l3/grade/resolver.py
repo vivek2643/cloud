@@ -51,6 +51,27 @@ from app.services.l3.grade.softlocal import solve_vignette
 DEFAULT_WORKING_SPACE = "rec709"
 
 
+def _corrected_source_stats(
+    color_stats: Optional[Dict[str, Any]], stack: Grade
+) -> Optional[Dict[str, Any]]:
+    """Project a file's measured `rgb_mean`/`rgb_std` through the correct+match
+    `stack` so the Look layer solves against the image AS CORRECTED, not the raw
+    source. Without this, a reference transfer computes its slope/offset from the
+    raw means while the correct layer has already stretched exposure -- the two
+    stack and DOUBLE-apply, crushing shadows / blowing highlights.
+
+    correct+match only ever produce slope/offset (power=1, sat=1 by
+    construction), so mean' = clamp(mean*slope+offset) and std' = std*slope is
+    exact for that stack, not an approximation."""
+    if not color_stats:
+        return None
+    mean = color_stats.get("rgb_mean") or [0.5, 0.5, 0.5]
+    std = color_stats.get("rgb_std") or [0.2, 0.2, 0.2]
+    corr_mean = [min(1.0, max(0.0, mean[c] * stack.slope[c] + stack.offset[c])) for c in range(3)]
+    corr_std = [max(0.0, std[c] * stack.slope[c]) for c in range(3)]
+    return {**color_stats, "rgb_mean": corr_mean, "rgb_std": corr_std}
+
+
 def _solve_look(sequence_look: Optional[Dict[str, Any]], color_stats: Optional[Dict[str, Any]]) -> Grade:
     if not sequence_look:
         return Grade()
@@ -94,7 +115,10 @@ def resolve_clip_grade(
     stack = solve_correct_grade(color_stats, already_graded=already_graded)
     if match_delta is not None:
         stack = compose(stack, match_delta, 1.0)
-    stack = compose(stack, _solve_look(sequence_look, color_stats), 1.0)
+    # The Look layer sits on top of correct+match, so it must be solved against
+    # the ALREADY-CORRECTED image (see _corrected_source_stats). Passing the raw
+    # color_stats here is what made a reference drop double-stretch the exposure.
+    stack = compose(stack, _solve_look(sequence_look, _corrected_source_stats(color_stats, stack)), 1.0)
     arc_intensity = (sequence_look or {}).get("arc_intensity")
     stack = compose(stack, solve_arc_grade(item.get("arc_intent"), arc_intensity), 1.0)
 

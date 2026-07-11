@@ -432,6 +432,7 @@ export function useProgramPlayer(
     const pool = poolRef.current;
     if (pool.length === 0) return;
     const cs = clipsRef.current;
+    const freshById = new Map(cs.map((c) => [c.id, c] as const));
 
     const isActive = (c: Clip) => c.progStart <= t && t < c.progEnd;
     const isPrewarm = (c: Clip) => playing && t < c.progStart && c.progStart <= t + PREWARM_MS;
@@ -465,13 +466,34 @@ export function useProgramPlayer(
     }
 
     for (const slot of pool) {
-      const clip = slot.clip;
+      let clip = slot.clip;
       if (!clip || !neededIds.has(clip.id)) {
         if (!slot.el.paused) slot.el.pause();
         slot.gain.gain.setTargetAtTime(0, ctx.currentTime, GAIN_TC);
         slot.el.style.opacity = "0";
         if (slot.lutRenderer) slot.lutRenderer.canvas.style.opacity = "0";
         continue;
+      }
+      // Refresh the slot to the LATEST resolved clip for this id. Slots are keyed
+      // by a grade-independent id (`c_<layer_id>`), so a clip already loaded in a
+      // slot is never re-`assignClip`d on a pure property change -- without this
+      // refresh its grade/gain/transform/trim would stay pinned to the values
+      // captured at first assignment (the LUT in particular freezes on the first
+      // look). Grade/gain/transform/dest are read fresh below from `slot.clip`; only
+      // a source file or position change needs a reseek (grade changes must not).
+      const fresh = freshById.get(clip.id);
+      if (fresh && fresh !== clip) {
+        const fileChanged = fresh.fileId !== clip.fileId;
+        const posChanged = fresh.srcInMs !== clip.srcInMs || fresh.progStart !== clip.progStart;
+        slot.clip = fresh;
+        clip = fresh;
+        if (fileChanged) {
+          const u = urlsRef.current[fresh.fileId];
+          if (u) slot.el.src = u;
+          slot.needsSeek = true;
+        } else if (posChanged) {
+          slot.needsSeek = true;
+        }
       }
       const url = urlsRef.current[clip.fileId];
       if (url && slot.el.src !== url) slot.el.src = url;

@@ -102,6 +102,12 @@ interface EditDocState {
   clear: () => void;
   /** Replace baseline after a successful save/agent write (keeps working == baseline). */
   commit: (version: number, doc: EditDocument) => void;
+  /** Commit a LOOK-ONLY save (color grade): refresh the authoritative version,
+   * look, and server-baked grades WITHOUT resetting the in-progress working
+   * timeline/operations or clearing the undo stack. A grade edit must not
+   * silently wipe a user's pending cuts or their undo history (which the full
+   * `commit` does, since it re-seeds working state from the server doc). */
+  commitLook: (version: number, doc: EditDocument) => void;
   revert: () => void;
   setWorking: (timeline: EditSegment[], operations: EditOperation[]) => void;
   /** Set the sequence-level look -- caller is responsible for persisting via
@@ -247,6 +253,17 @@ export const useEditDocStore = create<EditDocState>((set, get) => ({
       future: [],
     });
   },
+
+  commitLook: (version, doc) =>
+    set({
+      baseVersion: version,
+      // Baseline follows the persisted doc so isDirty stays honest, but WORKING
+      // timeline/operations and the undo stack are deliberately left untouched.
+      baselineTimeline: doc.timeline ?? [],
+      baselineOperations: doc.operations ?? [],
+      look: doc.look,
+      resolvedGrades: gradesFromDoc(doc),
+    }),
 
   setLook: (look) => set({ look }),
 

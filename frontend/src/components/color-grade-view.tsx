@@ -92,12 +92,9 @@ function Dial({ value, onChange, label }: { value: number; onChange: (v: number)
 
 export function ColorGradeView() {
   const threadId = useEditDocStore((s) => s.threadId);
-  const baseVersion = useEditDocStore((s) => s.baseVersion);
-  const timeline = useEditDocStore((s) => s.timeline);
-  const operations = useEditDocStore((s) => s.operations);
   const look = useEditDocStore((s) => s.look);
   const setLook = useEditDocStore((s) => s.setLook);
-  const wdCommit = useEditDocStore((s) => s.commit);
+  const wdCommitLook = useEditDocStore((s) => s.commitLook);
   const gradeBypass = useTimelineView((s) => s.gradeBypass);
   const toggleGradeBypass = useTimelineView((s) => s.toggleGradeBypass);
   const token = useAuthStore((s) => s.session?.access_token);
@@ -116,36 +113,76 @@ export function ColorGradeView() {
     getGradePresets(token).then(setPresets).catch(() => {});
   }, [token]);
 
-  const persistLook = useCallback(
-    async (next: EditLook | undefined) => {
-      if (!threadId || !token) return;
-      const prev = look;
-      setLook(next);
-      setSaving(true);
-      setError(null);
-      try {
-        const res = await saveEditDocument(
-          threadId,
-          { base_version: baseVersion, timeline, operations, look: next },
-          token
-        );
-        wdCommit(res.version, res.document);
-      } catch (e) {
-        setLook(prev);
-        setError(e instanceof Error ? e.message : "Could not save the grade.");
-      } finally {
-        setSaving(false);
+  // --- Look persistence -------------------------------------------------
+  // A look change (esp. a dragged dial) must apply to the dial INSTANTLY but
+  // persist at most once per gesture. Firing a save per tick raced many
+  // requests against the same stale base_version -> 409s -> reverts -> the
+  // dial jumped around. Here the local look updates immediately (never
+  // reverts), while a single serialized, debounced save runs against the LIVE
+  // head version read from the store at flush time (not a stale closure).
+  const pendingRef = useRef<EditLook | undefined>(undefined);
+  const savingRef = useRef(false);
+  const flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const flushLook = useCallback(async () => {
+    // One save at a time; the finally-block re-flushes if the user moved on.
+    if (savingRef.current) return;
+    const st = useEditDocStore.getState();
+    if (!st.threadId || !token) return;
+    const next = pendingRef.current;
+    savingRef.current = true;
+    setSaving(true);
+    setError(null);
+    try {
+      const res = await saveEditDocument(
+        st.threadId,
+        // LIVE head version + working state, so concurrent edits never send a
+        // stale base_version (the cause of the 409 storm).
+        { base_version: st.baseVersion, timeline: st.timeline, operations: st.operations, look: next },
+        token
+      );
+      wdCommitLook(res.version, res.document);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not save the grade.");
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+      // The user changed the look again while we were saving -> persist newest.
+      if (pendingRef.current !== next) void flushLook();
+    }
+  }, [token, wdCommitLook]);
+
+  const applyLook = useCallback(
+    (next: EditLook | undefined, immediate = false) => {
+      setLook(next); // instant local: the dial reflects input and never reverts
+      pendingRef.current = next;
+      if (flushTimer.current) clearTimeout(flushTimer.current);
+      if (immediate) {
+        void flushLook();
+      } else {
+        flushTimer.current = setTimeout(() => void flushLook(), 300);
       }
     },
-    [threadId, token, baseVersion, timeline, operations, look, setLook, wdCommit]
+    [setLook, flushLook]
+  );
+
+  // Persist a pending debounced change if the panel unmounts mid-gesture.
+  useEffect(
+    () => () => {
+      if (flushTimer.current) {
+        clearTimeout(flushTimer.current);
+        void flushLook();
+      }
+    },
+    [flushLook]
   );
 
   function selectPreset(presetId: string) {
-    void persistLook({ ...(look ?? {}), mode: "preset", preset_id: presetId, lut_ref: null });
+    applyLook({ ...(look ?? {}), mode: "preset", preset_id: presetId, lut_ref: null }, true);
   }
 
   function setArcIntensity(v: number) {
-    void persistLook({ ...(look ?? {}), arc_intensity: v });
+    applyLook({ ...(look ?? {}), arc_intensity: v });
   }
 
   function onReferenceFile(file: File) {
@@ -154,12 +191,15 @@ export function ColorGradeView() {
     img.onload = () => {
       const stats = computeImageStats(img);
       URL.revokeObjectURL(url);
-      void persistLook({
-        ...(look ?? {}),
-        mode: "reference",
-        reference_stats: stats,
-        match_strength: look?.match_strength ?? 0.6,
-      });
+      applyLook(
+        {
+          ...(look ?? {}),
+          mode: "reference",
+          reference_stats: stats,
+          match_strength: look?.match_strength ?? 0.6,
+        },
+        true
+      );
     };
     img.onerror = () => {
       URL.revokeObjectURL(url);
@@ -184,7 +224,7 @@ export function ColorGradeView() {
         throw new Error(body.detail || `Upload failed (${res.status})`);
       }
       const { lut_ref } = await res.json();
-      await persistLook({ ...(look ?? {}), mode: "lut", lut_ref });
+      applyLook({ ...(look ?? {}), mode: "lut", lut_ref }, true);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not upload that LUT.");
     } finally {
@@ -309,7 +349,7 @@ export function ColorGradeView() {
             <div className="mt-2">
               <Dial
                 value={look.match_strength ?? 0.6}
-                onChange={(v) => void persistLook({ ...look, match_strength: v })}
+                onChange={(v) => applyLook({ ...look, match_strength: v })}
                 label="Match strength"
               />
             </div>
