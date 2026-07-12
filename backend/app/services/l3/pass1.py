@@ -563,33 +563,37 @@ def _contiguous_atom_runs(lattice: Lattice, atom_ids: List[int]) -> List[List[in
 
 
 # --------------------------------------------------------------------------
-# Synced outlooks (audio_sync.plan.md SS7.4/7.6). A sync group's angles are the
-# SAME recorded moment from different cameras; sync already knows -- exactly,
-# from the cross-correlation offsets -- which files are simultaneous and how
-# they line up. So the outlook grouping is CODE's to produce, not the model's
-# to guess (it consistently fails to, and the SYNC hint tells it not to try).
+# Outlook grouping. An OUTLOOK group's members are alternate cameras of the
+# SAME moment (the user declared them). The offset alignment already knows --
+# from the cross-correlation -- how they line up, so the outlook grouping is
+# CODE's to produce, not the model's to guess (it consistently fails to, and
+# the outlook hint tells it not to try).
 #
-#   replicate_synced_speech: BEFORE enforcement, mirror the authoritative
-#     angle's speech beats onto every high-confidence angle. Every synced angle
-#     already carries the byte-identical (re-based) authoritative word list
+#   replicate_outlook_speech: BEFORE enforcement, mirror the authoritative
+#     angle's speech beats onto every angle in the group. Every angle already
+#     carries the byte-identical (re-based) authoritative word list
 #     (lattice_merge.authoritative_view), so a beat's word-INDEX span transfers
-#     verbatim. Enforcement then runs per angle with synced=True (a shot
-#     boundary never splits a beat; interior atoms are absorbed), yielding
-#     byte-identical final speech cuts across the group.
-#   group_synced_outlooks: AFTER enforcement, link those aligned per-angle cuts
-#     into take_candidates -- one per beat. Pass 2a resolves each as an OUTLOOK
+#     verbatim regardless of alignment confidence. Enforcement then runs per
+#     angle with synced=True (a shot boundary never splits a beat; interior
+#     atoms are absorbed), yielding byte-identical final speech cuts across the
+#     group.
+#   group_outlooks: AFTER enforcement, link those aligned per-angle cuts into
+#     take_candidates -- one per beat. Pass 2a resolves each as an OUTLOOK
 #     (same words, different setting -> NO crowned winner), which is exactly the
 #     structure footage_map/observe's alt-PIC angle switching consumes.
 #
-# Everything is gated on high confidence (lattice_merge.high_conf_groups):
-# replicating onto a badly-aligned angle would fabricate a genuinely misaligned
-# outlook, so a low-confidence member is left as an independent clip instead.
+# ALL declared members are grouped (confidence is metadata, never an
+# exclusion): a member is an outlook of the others by definition, and demoting
+# a low-confidence one to an independent clip is exactly what let the model
+# mis-group it as a TAKE before. Takes and outlooks are distinct -- a declared
+# group's members are never takes of each other (see the take-remap filter in
+# enforce_lattice_partition).
 # --------------------------------------------------------------------------
 
 def _canonical_beats(
     owner_fid: str, cuts_by_file: Dict[str, List[SpeechCut]], owner_lattice: Lattice,
 ) -> List[Tuple[Tuple[int, int], str, List[str], "str | None"]]:
-    """The full, gap-free beat set for a synced group, defined ONCE on
+    """The full, gap-free beat set for an outlook group, defined ONCE on
     ``owner_fid`` (the authoritative angle) so every angle can mirror the same
     spans. The owner's model speech cuts are kept verbatim; any transcript word
     they leave uncovered is recovered EXACTLY as ``enforce_lattice_partition``'s
@@ -621,66 +625,79 @@ def _canonical_beats(
     return beats
 
 
-def replicate_synced_speech(
+def replicate_outlook_speech(
     output: Pass1Output, lattices: Dict[str, Lattice],
-    groups_hi: Dict[str, Dict[str, Any]],
+    groups: Dict[str, Dict[str, Any]],
 ) -> Pass1Output:
-    """Mirror each synced group's authoritative-angle speech beats onto every
-    high-confidence angle, BEFORE ``enforce_lattice_partition``. Each angle ends
-    up with byte-identical word spans, so enforcement -- run per angle with
+    """Mirror each outlook group's authoritative-angle speech beats onto EVERY
+    angle in the group, BEFORE ``enforce_lattice_partition``. Each angle ends up
+    with byte-identical word spans, so enforcement -- run per angle with
     ``synced=True`` -- yields identical final speech cuts across the group,
-    ready to link as outlooks (``group_synced_outlooks``). Angles NOT in a
-    high-confidence group are untouched (their own model cuts + normal
-    coverage-fill stand)."""
-    if not groups_hi:
+    ready to link as outlooks (``group_outlooks``). Angles NOT in a group are
+    untouched (their own model cuts + normal coverage-fill stand)."""
+    if not groups:
         return output
     cuts_by_file: Dict[str, List[SpeechCut]] = {}
     for sc in output.speech_cuts:
         cuts_by_file.setdefault(sc.file_id, []).append(sc)
     handled: Set[str] = set()
     replicas: List[SpeechCut] = []
-    for grp in groups_hi.values():
-        hi = sorted(f for f in grp["members"] if f in lattices and lattices[f].words)
-        if len(hi) < 2:
+    for grp in groups.values():
+        angles = sorted(f for f in grp["members"] if f in lattices and lattices[f].words)
+        if len(angles) < 2:
             continue
         auth = grp["auth"]
-        owner = auth if (auth in hi and cuts_by_file.get(auth)) else max(
-            hi, key=lambda f: len(cuts_by_file.get(f, [])))
+        owner = auth if (auth in angles and cuts_by_file.get(auth)) else max(
+            angles, key=lambda f: len(cuts_by_file.get(f, [])))
         beats = _canonical_beats(owner, cuts_by_file, lattices[owner])
         if not beats:
             continue
-        for f in hi:
-            handled.add(f)
+        for f in angles:
+            # This angle's footage-clipped authoritative words (lattice_merge.
+            # authoritative_view): a shorter/later-starting angle holds only a
+            # prefix of the owner's words. Indices are shared with the owner up
+            # to that prefix, so a beat is mirrored by indexing straight into
+            # this angle's words -- clamped to the last word it actually has.
+            nw = len(lattices[f].words)
+            emitted = 0
             for span, label, spk, beat_id in beats:
-                replicas.append(SpeechCut(file_id=f, word_span=span, label=label,
-                                          speaker_ids=list(spk), beat_id=beat_id))
+                a, b = span
+                if a >= nw:
+                    continue  # this angle's footage ends before the beat starts
+                replicas.append(SpeechCut(file_id=f, word_span=(a, min(b, nw - 1)),
+                                          label=label, speaker_ids=list(spk), beat_id=beat_id))
+                emitted += 1
+            # Only take over an angle we actually placed beats on; an angle that
+            # overlaps none of the owner's beats keeps its own model cuts.
+            if emitted:
+                handled.add(f)
     if not handled:
         return output
     kept = [sc for sc in output.speech_cuts if sc.file_id not in handled]
     return output.model_copy(update={"speech_cuts": kept + replicas})
 
 
-def group_synced_outlooks(
-    output: Pass1Output, groups_hi: Dict[str, Dict[str, Any]],
+def group_outlooks(
+    output: Pass1Output, groups: Dict[str, Dict[str, Any]],
 ) -> Pass1Output:
-    """Link the (now enforcement-aligned) speech cuts of each synced group's
-    high-confidence angles into take_candidates -- one per beat, its members the
+    """Link the (now enforcement-aligned) speech cuts of each outlook group's
+    angles into take_candidates -- one per beat, its members the
     identical-word-span cut on each angle. Runs AFTER
     ``enforce_lattice_partition`` (so members reference final cut spans exactly,
     needing none of enforce's remap/same-line repair) and BEFORE pass 2a (which
     resolves each as an OUTLOOK from the pixels -> no crowned winner)."""
-    if not groups_hi:
+    if not groups:
         return output
     spans_by_file: Dict[str, Set[Tuple[int, int]]] = {}
     for sc in output.speech_cuts:
         spans_by_file.setdefault(sc.file_id, set()).add(tuple(sc.word_span))
     new_takes: List[TakeCandidate] = []
-    for gid, grp in groups_hi.items():
-        hi = sorted(f for f in grp["members"] if f in spans_by_file)
-        if len(hi) < 2:
+    for gid, grp in groups.items():
+        angles = sorted(f for f in grp["members"] if f in spans_by_file)
+        if len(angles) < 2:
             continue
         span_members: Dict[Tuple[int, int], List[str]] = {}
-        for f in hi:
+        for f in angles:
             for span in spans_by_file[f]:
                 span_members.setdefault(span, []).append(f)
         for span in sorted(span_members):
@@ -689,14 +706,15 @@ def group_synced_outlooks(
                 continue
             members = [TakeMember(file_id=f, word_span=span) for f in sorted(files)]
             new_takes.append(TakeCandidate(
-                group_id=f"sync:{gid[:8]}:{span[0]}-{span[1]}", members=members))
+                group_id=f"outlook:{gid[:8]}:{span[0]}-{span[1]}", members=members))
     if not new_takes:
         return output
     return output.model_copy(update={"take_candidates": output.take_candidates + new_takes})
 
 
 def enforce_lattice_partition(
-    output: Pass1Output, lattices: Dict[str, Lattice], synced_file_ids: "set | None" = None,
+    output: Pass1Output, lattices: Dict[str, Lattice], outlook_file_ids: "set | None" = None,
+    outlook_group_of: "dict | None" = None,
 ) -> Pass1Output:
     """Deterministically repair pass 1's grouping against the lattice, and
     guarantee TOTAL COVERAGE -- the load-bearing rule of deterministic-keep
@@ -705,11 +723,15 @@ def enforce_lattice_partition(
     Anything it leaves out of every group is surfaced as a recovered candidate;
     the ONLY way something disappears is an explicit, recoverable junk label.
 
-    ``synced_file_ids`` (audio_sync.plan.md SS7.6): file_ids belonging to a
-    synced multicam group, where a video shot boundary must NOT block an
-    audio weld (see `_gap_seam`'s ``synced`` param). None/empty -> identical
-    to today's behavior for every file (the no-multicam-regression guarantee,
-    SS2/SS15's last checklist item).
+    ``outlook_file_ids``: file_ids belonging to an OUTLOOK group (alternate
+    cameras of one moment), where a video shot boundary must NOT block an audio
+    weld (see `_gap_seam`'s ``synced`` param). None/empty -> identical to
+    today's behavior for every file (the no-regression guarantee).
+
+    ``outlook_group_of`` (``{file_id: group_id}``): used to DROP any model
+    take-candidate whose members all live in one outlook group -- those clips
+    are alternate angles (outlooks), never retakes of each other, so code owns
+    their grouping (``group_outlooks``) and the model's take verdict is void.
 
       1. Split any speech_cut at atom-owned gaps that are a HARD seam
          (``_seam_split`` / ``seam.classify_seam``); a WELDABLE gap is ABSORBED
@@ -747,7 +769,8 @@ def enforce_lattice_partition(
     # (below) and play inside the spoken beat instead of becoming a video cut.
     absorbed_atoms: Dict[str, set] = {}
     new_cuts: List[SpeechCut] = []
-    synced_ids = synced_file_ids or set()
+    synced_ids = outlook_file_ids or set()
+    group_of = outlook_group_of or {}
     for sc in output.speech_cuts:
         lattice = lattices.get(sc.file_id)
         if lattice is None or not lattice.words:
@@ -836,6 +859,16 @@ def enforce_lattice_partition(
 
     new_takes: List[TakeCandidate] = []
     for tc in output.take_candidates:
+        # Outlook guard: a candidate whose members all sit in ONE outlook group
+        # is alternate angles of the same moment, not retakes -- drop it whole.
+        # Code re-groups those beats as outlooks (`group_outlooks`) so they get
+        # no crowned winner; keeping the model's take verdict would fabricate a
+        # false winner + pull in that angle's non-authoritative audio.
+        member_groups = {group_of.get(m.file_id) for m in tc.members}
+        if len(tc.members) >= 2 and len(member_groups) == 1 and None not in member_groups:
+            logger.info("pass1 enforce: dropping take group %r -- members are one "
+                        "outlook group (angles, not takes)", tc.group_id)
+            continue
         seen: set = set()
         members: List[TakeMember] = []
         for m in tc.members:

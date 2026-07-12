@@ -1,8 +1,12 @@
 "use client";
 
 /**
- * Multicam sync declare/nudge panel (audio_sync.plan.md SS10). Opened via
- * `SyncButton` (search-edit-bar.tsx) once 2+ files are selected in Drive.
+ * Outlook (alternate-angle) declare/nudge panel. Opened via `SyncButton`
+ * (search-edit-bar.tsx) once 2+ files are selected in Drive. Declaring an
+ * outlook group tells ingest these clips are alternate cameras of the same
+ * moment: they share one authoritative audio track and switch freely on
+ * picture. Alignment confidence is only about how well the offsets line up
+ * (nudge to fix); every declared member is grouped as an outlook regardless.
  * v1 UI simplification: a numeric offset field per member rather than a
  * draggable stacked-waveform view -- the `timeline-editor.tsx` `Waveform`
  * component (client-side peak decode from the playback proxy) is the
@@ -89,7 +93,7 @@ export function SyncPanel() {
         <div className="mb-4 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Waves size={16} style={{ color: "var(--accent)" }} />
-            <p className="text-sm font-medium">Sync {syncScopeFileIds.length} files</p>
+            <p className="text-sm font-medium">Outlook group · {syncScopeFileIds.length} files</p>
           </div>
           <button onClick={closeSyncPanel} className="rounded p-1 hover:bg-[var(--accent-soft)]">
             <X size={16} />
@@ -153,7 +157,8 @@ export function SyncPanel() {
             </div>
             {result.members.some((m) => !m.high_confidence) && (
               <p className="text-[11px]" style={{ color: "var(--muted)" }}>
-                Low confidence on some members -- check/nudge their offsets before confirming.
+                Weak auto-alignment on some angles -- nudge their offsets so the picture lines
+                up. They still join as outlooks either way.
               </p>
             )}
             <div className="flex justify-end gap-2">
@@ -171,7 +176,7 @@ export function SyncPanel() {
                 style={{ background: "var(--accent)", color: "var(--background)" }}
               >
                 {saving && <Loader2 size={12} className="animate-spin" />}
-                Confirm sync
+                Confirm outlook group
               </button>
             </div>
           </div>
@@ -181,7 +186,8 @@ export function SyncPanel() {
           <div className="flex flex-col items-center gap-2 py-6 text-center">
             <CheckCircle2 size={28} style={{ color: "var(--success)" }} />
             <p className="text-[13px]">
-              Synced. Ingesting these files will now use one authoritative audio source.
+              Grouped as outlooks. Ingesting these files will now use one authoritative
+              audio source across every angle.
             </p>
             <button
               onClick={closeSyncPanel}

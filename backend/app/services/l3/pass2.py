@@ -129,3 +129,36 @@ def apply_junk_suspects(pass2: Pass2Output, pass1: Pass1Output) -> Pass2Output:
     if n:
         logger.info("pass2: %d cut(s) marked junk from pass-1 suspects", n)
     return pass2
+
+
+def apply_outlook_roles(pass2: Pass2Output, pass1: Pass1Output) -> Pass2Output:
+    """A DECLARED outlook group's members are alternate cameras of the same
+    moment -- outlooks by definition, never retakes -- so their take grouping
+    is CODE's, not the model's. For every pass-1 outlook candidate
+    (``group_outlooks``, group_id prefixed ``outlook:``) stamp its member cuts
+    with that shared group id and ``take_role="outlook"``, overriding pass 2a's
+    pixel-based verdict: pass 2a compares the stills and can decide "same
+    setting -> pick a winner", but it cannot know these clips were declared
+    simultaneous, so its winner/take call on a declared outlook is simply wrong.
+    Mirrors ``apply_junk_suspects``: pass 1 owns the meaning, code carries it
+    deterministically onto the final cuts."""
+    member_group: Dict[Tuple[str, Tuple[int, int]], str] = {}
+    for tc in pass1.take_candidates:
+        if not str(tc.group_id).startswith("outlook:"):
+            continue
+        for m in tc.members:
+            member_group[(m.file_id, tuple(m.word_span))] = tc.group_id
+    if not member_group:
+        return pass2
+    n = 0
+    for c in pass2.cuts:
+        if c.kind != "speech" or c.word_span is None:
+            continue
+        gid = member_group.get((c.file_id, tuple(c.word_span)))
+        if gid is not None and (c.take_role != "outlook" or c.take_group_id != gid):
+            c.take_group_id = gid
+            c.take_role = "outlook"
+            n += 1
+    if n:
+        logger.info("pass2: %d cut(s) forced to outlook role from declared groups", n)
+    return pass2

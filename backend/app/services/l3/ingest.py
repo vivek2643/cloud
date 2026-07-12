@@ -46,7 +46,7 @@ from app.services.l3 import pass2b
 from app.services.l3 import post
 from app.services.l3.lattice import Lattice
 from app.services.l3.sync import store as sync_store
-from app.services.l3.sync.lattice_merge import apply_sync_groups, high_conf_groups
+from app.services.l3.sync.lattice_merge import apply_outlook_groups, outlook_groups
 from app.services.l3.pass2_params import (
     MAX_CUTS_PER_VISUAL_BATCH, MAX_PARALLEL_SHARDS, MAX_PARALLEL_VISUAL_BATCHES, STILL_WIDTH_PX,
 )
@@ -116,22 +116,22 @@ def run_ingest(project_id: str) -> str:
         if not file_rows:
             raise ValueError(f"project {project_id} has no ingest-ready files")
 
-        # audio_sync.plan.md SS2/SS7: pin whatever sync groups exist for
-        # this project's files RIGHT NOW (a later re-sync must not mutate
-        # this run -- SS6 "pinning") and swap each synced angle's Lattice
-        # speech side onto its group's authoritative source. A project with
-        # no declared sync groups is untouched here (`sync_by_file` empty
-        # -> `file_rows`/hints/synced_ids all pass through as-is): the
-        # no-multicam-regression guarantee (SS2/SS15's last checklist item).
+        # Pin whatever OUTLOOK groups exist for this project's files RIGHT NOW
+        # (a later re-align must not mutate this run) and swap each angle's
+        # Lattice speech side onto its group's authoritative source. A project
+        # with no declared groups is untouched here (`outlook_by_file` empty ->
+        # `file_rows`/hints/ids all pass through as-is): the no-regression
+        # guarantee.
         pre_file_ids = [fid for fid, _name, _dur, _lat in file_rows]
-        sync_by_file = sync_store.sync_groups_for_files(pre_file_ids)
-        # Only confidently-aligned groups (>= 2 high-confidence members) are
-        # treated as synced: speech-swapped, beat-mirrored, and grouped as
-        # outlooks. A low-confidence member is left an independent clip so we
-        # never fabricate a misaligned outlook (audio_sync.plan.md SS7).
-        groups_hi = high_conf_groups(sync_by_file)
-        file_rows, sync_hints, synced_file_ids = apply_sync_groups(file_rows, sync_by_file, groups_hi)
-        sync_group_by_file = {fid: gid for gid, grp in groups_hi.items() for fid in grp["members"]}
+        outlook_by_file = sync_store.sync_groups_for_files(pre_file_ids)
+        # EVERY member of a declared group is an outlook of the others (a
+        # different camera on one moment) -- speech-swapped, beat-mirrored, and
+        # grouped as outlooks. Alignment confidence is metadata only, never an
+        # exclusion: demoting a low-confidence member to an independent clip is
+        # exactly what let pass 1 mis-group it as a TAKE with its own audio.
+        groups = outlook_groups(outlook_by_file)
+        file_rows, outlook_hints, outlook_file_ids = apply_outlook_groups(file_rows, outlook_by_file, groups)
+        outlook_group_by_file = {fid: gid for gid, grp in groups.items() for fid in grp["members"]}
 
         lattices: Dict[str, Lattice] = {fid: lat for fid, _name, _dur, lat in file_rows}
         file_ids = list(lattices.keys())
@@ -139,22 +139,23 @@ def run_ingest(project_id: str) -> str:
         proxy_keys = _proxy_keys_for_files(file_ids)
 
         store.set_status(ingest_run_id, "pass1")
-        pass1_completion = pass1.run_pass1(file_rows, sync_hints)
+        pass1_completion = pass1.run_pass1(file_rows, outlook_hints)
         pass1_output = pass1.Pass1Output.model_validate(pass1_completion.data)
-        # Synced angles: mirror the authoritative angle's speech beats onto
-        # every high-confidence angle BEFORE enforcement, so each angle carries
-        # the identical spans (audio_sync.plan.md SS7.4). Enforcement then runs
-        # per angle (synced=True) and yields byte-identical final speech cuts.
-        pass1_output = pass1.replicate_synced_speech(pass1_output, lattices, groups_hi)
+        # Outlook angles: mirror the authoritative angle's speech beats onto
+        # every angle in the group BEFORE enforcement, so each angle carries the
+        # identical spans. Enforcement then runs per angle (synced=True) and
+        # yields byte-identical final speech cuts.
+        pass1_output = pass1.replicate_outlook_speech(pass1_output, lattices, groups)
         # Deterministic boundary repair (split cuts crossing atom-owned gaps,
-        # realign take members) -- the model owns meaning, the lattice owns
-        # boundaries. The ENFORCED output is what gets persisted: pass 2's
-        # cached prefix and the image plan must see the same refs.
-        pass1_output = pass1.enforce_lattice_partition(pass1_output, lattices, synced_file_ids)
-        # Now that each synced angle's cuts are aligned, link them into
-        # take_candidates -- pass 2a resolves each as an outlook (no winner),
-        # feeding footage_map/observe's alt-PIC angle switching (SS7.4/7.6).
-        pass1_output = pass1.group_synced_outlooks(pass1_output, groups_hi)
+        # realign take members, and drop any take-candidate that is really one
+        # outlook group's angles) -- the model owns meaning, the lattice owns
+        # boundaries. The ENFORCED output is what gets persisted.
+        pass1_output = pass1.enforce_lattice_partition(
+            pass1_output, lattices, outlook_file_ids, outlook_group_by_file)
+        # Now that each angle's cuts are aligned, link them into take_candidates
+        # -- pass 2a resolves each as an outlook (no winner), feeding
+        # footage_map/observe's alt-PIC angle switching.
+        pass1_output = pass1.group_outlooks(pass1_output, groups)
         store.record_pass1_result(ingest_run_id, pass1_output.model_dump(), pass1_completion.usage,
                                   pass1_output.project_summary)
 
@@ -215,13 +216,17 @@ def run_ingest(project_id: str) -> str:
 
         pass2_output = pass2.merge_identity_and_visual(identity_output, visual_by_index)
         pass2_output = pass2.apply_junk_suspects(pass2_output, pass1_output)
+        # A declared outlook group's members are alternate angles, never
+        # retakes: code (not pass 2a's pixel guess) owns that categorical call,
+        # so force every declared-outlook member to take_role='outlook'.
+        pass2_output = pass2.apply_outlook_roles(pass2_output, pass1_output)
 
         store.set_status(ingest_run_id, "post")
         records = post.assemble_cut_records(pass2_output, lattices, motion_by_file, silences_by_file,
                                             junk_suspects=pass1_output.junk_suspects,
                                             audio_by_file=audio_by_file,
-                                            synced_file_ids=synced_file_ids,
-                                            sync_group_by_file=sync_group_by_file)
+                                            synced_file_ids=outlook_file_ids,
+                                            sync_group_by_file=outlook_group_by_file)
 
         store.delete_cut_records_for_run(ingest_run_id)
         record_ids = store.insert_cut_records(ingest_run_id, records)

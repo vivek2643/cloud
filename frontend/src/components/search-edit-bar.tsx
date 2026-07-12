@@ -47,11 +47,11 @@ export function SearchEditBar() {
 }
 
 /**
- * Multicam sync launcher (audio_sync.plan.md SS10): only appears once 2+
- * video/audio files are selected -- "select the files, hit Sync" (SS1's
- * user-declared v1 flow). Opens the sync-declare panel scoped to the
- * current selection; unlike Edit, there is no "all clips here" fallback --
- * a sync group is meaningless without an explicit multi-selection.
+ * Outlook-group launcher: only appears once 2+ video/audio files are selected
+ * -- "select the alternate angles, hit Outlook". Opens the declare panel
+ * scoped to the current selection; unlike Edit, there is no "all clips here"
+ * fallback -- an outlook group is meaningless without an explicit
+ * multi-selection.
  */
 export function SyncButton() {
   const { files, selectedIds, openSyncPanel } = useDriveStore();
@@ -72,12 +72,12 @@ export function SyncButton() {
       style={{ borderColor: "var(--border)", color: "var(--foreground)" }}
       title={
         canSync
-          ? `Sync ${selectedSyncIds.length} selected file(s) onto one clock`
-          : "Select 2+ video/audio files to sync"
+          ? `Group ${selectedSyncIds.length} selected file(s) as alternate-angle outlooks`
+          : "Select 2+ video/audio files to group as outlooks"
       }
     >
       <Waves size={16} />
-      SYNC
+      OUTLOOK
       <span className="rounded-full px-1.5 text-xs" style={{ background: "var(--accent-soft)" }}>
         {selectedSyncIds.length}
       </span>

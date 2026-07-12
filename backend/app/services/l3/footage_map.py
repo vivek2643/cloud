@@ -312,6 +312,12 @@ def build_clip_tree(
             # carries it (None for legacy hero cuts) -- see _annotate_dups.
             "take_group_id": cut.get("take_group_id"),
             "take_role": cut.get("take_role"),
+            # Outlook group this beat belongs to (alternate cameras of one
+            # moment sharing an authoritative audio track). Carried through so
+            # `_annotate_outlook_groups` can tell the brain the audio is
+            # decoupled from whichever angle it shows. (DB column is
+            # `sync_group_id`; the map speaks only "outlook".)
+            "outlook_group_id": cut.get("sync_group_id"),
             # Cuts-v3 continuity (cuts_v3_continuity.plan.md): junk stays IN
             # the map, labeled, and its persisted position/weld-to-neighbor
             # facts ride straight through (False/{} for legacy hero cuts).
@@ -638,22 +644,41 @@ def _alt_pic_segment(m: Dict[str, Any], alias: Optional[Dict[Any, str]],
     `Gx→ref (shot, q)`. Never a verdict -- just where else this sound's picture
     lives. Absent when there is no co-occurrence (`_annotate_dups` sets no
     `alt_pic` in that case) or when no member resolves to a picture distinct
-    from this beat's own."""
+    from this beat's own.
+
+    OUTLOOK vs TAKE dedupe differs, because the two are distinct kinds:
+      * TAKE (retakes of the same content): collapse by on-camera PERSON and
+        drop an alternate that shows the same person as this beat -- offering
+        the same face twice is noise, the brain wants the distinct alternate.
+      * OUTLOOK (alternate CAMERAS of one simultaneous moment): every angle is
+        a real, switchable option even when it shows the same person (that's
+        the whole point of multicam) or when the on-camera identity is unknown.
+        Collapse by ANGLE (file) instead, and never drop on same/unknown who --
+        otherwise a talking-head shot from three cameras would surface as one."""
     facts = m.get("alt_pic") or []
     if not facts:
         return ""
+    is_outlook = bool(m.get("outlook_group_id")) or m.get("take_role") == "outlook"
     my_who = _pic_who(m, _speaker_handle(m), alias, oncam)
     seen = set()
     parts: List[str] = []
     for f in facts:
         shown, _ = _shown_and_cam(f.get("file"), f.get("voice"), alias, oncam)
         who = shown or _global_speaker(f.get("file"), f.get("voice"), alias)
-        if not who or who == my_who or who in seen:
-            continue
-        seen.add(who)
+        if is_outlook:
+            key = f.get("file")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            label = who or "angle"
+        else:
+            if not who or who == my_who or who in seen:
+                continue
+            seen.add(who)
+            label = who
         bits = [b for b in (f.get("framing"), _qual(float(f.get("score", 0.0)))) if b]
         retry = ", retry" if f.get("restart") else ""
-        parts.append(f"{who}→{f['moment_id']} ({', '.join(bits)}{retry})")
+        parts.append(f"{label}→{f['moment_id']} ({', '.join(bits)}{retry})")
     return f" ·alt-PIC:{', '.join(parts)}" if parts else ""
 
 
@@ -756,14 +781,14 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False,
     # adds no signal and would just bloat every line).
     cam = (m.get("camera") or "").strip()
     cam_tag = f" cam:{cam.replace(' ', '-')}" if cam and cam not in ("static", "unknown") else ""
-    # audio_sync.plan.md SS9: a structural fact only -- this moment's audio is
-    # shared verbatim with N-1 other angles (the group's authoritative
-    # track), picture choice is still entirely the brain's call.
-    sync_tag = f" sync:{m['sync_angle_count']}-angles" if m.get("sync_angle_count") else ""
+    # A structural fact only -- this moment's audio is shared verbatim with the
+    # other angles (the outlook group's authoritative track), so picture choice
+    # is entirely the brain's call and switching angles never jumps the audio.
+    outlook_tag = f" outlook:{m['outlook_angle_count']}-angles" if m.get("outlook_angle_count") else ""
     alt = _alt_pic_segment(m, alias, oncam)
     return (f"  {m['moment_id'].split(':')[-1]} {_capture_tag(m)} {pic} {snd} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])} {_dur_tag(m)}] "
-            f"\"{gist}\"{gloss} · nrg:{nrg}{pace_tag}{cam_tag}{sync_tag}{cut_tag}{run}{alt}")
+            f"\"{gist}\"{gloss} · nrg:{nrg}{pace_tag}{cam_tag}{outlook_tag}{cut_tag}{run}{alt}")
 
 
 def _clip_block(tree: Dict[str, Any], *, compact: bool = False,
@@ -846,28 +871,28 @@ def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return summary
 
 
-def _annotate_sync_groups(trees: List[Dict[str, Any]]) -> None:
-    """audio_sync.plan.md SS9: tag each moment whose cut carries a
-    `sync_group_id` with `sync_angle_count` (how many OTHER moments in this
-    footage map share that same group) -- a purely STRUCTURAL fact
-    (`_moment_line` renders it as `sync:N-angles`), never editorial guidance.
-    The brain still picks picture on its own; this only tells it "these N
-    moments' audio is the same authoritative track, decoupled from whichever
-    angle you show." Mirrors `_annotate_dups`'s in-place tagging style, but
-    deliberately does NOT crown a winner or fold alt-facts (that's what
-    `dup_group`/`alt_pic` already do for take groups -- this is a different,
-    additive fact about AUDIO identity, not picture choice)."""
-    by_group: Dict[str, List[Dict[str, Any]]] = {}
+def _annotate_outlook_groups(trees: List[Dict[str, Any]]) -> None:
+    """Tag each moment in an outlook group with `outlook_angle_count` -- how
+    many distinct ANGLES cover THIS beat (this angle + its alt-PIC alternates),
+    a purely STRUCTURAL fact (`_moment_line` renders it as `outlook:N-angles`),
+    never editorial guidance. It tells the brain "these N angles' picture all
+    ride the same authoritative audio track, so switching between them never
+    jumps the sound" -- picture choice is still entirely the brain's call.
+
+    Counts per-BEAT (from the beat's own alt-PIC angles), NOT how many moments
+    share the project-wide group id: a group id spans the whole recording, but
+    a given beat is only actually covered by the angles that were rolling then
+    (a shorter angle drops out for the parts it didn't film). Runs after
+    `_annotate_dups`, which populates each moment's `alt_pic`."""
     for t in trees:
         for m in t.get("moments", []) or []:
-            gid = m.get("sync_group_id")
-            if gid and not m.get("junk"):
-                by_group.setdefault(gid, []).append(m)
-    for members in by_group.values():
-        if len(members) < 2:
-            continue
-        for m in members:
-            m["sync_angle_count"] = len(members)
+            if m.get("junk") or not m.get("outlook_group_id"):
+                continue
+            angles = {g.get("file") for g in (m.get("alt_pic") or []) if g.get("file")}
+            angles.add(m.get("file_id"))   # this beat's own angle
+            angles.discard(None)
+            if len(angles) >= 2:
+                m["outlook_angle_count"] = len(angles)
 
 
 def assemble_map(file_ids: List[str], *, compact: bool = False,
@@ -886,8 +911,8 @@ def assemble_map(file_ids: List[str], *, compact: bool = False,
     """
     trees = get_trees(file_ids, run_id=run_id)
     ordered = [trees[fid] for fid in file_ids if fid in trees]
-    dups = _annotate_dups(ordered)   # tags moments in `ordered` in place
-    _annotate_sync_groups(ordered)   # tags moments in `ordered` in place
+    dups = _annotate_dups(ordered)      # tags moments in `ordered` in place
+    _annotate_outlook_groups(ordered)   # tags moments in `ordered` in place
     text = "\n\n".join(_clip_block(t, compact=compact)
                        for t in ordered)
     n_moments = sum(t["moment_count"] for t in ordered)
