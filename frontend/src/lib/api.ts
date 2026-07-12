@@ -996,6 +996,89 @@ export function getCaptionSuggestions(
   return request<CaptionSuggestionsResponse>(`/api/captions/suggestions?${params}`, { token });
 }
 
+// --- Multicam sync (audio_sync.plan.md SS10) ---
+
+export type SyncRole = "video_angle" | "audio";
+export type SyncAlignedBy = "auto" | "manual";
+
+export interface SyncDetectMember {
+  file_id: string;
+  offset_ms: number;
+  confidence: number;
+  role: SyncRole;
+  aligned_by: SyncAlignedBy;
+  high_confidence: boolean;
+}
+
+export interface SyncDetectResult {
+  members: SyncDetectMember[];
+  suggested_authoritative_file_id: string | null;
+  unusable_file_ids: string[];
+}
+
+export function detectSync(fileIds: string[], token: string, roles?: Record<string, SyncRole>) {
+  return request<SyncDetectResult>("/api/sync/detect", {
+    method: "POST",
+    body: JSON.stringify({ file_ids: fileIds, roles }),
+    token,
+  });
+}
+
+export interface SyncGroupMember {
+  file_id: string;
+  offset_ms: number;
+  role: SyncRole;
+  confidence: number | null;
+  aligned_by: SyncAlignedBy;
+}
+
+export interface SyncGroup {
+  id: string;
+  project_id: string;
+  authoritative_audio_file_id: string | null;
+  created_by: string;
+  created_at: string;
+  members: SyncGroupMember[];
+}
+
+export interface CreateSyncGroupMember {
+  file_id: string;
+  offset_ms: number;
+  role: SyncRole;
+  confidence?: number | null;
+  aligned_by: SyncAlignedBy;
+}
+
+export function createSyncGroup(
+  members: CreateSyncGroupMember[], token: string, authoritativeAudioFileId?: string | null
+) {
+  return request<SyncGroup>("/api/sync/groups", {
+    method: "POST",
+    body: JSON.stringify({ members, authoritative_audio_file_id: authoritativeAudioFileId }),
+    token,
+  });
+}
+
+export function listSyncGroups(projectId: string, token: string) {
+  return request<SyncGroup[]>(`/api/sync/groups?project_id=${projectId}`, { token });
+}
+
+export function setSyncAuthoritative(groupId: string, fileId: string, token: string) {
+  return request<SyncGroup>(`/api/sync/groups/${groupId}/authoritative`, {
+    method: "PATCH", body: JSON.stringify({ file_id: fileId }), token,
+  });
+}
+
+export function nudgeSyncOffset(groupId: string, fileId: string, offsetMs: number, token: string) {
+  return request<SyncGroup>(`/api/sync/groups/${groupId}/members/${fileId}`, {
+    method: "PATCH", body: JSON.stringify({ offset_ms: offsetMs }), token,
+  });
+}
+
+export function deleteSyncGroup(groupId: string, token: string) {
+  return request<{ deleted: boolean }>(`/api/sync/groups/${groupId}`, { method: "DELETE", token });
+}
+
 // --- Render / export ---
 
 export type RenderStatus = "queued" | "running" | "done" | "failed" | "cancelled";

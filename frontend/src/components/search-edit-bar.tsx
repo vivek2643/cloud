@@ -1,6 +1,6 @@
 "use client";
 
-import { Search, Sparkles, X } from "lucide-react";
+import { Search, Sparkles, Waves, X } from "lucide-react";
 import { useDriveStore } from "@/stores/drive-store";
 
 /**
@@ -38,10 +38,50 @@ export function SearchEditBar() {
       </div>
 
       {/* Highlighted Edit launcher, parallel to the search bar on the right. */}
-      <div className="absolute right-0 top-1/2 -translate-y-1/2">
+      <div className="absolute right-0 top-1/2 -translate-y-1/2 flex items-center gap-2">
+        <SyncButton />
         <EditButton />
       </div>
     </div>
+  );
+}
+
+/**
+ * Multicam sync launcher (audio_sync.plan.md SS10): only appears once 2+
+ * video/audio files are selected -- "select the files, hit Sync" (SS1's
+ * user-declared v1 flow). Opens the sync-declare panel scoped to the
+ * current selection; unlike Edit, there is no "all clips here" fallback --
+ * a sync group is meaningless without an explicit multi-selection.
+ */
+export function SyncButton() {
+  const { files, selectedIds, openSyncPanel } = useDriveStore();
+
+  const selectable = files.filter(
+    (f) => (f.file_type === "video" || f.file_type === "audio") && f.status === "ready"
+  );
+  const selectedSyncIds = selectable.filter((f) => selectedIds.has(f.id)).map((f) => f.id);
+  const canSync = selectedSyncIds.length >= 2;
+
+  if (selectedSyncIds.length === 0) return null;
+
+  return (
+    <button
+      onClick={() => canSync && openSyncPanel(selectedSyncIds)}
+      disabled={!canSync}
+      className="flex items-center gap-1.5 rounded-lg border px-4 py-2.5 text-sm font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+      style={{ borderColor: "var(--border)", color: "var(--foreground)" }}
+      title={
+        canSync
+          ? `Sync ${selectedSyncIds.length} selected file(s) onto one clock`
+          : "Select 2+ video/audio files to sync"
+      }
+    >
+      <Waves size={16} />
+      SYNC
+      <span className="rounded-full px-1.5 text-xs" style={{ background: "var(--accent-soft)" }}>
+        {selectedSyncIds.length}
+      </span>
+    </button>
   );
 }
 

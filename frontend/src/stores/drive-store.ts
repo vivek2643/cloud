@@ -32,6 +32,12 @@ interface DriveState {
   openAiPanel: (fileIds: string[]) => void;
   closeAiPanel: () => void;
 
+  // Multicam sync (audio_sync.plan.md SS10)
+  syncPanelOpen: boolean;
+  syncScopeFileIds: string[];
+  openSyncPanel: (fileIds: string[]) => void;
+  closeSyncPanel: () => void;
+
   setCurrentFolder: (id: string | null) => void;
   setFolders: (folders: Folder[]) => void;
   setFiles: (files: FileRecord[]) => void;
@@ -62,6 +68,11 @@ export const useDriveStore = create<DriveState>((set) => ({
   aiScopeFileIds: [],
   openAiPanel: (fileIds) => set({ aiPanelOpen: true, aiScopeFileIds: fileIds }),
   closeAiPanel: () => set({ aiPanelOpen: false }),
+
+  syncPanelOpen: false,
+  syncScopeFileIds: [],
+  openSyncPanel: (fileIds) => set({ syncPanelOpen: true, syncScopeFileIds: fileIds }),
+  closeSyncPanel: () => set({ syncPanelOpen: false }),
 
   setCurrentFolder: (id) => set({ currentFolderId: id, selectedIds: new Set() }),
   setFolders: (folders) => set({ folders }),

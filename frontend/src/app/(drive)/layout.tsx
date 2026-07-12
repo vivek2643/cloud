@@ -7,6 +7,7 @@ import { Navbar } from "@/components/navbar";
 import { Sidebar } from "@/components/sidebar";
 import { UploadProgress } from "@/components/upload-progress";
 import { AiEditPanel } from "@/components/ai-edit-panel";
+import { SyncPanel } from "@/components/sync-panel";
 import { useAuthStore } from "@/stores/auth-store";
 import { isSupabaseConfigured } from "@/lib/supabase";
 
@@ -76,6 +77,7 @@ function DriveShell({ children }: { children: React.ReactNode }) {
         </main>
         <AiEditPanel />
       </div>
+      <SyncPanel />
     </div>
   );
 }
