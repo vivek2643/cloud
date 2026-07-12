@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -560,6 +560,139 @@ def _contiguous_atom_runs(lattice: Lattice, atom_ids: List[int]) -> List[List[in
         else:
             runs.append([a.atom_id])
     return runs
+
+
+# --------------------------------------------------------------------------
+# Synced outlooks (audio_sync.plan.md SS7.4/7.6). A sync group's angles are the
+# SAME recorded moment from different cameras; sync already knows -- exactly,
+# from the cross-correlation offsets -- which files are simultaneous and how
+# they line up. So the outlook grouping is CODE's to produce, not the model's
+# to guess (it consistently fails to, and the SYNC hint tells it not to try).
+#
+#   replicate_synced_speech: BEFORE enforcement, mirror the authoritative
+#     angle's speech beats onto every high-confidence angle. Every synced angle
+#     already carries the byte-identical (re-based) authoritative word list
+#     (lattice_merge.authoritative_view), so a beat's word-INDEX span transfers
+#     verbatim. Enforcement then runs per angle with synced=True (a shot
+#     boundary never splits a beat; interior atoms are absorbed), yielding
+#     byte-identical final speech cuts across the group.
+#   group_synced_outlooks: AFTER enforcement, link those aligned per-angle cuts
+#     into take_candidates -- one per beat. Pass 2a resolves each as an OUTLOOK
+#     (same words, different setting -> NO crowned winner), which is exactly the
+#     structure footage_map/observe's alt-PIC angle switching consumes.
+#
+# Everything is gated on high confidence (lattice_merge.high_conf_groups):
+# replicating onto a badly-aligned angle would fabricate a genuinely misaligned
+# outlook, so a low-confidence member is left as an independent clip instead.
+# --------------------------------------------------------------------------
+
+def _canonical_beats(
+    owner_fid: str, cuts_by_file: Dict[str, List[SpeechCut]], owner_lattice: Lattice,
+) -> List[Tuple[Tuple[int, int], str, List[str], "str | None"]]:
+    """The full, gap-free beat set for a synced group, defined ONCE on
+    ``owner_fid`` (the authoritative angle) so every angle can mirror the same
+    spans. The owner's model speech cuts are kept verbatim; any transcript word
+    they leave uncovered is recovered EXACTLY as ``enforce_lattice_partition``'s
+    speech coverage-fill would (``_span_pieces`` at every atom-owned gap, label
+    "(recovered)") -- so once each mirrored angle passes through enforcement its
+    coverage-fill finds everything already covered and adds nothing angle-local
+    (that per-angle recovery is what produced misaligned cuts before this).
+    Returned sorted by word start."""
+    words = owner_lattice.words
+    beats: List[Tuple[Tuple[int, int], str, List[str], "str | None"]] = []
+    covered = [False] * len(words)
+    for c in sorted(cuts_by_file.get(owner_fid, []), key=lambda s: s.word_span[0]):
+        a, b = c.word_span
+        for k in range(max(0, a), min(len(covered), b + 1)):
+            covered[k] = True
+        beats.append((tuple(c.word_span), c.label, list(c.speaker_ids), c.beat_id))
+    i = 0
+    while i < len(covered):
+        if covered[i]:
+            i += 1
+            continue
+        j = i
+        while j < len(covered) and not covered[j]:
+            j += 1
+        for pa, pb in _span_pieces(words, owner_lattice.atoms, (i, j - 1)):
+            beats.append(((pa, pb), "(recovered)", [], None))
+        i = j
+    beats.sort(key=lambda x: x[0][0])
+    return beats
+
+
+def replicate_synced_speech(
+    output: Pass1Output, lattices: Dict[str, Lattice],
+    groups_hi: Dict[str, Dict[str, Any]],
+) -> Pass1Output:
+    """Mirror each synced group's authoritative-angle speech beats onto every
+    high-confidence angle, BEFORE ``enforce_lattice_partition``. Each angle ends
+    up with byte-identical word spans, so enforcement -- run per angle with
+    ``synced=True`` -- yields identical final speech cuts across the group,
+    ready to link as outlooks (``group_synced_outlooks``). Angles NOT in a
+    high-confidence group are untouched (their own model cuts + normal
+    coverage-fill stand)."""
+    if not groups_hi:
+        return output
+    cuts_by_file: Dict[str, List[SpeechCut]] = {}
+    for sc in output.speech_cuts:
+        cuts_by_file.setdefault(sc.file_id, []).append(sc)
+    handled: Set[str] = set()
+    replicas: List[SpeechCut] = []
+    for grp in groups_hi.values():
+        hi = sorted(f for f in grp["members"] if f in lattices and lattices[f].words)
+        if len(hi) < 2:
+            continue
+        auth = grp["auth"]
+        owner = auth if (auth in hi and cuts_by_file.get(auth)) else max(
+            hi, key=lambda f: len(cuts_by_file.get(f, [])))
+        beats = _canonical_beats(owner, cuts_by_file, lattices[owner])
+        if not beats:
+            continue
+        for f in hi:
+            handled.add(f)
+            for span, label, spk, beat_id in beats:
+                replicas.append(SpeechCut(file_id=f, word_span=span, label=label,
+                                          speaker_ids=list(spk), beat_id=beat_id))
+    if not handled:
+        return output
+    kept = [sc for sc in output.speech_cuts if sc.file_id not in handled]
+    return output.model_copy(update={"speech_cuts": kept + replicas})
+
+
+def group_synced_outlooks(
+    output: Pass1Output, groups_hi: Dict[str, Dict[str, Any]],
+) -> Pass1Output:
+    """Link the (now enforcement-aligned) speech cuts of each synced group's
+    high-confidence angles into take_candidates -- one per beat, its members the
+    identical-word-span cut on each angle. Runs AFTER
+    ``enforce_lattice_partition`` (so members reference final cut spans exactly,
+    needing none of enforce's remap/same-line repair) and BEFORE pass 2a (which
+    resolves each as an OUTLOOK from the pixels -> no crowned winner)."""
+    if not groups_hi:
+        return output
+    spans_by_file: Dict[str, Set[Tuple[int, int]]] = {}
+    for sc in output.speech_cuts:
+        spans_by_file.setdefault(sc.file_id, set()).add(tuple(sc.word_span))
+    new_takes: List[TakeCandidate] = []
+    for gid, grp in groups_hi.items():
+        hi = sorted(f for f in grp["members"] if f in spans_by_file)
+        if len(hi) < 2:
+            continue
+        span_members: Dict[Tuple[int, int], List[str]] = {}
+        for f in hi:
+            for span in spans_by_file[f]:
+                span_members.setdefault(span, []).append(f)
+        for span in sorted(span_members):
+            files = span_members[span]
+            if len(files) < 2:
+                continue
+            members = [TakeMember(file_id=f, word_span=span) for f in sorted(files)]
+            new_takes.append(TakeCandidate(
+                group_id=f"sync:{gid[:8]}:{span[0]}-{span[1]}", members=members))
+    if not new_takes:
+        return output
+    return output.model_copy(update={"take_candidates": output.take_candidates + new_takes})
 
 
 def enforce_lattice_partition(

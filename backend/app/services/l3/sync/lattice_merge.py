@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Set, Tuple
 
 from app.services.l3.diarize import Turn
 from app.services.l3.lattice import Lattice, build_atoms, load_motion_scene
+from app.services.l3.sync.detect import HIGH_CONFIDENCE_THRESHOLD
 
 
 def _retime_words(words: List[dict], delta_ms: int) -> List[dict]:
@@ -70,38 +71,70 @@ def authoritative_view(angle_lattice: Lattice, authoritative: Lattice, delta_ms:
     )
 
 
+def _is_high_conf(member: Dict[str, Any]) -> bool:
+    """A member we trust enough to fold into an outlook group. A committed
+    manual nudge is trusted outright (a human aligned it); an auto alignment
+    must clear the cross-correlation confidence gate. Below the gate the member
+    is left as an ordinary independent clip -- SS7's "never fabricate a
+    misaligned outlook"."""
+    if member.get("aligned_by") == "manual":
+        return True
+    c = member.get("confidence")
+    return c is not None and float(c) >= HIGH_CONFIDENCE_THRESHOLD
+
+
+def high_conf_groups(sync_by_file: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """`sync.store.sync_groups_for_files` collapsed to the groups that actually
+    have >= 2 confidently-aligned members -- the ONLY ones we treat as synced
+    (speech-swap, mirror beats, form outlooks). Shape: `{group_id: {"auth":
+    authoritative_file_id, "members": {high-conf file_ids}}}`. A group with
+    fewer than two high-confidence members is dropped whole (its files behave
+    as ordinary, independent clips)."""
+    groups: Dict[str, Dict[str, Any]] = {}
+    for fid, g in sync_by_file.items():
+        gid = g["group_id"]
+        grp = groups.setdefault(gid, {"auth": g["authoritative_audio_file_id"], "members": set()})
+        if _is_high_conf(g["members"][fid]):
+            grp["members"].add(fid)
+    return {gid: grp for gid, grp in groups.items() if len(grp["members"]) >= 2}
+
+
 def apply_sync_groups(
     file_rows: List[Tuple[str, str, int, Lattice]],
     sync_by_file: Dict[str, Dict[str, Any]],
+    groups_hi: Dict[str, Dict[str, Any]],
 ) -> Tuple[List[Tuple[str, str, int, Lattice]], Dict[str, str], Set[str]]:
     """`file_rows` (as `pass1.load_project_file_rows` returns) with every
-    synced angle's Lattice speech-swapped onto its group's authoritative
-    source (SS7.1/7.2), plus the pass-1 sync-hint text per synced file
-    (SS7.3) and the full set of synced file_ids (SS7.6's `synced_file_ids`,
+    high-confidence synced angle's Lattice speech-swapped onto its group's
+    authoritative source (SS7.1/7.2), plus the pass-1 sync-hint text per synced
+    file (SS7.3) and the set of synced file_ids (SS7.6's `synced_file_ids`,
     threaded into `enforce_lattice_partition`/`post.assemble_cut_records`).
 
-    `sync_by_file`: `sync.store.sync_groups_for_files`'s return shape --
-    `{file_id: {"authoritative_audio_file_id", "members": {file_id:
-    {"offset_ms","role"}}}}`. A file absent from `sync_by_file` is
-    untouched (SS2's no-op guarantee: a project with no declared sync
-    groups behaves byte-identical to before this feature existed)."""
-    if not sync_by_file:
+    Only files in a `groups_hi` group are touched: a low-confidence member (or
+    a group with fewer than two confident members) is dropped by
+    `high_conf_groups` and passes through untouched -- both the no-declared-sync
+    no-op guarantee (SS2) and the "never fabricate a misaligned outlook"
+    fail-safe (SS7). `sync_by_file` is still consulted for the per-member
+    offsets used to compute the re-basing delta."""
+    if not groups_hi:
         return file_rows, {}, set()
 
+    hi_to_group = {fid: gid for gid, grp in groups_hi.items() for fid in grp["members"]}
     lattices_by_id = {fid: lat for fid, _, _, lat in file_rows}
     hints: Dict[str, str] = {}
     synced_ids: Set[str] = set()
     out: List[Tuple[str, str, int, Lattice]] = []
 
     for fid, name, dur, lattice in file_rows:
-        group = sync_by_file.get(fid)
-        if group is None:
+        gid = hi_to_group.get(fid)
+        if gid is None:
             out.append((fid, name, dur, lattice))
             continue
-        auth_fid = group["authoritative_audio_file_id"]
+        grp = groups_hi[gid]
+        auth_fid = grp["auth"]
         auth_lattice = lattices_by_id.get(auth_fid)
-        members = group["members"]
-        other_ids = [m for m in members if m != fid]
+        members = sync_by_file[fid]["members"]
+        other_ids = sorted(m for m in grp["members"] if m != fid)
         synced_ids.add(fid)
         hints[fid] = sync_hint_line(fid, other_ids)
         if auth_lattice is None or auth_fid not in members or fid not in members:

@@ -100,7 +100,7 @@ def sync_groups_for_files(file_ids: List[str]) -> Dict[str, Dict[str, Any]]:
         rows = conn.execute(
             """
             select sg.id::text as group_id, sg.authoritative_audio_file_id::text,
-                   sgm.file_id::text, sgm.offset_ms, sgm.role
+                   sgm.file_id::text, sgm.offset_ms, sgm.role, sgm.confidence, sgm.aligned_by
               from sync_group_members sgm
               join sync_groups sg on sg.id = sgm.group_id
              where sgm.group_id in (
@@ -116,7 +116,13 @@ def sync_groups_for_files(file_ids: List[str]) -> Dict[str, Dict[str, Any]]:
             "authoritative_audio_file_id": r["authoritative_audio_file_id"],
             "members": {},
         })
-        g["members"][r["file_id"]] = {"offset_ms": r["offset_ms"], "role": r["role"]}
+        # confidence/aligned_by gate the outlook replication (lattice_merge.
+        # high_conf_groups): a low-confidence auto alignment stays an
+        # independent clip so we never fabricate a misaligned outlook.
+        g["members"][r["file_id"]] = {
+            "offset_ms": r["offset_ms"], "role": r["role"],
+            "confidence": r["confidence"], "aligned_by": r["aligned_by"],
+        }
     out: Dict[str, Dict[str, Any]] = {}
     for g in groups.values():
         for fid in g["members"]:
