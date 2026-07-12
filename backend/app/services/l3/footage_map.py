@@ -756,10 +756,14 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False,
     # adds no signal and would just bloat every line).
     cam = (m.get("camera") or "").strip()
     cam_tag = f" cam:{cam.replace(' ', '-')}" if cam and cam not in ("static", "unknown") else ""
+    # audio_sync.plan.md SS9: a structural fact only -- this moment's audio is
+    # shared verbatim with N-1 other angles (the group's authoritative
+    # track), picture choice is still entirely the brain's call.
+    sync_tag = f" sync:{m['sync_angle_count']}-angles" if m.get("sync_angle_count") else ""
     alt = _alt_pic_segment(m, alias, oncam)
     return (f"  {m['moment_id'].split(':')[-1]} {_capture_tag(m)} {pic} {snd} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])} {_dur_tag(m)}] "
-            f"\"{gist}\"{gloss} · nrg:{nrg}{pace_tag}{cam_tag}{cut_tag}{run}{alt}")
+            f"\"{gist}\"{gloss} · nrg:{nrg}{pace_tag}{cam_tag}{sync_tag}{cut_tag}{run}{alt}")
 
 
 def _clip_block(tree: Dict[str, Any], *, compact: bool = False,
@@ -842,6 +846,30 @@ def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return summary
 
 
+def _annotate_sync_groups(trees: List[Dict[str, Any]]) -> None:
+    """audio_sync.plan.md SS9: tag each moment whose cut carries a
+    `sync_group_id` with `sync_angle_count` (how many OTHER moments in this
+    footage map share that same group) -- a purely STRUCTURAL fact
+    (`_moment_line` renders it as `sync:N-angles`), never editorial guidance.
+    The brain still picks picture on its own; this only tells it "these N
+    moments' audio is the same authoritative track, decoupled from whichever
+    angle you show." Mirrors `_annotate_dups`'s in-place tagging style, but
+    deliberately does NOT crown a winner or fold alt-facts (that's what
+    `dup_group`/`alt_pic` already do for take groups -- this is a different,
+    additive fact about AUDIO identity, not picture choice)."""
+    by_group: Dict[str, List[Dict[str, Any]]] = {}
+    for t in trees:
+        for m in t.get("moments", []) or []:
+            gid = m.get("sync_group_id")
+            if gid and not m.get("junk"):
+                by_group.setdefault(gid, []).append(m)
+    for members in by_group.values():
+        if len(members) < 2:
+            continue
+        for m in members:
+            m["sync_angle_count"] = len(members)
+
+
 def assemble_map(file_ids: List[str], *, compact: bool = False,
                  run_id: Optional[str] = None) -> Dict[str, Any]:
     """The Tier-0 footage index for the arranger.
@@ -859,6 +887,7 @@ def assemble_map(file_ids: List[str], *, compact: bool = False,
     trees = get_trees(file_ids, run_id=run_id)
     ordered = [trees[fid] for fid in file_ids if fid in trees]
     dups = _annotate_dups(ordered)   # tags moments in `ordered` in place
+    _annotate_sync_groups(ordered)   # tags moments in `ordered` in place
     text = "\n\n".join(_clip_block(t, compact=compact)
                        for t in ordered)
     n_moments = sum(t["moment_count"] for t in ordered)

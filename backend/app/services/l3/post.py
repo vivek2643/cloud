@@ -361,6 +361,12 @@ class CutRecord:
     # left/right, tilt up/down, zoom in/out, follow subject, shaky, unknown) --
     # so the brain knows how a shot moves without reading raw motion signals.
     camera: str = "unknown"
+    # audio_sync.plan.md SS6 "pinning": which sync_groups row (if any) this
+    # cut's file belonged to AT INGEST TIME. None for a non-synced file
+    # (the overwhelming common case). Snapshotting this (rather than joining
+    # sync_group_members live) means a later re-sync of the same files can't
+    # retroactively change what an already-ingested edit's audio came from.
+    sync_group_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -377,6 +383,7 @@ class CutRecord:
             "channel": self.channel, "continuity": self.continuity,
             "speech_quality": self.speech_quality, "total_quality": self.total_quality,
             "characteristics": self.characteristics, "camera": self.camera,
+            "sync_group_id": self.sync_group_id,
         }
 
 
@@ -515,11 +522,16 @@ def _junk_suspect_spans(junk_suspects: List[JunkSuspect], lattice: Lattice) -> L
     return out
 
 
-def _has_scene_or_transition(atoms: List, gap_lo: int, gap_hi: int) -> bool:
+def _has_scene_or_transition(atoms: List, gap_lo: int, gap_hi: int, *, synced: bool = False) -> bool:
     """A break-type atom boundary (shot cut / wipe / degenerate -- never an
     energy-regime edge) lands AT the seam's two boundary points (the common
     case: the cuts touch, ``gap_lo == gap_hi``) or strictly inside a nonzero
-    gap between them. Mirrors ``pass1._gap_seam``'s break-edge test."""
+    gap between them. Mirrors ``pass1._gap_seam``'s break-edge test,
+    including its ``synced`` skip (audio_sync.plan.md SS7.6): a synced
+    multicam file's picture is decoupled from the speech beat, so its own
+    shot boundary must not read as a hard continuity break."""
+    if synced:
+        return False
     for a in atoms:
         if a.end_ms == gap_lo and a.state_out in BREAK_BOUNDARY_REASONS:
             return True
@@ -549,7 +561,7 @@ def _has_flagged_break(junk_spans: List[Tuple[int, int]], gap_lo: int, gap_hi: i
 def _clip_continuity(
     file_id: str, idxs: List[int],
     resolved: List[Tuple[Pass2Cut, int, int, List[int]]],
-    lattice: Lattice, junk_spans: List[Tuple[int, int]],
+    lattice: Lattice, junk_spans: List[Tuple[int, int]], *, synced: bool = False,
 ) -> Dict[int, Dict[str, Any]]:
     """cut_no/of/prev_contiguous/next_contiguous/seam_reason_* for every cut on
     one clip, in source order over ALL cuts (incl. junk). One seam verdict per
@@ -570,7 +582,7 @@ def _clip_continuity(
             same_speaker=(cur_cut.speaker == nxt_cut.speaker),
             gap_ms=max(0, ns - ce),
             bridged_speech_ms=(ce - cs) + (ne - ns),
-            has_scene_or_transition=_has_scene_or_transition(lattice.atoms, ce, ns),
+            has_scene_or_transition=_has_scene_or_transition(lattice.atoms, ce, ns, synced=synced),
             has_flagged_break=_has_flagged_break(junk_spans, ce, ns),
         ))
         conts[pos]["next_contiguous"] = verdict.weldable
@@ -599,6 +611,8 @@ def assemble_cut_records(
     silences_by_file: Dict[str, List[dict]],
     junk_suspects: Optional[List[JunkSuspect]] = None,
     audio_by_file: Optional[Dict[str, Dict[str, Any]]] = None,
+    synced_file_ids: Optional[set] = None,
+    sync_group_by_file: Optional[Dict[str, str]] = None,
 ) -> List[CutRecord]:
     """Resolve every judged cut to its final ms span (word/atom edges only,
     by construction), enforce zero-overlap per file (gaps are legal -- cuts are
@@ -606,10 +620,13 @@ def assemble_cut_records(
     + continuity (cut_no/of + weldable-neighbor flags, over ALL cuts incl.
     junk) for each. ``junk_suspects`` (pass 1's, post-enforcement) feeds the
     continuity seam test's flagged-break signal; omit for a caller that has
-    none (continuity then just never reports a flagged break). Raises
-    ``ValueError`` (stage ``post``, per the plan's "no fallback" rule) on any
-    invariant violation -- the caller marks the ingest run ``failed`` for
-    re-run."""
+    none (continuity then just never reports a flagged break). ``synced_file_ids``
+    (audio_sync.plan.md SS7.6): file_ids in a synced multicam group, whose
+    continuity seam test skips the video shot-check -- see
+    ``_has_scene_or_transition``'s ``synced`` param; None/empty is identical
+    to today's behavior. Raises ``ValueError`` (stage ``post``, per the plan's
+    "no fallback" rule) on any invariant violation -- the caller marks the
+    ingest run ``failed`` for re-run."""
     junk_by_file: Dict[str, List[JunkSuspect]] = {}
     for js in (junk_suspects or []):
         junk_by_file.setdefault(js.file_id, []).append(js)
@@ -656,6 +673,7 @@ def assemble_cut_records(
         logger.warning("no cuts assigned for file(s) %s -- all-junk clip, or a "
                         "pass-2 omission worth checking", sorted(missing))
 
+    synced_ids = synced_file_ids or set()
     next_start: Dict[int, int] = {}
     continuity_by_idx: Dict[int, Dict[str, Any]] = {}
     for file_id, idxs in by_file.items():
@@ -666,7 +684,9 @@ def assemble_cut_records(
         for pos, i in enumerate(idxs):
             next_start[i] = resolved[idxs[pos + 1]][1] if pos + 1 < len(idxs) else duration_ms
         junk_spans = _junk_suspect_spans(junk_by_file.get(file_id, []), lattices[file_id])
-        continuity_by_idx.update(_clip_continuity(file_id, idxs, resolved, lattices[file_id], junk_spans))
+        continuity_by_idx.update(_clip_continuity(
+            file_id, idxs, resolved, lattices[file_id], junk_spans, synced=file_id in synced_ids,
+        ))
 
     out: List[CutRecord] = []
     for idx, (cut, s, e, anchors) in enumerate(resolved):
@@ -719,6 +739,7 @@ def assemble_cut_records(
                      else (cut.channel if cut.channel in ("done", "shown") else "shown")),
             continuity=continuity_by_idx.get(idx, {}),
             camera=classify_camera_move(motion, s, e),
+            sync_group_id=(sync_group_by_file or {}).get(cut.file_id),
         ))
     _enforce_take_winner(out)
     return out

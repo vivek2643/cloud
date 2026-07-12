@@ -296,6 +296,11 @@ def _to_cut_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         # A plain camera-move phrase (static / pan / tilt / zoom / follow /
         # shaky) so the brain knows how the shot moves without raw signals.
         "camera": row.get("camera") or "unknown",
+        # audio_sync.plan.md SS9: which sync_groups row (if any) this cut's
+        # audio belongs to -- footage_map._annotate_sync_groups reads this
+        # to tag "N angles share this audio", a structural fact, not
+        # editorial guidance (the brain still picks picture on its own).
+        "sync_group_id": row.get("sync_group_id"),
     }
 
 

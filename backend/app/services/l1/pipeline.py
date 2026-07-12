@@ -44,8 +44,11 @@ STAGES = ("proxy", "transcript", "audio_features", "diarization", "motion_dynami
 STAGES_V2 = STAGES + ("scene_detect",)
 # color grading: additive, independent of the cuts-v2 versioning above.
 STAGES_COLOR = STAGES_V2 + ("color_stats",)
-# Audio-only uploads (music) run a different, video-free set of stages.
-AUDIO_STAGES = ("audio_proxy", "audio_features")
+# Audio-only uploads run a different, video-free set of stages. `transcript`/
+# `diarization` are CONDITIONAL (audio_sync.plan.md SS4.1): they only run when
+# `audio_features.is_musical` comes back false (a spoken external-mic/audio
+# file, not music/SFX) -- see `_orchestrate_audio`.
+AUDIO_STAGES = ("audio_proxy", "audio_features", "transcript", "diarization")
 
 
 def _pg_conn() -> psycopg.Connection:
@@ -822,6 +825,20 @@ def _orchestrate_audio(file_id: str, r2_key: str, settings) -> None:
 
                 _run_stage(conn, file_id, "audio_features",
                            _stage5_audio, file_id, wav_path, conn)
+
+                # audio_sync.plan.md SS4.1: a spoken external-mic/audio upload
+                # needs a transcript + diarization to ever be an authoritative
+                # sync source. Gate on `is_musical` (the only "is this speech"
+                # signal that exists today -- see audio_features._detect_musicality)
+                # so a pure music/SFX file skips the heavy speech stages
+                # entirely, same as before this change.
+                row = conn.execute(
+                    "select is_musical from audio_features where file_id = %s", (file_id,)
+                ).fetchone()
+                is_musical = bool(row[0]) if row else False
+                if not is_musical:
+                    _run_stage(conn, file_id, "transcript", _stage2_transcript, file_id, wav_path, conn)
+                    _run_stage(conn, file_id, "diarization", _stage6_diarization, file_id, wav_path, conn)
 
         _set_l1_status(file_id, "ready")
         logger.info("L1(audio) complete for %s", file_id)

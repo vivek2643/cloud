@@ -144,8 +144,12 @@ _SYSTEM = (
 )
 
 
-def _render_clip_block(file_id: str, name: str, duration_ms: int, lattice: Lattice) -> str:
+def _render_clip_block(
+    file_id: str, name: str, duration_ms: int, lattice: Lattice, sync_hint: str | None = None,
+) -> str:
     lines = [f"=== CLIP {file_id} \"{name}\" ({duration_ms / 1000:.1f}s) ==="]
+    if sync_hint:
+        lines.append(sync_hint)
     if lattice.words:
         lines.append("TRANSCRIPT (word_idx:word, [Sx] marks a speaker change):")
         parts: List[str] = []
@@ -166,11 +170,21 @@ def _render_clip_block(file_id: str, name: str, duration_ms: int, lattice: Latti
     return "\n".join(lines)
 
 
-def build_pass1_blocks(file_rows: List[Tuple[str, str, int, Lattice]]) -> List[Dict[str, Any]]:
+def build_pass1_blocks(
+    file_rows: List[Tuple[str, str, int, Lattice]], sync_hints: Dict[str, str] | None = None,
+) -> List[Dict[str, Any]]:
     """One text block per clip. ``file_rows`` = [(file_id, name, duration_ms,
     lattice)]. All clips ride in ONE user turn so pass 1 reasons across the
-    whole project at once (cross-clip takes need this)."""
-    return [text_block(_render_clip_block(fid, name, dur, lat)) for fid, name, dur, lat in file_rows]
+    whole project at once (cross-clip takes need this). ``sync_hints``
+    (audio_sync.plan.md SS7.3): optional file_id -> hint line, feeding pass 1
+    the KNOWN simultaneity of a synced multicam group's members explicitly,
+    instead of leaving it to guess from (now byte-identical, re-based)
+    transcript overlap alone."""
+    sync_hints = sync_hints or {}
+    return [
+        text_block(_render_clip_block(fid, name, dur, lat, sync_hints.get(fid)))
+        for fid, name, dur, lat in file_rows
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -281,14 +295,22 @@ def _span_pieces(words: List[dict], atoms: List[Any], span: Tuple[int, int]) -> 
 
 def _gap_seam(
     words: List[dict], atoms: List[Any], i: int, junk_atom_ids: set,
-    beat_lo_ms: int, beat_hi_ms: int,
+    beat_lo_ms: int, beat_hi_ms: int, *, synced: bool = False,
 ):
     """Classify the atom-owned gap between word ``i`` and word ``i+1`` for a beat
     spanning [``beat_lo_ms``, ``beat_hi_ms``]. Returns ``(verdict, gap_atoms)``;
     ``(None, [])`` when the gap holds no atom (a bare inter-word pause -- never a
     boundary on its own). The break-edge test reads the atoms' OWN boundary
     reasons (shot cut / transition strictly inside the gap); an R_ACTION energy
-    edge is continuous footage, not a break."""
+    edge is continuous footage, not a break.
+
+    ``synced`` (audio_sync.plan.md SS7.6, recommended option (a)): this file
+    belongs to a synced multicam group, so its own picture is decoupled from
+    the speech beat -- a shot boundary in ITS atoms must NOT block an audio
+    weld (the brain can still cut to a clean angle on top; welding is now an
+    audio/semantic decision only). Skips the break-edge test entirely rather
+    than just forcing it False, so a synced gap's verdict never depends on
+    which angle happened to supply the atoms."""
     gap_lo = int(words[i].get("end_ms", 0))
     gap_hi = int(words[i + 1].get("start_ms", 0))
     if gap_hi <= gap_lo:
@@ -296,7 +318,7 @@ def _gap_seam(
     gap_atoms = [at for at in atoms if gap_lo <= (at.start_ms + at.end_ms) // 2 < gap_hi]
     if not gap_atoms:
         return None, []
-    has_break_edge = any(
+    has_break_edge = False if synced else any(
         (at.state_in in BREAK_BOUNDARY_REASONS and gap_lo < at.start_ms < gap_hi)
         or (at.state_out in BREAK_BOUNDARY_REASONS and gap_lo < at.end_ms < gap_hi)
         for at in gap_atoms
@@ -314,6 +336,7 @@ def _gap_seam(
 
 def _seam_split(
     words: List[dict], atoms: List[Any], span: Tuple[int, int], junk_atom_ids: set,
+    *, synced: bool = False,
 ) -> Tuple[List[Tuple[int, int]], List[int]]:
     """Seam-aware split of a single LLM word range (cuts_v3_speech_bridge.plan.md).
     Like ``_span_pieces``, but an atom-owned gap INSIDE the range is split ONLY
@@ -332,7 +355,7 @@ def _seam_split(
     absorbed: List[int] = []
     cur = a
     for i in range(a, b):
-        verdict, gap_atoms = _gap_seam(words, atoms, i, junk_atom_ids, beat_lo, beat_hi)
+        verdict, gap_atoms = _gap_seam(words, atoms, i, junk_atom_ids, beat_lo, beat_hi, synced=synced)
         if verdict is None:
             continue
         if verdict.weldable:
@@ -345,7 +368,7 @@ def _seam_split(
 
 
 def _merge_beats(
-    cuts: List[SpeechCut], lattice: Lattice, junk_atom_ids: set,
+    cuts: List[SpeechCut], lattice: Lattice, junk_atom_ids: set, *, synced: bool = False,
 ) -> Tuple[List[SpeechCut], List[int]]:
     """Merge consecutive same-file speech cuts the model tagged with the SAME
     beat_id into one continuous beat -- but ONLY across a weldable seam (the
@@ -373,7 +396,7 @@ def _merge_beats(
             beat_lo = int(words[prev.word_span[0]].get("start_ms", 0))
             beat_hi = int(words[sc.word_span[1]].get("end_ms", 0))
             verdict, gap_atoms = _gap_seam(words, atoms, prev.word_span[1], junk_atom_ids,
-                                           beat_lo, beat_hi)
+                                           beat_lo, beat_hi, synced=synced)
             # No atom in the gap -> a bare short pause; weld iff same speaker
             # (there is no break to cross). An atom present -> trust the full
             # seam verdict (which already checks the speaker).
@@ -539,13 +562,21 @@ def _contiguous_atom_runs(lattice: Lattice, atom_ids: List[int]) -> List[List[in
     return runs
 
 
-def enforce_lattice_partition(output: Pass1Output, lattices: Dict[str, Lattice]) -> Pass1Output:
+def enforce_lattice_partition(
+    output: Pass1Output, lattices: Dict[str, Lattice], synced_file_ids: "set | None" = None,
+) -> Pass1Output:
     """Deterministically repair pass 1's grouping against the lattice, and
     guarantee TOTAL COVERAGE -- the load-bearing rule of deterministic-keep
     (cuts_v3_deterministic_keep.plan.md): the model chooses MEANING (grouping,
     takes, what is junk), but it can never silently drop a word or an atom.
     Anything it leaves out of every group is surfaced as a recovered candidate;
     the ONLY way something disappears is an explicit, recoverable junk label.
+
+    ``synced_file_ids`` (audio_sync.plan.md SS7.6): file_ids belonging to a
+    synced multicam group, where a video shot boundary must NOT block an
+    audio weld (see `_gap_seam`'s ``synced`` param). None/empty -> identical
+    to today's behavior for every file (the no-multicam-regression guarantee,
+    SS2/SS15's last checklist item).
 
       1. Split any speech_cut at atom-owned gaps that are a HARD seam
          (``_seam_split`` / ``seam.classify_seam``); a WELDABLE gap is ABSORBED
@@ -583,13 +614,15 @@ def enforce_lattice_partition(output: Pass1Output, lattices: Dict[str, Lattice])
     # (below) and play inside the spoken beat instead of becoming a video cut.
     absorbed_atoms: Dict[str, set] = {}
     new_cuts: List[SpeechCut] = []
+    synced_ids = synced_file_ids or set()
     for sc in output.speech_cuts:
         lattice = lattices.get(sc.file_id)
         if lattice is None or not lattice.words:
             new_cuts.append(sc)
             continue
         pieces, absorbed = _seam_split(lattice.words, lattice.atoms, tuple(sc.word_span),
-                                       junk_atom_ids.get(sc.file_id, set()))
+                                       junk_atom_ids.get(sc.file_id, set()),
+                                       synced=sc.file_id in synced_ids)
         if absorbed:
             absorbed_atoms.setdefault(sc.file_id, set()).update(absorbed)
             logger.info("pass1 enforce: beat %r words[%d-%d] absorbed %d atom(s) across "
@@ -645,7 +678,8 @@ def enforce_lattice_partition(output: Pass1Output, lattices: Dict[str, Lattice])
         lattice = lattices.get(file_id)
         if lattice is not None and lattice.words:
             file_cuts, merged_absorbed = _merge_beats(file_cuts, lattice,
-                                                      junk_atom_ids.get(file_id, set()))
+                                                      junk_atom_ids.get(file_id, set()),
+                                                      synced=file_id in synced_ids)
             if merged_absorbed:
                 absorbed_atoms.setdefault(file_id, set()).update(merged_absorbed)
                 logger.info("pass1 enforce: merged same-beat neighbours in %s, absorbing "
@@ -756,13 +790,16 @@ def enforce_lattice_partition(output: Pass1Output, lattices: Dict[str, Lattice])
 # Orchestration
 # --------------------------------------------------------------------------
 
-def run_pass1(file_rows: List[Tuple[str, str, int, Lattice]]) -> ic.Completion:
+def run_pass1(
+    file_rows: List[Tuple[str, str, int, Lattice]], sync_hints: Dict[str, str] | None = None,
+) -> ic.Completion:
     """The ingest's first model call: everything, all clips at once. Makes
     exactly one ``llm.client.complete`` call over already-loaded lattices --
-    no DB write here (the caller persists the result onto ``ingest_runs``)."""
+    no DB write here (the caller persists the result onto ``ingest_runs``).
+    ``sync_hints``: see `build_pass1_blocks`."""
     if not file_rows:
         raise ValueError("run_pass1: no files to ingest")
-    blocks = build_pass1_blocks(file_rows)
+    blocks = build_pass1_blocks(file_rows, sync_hints)
     lattices = {fid: lat for fid, _name, _dur, lat in file_rows}
     def _checks(output: Pass1Output) -> str | None:
         return (_word_spans_in_range(output, lattices)

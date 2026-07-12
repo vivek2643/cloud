@@ -43,6 +43,15 @@ def _durations(file_ids: List[str]) -> Dict[str, int]:
     return {r[0]: int(float(r[1]) * 1000) for r in rows}
 
 
+def _resolve_audio_routes(timeline: List[dict]) -> Dict[str, dict]:
+    try:
+        from app.services.l3.sync.audio_route import resolve_audio_routes
+        return resolve_audio_routes(timeline)
+    except Exception:
+        logger.exception("resolve_document: sync audio-route lookup failed (continuing without re-routing)")
+        return {}
+
+
 def _resolve_captions(document: Dict[str, Any], resolved: Dict[str, Any]) -> List[Dict[str, Any]]:
     try:
         from app.services.l3.captions.resolver import resolve_captions_for_document
@@ -66,14 +75,23 @@ def resolve_document(document: Dict[str, Any]) -> Dict[str, Any]:
         if "captions" not in res:
             res["captions"] = _resolve_captions(document, res)
         return res
-    fids = list({s["file_id"] for s in (document.get("timeline") or [])})
+    timeline = document.get("timeline") or []
+    fids = list({s["file_id"] for s in timeline})
     color_stats: Dict[str, dict] = {}
     try:
         from app.services.l3.grade.measure import fetch_color_stats
         color_stats = fetch_color_stats(fids)
     except Exception:
         logger.exception("resolve_document: color_stats lookup failed (continuing)")
-    resolved = layers.resolve(document, _durations(fids), color_stats).to_dict()
+    audio_routes = _resolve_audio_routes(timeline)
+    # A synced group's authoritative source may be a file that's never itself
+    # a spine angle (e.g. a dedicated external mic) -- durations must cover
+    # it too so `_apply_split_edits`'s clamp has real footage room to work
+    # with (audio_sync.plan.md SS8).
+    route_fids = {r["source_file_id"] for r in audio_routes.values()}
+    resolved = layers.resolve(
+        document, _durations(list(set(fids) | route_fids)), color_stats, audio_routes,
+    ).to_dict()
     resolved["captions"] = _resolve_captions(document, resolved)
     return resolved
 

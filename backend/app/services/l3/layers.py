@@ -519,6 +519,7 @@ def resolve(
     document: dict,
     durations: Optional[Dict[str, int]] = None,
     color_stats: Optional[Dict[str, dict]] = None,
+    audio_routes: Optional[Dict[str, dict]] = None,
 ) -> ResolvedTimeline:
     """Compile the spine + operations into the flat resolved layer set.
 
@@ -528,9 +529,16 @@ def resolve(
     `color_stats` (file_id -> L1 color_stats row, see grade.measure) feeds the
     correct layer (SS5); a missing/absent entry just means that clip's grade
     stays identity (never-worse: no measurement, no basis to change anything).
+    `audio_routes` (audio_sync.plan.md SS8, see `sync.audio_route.resolve_audio_routes`):
+    seg_id -> {source_file_id, src_in_ms, src_out_ms} for a spine segment
+    whose cut belongs to a synced group -- the picture stays the shown
+    angle, but the coupled AudioLayer is re-routed to the group's
+    authoritative source instead. Missing entry -> today's coupled audio,
+    unchanged (the no-multicam-regression guarantee).
     """
     durations = durations or {}
     color_stats = color_stats or {}
+    audio_routes = audio_routes or {}
     timeline = document.get("timeline") or []
     operations = document.get("operations") or []
     spans, total = spine_spans(timeline)
@@ -557,11 +565,13 @@ def resolve(
                 match_delta=match_deltas.get(seg["file_id"]),
             ),
         ))
+        route = audio_routes.get(seg["seg_id"])
         audio.append(AudioLayer(
             layer_id=f"a_{seg['seg_id']}",
             role=ROLE_DIALOGUE,
-            source_file_id=seg["file_id"],
-            src_in_ms=int(seg["in_ms"]), src_out_ms=int(seg["out_ms"]),
+            source_file_id=route["source_file_id"] if route else seg["file_id"],
+            src_in_ms=int(route["src_in_ms"]) if route else int(seg["in_ms"]),
+            src_out_ms=int(route["src_out_ms"]) if route else int(seg["out_ms"]),
             prog_start_ms=s.prog_start_ms, prog_end_ms=s.prog_end_ms,
             kind="spine",
             # A muted segment (stray speech under a video cut) keeps its picture

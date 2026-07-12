@@ -45,6 +45,8 @@ from app.services.l3 import pass2a
 from app.services.l3 import pass2b
 from app.services.l3 import post
 from app.services.l3.lattice import Lattice
+from app.services.l3.sync import store as sync_store
+from app.services.l3.sync.lattice_merge import apply_sync_groups
 from app.services.l3.pass2_params import (
     MAX_CUTS_PER_VISUAL_BATCH, MAX_PARALLEL_SHARDS, MAX_PARALLEL_VISUAL_BATCHES, STILL_WIDTH_PX,
 )
@@ -113,19 +115,32 @@ def run_ingest(project_id: str) -> str:
         file_rows = pass1.load_project_file_rows(project_id)
         if not file_rows:
             raise ValueError(f"project {project_id} has no ingest-ready files")
+
+        # audio_sync.plan.md SS2/SS7: pin whatever sync groups exist for
+        # this project's files RIGHT NOW (a later re-sync must not mutate
+        # this run -- SS6 "pinning") and swap each synced angle's Lattice
+        # speech side onto its group's authoritative source. A project with
+        # no declared sync groups is untouched here (`sync_by_file` empty
+        # -> `file_rows`/hints/synced_ids all pass through as-is): the
+        # no-multicam-regression guarantee (SS2/SS15's last checklist item).
+        pre_file_ids = [fid for fid, _name, _dur, _lat in file_rows]
+        sync_by_file = sync_store.sync_groups_for_files(pre_file_ids)
+        file_rows, sync_hints, synced_file_ids = apply_sync_groups(file_rows, sync_by_file)
+        sync_group_by_file = {fid: g["group_id"] for fid, g in sync_by_file.items()}
+
         lattices: Dict[str, Lattice] = {fid: lat for fid, _name, _dur, lat in file_rows}
         file_ids = list(lattices.keys())
         motion_by_file, scene_by_file, silences_by_file, audio_by_file = _load_signals(file_ids)
         proxy_keys = _proxy_keys_for_files(file_ids)
 
         store.set_status(ingest_run_id, "pass1")
-        pass1_completion = pass1.run_pass1(file_rows)
+        pass1_completion = pass1.run_pass1(file_rows, sync_hints)
         pass1_output = pass1.Pass1Output.model_validate(pass1_completion.data)
         # Deterministic boundary repair (split cuts crossing atom-owned gaps,
         # realign take members) -- the model owns meaning, the lattice owns
         # boundaries. The ENFORCED output is what gets persisted: pass 2's
         # cached prefix and the image plan must see the same refs.
-        pass1_output = pass1.enforce_lattice_partition(pass1_output, lattices)
+        pass1_output = pass1.enforce_lattice_partition(pass1_output, lattices, synced_file_ids)
         store.record_pass1_result(ingest_run_id, pass1_output.model_dump(), pass1_completion.usage,
                                   pass1_output.project_summary)
 
@@ -190,7 +205,9 @@ def run_ingest(project_id: str) -> str:
         store.set_status(ingest_run_id, "post")
         records = post.assemble_cut_records(pass2_output, lattices, motion_by_file, silences_by_file,
                                             junk_suspects=pass1_output.junk_suspects,
-                                            audio_by_file=audio_by_file)
+                                            audio_by_file=audio_by_file,
+                                            synced_file_ids=synced_file_ids,
+                                            sync_group_by_file=sync_group_by_file)
 
         store.delete_cut_records_for_run(ingest_run_id)
         record_ids = store.insert_cut_records(ingest_run_id, records)
