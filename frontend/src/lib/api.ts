@@ -1010,9 +1010,18 @@ export interface SyncDetectMember {
   high_confidence: boolean;
 }
 
-export interface SyncDetectResult {
+export interface SyncDetectGroup {
   members: SyncDetectMember[];
   suggested_authoritative_file_id: string | null;
+}
+
+export interface SyncDetectResult {
+  // The selected files partitioned into same-audio groups (all-pairs overlap).
+  // May be more than one group (e.g. two camera pairs split by a recording
+  // break) or empty (none of the files share audio).
+  groups: SyncDetectGroup[];
+  // Usable files that overlapped nobody -- they use their own audio.
+  ungrouped_file_ids: string[];
   unusable_file_ids: string[];
 }
 

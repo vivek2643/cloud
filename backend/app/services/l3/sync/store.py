@@ -117,8 +117,11 @@ def sync_groups_for_files(file_ids: List[str]) -> Dict[str, Dict[str, Any]]:
             "members": {},
         })
         # confidence/aligned_by are ALIGNMENT-QUALITY metadata (drive the
-        # nudge-me UI hint), not a grouping gate: every declared member is an
-        # outlook of the others regardless (lattice_merge.outlook_groups).
+        # nudge-me UI hint), not a grouping gate. Group membership is already
+        # decided at DETECTION by audio overlap (detect.partition_by_overlap):
+        # a persisted group's members genuinely share the same real-time audio,
+        # so every one is a true outlook of the others regardless of how tightly
+        # its individual offset happened to align (lattice_merge.outlook_groups).
         g["members"][r["file_id"]] = {
             "offset_ms": r["offset_ms"], "role": r["role"],
             "confidence": r["confidence"], "aligned_by": r["aligned_by"],

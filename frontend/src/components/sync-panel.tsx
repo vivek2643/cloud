@@ -2,11 +2,14 @@
 
 /**
  * Outlook (alternate-angle) declare/nudge panel. Opened via `SyncButton`
- * (search-edit-bar.tsx) once 2+ files are selected in Drive. Declaring an
- * outlook group tells ingest these clips are alternate cameras of the same
- * moment: they share one authoritative audio track and switch freely on
- * picture. Alignment confidence is only about how well the offsets line up
- * (nudge to fix); every declared member is grouped as an outlook regardless.
+ * (search-edit-bar.tsx) once 2+ files are selected in Drive. It runs an
+ * all-pairs audio-overlap detection: the selected files are partitioned into
+ * however many same-audio GROUPS actually exist (files that carry the same
+ * real-time audio group together; a post-break continuation or unrelated clip
+ * falls into its own group or stays ungrouped). Each group shares one
+ * authoritative audio track and switches freely on picture. Alignment
+ * confidence is only about how tightly a member's offset lines up (nudge to
+ * fix); it never decides membership -- overlap does, at detection.
  * v1 UI simplification: a numeric offset field per member rather than a
  * draggable stacked-waveform view -- the `timeline-editor.tsx` `Waveform`
  * component (client-side peak decode from the playback proxy) is the
@@ -30,7 +33,9 @@ export function SyncPanel() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<SyncDetectResult | null>(null);
-  const [authoritative, setAuthoritative] = useState<string | null>(null);
+  // Per detected group: chosen authoritative file id (indexed by group order).
+  const [authoritative, setAuthoritative] = useState<Record<number, string | null>>({});
+  // Offsets are keyed by file id (unique across groups).
   const [offsets, setOffsets] = useState<Record<string, number>>({});
   const [saving, setSaving] = useState(false);
   const [done, setDone] = useState(false);
@@ -44,8 +49,14 @@ export function SyncPanel() {
     detectSync(syncScopeFileIds, token)
       .then((res) => {
         setResult(res);
-        setAuthoritative(res.suggested_authoritative_file_id);
-        setOffsets(Object.fromEntries(res.members.map((m) => [m.file_id, m.offset_ms])));
+        setAuthoritative(
+          Object.fromEntries(res.groups.map((g, i) => [i, g.suggested_authoritative_file_id])),
+        );
+        setOffsets(
+          Object.fromEntries(
+            res.groups.flatMap((g) => g.members.map((m) => [m.file_id, m.offset_ms])),
+          ),
+        );
       })
       .catch((e) => setError(e instanceof Error ? e.message : "Detection failed."))
       .finally(() => setLoading(false));
@@ -62,27 +73,34 @@ export function SyncPanel() {
     setSaving(true);
     setError(null);
     try {
-      await createSyncGroup(
-        result.members.map((m) => {
-          const edited = (offsets[m.file_id] ?? m.offset_ms) !== m.offset_ms;
-          return {
-            file_id: m.file_id,
-            offset_ms: offsets[m.file_id] ?? m.offset_ms,
-            role: m.role,
-            confidence: edited ? null : m.confidence,
-            aligned_by: (edited ? "manual" : m.aligned_by) as SyncAlignedBy,
-          };
-        }),
-        token,
-        authoritative,
+      // One persisted sync group per detected same-audio group.
+      await Promise.all(
+        result.groups.map((g, i) =>
+          createSyncGroup(
+            g.members.map((m) => {
+              const edited = (offsets[m.file_id] ?? m.offset_ms) !== m.offset_ms;
+              return {
+                file_id: m.file_id,
+                offset_ms: offsets[m.file_id] ?? m.offset_ms,
+                role: m.role,
+                confidence: edited ? null : m.confidence,
+                aligned_by: (edited ? "manual" : m.aligned_by) as SyncAlignedBy,
+              };
+            }),
+            token,
+            authoritative[i],
+          ),
+        ),
       );
       setDone(true);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not save the sync group.");
+      setError(e instanceof Error ? e.message : "Could not save the outlook group(s).");
     } finally {
       setSaving(false);
     }
   }
+
+  const groups = result?.groups ?? [];
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(0,0,0,0.6)" }}>
@@ -93,7 +111,7 @@ export function SyncPanel() {
         <div className="mb-4 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Waves size={16} style={{ color: "var(--accent)" }} />
-            <p className="text-sm font-medium">Outlook group · {syncScopeFileIds.length} files</p>
+            <p className="text-sm font-medium">Outlook · {syncScopeFileIds.length} files</p>
           </div>
           <button onClick={closeSyncPanel} className="rounded p-1 hover:bg-[var(--accent-soft)]">
             <X size={16} />
@@ -112,55 +130,83 @@ export function SyncPanel() {
           <div className="space-y-4">
             {result.unusable_file_ids.length > 0 && (
               <p className="text-[11px]" style={{ color: "var(--danger)" }}>
-                Could not read audio from {result.unusable_file_ids.length} file(s) -- excluded below.
+                Could not read audio from {result.unusable_file_ids.length} file(s) -- excluded.
               </p>
             )}
-            <div className="max-h-80 space-y-2 overflow-y-auto">
-              {result.members.map((m) => (
-                <div
-                  key={m.file_id}
-                  className="flex items-center gap-2 rounded-lg border px-3 py-2"
-                  style={{ borderColor: "var(--border)" }}
-                >
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-[12px] font-medium">{fileName(m.file_id)}</p>
-                    <p className="text-[10px]" style={{ color: "var(--muted)" }}>
-                      {m.role === "audio" ? "external audio" : "camera angle"}
+
+            {groups.length === 0 && (
+              <p className="py-4 text-center text-[12px]" style={{ color: "var(--muted)" }}>
+                None of these files share the same audio, so there is no outlook group to
+                create. They will each keep their own audio.
+              </p>
+            )}
+
+            {groups.length > 1 && (
+              <p className="text-[11px]" style={{ color: "var(--muted)" }}>
+                Found {groups.length} separate groups — these files don&apos;t all share one
+                audio (likely a recording break). Each group is aligned on its own.
+              </p>
+            )}
+
+            <div className="max-h-80 space-y-4 overflow-y-auto">
+              {groups.map((group, gi) => (
+                <div key={gi} className="space-y-2">
+                  {groups.length > 1 && (
+                    <p className="text-[11px] font-medium" style={{ color: "var(--muted)" }}>
+                      Group {gi + 1} · {group.members.length} files
                     </p>
-                  </div>
-                  <input
-                    type="number"
-                    value={offsets[m.file_id] ?? m.offset_ms}
-                    onChange={(e) => setOffsets((prev) => ({ ...prev, [m.file_id]: Number(e.target.value) }))}
-                    className="w-24 rounded border bg-transparent px-2 py-1 text-right text-[12px] tabular-nums outline-none"
-                    style={{ borderColor: "var(--border)" }}
-                  />
-                  <span className="text-[10px]" style={{ color: "var(--muted)" }}>ms</span>
-                  <span title={m.high_confidence ? "High confidence" : "Low confidence -- check this offset"}>
-                    {m.high_confidence ? (
-                      <CheckCircle2 size={14} style={{ color: "var(--success)" }} />
-                    ) : (
-                      <AlertTriangle size={14} style={{ color: "var(--danger)" }} />
-                    )}
-                  </span>
-                  <label className="flex items-center gap-1 text-[10px]" style={{ color: "var(--muted)" }}>
-                    <input
-                      type="radio"
-                      name="authoritative"
-                      checked={authoritative === m.file_id}
-                      onChange={() => setAuthoritative(m.file_id)}
-                    />
-                    authoritative
-                  </label>
+                  )}
+                  {group.members.map((m) => (
+                    <div
+                      key={m.file_id}
+                      className="flex items-center gap-2 rounded-lg border px-3 py-2"
+                      style={{ borderColor: "var(--border)" }}
+                    >
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-[12px] font-medium">{fileName(m.file_id)}</p>
+                        <p className="text-[10px]" style={{ color: "var(--muted)" }}>
+                          {m.role === "audio" ? "external audio" : "camera angle"}
+                        </p>
+                      </div>
+                      <input
+                        type="number"
+                        value={offsets[m.file_id] ?? m.offset_ms}
+                        onChange={(e) =>
+                          setOffsets((prev) => ({ ...prev, [m.file_id]: Number(e.target.value) }))
+                        }
+                        className="w-24 rounded border bg-transparent px-2 py-1 text-right text-[12px] tabular-nums outline-none"
+                        style={{ borderColor: "var(--border)" }}
+                      />
+                      <span className="text-[10px]" style={{ color: "var(--muted)" }}>ms</span>
+                      <span title={m.high_confidence ? "High confidence" : "Low confidence -- check this offset"}>
+                        {m.high_confidence ? (
+                          <CheckCircle2 size={14} style={{ color: "var(--success)" }} />
+                        ) : (
+                          <AlertTriangle size={14} style={{ color: "var(--danger)" }} />
+                        )}
+                      </span>
+                      <label className="flex items-center gap-1 text-[10px]" style={{ color: "var(--muted)" }}>
+                        <input
+                          type="radio"
+                          name={`authoritative-${gi}`}
+                          checked={authoritative[gi] === m.file_id}
+                          onChange={() => setAuthoritative((prev) => ({ ...prev, [gi]: m.file_id }))}
+                        />
+                        authoritative
+                      </label>
+                    </div>
+                  ))}
                 </div>
               ))}
             </div>
-            {result.members.some((m) => !m.high_confidence) && (
+
+            {groups.some((g) => g.members.some((m) => !m.high_confidence)) && (
               <p className="text-[11px]" style={{ color: "var(--muted)" }}>
                 Weak auto-alignment on some angles -- nudge their offsets so the picture lines
                 up. They still join as outlooks either way.
               </p>
             )}
+
             <div className="flex justify-end gap-2">
               <button
                 onClick={closeSyncPanel}
@@ -171,12 +217,12 @@ export function SyncPanel() {
               </button>
               <button
                 onClick={() => void confirm()}
-                disabled={saving}
+                disabled={saving || groups.length === 0}
                 className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] font-medium disabled:opacity-50"
                 style={{ background: "var(--accent)", color: "var(--background)" }}
               >
                 {saving && <Loader2 size={12} className="animate-spin" />}
-                Confirm outlook group
+                {groups.length > 1 ? `Confirm ${groups.length} groups` : "Confirm outlook group"}
               </button>
             </div>
           </div>
@@ -187,7 +233,7 @@ export function SyncPanel() {
             <CheckCircle2 size={28} style={{ color: "var(--success)" }} />
             <p className="text-[13px]">
               Grouped as outlooks. Ingesting these files will now use one authoritative
-              audio source across every angle.
+              audio source across every angle in each group.
             </p>
             <button
               onClick={closeSyncPanel}

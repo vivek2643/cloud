@@ -27,7 +27,7 @@ from app.auth import get_current_user_id
 from app.services.l3.projects import find_or_create_project
 from app.services.l3.sync import store as sync_store
 from app.services.l3.sync.authoritative import GroupMember, pick_authoritative
-from app.services.l3.sync.detect import envelope, solve_group_offsets
+from app.services.l3.sync.detect import HIGH_CONFIDENCE_THRESHOLD, envelope, partition_by_overlap
 from app.services.processing import _download_from_r2
 
 logger = logging.getLogger(__name__)
@@ -108,26 +108,38 @@ def detect_sync(body: DetectBody, user_id: str = Depends(get_current_user_id)) -
     if len(usable) < 2:
         raise HTTPException(status_code=422, detail="Could not extract usable audio from at least 2 files")
 
-    alignments = solve_group_offsets(usable)
+    # All-pairs overlap partition: the selected files may resolve into MORE THAN
+    # ONE same-audio group (e.g. two camera pairs split across a recording break
+    # -- block-1 cams overlap each other, block-2 cams overlap each other, but
+    # the two blocks don't overlap at all). Each detected group is previewed
+    # separately; files that overlap nobody come back as `ungrouped_file_ids`.
+    detected, ungrouped = partition_by_overlap(usable)
     roles = body.roles or {}
     audio_features = _fetch_audio_features(list(found_ids))
     role_of = {f["id"]: roles.get(f["id"]) or ("audio" if f["file_type"] == "audio" else "video_angle")
                for f in files}
-    auth_fid = pick_authoritative([
-        GroupMember(file_id=fid, role=role_of.get(fid, "video_angle"), audio_features=audio_features.get(fid))
-        for fid in usable
-    ])
+
+    groups = []
+    for grp in detected:
+        auth_fid = pick_authoritative([
+            GroupMember(file_id=fid, role=role_of.get(fid, "video_angle"), audio_features=audio_features.get(fid))
+            for fid in grp
+        ])
+        groups.append({
+            "members": [
+                {
+                    "file_id": fid, "offset_ms": pa.offset_ms, "confidence": round(pa.confidence, 3),
+                    "role": role_of.get(fid, "video_angle"), "aligned_by": "auto",
+                    "high_confidence": pa.confidence >= HIGH_CONFIDENCE_THRESHOLD,
+                }
+                for fid, pa in grp.items()
+            ],
+            "suggested_authoritative_file_id": auth_fid,
+        })
 
     return {
-        "members": [
-            {
-                "file_id": fid, "offset_ms": pa.offset_ms, "confidence": round(pa.confidence, 3),
-                "role": role_of.get(fid, "video_angle"), "aligned_by": "auto",
-                "high_confidence": pa.confidence >= 0.3,
-            }
-            for fid, pa in alignments.items()
-        ],
-        "suggested_authoritative_file_id": auth_fid,
+        "groups": groups,
+        "ungrouped_file_ids": ungrouped,
         "unusable_file_ids": [fid for fid in body.file_ids if fid not in usable],
     }
 
