@@ -21,7 +21,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Set, Tuple
 
 from app.services.l3.diarize import Turn
-from app.services.l3.lattice import Lattice
+from app.services.l3.lattice import Lattice, build_atoms, load_motion_scene
 
 
 def _retime_words(words: List[dict], delta_ms: int) -> List[dict]:
@@ -36,22 +36,37 @@ def _retime_turns(turns: List[Turn], delta_ms: int) -> List[Turn]:
 
 
 def authoritative_view(angle_lattice: Lattice, authoritative: Lattice, delta_ms: int) -> Lattice:
-    """`angle_lattice` (this file's own -- keeps its real per-angle atoms)
-    with its speech side replaced by `authoritative`'s words/turns/hints,
-    shifted by `delta_ms` onto `angle_lattice`'s own clock. `delta_ms` =
-    `authoritative_offset_ms - angle_offset_ms` (the group-clock term
-    cancels: `group_ms = auth_ms + auth_offset == angle_ms + angle_offset`
+    """`angle_lattice` with its speech side replaced by `authoritative`'s
+    words/turns/hints, shifted by `delta_ms` onto `angle_lattice`'s own clock.
+    `delta_ms` = `authoritative_offset_ms - angle_offset_ms` (the group-clock
+    term cancels: `group_ms = auth_ms + auth_offset == angle_ms + angle_offset`
     => `angle_ms = auth_ms + (auth_offset - angle_offset)`; see
     `sync/detect.py`'s offset convention). `hints` are copied UNCHANGED:
     `speech_hints` text only ever references word INDEX positions and
-    relative gap durations, both invariant under a constant ms shift."""
+    relative gap durations, both invariant under a constant ms shift.
+
+    Atoms are REBUILT (not carried over) against the re-based authoritative
+    words, using THIS angle's own motion/scene. That keeps them genuinely
+    per-angle (SS7.4: framing/movement is real per-angle content, sourced from
+    this angle's video) while restoring `build_atoms`'s structural guarantee
+    that a video atom never overlaps speech: the original atoms were carved
+    against this angle's OWN (now-discarded) word timings, so after the swap a
+    (shifted) authoritative word span could straddle a stale atom -- which
+    breaks the speech/atom partition `enforce_lattice_partition` asserts
+    (`_no_speech_cut_swallows_atoms`). Re-deriving them against the words they
+    now coexist with makes the partition hold by construction again."""
+    words = _retime_words(authoritative.words, delta_ms)
+    turns = _retime_turns(authoritative.turns, delta_ms)
+    motion, scene = load_motion_scene(angle_lattice.file_id)
+    atoms = build_atoms(angle_lattice.file_id, angle_lattice.duration_ms,
+                        motion, scene, turns, words=words)
     return Lattice(
         file_id=angle_lattice.file_id,
         duration_ms=angle_lattice.duration_ms,
-        words=_retime_words(authoritative.words, delta_ms),
-        turns=_retime_turns(authoritative.turns, delta_ms),
+        words=words,
+        turns=turns,
         hints=list(authoritative.hints),
-        atoms=angle_lattice.atoms,
+        atoms=atoms,
     )
 
 

@@ -522,19 +522,13 @@ def snap_word_edge(file_id: str, word_idx: int) -> int:
     return _snap_word_edge(words, word_idx, silences)
 
 
-def load_lattice(file_id: str) -> Optional[Lattice]:
-    """Load one file's full lattice (words + hints + video atoms). None when
-    the file has no duration yet."""
-    from app.services.l3.diarize import load_turns
-
+def load_motion_scene(file_id: str) -> Tuple[Optional[dict], Optional[dict]]:
+    """The ``motion_dynamics`` + ``scene_cuts`` signals for one file, in the
+    exact shape ``build_atoms`` expects. Extracted from ``load_lattice`` so the
+    sync speech-swap can REBUILD a synced angle's atoms against the
+    authoritative (re-based) words while still using THIS angle's own motion/
+    scene -- see ``sync/lattice_merge.authoritative_view``."""
     with _pg_conn() as conn:
-        row = conn.execute(
-            "select duration_seconds from files where id = %s", (file_id,)
-        ).fetchone()
-        if not row or not row[0]:
-            return None
-        duration_ms = int(float(row[0]) * 1000)
-
         m = conn.execute(
             """select hop_ms, camera_stability, camera_coherence, camera_motion,
                       blur, camera_cut_cost, action_energy, action_points,
@@ -551,12 +545,27 @@ def load_lattice(file_id: str) -> Optional[Lattice]:
                 "action_energy": m[6] or [], "action_points": m[7] or [],
                 "transition_points": m[8] or [],
             }
-
         s = conn.execute(
             "select shot_points from scene_cuts where file_id = %s", (file_id,)
         ).fetchone()
         scene = {"shot_points": s[0] or []} if s else None
+    return motion, scene
 
+
+def load_lattice(file_id: str) -> Optional[Lattice]:
+    """Load one file's full lattice (words + hints + video atoms). None when
+    the file has no duration yet."""
+    from app.services.l3.diarize import load_turns
+
+    with _pg_conn() as conn:
+        row = conn.execute(
+            "select duration_seconds from files where id = %s", (file_id,)
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        duration_ms = int(float(row[0]) * 1000)
+
+    motion, scene = load_motion_scene(file_id)
     words = _load_words(file_id)
     _text, _speakers, turns = load_turns(file_id, turn_gap_ms=LONG_PAUSE_MS)
     atoms = build_atoms(file_id, duration_ms, motion, scene, turns, words=words)
