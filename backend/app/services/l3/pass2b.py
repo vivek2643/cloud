@@ -82,6 +82,25 @@ class TasteFences(BaseModel):
     min_tasteful_speed: float = 1.0
 
 
+class Appearance(BaseModel):
+    """Structured, STABLE-ONLY identity traits (identity_map.plan.md Phase 0):
+    categorical fields code can match exactly, instead of parsing free prose.
+    Deliberately excludes anything volatile (clothing, pose, current action)
+    -- those change shot to shot and would poison the cross-file fingerprint
+    `identity/reconcile.py` clusters on. Every field is optional/"unsure";
+    the model states what it can actually see, never guesses to fill a slot."""
+    model_config = ConfigDict(extra="forbid")
+
+    apparent_gender: str | None = None    # "male" | "female" | "unsure"
+    apparent_age_band: str | None = None  # "child"|"teen"|"20s"|"30s"|"40s"|"50s"|"60s+"|"unsure"
+    hair: str | None = None               # "bald"|"very_short"|"short"|"medium"|"long"|"unsure"
+    hair_color: str | None = None         # "black"|"brown"|"blonde"|"grey"|"white"|"red"|"unsure"
+    facial_hair: str | None = None        # "none"|"stubble"|"moustache"|"beard"|"goatee"|"unsure"
+    glasses: str | None = None            # "yes"|"no"|"unsure"
+    skin_tone: str | None = None          # "light"|"medium"|"tan"|"dark"|"unsure"
+    build: str | None = None              # "slim"|"average"|"heavy"|"unsure"
+
+
 class PersonLook(BaseModel):
     """A concise visual fingerprint of one person visible in the cut -- enough
     to recognise the same person across cuts by eye, never an identity claim.
@@ -90,6 +109,7 @@ class PersonLook(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     description: str                       # e.g. "man, short dark hair, beard, grey hoodie"
+    appearance: Appearance = Field(default_factory=Appearance)  # stable-trait fingerprint, see Appearance
     position: str | None = None            # rough frame position: "left" | "center" | "right"
     speaking: bool | None = None           # mouth visibly moving in these frames
 
@@ -158,6 +178,15 @@ _SYSTEM = (
     "whether their mouth is visibly moving (speaking). No people on screen "
     "-> empty list. Describe appearance only; never guess names or assign "
     "any score.\n\n"
+    "Each person ALSO gets a structured `appearance` (nested inside that "
+    "person, alongside description/position/speaking): apparent_gender, "
+    "apparent_age_band, hair, hair_color, facial_hair, glasses, skin_tone, "
+    "build -- each one of its listed categories, or omitted/\"unsure\" if not "
+    "clearly visible. These are for matching the SAME PERSON across "
+    "different cuts and different camera angles, so use ONLY traits that "
+    "stay stable shot to shot: never clothing, never pose, never what they "
+    "are doing right now -- those belong in `description`/`position`, not "
+    "`appearance`. Leave a field unset rather than guess.\n\n"
     "Reference every judgment by cut_index, the integer given in the CUT "
     "list and image captions -- one judgment per cut in this batch, no "
     "more, no fewer."

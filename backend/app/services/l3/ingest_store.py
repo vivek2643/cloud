@@ -59,6 +59,31 @@ def record_pass1_result(ingest_run_id: str, pass1_output: Dict[str, Any],
         )
 
 
+def set_identity_map(ingest_run_id: str, identity_map: Dict[str, Any]) -> None:
+    """Persist this run's reconciled-cast payload (identity_map.plan.md
+    Phase 3b) -- `footage_map.assemble_map` loads it back by `run_id` to
+    fill the `oncam`/`alias` maps."""
+    with _pg_conn() as conn:
+        conn.execute(
+            "update ingest_runs set identity_map = %s where id = %s",
+            (json.dumps(identity_map), ingest_run_id),
+        )
+
+
+def get_identity_map(ingest_run_id: str) -> Optional[Dict[str, Any]]:
+    """None for an older run, a run identity reconciliation found nothing
+    to bind/cluster for, or an unknown run id -- callers treat that as
+    "no reconciled cast," never an error (fail-open, same contract as
+    every other identity_map fallback)."""
+    with _pg_conn() as conn:
+        row = conn.execute(
+            "select identity_map from ingest_runs where id = %s", (ingest_run_id,)
+        ).fetchone()
+    if not row or not row[0]:
+        return None
+    return row[0] if isinstance(row[0], dict) else json.loads(row[0])
+
+
 def accumulate_pass2_usage(ingest_run_id: str, usage: Dict[str, int]) -> None:
     with _pg_conn() as conn:
         conn.execute(

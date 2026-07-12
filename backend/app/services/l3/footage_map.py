@@ -895,6 +895,35 @@ def _annotate_outlook_groups(trees: List[Dict[str, Any]]) -> None:
                 m["outlook_angle_count"] = len(angles)
 
 
+def _identity_maps_for(file_ids: List[str], run_id: Optional[str]) -> Tuple[Optional[Dict[str, str]], Optional[Dict[Any, str]]]:
+    """(oncam, alias) for the covering ingest run's reconciled cast
+    (identity_map.plan.md Phase 4), or (None, None) when there isn't one --
+    an older run, a run reconciliation found nothing to bind/cluster for, or
+    no covering run at all. `alias` keys are re-split from the persisted
+    ``"file_id|voice"`` string into the `(file_id, voice)` tuples
+    `_shown_and_cam`/`_pic_who` already expect. Fail-open: any lookup error
+    degrades to (None, None), i.e. today's behavior, never breaks the map."""
+    try:
+        from app.services.l3 import cuts_v3_read, ingest_store
+        resolved_run_id = run_id or cuts_v3_read.latest_run_for_files(file_ids)
+        if resolved_run_id is None:
+            return None, None
+        identity_map = ingest_store.get_identity_map(resolved_run_id)
+        if not identity_map:
+            return None, None
+        oncam = identity_map.get("oncam") or None
+        raw_alias = identity_map.get("alias") or {}
+        alias = {}
+        for key, display in raw_alias.items():
+            fid, _, voice = str(key).partition("|")
+            if fid and voice:
+                alias[(fid, voice)] = display
+        return oncam, (alias or None)
+    except Exception:
+        logger.exception("footage_map: identity_map lookup failed (continuing without it)")
+        return None, None
+
+
 def assemble_map(file_ids: List[str], *, compact: bool = False,
                  run_id: Optional[str] = None) -> Dict[str, Any]:
     """The Tier-0 footage index for the arranger.
@@ -906,14 +935,18 @@ def assemble_map(file_ids: List[str], *, compact: bool = False,
     path; resident mode emits the full line. Moments are tagged in place with
     cross-clip duplicate links -- coverage reads INLINE on each beat as
     ``·alt-PIC`` (no separate coverage block: dedupe the information, not the
-    sequence). Speakers read as their per-clip diarized id (each clip's own
-    ``PIC``/``SND`` handles).
+    sequence). Speakers resolve through the covering run's reconciled cast
+    (identity_map.plan.md) when one exists -- ``PIC``/``alt-PIC`` then name
+    real persons instead of a raw per-clip diarized id; absent a reconciled
+    cast (older run, or nothing bindable/clusterable), behaves exactly as
+    before this feature existed.
     """
     trees = get_trees(file_ids, run_id=run_id)
     ordered = [trees[fid] for fid in file_ids if fid in trees]
     dups = _annotate_dups(ordered)      # tags moments in `ordered` in place
     _annotate_outlook_groups(ordered)   # tags moments in `ordered` in place
-    text = "\n\n".join(_clip_block(t, compact=compact)
+    oncam, alias = _identity_maps_for(file_ids, run_id)
+    text = "\n\n".join(_clip_block(t, compact=compact, alias=alias, oncam=oncam)
                        for t in ordered)
     n_moments = sum(t["moment_count"] for t in ordered)
     return {

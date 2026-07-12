@@ -44,6 +44,7 @@ from app.services.l3 import pass2
 from app.services.l3 import pass2a
 from app.services.l3 import pass2b
 from app.services.l3 import post
+from app.services.l3.identity import apply as identity_apply
 from app.services.l3.lattice import Lattice
 from app.services.l3.sync import store as sync_store
 from app.services.l3.sync.lattice_merge import apply_outlook_groups, outlook_groups
@@ -220,6 +221,19 @@ def run_ingest(project_id: str) -> str:
         # retakes: code (not pass 2a's pixel guess) owns that categorical call,
         # so force every declared-outlook member to take_role='outlook'.
         pass2_output = pass2.apply_outlook_roles(pass2_output, pass1_output)
+
+        # Cumulative identity map (identity_map.plan.md): reconcile WHO's
+        # talking (voice<->camera-motion binding, Phase 1) and WHO's shown
+        # (cross-file appearance clustering, Phase 2) once, deterministically,
+        # then rewrite on_camera from pass 2a's per-still guess into a derived
+        # fact (Phase 3a). Must run before assemble_cut_records below --
+        # on_camera also feeds total_quality there, so the rewrite only
+        # counts if it lands first. `groups` is the SAME outlook grouping the
+        # speech lattice merge already used (line ~132), so binding and
+        # identity share one notion of "these cameras are one moment."
+        pass2_output, identity_map = identity_apply.run(pass2_output, lattices, motion_by_file, groups)
+        if identity_map.get("persons"):
+            store.set_identity_map(ingest_run_id, identity_map)
 
         store.set_status(ingest_run_id, "post")
         records = post.assemble_cut_records(pass2_output, lattices, motion_by_file, silences_by_file,
