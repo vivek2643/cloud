@@ -107,6 +107,19 @@ class Settings(BaseSettings):
     # this window to keep reading the pass-1 prefix at the cheap cache rate.
     ingest_cache_ttl_seconds: int = 300
 
+    # gemini_pass2.plan.md: Pass 2 backend, gated per-environment. "anthropic"
+    # (default, unchanged) keeps ic.complete("pass2", ...) on the proven
+    # Claude tool-forced path; "gemini" routes it to
+    # app.services.llm.ingest_gemini.complete_gemini instead. ingest_pass2_model
+    # is the model id for WHICHEVER provider is selected (e.g. set it to a
+    # Gemini model id when this is "gemini"). Pass 1 always stays Anthropic --
+    # this flag has no effect on it.
+    ingest_pass2_provider: str = "anthropic"
+    # Gemini thinking effort for Pass 2: "low"/"medium"/"high" (mapped to a
+    # fixed thinking_budget token count) or a numeric string used as the
+    # budget directly.
+    ingest_pass2_thinking: str = "low"
+
     @property
     def r2_endpoint(self) -> str:
         return f"https://{self.r2_account_id}.r2.cloudflarestorage.com"

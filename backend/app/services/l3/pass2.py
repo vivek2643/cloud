@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.config import get_settings
 from app.services.l3.image_plan import PlannedFrame
 from app.services.l3.lattice import Lattice, resolve_speech_span_ms
 from app.services.l3.pass1 import Pass1Output, build_pass1_blocks, render_pass1_output
@@ -438,6 +439,36 @@ _SYSTEM = (
     "video_group[i], VERBATIM. Never invent a new ref."
 )
 
+# gemini_pass2.plan.md Phase 3: appended to _SYSTEM ONLY when
+# ingest_pass2_provider=="gemini" -- never mutates the base prompt (that
+# would perturb the proven Claude path). The Anthropic path relies on
+# FORCED tool-use (tool_choice pinned to the one schema tool) to guarantee a
+# non-empty, fully-populated response; Gemini's structured-output path has
+# no equivalent forcing mechanism, so an unconstrained call was observed
+# satisfying the schema trivially with `cuts: []`. This suffix states the
+# contract explicitly; `ingest_gemini.gemini_schema` backs it with an
+# enforced `cuts` minItems=1 + required, so a genuinely empty response is a
+# schema violation (re-asked), not a silent success.
+_GEMINI_REINFORCE = (
+    "\n\nOUTPUT CONTRACT (STRICT): Return a JSON object {\"cuts\": [ ... ]}. "
+    "Emit EXACTLY ONE cut object per source_ref you were shown -- never an "
+    "empty list, never skip a ref. Every cut MUST include a non-empty label "
+    "and summary, plus framing (subject_box + shot_size) and look. Fill "
+    "every required field from the pixels; use the 'unsure' category rather "
+    "than omitting a field."
+)
+
+
+def gemini_system_prompt() -> str:
+    """The exact system string a Gemini-provider batch call sends
+    (``_SYSTEM`` + the reinforcement suffix). P4 (gemini_pass2.plan.md):
+    ``ingest.py`` bakes this into the per-run ``CachedContent`` so caching
+    doesn't silently drop the reinforcement -- a cached call's per-call
+    config never re-sends ``system_instruction`` (see
+    ``ingest_gemini._build_config``), so whatever was baked in at cache
+    creation is the ONLY system prompt those calls ever get."""
+    return _SYSTEM + _GEMINI_REINFORCE
+
 
 def build_pass2_batch_blocks(
     planned_frames: List[PlannedFrame], images_b64: Dict[Tuple[str, int], str],
@@ -766,15 +797,31 @@ def run_pass2_batch(
     (see render_pass1_output), so the model can only see -- and so only
     emit -- the cuts it was actually shown. ``batch_frames``/``images_b64``
     are this batch's images, appended uncached. Raises ``ValueError`` if the
-    batch has no resolvable images."""
+    batch has no resolvable images.
+
+    gemini_pass2.plan.md: when ``ingest_pass2_provider=="gemini"``, the
+    reinforcement suffix is appended to the system prompt (never mutates
+    ``_SYSTEM`` itself, so the proven Claude path is untouched) and, if a
+    per-run Gemini ``CachedContent`` is active (P4), the STABLE
+    ``build_pass1_blocks`` prefix is left out of this call entirely -- it's
+    already baked into that cache; re-sending it here would erase the cost
+    win caching exists for. Only the per-batch-trimmed ``render_pass1_output``
+    (which differs batch to batch) is ever sent fresh."""
     batch_refs = {f.ref for f in batch_frames}
-    cached_blocks = build_pass1_blocks(file_rows) + [
-        text_block(render_pass1_output(pass1_output, batch_refs))]
+    settings = get_settings()
+    system = _SYSTEM
+    stable_blocks = build_pass1_blocks(file_rows)
+    if settings.ingest_pass2_provider == "gemini":
+        system = system + _GEMINI_REINFORCE
+        from app.services.llm import ingest_gemini as ig
+        if ig.get_pass2_cache_handle():
+            stable_blocks = []
+    cached_blocks = stable_blocks + [text_block(render_pass1_output(pass1_output, batch_refs))]
     image_blocks = build_pass2_batch_blocks(batch_frames, images_b64)
     if not image_blocks:
         raise ValueError("run_pass2_batch: no images resolved for this batch")
     lattices = {fid: lattice for fid, _name, _dur, lattice in file_rows}
-    completion = ic.complete("pass2", _SYSTEM, cached_blocks, Pass2BatchOutput,
+    completion = ic.complete("pass2", system, cached_blocks, Pass2BatchOutput,
                              extra_blocks=image_blocks, max_tokens=32000,
                              extra_check=lambda output: _pass2_semantic_checks(
                                  output, pass1_output, lattices, batch_refs))

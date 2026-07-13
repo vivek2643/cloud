@@ -258,6 +258,18 @@ def complete(
     schema-valid parsed object, return an error string to reject it, or
     None to accept -- a violation is folded into the exact same
     one-re-ask-then-fail-loud path as a schema violation."""
+    # gemini_pass2.plan.md: Pass 2 only, gated, off by default. Every other
+    # stage (pass1, and pass2 itself when the flag is "anthropic") never
+    # imports ingest_gemini at all -- this branch is the ENTIRE surface area
+    # where main's behavior can change, and only when the env flag is flipped.
+    if stage == "pass2" and get_settings().ingest_pass2_provider == "gemini":
+        from app.services.llm import ingest_gemini as ig
+        return ig.complete_gemini(
+            system, blocks, schema, extra_blocks=extra_blocks,
+            max_tokens=max_tokens, extra_check=extra_check,
+            thinking=get_settings().ingest_pass2_thinking,
+            cached_content=ig.get_pass2_cache_handle(),
+        )
     client = _sdk_client()
     model = _model_for(stage)
     tool = _schema_tool(schema)

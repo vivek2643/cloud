@@ -30,6 +30,7 @@ import logging
 import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from typing import Any, Dict, List, Tuple
 
 from app.config import get_settings
@@ -174,23 +175,48 @@ def run_ingest(project_id: str) -> str:
             batch_args.append((batch_file_rows, batch_frames))
 
         all_cuts: List[pass2.Pass2Cut] = []
-        # Batches only share a read-only cached prefix -- no reason to make
-        # one wait on another's response. Concurrency here is a pure
-        # wall-clock win (see MAX_PARALLEL_PASS2_BATCHES); a failure in any
-        # batch still propagates and fails the whole run, same as sequential did.
-        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_PASS2_BATCHES, len(batch_args)) or 1) as pool:
-            futures = [
-                pool.submit(pass2.run_pass2_batch, rows, pass1_output, frames, images_b64)
-                for rows, frames in batch_args
-            ]
-            for future in futures:
-                completion = future.result()
-                store.accumulate_pass2_usage(ingest_run_id, completion.usage)
-                batch_output = pass2.Pass2BatchOutput.model_validate(completion.data)
-                # locators (word_span/atom_ids) are code-derived from pass 1,
-                # not echoed by the model -- see pass2.backfill_locators.
-                batch_output = pass2.backfill_locators(batch_output, pass1_output)
-                all_cuts.extend(pass2.to_pass2_cuts(batch_output.cuts))
+        # gemini_pass2.plan.md P4: a per-run Gemini CachedContent, gated to
+        # the gemini provider only. On the default Anthropic path this
+        # whole block is skipped -- ingest_gemini (and google-genai) is
+        # never imported, `cache_ctx`/`submit_batch` stay the plain
+        # no-cache versions, byte-identical to before P4 existed. Cost
+        # optimization only; a failed/skipped cache just means every batch
+        # runs uncached (see create_pass2_cache's own graceful-degradation
+        # contract) -- never a correctness requirement.
+        cache_ctx = nullcontext()
+        pass2_cache_name = None
+        submit_batch = lambda pool, rows, frames: pool.submit(  # noqa: E731
+            pass2.run_pass2_batch, rows, pass1_output, frames, images_b64)
+
+        if settings.ingest_pass2_provider == "gemini":
+            from app.services.llm import ingest_gemini as ig
+            pass2_cache_name = ig.create_pass2_cache(pass2.gemini_system_prompt(), pass1.build_pass1_blocks(file_rows))
+            if pass2_cache_name:
+                cache_ctx = ig.pass2_cache_scope(pass2_cache_name)
+                submit_batch = lambda pool, rows, frames: ig.submit_with_cache_context(  # noqa: E731
+                    pool, pass2.run_pass2_batch, rows, pass1_output, frames, images_b64)
+
+        try:
+            # Batches only share a read-only cached prefix -- no reason to
+            # make one wait on another's response. Concurrency here is a
+            # pure wall-clock win (see MAX_PARALLEL_PASS2_BATCHES); a
+            # failure in any batch still propagates and fails the whole
+            # run, same as sequential did.
+            with cache_ctx, ThreadPoolExecutor(
+                    max_workers=min(MAX_PARALLEL_PASS2_BATCHES, len(batch_args)) or 1) as pool:
+                futures = [submit_batch(pool, rows, frames) for rows, frames in batch_args]
+                for future in futures:
+                    completion = future.result()
+                    store.accumulate_pass2_usage(ingest_run_id, completion.usage)
+                    batch_output = pass2.Pass2BatchOutput.model_validate(completion.data)
+                    # locators (word_span/atom_ids) are code-derived from pass 1,
+                    # not echoed by the model -- see pass2.backfill_locators.
+                    batch_output = pass2.backfill_locators(batch_output, pass1_output)
+                    all_cuts.extend(pass2.to_pass2_cuts(batch_output.cuts))
+        finally:
+            if pass2_cache_name:
+                from app.services.llm import ingest_gemini as ig
+                ig.delete_pass2_cache(pass2_cache_name)
 
         pass2_output = pass2.Pass2Output(cuts=all_cuts)
         pass2_output = pass2.apply_junk_suspects(pass2_output, pass1_output)
