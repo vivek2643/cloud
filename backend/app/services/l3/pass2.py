@@ -68,6 +68,16 @@ SHOT_SIZES = (
     "medium_wide", "wide", "extreme_wide", "unsure",
 )
 
+# Technical shot stability -- a category a SINGLE still often can't judge
+# (perception_upgrade.plan.md Part C2); the 2nd (early/late) frame makes it
+# answerable by showing whether the frame drifted/blurred/exposure-shifted
+# between the two moments. Purely descriptive; code (not the model) decides
+# what, if anything, to do with it (see post.py's optional visual-score
+# penalty). Closed set so "unsure" is the only off-list fallback.
+SHOT_QUALITY = (
+    "stable", "shaky", "whip", "soft_focus", "racking_focus", "exposure_shift", "unsure",
+)
+
 
 class Framing(BaseModel):
     subject_box: Tuple[float, float, float, float] | None = None   # normalized x,y,w,h
@@ -78,6 +88,9 @@ class Framing(BaseModel):
     # How tight the framing is on the subject -- one of SHOT_SIZES. Purely a
     # category from the pixels; code (not the model) maps it to a number.
     shot_size: str = "unsure"
+    # Technical stability -- one of SHOT_QUALITY. Optional/prompt-nudged only
+    # (Flash-Lite guardrail: never made required -- see gemini_schema).
+    shot_quality: str = "unsure"
 
 
 class WhiteReference(BaseModel):
@@ -150,6 +163,7 @@ class PersonLook(BaseModel):
 # Reel-trail shard, which the one-re-ask loop then couldn't clear.
 _KIND_ALIASES = {
     "video_tentative_group": "video", "video_group": "video", "vid": "video",
+    "video_cut": "video",
     "speech_cut": "speech", "speech_group": "speech", "spoken": "speech",
 }
 
@@ -188,6 +202,10 @@ class CutJudgment(BaseModel):
     # eye across cuts (for identity_map + "show the speaker" arrange decisions).
     # Empty for a cut with no people on screen.
     people: List[PersonLook] = Field(default_factory=list)
+    # perception_upgrade.plan.md Part C3: any legible on-screen text/graphics
+    # (title, lower-third, slide, UI) -- "" when none. Optional/prompt-nudged
+    # only (Flash-Lite guardrail: never required).
+    screen_text: str = ""
 
     @field_validator("channel", mode="before")
     @classmethod
@@ -246,6 +264,8 @@ class Pass2Cut(BaseModel):
     # recognise the same person across cuts. List of {description, position,
     # speaking, appearance}. See PersonLook.
     people: List[dict] = Field(default_factory=list)
+    # perception_upgrade.plan.md Part C3: on-screen text/graphics, "" if none.
+    screen_text: str = ""
 
 
 class Pass2Output(BaseModel):
@@ -269,6 +289,7 @@ def to_pass2_cuts(judgments: List[CutJudgment]) -> List[Pass2Cut]:
             taste_fences=j.taste_fences, readability_ms=j.readability_ms,
             natural_sound=j.natural_sound, channel=j.channel,
             people=[p.model_dump() for p in j.people],
+            screen_text=j.screen_text,
         )
         for j in judgments
     ]
@@ -370,6 +391,13 @@ _SYSTEM = (
     "below -- the pass-1 result may mention other clips, but those are "
     "handled in separate calls; never emit a cut for a clip you were not "
     "shown images for.\n\n"
+    "You may see up to TWO frames for one cut, labelled early/late in their "
+    "captions: they are the SAME cut at two different moments. Read them "
+    "TOGETHER and describe what CHANGES between them (a gesture completing, "
+    "a camera move, an expression shifting, an object entering/leaving "
+    "frame) -- that change IS the content worth judging. NEVER emit two cut "
+    "records for one source_ref just because it has two frames; it is still "
+    "exactly one cut (see the one-record-per-ref rule below).\n\n"
     "For every in-scope speech_cut and every in-scope video_tentative_group, "
     "emit ONE final cut record (a tentative video group MAY be split back "
     "into multiple cuts along its existing atom_ids if the pixels show it "
@@ -383,7 +411,11 @@ _SYSTEM = (
     "  - label, summary (a best guess from image + transcript is fine, and "
     "expected). A label must name what the cut SHOWS (e.g. 'forehand "
     "swing', 'catches the ball'), never a mechanical 'settle'/'trailing "
-    "frames'.\n"
+    "frames'. summary must describe WHAT IS HAPPENING -- the action, the "
+    "beat, the on-screen event, and (when you saw two frames) what CHANGES "
+    "across them -- never a static description of a still ('a man in a "
+    "kitchen' is not a summary; 'he cracks an egg into the bowl and starts "
+    "whisking' is).\n"
     "  - on_camera (does the visible person match the diarized speaker)\n"
     "  - channel: the delivery CATEGORY -- for a video cut set \"done\" when "
     "an action is performed/demonstrated on screen (a swing, a catch, "
@@ -403,7 +435,12 @@ _SYSTEM = (
     "landscape), rotation_deg only for a visibly tilted shot (else 0), and "
     "shot_size -- how tight the frame is on the subject, exactly one of: "
     "extreme_close_up, close_up, medium_close_up, medium, medium_wide, "
-    "wide, extreme_wide (use unsure only if there is no clear subject)\n"
+    "wide, extreme_wide (use unsure only if there is no clear subject), and "
+    "shot_quality -- technical stability, exactly one of: stable, shaky "
+    "(handheld wobble), whip (a fast pan/tilt blur), soft_focus, "
+    "racking_focus (focus visibly pulling), exposure_shift (visibly "
+    "brightening/darkening); if you saw two frames judge it from how the "
+    "shot behaves BETWEEN them, one still is unsure by default\n"
     "  - look: graded vs log/flat, palette, exposure_flags, and its "
     "white_reference, which is a field NESTED INSIDE look (look."
     "white_reference, NOT a top-level field): if some object in frame is "
@@ -434,6 +471,10 @@ _SYSTEM = (
     "stay stable shot to shot: never clothing, never pose, never what they "
     "are doing right now -- those belong in `description`/`position`, not "
     "`appearance`. Leave a field unset rather than guess.\n\n"
+    "screen_text: any legible on-screen text or graphics (a title, "
+    "lower-third, slide, UI element, screen share) -- transcribe what it "
+    "says; note briefly if it changes between the frames you were shown. "
+    "Empty string if there is no on-screen text/graphic.\n\n"
     "Reference every cut by source_ref using the SAME ref string pass 1 "
     "(and the image captions) used for it -- speech_cut[i] or "
     "video_group[i], VERBATIM. Never invent a new ref."
@@ -455,7 +496,14 @@ _GEMINI_REINFORCE = (
     "empty list, never skip a ref. Every cut MUST include a non-empty label "
     "and summary, plus framing (subject_box + shot_size) and look. Fill "
     "every required field from the pixels; use the 'unsure' category rather "
-    "than omitting a field."
+    "than omitting a field.\n"
+    "ALWAYS set framing.subject_box: the normalized [x, y, w, h] box around "
+    "the shot's MAIN compositional subject. Every shot has one -- for b-roll, "
+    "scenery, or product footage with no person, box the dominant focal "
+    "element (the hero object, the focal landscape feature, the horizon "
+    "subject). Never leave subject_box null.\n"
+    "In `people`, list EVERY person visible on screen (one entry each); leave "
+    "it empty ONLY when there is genuinely no person anywhere in frame."
 )
 
 
@@ -473,16 +521,24 @@ def gemini_system_prompt() -> str:
 def build_pass2_batch_blocks(
     planned_frames: List[PlannedFrame], images_b64: Dict[Tuple[str, int], str],
 ) -> List[Dict[str, Any]]:
-    """Numbered [caption, image] block pairs for one batch, in stable
-    (file_id, ts_ms) order. Frames with no extracted image (not yet pulled,
-    or extraction failed upstream) are skipped rather than sent blank."""
-    ordered = sorted(planned_frames, key=lambda f: (f.file_id, f.ts_ms))
+    """Numbered [caption, image] block pairs for one batch, in
+    (file_id, ref, ts_ms) order -- perception_upgrade.plan.md Part B: sorting
+    by ref (not just file_id/ts_ms) keeps a ref's early/late pair ADJACENT in
+    the sequence the model reads, rather than interleaved with other cuts'
+    frames that merely happen to fall between them in time. Frames with no
+    extracted image (not yet pulled, or extraction failed upstream) are
+    skipped rather than sent blank. Each caption is labelled with its phase
+    (early/late) so the model knows which frames are a pair to read
+    TOGETHER; a "only" phase (the common case -- most cuts stay single-frame)
+    gets no suffix at all."""
+    ordered = sorted(planned_frames, key=lambda f: (f.file_id, f.ref, f.ts_ms))
     blocks: List[Dict[str, Any]] = []
     for n, f in enumerate(ordered, start=1):
         b64 = images_b64.get((f.file_id, f.ts_ms))
         if b64 is None:
             continue
-        blocks.append(text_block(f"IMG {n} = clip {f.file_id}, {f.ts_ms / 1000:.1f}s, {f.ref}"))
+        suffix = f" ({f.phase})" if f.phase in ("early", "late") else ""
+        blocks.append(text_block(f"IMG {n} = clip {f.file_id}, {f.ts_ms / 1000:.1f}s, {f.ref}{suffix}"))
         blocks.append(image_block(b64))
     return blocks
 

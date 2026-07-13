@@ -117,6 +117,34 @@ def test_gemini_schema_channel_and_shot_size_enums():
     print("ok  test_gemini_schema_channel_and_shot_size_enums")
 
 
+def test_gemini_schema_shot_quality_gets_its_enum_and_stays_optional():
+    # perception_upgrade.plan.md Part C2 / Flash-Lite guardrail: shot_quality
+    # gets a closed enum like shot_size, but must NEVER end up in Framing's
+    # `required` -- requiring a new field is what triggered the earlier
+    # subject_box runaway-thinking failure.
+    sanitized = ig.gemini_schema(pass2.Pass2BatchOutput)
+    framing = sanitized["$defs"]["Framing"]
+    shot_quality = framing["properties"]["shot_quality"]
+    assert set(shot_quality["enum"]) == set(pass2.SHOT_QUALITY)
+    assert "shot_quality" not in (framing.get("required") or [])
+    print("ok  test_gemini_schema_shot_quality_gets_its_enum_and_stays_optional")
+
+
+def test_gemini_schema_screen_text_stays_an_optional_plain_string():
+    # perception_upgrade.plan.md Part C3: screen_text needs no special-casing
+    # in gemini_schema (a plain nullable string, generic sanitizer handles
+    # it) -- assert it never grows an enum/minLength and never becomes
+    # required, same guardrail as shot_quality.
+    sanitized = ig.gemini_schema(pass2.Pass2BatchOutput)
+    cut_judgment = sanitized["$defs"]["CutJudgment"]
+    screen_text = cut_judgment["properties"]["screen_text"]
+    assert screen_text.get("type") == "string", screen_text
+    assert "enum" not in screen_text, screen_text
+    assert "minLength" not in screen_text, screen_text
+    assert "screen_text" not in (cut_judgment.get("required") or [])
+    print("ok  test_gemini_schema_screen_text_stays_an_optional_plain_string")
+
+
 def test_gemini_schema_accepted_by_the_real_sdk_config():
     types = _types()
     sanitized = ig.gemini_schema(pass2.Pass2BatchOutput)
@@ -413,9 +441,14 @@ def test_complete_routes_pass2_to_gemini_when_provider_is_gemini():
     print("ok  test_complete_routes_pass2_to_gemini_when_provider_is_gemini")
 
 
-def test_complete_default_provider_never_touches_gemini():
+def test_complete_anthropic_provider_never_touches_gemini():
+    # perception_upgrade.plan.md Part A flipped the DEFAULT to "gemini" (A/B
+    # verified) -- this test explicitly selects "anthropic" to verify that
+    # code path stays untouched/available, rather than relying on it being
+    # the ambient default.
     settings = get_settings()
-    assert settings.ingest_pass2_provider == "anthropic"  # the default, unchanged
+    orig_provider = settings.ingest_pass2_provider
+    settings.ingest_pass2_provider = "anthropic"
     good = {"cuts": []}
     fake, orig = _with_fake_anthropic_client(
         [FakeResponse([FakeBlock("tool_use", ic._TOOL_NAME, good)])])
@@ -423,16 +456,17 @@ def test_complete_default_provider_never_touches_gemini():
 
     def fail_if_called(*a, **k):
         called["hit"] = True
-        raise AssertionError("complete_gemini must not be called on the default provider")
+        raise AssertionError("complete_gemini must not be called on the anthropic provider")
 
     try:
         with mock.patch.object(ig, "complete_gemini", fail_if_called):
             ic.complete("pass2", "sys", [text_block("x")], pass2.Pass2BatchOutput)
     finally:
         ic._sdk_client = orig
+        settings.ingest_pass2_provider = orig_provider
     assert called["hit"] is False
     assert len(fake.messages.calls) == 1  # went through the real Anthropic path
-    print("ok  test_complete_default_provider_never_touches_gemini")
+    print("ok  test_complete_anthropic_provider_never_touches_gemini")
 
 
 def test_complete_non_pass2_stage_ignores_the_gemini_flag():
@@ -464,7 +498,7 @@ def test_complete_non_pass2_stage_ignores_the_gemini_flag():
 # pass2.run_pass2_batch -- gated reinforcement suffix
 # --------------------------------------------------------------------------
 
-def test_run_pass2_batch_default_provider_system_prompt_unchanged():
+def test_run_pass2_batch_anthropic_provider_system_prompt_unchanged():
     from app.services.l3.lattice import Lattice
     from app.services.l3.pass1 import Pass1Output, SpeechCut
     from app.services.l3.image_plan import PlannedFrame
@@ -481,12 +515,16 @@ def test_run_pass2_batch_default_provider_system_prompt_unchanged():
         return Completion(data={"cuts": []}, usage={}, attempts=1)
 
     settings = get_settings()
-    assert settings.ingest_pass2_provider == "anthropic"
-    with mock.patch.object(ic, "complete", fake_complete):
-        pass2.run_pass2_batch([("f1", "a.mp4", 10000, lat)], p1, frames, {("f1", 100): "ZmFrZQ=="})
+    orig_provider = settings.ingest_pass2_provider
+    settings.ingest_pass2_provider = "anthropic"
+    try:
+        with mock.patch.object(ic, "complete", fake_complete):
+            pass2.run_pass2_batch([("f1", "a.mp4", 10000, lat)], p1, frames, {("f1", 100): "ZmFrZQ=="})
+    finally:
+        settings.ingest_pass2_provider = orig_provider
 
     assert captured["system"] == pass2._SYSTEM
-    print("ok  test_run_pass2_batch_default_provider_system_prompt_unchanged")
+    print("ok  test_run_pass2_batch_anthropic_provider_system_prompt_unchanged")
 
 
 def test_run_pass2_batch_gemini_provider_appends_reinforcement():
@@ -558,6 +596,8 @@ def main():
     test_gemini_schema_forces_non_empty_cuts()
     test_gemini_schema_label_summary_minlength_and_pydantic_required()
     test_gemini_schema_channel_and_shot_size_enums()
+    test_gemini_schema_shot_quality_gets_its_enum_and_stays_optional()
+    test_gemini_schema_screen_text_stays_an_optional_plain_string()
     test_gemini_schema_accepted_by_the_real_sdk_config()
     test_gemini_schema_is_a_noop_on_a_schema_without_the_pass2_shape()
     test_resolve_thinking_budget()
@@ -575,9 +615,9 @@ def main():
     test_bare_pool_submit_does_not_see_the_cache_scope()
     test_pass2_cache_scope_sequential_scopes_do_not_leak()
     test_complete_routes_pass2_to_gemini_when_provider_is_gemini()
-    test_complete_default_provider_never_touches_gemini()
+    test_complete_anthropic_provider_never_touches_gemini()
     test_complete_non_pass2_stage_ignores_the_gemini_flag()
-    test_run_pass2_batch_default_provider_system_prompt_unchanged()
+    test_run_pass2_batch_anthropic_provider_system_prompt_unchanged()
     test_run_pass2_batch_gemini_provider_appends_reinforcement()
     test_run_pass2_batch_omits_stable_blocks_when_a_cache_handle_is_active()
     print("\nall ingest_gemini tests passed")

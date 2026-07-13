@@ -23,6 +23,7 @@ BACKEND = os.path.dirname(HERE)
 if BACKEND not in sys.path:
     sys.path.insert(0, BACKEND)
 
+from app.config import get_settings  # noqa: E402
 from app.services.l3 import pass2  # noqa: E402
 from app.services.l3 import post  # noqa: E402
 from app.services.l3.image_plan import PlannedFrame  # noqa: E402
@@ -564,8 +565,11 @@ def test_build_pass2_batches_ignores_non_cut_refs():
 # --------------------------------------------------------------------------
 
 def test_batch_blocks_skip_unresolved_images():
-    frames = [PlannedFrame("f1", 200, "speech_cut", "speech_cut[0]"),
-             PlannedFrame("f1", 100, "speech_cut", "speech_cut[1]")]
+    # ref[0]'s frame is resolved, ref[1]'s is not -- sorted by (file, ref,
+    # ts) the resolved one is IMG 1, the unresolved one is silently skipped
+    # (not sent blank) and never gets a number at all.
+    frames = [PlannedFrame("f1", 100, "speech_cut", "speech_cut[0]"),
+             PlannedFrame("f1", 200, "speech_cut", "speech_cut[1]")]
     images = {("f1", 100): "ZmFrZQ=="}   # only one of the two resolved
     blocks = pass2.build_pass2_batch_blocks(frames, images)
     assert len(blocks) == 2, blocks   # one [caption, image] pair only
@@ -575,17 +579,38 @@ def test_batch_blocks_skip_unresolved_images():
     print("ok  test_batch_blocks_skip_unresolved_images")
 
 
-def test_batch_blocks_ordered_by_file_then_ts():
+def test_batch_blocks_ordered_by_file_then_ref_then_ts():
+    # perception_upgrade.plan.md Part B: sorted by (file_id, ref, ts_ms) --
+    # NOT just (file_id, ts_ms) -- so a ref's early/late pair always lands
+    # adjacent in the sequence, never interleaved with another ref's frame
+    # that merely happens to fall between them in time.
     frames = [PlannedFrame("f2", 50, "speech_cut", "speech_cut[0]"),
              PlannedFrame("f1", 200, "speech_cut", "speech_cut[0]"),
              PlannedFrame("f1", 100, "speech_cut", "speech_cut[1]")]
     images = {("f2", 50): "a", ("f1", 200): "b", ("f1", 100): "c"}
     blocks = pass2.build_pass2_batch_blocks(frames, images)
     captions = [b["text"] for b in blocks if b["type"] == "text"]
-    assert "clip f1, 0.1s" in captions[0], captions
-    assert "clip f1, 0.2s" in captions[1], captions
+    # f1/speech_cut[0] (200ms) sorts before f1/speech_cut[1] (100ms) --
+    # grouped by REF first, not by timestamp -- then f2/speech_cut[0].
+    assert "clip f1, 0.2s" in captions[0], captions
+    assert "clip f1, 0.1s" in captions[1], captions
     assert "clip f2, 0.1s" in captions[2], captions
-    print("ok  test_batch_blocks_ordered_by_file_then_ts")
+    print("ok  test_batch_blocks_ordered_by_file_then_ref_then_ts")
+
+
+def test_batch_blocks_label_early_late_phase_only_only_gets_no_suffix():
+    frames = [
+        PlannedFrame("f1", 100, "speech_cut", "speech_cut[0]", "early"),
+        PlannedFrame("f1", 300, "speech_cut", "speech_cut[0]", "late"),
+        PlannedFrame("f1", 500, "speech_cut", "speech_cut[1]", "only"),
+    ]
+    images = {("f1", 100): "a", ("f1", 300): "b", ("f1", 500): "c"}
+    blocks = pass2.build_pass2_batch_blocks(frames, images)
+    captions = [b["text"] for b in blocks if b["type"] == "text"]
+    assert captions[0].endswith("speech_cut[0] (early)"), captions
+    assert captions[1].endswith("speech_cut[0] (late)"), captions
+    assert captions[2].endswith("speech_cut[1]"), captions   # no suffix for "only"
+    print("ok  test_batch_blocks_label_early_late_phase_only_only_gets_no_suffix")
 
 
 def test_run_pass2_batch_raises_when_no_images_resolve():
@@ -599,6 +624,10 @@ def test_run_pass2_batch_raises_when_no_images_resolve():
 
 
 def test_run_pass2_batch_calls_complete_with_pass2_stage_and_cached_prefix():
+    # Forces the anthropic provider explicitly -- perception_upgrade.plan.md
+    # Part A made "gemini" the default, and this test exercises the
+    # Anthropic-specific SDK client/cache_control wire shape (see
+    # test_ingest_gemini.py for the gemini-provider equivalent).
     good = {"cuts": [{
         "source_ref": "speech_cut[0]", "kind": "speech", "file_id": "f1",
         "word_span": [0, 2], "label": "intro", "summary": "hello there",
@@ -606,12 +635,16 @@ def test_run_pass2_batch_calls_complete_with_pass2_stage_and_cached_prefix():
     fake, orig = _with_fake_client([FakeResponse([FakeBlock("tool_use", ic._TOOL_NAME, good)])])
     frames = [PlannedFrame("f1", 100, "speech_cut", "speech_cut[0]")]
     pass1_output = Pass1Output(speech_cuts=[SpeechCut(file_id="f1", word_span=(0, 2), label="intro")])
+    settings = get_settings()
+    orig_provider = settings.ingest_pass2_provider
+    settings.ingest_pass2_provider = "anthropic"
     try:
         result = pass2.run_pass2_batch(
             [("f1", "a.mp4", 10000, _lat("f1"))], pass1_output, frames, {("f1", 100): "ZmFrZQ=="},
         )
     finally:
         ic._sdk_client = orig
+        settings.ingest_pass2_provider = orig_provider
 
     call = fake.messages.calls[0]
     assert call["tools"][0]["input_schema"] == pass2.Pass2BatchOutput.model_json_schema()
@@ -677,7 +710,8 @@ def main():
     test_build_pass2_batches_empty_frames_yield_no_batches()
     test_build_pass2_batches_ignores_non_cut_refs()
     test_batch_blocks_skip_unresolved_images()
-    test_batch_blocks_ordered_by_file_then_ts()
+    test_batch_blocks_ordered_by_file_then_ref_then_ts()
+    test_batch_blocks_label_early_late_phase_only_only_gets_no_suffix()
     test_run_pass2_batch_raises_when_no_images_resolve()
     test_run_pass2_batch_calls_complete_with_pass2_stage_and_cached_prefix()
     test_render_pass1_output_omits_take_candidates_section()

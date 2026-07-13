@@ -58,17 +58,20 @@ class FakeStore:
 
 
 class _Patcher:
-    """Tiny manual monkeypatch helper -- set attrs, restore all on exit."""
+    """Tiny manual monkeypatch helper -- set attrs, restore all on exit.
+    Keyed by id(obj) (not obj itself) since a pydantic Settings instance
+    (perception_upgrade.plan.md: patching ingest_pass2_provider on the live
+    get_settings() singleton) isn't hashable."""
 
     def __init__(self):
         self._orig = {}
 
     def set(self, obj, name, value):
-        self._orig[(obj, name)] = getattr(obj, name)
+        self._orig[(id(obj), name)] = (obj, getattr(obj, name))
         setattr(obj, name, value)
 
     def restore(self):
-        for (obj, name), value in self._orig.items():
+        for (_id, name), (obj, value) in self._orig.items():
             setattr(obj, name, value)
 
 
@@ -90,13 +93,21 @@ def _basic_patches(p, fake_store, file_rows):
     real DB lookup must never run). build_pass2_batches is left REAL (pure,
     deterministic) -- with empty planned_frames it naturally returns [], so
     tests that don't care about batch composition don't need to mock it at
-    all."""
+    all. ingest_pass2_provider is forced to "anthropic" -- these tests care
+    about STAGE SEQUENCING, not provider choice, and pass2.run_pass2_batch is
+    ALWAYS faked below anyway; without this, perception_upgrade.plan.md Part
+    A's default ("gemini") would make run_ingest's P4 caching block try a
+    REAL ingest_gemini.create_pass2_cache network call every time (see
+    test_ingest_gemini.py for the dedicated, properly-mocked gemini-provider
+    coverage of that path)."""
     p.set(ingest, "store", fake_store)
     p.set(ingest.pass1, "load_project_file_rows", lambda pid: file_rows)
     p.set(ingest, "_proxy_keys_for_files", lambda file_ids: {})
     p.set(ingest, "build_l1_snapshot",
           lambda fid: {"motion_dynamics": {}, "scene_cuts": {}, "audio_features": {}})
+    p.set(ingest, "_onsets_for_files", lambda file_ids: {})
     p.set(ingest.sync_store, "sync_groups_for_files", lambda file_ids: {})
+    p.set(ingest.get_settings(), "ingest_pass2_provider", "anthropic")
     p.set(ingest.pass1, "run_pass1",
           lambda file_rows, outlook_hints=None: ic.Completion(data=_GOOD_PASS1, usage={}, attempts=1))
     p.set(ingest.ip, "build_image_plan", lambda *a, **k: [])
@@ -183,6 +194,7 @@ def test_run_ingest_marks_failed_and_reraises_on_pass1_failure():
     p.set(ingest, "_proxy_keys_for_files", lambda file_ids: {})
     p.set(ingest, "build_l1_snapshot",
           lambda fid: {"motion_dynamics": {}, "scene_cuts": {}, "audio_features": {}})
+    p.set(ingest, "_onsets_for_files", lambda file_ids: {})
     p.set(ingest.sync_store, "sync_groups_for_files", lambda file_ids: {})
     p.set(ingest.pass1, "run_pass1", boom)
     try:

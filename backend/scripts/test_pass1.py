@@ -544,6 +544,162 @@ def test_beat_merge_does_not_touch_untagged_neighbours():
     print("ok  test_beat_merge_does_not_touch_untagged_neighbours")
 
 
+def _trailing_runt_lattice(gap_atoms, *, gap_span=(2000, 2600)):
+    """Five real words ('Watch this trick right now') then ONE trailing runt
+    word ('yeah'), split by a single wordless gap at ``gap_span`` holding
+    ``gap_atoms``."""
+    g_lo, g_hi = gap_span
+    words = [
+        {"start_ms": 0, "end_ms": 400, "text": "Watch", "speaker": "S1"},
+        {"start_ms": 400, "end_ms": 800, "text": "this", "speaker": "S1"},
+        {"start_ms": 800, "end_ms": 1200, "text": "trick", "speaker": "S1"},
+        {"start_ms": 1200, "end_ms": 1600, "text": "right", "speaker": "S1"},
+        {"start_ms": 1600, "end_ms": g_lo, "text": "now", "speaker": "S1"},
+        {"start_ms": g_hi, "end_ms": g_hi + 400, "text": "yeah", "speaker": "S1"},
+    ]
+    return Lattice(file_id="f1", duration_ms=g_hi + 400, words=words, turns=[],
+                   hints=[], atoms=list(gap_atoms))
+
+
+def _leading_runt_lattice(gap_atoms, *, gap_span=(400, 1000)):
+    """ONE leading runt word ('So'), a wordless gap at ``gap_span`` holding
+    ``gap_atoms``, then five real words ('watch this cool trick now')."""
+    g_lo, g_hi = gap_span
+    words = [
+        {"start_ms": 0, "end_ms": g_lo, "text": "So", "speaker": "S1"},
+        {"start_ms": g_hi, "end_ms": g_hi + 400, "text": "watch", "speaker": "S1"},
+        {"start_ms": g_hi + 400, "end_ms": g_hi + 800, "text": "this", "speaker": "S1"},
+        {"start_ms": g_hi + 800, "end_ms": g_hi + 1200, "text": "cool", "speaker": "S1"},
+        {"start_ms": g_hi + 1200, "end_ms": g_hi + 1600, "text": "trick", "speaker": "S1"},
+        {"start_ms": g_hi + 1600, "end_ms": g_hi + 2000, "text": "now", "speaker": "S1"},
+    ]
+    return Lattice(file_id="f1", duration_ms=g_hi + 2000, words=words, turns=[],
+                   hints=[], atoms=list(gap_atoms))
+
+
+def test_runt_guard_absorbs_trailing_runt_into_preceding_cut():
+    # A real 5-word thought followed by a 1-word trailing runt ("yeah") across
+    # a weldable gap. Word count 1 is <= 3 and below this clip's own median
+    # (3.0, from [5, 1]) -- a runt with no hardcoded ms threshold involved --
+    # so it folds BACKWARD into the preceding cut.
+    atom = Atom(atom_id=10, file_id="f1", start_ms=2000, end_ms=2600,
+                state_in="speech_edge", state_out="speech_edge",
+                action_energy=0.3, coherence=0.9)
+    lat = _trailing_runt_lattice([atom])
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [
+            {"file_id": "f1", "word_span": [0, 4], "label": "main"},
+            {"file_id": "f1", "word_span": [5, 5], "label": "trailing runt"},
+        ],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    assert [tuple(sc.word_span) for sc in fixed.speech_cuts] == [(0, 5)], fixed.speech_cuts
+    assert fixed.speech_cuts[0].label == "main"
+    print("ok  test_runt_guard_absorbs_trailing_runt_into_preceding_cut")
+
+
+def test_runt_guard_absorbs_leading_runt_into_following_cut():
+    # A 1-word leading runt ("So") before a real 5-word thought, across a
+    # weldable gap -> the runt folds FORWARD into the following cut.
+    atom = Atom(atom_id=10, file_id="f1", start_ms=400, end_ms=1000,
+                state_in="speech_edge", state_out="speech_edge",
+                action_energy=0.3, coherence=0.9)
+    lat = _leading_runt_lattice([atom])
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [
+            {"file_id": "f1", "word_span": [0, 0], "label": "leading runt"},
+            {"file_id": "f1", "word_span": [1, 5], "label": "main"},
+        ],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    assert [tuple(sc.word_span) for sc in fixed.speech_cuts] == [(0, 5)], fixed.speech_cuts
+    assert fixed.speech_cuts[0].label == "main"
+    print("ok  test_runt_guard_absorbs_leading_runt_into_following_cut")
+
+
+def test_runt_guard_respects_the_seam_guard():
+    # Same trailing-runt shape, but a SHOT CUT sits in the gap -> hard seam ->
+    # the runt is left split, same as the beat-merge guard (on any doubt,
+    # leave it split).
+    a0 = Atom(atom_id=10, file_id="f1", start_ms=2000, end_ms=2300,
+              state_in="speech_edge", state_out="shot_cut", action_energy=0.5, coherence=0.9)
+    a1 = Atom(atom_id=11, file_id="f1", start_ms=2300, end_ms=2600,
+              state_in="shot_cut", state_out="speech_edge", action_energy=0.5, coherence=0.9)
+    lat = _trailing_runt_lattice([a0, a1])
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [
+            {"file_id": "f1", "word_span": [0, 4], "label": "main"},
+            {"file_id": "f1", "word_span": [5, 5], "label": "trailing runt"},
+        ],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    assert [tuple(sc.word_span) for sc in fixed.speech_cuts] == [(0, 4), (5, 5)], fixed.speech_cuts
+    print("ok  test_runt_guard_respects_the_seam_guard")
+
+
+def test_runt_guard_does_not_absorb_a_take_member():
+    # The preceding cut is a take_candidate member -- its word_span identity
+    # must stay exactly what pass 2a expects, so absorption is blocked even
+    # though the seam is otherwise weldable.
+    atom = Atom(atom_id=10, file_id="f1", start_ms=2000, end_ms=2600,
+                state_in="speech_edge", state_out="speech_edge",
+                action_energy=0.3, coherence=0.9)
+    lat = _trailing_runt_lattice([atom])
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [
+            {"file_id": "f1", "word_span": [0, 4], "label": "main"},
+            {"file_id": "f1", "word_span": [5, 5], "label": "trailing runt"},
+        ],
+        "take_candidates": [
+            {"group_id": "t1", "members": [{"file_id": "f1", "word_span": [0, 4]}]},
+        ],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    assert [tuple(sc.word_span) for sc in fixed.speech_cuts] == [(0, 4), (5, 5)], fixed.speech_cuts
+    print("ok  test_runt_guard_does_not_absorb_a_take_member")
+
+
+def test_runt_guard_does_not_absorb_flagged_junk():
+    # The runt itself is a flagged junk suspect -- code never silently fuses a
+    # false start into the real line.
+    atom = Atom(atom_id=10, file_id="f1", start_ms=2000, end_ms=2600,
+                state_in="speech_edge", state_out="speech_edge",
+                action_energy=0.3, coherence=0.9)
+    lat = _trailing_runt_lattice([atom])
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [
+            {"file_id": "f1", "word_span": [0, 4], "label": "main"},
+            {"file_id": "f1", "word_span": [5, 5], "label": "trailing runt"},
+        ],
+        "junk_suspects": [
+            {"file_id": "f1", "word_span": [5, 5], "reason": "false start"},
+        ],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    assert [tuple(sc.word_span) for sc in fixed.speech_cuts] == [(0, 4), (5, 5)], fixed.speech_cuts
+    print("ok  test_runt_guard_does_not_absorb_flagged_junk")
+
+
+def test_runt_guard_skips_outlook_synced_files():
+    # Otherwise-weldable trailing runt, but the file belongs to an outlook
+    # group -- group_outlooks (run right after enforce_lattice_partition)
+    # needs BYTE-IDENTICAL word spans across every angle, so runt absorption
+    # must not touch a synced file at all.
+    atom = Atom(atom_id=10, file_id="f1", start_ms=2000, end_ms=2600,
+                state_in="speech_edge", state_out="speech_edge",
+                action_energy=0.3, coherence=0.9)
+    lat = _trailing_runt_lattice([atom])
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [
+            {"file_id": "f1", "word_span": [0, 4], "label": "main"},
+            {"file_id": "f1", "word_span": [5, 5], "label": "trailing runt"},
+        ],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat}, outlook_file_ids={"f1"})
+    assert [tuple(sc.word_span) for sc in fixed.speech_cuts] == [(0, 4), (5, 5)], fixed.speech_cuts
+    print("ok  test_runt_guard_skips_outlook_synced_files")
+
+
 def test_silent_trailing_word_is_folded_into_its_beat():
     # Real-data artifact: a zero-duration trailing word ("you." timed
     # end==start) left uncovered by the model, sitting flush against an atom.
@@ -655,6 +811,12 @@ def main():
     test_beat_merge_fuses_same_beat_neighbours_across_weldable_seam()
     test_beat_merge_respects_the_seam_guard()
     test_beat_merge_does_not_touch_untagged_neighbours()
+    test_runt_guard_absorbs_trailing_runt_into_preceding_cut()
+    test_runt_guard_absorbs_leading_runt_into_following_cut()
+    test_runt_guard_respects_the_seam_guard()
+    test_runt_guard_does_not_absorb_a_take_member()
+    test_runt_guard_does_not_absorb_flagged_junk()
+    test_runt_guard_skips_outlook_synced_files()
     test_silent_trailing_word_is_folded_into_its_beat()
     test_isolated_silent_word_is_dropped()
     test_no_overlapping_speech_cuts()

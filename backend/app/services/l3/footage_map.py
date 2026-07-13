@@ -328,6 +328,13 @@ def build_clip_tree(
             # levels, removable dead-air/filler spans) -- the pacing ROOM the
             # brain reads + `retime` acts on. {} for legacy hero cuts.
             "pace": cut.get("pace") or {},
+            # perception_upgrade.plan.md: on-screen text/graphics (slide,
+            # lower-third, UI, title) the model read off the pixels, and this
+            # cut's single strongest INSTANT (code-computed -- see
+            # post._salience; distinct from hero_ts_ms, the best STILL).
+            # "" / {} on a pre-migration cut.
+            "screen_text": cut.get("screen_text") or "",
+            "salience": cut.get("salience") or {},
             "variants": variants,
             "atoms": [],
         })

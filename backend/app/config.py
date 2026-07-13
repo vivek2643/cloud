@@ -102,22 +102,31 @@ class Settings(BaseSettings):
     # Model ids are per-stage so either pass can be swapped independently via
     # env var -- prompts are model-agnostic (see cuts_v3.plan.md, "Model layer").
     ingest_pass1_model: str = "claude-sonnet-5"
-    ingest_pass2_model: str = "claude-sonnet-5"
+    ingest_pass2_model: str = "gemini-3.1-flash-lite"
     # Prompt-cache TTL headroom: pass-2 shards must run back-to-back within
     # this window to keep reading the pass-1 prefix at the cheap cache rate.
     ingest_cache_ttl_seconds: int = 300
 
-    # gemini_pass2.plan.md: Pass 2 backend, gated per-environment. "anthropic"
-    # (default, unchanged) keeps ic.complete("pass2", ...) on the proven
-    # Claude tool-forced path; "gemini" routes it to
-    # app.services.llm.ingest_gemini.complete_gemini instead. ingest_pass2_model
-    # is the model id for WHICHEVER provider is selected (e.g. set it to a
-    # Gemini model id when this is "gemini"). Pass 1 always stays Anthropic --
-    # this flag has no effect on it.
-    ingest_pass2_provider: str = "anthropic"
+    # gemini_pass2.plan.md: Pass 2 backend. "anthropic" keeps ic.complete(
+    # "pass2", ...) on the Claude tool-forced path; "gemini" routes it to
+    # app.services.llm.ingest_gemini.complete_gemini instead.
+    # ingest_pass2_model is the model id for WHICHEVER provider is selected.
+    # Pass 1 always stays Anthropic -- this flag has no effect on it.
+    # perception_upgrade.plan.md Part A: flipped to "gemini" -- A/B verified
+    # across podcast + drone/b-roll reel + montage reel (6/6 ingests OK,
+    # coverage at Sonnet parity, 28-47x cheaper, no IngestFailure). Flip back
+    # to "anthropic" to roll back; single env-var change, no code involved.
+    ingest_pass2_provider: str = "gemini"
     # Gemini thinking effort for Pass 2: "low"/"medium"/"high" (mapped to a
-    # fixed thinking_budget token count) or a numeric string used as the
-    # budget directly.
+    # fixed thinking_budget token count) or a numeric string used as the budget
+    # directly. MUST stay "low": on gemini-3.x flash-lite thinking_budget is a
+    # soft target the model can overshoot without bound, and it counts INSIDE
+    # max_output_tokens. At "medium"/"high" the hardest b-roll batches spiral --
+    # thinking eats the entire output budget (observed think_tok=30k+,
+    # finish=MAX_TOKENS) and zero JSON is emitted, failing the whole run. At
+    # "low" the budget stays small enough that even hard batches finish and
+    # emit. B-roll field coverage is nudged via the prompt, not more thinking.
+    # Only affects the gemini pass-2 path.
     ingest_pass2_thinking: str = "low"
 
     @property

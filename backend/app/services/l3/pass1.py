@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import re
+import statistics
 from typing import Any, Dict, List, Set, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -112,17 +113,24 @@ _SYSTEM = (
     "detected motion impacts. Read these to judge what each shot is doing.\n"
     "  - HINTS: where speaker changes and long pauses fall (informational).\n\n"
     "Produce, across all clips:\n"
-    "  - speech_cuts: coherent spoken beats, as word-index ranges. A held pause "
+    "  - speech_cuts: coherent spoken beats, as word-index ranges. A speech cut "
+    "is a COMPLETE, DELIVERABLE THOUGHT -- a full sentence or clause, or a "
+    "coherent multi-sentence beat -- that an editor could place on its own. It "
+    "is NEVER a fragment, a connector, or a trailing tail: do NOT emit a "
+    "1-3 word runt ('yeah', 'so', 'and then...', a trailing '...right?') as "
+    "its own cut -- absorb it into the adjacent thought it belongs to (the "
+    "same range as the line it leads into or trails off from). A held pause "
     "or a demonstrated action in the MIDDLE of one continuous thought is NOT a "
     "boundary -- keep 'to inform you ... there's a catch' as ONE range even if "
-    "the speaker pauses dramatically in the middle. When one continuous moment "
-    "is split across consecutive cuts anyway -- a single podcast-style answer, a "
-    "sentence that resumes after a beat -- tag those cuts with the SAME beat_id "
-    "(your call, from meaning: what is one delivered thought?). Code merges "
-    "same-beat cuts ONLY when the footage between is continuous (no shot change, "
-    "transition, or speaker change), so tag freely -- the deterministic guard "
-    "blocks a wrong merge (e.g. it will NOT let a false start you flag as junk "
-    "fuse into the real line). Leave beat_id empty for a cut that stands alone.\n"
+    "the speaker pauses dramatically in the middle; never split mid-thought on "
+    "a dramatic pause. When one continuous moment is split across consecutive "
+    "cuts anyway -- a single podcast-style answer, a sentence that resumes "
+    "after a beat -- tag those cuts with the SAME beat_id (your call, from "
+    "meaning: what is one delivered thought?). Code merges same-beat cuts "
+    "ONLY when the footage between is continuous (no shot change, transition, "
+    "or speaker change), so tag freely -- the deterministic guard blocks a "
+    "wrong merge (e.g. it will NOT let a false start you flag as junk fuse "
+    "into the real line). Leave beat_id empty for a cut that stands alone.\n"
     "  - take_candidates: near-identical retakes of the same line (within or across "
     "clips); each member is one whole speech_cut.\n"
     "  - video_tentative_groups: visual moments worth keeping, each a group of "
@@ -481,6 +489,105 @@ def _fold_silent_speech_cuts(cuts: List[SpeechCut], lattice: Lattice) -> List[Sp
     return out
 
 
+# A speech cut this short (word count) AND below the clip's own median is a
+# RUNT -- a stray connector or trailing tail, not a deliverable thought (see
+# the _SYSTEM speech_cuts bullet's "1-3 word runt" examples). Word-count based,
+# never a hardcoded ms: mirrors the model-facing rule with a code-owned bound.
+_RUNT_MAX_WORDS = 3
+
+
+def _is_speech_runt(sc: SpeechCut, median_words: float) -> bool:
+    n = sc.word_span[1] - sc.word_span[0] + 1
+    return n <= _RUNT_MAX_WORDS and n < median_words
+
+
+def _absorb_runt_speech_cuts(
+    cuts: List[SpeechCut], lattice: Lattice, junk_atom_ids: set,
+    claimed_words: set, junk_word_spans: List[Tuple[int, int]], *, synced: bool = False,
+) -> Tuple[List[SpeechCut], List[int]]:
+    """Deterministically fold a RUNT speech cut -- short by THIS clip's OWN
+    word-count distribution, never a hardcoded ms (perception_upgrade.plan.md
+    Part E2) -- into the adjacent thought it belongs to. Mirrors
+    ``_merge_beats``'s propose/dispose contract, except the 'propose' half is
+    code (a cut IS a runt iff ``_is_speech_runt``), not the model's beat_id.
+
+    Absorption requires ALL of: same file + word-contiguous with the
+    neighbour, a weldable seam between them (``seam.classify_seam`` -- no shot
+    change / transition / speaker change, gap not longer than what it
+    bridges), and neither cut is a take/outlook member (``claimed_words``) or
+    flagged junk (``junk_word_spans``). Any doubt -> leave it split. Tries
+    absorbing BACKWARD (into the preceding cut) first, then any surviving
+    runt FORWARD (into the following cut), so a run of consecutive runts
+    chains onto whichever real thought is adjacent. Returns
+    ``(cuts, absorbed_atom_ids)`` -- absorbed atoms must leave the video pool,
+    same as ``_merge_beats``."""
+    words = lattice.words
+    atoms = lattice.atoms
+    ordered = sorted(cuts, key=lambda s: s.word_span[0])
+    if len(ordered) < 2 or not words:
+        return ordered, []
+    median_words = statistics.median(sc.word_span[1] - sc.word_span[0] + 1 for sc in ordered)
+
+    def _claimed_or_junk(sc: SpeechCut) -> bool:
+        a, b = sc.word_span
+        if any(a <= i <= b for i in claimed_words):
+            return True
+        return any(a <= ja and jb <= b for ja, jb in junk_word_spans)
+
+    def _try_weld(prev: SpeechCut, nxt: SpeechCut) -> Tuple[bool, List[int]]:
+        if prev.file_id != nxt.file_id or prev.word_span[1] + 1 != nxt.word_span[0]:
+            return False, []
+        if prev.word_span[1] >= len(words) or nxt.word_span[0] >= len(words):
+            return False, []
+        beat_lo = int(words[prev.word_span[0]].get("start_ms", 0))
+        beat_hi = int(words[nxt.word_span[1]].get("end_ms", 0))
+        verdict, gap_atoms = _gap_seam(words, atoms, prev.word_span[1], junk_atom_ids,
+                                       beat_lo, beat_hi, synced=synced)
+        if verdict is None:
+            same_spk = (words[prev.word_span[1]].get("speaker") == words[nxt.word_span[0]].get("speaker"))
+            return same_spk, []
+        return verdict.weldable, [at.atom_id for at in gap_atoms]
+
+    absorbed_atoms: List[int] = []
+    n_absorbed = 0
+
+    # Pass 1: absorb a runt BACKWARD into the preceding (already-placed) cut.
+    stage1: List[SpeechCut] = []
+    for sc in ordered:
+        prev = stage1[-1] if stage1 else None
+        if (prev is not None and _is_speech_runt(sc, median_words)
+                and not _claimed_or_junk(sc) and not _claimed_or_junk(prev)):
+            weld, gap_atoms = _try_weld(prev, sc)
+            if weld:
+                stage1[-1] = SpeechCut(file_id=prev.file_id, word_span=(prev.word_span[0], sc.word_span[1]),
+                                       label=prev.label, speaker_ids=list(prev.speaker_ids),
+                                       beat_id=prev.beat_id)
+                absorbed_atoms.extend(gap_atoms)
+                n_absorbed += 1
+                continue
+        stage1.append(sc)
+
+    # Pass 2: absorb any SURVIVING runt FORWARD into the following cut.
+    out: List[SpeechCut] = []
+    for sc in reversed(stage1):
+        nxt = out[0] if out else None
+        if (nxt is not None and _is_speech_runt(sc, median_words)
+                and not _claimed_or_junk(sc) and not _claimed_or_junk(nxt)):
+            weld, gap_atoms = _try_weld(sc, nxt)
+            if weld:
+                out[0] = SpeechCut(file_id=nxt.file_id, word_span=(sc.word_span[0], nxt.word_span[1]),
+                                   label=nxt.label, speaker_ids=list(nxt.speaker_ids),
+                                   beat_id=nxt.beat_id)
+                absorbed_atoms.extend(gap_atoms)
+                n_absorbed += 1
+                continue
+        out.insert(0, sc)
+    if n_absorbed:
+        logger.info("pass1 enforce: runt guard absorbed %d speech cut(s) in %s",
+                    n_absorbed, ordered[0].file_id if ordered else "?")
+    return out, absorbed_atoms
+
+
 # Take-identity text match: a take group is "the same LINE said again", so its
 # members' transcripts must actually share content words. These two govern that
 # SAME-LINE text test only (not cut boundaries): keep a member when at least
@@ -765,6 +872,19 @@ def enforce_lattice_partition(
         if js.atom_ids:
             junk_atom_ids.setdefault(js.file_id, set()).update(js.atom_ids)
 
+    # Word-level junk spans + take/outlook-claimed words, gathered up front for
+    # the runt-absorption guard (step 2c below): a runt never absorbs across a
+    # flagged span, and never touches a take/outlook member's word_span (its
+    # identity must stay exactly what pass 2a / group_outlooks expect).
+    junk_word_spans: Dict[str, List[Tuple[int, int]]] = {}
+    for js in output.junk_suspects:
+        if js.word_span is not None:
+            junk_word_spans.setdefault(js.file_id, []).append(tuple(js.word_span))
+    claimed_words: Dict[str, set] = {}
+    for tc in output.take_candidates:
+        for m in tc.members:
+            claimed_words.setdefault(m.file_id, set()).update(range(m.word_span[0], m.word_span[1] + 1))
+
     # Atoms a beat ABSORBED across a weldable seam: they leave the video pool
     # (below) and play inside the spoken beat instead of becoming a video cut.
     absorbed_atoms: Dict[str, set] = {}
@@ -843,6 +963,20 @@ def enforce_lattice_partition(
             # Fold any zero-audible-duration cut into its neighbour so no speech
             # cut resolves to a degenerate (src_out <= src_in) span downstream.
             file_cuts = _fold_silent_speech_cuts(file_cuts, lattice)
+            # 2c. RUNT GUARD: absorb a cut that is short by this clip's OWN
+            # word-count distribution into the weldable neighbour it belongs
+            # to (perception_upgrade.plan.md Part E2). Skipped for outlook/
+            # synced files -- group_outlooks (run after this function) links
+            # angles by BYTE-IDENTICAL word spans, an invariant this file's
+            # own local seam/junk pattern could break if run per-angle.
+            if file_id not in synced_ids:
+                file_cuts, runt_absorbed = _absorb_runt_speech_cuts(
+                    file_cuts, lattice, junk_atom_ids.get(file_id, set()),
+                    claimed_words.get(file_id, set()), junk_word_spans.get(file_id, []),
+                    synced=False,
+                )
+                if runt_absorbed:
+                    absorbed_atoms.setdefault(file_id, set()).update(runt_absorbed)
         merged_cuts.extend(file_cuts)
     new_cuts = merged_cuts
 

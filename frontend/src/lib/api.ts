@@ -148,6 +148,11 @@ export type ShotSize =
   | "extreme_close_up" | "close_up" | "medium_close_up" | "medium"
   | "medium_wide" | "wide" | "extreme_wide" | "unsure";
 
+// Technical shot stability (perception_upgrade.plan.md Part C2) -- a single
+// still often can't judge this; absent on runs before the field existed.
+export type ShotQuality =
+  | "stable" | "shaky" | "whip" | "soft_focus" | "racking_focus" | "exposure_shift" | "unsure";
+
 export interface Framing {
   subject_box?: [number, number, number, number] | null;
   crop_16x9?: [number, number, number, number] | null;
@@ -157,6 +162,7 @@ export interface Framing {
   // How tight the frame is on the subject (pass 2 image judgment). Feeds the
   // visual half of total_quality. Absent on pre-migration runs.
   shot_size?: ShotSize;
+  shot_quality?: ShotQuality;
 }
 
 // One person visible in a cut, described well enough to recognise across cuts
@@ -231,6 +237,14 @@ export interface CutRecord {
   // "tilt up"/"tilt down", "zoom in"/"zoom out", "follow subject", "shaky").
   // Deterministic from L1 camera velocity; "unknown" on pre-migration runs.
   camera?: string;
+  // On-screen text/graphics (title, lower-third, slide, UI) read off the
+  // pixels by the pass 2 image LLM. "" / absent when there is none, or on a
+  // pre-migration run.
+  screen_text?: string;
+  // This cut's single strongest INSTANT, code-computed (post._salience) --
+  // distinct from hero_ts_ms (the best STILL for display). null/absent on a
+  // pre-migration run or a cut with no usable signal.
+  salience?: { peak_ms: number; score: number } | null;
 }
 
 export type IngestStatus = "pending" | "pass1" | "images" | "pass2" | "post" | "ready" | "failed";

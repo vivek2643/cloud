@@ -158,10 +158,13 @@ def test_take_member_always_kept_even_at_tiny_budget():
     print("ok  test_take_member_always_kept_even_at_tiny_budget")
 
 
-def test_budget_truncation_drops_extras_not_mandatory_frames():
-    # A group with 3 anchors + a drift point inside the speech cut: the
-    # mandatory floor (take, speech cut, group's FIRST anchor) always ships;
-    # the budget then trims extra anchors before drift, lowest tier first.
+def test_budget_truncation_second_moment_outranks_extra_anchors_and_drift():
+    # A group with 3 anchors + a drift point inside the speech cut, no
+    # motion data (hop_ms=0 -> every non-trivial span clears the runt guard,
+    # see _is_runt_span). perception_upgrade.plan.md's new tier order is
+    # mandatory > second_moment > extra_anchors > drift: with only 1 slot of
+    # budget beyond the 3 mandatory frames, it goes to a 2nd-moment
+    # candidate (take's "late"), not the next anchor or the drift point.
     atoms = [_atom(0, 3000, 6000, anchors=[3500, 4200, 5100])]
     lat = _lattice_with_atoms("f1", 5, atoms)
     pass1 = Pass1Output(
@@ -176,13 +179,102 @@ def test_budget_truncation_drops_extras_not_mandatory_frames():
         frames = ip.build_image_plan(pass1, {"f1": lat}, {}, scene, {})
     finally:
         ip.FRAME_BUDGET_PER_CLIP = orig_budget
+    assert len(frames) == 4, frames
     reasons = sorted(f.reason for f in frames)
-    # 1 take + 1 speech + first anchor (mandatory) + 1 extra anchor; drift dropped.
+    # 1 take (x2, early+late) + 1 speech (mandatory only) + 1st video anchor
+    # (mandatory only) -- the extra anchors and the drift point both lost
+    # out to the take's 2nd-moment frame.
     assert reasons == [ip.REASON_SPEECH_CUT, ip.REASON_TAKE_MEMBER,
-                       ip.REASON_VIDEO_GROUP_ANCHOR, ip.REASON_VIDEO_GROUP_ANCHOR], frames
+                       ip.REASON_TAKE_MEMBER, ip.REASON_VIDEO_GROUP_ANCHOR], frames
+    takes = [f for f in frames if f.reason == ip.REASON_TAKE_MEMBER]
+    assert {f.phase for f in takes} == {"early", "late"}, takes
+    # speech/video kept only their mandatory frame -- and since their would-be
+    # 2nd-moment partner never survived the budget, they're relabeled "only"
+    # (never a dangling "early" with no "late" to pair with).
+    non_take = [f for f in frames if f.reason != ip.REASON_TAKE_MEMBER]
+    assert all(f.phase == "only" for f in non_take), non_take
+    print("ok  test_budget_truncation_second_moment_outranks_extra_anchors_and_drift")
+
+
+def test_budget_truncation_extra_anchors_outrank_drift_once_second_moment_is_covered():
+    # Same fixture, but with enough budget to satisfy every mandatory AND
+    # 2nd-moment candidate -- confirms the ORIGINAL ordering (extra anchors
+    # before drift) still holds beneath the new second_moment tier.
+    atoms = [_atom(0, 3000, 6000, anchors=[3500, 4200, 5100])]
+    lat = _lattice_with_atoms("f1", 5, atoms)
+    pass1 = Pass1Output(
+        take_candidates=[TakeCandidate(group_id="tg1", members=[TakeMember(file_id="f1", word_span=(0, 1))])],
+        speech_cuts=[SpeechCut(file_id="f1", word_span=(0, 4), label="x")],
+        video_tentative_groups=[VideoTentativeGroup(file_id="f1", atom_ids=[0])],
+    )
+    scene = {"f1": {"composition_points": [{"ts_ms": 700}]}}
+    orig_budget = ip.FRAME_BUDGET_PER_CLIP
+    # 3 mandatory + 3 second-moment (take/speech/video each get a "late") + 1.
+    ip.FRAME_BUDGET_PER_CLIP = 7
+    try:
+        frames = ip.build_image_plan(pass1, {"f1": lat}, {}, scene, {})
+    finally:
+        ip.FRAME_BUDGET_PER_CLIP = orig_budget
     anchor_ts = sorted(f.ts_ms for f in frames if f.reason == ip.REASON_VIDEO_GROUP_ANCHOR)
-    assert anchor_ts == [3500, 4200], anchor_ts
-    print("ok  test_budget_truncation_drops_extras_not_mandatory_frames")
+    # first anchor (mandatory, early) + last anchor (2nd moment, late) +
+    # the one leftover middle anchor (the extra that wins the final slot
+    # over the drift point).
+    assert anchor_ts == [3500, 4200, 5100], anchor_ts
+    assert not any(f.reason == ip.REASON_COMPOSITION_DRIFT for f in frames), frames
+    print("ok  test_budget_truncation_extra_anchors_outrank_drift_once_second_moment_is_covered")
+
+
+def test_long_speech_cut_gets_early_and_late_frames():
+    # A long span relative to a short baseline unit in the same clip, with
+    # real motion data (hop_ms>0) so the runt guard's distribution check is
+    # meaningfully exercised (not vacuously true the way hop_ms=0 makes it).
+    lat = _lattice_with_atoms("f1", 20, [])
+    short = SpeechCut(file_id="f1", word_span=(0, 1), label="short")   # ~700ms
+    long_cut = SpeechCut(file_id="f1", word_span=(2, 15), label="long")  # much bigger
+    pass1 = Pass1Output(speech_cuts=[short, long_cut])
+    hop = 50
+    n = 400
+    blur = [0.9] * n
+    blur[20] = 0.05    # sharp sample early in the long cut's span
+    blur[200] = 0.05   # sharp sample late in the long cut's span
+    motion = {"f1": {"hop_ms": hop, "blur": blur, "action_energy": [0.0] * n}}
+    frames = ip.build_image_plan(pass1, {"f1": lat}, motion, {}, {})
+    long_frames = [f for f in frames if f.ref == "speech_cut[1]"]
+    assert len(long_frames) == 2, long_frames
+    assert {f.phase for f in long_frames} == {"early", "late"}, long_frames
+    early = next(f for f in long_frames if f.phase == "early")
+    late = next(f for f in long_frames if f.phase == "late")
+    assert early.ts_ms < late.ts_ms, (early, late)
+    print("ok  test_long_speech_cut_gets_early_and_late_frames")
+
+
+def test_runt_speech_cut_stays_single_frame():
+    # Two units of similar (short) size in the same clip -- neither is short
+    # relative to the OTHER, so this alone doesn't prove the median check;
+    # combined with a real hop_ms it confirms two near-identical candidate
+    # instants collapse via the proximity guard, not just default to 2 frames.
+    lat = _lattice_with_atoms("f1", 3, [])
+    pass1 = Pass1Output(speech_cuts=[SpeechCut(file_id="f1", word_span=(0, 1), label="x")])
+    hop = 500   # coarse hop relative to the ~700ms span -> few/no distinct samples
+    motion = {"f1": {"hop_ms": hop, "blur": [0.5, 0.5], "action_energy": [0.0, 0.0]}}
+    frames = ip.build_image_plan(pass1, {"f1": lat}, motion, {}, {})
+    assert len(frames) == 1, frames
+    assert frames[0].phase == "only", frames[0]
+    print("ok  test_runt_speech_cut_stays_single_frame")
+
+
+def test_anchored_video_group_gets_first_and_last_anchor_when_far_apart():
+    atoms = [_atom(0, 0, 10000, anchors=[100, 5000, 9800])]
+    lat = _lattice_with_atoms("f1", 0, atoms)
+    pass1 = Pass1Output(video_tentative_groups=[VideoTentativeGroup(file_id="f1", atom_ids=[0])])
+    frames = ip.build_image_plan(pass1, {"f1": lat}, {}, {}, {})
+    assert len(frames) == 3, frames   # first (early) + last (late) + leftover middle anchor extra
+    early = next(f for f in frames if f.phase == "early")
+    late = next(f for f in frames if f.phase == "late")
+    assert early.ts_ms == 100 and late.ts_ms == 9800, (early, late)
+    leftover = [f for f in frames if f.phase == "only"]
+    assert len(leftover) == 1 and leftover[0].ts_ms == 5000, leftover
+    print("ok  test_anchored_video_group_gets_first_and_last_anchor_when_far_apart")
 
 
 def test_unknown_file_id_skipped_gracefully():
@@ -205,7 +297,10 @@ def test_no_pass1_content_yields_no_frames():
 
 def test_planned_frame_to_dict():
     f = ip.PlannedFrame("f1", 123, ip.REASON_SPEECH_CUT, "speech_cut[0]")
-    assert f.to_dict() == {"file_id": "f1", "ts_ms": 123, "reason": "speech_cut", "ref": "speech_cut[0]"}
+    assert f.to_dict() == {"file_id": "f1", "ts_ms": 123, "reason": "speech_cut",
+                           "ref": "speech_cut[0]", "phase": "only"}
+    f2 = ip.PlannedFrame("f1", 123, ip.REASON_SPEECH_CUT, "speech_cut[0]", "early")
+    assert f2.to_dict()["phase"] == "early"
     print("ok  test_planned_frame_to_dict")
 
 
@@ -217,7 +312,11 @@ def main():
     test_video_group_unanchored_uses_calm_and_sharp_fallback()
     test_video_group_with_no_resolvable_atoms_is_skipped()
     test_take_member_always_kept_even_at_tiny_budget()
-    test_budget_truncation_drops_extras_not_mandatory_frames()
+    test_budget_truncation_second_moment_outranks_extra_anchors_and_drift()
+    test_budget_truncation_extra_anchors_outrank_drift_once_second_moment_is_covered()
+    test_long_speech_cut_gets_early_and_late_frames()
+    test_runt_speech_cut_stays_single_frame()
+    test_anchored_video_group_gets_first_and_last_anchor_when_far_apart()
     test_unknown_file_id_skipped_gracefully()
     test_no_pass1_content_yields_no_frames()
     test_planned_frame_to_dict()

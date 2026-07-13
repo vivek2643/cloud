@@ -53,6 +53,11 @@ _SHOT_SIZE_ENUM = (
     "medium_wide", "wide", "extreme_wide", "unsure",
 )
 _CHANNEL_ENUM = ("said", "done", "shown")
+# Mirrors pass2.SHOT_QUALITY (perception_upgrade.plan.md Part C2) -- OPTIONAL
+# only (never added to `required`; see the Flash-Lite guardrail note below).
+_SHOT_QUALITY_ENUM = (
+    "stable", "shaky", "whip", "soft_focus", "racking_focus", "exposure_shift", "unsure",
+)
 
 # Keys Gemini's response_schema converter rejects outright (probed against
 # the real API). "format" is stripped unconditionally -- no field in this
@@ -155,6 +160,19 @@ def gemini_schema(schema: Type[BaseModel]) -> dict:
         framing_props = framing_def.get("properties") or {}
         if "shot_size" in framing_props and isinstance(framing_props["shot_size"], dict):
             framing_props["shot_size"]["enum"] = list(_SHOT_SIZE_ENUM)
+        if "shot_quality" in framing_props and isinstance(framing_props["shot_quality"], dict):
+            framing_props["shot_quality"]["enum"] = list(_SHOT_QUALITY_ENUM)
+        # NOTE: shot_quality (like subject_box below) stays OPTIONAL -- never
+        # added to `required`. perception_upgrade.plan.md's Flash-Lite
+        # guardrail: every NEW model field is additive/optional/prompt-nudged
+        # only; requiring one risks the same runaway-thinking failure mode
+        # subject_box hit (see below).
+        # NOTE: subject_box stays OPTIONAL/nullable here. Forcing it required
+        # (an earlier "knob #2" attempt) triggered runaway dynamic thinking on
+        # ambiguous b-roll batches: Flash-Lite spends the ENTIRE output budget
+        # reasoning about a box it can't confidently place (observed
+        # think_tok >= 30k, finish=MAX_TOKENS, zero JSON emitted). subject_box
+        # recovery is nudged via the prompt instead, never hard-required.
 
     return sanitized
 
@@ -235,6 +253,23 @@ def _response_text(resp: Any) -> str:
     return "".join(bits)
 
 
+def _diag(resp: Any) -> str:
+    """One-line diagnostic for a Gemini response: finish reason, the kinds of
+    content parts present, and the assembled text length -- the signal that
+    tells an empty/failed pass-2 batch (finish=MAX_TOKENS, thinking-only
+    parts, or a safety block) apart from a genuine answer."""
+    cand = (getattr(resp, "candidates", None) or [None])[0]
+    finish = getattr(cand, "finish_reason", None)
+    parts = getattr(getattr(cand, "content", None), "parts", None) or []
+    kinds = [("text" if getattr(p, "text", None) else
+              ("thought" if getattr(p, "thought", None) else "other")) for p in parts]
+    um = getattr(resp, "usage_metadata", None)
+    return (f"finish={finish} parts={kinds} text_len={len(_response_text(resp))} "
+            f"in_tok={getattr(um, 'prompt_token_count', None)} "
+            f"out_tok={getattr(um, 'candidates_token_count', None)} "
+            f"think_tok={getattr(um, 'thoughts_token_count', None)}")
+
+
 def _parse_raw(resp: Any) -> Optional[Dict[str, Any]]:
     text = _response_text(resp).strip()
     if not text:
@@ -309,6 +344,7 @@ def complete_gemini(
         return client.models.generate_content(model=resolved_model, contents=contents, config=cfg)
 
     resp = _call(config)
+    logger.info("ingest_gemini: attempt 1 response -- %s", _diag(resp))
     usage = _usage_of(resp)
     raw = _parse_raw(resp)
     parsed, err = _validate(schema, raw)
@@ -336,6 +372,7 @@ def complete_gemini(
         return client.models.generate_content(model=resolved_model, contents=contents2, config=config)
 
     resp2 = _call2()
+    logger.info("ingest_gemini: attempt 2 response -- %s", _diag(resp2))
     usage2 = _usage_of(resp2)
     total_usage = _sum_usage(usage, usage2)
     raw2 = _parse_raw(resp2)

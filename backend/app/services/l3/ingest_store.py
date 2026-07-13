@@ -130,13 +130,15 @@ def insert_cut_records(ingest_run_id: str, records: List[CutRecord]) -> List[str
                     word_span, atom_ids, label, summary, speaker, on_camera,
                     take_group_id, take_role, junk, junk_reason,
                     framing, look, caption_zones, pace, hero_ts_ms, channel, continuity,
-                    speech_quality, total_quality, characteristics, camera, sync_group_id
+                    speech_quality, total_quality, characteristics, camera, sync_group_id,
+                    screen_text, salience
                 ) values (
                     %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s,
+                    %s, %s
                 )
                 returning id::text
                 """,
@@ -153,6 +155,7 @@ def insert_cut_records(ingest_run_id: str, records: List[CutRecord]) -> List[str
                     json.dumps(r.continuity),
                     r.speech_quality, r.total_quality, json.dumps(r.characteristics),
                     r.camera, r.sync_group_id,
+                    r.screen_text, json.dumps(r.salience),
                 ),
             ).fetchone()
             ids.append(row[0])

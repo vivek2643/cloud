@@ -15,7 +15,10 @@ STILL_WIDTH_PX = 768
 # structure, independent of image count. (No separate image-token cap here
 # anymore either -- co-location is gone, so batching is pure size-based
 # chunking; cut count was already the binding constraint in practice.)
-MAX_CUTS_PER_PASS2_BATCH = 15
+# perception_upgrade.plan.md Part B: halved from 15 -- a cut can now carry
+# TWO frames (early/late) instead of one, so image bytes per batch roughly
+# double on dense clips. Cheap on Flash-Lite; keeps request size safe.
+MAX_CUTS_PER_PASS2_BATCH = 7
 
 # Batches only share a read-only cached prompt prefix, so running them
 # concurrently instead of back-to-back is a pure wall-clock win (see

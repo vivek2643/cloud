@@ -52,6 +52,23 @@ from app.services.processing import _download_from_r2, _upload_to_r2
 logger = logging.getLogger(__name__)
 
 
+def _onsets_for_files(file_ids: List[str]) -> Dict[str, List[int]]:
+    """file_id -> its audio_features.onsets_ms, a targeted query rather than
+    reuse of build_l1_snapshot -- that function is shared by several
+    routers/audit_log consumers that read a summary view (onset_count, not
+    the raw list); adding the full onsets list there would bloat every one
+    of those payloads for a value only post._salience needs (perception_
+    upgrade.plan.md Part D)."""
+    if not file_ids:
+        return {}
+    with pass1._pg_conn() as conn:
+        rows = conn.execute(
+            "select file_id::text, onsets_ms from audio_features where file_id = any(%s::uuid[])",
+            (file_ids,),
+        ).fetchall()
+    return {fid: (onsets or []) for fid, onsets in rows}
+
+
 def _load_signals(
     file_ids: List[str],
 ) -> Tuple[Dict[str, dict], Dict[str, dict], Dict[str, list], Dict[str, dict]]:
@@ -59,6 +76,7 @@ def _load_signals(
     scene_by_file: Dict[str, dict] = {}
     silences_by_file: Dict[str, list] = {}
     audio_by_file: Dict[str, dict] = {}
+    onsets_by_file = _onsets_for_files(file_ids)
     for fid in file_ids:
         snap = build_l1_snapshot(fid)
         motion_by_file[fid] = snap.get("motion_dynamics") or {}
@@ -67,7 +85,9 @@ def _load_signals(
         silences_by_file[fid] = af.get("silence_intervals") or []
         # rms_db (dB energy envelope) + its hop feed the speech_quality loudness
         # term in post.assemble_cut_records; empty when a clip has no audio_features.
-        audio_by_file[fid] = {"rms_db": af.get("rms_db") or [], "hop_ms": af.get("prosody_hop_ms") or 0}
+        # onsets_ms feeds post._salience's proximity-bump term (Part D).
+        audio_by_file[fid] = {"rms_db": af.get("rms_db") or [], "hop_ms": af.get("prosody_hop_ms") or 0,
+                              "onsets_ms": onsets_by_file.get(fid) or []}
     return motion_by_file, scene_by_file, silences_by_file, audio_by_file
 
 

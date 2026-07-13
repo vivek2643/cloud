@@ -116,6 +116,56 @@ def test_energy_grade_bands():
     print("ok  test_energy_grade_bands")
 
 
+# --------------------------------------------------------------------------
+# salience (perception_upgrade.plan.md Part D): a single code-owned "strongest
+# instant" per cut, fused from action_energy + rms loudness + onset/anchor
+# bumps, all normalized clip-relative (no absolute constants).
+# --------------------------------------------------------------------------
+
+def test_salience_no_signal_falls_back_to_hero_ts():
+    sal = post._salience([], 100, 0, 1000, None, None, [], 0, None, None, [], [], 500)
+    assert sal == {"peak_ms": 500, "score": 0.0}, sal
+    print("ok  test_salience_no_signal_falls_back_to_hero_ts")
+
+
+def test_salience_peaks_at_the_loudest_action_energy_hop():
+    ae = [0.1] * 10
+    ae[5] = 0.9
+    lo, hi = post._series_lohi(ae)
+    sal = post._salience(ae, 100, 0, 1000, lo, hi, [], 0, None, None, [], [], 999)
+    assert sal["peak_ms"] == 500, sal
+    assert sal["score"] == 1.0, sal
+    print("ok  test_salience_peaks_at_the_loudest_action_energy_hop")
+
+
+def test_salience_onset_bump_dominates_flat_energy():
+    # A perfectly flat action_energy series is DEGENERATE under clip-relative
+    # normalization (lo == hi -> _norm_in_clip is None everywhere) -- it
+    # contributes nothing. An onset inside the span is then the only signal.
+    ae = [0.5] * 10
+    lo, hi = post._series_lohi(ae)
+    sal = post._salience(ae, 100, 0, 1000, lo, hi, [], 0, None, None, [], [300], 999)
+    assert sal["peak_ms"] == 300, sal
+    assert sal["score"] == 1.0, sal
+    print("ok  test_salience_onset_bump_dominates_flat_energy")
+
+
+def test_salience_onset_outside_span_is_ignored():
+    sal = post._salience([], 100, 1000, 2000, None, None, [], 0, None, None, [], [500], 1500)
+    assert sal == {"peak_ms": 1500, "score": 0.0}, sal
+    print("ok  test_salience_onset_outside_span_is_ignored")
+
+
+def test_salience_uses_rms_loudness_when_action_energy_flat():
+    ae = [0.2] * 10   # degenerate -> no contribution, isolates the rms term
+    rms = [-40.0, -40.0, -10.0, -40.0, -40.0]   # rms_hop_ms=200ms over [0, 1000)
+    rms_lo, rms_hi = post._series_lohi(rms)
+    sal = post._salience(ae, 100, 0, 1000, 0.2, 0.2, rms, 200, rms_lo, rms_hi, [], [], 999)
+    assert sal["peak_ms"] == 400, sal   # rms bin 2 (-10dB, loudest) covers ms [400, 600)
+    assert sal["score"] == 1.0, sal
+    print("ok  test_salience_uses_rms_loudness_when_action_energy_flat")
+
+
 def _cam_motion(dx=None, dy=None, dz=None, action=None, coherence=None, hop_ms=100, n=10):
     z = [0.0] * n
     return {
@@ -607,6 +657,11 @@ def main():
     test_pace_levels_partial_saturation_repeats_nearest_reachable()
     test_pace_levels_zero_intrinsic_velocity_maxes_every_level()
     test_energy_grade_bands()
+    test_salience_no_signal_falls_back_to_hero_ts()
+    test_salience_peaks_at_the_loudest_action_energy_hop()
+    test_salience_onset_bump_dominates_flat_energy()
+    test_salience_onset_outside_span_is_ignored()
+    test_salience_uses_rms_loudness_when_action_energy_flat()
     test_classify_camera_move()
     test_validate_no_overlap_passes_exact_coverage()
     test_validate_no_overlap_allows_start_gap()

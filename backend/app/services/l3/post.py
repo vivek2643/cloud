@@ -217,6 +217,18 @@ def compute_speech_quality(
     return round(_mean(terms) or 0.0, 3)
 
 
+# perception_upgrade.plan.md Part C2 (optional downstream): a technically
+# poor shot_quality nudges total_quality DOWN -- gated on the field being
+# PRESENT (a bad/unknown value from an old, pre-migration run is simply
+# absent from `framing`, so `.get()` returns None and this is a no-op; old
+# runs are unaffected by construction, never explicitly branched on).
+# "stable"/"unsure" are deliberately absent (no penalty -- unsure means the
+# model genuinely couldn't tell, not that the shot is bad).
+_SHOT_QUALITY_PENALTY = {
+    "shaky": 0.7, "whip": 0.7, "soft_focus": 0.6, "racking_focus": 0.8, "exposure_shift": 0.8,
+}
+
+
 def compute_visual_score(
     on_camera: Optional[bool], framing: Dict[str, Any], look: Dict[str, Any],
     blur: List[float], hop_ms: int, s: int, e: int,
@@ -225,7 +237,9 @@ def compute_visual_score(
     """Presentation quality of the pixels, 0..1 (mean of whatever terms are
     available): subject on camera, framing tightness (shot_size ordinal),
     sharpness (clip-relative, since blur is unitless), and a clean/graded look.
-    None when NOTHING visual is known (e.g. a bare speech cut with no framing)."""
+    None when NOTHING visual is known (e.g. a bare speech cut with no framing).
+    A technically poor shot_quality (present only on runs that have it) then
+    scales the result down -- see _SHOT_QUALITY_PENALTY."""
     terms: List[float] = []
     if on_camera is not None:
         terms.append(1.0 if on_camera else 0.0)
@@ -238,7 +252,11 @@ def compute_visual_score(
     if look:
         clean = not (look.get("exposure_flags") or [])
         terms.append(1.0 if (bool(look.get("graded")) and clean) else (0.7 if clean else 0.4))
-    return _mean(terms)
+    result = _mean(terms)
+    if result is None:
+        return None
+    penalty = _SHOT_QUALITY_PENALTY.get((framing or {}).get("shot_quality"))
+    return result * penalty if penalty is not None else result
 
 
 def compute_total_quality(kind: str, speech_quality: Optional[float],
@@ -318,6 +336,75 @@ def classify_camera_move(motion: Dict[str, Any], s: int, e: int) -> str:
     return "tilt up" if rate_y > 0 else "tilt down"
 
 
+# --------------------------------------------------------------------------
+# Salience (perception_upgrade.plan.md Part D, "F8"): the cut's single
+# strongest INSTANT, fused from signals L1 already computed. Deterministic,
+# code-owned -- NOT the LLM's job (it's a number), and DISTINCT from
+# hero_ts_ms (the best still for DISPLAY; salience is the strongest EVENT
+# moment -- useful for emphasis, thumbnail choice, punch-in timing, and for
+# the brain to know where a cut peaks).
+# --------------------------------------------------------------------------
+
+def _salience(
+    action_energy: List[float], hop_ms: int, s: int, e: int,
+    ae_lo: Optional[float], ae_hi: Optional[float],
+    rms_db: List[float], rms_hop_ms: int, rms_lo: Optional[float], rms_hi: Optional[float],
+    anchors: List[int], onsets_ms: List[int], hero_ts_ms: int,
+) -> Dict[str, Any]:
+    """A per-hop curve over [s, e) fusing (a) normalized action_energy,
+    (b) normalized loudness, and (c) a flat bump at any onset/anchor instant
+    inside the span (a moment L1 already flagged as "something happened
+    here") -- reusing the SAME clip-relative normalization
+    (_norm_in_clip/_series_lohi) the quality scores use, so there are no
+    absolute energy/dB constants. peak_ms = argmax (absolute ms); score =
+    the peak's height normalized against the CUT's own curve range, 0..1.
+    No usable signal at all -> {peak_ms: hero_ts_ms, score: 0.0} (the
+    already-computed best STILL, never a fabricated peak)."""
+    no_signal = {"peak_ms": hero_ts_ms, "score": 0.0}
+    if hop_ms <= 0 or e <= s:
+        return no_signal
+    lo_i, hi_i = s // hop_ms, max(s // hop_ms, (e - 1) // hop_ms)
+    n = hi_i - lo_i + 1
+    if n <= 0:
+        return no_signal
+
+    curve = [0.0] * n
+    have_signal = False
+
+    for i in range(n):
+        ae_i = lo_i + i
+        if ae_i < len(action_energy):
+            v = _norm_in_clip(action_energy[ae_i], ae_lo, ae_hi)
+            if v is not None:
+                curve[i] += v
+                have_signal = True
+
+    if rms_db and rms_hop_ms > 0:
+        for i in range(n):
+            bin_ms = (lo_i + i) * hop_ms
+            rms_i = bin_ms // rms_hop_ms
+            if 0 <= rms_i < len(rms_db):
+                v = _norm_in_clip(rms_db[rms_i], rms_lo, rms_hi)
+                if v is not None:
+                    curve[i] += v
+                    have_signal = True
+
+    for t in list(anchors or []) + [t for t in (onsets_ms or []) if s <= t < e]:
+        i = (int(t) // hop_ms) - lo_i
+        if 0 <= i < n:
+            curve[i] += 1.0
+            have_signal = True
+
+    if not have_signal:
+        return no_signal
+
+    peak_i = max(range(n), key=lambda i: curve[i])
+    peak_val = curve[peak_i]
+    c_lo, c_hi = min(curve), max(curve)
+    score = _clamp01((peak_val - c_lo) / (c_hi - c_lo)) if c_hi > c_lo else (1.0 if peak_val > 0 else 0.0)
+    return {"peak_ms": int((lo_i + peak_i) * hop_ms), "score": round(score, 3)}
+
+
 @dataclass
 class CutRecord:
     file_id: str
@@ -367,6 +454,13 @@ class CutRecord:
     # sync_group_members live) means a later re-sync of the same files can't
     # retroactively change what an already-ingested edit's audio came from.
     sync_group_id: Optional[str] = None
+    # perception_upgrade.plan.md Part C3: on-screen text/graphics (slide,
+    # lower-third, UI, title) the model read off the pixels -- "" when none.
+    # LLM-owned free text; unlocks tutorials/explainers/screen-recordings.
+    screen_text: str = ""
+    # perception_upgrade.plan.md Part D ("F8"): the cut's single strongest
+    # INSTANT, code-computed -- see _salience. {} on a cut with no signal.
+    salience: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -384,6 +478,7 @@ class CutRecord:
             "speech_quality": self.speech_quality, "total_quality": self.total_quality,
             "characteristics": self.characteristics, "camera": self.camera,
             "sync_group_id": self.sync_group_id,
+            "screen_text": self.screen_text, "salience": self.salience,
         }
 
 
@@ -636,6 +731,7 @@ def assemble_cut_records(
     # against its OWN clip's spread, so there are no absolute dB/pixel constants.
     rms_lohi = {fid: _series_lohi((a or {}).get("rms_db") or []) for fid, a in audio_by_file.items()}
     blur_lohi = {fid: _series_lohi((m or {}).get("blur") or []) for fid, m in motion_by_file.items()}
+    ae_lohi = {fid: _series_lohi((m or {}).get("action_energy") or []) for fid, m in motion_by_file.items()}
 
     resolved: List[Tuple[Pass2Cut, int, int, List[int]]] = []
     for cut in pass2_output.cuts:
@@ -694,6 +790,7 @@ def assemble_cut_records(
         blur = motion.get("blur") or []
         hop_ms = int(motion.get("hop_ms") or 0)
         action_energy = motion.get("action_energy") or []
+        audio = audio_by_file.get(cut.file_id) or {}
         hero_ts = pick_hero_ts_ms(anchors, blur, hop_ms, s, e)
         pace = compute_pace_envelope(
             kind=cut.kind, s=s, e=e, readability_ms=cut.readability_ms, anchors=anchors,
@@ -708,7 +805,6 @@ def assemble_cut_records(
             pace.remove_spans = compute_speech_remove_spans(
                 lattices[cut.file_id].words, cut.word_span, s, e)
             remove_budget = sum(b - a for a, b in pace.remove_spans)
-            audio = audio_by_file.get(cut.file_id) or {}
             rms_lo, rms_hi = rms_lohi.get(cut.file_id, (None, None))
             speech_quality = compute_speech_quality(
                 audio.get("rms_db") or [], int(audio.get("hop_ms") or 0),
@@ -720,6 +816,14 @@ def assemble_cut_records(
         visual_score = compute_visual_score(
             cut.on_camera, framing_dict, look_dict, blur, hop_ms, s, e, blur_lo, blur_hi)
         total_quality = compute_total_quality(cut.kind, speech_quality, visual_score)
+
+        ae_lo, ae_hi = ae_lohi.get(cut.file_id, (None, None))
+        rms_lo, rms_hi = rms_lohi.get(cut.file_id, (None, None))
+        salience = _salience(
+            action_energy, hop_ms, s, e, ae_lo, ae_hi,
+            audio.get("rms_db") or [], int(audio.get("hop_ms") or 0), rms_lo, rms_hi,
+            anchors, audio.get("onsets_ms") or [], hero_ts,
+        )
 
         out.append(CutRecord(
             file_id=cut.file_id, src_in_ms=s, src_out_ms=e, kind=cut.kind,
@@ -740,6 +844,7 @@ def assemble_cut_records(
             continuity=continuity_by_idx.get(idx, {}),
             camera=classify_camera_move(motion, s, e),
             sync_group_id=(sync_group_by_file or {}).get(cut.file_id),
+            screen_text=cut.screen_text, salience=salience,
         ))
     _enforce_take_winner(out)
     return out
