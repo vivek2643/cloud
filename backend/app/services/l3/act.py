@@ -212,6 +212,204 @@ def place(document: dict, index: _MapIndex, ref: str, *,
     return doc
 
 
+_AUDIO_ROLES = ("music", "voiceover", "sfx")
+_AUDIO_KINDS = ("bed", "replace", "sfx")
+
+
+def place_audio(
+    document: dict, *, source_file_id: str, role: str, from_ms: int, to_ms: int,
+    src_in_ms: int = 0, src_out_ms: Optional[int] = None,
+    gain_db: float = 0.0, duck_db: float = 0.0, audio_kind: str = "bed",
+    asset_dur_ms: Optional[int] = None, reason: str = "",
+) -> dict:
+    """Place a music/voiceover/SFX bed on program window [from_ms, to_ms]
+    (audio_brain.plan.md Phase 1a) -- the op ``layers.resolve``'s
+    ``place_audio`` branch already reads; this is what actually CREATES it.
+
+    ``role="voiceover"`` is stored as-is (so observe/the brain can see its
+    own intent) -- ``layers.resolve`` is what maps it onto the plain
+    ``ROLE_DIALOGUE`` bed at render time (no auto-duck PRIORITY; VO is
+    balanced by the brain like any other bed, never privileged by code).
+
+    Never auto-loops or auto-stretches: if the requested window is longer
+    than the source has (``asset_dur_ms``), ``src_out_ms`` clamps to the
+    asset's actual end while ``to_ms`` keeps the brain's full requested
+    window -- the shortfall renders as silence for the remainder (no
+    special-casing needed downstream) and is exactly what observe's digest
+    surfaces as a fact (``asset_dur_ms < window_ms``) for the brain to act
+    on, never silently patched over here.
+
+    `duck_db` defaults to 0 (no duck) -- ``layers._apply_levels`` only ever
+    ducks when the caller (the brain, via this op or the `duck` verb)
+    explicitly sets it negative. Illegal role/window/source -> unchanged doc."""
+    if role not in _AUDIO_ROLES or not source_file_id:
+        return document
+    try:
+        f, t = int(from_ms), int(to_ms)
+        s_in = max(0, int(src_in_ms))
+    except (TypeError, ValueError):
+        return document
+    if t <= f:
+        return document
+    window = t - f
+
+    if src_out_ms is not None:
+        try:
+            s_out = int(src_out_ms)
+        except (TypeError, ValueError):
+            return document
+    elif asset_dur_ms is not None:
+        s_out = min(int(asset_dur_ms), s_in + window)
+    else:
+        # Duration unknown (a lookup miss, not a missing asset) -- assume the
+        # requested window is available rather than guessing it's short.
+        s_out = s_in + window
+    if asset_dur_ms is not None:
+        s_out = min(s_out, int(asset_dur_ms))
+    if s_out <= s_in:
+        return document
+
+    doc = _clone(document)
+    doc["operations"].append({
+        "op_id": f"pa_{uuid.uuid4().hex[:6]}",
+        "type": "place_audio",
+        "role": role,
+        "source_file_id": source_file_id,
+        "src_in_ms": s_in, "src_out_ms": s_out,
+        "from_ms": f, "to_ms": t,
+        "gain_db": float(gain_db), "duck_db": float(duck_db),
+        "audio_kind": audio_kind if audio_kind in _AUDIO_KINDS else "bed",
+        "rationale": reason or None,
+    })
+    return doc
+
+
+def set_gain(document: dict, target_id: str, *, gain_db: float) -> dict:
+    """Set a layer's OWN level (dB) -- a main-line seg's coupled audio, or an
+    A2 `place_audio` bed. Separate from `duck` (a side-chain reduction applied
+    only where a bed overlaps dialogue); this is the layer's base level.
+    Illegal id or value -> unchanged doc."""
+    try:
+        g = float(gain_db)
+    except (TypeError, ValueError):
+        return document
+    doc = _clone(document)
+    seg = next((s for s in doc["timeline"] if s.get("seg_id") == target_id), None)
+    if seg is not None:
+        seg["gain_db"] = g
+        return doc
+    op = next((o for o in doc["operations"]
+               if o.get("op_id") == target_id and o.get("type") == "place_audio"), None)
+    if op is None:
+        return document
+    op["gain_db"] = g
+    return doc
+
+
+def duck(document: dict, target_id: str, *, amount_db: float) -> dict:
+    """Set an A2 bed's explicit duck (dB, typically <=0) -- applied ONLY where
+    it overlaps live spine dialogue (`layers._apply_levels`); 0 clears it.
+    There is no auto-duck: a bed ducks only by what this (or `place_audio`)
+    sets. Only targets a `place_audio` op -- the live spine track is never a
+    valid target (nothing ducks it; it's what other beds duck under).
+    Illegal id or value -> unchanged doc."""
+    try:
+        d = float(amount_db)
+    except (TypeError, ValueError):
+        return document
+    doc = _clone(document)
+    op = next((o for o in doc["operations"]
+               if o.get("op_id") == target_id and o.get("type") == "place_audio"), None)
+    if op is None:
+        return document
+    op["duck_db"] = d
+    return doc
+
+
+def fade_audio(document: dict, target_id: str, *,
+               in_ms: Optional[int] = None, out_ms: Optional[int] = None) -> dict:
+    """Set a fade envelope on a layer's own edges -- a main-line seg's coupled
+    audio, or an A2 bed. `in_ms`/`out_ms` are fade DURATIONS in ms (0 clears
+    that edge); an omitted edge is left as-is. Hard start/stop by default --
+    nothing fades unless this sets it. Illegal id/value or both edges omitted
+    -> unchanged doc."""
+    if in_ms is None and out_ms is None:
+        return document
+    try:
+        f_in = int(in_ms) if in_ms is not None else None
+        f_out = int(out_ms) if out_ms is not None else None
+    except (TypeError, ValueError):
+        return document
+    if (f_in is not None and f_in < 0) or (f_out is not None and f_out < 0):
+        return document
+    doc = _clone(document)
+    target = next((s for s in doc["timeline"] if s.get("seg_id") == target_id), None)
+    if target is None:
+        target = next((o for o in doc["operations"]
+                      if o.get("op_id") == target_id and o.get("type") == "place_audio"), None)
+    if target is None:
+        return document
+    if f_in is not None:
+        target["fade_in_ms"] = f_in
+    if f_out is not None:
+        target["fade_out_ms"] = f_out
+    return doc
+
+
+def crossfade(document: dict, seam_seg_id: str, *, ms: int) -> dict:
+    """Cross-dissolve the spine AUDIO across the seam just before main-line cut
+    `seam_seg_id`: the previous cut's audio and the next cut's audio overlap by
+    `ms` (split evenly, each extending toward the other) and fade across that
+    overlap (`layers._apply_crossfades`). One crossfade per seam (re-issuing
+    replaces); `ms<=0` clears. The first segment has no seam before it, and a
+    negative `ms` makes no sense here (unlike `split_edit`'s signed J/L offset)
+    -> unchanged doc."""
+    try:
+        m = int(ms)
+    except (TypeError, ValueError):
+        return document
+    if m < 0:
+        return document
+    timeline = document.get("timeline") or []
+    i = next((idx for idx, s in enumerate(timeline) if s.get("seg_id") == seam_seg_id), None)
+    if i is None or i == 0:
+        return document
+    doc = _clone(document)
+    doc["operations"] = [
+        o for o in doc["operations"]
+        if not (o.get("type") == "crossfade" and o.get("seam_seg_id") == seam_seg_id)
+    ]
+    if m > 0:
+        doc["operations"].append({
+            "op_id": f"xf_{uuid.uuid4().hex[:6]}", "type": "crossfade",
+            "seam_seg_id": seam_seg_id, "ms": m,
+        })
+    return doc
+
+
+def replace_audio(document: dict, target_id: str, *,
+                  source_file_id: str, src_in_ms: int, src_out_ms: int) -> dict:
+    """Override a main-line cut's coupled audio source with an explicit pick --
+    the escape hatch for outlook authoritative routing (audio_sync.plan.md):
+    this wins over the auto-computed route (`layers.resolve` checks the
+    override first). Also the general tool for swapping a cut's sound to any
+    other file's span regardless of routing. Illegal seg/span -> unchanged doc."""
+    try:
+        s_in, s_out = int(src_in_ms), int(src_out_ms)
+    except (TypeError, ValueError):
+        return document
+    if not source_file_id or s_out <= s_in:
+        return document
+    doc = _clone(document)
+    seg = next((s for s in doc["timeline"] if s.get("seg_id") == target_id), None)
+    if seg is None:
+        return document
+    seg["audio_override"] = {
+        "source_file_id": source_file_id, "src_in_ms": s_in, "src_out_ms": s_out,
+    }
+    return doc
+
+
 def remove(document: dict, target_id: str) -> dict:
     """Drop a main-line segment (by seg_id), an operation (by op_id), or a layout
     region (by region_id) -- and tear the split/PiP down SYMMETRICALLY:
@@ -249,24 +447,48 @@ def remove(document: dict, target_id: str) -> dict:
     return doc
 
 
-def move(document: dict, seg_id: str, to_index: int) -> dict:
-    """Reorder a main-line segment to ``to_index`` (0-based). Op reposition is a
-    separate concern (``set_from``); this is the main-line sequence."""
+def move(document: dict, target_id: str,
+        to_index: Optional[int] = None, to_ms: Optional[int] = None) -> dict:
+    """Reorder a main-line segment to ``to_index`` (0-based), OR reposition a
+    placed op (a V2 ``place_video`` cutaway or an A2 ``place_audio`` bed) to
+    start at program ``to_ms``, keeping its own duration (audio_brain.plan.md:
+    extends this one verb to beds instead of a separate op-reposition verb).
+    Exactly one of ``to_index``/``to_ms`` applies, matching whichever kind of
+    id ``target_id`` resolves to; neither given, or the id doesn't match that
+    kind -> unchanged doc."""
     doc = _clone(document)
-    tl = doc["timeline"]
-    src = next((i for i, s in enumerate(tl) if s.get("seg_id") == seg_id), None)
-    if src is None:
-        return document
-    seg = tl.pop(src)
-    dst = max(0, min(int(to_index), len(tl)))
-    tl.insert(dst, seg)
-    return doc
+    if to_index is not None:
+        tl = doc["timeline"]
+        src = next((i for i, s in enumerate(tl) if s.get("seg_id") == target_id), None)
+        if src is None:
+            return document
+        seg = tl.pop(src)
+        dst = max(0, min(int(to_index), len(tl)))
+        tl.insert(dst, seg)
+        return doc
+    if to_ms is not None:
+        op = next((o for o in doc["operations"] if o.get("op_id") == target_id
+                   and o.get("type") in ("place_video", "place_audio")), None)
+        if op is None:
+            return document
+        try:
+            new_from = max(0, int(to_ms))
+        except (TypeError, ValueError):
+            return document
+        dur = int(op.get("to_ms", 0)) - int(op.get("from_ms", 0))
+        if dur <= 0:
+            return document
+        op["from_ms"], op["to_ms"] = new_from, new_from + dur
+        return doc
+    return document
 
 
 def trim(document: dict, target_id: str, *,
          in_ms: Optional[int] = None, out_ms: Optional[int] = None,
          delta_in_ms: Optional[int] = None, delta_out_ms: Optional[int] = None) -> dict:
-    """Adjust the SOURCE span of a main-line segment (or a place_video op).
+    """Adjust the SOURCE span of a main-line segment, or of a placed op (a V2
+    ``place_video`` cutaway or an A2 ``place_audio`` bed -- audio_brain.plan.md
+    extends this verb to beds instead of adding a separate one).
 
     Absolute (``in_ms``/``out_ms``) or relative (``delta_in_ms``/``delta_out_ms``,
     e.g. delta_in_ms=+200 nudges the in-point 200ms later). The result is clamped
@@ -282,8 +504,8 @@ def trim(document: dict, target_id: str, *,
             return document
         seg["in_ms"], seg["out_ms"] = new_in, new_out
         return doc
-    op = next((o for o in doc["operations"]
-               if o.get("op_id") == target_id and o.get("type") == "place_video"), None)
+    op = next((o for o in doc["operations"] if o.get("op_id") == target_id
+               and o.get("type") in ("place_video", "place_audio")), None)
     if op is None:
         return document
     cur_in, cur_out = int(op["src_in_ms"]), int(op["src_out_ms"])

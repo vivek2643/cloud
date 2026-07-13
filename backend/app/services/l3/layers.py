@@ -307,6 +307,11 @@ class AudioLayer:
     duck_db: float = 0.0
     kind: str = "spine"          # spine | bed | replace | sfx
     op_id: Optional[str] = None
+    # Fade envelope on this layer's own edges (audio_brain.plan.md `fade_audio`
+    # + `crossfade`) -- ms from prog_start_ms / into prog_end_ms. 0 = hard
+    # start/stop (the default: beds never fade unless the brain sets one).
+    fade_in_ms: int = 0
+    fade_out_ms: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -321,6 +326,8 @@ class AudioLayer:
             "duck_db": self.duck_db,
             "kind": self.kind,
             "op_id": self.op_id,
+            "fade_in_ms": self.fade_in_ms,
+            "fade_out_ms": self.fade_out_ms,
         }
 
 
@@ -446,6 +453,43 @@ def _apply_split_edits(
         cur_a.src_in_ms = _clamp(cur_a.src_in_ms + offset, 0, cur_a.src_out_ms)
 
 
+def _apply_crossfades(
+    spans: List[SpineSpan],
+    audio_layers: List[AudioLayer],
+    operations: List[dict],
+    durations: Dict[str, int],
+) -> None:
+    """`crossfade`: overlap the two spine (dialogue) layers either side of a
+    seam by `ms` total (split evenly), each extending toward the other --
+    previous audio plays on into the next picture, next audio starts under the
+    previous picture -- then fades the overlapping edges (`fade_out_ms` on the
+    outgoing layer, `fade_in_ms` on the incoming one) so they cross-dissolve
+    instead of doubling up at full volume. Audibly equivalent to ffmpeg's
+    `acrossfade` for a linear/triangular curve, built on the SAME per-layer
+    delay-then-`amix` mix compositor already uses (no 2-input topology
+    needed). One crossfade per seam (re-issuing replaces, `ms<=0` clears)."""
+    by_seg = {s.seg["seg_id"]: i for i, s in enumerate(spans)}
+    for op in operations:
+        if op.get("type") != "crossfade":
+            continue
+        i = by_seg.get(op.get("seam_seg_id"))
+        if i is None or i == 0 or i >= len(audio_layers):
+            continue
+        ms = int(op.get("ms", 0))
+        if ms <= 0:
+            continue
+        prev_a, cur_a = audio_layers[i - 1], audio_layers[i]
+        fwd = ms // 2
+        back = ms - fwd
+        prev_dur_room = durations.get(prev_a.source_file_id, prev_a.src_out_ms)
+        prev_a.prog_end_ms += fwd
+        prev_a.src_out_ms = _clamp(prev_a.src_out_ms + fwd, prev_a.src_in_ms, prev_dur_room)
+        cur_a.prog_start_ms = max(0, cur_a.prog_start_ms - back)
+        cur_a.src_in_ms = _clamp(cur_a.src_in_ms - back, 0, cur_a.src_out_ms)
+        prev_a.fade_out_ms = max(prev_a.fade_out_ms, fwd + back)
+        cur_a.fade_in_ms = max(cur_a.fade_in_ms, fwd + back)
+
+
 def _slice_video(v: VideoLayer, ps: int, pe: int, dest: Optional[dict]) -> VideoLayer:
     """A sub-span [ps, pe) of a video layer, source-mapped, with an optional dest
     rect stamped on (and fit forced to cover so a split/PiP cell fills, not
@@ -565,7 +609,10 @@ def resolve(
                 match_delta=match_deltas.get(seg["file_id"]),
             ),
         ))
-        route = audio_routes.get(seg["seg_id"])
+        # `replace_audio`'s override (audio_brain.plan.md) wins over the
+        # auto-computed outlook route -- the escape hatch that makes the one
+        # structural default (authoritative routing) fully overridable.
+        route = seg.get("audio_override") or audio_routes.get(seg["seg_id"])
         audio.append(AudioLayer(
             layer_id=f"a_{seg['seg_id']}",
             role=ROLE_DIALOGUE,
@@ -576,11 +623,16 @@ def resolve(
             kind="spine",
             # A muted segment (stray speech under a video cut) keeps its picture
             # but drops its source audio -- rendered as volume=0 downstream.
-            gain_db=-120.0 if seg.get("mute") else 0.0,
+            # Otherwise `set_gain` may have set an explicit level (0 = untouched).
+            gain_db=-120.0 if seg.get("mute") else float(seg.get("gain_db", 0.0) or 0.0),
+            fade_in_ms=int(seg.get("fade_in_ms", 0) or 0),
+            fade_out_ms=int(seg.get("fade_out_ms", 0) or 0),
         ))
 
     # --- J/L split edits reshape the spine audio boundaries ---
     _apply_split_edits(spans, audio, operations, durations)
+    # --- crossfades overlap two adjacent spine layers at a seam ---
+    _apply_crossfades(spans, audio, operations, durations)
 
     # --- operations that add/override layers ---
     for op in operations:
@@ -602,14 +654,23 @@ def resolve(
                 ),
             ))
         elif t == "place_audio":
+            # "voiceover" is a plain ROLE_DIALOGUE bed at render time (a fact
+            # the brain can still see via the op's own literal role string) --
+            # audio_brain.plan.md: no auto-duck PRIORITY, no privilege. It stays
+            # duck-able like any other bed because `_apply_levels` below only
+            # exempts spine (kind=="spine") layers from ducking, not every
+            # dialogue-role one.
+            role = ROLE_DIALOGUE if op.get("role") == "voiceover" else op.get("role", ROLE_MUSIC)
             audio.append(AudioLayer(
                 layer_id=op["op_id"],
-                role=op.get("role", ROLE_MUSIC),
+                role=role,
                 source_file_id=op["source_file_id"],
                 src_in_ms=int(op["src_in_ms"]), src_out_ms=int(op["src_out_ms"]),
                 prog_start_ms=int(op["from_ms"]), prog_end_ms=int(op["to_ms"]),
                 gain_db=float(op.get("gain_db", 0.0)),
                 kind=op.get("audio_kind", "bed"), op_id=op["op_id"],
+                fade_in_ms=int(op.get("fade_in_ms", 0) or 0),
+                fade_out_ms=int(op.get("fade_out_ms", 0) or 0),
             ))
 
     # --- spatial layout regions (split-screen / PiP): stamp dest sub-rects ---
@@ -633,8 +694,12 @@ def _overlaps(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
 def _apply_levels(audio_layers: List[AudioLayer], operations: List[dict]) -> None:
     """Resolve duck + explicit level automation.
 
-    1. Auto-duck: any bed/sfx layer overlapping live dialogue gets the op's
-       requested duck (or a default) so speech stays intelligible.
+    1. Duck (opt-in, audio_brain.plan.md): a bed/sfx layer whose `place_audio`
+       op set a negative `duck_db`, and that overlaps live spine dialogue,
+       gets that duck applied. `duck_db=0` (the default) never ducks -- there
+       is no auto-duck. The live spine track itself is never ducked (it's
+       what things duck FOR), but a `voiceover`-role bed IS duck-able like any
+       other bed -- it's a plain dialogue-role layer, not privileged.
     2. `level` ops apply an explicit gain (or mute) to a role over a range.
     """
     dialogue_spans = [
@@ -647,7 +712,7 @@ def _apply_levels(audio_layers: List[AudioLayer], operations: List[dict]) -> Non
         for op in operations if op.get("type") == "place_audio" and op.get("op_id")
     }
     for a in audio_layers:
-        if a.role == ROLE_DIALOGUE:
+        if a.kind == "spine":
             continue
         duck = duck_by_op.get(a.op_id, 0.0)
         if duck < 0 and any(_overlaps(a.prog_start_ms, a.prog_end_ms, ds, de)

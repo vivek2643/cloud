@@ -44,6 +44,17 @@ class EditContext:
     durations: Dict[str, int]          # file_id -> ms
     color_stats: Dict[str, dict] = field(default_factory=dict)  # file_id -> L1 color_stats row
     dup_groups: List[dict] = field(default_factory=list)
+    # L1 audio_features (audio_brain.plan.md) for THIS turn's file_ids -- loudness,
+    # musicality, bpm, onsets. file_id -> {integrated_lufs, is_musical, bpm,
+    # onsets_ms, silence_intervals} (missing entry -> that file has no L1 audio
+    # analysis yet; callers treat that as "no fact", never an error).
+    audio_features: Dict[str, dict] = field(default_factory=dict)
+    # This user's uploaded audio-type files available to place as a bed --
+    # NOT limited to file_ids (an uploaded music/SFX file may never have been
+    # used as a video source). {file_id, name, dur_ms, is_musical, bpm}. Whether
+    # one is already placed in THIS document is a per-document fact the digest
+    # (observe.audio_state) computes, not something build_context can know.
+    audio_assets: List[dict] = field(default_factory=list)
     # The Cuts v3 ingest run this turn is resolved against -- the thread's pinned
     # run (migration 028) or the live "latest covering run", resolved ONCE here so
     # every projection in the turn (the map struct + the re-assembled BEAT INDEX
@@ -86,6 +97,20 @@ def build_context(file_ids: List[str], run_id: Optional[str] = None) -> EditCont
         color_stats = fetch_color_stats(file_ids)
     except Exception:
         logger.exception("observe: color_stats lookup failed (continuing)")
+    audio_assets: List[dict] = []
+    try:
+        audio_assets = _fetch_audio_assets(file_ids)
+    except Exception:
+        logger.exception("observe: audio_assets lookup failed (continuing)")
+    audio_features: Dict[str, dict] = {}
+    try:
+        # Cover both this turn's video/audio file_ids AND every uploaded audio
+        # asset in scope (a music/SFX file may never have been a file_id) --
+        # onsets/bpm feed the beat grid regardless of which the brain places.
+        all_audio_ids = list(file_ids) + [a["file_id"] for a in audio_assets]
+        audio_features = _fetch_audio_features(all_audio_ids)
+    except Exception:
+        logger.exception("observe: audio_features lookup failed (continuing)")
     return EditContext(
         file_ids=list(file_ids),
         index=_MapIndex(map_struct),
@@ -93,8 +118,72 @@ def build_context(file_ids: List[str], run_id: Optional[str] = None) -> EditCont
         durations=durations,
         color_stats=color_stats,
         dup_groups=fmap.get("dup_groups") or [],
+        audio_features=audio_features,
+        audio_assets=audio_assets,
         run_id=eff_run,
     )
+
+
+def _pg_conn():
+    import psycopg
+    from app.config import get_settings
+    return psycopg.connect(get_settings().database_url, autocommit=True)
+
+
+def _fetch_audio_features(file_ids: List[str]) -> Dict[str, dict]:
+    """L1 audio_features rows for this turn's file_ids, keyed by file_id --
+    feeds per-cut `loudness_rel` (a fact, never auto-normalized) and lets a
+    VIDEO source double as a musical bed's `is_musical`/`bpm` when it's used
+    for one (audio_brain.plan.md SS1c/2b). A file with no row simply has no
+    entry -- observe treats that as "no fact", not zero/silence."""
+    if not file_ids:
+        return {}
+    with _pg_conn() as conn:
+        rows = conn.execute(
+            """
+            select file_id::text, integrated_lufs, is_musical, bpm, onsets_ms
+              from audio_features where file_id = any(%s::uuid[])
+            """,
+            (file_ids,),
+        ).fetchall()
+    return {
+        r[0]: {"integrated_lufs": r[1], "is_musical": r[2], "bpm": r[3], "onsets_ms": r[4]}
+        for r in rows
+    }
+
+
+def _fetch_audio_assets(file_ids: List[str]) -> List[dict]:
+    """This user's ready, audio-type files -- candidates `place_audio` can use
+    that aren't necessarily among this turn's file_ids (a music/SFX file is
+    uploaded for scoring, never as a video source). Scoped to the SAME user as
+    the current file_ids (whoever owns this edit); an unknown/empty file_ids
+    or no matching user -> no assets, never a fabricated list."""
+    if not file_ids:
+        return []
+    with _pg_conn() as conn:
+        owner = conn.execute(
+            "select user_id from files where id = any(%s::uuid[]) limit 1",
+            (file_ids,),
+        ).fetchone()
+        if not owner:
+            return []
+        rows = conn.execute(
+            """
+            select f.id::text, f.filename,
+                   coalesce(f.duration_seconds, 0),
+                   af.is_musical, af.bpm
+              from files f
+              left join audio_features af on af.file_id = f.id
+             where f.user_id = %s and f.file_type = 'audio' and f.status = 'ready'
+             order by f.created_at desc
+            """,
+            (owner[0],),
+        ).fetchall()
+    return [
+        {"file_id": r[0], "name": r[1], "dur_ms": int(float(r[2]) * 1000),
+         "is_musical": r[3], "bpm": r[4]}
+        for r in rows
+    ]
 
 
 def resolve_doc(document: dict, ctx: EditContext) -> dict:
@@ -205,6 +294,25 @@ def snap_span_to_seams(points: List[int], in_ms: Any, out_ms: Any, *,
     return out
 
 
+def snap_to_beats(grid_ms: List[int], ms: Any, *, max_move_ms: Optional[int] = None) -> Dict[str, Any]:
+    """Snap a single program-time edge `ms` to the nearest beat/onset in
+    `grid_ms` (flattened `onsets_ms` from `audio_state`'s `beat_grid`,
+    audio_brain.plan.md 2b). Same sovereignty-cap contract as
+    `snap_span_to_seams`: beyond `max_move_ms` the caller's edge is kept,
+    reported as `suggested_ms` instead. No grid -> unchanged, `snapped=False`
+    -- there's nothing to snap to where there's no music."""
+    try:
+        m = int(ms)
+    except (TypeError, ValueError):
+        return {"ms": ms, "snapped": False}
+    if not grid_ms:
+        return {"ms": m, "snapped": False}
+    nearest = min(grid_ms, key=lambda p: abs(p - m))
+    if max_move_ms is not None and abs(nearest - m) > int(max_move_ms):
+        return {"ms": m, "snapped": True, "suggested_ms": nearest, "delta_ms": 0}
+    return {"ms": nearest, "snapped": True, "delta_ms": nearest - m}
+
+
 # --------------------------------------------------------------------------
 # 1. read_state
 # --------------------------------------------------------------------------
@@ -228,6 +336,25 @@ def read_state(document: dict, ctx: EditContext) -> dict:
         for v in ((document.get("resolved") or {}).get("video_layers") or [])
     }
 
+    # Audio facts (audio_brain.plan.md 1c). `replace_windows`: program spans a
+    # place_audio op tagged audio_kind="replace" covers -- a brain-authored fact
+    # about ITS OWN past decision, not a code-enforced mute of the cut beneath.
+    replace_windows = [
+        (int(o.get("from_ms", 0)), int(o.get("to_ms", 0)))
+        for o in ops if o.get("type") == "place_audio" and o.get("audio_kind") == "replace"
+    ]
+    lufs_by_file = {
+        fid: af["integrated_lufs"] for fid, af in ctx.audio_features.items()
+        if af.get("integrated_lufs") is not None
+    }
+    _timeline_lufs = sorted(
+        lufs_by_file[seg["file_id"]] for seg in timeline
+        if seg.get("file_id") in lufs_by_file
+    )
+    lufs_median = (
+        _timeline_lufs[len(_timeline_lufs) // 2] if _timeline_lufs else None
+    )
+
     cuts = []
     prog = 0
     for i, seg in enumerate(timeline):
@@ -236,6 +363,15 @@ def read_state(document: dict, ctx: EditContext) -> dict:
         snippet = (seg.get("content") or "").replace("\n", " ").strip()
         if len(snippet) > 60:
             snippet = snippet[:57] + "..."
+        prog_end = prog + dur
+        if seg.get("mute"):
+            audio_source = "muted"
+        elif any(f < prog_end and prog < t for f, t in replace_windows):
+            audio_source = "replaced"
+        elif meta.get("outlook_group_id"):
+            audio_source = "group-authoritative"
+        else:
+            audio_source = "own"
         cut = {
             "pos": i + 1,
             "seg_id": seg.get("seg_id"),
@@ -243,13 +379,20 @@ def read_state(document: dict, ctx: EditContext) -> dict:
             "file": _fid8(seg.get("file_id") or ""),
             # Program window (ms) so the brain can target split/PiP by time.
             "prog_start_ms": prog,
-            "prog_end_ms": prog + dur,
+            "prog_end_ms": prog_end,
             "dur_ms": dur,
             "channel": meta.get("channel") or seg.get("axis"),
             "speaker": meta.get("speaker"),
             "muted": bool(seg.get("mute")),
+            "audio_source": audio_source,
             "text": snippet,
         }
+        natural_sound = (meta.get("pace") or {}).get("natural_sound")
+        if natural_sound is not None:
+            cut["natural_sound"] = bool(natural_sound)
+        file_lufs = lufs_by_file.get(seg.get("file_id"))
+        if file_lufs is not None and lufs_median is not None:
+            cut["loudness_rel"] = round(file_lufs - lufs_median, 1)
         grade = grade_by_layer_id.get(f"v_{seg.get('seg_id')}")
         if grade and grade.get("cdl"):
             summary = explain_grade(grade["cdl"])
@@ -295,6 +438,128 @@ def read_state(document: dict, ctx: EditContext) -> dict:
     if splits:
         state["split_edits"] = splits
     return state
+
+
+# --------------------------------------------------------------------------
+# 1b. audio_state (audio_brain.plan.md 1c -- beds, continuous runs, assets)
+# --------------------------------------------------------------------------
+
+def audio_state(document: dict, ctx: EditContext) -> dict:
+    """The audio digest: placed beds (with the asset-vs-window length so a
+    shortfall is a visible fact, never auto-looped), outlook-authoritative runs
+    (a fact, not a lock -- `split_edit` still works inside one), and this
+    user's unused uploaded audio files. Facts only -- no "use this for X"."""
+    timeline = document.get("timeline") or []
+    ops = document.get("operations") or []
+    name_by_file = {a["file_id"]: a["name"] for a in ctx.audio_assets}
+    dur_by_file = {a["file_id"]: a["dur_ms"] for a in ctx.audio_assets}
+
+    beds = []
+    used_source_ids = set()
+    for o in ops:
+        if o.get("type") != "place_audio":
+            continue
+        src = o.get("source_file_id")
+        used_source_ids.add(src)
+        window_ms = int(o.get("to_ms", 0)) - int(o.get("from_ms", 0))
+        # `ctx.durations` only covers this turn's file_ids (video sources); an
+        # uploaded audio-only asset's length lives in `ctx.audio_assets`.
+        asset_dur_ms = ctx.durations.get(src)
+        if asset_dur_ms is None:
+            asset_dur_ms = dur_by_file.get(src)
+        bed = {
+            "op_id": o.get("op_id"), "role": o.get("role"),
+            "kind": o.get("audio_kind", "bed"),
+            "from_ms": o.get("from_ms"), "to_ms": o.get("to_ms"),
+            "gain_db": o.get("gain_db", 0.0), "duck_db": o.get("duck_db", 0.0),
+            "asset": name_by_file.get(src) or _fid8(src or ""),
+            "window_ms": window_ms,
+        }
+        if asset_dur_ms is not None:
+            bed["asset_dur_ms"] = asset_dur_ms
+            src_span_ms = int(o.get("src_out_ms", 0)) - int(o.get("src_in_ms", 0))
+            if src_span_ms < window_ms:
+                bed["shortfall_ms"] = window_ms - src_span_ms
+        beds.append(bed)
+
+    # continuous_beds: consecutive main-line cuts sharing one outlook sync
+    # group -- their coupled audio is already one continuous authoritative
+    # source across the angle switches (audio_sync.plan.md), surfaced here as
+    # a fact so the brain doesn't need to re-derive it from per-cut meta. A
+    # run of exactly one cut isn't a cross-cut fact worth surfacing.
+    continuous_beds = []
+    run_group, run_start_ms, run_end_ms, run_len = None, 0, 0, 0
+    prog = 0
+
+    def _flush():
+        if run_group and run_len > 1:
+            continuous_beds.append({
+                "from_ms": run_start_ms, "to_ms": run_end_ms, "group_id": run_group,
+                "note": "shares one authoritative audio source across these angle switches",
+            })
+
+    for seg in timeline:
+        dur = int(seg.get("out_ms", 0)) - int(seg.get("in_ms", 0))
+        meta = ctx.meta_by_ref.get(seg.get("ref") or "") or {}
+        group = meta.get("outlook_group_id")
+        if group and group == run_group:
+            run_end_ms = prog + dur
+            run_len += 1
+        else:
+            _flush()
+            run_group, run_start_ms, run_end_ms, run_len = group, prog, prog + dur, 1
+        prog += dur
+    _flush()
+
+    channels = ["V1", "A1"] if timeline else []
+    if any(o.get("type") == "place_video" for o in ops):
+        channels.append("V2")
+    if beds:
+        channels.append("A2")
+
+    out = {
+        "beds": beds,
+        "continuous_beds": continuous_beds,
+        "assets": [a for a in ctx.audio_assets if a["file_id"] not in used_source_ids],
+        "channels": channels,
+    }
+    grid = _beat_grid(document, ctx)
+    if grid:
+        out["beat_grid"] = grid
+    return out
+
+
+def _beat_grid(document: dict, ctx: EditContext) -> List[dict]:
+    """BPM + onset positions mapped to PROGRAM time (audio_brain.plan.md 2b),
+    one entry per musical source currently in play -- an A2 bed or a main-line
+    video clip doubling as one. Surfaced ONLY when a musical source exists;
+    the brain doesn't try to snap where there's no music."""
+    grid: List[dict] = []
+    for o in document.get("operations") or []:
+        if o.get("type") != "place_audio":
+            continue
+        af = ctx.audio_features.get(o.get("source_file_id") or "")
+        if not af or not af.get("is_musical"):
+            continue
+        src_in = int(o.get("src_in_ms", 0))
+        f, t = int(o.get("from_ms", 0)), int(o.get("to_ms", 0))
+        onsets = [f + (int(ms) - src_in) for ms in (af.get("onsets_ms") or [])
+                 if src_in <= int(ms) < src_in + (t - f)]
+        grid.append({"source": o.get("op_id"), "bpm": af.get("bpm"),
+                     "from_ms": f, "to_ms": t, "onsets_ms": onsets})
+
+    prog = 0
+    for seg in document.get("timeline") or []:
+        dur = int(seg.get("out_ms", 0)) - int(seg.get("in_ms", 0))
+        af = ctx.audio_features.get(seg.get("file_id") or "")
+        if af and af.get("is_musical"):
+            src_in = int(seg.get("in_ms", 0))
+            onsets = [prog + (int(ms) - src_in) for ms in (af.get("onsets_ms") or [])
+                     if src_in <= int(ms) < src_in + dur]
+            grid.append({"source": seg.get("seg_id"), "bpm": af.get("bpm"),
+                        "from_ms": prog, "to_ms": prog + dur, "onsets_ms": onsets})
+        prog += dur
+    return grid
 
 
 # --------------------------------------------------------------------------
@@ -492,6 +757,7 @@ def affordances(document: dict, ctx: EditContext) -> dict:
             group_members[mid] = [x for x in (g.get("members") or []) if x != mid]
 
     per_cut = []
+    prog = 0
     for i, seg in enumerate(timeline):
         ref = seg.get("ref")
         meta = ctx.meta_by_ref.get(ref or "") or {}
@@ -500,6 +766,7 @@ def affordances(document: dict, ctx: EditContext) -> dict:
         tighter = [L for L in _LEVELS if L in variants and _idx(L) > _idx(cur)]
         wider = [L for L in _LEVELS if L in variants and _idx(L) < _idx(cur)]
         is_video = (meta.get("channel") in ("done", "shown")) or seg.get("axis") == "any"
+        dur = int(seg.get("out_ms", 0)) - int(seg.get("in_ms", 0))
         entry = {
             "pos": i + 1,
             "seg_id": seg.get("seg_id"),
@@ -508,9 +775,12 @@ def affordances(document: dict, ctx: EditContext) -> dict:
             "can_widen_to": wider,
             "alternate_takes": group_members.get(ref or "", []),
             "can_toggle_audio": bool(is_video),
+            # `place_audio`'s from_ms/to_ms for a bed spanning exactly this cut.
+            "can_place_bed_here": {"from_ms": prog, "to_ms": prog + dur},
         }
         entry.update(_pace_affordance(meta, is_video))
         per_cut.append(entry)
+        prog += dur
 
     # Video moments in the library not already on the main line. Junk is left
     # out of this pool (still placeable by ref if the brain chooses to).
@@ -533,13 +803,17 @@ def affordances(document: dict, ctx: EditContext) -> dict:
         "can_add_channel": ["V2", "A2"],
         "cutaway_pool": cutaway_pool[:50],
         "layout_templates": ["split_h", "split_v", "pip"],
+        # This user's unused-audio-file count (audio_brain.plan.md 1d) -- the
+        # full list with names/duration/bpm is `audio_state`'s `assets`.
+        "audio_assets": len(ctx.audio_assets),
         # cuts_v3_continuity.plan.md: the cut-centric loop places by ref only --
         # no raw-footage scan (source_awareness/scan_source/place_span retired
         # from the tool loop; the beat index + its continuity block is the only
         # source of awareness now).
-        "verbs": ["place", "trim", "remove", "move", "set_audio",
+        "verbs": ["place", "trim", "remove", "move", "set_audio", "place_audio",
+                  "set_gain", "duck", "fade_audio", "crossfade", "replace_audio",
                   "tighten", "retime", "split_screen"],
-        "senses": ["read_state", "predict", "validate", "diagnose", "affordances"],
+        "senses": ["read_state", "predict", "validate", "diagnose", "affordances", "audio_state"],
     }
 
 

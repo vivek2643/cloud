@@ -632,6 +632,19 @@ def _render_layers(
             chain += ",volume=0"
         elif abs(gain_db) > 0.01:
             chain += f",volume={gain_db:.2f}dB"
+        # Fade envelope (audio_brain.plan.md `fade_audio`/`crossfade`): hard
+        # start/stop unless the brain set an edge. `adelay` above already put
+        # this layer's PTS on the ABSOLUTE program timeline, so `afade`'s `st`
+        # is just this layer's own prog_start/prog_end in seconds -- no extra
+        # bookkeeping needed to line it up with the rest of the mix.
+        fade_in_ms = int(a.get("fade_in_ms", 0) or 0)
+        fade_out_ms = int(a.get("fade_out_ms", 0) or 0)
+        if fade_in_ms > 0:
+            chain += f",afade=t=in:st={delay_ms / 1000.0:.3f}:d={fade_in_ms / 1000.0:.3f}"
+        if fade_out_ms > 0:
+            prog_end_ms = int(a.get("prog_end_ms", 0))
+            st_out = max(0, prog_end_ms - fade_out_ms) / 1000.0
+            chain += f",afade=t=out:st={st_out:.3f}:d={fade_out_ms / 1000.0:.3f}"
         chain += f"[a{j}]"
         filt.append(chain)
         audio_labels.append(f"[a{j}]")
