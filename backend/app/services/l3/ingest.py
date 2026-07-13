@@ -1,25 +1,24 @@
 """
-Cuts v3 orchestrator: pass1 -> image_plan -> frame extraction -> pass2a
-(identity + take resolution, shards run concurrently) -> pass2b (visual
-judgment, batches run concurrently) -> merge -> post -> persist + hero
-frames. One call per project; re-runnable (each call is a fresh
-``ingest_run`` row -- nothing is patched in place). See cuts_v3.plan.md
-section 6 and the build-order table (step E).
+Cuts v3 orchestrator: pass1 -> image_plan -> frame extraction -> pass2
+(identity + full visual judgment in one call per batch, batches run
+concurrently) -> post -> persist + hero frames. One call per project;
+re-runnable (each call is a fresh ``ingest_run`` row -- nothing is patched
+in place). See cuts_v3.plan.md section 6 and the build-order table (step E).
 
-Pass 2a and pass 2b both run their calls IN PARALLEL (ThreadPoolExecutor),
-not sequentially: within each stage the calls only share a read-only cached
-prefix, so nothing stops them firing at the same time -- this is a pure
-wall-clock win (pass 2a's take-comparison shards still stay take-group-aware
-via co-location; pass 2b's batches have no such constraint at all and can
-run with even more parallelism). See pass2a.py / pass2b.py for why the
-identity/take half and the pure visual-judgment half are split into two
-calls instead of one large one.
+Pass 2's batches run IN PARALLEL (ThreadPoolExecutor), not sequentially:
+they only share a read-only cached prefix, so nothing stops them firing at
+the same time -- this is a pure wall-clock win. Batching is pure size-based
+chunking, no co-location constraint at all (pass2_merge.plan.md): the one
+thing that used to need cross-cut pixels -- resolving a take group's members
+into take/winner/outlook -- is now deterministic code
+(``pass2.apply_take_groups``, fed by pass 1's own ``take_candidates``), so
+there is no reason for a take's members to share a batch or for images to be
+sent to the model more than once.
 
 THIS MODULE SPENDS REAL MONEY once invoked: ``run_ingest`` makes one real
-pass-1 API call, one real pass-2a call per identity shard, and one real
-pass-2b call per visual batch. Every deterministic step it wires together
-(pass1's prompt building, image_plan, pass2a/pass2b's prompt building,
-post's assembly) already has its own zero-cost test coverage;
+pass-1 API call and one real pass-2 call per batch. Every deterministic step
+it wires together (pass1's prompt building, image_plan, pass2's prompt
+building, post's assembly) already has its own zero-cost test coverage;
 ``scripts/test_ingest.py`` mocks every one of those seams so the
 ORCHESTRATION ITSELF (stage sequencing, status transitions, error handling)
 is verified without spending anything. Actually calling ``run_ingest``
@@ -41,16 +40,12 @@ from app.services.l3 import image_plan as ip
 from app.services.l3 import ingest_store as store
 from app.services.l3 import pass1
 from app.services.l3 import pass2
-from app.services.l3 import pass2a
-from app.services.l3 import pass2b
 from app.services.l3 import post
 from app.services.l3.identity import apply as identity_apply
 from app.services.l3.lattice import Lattice
 from app.services.l3.sync import store as sync_store
 from app.services.l3.sync.lattice_merge import apply_outlook_groups, outlook_groups
-from app.services.l3.pass2_params import (
-    MAX_CUTS_PER_VISUAL_BATCH, MAX_PARALLEL_SHARDS, MAX_PARALLEL_VISUAL_BATCHES, STILL_WIDTH_PX,
-)
+from app.services.l3.pass2_params import MAX_PARALLEL_PASS2_BATCHES, STILL_WIDTH_PX
 from app.services.processing import _download_from_r2, _upload_to_r2
 
 logger = logging.getLogger(__name__)
@@ -165,67 +160,52 @@ def run_ingest(project_id: str) -> str:
                                              silences_by_file)
         images_b64 = fr.extract_for_planned_frames(planned_frames, proxy_keys)
 
-        # pass2a/pass2b are both still reported as "pass2" -- the DB status
-        # column's check constraint only knows the original stage names,
-        # and splitting it further isn't worth a migration for what's
-        # purely a finer-grained progress label.
+        # Still reported as "pass2" -- the DB status column's check
+        # constraint only knows the original stage name, and adding a new
+        # one isn't worth a migration for what's purely a progress label.
         store.set_status(ingest_run_id, "pass2")
-        identity_shards = pass2a.build_identity_shards(pass1_output, planned_frames)
-        shard_args = []
-        for shard_refs in identity_shards:
-            ref_set = set(shard_refs)
-            shard_frames = [f for f in planned_frames if f.ref in ref_set]
-            shard_file_ids = {f.file_id for f in shard_frames}
-            shard_file_rows = [row for row in file_rows if row[0] in shard_file_ids]
-            shard_args.append((shard_file_rows, shard_frames))
+        batches = pass2.build_pass2_batches(pass1_output, planned_frames)
+        batch_args = []
+        for batch_refs in batches:
+            ref_set = set(batch_refs)
+            batch_frames = [f for f in planned_frames if f.ref in ref_set]
+            batch_file_ids = {f.file_id for f in batch_frames}
+            batch_file_rows = [row for row in file_rows if row[0] in batch_file_ids]
+            batch_args.append((batch_file_rows, batch_frames))
 
-        all_identity_cuts: List[pass2a.IdentityCut] = []
-        # Shards only share a read-only cached prefix -- no reason to make
+        all_cuts: List[pass2.Pass2Cut] = []
+        # Batches only share a read-only cached prefix -- no reason to make
         # one wait on another's response. Concurrency here is a pure
-        # wall-clock win (see MAX_PARALLEL_SHARDS); a failure in any shard
-        # still propagates and fails the whole run, same as sequential did.
-        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_SHARDS, len(shard_args)) or 1) as pool:
+        # wall-clock win (see MAX_PARALLEL_PASS2_BATCHES); a failure in any
+        # batch still propagates and fails the whole run, same as sequential did.
+        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_PASS2_BATCHES, len(batch_args)) or 1) as pool:
             futures = [
-                pool.submit(pass2a.run_identity_shard, rows, pass1_output, frames, images_b64)
-                for rows, frames in shard_args
+                pool.submit(pass2.run_pass2_batch, rows, pass1_output, frames, images_b64)
+                for rows, frames in batch_args
             ]
             for future in futures:
                 completion = future.result()
                 store.accumulate_pass2_usage(ingest_run_id, completion.usage)
-                shard_output = pass2a.IdentityOutput.model_validate(completion.data)
+                batch_output = pass2.Pass2BatchOutput.model_validate(completion.data)
                 # locators (word_span/atom_ids) are code-derived from pass 1,
-                # not echoed by the model -- see pass2a.backfill_locators.
-                shard_output = pass2a.backfill_locators(shard_output, pass1_output)
-                all_identity_cuts.extend(shard_output.cuts)
-        identity_output = pass2a.IdentityOutput(cuts=all_identity_cuts)
+                # not echoed by the model -- see pass2.backfill_locators.
+                batch_output = pass2.backfill_locators(batch_output, pass1_output)
+                all_cuts.extend(pass2.to_pass2_cuts(batch_output.cuts))
 
-        batches = pass2b.build_visual_batches(identity_output, MAX_CUTS_PER_VISUAL_BATCH)
-        visual_by_index: Dict[int, pass2b.VisualJudgment] = {}
-        # No take-style co-location constraint here at all (see pass2b.py),
-        # so batches can run with even more parallelism than pass 2a's shards.
-        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_VISUAL_BATCHES, len(batches)) or 1) as pool:
-            futures = [
-                pool.submit(pass2b.run_visual_batch, identity_output, batch, planned_frames, images_b64)
-                for batch in batches
-            ]
-            for future in futures:
-                completion = future.result()
-                store.accumulate_pass2_usage(ingest_run_id, completion.usage)
-                batch_output = pass2b.VisualOutput.model_validate(completion.data)
-                for judgment in batch_output.judgments:
-                    visual_by_index[judgment.cut_index] = judgment
-
-        pass2_output = pass2.merge_identity_and_visual(identity_output, visual_by_index)
+        pass2_output = pass2.Pass2Output(cuts=all_cuts)
         pass2_output = pass2.apply_junk_suspects(pass2_output, pass1_output)
-        # A declared outlook group's members are alternate angles, never
-        # retakes: code (not pass 2a's pixel guess) owns that categorical call,
-        # so force every declared-outlook member to take_role='outlook'.
-        pass2_output = pass2.apply_outlook_roles(pass2_output, pass1_output)
+        # take_group_id/take_role are entirely code-owned now (pass2_merge.
+        # plan.md D1/D2): the model never resolves takes, so this is the
+        # ONLY place they're ever set -- both declared-outlook members
+        # (alternate angles, never retakes) and genuine same-setting takes
+        # (post._enforce_take_winner crowns the winner right after post.py's
+        # assemble_cut_records call below).
+        pass2_output = pass2.apply_take_groups(pass2_output, pass1_output)
 
         # Cumulative identity map (identity_map.plan.md): reconcile WHO's
         # talking (voice<->camera-motion binding, Phase 1) and WHO's shown
         # (cross-file appearance clustering, Phase 2) once, deterministically,
-        # then rewrite on_camera from pass 2a's per-still guess into a derived
+        # then rewrite on_camera from pass 2's per-still guess into a derived
         # fact (Phase 3a). Must run before assemble_cut_records below --
         # on_camera also feeds total_quality there, so the rewrite only
         # counts if it lands first. `groups` is the SAME outlook grouping the
