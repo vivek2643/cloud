@@ -30,6 +30,7 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import time
 from typing import Any, Callable, Dict, List, Optional, Type, TypeVar
 
 from pydantic import BaseModel
@@ -310,6 +311,15 @@ def _build_config(
     return types.GenerateContentConfig(**kwargs)
 
 
+# Flash-Lite occasionally returns NO parseable output: the entire max_output
+# budget went to thinking (thought_signature parts, finish=MAX_TOKENS) and zero
+# JSON was emitted. That's a TRANSIENT, not a schema disagreement -- retry the
+# SAME request a few times before it's allowed to consume the single re-ask or
+# fail the whole run. Small backoff, scaled by attempt.
+_EMPTY_RETRIES = 2
+_EMPTY_BACKOFF_S = 1.0
+
+
 def complete_gemini(
     system: str,
     blocks: List[Block],
@@ -340,13 +350,34 @@ def complete_gemini(
     contents = [types.Content(role="user", parts=parts)]
     config = _build_config(types, schema, system, max_tokens, thinking, cached_content)
 
-    def _call(cfg: Any) -> Any:
-        return client.models.generate_content(model=resolved_model, contents=contents, config=cfg)
+    def _gen(call_contents: Any) -> Any:
+        return client.models.generate_content(model=resolved_model, contents=call_contents, config=config)
 
-    resp = _call(config)
-    logger.info("ingest_gemini: attempt 1 response -- %s", _diag(resp))
-    usage = _usage_of(resp)
-    raw = _parse_raw(resp)
+    def _gen_with_empty_retry(call_contents: Any, label: str) -> tuple[Any, Any, Dict[str, int]]:
+        """One structured call, retried ONLY on an empty/no-output response
+        (``_parse_raw`` -> None) -- the transient Flash-Lite failure where the
+        whole output budget went to thinking and zero JSON came back. Distinct
+        from a schema/semantic DISAGREEMENT (raw parses but is invalid), which is
+        left to the single re-ask below. Usage is summed across retries so cost
+        accounting stays honest. A lone flaky empty response must never
+        hard-fail a whole ingest run."""
+        resp = _gen(call_contents)
+        logger.info("ingest_gemini: %s response -- %s", label, _diag(resp))
+        usage = _usage_of(resp)
+        raw = _parse_raw(resp)
+        for i in range(1, _EMPTY_RETRIES + 1):
+            if raw is not None:
+                break
+            time.sleep(_EMPTY_BACKOFF_S * i)
+            logger.warning("ingest_gemini: %s produced NO output (likely thinking "
+                           "overshoot); retrying same request %d/%d", label, i, _EMPTY_RETRIES)
+            resp = _gen(call_contents)
+            logger.info("ingest_gemini: %s retry %d response -- %s", label, i, _diag(resp))
+            usage = _sum_usage(usage, _usage_of(resp))
+            raw = _parse_raw(resp)
+        return resp, raw, usage
+
+    resp, raw, usage = _gen_with_empty_retry(contents, "attempt 1")
     parsed, err = _validate(schema, raw)
     if parsed is not None and extra_check is not None:
         sem_err = extra_check(parsed)
@@ -368,14 +399,8 @@ def complete_gemini(
         types.Content(role="user", parts=[types.Part(text=correction)]),
     ]
 
-    def _call2() -> Any:
-        return client.models.generate_content(model=resolved_model, contents=contents2, config=config)
-
-    resp2 = _call2()
-    logger.info("ingest_gemini: attempt 2 response -- %s", _diag(resp2))
-    usage2 = _usage_of(resp2)
+    resp2, raw2, usage2 = _gen_with_empty_retry(contents2, "attempt 2 (re-ask)")
     total_usage = _sum_usage(usage, usage2)
-    raw2 = _parse_raw(resp2)
     parsed2, err2 = _validate(schema, raw2)
     if parsed2 is not None and extra_check is not None:
         sem_err2 = extra_check(parsed2)

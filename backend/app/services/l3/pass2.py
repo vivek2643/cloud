@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.config import get_settings
 from app.services.l3.image_plan import PlannedFrame
@@ -222,6 +222,23 @@ class CutJudgment(BaseModel):
             key = v.strip().lower()
             return _KIND_ALIASES.get(key, key)
         return v
+
+    @model_validator(mode="after")
+    def _kind_from_ref(self) -> "CutJudgment":
+        # kind is FULLY determined by the source_ref prefix (speech_cut[ ->
+        # speech, video_group[ -> video), so DERIVE it here instead of trusting
+        # the model's kind field. Flash-Lite routinely confuses kind (structural)
+        # with channel (semantic) and emits kind="said"/"shown" on an otherwise
+        # valid ref; left uncorrected that trips the ref/kind semantic check and
+        # burns the single re-ask on a field we can compute -- observed
+        # hard-failing whole runs (video_group[..] kind="shown", speech_cut[..]
+        # kind="said"). An unrecognized prefix is left as-is; _source_refs_exist
+        # rejects a genuinely invalid ref separately.
+        if self.source_ref.startswith("speech_cut["):
+            self.kind = "speech"
+        elif self.source_ref.startswith("video_group["):
+            self.kind = "video"
+        return self
 
 
 class Pass2BatchOutput(BaseModel):

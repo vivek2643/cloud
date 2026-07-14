@@ -346,14 +346,22 @@ def test_no_duplicate_atoms_catches_an_atom_split_across_two_cuts():
     print("ok  test_no_duplicate_atoms_catches_an_atom_split_across_two_cuts")
 
 
-def test_kind_matches_source_ref_catches_a_speech_ref_typed_as_video():
-    out = pass2.Pass2BatchOutput(cuts=[
-        pass2.CutJudgment(source_ref="speech_cut[10]", kind="video", file_id="f1",
-                          atom_ids=[3], label="a", summary="a"),
-    ])
-    err = pass2._kind_matches_source_ref(out)
-    assert err is not None and "speech_cut[10]" in err and "kind='video'" in err, err
-    print("ok  test_kind_matches_source_ref_catches_a_speech_ref_typed_as_video")
+def test_kind_is_derived_from_source_ref_not_the_models_field():
+    # Flash-Lite routinely confuses kind (structural) with channel (semantic) and
+    # emits kind="said"/"shown" on an otherwise valid ref. kind is DERIVED from
+    # the ref prefix at parse time, so the mismatch is silently corrected --
+    # never a re-ask, never a hard-fail (regression guard for two observed run
+    # failures: video_group[..] kind="shown", speech_cut[..] kind="said").
+    speech = pass2.CutJudgment(source_ref="speech_cut[10]", kind="said", file_id="f1",
+                               word_span=(0, 1), label="a", summary="a")
+    assert speech.kind == "speech", speech.kind
+    video = pass2.CutJudgment(source_ref="video_group[3]", kind="shown", file_id="f1",
+                              atom_ids=[3], label="a", summary="a")
+    assert video.kind == "video", video.kind
+    # so the defensive ref/kind check can no longer fire on real cuts
+    out = pass2.Pass2BatchOutput(cuts=[speech, video])
+    assert pass2._kind_matches_source_ref(out) is None
+    print("ok  test_kind_is_derived_from_source_ref_not_the_models_field")
 
 
 def test_no_overlapping_word_spans_catches_a_duplicate_span():
@@ -381,12 +389,8 @@ def _pass1_with(n_speech: int = 4, n_video: int = 4) -> Pass1Output:
 
 def test_pass2_semantic_checks_combines_all_checks():
     p1 = _pass1_with()
-    kind_mismatch = pass2.Pass2BatchOutput(cuts=[
-        pass2.CutJudgment(source_ref="speech_cut[0]", kind="video", file_id="f1",
-                          atom_ids=[0], label="a", summary="a"),
-    ])
-    assert pass2._pass2_semantic_checks(kind_mismatch, p1, {}, {"speech_cut[0]"}) is not None
-
+    # (kind/ref mismatch is no longer a semantic error -- kind is derived from
+    # the ref at parse time; see test_kind_is_derived_from_source_ref_*.)
     dup_atoms = pass2.Pass2BatchOutput(cuts=[
         pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
                           atom_ids=[0], label="a", summary="a"),
@@ -696,7 +700,7 @@ def main():
     test_cutjudgment_defaults_are_safe()
     test_no_duplicate_atoms_passes_when_every_atom_is_used_once()
     test_no_duplicate_atoms_catches_an_atom_split_across_two_cuts()
-    test_kind_matches_source_ref_catches_a_speech_ref_typed_as_video()
+    test_kind_is_derived_from_source_ref_not_the_models_field()
     test_no_overlapping_word_spans_catches_a_duplicate_span()
     test_pass2_semantic_checks_combines_all_checks()
     test_drop_out_of_batch_cuts_filters_strays_and_fixes_file_id()

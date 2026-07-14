@@ -297,6 +297,55 @@ def test_complete_gemini_raises_ingest_failure_after_two_failures():
     print("ok  test_complete_gemini_raises_ingest_failure_after_two_failures")
 
 
+def test_complete_gemini_retries_an_empty_response_then_succeeds():
+    # A response with NO parseable output (empty text -- Flash-Lite spent the
+    # whole budget on thinking) is a TRANSIENT: retry the SAME request, don't
+    # burn the re-ask or fail. First call empty, retry returns a good cut ->
+    # still attempts==1 (the empty retry is not a re-ask).
+    responses = ["", _GOOD_CUT]
+    calls = []
+
+    def fake_generate_content(model, contents, config):
+        calls.append(1)
+        return _FakeGeminiResp(responses.pop(0))
+
+    fake_client = mock.Mock()
+    fake_client.models.generate_content = fake_generate_content
+    with mock.patch.object(ig, "_sdk", return_value=(fake_client, _types())), \
+         mock.patch.object(ig.time, "sleep", lambda *a: None):
+        result = ig.complete_gemini("sys", [text_block("hello")], pass2.Pass2BatchOutput,
+                                    max_tokens=1000)
+
+    assert result.attempts == 1, result.attempts
+    assert len(result.data["cuts"]) == 1
+    assert len(calls) == 2, calls   # initial empty + one retry
+    print("ok  test_complete_gemini_retries_an_empty_response_then_succeeds")
+
+
+def test_complete_gemini_empty_forever_is_bounded_and_still_fails_loud():
+    # If output stays empty through the retries AND the re-ask (also retried),
+    # it must NOT loop forever -- it fails loud after a bounded number of calls:
+    # (1 + _EMPTY_RETRIES) for attempt 1 + the same for the re-ask.
+    calls = []
+
+    def fake_generate_content(model, contents, config):
+        calls.append(1)
+        return _FakeGeminiResp("")
+
+    fake_client = mock.Mock()
+    fake_client.models.generate_content = fake_generate_content
+    with mock.patch.object(ig, "_sdk", return_value=(fake_client, _types())), \
+         mock.patch.object(ig.time, "sleep", lambda *a: None):
+        try:
+            ig.complete_gemini("sys", [text_block("hello")], pass2.Pass2BatchOutput,
+                               max_tokens=1000)
+            assert False, "expected IngestFailure"
+        except ig.IngestFailure as e:
+            assert e.stage == "pass2"
+    assert len(calls) == 2 * (1 + ig._EMPTY_RETRIES), calls
+    print("ok  test_complete_gemini_empty_forever_is_bounded_and_still_fails_loud")
+
+
 def test_complete_gemini_passes_response_schema_and_thinking_config():
     captured = {}
 
@@ -606,6 +655,8 @@ def main():
     test_complete_gemini_success_first_try()
     test_complete_gemini_reasks_once_then_succeeds()
     test_complete_gemini_raises_ingest_failure_after_two_failures()
+    test_complete_gemini_retries_an_empty_response_then_succeeds()
+    test_complete_gemini_empty_forever_is_bounded_and_still_fails_loud()
     test_complete_gemini_passes_response_schema_and_thinking_config()
     test_complete_gemini_omits_system_instruction_when_cached()
     test_create_pass2_cache_returns_the_resource_name()
