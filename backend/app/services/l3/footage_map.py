@@ -777,6 +777,11 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False,
     summ = (m.get("summary") or "").strip().replace("\n", " ")
     if summ and not m.get("summary_covered_by_speech"):
         gloss = f" graphic:\"{_short_gist(summ)}\""
+    # Legible on-screen text/graphics the model read off the pixels (slide,
+    # lower-third, UI, title) -- distinct from the action gloss; rendered only
+    # when present so text-free footage stays terse. "" on a pre-migration cut.
+    scr = (m.get("screen_text") or "").strip().replace("\n", " ")
+    scr_tag = f" text:\"{_short_gist(scr)}\"" if scr else ""
     # Continuity run: this beat is part of one uninterrupted same-clip shot
     # (members listed in source order); keep run members together + in order.
     run = ""
@@ -795,7 +800,7 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False,
     alt = _alt_pic_segment(m, alias, oncam)
     return (f"  {m['moment_id'].split(':')[-1]} {_capture_tag(m)} {pic} {snd} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])} {_dur_tag(m)}] "
-            f"\"{gist}\"{gloss} · nrg:{nrg}{pace_tag}{cam_tag}{outlook_tag}{cut_tag}{run}{alt}")
+            f"\"{gist}\"{gloss}{scr_tag} · nrg:{nrg}{pace_tag}{cam_tag}{outlook_tag}{cut_tag}{run}{alt}")
 
 
 def _clip_block(tree: Dict[str, Any], *, compact: bool = False,

@@ -2,8 +2,8 @@
   GUIDANCE DOC -- Edso's reference for GUESSING under incomplete perception.
 
   Edso can't see or hear. It works off the transcript and each cut's information
-  (label, summary, channel=said/done/shown, camera move, quality scores,
-  take role, continuity). When that leaves a gap -- what to put on screen next,
+  (label, summary, channel=said/done/shown, on-screen text, energy, camera move,
+  quality scores, take role, continuity). When that leaves a gap -- what to put on screen next,
   which angle to show -- this doc says how to make the best GUESS. It is not a
   rulebook and not per-format cookbook: two general principles cover almost
   every requirement, and the podcast section is one worked example that uses
@@ -17,17 +17,29 @@
 
 # Guidance: how to guess
 
-## 1. Predict what's next from the transcript
-The spoken words are the plan. Read them as intent: when a line names or implies
-something to be seen ("look at this", "here's the setup", "so I grab the…", "and
-then it does X"), the next thing on screen is probably a video cut OF that. Scan
-the cut information — labels/summaries, channel (`done` = an action performed,
-`shown` = something displayed), the `camera` move — for the cut that matches the
-guess, and place it under or right after the line. If nothing matches, stay on
-the speaker. This is how to arrange B-roll, demos, and actions for vlogs,
-tutorials, talking-head, and anything where speech leads and the picture should
-follow along. Strictly follow the transcript order; guess only the pictures that
-ride alongside it.
+## 1. Read the words and pictures as one
+The words and the pictures are a single reading, not a ranking — take each beat
+from everything at once and lean on whichever carries the meaning at that moment.
+
+When the words lead (talk-driven material — vlog, tutorial, talking-head): read
+them as intent. When a line names or implies something to be seen ("look at
+this", "here's the setup", "so I grab the…", "and then it does X"), the next
+thing on screen is probably a video cut OF that. Scan the cut information —
+labels/summaries, channel (`done` = an action performed, `shown` = something
+displayed), any on-screen `text:`, the `camera` move — for the cut that matches
+the guess, and place it under or right after the line. If nothing matches, stay
+on the speaker. Follow the transcript order; guess only the pictures that ride
+alongside it.
+
+When the words DON'T lead (little or no speech — b-roll, montage, action): the
+pictures carry the meaning. Read the visual signals instead — each cut's energy
+(`nrg`), whether shots continue or break (welds / `cut:`), any on-screen
+`text:`, its `camera` move — to decide what matters and what follows what. There
+is NO house style to fall back on: take the shape and the pace from the user's
+goal and the material in front of you, never from a default "look". If music
+drives the piece, let its beat set the pace. In mixed material (reels, most
+social) the lead flips moment to moment — read each beat for whatever is carrying
+it right then.
 
 ## 2. Outlooks are alternate angles — pick per beat
 An OUTLOOK is the same content shot from a different angle (not a retake, so it
