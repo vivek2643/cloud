@@ -229,11 +229,19 @@ def _specs() -> List[Dict[str, Any]]:
         # --- ASK (pause the turn for a user-owned decision) ---
         S("ask_user", "Pauses the turn and asks the user one or more multiple-choice "
           "questions (each needs 2+ concrete options; they can also type their own). "
-          "Calling this ENDS your turn; you resume when they answer.",
+          "SUGGEST, don't just ask: set `recommended` to your pick and `why` to one "
+          "short reason, when you have one. Calling this ENDS your turn; you resume "
+          "when they answer.",
           obj({"questions": {"type": "array", "items": {"type": "object", "properties": {
               "prompt": {"type": "string"},
               "options": {"type": "array", "items": {"type": "string"}},
-              "allow_multiple": {"type": "boolean"}},
+              "allow_multiple": {"type": "boolean"},
+              "recommended": {"type": "string", "description":
+                  "Your suggested pick -- must be one of `options`."},
+              "why": {"type": "string", "description":
+                  "One short line: why you'd go with `recommended`."},
+              "preview": {"type": "string", "description":
+                  "Optional: one short line on what you'll do if they pick `recommended`."}},
               "required": ["prompt", "options"]}}}, ["questions"])),
     ]
 
@@ -277,7 +285,12 @@ def _beat_grid_ms(document: dict, ctx: EditContext) -> List[int]:
 
 def _normalize_questions(args: Dict[str, Any]) -> List[dict]:
     """Coerce the brain's ask_user payload into surfaced questions: each needs a
-    prompt + >= 2 concrete options (bad ones dropped)."""
+    prompt + >= 2 concrete options (bad ones dropped). `recommended`/`why`/
+    `preview` are an enrichment (interactive_ask_and_salience.plan.md WS1) --
+    the brain SUGGESTS rather than just asking. `recommended` is kept only
+    when it names one of the surfaced `options` (never a dangling default);
+    `why`/`preview` are kept only alongside a valid `recommended` (a reason
+    with nothing to recommend is noise)."""
     out: List[dict] = []
     for i, q in enumerate(args.get("questions") or []):
         if not isinstance(q, dict):
@@ -286,8 +299,18 @@ def _normalize_questions(args: Dict[str, Any]) -> List[dict]:
         opts = [str(o).strip() for o in (q.get("options") or []) if str(o).strip()]
         if not prompt or len(opts) < 2:
             continue
-        out.append({"id": f"q{i}", "prompt": prompt, "options": opts,
-                    "allow_multiple": bool(q.get("allow_multiple"))})
+        item = {"id": f"q{i}", "prompt": prompt, "options": opts,
+                "allow_multiple": bool(q.get("allow_multiple"))}
+        recommended = str(q.get("recommended") or "").strip()
+        if recommended and recommended in opts:
+            item["recommended"] = recommended
+            why = str(q.get("why") or "").strip()
+            if why:
+                item["why"] = why
+            preview = str(q.get("preview") or "").strip()
+            if preview:
+                item["preview"] = preview
+        out.append(item)
     return out
 
 

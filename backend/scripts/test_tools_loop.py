@@ -139,6 +139,55 @@ def test_loop_ask_user_pauses_turn():
     print("ok  loop: ask_user pauses the turn with pickable options")
 
 
+# --------------------------------------------------------------------------
+# _normalize_questions (interactive_ask_and_salience.plan.md WS1-A): the
+# ask_user payload's recommended/why/preview enrichment.
+# --------------------------------------------------------------------------
+
+def test_normalize_questions_surfaces_a_valid_recommendation():
+    out = tools._normalize_questions({"questions": [
+        {"prompt": "Which take?", "options": ["Take 1", "Take 2"],
+         "recommended": "Take 2", "why": "cleaner delivery", "preview": "I'll use Take 2."},
+    ]})
+    assert len(out) == 1, out
+    q = out[0]
+    assert q["recommended"] == "Take 2", q
+    assert q["why"] == "cleaner delivery", q
+    assert q["preview"] == "I'll use Take 2.", q
+    print("ok  normalize_questions: valid recommended/why/preview surfaced")
+
+
+def test_normalize_questions_drops_a_recommendation_not_in_options():
+    out = tools._normalize_questions({"questions": [
+        {"prompt": "Which take?", "options": ["Take 1", "Take 2"],
+         "recommended": "Take 3", "why": "dangling default"},
+    ]})
+    assert len(out) == 1, out
+    q = out[0]
+    assert "recommended" not in q, q
+    assert "why" not in q, q          # a reason with nothing to recommend is noise
+    print("ok  normalize_questions: dangling recommended (not in options) is dropped")
+
+
+def test_normalize_questions_still_drops_under_two_options():
+    out = tools._normalize_questions({"questions": [
+        {"prompt": "Only one option?", "options": ["Take 1"], "recommended": "Take 1"},
+        {"prompt": "Real question", "options": ["A", "B"]},
+    ]})
+    assert len(out) == 1 and out[0]["prompt"] == "Real question", out
+    print("ok  normalize_questions: <2 options still dropped (unchanged)")
+
+
+def test_normalize_questions_no_recommendation_omits_the_keys():
+    out = tools._normalize_questions({"questions": [
+        {"prompt": "Plain ask", "options": ["A", "B"]},
+    ]})
+    assert len(out) == 1, out
+    q = out[0]
+    assert "recommended" not in q and "why" not in q and "preview" not in q, q
+    print("ok  normalize_questions: no recommendation -> keys omitted entirely")
+
+
 def test_loop_split_screen_after_answer():
     """After the user answered the split question, the brain builds V1 then lays a
     split_screen -> op + layout region land on the working doc."""
@@ -166,6 +215,10 @@ def main():
     test_loop_pure_chat_no_change()
     test_loop_bad_tool_is_noop()
     test_loop_ask_user_pauses_turn()
+    test_normalize_questions_surfaces_a_valid_recommendation()
+    test_normalize_questions_drops_a_recommendation_not_in_options()
+    test_normalize_questions_still_drops_under_two_options()
+    test_normalize_questions_no_recommendation_omits_the_keys()
     test_loop_split_screen_after_answer()
     print("\nall tool-loop tests passed")
 

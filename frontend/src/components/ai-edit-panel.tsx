@@ -725,29 +725,87 @@ function QuestionCard({
   return (
     <div className="flex flex-col gap-3">
       {questions.map((q) => (
-        <div
-          key={q.id}
-          className="flex flex-col gap-2 rounded-2xl border px-3 py-3"
-          style={{ borderColor: "var(--accent)", background: "var(--accent-soft)" }}
-        >
-          <p className="text-sm font-medium">{q.prompt}</p>
-          <div className="flex flex-wrap gap-2">
-            {q.options.map((opt) => (
-              <button
-                key={opt}
-                onClick={() => onPick(opt)}
-                className="rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--background)]"
-                style={{ borderColor: "var(--border)" }}
-              >
-                {opt}
-              </button>
-            ))}
-          </div>
-          <p className="text-xs" style={{ color: "var(--muted)" }}>
-            …or just type your own answer below.
-          </p>
-        </div>
+        <QuestionItem key={q.id} question={q} onPick={onPick} />
       ))}
+    </div>
+  );
+}
+
+function QuestionItem({
+  question: q,
+  onPick,
+}: {
+  question: ThreadQuestion;
+  onPick: (text: string) => void;
+}) {
+  // allow_multiple: options toggle a local selection; a Send button submits
+  // the joined picks as one message. Single-select stays click-to-send.
+  const [selected, setSelected] = useState<string[]>([]);
+
+  function toggle(opt: string) {
+    setSelected((prev) => (prev.includes(opt) ? prev.filter((o) => o !== opt) : [...prev, opt]));
+  }
+
+  return (
+    <div
+      className="flex flex-col gap-2 rounded-2xl border px-3 py-3"
+      style={{ borderColor: "var(--accent)", background: "var(--accent-soft)" }}
+    >
+      <p className="text-sm font-medium">{q.prompt}</p>
+      {q.why && (
+        <p className="text-xs" style={{ color: "var(--muted)" }}>
+          {q.why}
+        </p>
+      )}
+      {q.preview && (
+        <p className="text-xs italic" style={{ color: "var(--muted)" }}>
+          {q.preview}
+        </p>
+      )}
+      <div className="flex flex-wrap gap-2">
+        {q.options.map((opt) => {
+          const isRecommended = opt === q.recommended;
+          const isSelected = selected.includes(opt);
+          return (
+            <button
+              key={opt}
+              onClick={() => (q.allow_multiple ? toggle(opt) : onPick(opt))}
+              className="flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--background)]"
+              style={{
+                borderColor: isSelected || isRecommended ? "var(--accent)" : "var(--border)",
+                background: isSelected ? "var(--accent)" : undefined,
+                color: isSelected ? "var(--background)" : undefined,
+              }}
+            >
+              {opt}
+              {isRecommended && (
+                <span
+                  className="rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide"
+                  style={{
+                    background: isSelected ? "var(--background)" : "var(--accent)",
+                    color: isSelected ? "var(--accent)" : "var(--background)",
+                  }}
+                >
+                  Recommended
+                </span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+      {q.allow_multiple && (
+        <button
+          onClick={() => selected.length > 0 && onPick(selected.join(", "))}
+          disabled={selected.length === 0}
+          className="self-start rounded-lg px-3 py-1.5 text-sm font-medium transition-colors disabled:opacity-40"
+          style={{ background: "var(--accent)", color: "var(--background)" }}
+        >
+          Send
+        </button>
+      )}
+      <p className="text-xs" style={{ color: "var(--muted)" }}>
+        …or just type your own answer below.
+      </p>
     </div>
   );
 }

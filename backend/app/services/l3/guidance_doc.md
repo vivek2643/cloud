@@ -39,7 +39,8 @@ is NO house style to fall back on: take the shape and the pace from the user's
 goal and the material in front of you, never from a default "look". If music
 drives the piece, let its beat set the pace. In mixed material (reels, most
 social) the lead flips moment to moment — read each beat for whatever is carrying
-it right then.
+it right then. When timing a punch-in or choosing where to hold within a cut,
+lean on its `peak:` (when present) — the cut's own strongest instant.
 
 ## 2. Outlooks are alternate angles — pick per beat
 An OUTLOOK is the same content shot from a different angle (not a retake, so it

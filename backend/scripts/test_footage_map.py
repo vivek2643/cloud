@@ -423,6 +423,57 @@ def test_moment_line_aliases_global_speaker():
     print("ok  test_moment_line_aliases_global_speaker")
 
 
+# --------------------------------------------------------------------------
+# peak tag (interactive_ask_and_salience.plan.md WS2): `peak:+X.Xs`, the
+# offset of post._salience's peak_ms into the cut -- rendered only when
+# interior and backed by real signal.
+# --------------------------------------------------------------------------
+
+def _salience_cut(hero_id, in_ms, out_ms, salience):
+    return _cut(hero_id, in_ms, out_ms, "watch this", salience=salience)
+
+
+def test_peak_tag_renders_for_an_interior_peak():
+    cut = _salience_cut("f:pk", 1000, 4000, {"peak_ms": 2500, "score": 0.9})
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "peak:+1.5s" in line, line
+    print("ok  test_peak_tag_renders_for_an_interior_peak")
+
+
+def test_peak_tag_absent_when_salience_missing():
+    cut = _salience_cut("f:pk", 1000, 4000, {})
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "peak:" not in line, line
+    print("ok  test_peak_tag_absent_when_salience_missing")
+
+
+def test_peak_tag_absent_on_no_signal_fallback():
+    # score == 0.0 means peak_ms just restates hero_ts_ms -- not a real peak.
+    cut = _salience_cut("f:pk", 1000, 4000, {"peak_ms": 2500, "score": 0.0})
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "peak:" not in line, line
+    print("ok  test_peak_tag_absent_on_no_signal_fallback")
+
+
+def test_peak_tag_absent_when_pinned_to_the_start():
+    cut = _salience_cut("f:pk", 1000, 4000, {"peak_ms": 1050, "score": 0.7})
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "peak:" not in line, line
+    print("ok  test_peak_tag_absent_when_pinned_to_the_start")
+
+
+def test_peak_tag_absent_when_pinned_to_the_end():
+    cut = _salience_cut("f:pk", 1000, 4000, {"peak_ms": 3950, "score": 0.7})
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "peak:" not in line, line
+    print("ok  test_peak_tag_absent_when_pinned_to_the_end")
+
+
 def test_default_energy_from_genre():
     """The tree opens the slider per genre: long-form calm, short-form punchy."""
     calm = fm.build_clip_tree("ffffffff-2222",
@@ -457,6 +508,11 @@ def main():
     test_cut_with_no_continuity_block_has_no_continuity_tag()
     test_take_group_excludes_junk_member()
     test_moment_line_aliases_global_speaker()
+    test_peak_tag_renders_for_an_interior_peak()
+    test_peak_tag_absent_when_salience_missing()
+    test_peak_tag_absent_on_no_signal_fallback()
+    test_peak_tag_absent_when_pinned_to_the_start()
+    test_peak_tag_absent_when_pinned_to_the_end()
     test_source_contiguous_beats_form_a_run_channel_agnostic()
     test_default_energy_from_genre()
     print("\nall footage-map tests passed")

@@ -537,6 +537,36 @@ def _framing_tag(m: Dict[str, Any]) -> str:
     return ""
 
 
+def _peak_tag(m: Dict[str, Any]) -> str:
+    """`peak:+X.Xs` -- this cut's single strongest INSTANT (post._salience,
+    code-computed), as an offset from the cut's own start; use it for
+    emphasis / punch-in / hold timing. Rendered only when the peak is
+    meaningfully INTERIOR -- more than a clip-relative edge guard away from
+    BOTH the start and the end, since a peak pinned to the first/last frame
+    tells the brain nothing. Never rendered for a pre-migration cut ({}) or
+    the no-signal fallback (score == 0.0, which is just hero_ts_ms restated,
+    not a real peak). `score` itself is NEVER shown: it's the peak's height
+    normalized against this cut's OWN curve range, so it reads as ~1.0 almost
+    everywhere and is not a cross-cut "how salient" magnitude."""
+    sal = m.get("salience") or {}
+    if not sal or not sal.get("score"):
+        return ""
+    peak_ms = sal.get("peak_ms")
+    if peak_ms is None:
+        return ""
+    in_ms, out_ms = m.get("in_ms", 0), m.get("out_ms", 0)
+    span_ms = out_ms - in_ms
+    if span_ms <= 0:
+        return ""
+    off_ms = peak_ms - in_ms
+    # ~1 hop_ms (L1's own granularity is consistently 100ms) or 10% of the
+    # span, whichever is larger -- a short cut still gets a usable guard band.
+    edge_guard = max(100, span_ms // 10)
+    if off_ms < edge_guard or (span_ms - off_ms) < edge_guard:
+        return ""
+    return f" peak:+{off_ms / 1000:.1f}s"
+
+
 def _speaker_handle(m: Dict[str, Any]) -> Optional[str]:
     """The RAW, resolvable speaker handle for a said moment -- the diarized voice
     id (else the VLM person id) that the shoot identity registry is keyed on.
@@ -793,6 +823,7 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False,
     # adds no signal and would just bloat every line).
     cam = (m.get("camera") or "").strip()
     cam_tag = f" cam:{cam.replace(' ', '-')}" if cam and cam not in ("static", "unknown") else ""
+    peak_tag = _peak_tag(m)
     # A structural fact only -- this moment's audio is shared verbatim with the
     # other angles (the outlook group's authoritative track), so picture choice
     # is entirely the brain's call and switching angles never jumps the audio.
@@ -800,7 +831,7 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False,
     alt = _alt_pic_segment(m, alias, oncam)
     return (f"  {m['moment_id'].split(':')[-1]} {_capture_tag(m)} {pic} {snd} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])} {_dur_tag(m)}] "
-            f"\"{gist}\"{gloss}{scr_tag} · nrg:{nrg}{pace_tag}{cam_tag}{outlook_tag}{cut_tag}{run}{alt}")
+            f"\"{gist}\"{gloss}{scr_tag} · nrg:{nrg}{pace_tag}{cam_tag}{peak_tag}{outlook_tag}{cut_tag}{run}{alt}")
 
 
 def _clip_block(tree: Dict[str, Any], *, compact: bool = False,

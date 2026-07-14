@@ -891,6 +891,12 @@ export interface ThreadQuestion {
   prompt: string;
   options: string[];
   allow_multiple?: boolean;
+  // The editor's suggested pick (one of `options`) + a one-line reason, and
+  // optionally a preview of what it'll do if picked -- an enrichment of the
+  // ask, not a new confirm round-trip (interactive_ask_and_salience.plan.md).
+  recommended?: string;
+  why?: string;
+  preview?: string;
 }
 
 export interface ThreadMessageResult {
