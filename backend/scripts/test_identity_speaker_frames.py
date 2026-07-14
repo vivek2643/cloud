@@ -69,11 +69,14 @@ def test_loudness_peak_ms_falls_back_to_midpoint_with_no_signal():
     print("ok  test_loudness_peak_ms_falls_back_to_midpoint_with_no_signal")
 
 
-def test_burst_offsets_three_two_one_by_window_length():
-    assert sf._burst_offsets(1000) == [-90, 0, 90]
-    assert sf._burst_offsets(120) == [-45, 45]
+def test_burst_offsets_scale_and_center_by_window_length():
+    # N=5, D_MS=100: a roomy window fits all 5 centered on 0; shorter windows
+    # shrink the count but stay symmetric; a tiny window collapses to [0].
+    assert sf._burst_offsets(1000) == [-200, -100, 0, 100, 200]
+    assert sf._burst_offsets(300) == [-150, -50, 50, 150]   # fits 4
+    assert sf._burst_offsets(120) == [-50, 50]              # fits 2
     assert sf._burst_offsets(50) == [0]
-    print("ok  test_burst_offsets_three_two_one_by_window_length")
+    print("ok  test_burst_offsets_scale_and_center_by_window_length")
 
 
 def test_burst_ts_stays_inside_the_window_and_snaps_to_sharpness():
@@ -81,7 +84,7 @@ def test_burst_ts_stays_inside_the_window_and_snaps_to_sharpness():
     # offset near it should snap there instead of the blurrier raw instant.
     blur = [0.9, 0.9, 0.1, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
     ts = sf._burst_ts(t_star=500, s=0, e=1000, blur=blur, hop_ms=100)
-    assert len(ts) == 3
+    assert len(ts) == 5
     assert all(0 <= t < 1000 for t in ts), ts
     print("ok  test_burst_ts_stays_inside_the_window_and_snaps_to_sharpness")
 
@@ -162,7 +165,7 @@ def test_plan_bursts_end_to_end_two_speakers_one_narrator():
     assert voices_with_bursts == {"V0", "V1"}, voices_with_bursts
     v0_bursts = [b for b in bursts if b.voice == "V0"]
     assert all(b.candidate_person == "P0" for b in v0_bursts), v0_bursts
-    assert all(len(b.ts_ms) == 3 for b in bursts), bursts
+    assert all(len(b.ts_ms) == 5 for b in bursts), bursts
     print("ok  test_plan_bursts_end_to_end_two_speakers_one_narrator")
 
 
@@ -200,7 +203,7 @@ def main():
     test_clean_windows_drops_a_turn_with_no_span_above_min_win_ms()
     test_loudness_peak_ms_finds_the_argmax_hop()
     test_loudness_peak_ms_falls_back_to_midpoint_with_no_signal()
-    test_burst_offsets_three_two_one_by_window_length()
+    test_burst_offsets_scale_and_center_by_window_length()
     test_burst_ts_stays_inside_the_window_and_snaps_to_sharpness()
     test_window_score_rewards_loud_sharp_isolated_prominent()
     test_covering_candidates_finds_the_visible_person_in_the_covering_cut()

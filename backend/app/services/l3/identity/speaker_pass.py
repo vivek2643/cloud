@@ -21,11 +21,17 @@ from app.services.llm.base import image_block, text_block
 
 logger = logging.getLogger(__name__)
 
-# Binding requires the winning candidate to take a clear MAJORITY of a
-# voice's windows, with a real margin over the runner-up -- a close or
-# ambiguous vote leaves the voice unbound (owner unknown) rather than
-# guessing. Conservative on purpose: a wrong bind is worse than an honest
-# "don't know" (identity_map.plan.md's founding stance, carried forward).
+# Binding requires the winning candidate to take a clear MAJORITY of the
+# OPINIONATED windows (those where the model actually named a mouthing
+# person), with a real margin over the runner-up. Abstentions -- windows
+# where no candidate's mouth clearly moved -- do NOT count against a winner:
+# in cross-cut footage (podcasts especially) the camera is often on the
+# LISTENER at a voice's loud instant, so most windows for a real on-camera
+# speaker correctly abstain, and only a handful actually catch them mouthing.
+# Counting abstentions in the denominator vetoed those true binds. What still
+# blocks a bind is genuine CONFLICT -- two different candidates both getting
+# votes (margin) -- not silence. Conservative where it matters (a split stays
+# unbound), relaxed where silence was never disagreement.
 MIN_VOTE_SHARE = 0.5
 MIN_VOTE_MARGIN = 1
 
@@ -107,13 +113,15 @@ def run_speaker_pass(
 
 def aggregate_votes(votes: List[WindowVote]) -> Optional[str]:
     """Majority + margin over a SINGLE voice's window votes -> the winning
-    candidate person id, or None (unbound) when the vote is close, split,
-    or empty. Requires the winner to hold a clear majority share
-    (`MIN_VOTE_SHARE`) AND a real margin (`MIN_VOTE_MARGIN`) over the
-    runner-up -- a 2-2 split or an unconvincing 1-vote edge both stay
-    unbound rather than guessing."""
-    total = len(votes)
-    if total == 0:
+    candidate person id, or None (unbound) when the vote is split or empty.
+    The share is computed over the OPINIONATED windows only (those that named
+    a mouthing candidate) -- abstentions (`speaking_person` unset: the shown
+    person was listening, or no mouth was legible) are silence, not a vote
+    against, so they never dilute an otherwise-clear winner. A bind still
+    requires a clear majority of those opinionated windows (`MIN_VOTE_SHARE`)
+    AND a real margin (`MIN_VOTE_MARGIN`) over the runner-up, so a genuine
+    conflict (two candidates each named) stays unbound rather than guessing."""
+    if not votes:
         return None
     counts: Dict[str, int] = {}
     for v in votes:
@@ -121,10 +129,11 @@ def aggregate_votes(votes: List[WindowVote]) -> Optional[str]:
             counts[v.speaking_person] = counts.get(v.speaking_person, 0) + 1
     if not counts:
         return None
+    opinionated = sum(counts.values())
     ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
     winner, top = ranked[0]
     second = ranked[1][1] if len(ranked) > 1 else 0
-    if top / total < MIN_VOTE_SHARE:
+    if top / opinionated < MIN_VOTE_SHARE:
         return None
     if top - second < MIN_VOTE_MARGIN:
         return None
@@ -143,10 +152,15 @@ def bind_voices(
     by_voice: Dict[str, List[Burst]] = {}
     for b in bursts:
         by_voice.setdefault(b.voice, []).append(b)
+    import os as _os
+    debug = bool(_os.environ.get("IDENTITY_DEBUG"))
     out: Dict[str, Optional[str]] = {}
     for voice, voice_bursts in sorted(by_voice.items()):
         votes = run_speaker_pass(voice_bursts, images_b64, persons)
         out[voice] = aggregate_votes(votes)
+        if debug:
+            named = [v.speaking_person for v in votes if v.speaking_person]
+            print(f"[IDDEBUG] {voice}: {len(votes)} window vote(s), named={named} -> {out[voice]}", flush=True)
         if out[voice] is None:
             logger.info("speaker_pass: voice %s unbound (%d window vote(s), no confident majority)",
                        voice, len(votes))

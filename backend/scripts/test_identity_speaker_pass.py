@@ -110,13 +110,27 @@ def test_aggregate_votes_empty_is_unbound():
     print("ok  test_aggregate_votes_empty_is_unbound")
 
 
-def test_aggregate_votes_unbound_below_majority_share():
-    # 2/5 for the winner -- well under a majority even with a margin over 2nd.
+def test_aggregate_votes_abstentions_do_not_dilute_a_clear_winner():
+    # 2 P0, 1 P1, 2 abstain. Over ALL 5 windows P0 is only 2/5, but the two
+    # abstentions are silence (listener on camera / no legible mouth), not
+    # votes against -- among the 3 OPINIONATED windows P0 is a clean 2-vs-1
+    # majority with margin, so P0 binds. (This is the reaction-shot fix:
+    # abstentions must not veto an otherwise-clear on-camera speaker.)
     votes = ([sp.WindowVote(window_id="w0", speaking_person="P0")] * 2
             + [sp.WindowVote(window_id="w1", speaking_person="P1")]
             + [sp.WindowVote(window_id="w2", speaking_person=None)] * 2)
-    assert sp.aggregate_votes(votes) is None
-    print("ok  test_aggregate_votes_unbound_below_majority_share")
+    assert sp.aggregate_votes(votes) == "P0"
+    print("ok  test_aggregate_votes_abstentions_do_not_dilute_a_clear_winner")
+
+
+def test_aggregate_votes_single_named_window_binds():
+    # The "at least one would work" case: one clean, uncontested vote amid
+    # abstentions binds -- the whole point of sampling several instants so
+    # at least one catches the speaker on camera.
+    votes = ([sp.WindowVote(window_id="w0", speaking_person="P0")]
+            + [sp.WindowVote(window_id="w1", speaking_person=None)] * 3)
+    assert sp.aggregate_votes(votes) == "P0"
+    print("ok  test_aggregate_votes_single_named_window_binds")
 
 
 # --------------------------------------------------------------------------
@@ -178,7 +192,8 @@ def main():
     test_aggregate_votes_unbound_on_a_split_tie()
     test_aggregate_votes_unbound_when_nobody_ever_speaks()
     test_aggregate_votes_empty_is_unbound()
-    test_aggregate_votes_unbound_below_majority_share()
+    test_aggregate_votes_abstentions_do_not_dilute_a_clear_winner()
+    test_aggregate_votes_single_named_window_binds()
     test_run_speaker_pass_returns_empty_with_no_images()
     test_run_speaker_pass_parses_the_model_votes()
     test_bind_voices_aggregates_per_voice_and_skips_the_rest()

@@ -38,9 +38,20 @@ from app.services.l3.video_segments import _sharpest_ms
 # clip-relative where possible.
 GUARD_MS = 150
 MIN_WIN_MS = 400
-K = 4
-N = 3
-D_MS = 90
+# Windows sampled per voice. Deliberately spans DIFFERENT covering subjects
+# (the diversity-aware pick below) so one pass sees the voice both when its
+# true owner is on camera AND when the other candidate is -- letting the
+# binding pass compare "whose mouth moves" rather than betting on one instant.
+K = 5
+# Frames per micro-burst (N) and their spacing (D_MS). A wider, denser burst
+# (5 frames over ~+/-200ms) gives the model a clearer moving-vs-still read of
+# the mouth than a single tight triple did -- articulation is ~3-7 Hz, so
+# ~100ms spacing shows real open/close CHANGE across the burst, and the extra
+# frames make the per-window "is this mouth moving" judgment far more robust.
+# `_burst_offsets` shrinks the count to fit a short window rather than spilling
+# outside it.
+N = 5
+D_MS = 100
 
 
 @dataclass
@@ -231,16 +242,21 @@ def _window_score(
 
 
 def _burst_offsets(win_len_ms: int, d_ms: int = D_MS, n: int = N) -> List[int]:
-    """N=3 offsets [-d, 0, +d] when the window comfortably fits them
-    (articulation is ~3-7 Hz, so frames need ~d apart to show mouth CHANGE
-    rather than collapsing to duplicate stills); drops to 2, then 1, for a
-    short window rather than reaching outside it."""
-    if win_len_ms >= 2 * d_ms:
-        return [-d_ms, 0, d_ms][: n if n < 3 else 3]
-    if win_len_ms >= d_ms:
-        half = d_ms // 2
-        return [-half, half]
-    return [0]
+    """Up to `n` offsets spaced `d_ms` apart, centered on the peak instant,
+    kept inside the window: `[-2d, -d, 0, +d, +2d]` for n=5 when the window
+    comfortably fits them (articulation is ~3-7 Hz, so frames ~d apart show
+    mouth CHANGE rather than collapsing to duplicate stills). Shrinks the
+    count -- and stays symmetric -- for a short window rather than reaching
+    outside it."""
+    if win_len_ms <= 0 or d_ms <= 0:
+        return [0]
+    fit = win_len_ms // d_ms + 1          # how many d-spaced frames span the window
+    k = max(1, min(n, fit))
+    if k <= 1:
+        return [0]
+    span = (k - 1) * d_ms
+    start = -(span // 2)
+    return [start + i * d_ms for i in range(k)]
 
 
 def _burst_ts(t_star: int, s: int, e: int, blur: List[float], hop_ms: int) -> List[int]:

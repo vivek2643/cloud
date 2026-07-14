@@ -29,6 +29,11 @@ librosa==0.10.2.post1
 # (already in the CUDA base image). If unavailable, speakers are left unset.
 pyannote.audio==3.3.2
 torchaudio==2.6.0
+# Pinned: pyannote 3.3.2 pulls speechbrain, but speechbrain 1.1.0 ships a
+# broken `speechbrain.integrations.k2_fsa` lazy module that raises ImportError
+# during the diarization pipeline load. 1.0.2 predates it and pyannote accepts
+# it -- keep this pin until pyannote/speechbrain resolve the incompatibility.
+speechbrain==1.0.2
 opencv-python-headless==4.11.0.86
 pydub==0.25.1
 pgvector==0.3.6
