@@ -252,6 +252,16 @@ export interface CutRecord {
   // distinct from hero_ts_ms (the best STILL for display). null/absent on a
   // pre-migration run or a cut with no usable signal.
   salience?: { peak_ms: number; score: number } | null;
+  // av_coupling_authoritative.plan.md: this cut's baked AUTHORITATIVE audio
+  // source, decided once at ingest (never re-derived lazily at render time).
+  // audio_file_id defaults to this cut's own file_id (same-source, offset 0)
+  // for the ~90% common case; a synced multicam cut couples to the group's
+  // authoritative file with a per-cut refined offset_ms. confidence is
+  // null for same-source cuts or when the refinement's guard fell back to
+  // the group's unrefined global delta.
+  audio_file_id?: string;
+  audio_offset_ms?: number;
+  audio_align_confidence?: number | null;
 }
 
 export type IngestStatus = "pending" | "pass1" | "images" | "pass2" | "post" | "ready" | "failed";

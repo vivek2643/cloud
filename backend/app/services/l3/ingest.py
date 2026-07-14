@@ -300,7 +300,8 @@ def run_ingest(project_id: str) -> str:
                                             junk_suspects=pass1_output.junk_suspects,
                                             audio_by_file=audio_by_file,
                                             synced_file_ids=outlook_file_ids,
-                                            sync_group_by_file=outlook_group_by_file)
+                                            sync_group_by_file=outlook_group_by_file,
+                                            sync_info_by_file=outlook_by_file)
 
         store.delete_cut_records_for_run(ingest_run_id)
         record_ids = store.insert_cut_records(ingest_run_id, records)

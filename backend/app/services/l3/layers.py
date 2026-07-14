@@ -573,12 +573,18 @@ def resolve(
     `color_stats` (file_id -> L1 color_stats row, see grade.measure) feeds the
     correct layer (SS5); a missing/absent entry just means that clip's grade
     stays identity (never-worse: no measurement, no basis to change anything).
-    `audio_routes` (audio_sync.plan.md SS8, see `sync.audio_route.resolve_audio_routes`):
-    seg_id -> {source_file_id, src_in_ms, src_out_ms} for a spine segment
-    whose cut belongs to a synced group -- the picture stays the shown
-    angle, but the coupled AudioLayer is re-routed to the group's
-    authoritative source instead. Missing entry -> today's coupled audio,
-    unchanged (the no-multicam-regression guarantee).
+    `audio_routes` (audio_sync.plan.md SS8, see `sync.audio_route.
+    resolve_audio_routes`) is now the LEGACY fallback only
+    (av_coupling_authoritative.plan.md): a spine segment's audio source is
+    normally already BAKED onto it (`seg["audio_file_id"]`/
+    `seg["audio_offset_ms"]`, from `act._segments_from_cut` ->
+    `ResolvedCut`, decided once per cut at assembly time and locally
+    refined against that cut's own audio window -- see
+    `post.assemble_cut_records`/`sync.av_couple`). `audio_routes` only
+    still matters for a segment with NO baked coupling at all: an edit
+    document built before this feature, or a hand-placed `place_span` span
+    (no cut to bake coupling from) -- byte-identical to before this
+    feature existed. `audio_override` (`replace_audio`) wins over both.
     """
     durations = durations or {}
     color_stats = color_stats or {}
@@ -609,16 +615,41 @@ def resolve(
                 match_delta=match_deltas.get(seg["file_id"]),
             ),
         ))
-        # `replace_audio`'s override (audio_brain.plan.md) wins over the
-        # auto-computed outlook route -- the escape hatch that makes the one
-        # structural default (authoritative routing) fully overridable.
-        route = seg.get("audio_override") or audio_routes.get(seg["seg_id"])
+        # Audio source priority (av_coupling_authoritative.plan.md):
+        #  1. `replace_audio`'s override (audio_brain.plan.md) -- the escape
+        #     hatch that makes any structural default fully overridable.
+        #  2. The segment's own BAKED coupling (`act._segments_from_cut`,
+        #     from `ResolvedCut.audio_file_id`/`audio_offset_ms` -- decided
+        #     once at cut-assembly time, refined per cut against this cut's
+        #     own audio window). This is the default for any segment placed
+        #     via a map ref.
+        #  3. Legacy `audio_routes` (`sync.audio_route.resolve_audio_routes`)
+        #     -- a segment with NO baked coupling at all: an edit document
+        #     built before this feature, or one hand-placed via `place_span`
+        #     (no cut to bake coupling from). Byte-identical to before this
+        #     feature existed.
+        #  4. Plain coupled audio (this segment's own file, offset 0).
+        route = seg.get("audio_override")
+        if route:
+            source_file_id = route["source_file_id"]
+            src_in_ms, src_out_ms = int(route["src_in_ms"]), int(route["src_out_ms"])
+        elif seg.get("audio_file_id"):
+            off = int(seg.get("audio_offset_ms", 0) or 0)
+            source_file_id = seg["audio_file_id"]
+            src_in_ms, src_out_ms = int(seg["in_ms"]) + off, int(seg["out_ms"]) + off
+        else:
+            route = audio_routes.get(seg["seg_id"])
+            if route:
+                source_file_id = route["source_file_id"]
+                src_in_ms, src_out_ms = int(route["src_in_ms"]), int(route["src_out_ms"])
+            else:
+                source_file_id = seg["file_id"]
+                src_in_ms, src_out_ms = int(seg["in_ms"]), int(seg["out_ms"])
         audio.append(AudioLayer(
             layer_id=f"a_{seg['seg_id']}",
             role=ROLE_DIALOGUE,
-            source_file_id=route["source_file_id"] if route else seg["file_id"],
-            src_in_ms=int(route["src_in_ms"]) if route else int(seg["in_ms"]),
-            src_out_ms=int(route["src_out_ms"]) if route else int(seg["out_ms"]),
+            source_file_id=source_file_id,
+            src_in_ms=src_in_ms, src_out_ms=src_out_ms,
             prog_start_ms=s.prog_start_ms, prog_end_ms=s.prog_end_ms,
             kind="spine",
             # A muted segment (stray speech under a video cut) keeps its picture

@@ -155,7 +155,7 @@ def test_run_ingest_calls_pass2_per_batch():
 
     def fake_assemble(pass2_output, lattices, motion_by_file, silences_by_file,
                       junk_suspects=None, audio_by_file=None,
-                      synced_file_ids=None, sync_group_by_file=None):
+                      synced_file_ids=None, sync_group_by_file=None, sync_info_by_file=None):
         recorded["cuts"] = list(pass2_output.cuts)
         return []
 

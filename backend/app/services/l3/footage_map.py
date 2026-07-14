@@ -340,6 +340,14 @@ def build_clip_tree(
             # "" / {} on a pre-migration cut.
             "screen_text": cut.get("screen_text") or "",
             "salience": cut.get("salience") or {},
+            # av_coupling_authoritative.plan.md: this cut's baked authoritative
+            # audio coupling -- carried through to ResolvedCut/segments so a
+            # placed beat plays correct, in-sync audio without a lazy re-route
+            # at render time. Defaults to this cut's own file at offset 0
+            # (cutrecord_map._to_cut_dict already resolves the legacy-row
+            # NULL case, so this is never missing).
+            "audio_file_id": cut.get("audio_file_id") or file_id,
+            "audio_offset_ms": int(cut.get("audio_offset_ms") or 0),
             "variants": variants,
             "atoms": [],
         })

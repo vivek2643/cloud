@@ -44,7 +44,9 @@ def test_to_cut_dict_maps_exact_keys_build_clip_tree_reads():
                 "voice_ids", "speaker_person", "visible_persons", "on_camera",
                 "src_in_ms", "src_out_ms", "play_ms", "keep_spans",
                 "score", "flags", "audio", "mute", "people", "framing", "quality",
-                "ladder", "take_group_id", "take_role", "junk", "junk_reason", "continuity"):
+                "ladder", "take_group_id", "take_role", "junk", "junk_reason", "continuity",
+                "screen_text", "salience", "audio_file_id", "audio_offset_ms",
+                "audio_align_confidence"):
         assert key in d, f"missing {key}"
     assert d["hero_id"] == "cut-1"
     assert d["channel"] == "shown"
@@ -55,6 +57,30 @@ def test_to_cut_dict_maps_exact_keys_build_clip_tree_reads():
     assert len(d["ladder"]) == 5
     assert [r["level"] for r in d["ladder"]] == ["broad", "calm", "balanced", "tight", "sharp"]
     print("ok  test_to_cut_dict_maps_exact_keys_build_clip_tree_reads")
+
+
+def test_to_cut_dict_surfaces_screen_text_salience_and_av_coupling():
+    row = _row(screen_text="Chapter 3", salience={"peak_ms": 4300, "score": 0.8},
+               audio_file_id="ffffffff-2222", audio_offset_ms=150, audio_align_confidence=0.92)
+    d = cm._to_cut_dict(row)
+    assert d["screen_text"] == "Chapter 3", d["screen_text"]
+    assert d["salience"] == {"peak_ms": 4300, "score": 0.8}, d["salience"]
+    assert d["audio_file_id"] == "ffffffff-2222", d["audio_file_id"]
+    assert d["audio_offset_ms"] == 150, d["audio_offset_ms"]
+    assert d["audio_align_confidence"] == 0.92, d["audio_align_confidence"]
+    print("ok  test_to_cut_dict_surfaces_screen_text_salience_and_av_coupling")
+
+
+def test_to_cut_dict_legacy_row_couples_to_its_own_file():
+    # A pre-migration row (audio_file_id column NULL) -- same-source coupling,
+    # never a null/missing audio source downstream.
+    row = _row(audio_file_id=None, audio_offset_ms=None, audio_align_confidence=None)
+    d = cm._to_cut_dict(row)
+    assert d["audio_file_id"] == row["file_id"], d["audio_file_id"]
+    assert d["audio_offset_ms"] == 0, d["audio_offset_ms"]
+    assert d["audio_align_confidence"] is None, d["audio_align_confidence"]
+    assert d["screen_text"] == "" and d["salience"] == {}
+    print("ok  test_to_cut_dict_legacy_row_couples_to_its_own_file")
 
 
 def test_to_cut_dict_feeds_build_clip_tree_end_to_end():
@@ -236,6 +262,8 @@ def test_unpinned_falls_back_to_latest_run():
 
 def main():
     test_to_cut_dict_maps_exact_keys_build_clip_tree_reads()
+    test_to_cut_dict_surfaces_screen_text_salience_and_av_coupling()
+    test_to_cut_dict_legacy_row_couples_to_its_own_file()
     test_to_cut_dict_feeds_build_clip_tree_end_to_end()
     test_junk_and_continuity_ride_through_unfiltered()
     test_subject_derivation()

@@ -309,6 +309,78 @@ def test_assemble_cut_records_end_to_end():
 
 
 # --------------------------------------------------------------------------
+# A/V coupling (av_coupling_authoritative.plan.md)
+# --------------------------------------------------------------------------
+
+def test_solo_cut_couples_to_its_own_file_at_zero_offset():
+    p2 = Pass2Output(cuts=[
+        Pass2Cut(source_ref="speech_cut[0]", kind="speech", file_id="f1", word_span=(0, 2),
+                label="intro", summary="says hi"),
+    ])
+    records = post.assemble_cut_records(p2, {"f1": _lattice()}, {"f1": _motion()}, {})
+    rec = records[0]
+    assert rec.audio_file_id == "f1", rec.audio_file_id
+    assert rec.audio_offset_ms == 0, rec.audio_offset_ms
+    assert rec.audio_align_confidence is None, rec.audio_align_confidence
+    print("ok  test_solo_cut_couples_to_its_own_file_at_zero_offset")
+
+
+def test_synced_cut_couples_to_authoritative_file_with_refined_offset():
+    # f1 (picture) is grouped with f2 (authoritative audio); the group's
+    # globally-solved offset only gets to +100ms, but the two files' own
+    # loudness envelopes carry a matching spike 200ms apart -- the local
+    # cross-correlation refinement must find that true total offset.
+    f1_rms = [-40.0] * 20
+    f1_rms[3] = -5.0     # spike at 300-400ms, inside the resolved cut span [0,800)
+    f2_rms = [-40.0] * 20
+    f2_rms[5] = -5.0     # same spike, 200ms later
+    audio_by_file = {
+        "f1": {"rms_db": f1_rms, "hop_ms": 100},
+        "f2": {"rms_db": f2_rms, "hop_ms": 100},
+    }
+    sync_info_by_file = {
+        "f1": {"authoritative_audio_file_id": "f2",
+              "members": {"f1": {"offset_ms": 100}, "f2": {"offset_ms": 0}}},
+    }
+    p2 = Pass2Output(cuts=[
+        Pass2Cut(source_ref="speech_cut[0]", kind="speech", file_id="f1", word_span=(0, 2),
+                label="intro", summary="says hi"),
+    ])
+    records = post.assemble_cut_records(
+        p2, {"f1": _lattice()}, {"f1": _motion()}, {},
+        audio_by_file=audio_by_file, sync_info_by_file=sync_info_by_file,
+    )
+    rec = records[0]
+    assert rec.audio_file_id == "f2", rec.audio_file_id
+    assert rec.audio_offset_ms == 200, rec.audio_offset_ms
+    assert rec.audio_align_confidence is not None and rec.audio_align_confidence > 0.9, \
+        rec.audio_align_confidence
+    print("ok  test_synced_cut_couples_to_authoritative_file_with_refined_offset")
+
+
+def test_synced_cut_falls_back_to_global_delta_with_no_authoritative_envelope():
+    # The authoritative file was never independently ingested (e.g. no
+    # transcript/audio_features row) -- refine_offset's guard must keep the
+    # unrefined global delta rather than raise or fabricate a lag.
+    sync_info_by_file = {
+        "f1": {"authoritative_audio_file_id": "f2",
+              "members": {"f1": {"offset_ms": 250}, "f2": {"offset_ms": 0}}},
+    }
+    p2 = Pass2Output(cuts=[
+        Pass2Cut(source_ref="speech_cut[0]", kind="speech", file_id="f1", word_span=(0, 2),
+                label="intro", summary="says hi"),
+    ])
+    records = post.assemble_cut_records(
+        p2, {"f1": _lattice()}, {"f1": _motion()}, {}, sync_info_by_file=sync_info_by_file,
+    )
+    rec = records[0]
+    assert rec.audio_file_id == "f2", rec.audio_file_id
+    assert rec.audio_offset_ms == 250, rec.audio_offset_ms
+    assert rec.audio_align_confidence is None, rec.audio_align_confidence
+    print("ok  test_synced_cut_falls_back_to_global_delta_with_no_authoritative_envelope")
+
+
+# --------------------------------------------------------------------------
 # continuity (cuts_v3_continuity.plan.md)
 # --------------------------------------------------------------------------
 
@@ -670,6 +742,9 @@ def main():
     test_validate_no_overlap_allows_middle_gap()
     test_validate_no_overlap_allows_no_cuts()
     test_assemble_cut_records_end_to_end()
+    test_solo_cut_couples_to_its_own_file_at_zero_offset()
+    test_synced_cut_couples_to_authoritative_file_with_refined_offset()
+    test_synced_cut_falls_back_to_global_delta_with_no_authoritative_envelope()
     test_junk_flag_is_preserved_verbatim()
     test_non_junk_stays_non_junk()
     test_assemble_raises_on_unknown_file_id()

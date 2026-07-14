@@ -84,6 +84,11 @@ def _segments_from_cut(rc: ResolvedCut) -> List[dict]:
             "mute": True if rc.mute else None,
             "ref": rc.ref or None,
             "level": rc.level,
+            # av_coupling_authoritative.plan.md: this cut's baked authoritative
+            # audio coupling -- default file_id/0 (same-source) when the
+            # resolved cut carries none.
+            "audio_file_id": rc.audio_file_id or rc.file_id,
+            "audio_offset_ms": rc.audio_offset_ms,
         })
     return out
 

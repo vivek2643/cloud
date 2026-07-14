@@ -313,6 +313,19 @@ def _to_cut_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         # share this audio", a structural fact, not editorial guidance (the
         # brain still picks picture on its own). DB column stays sync_group_id.
         "sync_group_id": row.get("sync_group_id"),
+        # perception_upgrade.plan.md Part C3/D: on-screen text/graphics the
+        # model read off the pixels, and this cut's single strongest INSTANT
+        # (code-computed, post._salience). "" / {} on a pre-migration cut --
+        # these were never actually surfaced here before (footage_map's
+        # screen_text/salience tags silently always rendered empty).
+        "screen_text": row.get("screen_text") or "",
+        "salience": row.get("salience") or {},
+        # av_coupling_authoritative.plan.md: this cut's baked, authoritative
+        # audio coupling. audio_file_id defaults to this cut's OWN file_id
+        # (same-source) for a pre-migration row (DB column is NULL there).
+        "audio_file_id": row.get("audio_file_id") or row["file_id"],
+        "audio_offset_ms": int(row.get("audio_offset_ms") or 0),
+        "audio_align_confidence": row.get("audio_align_confidence"),
     }
 
 

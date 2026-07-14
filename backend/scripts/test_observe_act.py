@@ -653,6 +653,67 @@ def test_pace_tag_and_affordances_surface_room():
     print("ok  pace tag + affordances + read_state surface the pacing room")
 
 
+# --------------------------------------------------------------------------
+# A/V coupling audio-source priority (av_coupling_authoritative.plan.md)
+# --------------------------------------------------------------------------
+
+def _seg(seg_id, file_id, in_ms, out_ms, **extra):
+    d = {"seg_id": seg_id, "file_id": file_id, "in_ms": in_ms, "out_ms": out_ms}
+    d.update(extra)
+    return d
+
+
+def test_resolve_uses_baked_coupling_over_legacy_audio_routes():
+    doc = {"timeline": [_seg("s0", "f1", 0, 1000, audio_file_id="f2", audio_offset_ms=150)]}
+    # A legacy route also exists for this seg_id -- baked coupling must win.
+    audio_routes = {"s0": {"source_file_id": "f9", "src_in_ms": 999, "src_out_ms": 1999}}
+    rt = layers.resolve(doc, {}, {}, audio_routes)
+    a = rt.audio_layers[0]
+    assert a.source_file_id == "f2", a
+    assert (a.src_in_ms, a.src_out_ms) == (150, 1150), (a.src_in_ms, a.src_out_ms)
+    print("ok  resolve: baked coupling wins over legacy audio_routes")
+
+
+def test_resolve_falls_back_to_legacy_audio_routes_with_no_baked_coupling():
+    # No audio_file_id at all -- an edit document built before this feature,
+    # or a place_span-placed span -- must still get the SS8 route correction.
+    doc = {"timeline": [_seg("s0", "f1", 0, 1000)]}
+    audio_routes = {"s0": {"source_file_id": "f2", "src_in_ms": 300, "src_out_ms": 1300}}
+    rt = layers.resolve(doc, {}, {}, audio_routes)
+    a = rt.audio_layers[0]
+    assert a.source_file_id == "f2", a
+    assert (a.src_in_ms, a.src_out_ms) == (300, 1300), (a.src_in_ms, a.src_out_ms)
+    print("ok  resolve: legacy audio_routes still applies with no baked coupling")
+
+
+def test_resolve_plain_coupled_audio_with_no_coupling_or_route_at_all():
+    doc = {"timeline": [_seg("s0", "f1", 0, 1000)]}
+    rt = layers.resolve(doc, {}, {}, {})
+    a = rt.audio_layers[0]
+    assert a.source_file_id == "f1", a
+    assert (a.src_in_ms, a.src_out_ms) == (0, 1000), (a.src_in_ms, a.src_out_ms)
+    print("ok  resolve: plain coupled audio with no coupling or route at all")
+
+
+def test_resolve_audio_override_wins_over_baked_coupling():
+    doc = {"timeline": [_seg("s0", "f1", 0, 1000, audio_file_id="f2", audio_offset_ms=150,
+                             audio_override={"source_file_id": "f3", "src_in_ms": 5000, "src_out_ms": 6000})]}
+    rt = layers.resolve(doc, {}, {}, {})
+    a = rt.audio_layers[0]
+    assert a.source_file_id == "f3", a
+    assert (a.src_in_ms, a.src_out_ms) == (5000, 6000), (a.src_in_ms, a.src_out_ms)
+    print("ok  resolve: audio_override wins over baked coupling")
+
+
+def test_resolve_same_source_baked_coupling_is_zero_offset():
+    doc = {"timeline": [_seg("s0", "f1", 500, 1500, audio_file_id="f1", audio_offset_ms=0)]}
+    rt = layers.resolve(doc, {}, {}, {})
+    a = rt.audio_layers[0]
+    assert a.source_file_id == "f1", a
+    assert (a.src_in_ms, a.src_out_ms) == (500, 1500), (a.src_in_ms, a.src_out_ms)
+    print("ok  resolve: same-source baked coupling is zero-offset identity")
+
+
 def main():
     test_read_state_reports_cuts_and_feel()
     test_place_adds_main_line_cut()
@@ -687,6 +748,11 @@ def main():
     test_retime_speech_trims_dead_air_and_is_idempotent()
     test_retime_unknown_pace_is_noop()
     test_pace_tag_and_affordances_surface_room()
+    test_resolve_uses_baked_coupling_over_legacy_audio_routes()
+    test_resolve_falls_back_to_legacy_audio_routes_with_no_baked_coupling()
+    test_resolve_plain_coupled_audio_with_no_coupling_or_route_at_all()
+    test_resolve_audio_override_wins_over_baked_coupling()
+    test_resolve_same_source_baked_coupling_is_zero_offset()
     print("\nall observe/act tests passed")
 
 

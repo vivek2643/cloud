@@ -75,6 +75,12 @@ class ResolvedCut:
     ref: str = ""               # the map id (carried onto segments for refinement)
     level: str = "balanced"
     mute: bool = False          # final source-audio mute (video default folded with the brain's audio:keep/mute)
+    # av_coupling_authoritative.plan.md: this cut's baked authoritative audio
+    # coupling (identity coupling -- file_id/0 -- for the ~90% solo-clip
+    # case). Carried onto segments so `layers.resolve` never has to re-derive
+    # audio routing lazily at render time.
+    audio_file_id: str = ""
+    audio_offset_ms: int = 0
 
 
 # --------------------------------------------------------------------------
@@ -144,6 +150,8 @@ class _MapIndex:
             track=p.track, from_ms=p.from_ms, reason=p.reason,
             ref=p.ref, level=v.get("level", level),
             mute=_resolve_mute(bool(m.get("mute")), p.audio),
+            audio_file_id=m.get("audio_file_id") or m["file_id"],
+            audio_offset_ms=int(m.get("audio_offset_ms") or 0),
         )
 
     def level_ok(self, ref: str, level: str) -> bool:

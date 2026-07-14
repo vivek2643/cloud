@@ -32,6 +32,7 @@ from app.services.l3.post_params import (
     FLATLINE_BAND, PACE_LEVEL_TARGETS, SPEED_CEIL, SPEED_FLOOR,
 )
 from app.services.l3.seam import BREAK_BOUNDARY_REASONS, Seam, classify_seam
+from app.services.l3.sync import av_couple
 from app.services.l3.video_segments import _sharpest_ms
 
 logger = logging.getLogger(__name__)
@@ -471,6 +472,20 @@ class CutRecord:
     voice_ids: List[str] = field(default_factory=list)
     speaker_person: Optional[str] = None
     visible_persons: List[str] = field(default_factory=list)
+    # av_coupling_authoritative.plan.md: this cut's AUTHORITATIVE audio,
+    # baked at assembly time -- a coupled (video, audio) unit, never
+    # re-derived lazily at render time. audio_file_id == file_id, offset 0
+    # for the ~90% common case (no sync group, or this file already IS the
+    # group's authoritative source); otherwise the group's authoritative
+    # file + a per-cut REFINED offset (sync.av_couple.refine_offset,
+    # cross-correlated against this cut's own audio window -- never just
+    # the group's loose global delta, which is what drifted into visible
+    # lip-sync error). audio_align_confidence is None for a same-source cut
+    # or when the refinement's guard rejected a weak/ambiguous peak and fell
+    # back to the unrefined global delta.
+    audio_file_id: str = ""
+    audio_offset_ms: int = 0
+    audio_align_confidence: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -491,6 +506,8 @@ class CutRecord:
             "screen_text": self.screen_text, "salience": self.salience,
             "voice_ids": self.voice_ids, "speaker_person": self.speaker_person,
             "visible_persons": self.visible_persons,
+            "audio_file_id": self.audio_file_id, "audio_offset_ms": self.audio_offset_ms,
+            "audio_align_confidence": self.audio_align_confidence,
         }
 
 
@@ -726,6 +743,7 @@ def assemble_cut_records(
     audio_by_file: Optional[Dict[str, Dict[str, Any]]] = None,
     synced_file_ids: Optional[set] = None,
     sync_group_by_file: Optional[Dict[str, str]] = None,
+    sync_info_by_file: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[CutRecord]:
     """Resolve every judged cut to its final ms span (word/atom edges only,
     by construction), enforce zero-overlap per file (gaps are legal -- cuts are
@@ -737,14 +755,21 @@ def assemble_cut_records(
     (audio_sync.plan.md SS7.6): file_ids in a synced multicam group, whose
     continuity seam test skips the video shot-check -- see
     ``_has_scene_or_transition``'s ``synced`` param; None/empty is identical
-    to today's behavior. Raises ``ValueError`` (stage ``post``, per the plan's
-    "no fallback" rule) on any invariant violation -- the caller marks the
-    ingest run ``failed`` for re-run."""
+    to today's behavior. ``sync_info_by_file`` (av_coupling_authoritative.
+    plan.md): ``sync.store.sync_groups_for_files``'s own shape (``{file_id:
+    {"authoritative_audio_file_id", "members": {file_id: {"offset_ms",
+    ...}}}}``) -- fed straight through to ``sync.av_couple.authoritative_for``
+    /``refine_offset`` to bake each cut's coupled ``(audio_file_id,
+    audio_offset_ms)``. None/empty -> every cut couples to its own file at
+    offset 0 (today's behavior). Raises ``ValueError`` (stage ``post``, per
+    the plan's "no fallback" rule) on any invariant violation -- the caller
+    marks the ingest run ``failed`` for re-run."""
     junk_by_file: Dict[str, List[JunkSuspect]] = {}
     for js in (junk_suspects or []):
         junk_by_file.setdefault(js.file_id, []).append(js)
 
     audio_by_file = audio_by_file or {}
+    sync_info_by_file = sync_info_by_file or {}
     # Clip-relative normalisers for the quality scores: each signal is ranked
     # against its OWN clip's spread, so there are no absolute dB/pixel constants.
     rms_lohi = {fid: _series_lohi((a or {}).get("rms_db") or []) for fid, a in audio_by_file.items()}
@@ -843,6 +868,23 @@ def assemble_cut_records(
             anchors, audio.get("onsets_ms") or [], hero_ts,
         )
 
+        # av_coupling_authoritative.plan.md: bake this cut's coupled audio
+        # source NOW (assembly time), never re-derived lazily at render time.
+        # Same-source (no group, or this file already IS the authoritative
+        # source) -> identity coupling, zero cost. Cross-source -> the
+        # group's global delta, LOCALLY REFINED against this cut's own
+        # audio window so a loose global offset / long-take clock drift
+        # can't show up as visible lip-sync error.
+        audio_file_id, audio_global_delta = av_couple.authoritative_for(cut.file_id, sync_info_by_file)
+        if audio_file_id == cut.file_id:
+            audio_offset_ms, audio_align_confidence = 0, None
+        else:
+            auth_audio = audio_by_file.get(audio_file_id) or {}
+            audio_offset_ms, audio_align_confidence = av_couple.refine_offset(
+                audio.get("rms_db") or [], auth_audio.get("rms_db") or [],
+                int(audio.get("hop_ms") or 0), s, e, audio_global_delta,
+            )
+
         out.append(CutRecord(
             file_id=cut.file_id, src_in_ms=s, src_out_ms=e, kind=cut.kind,
             word_span=cut.word_span, atom_ids=cut.atom_ids, label=cut.label, summary=cut.summary,
@@ -865,6 +907,8 @@ def assemble_cut_records(
             screen_text=cut.screen_text, salience=salience,
             voice_ids=cut.voice_ids, speaker_person=cut.speaker_person,
             visible_persons=cut.visible_persons,
+            audio_file_id=audio_file_id, audio_offset_ms=audio_offset_ms,
+            audio_align_confidence=audio_align_confidence,
         ))
     _enforce_take_winner(out)
     return out
