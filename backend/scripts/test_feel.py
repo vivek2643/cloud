@@ -62,8 +62,8 @@ def test_same_speaker_jump_cut_risk():
         _seg("b", "f1", 3000, 6000, content="and one more thing", ref="f1:m01"),
         _seg("c", "f2", 6000, 9000, content="different person now", ref="f2:m00"),
     ]
-    meta = {"f1:m00": {"speaker": "S0"}, "f1:m01": {"speaker": "S0"},
-            "f2:m00": {"speaker": "S1"}}
+    meta = {"f1:m00": {"speaker_person": "P0"}, "f1:m01": {"speaker_person": "P0"},
+            "f2:m00": {"speaker_person": "P1"}}
     r = feel.simulate(tl, meta_by_ref=meta)
     txt = r.narrate().lower()
     assert "jump-cut risk" in txt and "1-2" in txt, txt

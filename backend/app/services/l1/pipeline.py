@@ -503,10 +503,11 @@ def _stage6_diarization(file_id: str, wav_path: str, conn: psycopg.Connection) -
             w["speaker"] = spk
 
     conn.execute(
-        "update transcripts set segments = %s::jsonb where file_id = %s",
-        (json.dumps(segments), file_id),
+        "update transcripts set segments = %s::jsonb, speaker_embeddings = %s::jsonb where file_id = %s",
+        (json.dumps(segments), json.dumps(result.embedding_by_speaker), file_id),
     )
-    logger.info("Diarization: %s -> %d speaker(s)", file_id, result.num_speakers)
+    logger.info("Diarization: %s -> %d speaker(s), %d voiceprint(s)",
+               file_id, result.num_speakers, len(result.embedding_by_speaker))
 
 
 # --- Stage 7: dialogue cut-cost grid (derived; cheap, CPU-only) -----------

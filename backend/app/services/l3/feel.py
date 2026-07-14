@@ -121,7 +121,7 @@ def simulate(
             words=words,
             pace_wps=pace,
             is_speech=is_speech,
-            speaker=meta.get("speaker"),
+            speaker=meta.get("speaker_person"),
             channel=meta.get("channel") or ("said" if is_speech else None),
             energy=0.0,  # filled below (needs the whole set for normalisation)
         ))

@@ -140,18 +140,19 @@ def test_map_text_lists_variants_no_atoms():
 
 def test_moment_line_flags_offcamera():
     """The brain's one-line index keys on CHANNEL.SUBJECT; an off-camera voice
-    (an off-screen interviewer / voiceover) renders an honest PIC:? -- never a
-    fabricated face -- while SND still names who is heard."""
+    (an off-screen interviewer / voiceover -- never visually confirmed, so
+    face clustering never saw them and the voice stayed unbound) renders an
+    honest PIC:? -- never a fabricated face -- and SND:OFF-CAM with no id,
+    never a guessed name."""
     cut = _cut("f:mo", 1000, 4000, "what made you start this", channel="said",
-               subject="person", speaker="interviewer", score=0.7,
+               subject="person", score=0.7,
                ladder=[_rung("balanced", 1000, 4000, "what made you start this", 0.7)],
-               flags=["offscreen"],
-               people=[{"voice_speaker_id": "S9", "person_id": None, "on_camera": False}])
+               flags=["offscreen"], voice_ids=["V9"], speaker_person=None, visible_persons=[])
     tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
     line = fm._moment_line(tree["moments"][0])
     assert "said.person" in line, line
     assert "PIC:?" in line, line
-    assert "SND:interviewer speaking" in line, line
+    assert "SND:OFF-CAM speaking" in line, line
     print("ok  test_moment_line_flags_offcamera")
 
 
@@ -200,21 +201,19 @@ def test_source_contiguous_beats_form_a_run_channel_agnostic():
 
 
 def test_reconciled_shows_face_and_cam_override():
-    """With the shoot cast (oncam map) supplied, PIC reports WHOSE FACE shows in
-    the clip -- from the reconciled cast, right even when the per-moment flag
-    disagrees (a clip whose A/V link was wrong) -- and SND names who's heard.
-    PIC leads the line; SND trails it."""
-    # Speaker G2 (voice S1) talks, but this clip SHOWS G1's face (off-cam speaker).
+    """PIC reports WHOSE FACE is visible in the clip (per-cut-occurrence face
+    clustering, voice_first_identity.plan.md Phase D) -- and SND names who's
+    heard, tagged OFF-CAM when the speaking voice's bound person isn't the
+    one shown here (the listener-camera case: P1 talks, but this clip shows
+    P0). PIC leads the line; SND trails it."""
     cut = _cut("48c93cef:m03", 1000, 4000, "and then we shipped it", channel="said",
-               subject="person", speaker="S1", score=0.6,
+               subject="person", score=0.6,
                ladder=[_rung("balanced", 1000, 4000, "and then we shipped it", 0.6)],
-               people=[{"voice_speaker_id": "S1", "person_id": None, "on_camera": True}])
+               voice_ids=["V1"], speaker_person="P1", visible_persons=["P0"], on_camera=False)
     tree = fm.build_clip_tree("48c93cef-aaa", {"name": "T", "duration_ms": 8000}, [cut])
-    alias = {("48c93cef-aaa", "S1"): "G2"}
-    oncam = {"48c93cef-aaa": "G1"}                       # this clip shows G1's face
-    line = fm._moment_line(tree["moments"][0], alias=alias, oncam=oncam)
-    assert "PIC:G1" in line, line              # reconciled shown-face overrides the flag
-    assert "SND:G2 speaking" in line, line
+    line = fm._moment_line(tree["moments"][0])
+    assert "PIC:P0" in line, line
+    assert "SND:P1 OFF-CAM speaking" in line, line
     assert line.index("PIC:") < line.index("SND:"), line  # picture leads, never the speaker
     print("ok  test_reconciled_shows_face_and_cam_override")
 
@@ -226,23 +225,22 @@ def test_said_beat_on_listener_camera_reads_pic_first_with_alt_pic():
     camera that DOES show the speaker for the same words (Fact #2 folded onto
     the beat, not buried in a distant coverage block)."""
     cut = _cut("48c93cef:m24", 1000, 4000, "that freedom he gave you", channel="said",
-               subject="person", speaker="S2", score=0.6,
+               subject="person", score=0.6,
                ladder=[_rung("balanced", 1000, 4000, "that freedom he gave you", 0.6)],
-               people=[{"voice_speaker_id": "S2", "person_id": None, "on_camera": True}],
+               voice_ids=["V2"], speaker_person="P2", visible_persons=["P1"], on_camera=False,
                framing="med")
     tree = fm.build_clip_tree("48c93cef-aaa", {"name": "Cam A", "duration_ms": 8000}, [cut])
     m = tree["moments"][0]
     # Folded on by `_annotate_dups` in the real path; set directly here to test
     # the render in isolation (mirrors how `_dups_block` fixtures worked before).
-    m["alt_pic"] = [{"moment_id": "1aedb093:m13", "file": "1aedb093-bbb", "voice": "S9",
+    m["alt_pic"] = [{"moment_id": "1aedb093:m13", "file": "1aedb093-bbb",
+                     "visible_persons": ["P2"], "speaker_person": "P2",
                      "framing": "med", "score": 0.73, "restart": False}]
-    alias = {("48c93cef-aaa", "S2"): "G2", ("1aedb093-bbb", "S9"): "G2"}
-    oncam = {"48c93cef-aaa": "G1", "1aedb093-bbb": "G2"}   # cam A shows the LISTENER G1
-    line = fm._moment_line(m, alias=alias, oncam=oncam)
-    assert "PIC:G1" in line, line
-    assert "SND:G2 speaking" in line, line
+    line = fm._moment_line(m)
+    assert "PIC:P1" in line, line
+    assert "SND:P2 OFF-CAM speaking" in line, line
     assert line.index("PIC:") < line.index("SND:"), line
-    assert "·alt-PIC:G2→1aedb093:m13" in line, line
+    assert "·alt-PIC:P2→1aedb093:m13" in line, line
     print("ok  test_said_beat_on_listener_camera_reads_pic_first_with_alt_pic")
 
 
@@ -262,9 +260,9 @@ def test_done_beat_pic_first_parity_and_snd_silence():
     """`done`/`shown` beats render the SAME PIC/SND shape as `said` -- equal
     citizens, not visually subordinate -- and a silent reaction reads SND:silence."""
     cut = _cut("f:d0", 1000, 3000, "nods, reacts", channel="done", subject="person",
-               speaker=None, score=0.9, audio="silent", mute=False,
+               score=0.9, audio="silent", mute=False,
                ladder=[_rung("balanced", 1000, 3000, "nods, reacts", 0.9)],
-               people=[{"person_id": "G1", "on_camera": True}], framing="med")
+               visible_persons=["G1"], framing="med")
     tree = fm.build_clip_tree("1e529bed-aaa", {"name": "T", "duration_ms": 8000}, [cut])
     line = fm._moment_line(tree["moments"][0])
     assert "PIC:G1" in line, line
@@ -273,23 +271,19 @@ def test_done_beat_pic_first_parity_and_snd_silence():
     print("ok  test_done_beat_pic_first_parity_and_snd_silence")
 
 
-def test_speaker_resolves_from_raw_handle_not_label():
-    """The speaker id gap: a said cut's `speaker` is a human LABEL ('main subject')
-    the registry can't match; the raw voice id lives in `people`. Resolution must
-    key on the RAW handle so every line names its shoot-wide person -- else every
-    speech line falls back to a role label and the brain can't match speaker to
-    camera. Without a registry it still reads the label, never the bare id."""
-    cut = _cut("48c93cef:m00", 1000, 4000, "we shipped it", speaker="main subject",
+def test_speaker_person_renders_on_cam_when_shown():
+    """A speaking voice bound to a person who IS visible in this cut renders
+    SND:<person> ON-CAM -- the straightforward, common case (voice_first_
+    identity.plan.md Phase F/G: voice->person binding + visible_persons both
+    resolve to the same id here)."""
+    cut = _cut("48c93cef:m00", 1000, 4000, "we shipped it",
                score=0.7, ladder=[_rung("balanced", 1000, 4000, "we shipped it", 0.7)],
-               people=[{"voice_speaker_id": "S0", "person_id": "p1", "on_camera": True}])
+               voice_ids=["V0"], speaker_person="P1", visible_persons=["P1"], on_camera=True)
     tree = fm.build_clip_tree("48c93cef-aaa", {"name": "T", "duration_ms": 8000}, [cut])
-    m = tree["moments"][0]
-    line = fm._moment_line(m, alias={("48c93cef-aaa", "S0"): "G2"})
-    assert "SND:G2 speaking" in line, line        # resolved off the raw voice handle
-    assert "main subject" not in line, line       # not the unresolvable label
-    plain = fm._moment_line(m)                     # no registry -> readable label
-    assert "SND:main subject speaking" in plain, plain
-    print("ok  test_speaker_resolves_from_raw_handle_not_label")
+    line = fm._moment_line(tree["moments"][0])
+    assert "SND:P1 ON-CAM speaking" in line, line
+    assert "PIC:P1" in line, line
+    print("ok  test_speaker_person_renders_on_cam_when_shown")
 
 
 def test_annotate_dups_reads_take_group_id():
@@ -411,18 +405,6 @@ def test_take_group_excludes_junk_member():
     print("ok  test_take_group_excludes_junk_member")
 
 
-def test_moment_line_aliases_global_speaker():
-    """A per-line speaker is shown as its global person id when the registry
-    linked it; without the alias it falls back to the raw voice."""
-    cut = _cut("f:g", 1000, 4000, "hello there", speaker="S0", score=0.6,
-               ladder=[_rung("balanced", 1000, 4000, "hello there", 0.6)])
-    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
-    m = tree["moments"][0]
-    assert "SND:G3 speaking" in fm._moment_line(m, alias={("ffffffff-1111", "S0"): "G3"})
-    assert "SND:S0 speaking" in fm._moment_line(m)         # no alias -> raw voice
-    print("ok  test_moment_line_aliases_global_speaker")
-
-
 # --------------------------------------------------------------------------
 # peak tag (interactive_ask_and_salience.plan.md WS2): `peak:+X.Xs`, the
 # offset of post._salience's peak_ms into the cut -- rendered only when
@@ -474,6 +456,25 @@ def test_peak_tag_absent_when_pinned_to_the_end():
     print("ok  test_peak_tag_absent_when_pinned_to_the_end")
 
 
+def test_cast_line_lists_majors_with_voices_and_others_by_id():
+    persons = [
+        {"person_id": "P0", "display": "bald man, beard", "is_major": True, "owned_voices": ["V0"]},
+        {"person_id": "P1", "display": "woman, long hair", "is_major": True, "owned_voices": []},
+        {"person_id": "P2", "display": "background extra", "is_major": False, "owned_voices": []},
+    ]
+    line = fm._cast_line(persons)
+    assert line.startswith("CAST: "), line
+    assert "P0 (bald man, beard) [voice:V0]" in line, line
+    assert "P1 (woman, long hair)" in line and "[voice:" not in line.split("P1")[1].split(";")[0], line
+    assert "other: P2" in line, line
+    print("ok  test_cast_line_lists_majors_with_voices_and_others_by_id")
+
+
+def test_cast_line_empty_with_no_persons():
+    assert fm._cast_line([]) == ""
+    print("ok  test_cast_line_empty_with_no_persons")
+
+
 def test_default_energy_from_genre():
     """The tree opens the slider per genre: long-form calm, short-form punchy."""
     calm = fm.build_clip_tree("ffffffff-2222",
@@ -499,7 +500,7 @@ def main():
     test_said_beat_on_listener_camera_reads_pic_first_with_alt_pic()
     test_alt_pic_absent_without_co_occurrence()
     test_done_beat_pic_first_parity_and_snd_silence()
-    test_speaker_resolves_from_raw_handle_not_label()
+    test_speaker_person_renders_on_cam_when_shown()
     test_annotate_dups_reads_take_group_id()
     test_junk_moment_renders_terse_line_not_the_rich_one()
     test_junk_moment_still_resolves_in_map_index()
@@ -507,13 +508,14 @@ def main():
     test_first_cut_has_no_prev_weld_mark()
     test_cut_with_no_continuity_block_has_no_continuity_tag()
     test_take_group_excludes_junk_member()
-    test_moment_line_aliases_global_speaker()
     test_peak_tag_renders_for_an_interior_peak()
     test_peak_tag_absent_when_salience_missing()
     test_peak_tag_absent_on_no_signal_fallback()
     test_peak_tag_absent_when_pinned_to_the_start()
     test_peak_tag_absent_when_pinned_to_the_end()
     test_source_contiguous_beats_form_a_run_channel_agnostic()
+    test_cast_line_lists_majors_with_voices_and_others_by_id()
+    test_cast_line_empty_with_no_persons()
     test_default_energy_from_genre()
     print("\nall footage-map tests passed")
 

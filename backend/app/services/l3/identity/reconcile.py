@@ -1,15 +1,29 @@
 """
-Cross-file person unification (identity_map.plan.md Phase 2): each camera
-frames (assumed) one person; this module fingerprints that person from the
-LLM's structured `appearance` categories, clusters cameras whose
-fingerprints genuinely agree into one `person_id`, and composes the
-`oncam`/`alias` maps `footage_map.py` renders into the brain's index.
+Cross-cut person unification (voice_first_identity.plan.md Phase D,
+superseding identity_map.plan.md Phase 2's per-FILE fingerprinting): each
+PERSON-OCCURRENCE -- one visible-person entry within one cut's `people[]`
+list -- is fingerprinted from the LLM's structured `appearance` categories
+and clustered into global `person_id`s by the SAME deterministic zero-
+disagreement matching identity_map.plan.md always used, just fed
+occurrences instead of whole files. This drops the "one camera frames one
+person" assumption entirely: a single cut showing two people now clusters
+each of them independently, and BOTH resolve to real global persons.
 
 Deterministic matching over LLM-authored categorical data -- code owns the
-clustering/assignment, the LLM only ever describes what it sees (Phase 0).
-Never forced: a camera whose fingerprint is too sparse or that disagrees
-with everyone stays its own person (over-splitting is the safe failure
-mode, not a wrong merge -- see the plan's "Known 1%").
+clustering/ranking, the LLM only ever describes what it sees (pass 2's
+`people`/`appearance`). Never forced: an occurrence whose fingerprint is too
+sparse or that disagrees with everyone stays its own person (over-splitting
+is the safe failure mode, not a wrong merge -- see identity_map.plan.md's
+"Known 1%", carried over unchanged).
+
+Every resulting person is ranked by PROMINENCE (how often they appear,
+whether they co-occur with speech, how large the cut's framing tends to be)
+and the top few are the shoot's "majors" -- named, described persons the
+cast table lists. Everyone else is still a real, distinct global id (an
+"other"), just not cast-table-worthy. A single cut with too many
+simultaneous people (a crowd shot) is excluded from clustering entirely --
+no basis to tell individuals apart occurrence by occurrence, and forcing an
+id per face there would be noise, not signal.
 """
 from __future__ import annotations
 
@@ -22,16 +36,47 @@ STABLE_FIELDS = (
 )
 # A merge needs at least this many fields where BOTH sides actually have
 # evidence (not just zero disagreement on nothing) -- otherwise two totally
-# undescribed cameras would trivially "match" on emptiness.
+# undescribed occurrences would trivially "match" on emptiness.
 MIN_SHARED_FIELDS = 3
+# A cut with more than this many simultaneously visible people is a CROWD --
+# no basis to tell individuals apart occurrence by occurrence, so none of
+# them are clustered or assigned a person id (identity_map.plan.md's "never
+# fabricate" stance, extended to crowds).
+CROWD_SIZE = 6
+# The shoot's "majors" (named cast-table entries, ranked by prominence);
+# everyone else is still a real, distinct person -- just an anonymous
+# "other" in the cast table, not a headline member.
+MAX_MAJORS = 3
+
+# (file_id, source_ref, person_index within that cut's people[] list) --
+# uniquely identifies one visible-person sighting.
+OccurrenceKey = Tuple[str, str, int]
+
+
+@dataclass
+class Occurrence:
+    """One visible-person sighting: a `PersonLook` entry inside one cut,
+    plus just enough cut-level context (does this cut carry speech, how big
+    was its subject framing) for the prominence ranking below. Built by
+    `identity/apply.py` from the project's `Pass2Cut`s -- this module stays
+    decoupled from the `pass2` schema on purpose (same pattern `bind.py`/
+    the old `reconcile.py` already used)."""
+    file_id: str
+    source_ref: str
+    person_index: int
+    appearance: Dict[str, Any]
+    description: str
+    is_speech_cut: bool
+    subject_box_area: Optional[float]   # None when the cut had no subject_box
 
 
 def build_fingerprint(appearances: List[dict]) -> Dict[str, str]:
-    """Majority vote per stable field across every `appearance` dict
-    collected for one file (one per person-occurrence across its cuts).
+    """Majority vote per stable field across the given `appearance` dicts.
     `None`/`"unsure"` never vote. A tie for most-common value leaves that
-    field unset (no clear majority, per the plan) rather than picking
-    arbitrarily."""
+    field unset (no clear majority) rather than picking arbitrarily. Used
+    both for a single occurrence (a list of length 1 -- majority vote over
+    one item just keeps whatever's set, cleaned of unsure/None) and, if a
+    caller ever wants it, an aggregate over several."""
     fp: Dict[str, str] = {}
     for f in STABLE_FIELDS:
         counts: Dict[str, int] = {}
@@ -65,22 +110,24 @@ def _distance(a: Dict[str, str], b: Dict[str, str]) -> Tuple[int, int]:
     return disagree, shared
 
 
-def cluster_files(
-    fingerprints: Dict[str, Dict[str, str]], min_shared: int = MIN_SHARED_FIELDS,
-) -> Dict[str, str]:
-    """`file_id -> person_id` via union-find over pairwise zero-disagreement,
-    enough-shared-evidence merges (deterministic agglomeration, Phase 2b).
-    `person_id`s are assigned `P0, P1, ...` ordered by each cluster's
-    minimum `file_id` -- stable across re-runs of the same file set."""
-    parent: Dict[str, str] = {fid: fid for fid in fingerprints}
+def cluster_occurrences(
+    fingerprints: Dict[OccurrenceKey, Dict[str, str]], min_shared: int = MIN_SHARED_FIELDS,
+) -> Dict[OccurrenceKey, str]:
+    """`occurrence_key -> person_id` via union-find over pairwise zero-
+    disagreement, enough-shared-evidence merges -- the SAME deterministic
+    agglomeration `identity_map.plan.md` always used, just fed occurrences
+    instead of whole files. `person_id`s are assigned `P0, P1, ...` ordered
+    by each cluster's minimum occurrence key, stable across re-runs of the
+    same cuts."""
+    parent: Dict[OccurrenceKey, OccurrenceKey] = {k: k for k in fingerprints}
 
-    def find(x: str) -> str:
+    def find(x: OccurrenceKey) -> OccurrenceKey:
         while parent[x] != x:
             parent[x] = parent[parent[x]]
             x = parent[x]
         return x
 
-    def union(a: str, b: str) -> None:
+    def union(a: OccurrenceKey, b: OccurrenceKey) -> None:
         ra, rb = find(a), find(b)
         if ra == rb:
             return
@@ -90,25 +137,25 @@ def cluster_files(
         else:
             parent[ra] = rb
 
-    ids = sorted(fingerprints.keys())
-    for i in range(len(ids)):
-        for j in range(i + 1, len(ids)):
-            a, b = ids[i], ids[j]
+    keys = sorted(fingerprints.keys())
+    for i in range(len(keys)):
+        for j in range(i + 1, len(keys)):
+            a, b = keys[i], keys[j]
             disagree, shared = _distance(fingerprints[a], fingerprints[b])
             if disagree == 0 and shared >= min_shared:
                 union(a, b)
 
-    clusters: Dict[str, List[str]] = {}
-    for fid in ids:
-        clusters.setdefault(find(fid), []).append(fid)
+    clusters: Dict[OccurrenceKey, List[OccurrenceKey]] = {}
+    for k in keys:
+        clusters.setdefault(find(k), []).append(k)
 
     ordered_roots = sorted(clusters.keys(), key=lambda r: min(clusters[r]))
-    file_person: Dict[str, str] = {}
+    occurrence_person: Dict[OccurrenceKey, str] = {}
     for i, root in enumerate(ordered_roots):
         pid = f"P{i}"
-        for fid in clusters[root]:
-            file_person[fid] = pid
-    return file_person
+        for k in clusters[root]:
+            occurrence_person[k] = pid
+    return occurrence_person
 
 
 @dataclass
@@ -117,92 +164,108 @@ class Person:
     display: str
     fingerprint: Dict[str, str] = field(default_factory=dict)
     file_ids: List[str] = field(default_factory=list)
+    appearance_count: int = 0
+    is_major: bool = False
+    # Filled later by identity/apply.py (Phase F/G), once voice->person
+    # binding (identity/speaker_pass.py) has resolved which voice(s), if
+    # any, this person was confirmed speaking. Empty here -- Phase D never
+    # touches voices at all.
+    owned_voices: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "person_id": self.person_id, "display": self.display,
             "fingerprint": self.fingerprint, "file_ids": self.file_ids,
+            "appearance_count": self.appearance_count, "is_major": self.is_major,
+            "owned_voices": self.owned_voices,
         }
 
 
-def build_persons(
-    file_person: Dict[str, str],
-    fingerprints: Dict[str, Dict[str, str]],
-    descriptions_by_file: Dict[str, List[str]],
-) -> Dict[str, Person]:
+def _prominence_key(agg: Dict[str, Any]) -> Tuple[int, int, float]:
+    """(appearance_count, speech_presence_count, avg_subject_box_area),
+    descending -- the plan's own three prominence signals, as a sort key. A
+    person who appears often, alongside speech, in a prominent framing is a
+    "major"; a background/incidental appearance is not."""
+    areas = agg["subject_box_areas"]
+    avg_area = sum(areas) / len(areas) if areas else 0.0
+    return (agg["appearance_count"], agg["speech_presence_count"], avg_area)
+
+
+def build_persons(occurrence_person: Dict[OccurrenceKey, str], occurrences: List[Occurrence]) -> Dict[str, Person]:
     """One `Person` per cluster: display label = the longest raw
-    `description` prose seen across the cluster's files (display only,
-    never an identity claim -- the plan's own framing); fingerprint =
-    the union of the member files' own fields (no conflicts possible,
-    clustering already required zero disagreement)."""
-    by_person: Dict[str, List[str]] = {}
-    for fid, pid in file_person.items():
-        by_person.setdefault(pid, []).append(fid)
+    `description` prose seen across the cluster's occurrences (display
+    only, never an identity claim); fingerprint = the union of the member
+    occurrences' own fields (no conflicts possible, clustering already
+    required zero disagreement). Ranks the top `MAX_MAJORS` clusters by
+    prominence and marks them `is_major=True`, in place on the returned
+    dict."""
+    by_key: Dict[OccurrenceKey, Occurrence] = {
+        (occ.file_id, occ.source_ref, occ.person_index): occ for occ in occurrences
+    }
+    agg_by_person: Dict[str, Dict[str, Any]] = {}
+    for key, pid in occurrence_person.items():
+        occ = by_key[key]
+        agg = agg_by_person.setdefault(pid, {
+            "file_ids": set(), "descriptions": [], "fingerprints": [],
+            "appearance_count": 0, "speech_presence_count": 0, "subject_box_areas": [],
+        })
+        agg["file_ids"].add(occ.file_id)
+        if occ.description:
+            agg["descriptions"].append(occ.description)
+        agg["fingerprints"].append(build_fingerprint([occ.appearance]))
+        agg["appearance_count"] += 1
+        if occ.is_speech_cut:
+            agg["speech_presence_count"] += 1
+        if occ.subject_box_area is not None:
+            agg["subject_box_areas"].append(occ.subject_box_area)
 
     persons: Dict[str, Person] = {}
-    for pid, fids in by_person.items():
-        descs = [d for fid in fids for d in descriptions_by_file.get(fid, []) if d]
-        display = max(descs, key=len) if descs else pid
+    for pid, agg in agg_by_person.items():
+        display = max(agg["descriptions"], key=len) if agg["descriptions"] else pid
         merged_fp: Dict[str, str] = {}
-        for fid in fids:
-            for k, v in fingerprints.get(fid, {}).items():
+        for fp in agg["fingerprints"]:
+            for k, v in fp.items():
                 merged_fp.setdefault(k, v)
-        persons[pid] = Person(person_id=pid, display=display, fingerprint=merged_fp, file_ids=sorted(fids))
+        persons[pid] = Person(person_id=pid, display=display, fingerprint=merged_fp,
+                              file_ids=sorted(agg["file_ids"]), appearance_count=agg["appearance_count"])
+
+    ranked = sorted(agg_by_person.keys(), key=lambda pid: _prominence_key(agg_by_person[pid]), reverse=True)
+    for pid in ranked[:MAX_MAJORS]:
+        persons[pid].is_major = True
     return persons
 
 
-def compose_maps(
-    file_person: Dict[str, str],
-    persons: Dict[str, Person],
-    bound_voice_by_file: Dict[str, Optional[str]],
-    groups: Dict[str, Dict[str, Any]],
-) -> Tuple[Dict[str, str], Dict[Tuple[str, str], str]]:
-    """(oncam, alias) -- Phase 2c. `oncam[file_id]` = the display name of
-    whoever that camera's picture shows. `alias[(file_id, voice)]` = the
-    display name behind a voice AS HEARD ON that file: a file's own bound
-    voice resolves directly; another voice heard in the same outlook group
-    resolves via whichever OTHER member is bound to it (the group's cameras
-    collectively cover every voice in the moment). A voice with no
-    resolvable person anywhere is simply absent (stays unresolved, same as
-    today)."""
-    oncam = {fid: persons[pid].display for fid, pid in file_person.items() if pid in persons}
-
-    alias: Dict[Tuple[str, str], str] = {}
-    for fid, voice in bound_voice_by_file.items():
-        if voice and fid in file_person:
-            alias[(fid, voice)] = persons[file_person[fid]].display
-
-    for grp in groups.values():
-        members = list(grp["members"])
-        for fid in members:
-            for other_fid in members:
-                if other_fid == fid:
-                    continue
-                other_voice = bound_voice_by_file.get(other_fid)
-                if other_voice and other_fid in file_person:
-                    alias.setdefault((fid, other_voice), persons[file_person[other_fid]].display)
-
-    return oncam, alias
+def visible_persons_by_cut(occurrence_person: Dict[OccurrenceKey, str]) -> Dict[Tuple[str, str], List[str]]:
+    """(file_id, source_ref) -> sorted, distinct global person ids visible
+    in that cut -- replaces the old one-person-per-FILE `oncam` map with a
+    per-CUT set, since a cut can now show several people at once."""
+    out: Dict[Tuple[str, str], set] = {}
+    for (fid, ref, _idx), pid in occurrence_person.items():
+        out.setdefault((fid, ref), set()).add(pid)
+    return {k: sorted(v) for k, v in out.items()}
 
 
-def reconcile(
-    appearances_by_file: Dict[str, List[dict]],
-    descriptions_by_file: Dict[str, List[str]],
-    bound_voice_by_file: Dict[str, Optional[str]],
-    groups: Dict[str, Dict[str, Any]],
-) -> Dict[str, Any]:
-    """The whole Phase 2 pipeline: fingerprint -> cluster -> compose. Returns
-    the persisted-shape payload's `persons`/`file_person` pieces plus the
-    derived `oncam`/`alias` maps (as a `{file_id: voice}`-keyed dict for
-    `alias`, since jsonb can't key on tuples -- `identity/apply.py`/
-    `footage_map.py` handle the `"file_id|voice"` string encoding)."""
-    fingerprints = {fid: build_fingerprint(apps) for fid, apps in appearances_by_file.items()}
-    file_person = cluster_files(fingerprints)
-    persons = build_persons(file_person, fingerprints, descriptions_by_file)
-    oncam, alias = compose_maps(file_person, persons, bound_voice_by_file, groups)
+def reconcile(occurrences: List[Occurrence]) -> Dict[str, Any]:
+    """The whole Phase D pipeline: crowd-exclude -> fingerprint -> cluster
+    -> rank majors -> compose per-cut visible_persons. Returns
+    ``{"persons": [Person.to_dict(), ...], "visible_persons":
+    {(file_id, source_ref): [person_id, ...]}}``. An occurrence in a crowd
+    cut (more than `CROWD_SIZE` simultaneous people) is dropped before
+    fingerprinting -- it never becomes a person and never appears in
+    `visible_persons` for that cut."""
+    by_cut: Dict[Tuple[str, str], List[Occurrence]] = {}
+    for occ in occurrences:
+        by_cut.setdefault((occ.file_id, occ.source_ref), []).append(occ)
+    kept = [occ for occs in by_cut.values() if len(occs) <= CROWD_SIZE for occ in occs]
+
+    fingerprints: Dict[OccurrenceKey, Dict[str, str]] = {
+        (occ.file_id, occ.source_ref, occ.person_index): build_fingerprint([occ.appearance])
+        for occ in kept
+    }
+    occurrence_person = cluster_occurrences(fingerprints)
+    persons = build_persons(occurrence_person, kept)
+    visible = visible_persons_by_cut(occurrence_person)
     return {
         "persons": [p.to_dict() for p in persons.values()],
-        "file_person": file_person,
-        "oncam": oncam,
-        "alias": alias,
+        "visible_persons": visible,
     }

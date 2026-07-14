@@ -374,9 +374,9 @@ def test_continuity_hard_break_on_speaker_change():
     lat = Lattice(file_id="f1", duration_ms=1000, words=words, turns=[], hints=[], atoms=[])
     p2 = Pass2Output(cuts=[
         Pass2Cut(source_ref="speech_cut[0]", kind="speech", file_id="f1", word_span=(0, 0),
-                label="a", summary="a", speaker="S0"),
+                label="a", summary="a", voice_ids=["V0"]),
         Pass2Cut(source_ref="speech_cut[1]", kind="speech", file_id="f1", word_span=(1, 1),
-                label="b", summary="b", speaker="S1"),
+                label="b", summary="b", voice_ids=["V1"]),
     ])
     records = post.assemble_cut_records(p2, {"f1": lat}, {"f1": {}}, {})
     first, second = records
@@ -397,9 +397,9 @@ def test_continuity_flagged_junk_suspect_in_the_gap_is_hard():
     lat = Lattice(file_id="f1", duration_ms=1500, words=words, turns=[], hints=[], atoms=[])
     p2 = Pass2Output(cuts=[
         Pass2Cut(source_ref="speech_cut[0]", kind="speech", file_id="f1", word_span=(0, 0),
-                label="a", summary="a", speaker="S0"),
+                label="a", summary="a", voice_ids=["V0"]),
         Pass2Cut(source_ref="speech_cut[1]", kind="speech", file_id="f1", word_span=(2, 2),
-                label="b", summary="b", speaker="S0"),
+                label="b", summary="b", voice_ids=["V0"]),
     ])
     suspects = [JunkSuspect(file_id="f1", word_span=(1, 1), reason="camera cue")]
     records = post.assemble_cut_records(p2, {"f1": lat}, {"f1": {}}, {}, junk_suspects=suspects)
@@ -607,7 +607,7 @@ def test_total_quality_blends_speech_and_video_is_visual_only():
 def _tg_rec(fid, s, e, role, tq):
     return post.CutRecord(
         file_id=fid, src_in_ms=s, src_out_ms=e, kind="speech", word_span=(0, 4),
-        atom_ids=None, label="line", summary="", speaker=None, on_camera=None,
+        atom_ids=None, label="line", summary="", on_camera=None,
         junk=False, junk_reason=None, framing={}, look={}, caption_zones=[],
         hero_ts_ms=s, pace=None, take_group_id="tg1", take_role=role, channel="said",
         speech_quality=None, total_quality=tq)

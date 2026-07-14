@@ -43,6 +43,7 @@ from app.services.l3 import pass1
 from app.services.l3 import pass2
 from app.services.l3 import post
 from app.services.l3.identity import apply as identity_apply
+from app.services.l3.identity import voices as identity_voices
 from app.services.l3.lattice import Lattice
 from app.services.l3.sync import store as sync_store
 from app.services.l3.sync.lattice_merge import apply_outlook_groups, outlook_groups
@@ -89,6 +90,23 @@ def _load_signals(
         audio_by_file[fid] = {"rms_db": af.get("rms_db") or [], "hop_ms": af.get("prosody_hop_ms") or 0,
                               "onsets_ms": onsets_by_file.get(fid) or []}
     return motion_by_file, scene_by_file, silences_by_file, audio_by_file
+
+
+def _embeddings_for_files(file_ids: List[str]) -> Dict[str, Dict[str, List[float]]]:
+    """file_id -> {local_speaker: embedding} from L1 diarization's captured
+    voiceprints (voice_first_identity.plan.md Phase A) -- the cross-clip
+    identity spine identity/voices.assign_voices clusters on. A file with no
+    embeddings (diarization never ran, or the pyannote build in use
+    couldn't produce them) is simply absent -- its speakers fall back to
+    unclustered singleton voices, never a hard failure."""
+    if not file_ids:
+        return {}
+    with pass1._pg_conn() as conn:
+        rows = conn.execute(
+            "select file_id::text, speaker_embeddings from transcripts where file_id = any(%s::uuid[])",
+            (file_ids,),
+        ).fetchall()
+    return {fid: (embeddings or {}) for fid, embeddings in rows if embeddings}
 
 
 def _proxy_keys_for_files(file_ids: List[str]) -> Dict[str, str]:
@@ -176,6 +194,21 @@ def run_ingest(project_id: str) -> str:
         store.record_pass1_result(ingest_run_id, pass1_output.model_dump(), pass1_completion.usage,
                                   pass1_output.project_summary)
 
+        # Cross-clip voice clustering (voice_first_identity.plan.md Phase B),
+        # computed ONCE here -- after pass 1 (needs its word-level speaker_ids
+        # roster) but BEFORE pass 2 (whose to_pass2_cuts backfills voice_ids
+        # from this SAME map, so every batch agrees on one global voice
+        # identity). `turns_by_file` feeds identity/speaker_frames.py later;
+        # `groups` is the SAME outlook grouping the speech lattice merge
+        # already used, so voice identity and speech boundaries share one
+        # notion of "these cameras are one moment."
+        embeddings_by_file = _embeddings_for_files(file_ids)
+        all_speakers_by_file: Dict[str, List[str]] = {}
+        for sc in pass1_output.speech_cuts:
+            all_speakers_by_file.setdefault(sc.file_id, []).extend(sc.speaker_ids)
+        voice_of = identity_voices.assign_voices(embeddings_by_file, groups, all_speakers_by_file)
+        turns_by_file = {fid: lat.turns for fid, lat in lattices.items()}
+
         store.set_status(ingest_run_id, "images")
         planned_frames = ip.build_image_plan(pass1_output, lattices, motion_by_file, scene_by_file,
                                              silences_by_file)
@@ -232,7 +265,7 @@ def run_ingest(project_id: str) -> str:
                     # locators (word_span/atom_ids) are code-derived from pass 1,
                     # not echoed by the model -- see pass2.backfill_locators.
                     batch_output = pass2.backfill_locators(batch_output, pass1_output)
-                    all_cuts.extend(pass2.to_pass2_cuts(batch_output.cuts))
+                    all_cuts.extend(pass2.to_pass2_cuts(batch_output.cuts, pass1_output, voice_of))
         finally:
             if pass2_cache_name:
                 from app.services.llm import ingest_gemini as ig
@@ -248,16 +281,17 @@ def run_ingest(project_id: str) -> str:
         # assemble_cut_records call below).
         pass2_output = pass2.apply_take_groups(pass2_output, pass1_output)
 
-        # Cumulative identity map (identity_map.plan.md): reconcile WHO's
-        # talking (voice<->camera-motion binding, Phase 1) and WHO's shown
-        # (cross-file appearance clustering, Phase 2) once, deterministically,
-        # then rewrite on_camera from pass 2's per-still guess into a derived
-        # fact (Phase 3a). Must run before assemble_cut_records below --
-        # on_camera also feeds total_quality there, so the rewrite only
-        # counts if it lands first. `groups` is the SAME outlook grouping the
-        # speech lattice merge already used (line ~132), so binding and
-        # identity share one notion of "these cameras are one moment."
-        pass2_output, identity_map = identity_apply.run(pass2_output, lattices, motion_by_file, groups)
+        # Deterministic identity resolution (voice_first_identity.plan.md
+        # Phases D/E/F/G): cluster visible faces into persons, plan the
+        # close-burst frames that reveal who's speaking, run the small
+        # per-voice binding pass, then derive on/off-camera per cut. Must run
+        # before assemble_cut_records below -- on_camera also feeds
+        # total_quality there, so the rewrite only counts if it lands first.
+        # `voice_of`/`turns_by_file` are the SAME voice map/turns pass 2's
+        # own voice_ids backfill already used, so identity stays one
+        # consistent notion project-wide.
+        pass2_output, identity_map = identity_apply.run(
+            pass2_output, lattices, voice_of, turns_by_file, audio_by_file, motion_by_file, proxy_keys)
         if identity_map.get("persons"):
             store.set_identity_map(ingest_run_id, identity_map)
 

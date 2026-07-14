@@ -106,6 +106,7 @@ def _basic_patches(p, fake_store, file_rows):
     p.set(ingest, "build_l1_snapshot",
           lambda fid: {"motion_dynamics": {}, "scene_cuts": {}, "audio_features": {}})
     p.set(ingest, "_onsets_for_files", lambda file_ids: {})
+    p.set(ingest, "_embeddings_for_files", lambda file_ids: {})
     p.set(ingest.sync_store, "sync_groups_for_files", lambda file_ids: {})
     p.set(ingest.get_settings(), "ingest_pass2_provider", "anthropic")
     p.set(ingest.pass1, "run_pass1",

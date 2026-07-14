@@ -286,7 +286,12 @@ def build_clip_tree(
                 cut.get("summary")
                 and _overlaps_any(anchor["in_ms"], anchor["out_ms"], speech_spans)
             ),
-            "speaker": cut.get("speaker"),
+            # voice_first_identity.plan.md: code-derived identity facts,
+            # carried straight through (see cutrecord_map._to_cut_dict).
+            "voice_ids": cut.get("voice_ids") or [],
+            "speaker_person": cut.get("speaker_person"),
+            "visible_persons": cut.get("visible_persons") or [],
+            "on_camera": cut.get("on_camera"),
             "gist": cut.get("label") or "",
             "flags": cut.get("flags") or [],
             # Source-audio facet for video cuts: what's on the track ("speech"/
@@ -503,22 +508,17 @@ def _short_gist(s: str, max_words: int = 6) -> str:
     return " ".join(words[:max_words]) + "\u2026"
 
 
-def _pic_who(m: Dict[str, Any], handle: Optional[str],
-            alias: Optional[Dict[Any, str]], oncam: Optional[Dict[str, str]]) -> Optional[str]:
-    """WHO or WHAT is on screen for this beat (Fact #1's PICTURE half) -- the
-    reconciled shoot cast's shown face when known (right even where this clip's
-    own on-camera flag was wrong), else this moment's own on-camera person, else
-    the subject noun for a non-person capture (place/object/graphic). None when
-    genuinely unknown -- PIC never invents a face it isn't told about."""
-    shown, _ = _shown_and_cam(m.get("file_id"), handle, alias, oncam)
-    if shown:
-        return shown
-    for p in (m.get("people") or []):
-        if p.get("on_camera") is True:
-            return p.get("person_id") or p.get("voice_speaker_id")
+def _pic_who(m: Dict[str, Any]) -> Optional[str]:
+    """WHO or WHAT is on screen for this beat (Fact #1's PICTURE half) --
+    every global person id visible in this cut (identity/reconcile.py's
+    per-cut-occurrence face clustering, voice_first_identity.plan.md Phase
+    D), joined; else the subject noun for a non-person capture (place/
+    object/graphic). None when the picture is flagged offscreen (audio-only
+    -- a subject guess would be a fabricated face) or genuinely unknown."""
+    vis = m.get("visible_persons") or []
+    if vis:
+        return "+".join(vis)
     if "offscreen" in (m.get("flags") or []):
-        return None
-    if any(p.get("on_camera") is False for p in (m.get("people") or [])):
         return None
     return m.get("subject") or None
 
@@ -567,60 +567,6 @@ def _peak_tag(m: Dict[str, Any]) -> str:
     return f" peak:+{off_ms / 1000:.1f}s"
 
 
-def _speaker_handle(m: Dict[str, Any]) -> Optional[str]:
-    """The RAW, resolvable speaker handle for a said moment -- the diarized voice
-    id (else the VLM person id) that the shoot identity registry is keyed on.
-
-    Critical distinction: the moment's ``speaker`` field is a human DISPLAY LABEL
-    (role/person/voice, e.g. "main subject") produced by the cast map for reading;
-    it does NOT resolve to a global id. The raw id needed to alias a voice to its
-    shoot-wide person lives in the ``people`` facet. Resolving off the label was
-    the "speaker id gap" -- every speech line fell back to its role label and the
-    brain could never match a speaker to their camera. Falls back to the display
-    ``speaker`` for an unresolved cut that already kept its raw voice id there."""
-    for p in (m.get("people") or []):
-        h = p.get("voice_speaker_id") or p.get("person_id")
-        if h:
-            return h
-    return m.get("speaker")
-
-
-def _global_speaker(file_id: Optional[str], handle: Optional[str],
-                    alias: Optional[Dict[Any, str]],
-                    label: Optional[str] = None) -> Optional[str]:
-    """The shoot-wide person id (Gx) for a raw voice/person handle, when the
-    registry linked it across clips; else the human ``label`` (the moment's
-    display speaker) when given, else the handle itself. Never nothing when a
-    speaker exists."""
-    if not handle:
-        return label
-    if alias and file_id is not None:
-        gid = alias.get((file_id, handle))
-        if gid:
-            return gid
-    return label if label is not None else handle
-
-
-def _shown_and_cam(file_id: Optional[str], handle: Optional[str],
-                   alias: Optional[Dict[Any, str]],
-                   oncam: Optional[Dict[str, str]]) -> Tuple[Optional[str], str]:
-    """(global face on screen, on/off-cam) DERIVED from the reconciled cast: whose
-    FACE this clip shows, and whether the speaker is that person. This is the
-    trustworthy on-camera fact -- it survives a clip whose per-clip A/V sensor was
-    wrong -- so it OVERRIDES the per-moment on_camera flag when available. The
-    speaker is resolved STRICTLY (raw handle -> Gx); an unresolved speaker can't
-    be claimed on-camera. Returns (None, "") when the shoot cast doesn't know who
-    this clip shows."""
-    if not oncam or file_id is None:
-        return None, ""
-    shown = oncam.get(file_id)
-    if not shown:
-        return None, ""
-    spk = alias.get((file_id, handle)) if (alias and handle) else None
-    cam = "on-cam" if (spk and spk == shown) else "off-cam"
-    return shown, cam
-
-
 def _dur_tag(m: Dict[str, Any]) -> str:
     """The cut's PLAY length (after any breath/dead-air excision) so the brain
     can pace + honor a target length without arithmetic on the timestamps."""
@@ -634,12 +580,11 @@ def _qual(score: float) -> str:
     return f"q.{int(round(max(0.0, score) * 100)):02d}"
 
 
-def _pic_segment(m: Dict[str, Any], handle: Optional[str],
-                 alias: Optional[Dict[Any, str]], oncam: Optional[Dict[str, str]]) -> str:
+def _pic_segment(m: Dict[str, Any]) -> str:
     """PIC leads the beat line: whose face / what scene is on screen (never the
     speaker), + shot size + quality. '?' when genuinely unresolved -- never a
     guess dressed up as a fact."""
-    who = _pic_who(m, handle, alias, oncam) or "?"
+    who = _pic_who(m) or "?"
     bits = [b for b in (_framing_tag(m), _qual(float(m.get("score", 0.0)))) if b]
     return f"PIC:{who} ({', '.join(bits)})"
 
@@ -662,23 +607,31 @@ def _snd_state(m: Dict[str, Any]) -> str:
     return _AUDIO_STATE.get(m.get("audio"), "silence")
 
 
-def _snd_segment(m: Dict[str, Any], handle: Optional[str],
-                 alias: Optional[Dict[Any, str]]) -> str:
-    """SND: a co-equal peer of PIC -- who is heard (identity-resolved off the RAW
-    handle, not the display label -- the speaker-id gap) + the audio state."""
+def _snd_segment(m: Dict[str, Any]) -> str:
+    """SND: a co-equal peer of PIC -- who is heard + the audio state. `who` is
+    the global person id the voice->face binding pass bound this cut's speaking
+    voice to (voice_first_identity.plan.md Phase F), tagged ON-CAM/OFF-CAM
+    against this cut's OWN visible_persons (Phase D) -- deterministic, never
+    a per-still guess. A resolved VOICE with no confident person binding (the
+    expected narration/podcast-listener case) renders OFF-CAM with no id --
+    never forced to a face. No voice resolved at all (shouldn't happen for a
+    real speech beat, but never fabricated) renders no identity at all."""
     state = _snd_state(m)
     if m.get("channel") != "said":
         return f"SND:{state}"
-    gspk = _global_speaker(m.get("file_id"), handle, alias, label=m.get("speaker"))
-    who = f"{gspk} " if gspk else ""
-    return f"SND:{who}{state}"
+    spk = m.get("speaker_person")
+    if spk:
+        cam = "ON-CAM" if m.get("on_camera") else "OFF-CAM"
+        return f"SND:{spk} {cam} {state}"
+    if m.get("voice_ids"):
+        return f"SND:OFF-CAM {state}"
+    return f"SND:{state}"
 
 
-def _alt_pic_segment(m: Dict[str, Any], alias: Optional[Dict[Any, str]],
-                     oncam: Optional[Dict[str, str]]) -> str:
+def _alt_pic_segment(m: Dict[str, Any]) -> str:
     """Fact #2 folded onto the beat: every OTHER picture the SAME sound is also
     available as (this beat's cross-clip take-group members), each a neutral
-    `Gx→ref (shot, q)`. Never a verdict -- just where else this sound's picture
+    `Px→ref (shot, q)`. Never a verdict -- just where else this sound's picture
     lives. Absent when there is no co-occurrence (`_annotate_dups` sets no
     `alt_pic` in that case) or when no member resolves to a picture distinct
     from this beat's own.
@@ -696,12 +649,11 @@ def _alt_pic_segment(m: Dict[str, Any], alias: Optional[Dict[Any, str]],
     if not facts:
         return ""
     is_outlook = bool(m.get("outlook_group_id")) or m.get("take_role") == "outlook"
-    my_who = _pic_who(m, _speaker_handle(m), alias, oncam)
+    my_who = _pic_who(m)
     seen = set()
     parts: List[str] = []
     for f in facts:
-        shown, _ = _shown_and_cam(f.get("file"), f.get("voice"), alias, oncam)
-        who = shown or _global_speaker(f.get("file"), f.get("voice"), alias)
+        who = "+".join(f.get("visible_persons") or []) or f.get("speaker_person")
         if is_outlook:
             key = f.get("file")
             if not key or key in seen:
@@ -774,9 +726,7 @@ def _continuity_tag(m: Dict[str, Any]) -> str:
     return f" · {prev}cut:{cut_no}/{of}{nxt}"
 
 
-def _moment_line(m: Dict[str, Any], *, compact: bool = False,
-                 alias: Optional[Dict[Any, str]] = None,
-                 oncam: Optional[Dict[str, str]] = None) -> str:
+def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     # Junk stays IN the map (labeled), never dropped, so numbering/contiguity
     # stay honest and the brain can still place it as a deliberate bridge --
     # but it renders as a terse one-liner (id + reason + position + span) so
@@ -788,14 +738,10 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False,
                 f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])} {_dur_tag(m)}]")
     levels = list(m["variants"].keys())
     nrg = "|".join(L for L in _LEVEL_NAMES if L in levels)
-    # Resolve the speaker off the RAW handle (people facet), not the display
-    # label -- so every speech line names its shoot-wide person (Gx), not a
-    # role label the registry can't match.
-    handle = _speaker_handle(m)
     # PIC leads (what actually lands on screen); SND is a co-equal peer, never
     # the subject -- placing a beat can no longer read as "showing the speaker".
-    pic = _pic_segment(m, handle, alias, oncam)
-    snd = _snd_segment(m, handle, alias)
+    pic = _pic_segment(m)
+    snd = _snd_segment(m)
     gist = (m.get("gist") or "").strip().replace("\n", " ")
     # Resident mode gives the model the FULL line so it picks by reading, not
     # guessing; compact (paged) mode truncates and relies on inspect_moment.
@@ -828,15 +774,13 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False,
     # other angles (the outlook group's authoritative track), so picture choice
     # is entirely the brain's call and switching angles never jumps the audio.
     outlook_tag = f" outlook:{m['outlook_angle_count']}-angles" if m.get("outlook_angle_count") else ""
-    alt = _alt_pic_segment(m, alias, oncam)
+    alt = _alt_pic_segment(m)
     return (f"  {m['moment_id'].split(':')[-1]} {_capture_tag(m)} {pic} {snd} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])} {_dur_tag(m)}] "
             f"\"{gist}\"{gloss}{scr_tag} · nrg:{nrg}{pace_tag}{cam_tag}{peak_tag}{outlook_tag}{cut_tag}{run}{alt}")
 
 
-def _clip_block(tree: Dict[str, Any], *, compact: bool = False,
-                alias: Optional[Dict[Any, str]] = None,
-                oncam: Optional[Dict[str, str]] = None) -> str:
+def _clip_block(tree: Dict[str, Any], *, compact: bool = False) -> str:
     head_bits = [f"{tree['duration_ms'] // 1000}s"]
     if tree.get("content_type"):
         head_bits.append(tree["content_type"])
@@ -848,8 +792,7 @@ def _clip_block(tree: Dict[str, Any], *, compact: bool = False,
         head_bits.append("people:" + ",".join(tree["people"]))
     header = (f"CLIP {tree['file_id'][:8]} \"{tree['name']}\" · "
               + " · ".join(head_bits))
-    lines = [header] + [_moment_line(m, compact=compact, alias=alias, oncam=oncam)
-                        for m in tree["moments"]]
+    lines = [header] + [_moment_line(m, compact=compact) for m in tree["moments"]]
     return "\n".join(lines)
 
 
@@ -892,7 +835,8 @@ def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         member_facts = [{
             "moment_id": m["moment_id"],
             "file": m["file_id"],
-            "voice": _speaker_handle(m),
+            "visible_persons": m.get("visible_persons") or [],
+            "speaker_person": m.get("speaker_person"),
             "framing": _framing_tag(m),
             "score": float(m.get("score", 0.0)),
             # cuts-v3 has no restart concept at the take-group level (that's a
@@ -938,33 +882,44 @@ def _annotate_outlook_groups(trees: List[Dict[str, Any]]) -> None:
                 m["outlook_angle_count"] = len(angles)
 
 
-def _identity_maps_for(file_ids: List[str], run_id: Optional[str]) -> Tuple[Optional[Dict[str, str]], Optional[Dict[Any, str]]]:
-    """(oncam, alias) for the covering ingest run's reconciled cast
-    (identity_map.plan.md Phase 4), or (None, None) when there isn't one --
-    an older run, a run reconciliation found nothing to bind/cluster for, or
-    no covering run at all. `alias` keys are re-split from the persisted
-    ``"file_id|voice"`` string into the `(file_id, voice)` tuples
-    `_shown_and_cam`/`_pic_who` already expect. Fail-open: any lookup error
-    degrades to (None, None), i.e. today's behavior, never breaks the map."""
+def _cast_line(persons: List[Dict[str, Any]]) -> str:
+    """One line summarizing the project's reconciled cast (voice_first_
+    identity.plan.md Phase D/G): each MAJOR person's id + a short display
+    description + the voice(s) confirmed theirs; everyone else (a real,
+    distinct person -- just not cast-table-worthy) listed by id only under
+    "other". '' when nothing was reconciled."""
+    if not persons:
+        return ""
+    majors = [p for p in persons if p.get("is_major")]
+    others = [p for p in persons if not p.get("is_major")]
+    parts = []
+    for p in sorted(majors, key=lambda p: p["person_id"]):
+        voices = ",".join(p.get("owned_voices") or [])
+        vtag = f" [voice:{voices}]" if voices else ""
+        parts.append(f"{p['person_id']} ({_short_gist(p.get('display') or p['person_id'])}){vtag}")
+    if others:
+        parts.append("other: " + ", ".join(p["person_id"] for p in sorted(others, key=lambda p: p["person_id"])))
+    return "CAST: " + "; ".join(parts)
+
+
+def _cast_table_for(file_ids: List[str], run_id: Optional[str]) -> str:
+    """The project's reconciled cast, rendered ONCE (identity/apply.py's
+    persisted payload -- voice_first_identity.plan.md), or '' when there
+    isn't one: an older run, a run reconciliation found nothing to
+    cluster, or no covering run at all. Fail-open: any lookup error
+    degrades to '', never breaks the map."""
     try:
         from app.services.l3 import cuts_v3_read, ingest_store
         resolved_run_id = run_id or cuts_v3_read.latest_run_for_files(file_ids)
         if resolved_run_id is None:
-            return None, None
+            return ""
         identity_map = ingest_store.get_identity_map(resolved_run_id)
         if not identity_map:
-            return None, None
-        oncam = identity_map.get("oncam") or None
-        raw_alias = identity_map.get("alias") or {}
-        alias = {}
-        for key, display in raw_alias.items():
-            fid, _, voice = str(key).partition("|")
-            if fid and voice:
-                alias[(fid, voice)] = display
-        return oncam, (alias or None)
+            return ""
+        return _cast_line(identity_map.get("persons") or [])
     except Exception:
-        logger.exception("footage_map: identity_map lookup failed (continuing without it)")
-        return None, None
+        logger.exception("footage_map: cast table lookup failed (continuing without it)")
+        return ""
 
 
 def assemble_map(file_ids: List[str], *, compact: bool = False,
@@ -978,19 +933,20 @@ def assemble_map(file_ids: List[str], *, compact: bool = False,
     path; resident mode emits the full line. Moments are tagged in place with
     cross-clip duplicate links -- coverage reads INLINE on each beat as
     ``·alt-PIC`` (no separate coverage block: dedupe the information, not the
-    sequence). Speakers resolve through the covering run's reconciled cast
-    (identity_map.plan.md) when one exists -- ``PIC``/``alt-PIC`` then name
-    real persons instead of a raw per-clip diarized id; absent a reconciled
-    cast (older run, or nothing bindable/clusterable), behaves exactly as
-    before this feature existed.
+    sequence). ``PIC``/``SND`` read identity DIRECTLY off each cut's own
+    ``visible_persons``/``speaker_person`` (voice_first_identity.plan.md,
+    code-derived at ingest) -- a CAST line (majors + voice ownership) is
+    prefixed once when the covering run reconciled one; absent a reconciled
+    cast (older run, or nothing bindable/clusterable), PIC/SND simply carry
+    no identity, same as before this feature existed.
     """
     trees = get_trees(file_ids, run_id=run_id)
     ordered = [trees[fid] for fid in file_ids if fid in trees]
     dups = _annotate_dups(ordered)      # tags moments in `ordered` in place
     _annotate_outlook_groups(ordered)   # tags moments in `ordered` in place
-    oncam, alias = _identity_maps_for(file_ids, run_id)
-    text = "\n\n".join(_clip_block(t, compact=compact, alias=alias, oncam=oncam)
-                       for t in ordered)
+    cast = _cast_table_for(file_ids, run_id)
+    blocks = [_clip_block(t, compact=compact) for t in ordered]
+    text = "\n\n".join(([cast] if cast else []) + blocks)
     n_moments = sum(t["moment_count"] for t in ordered)
     return {
         "text": text,

@@ -206,6 +206,46 @@ def test_diarization_smooths_phantom_speaker_blips():
     print("ok: diarization folds phantom trailing/sandwiched blips, keeps real turns")
 
 
+def test_speaker_embeddings_maps_labels_and_drops_nan():
+    from app.services.l1 import diarization as dz
+
+    class _FakeAnnotation:
+        def labels(self):
+            return ["SPEAKER_00", "SPEAKER_01", "SPEAKER_02"]
+
+    def fake_pipe(wav_path, return_embeddings=False, **kwargs):
+        assert return_embeddings is True
+        return _FakeAnnotation(), [
+            [0.1, 0.2, 0.3],
+            [float("nan"), 0.5, 0.6],   # dropped -- NaN
+            [0.7, 0.8],
+        ]
+
+    annotation, by_label = dz._speaker_embeddings(fake_pipe, "x.wav", {})
+    assert isinstance(annotation, _FakeAnnotation)
+    assert by_label == {"SPEAKER_00": [0.1, 0.2, 0.3], "SPEAKER_02": [0.7, 0.8]}, by_label
+    print("ok: _speaker_embeddings maps pyannote labels to vectors, drops NaN")
+
+
+def test_speaker_embeddings_falls_back_on_typeerror():
+    from app.services.l1 import diarization as dz
+
+    class _FakeAnnotation:
+        def labels(self):
+            return []
+
+    def fake_pipe(wav_path, **kwargs):
+        # Simulates an older pyannote build that doesn't accept the kwarg.
+        if "return_embeddings" in kwargs:
+            raise TypeError("unexpected keyword argument 'return_embeddings'")
+        return _FakeAnnotation()
+
+    annotation, by_label = dz._speaker_embeddings(fake_pipe, "x.wav", {})
+    assert isinstance(annotation, _FakeAnnotation)
+    assert by_label == {}, by_label
+    print("ok: _speaker_embeddings falls back cleanly on an older pyannote build")
+
+
 def test_rejoin_trailing_fragment():
     # "...what actually" (unfinished) + a 0.5s "matters" tail after a ~700ms pause.
     words = [
@@ -236,6 +276,8 @@ def main():
     test_production_cue_survives_short_forward_merge()
     test_offscreen_loudness_flag()
     test_diarization_smooths_phantom_speaker_blips()
+    test_speaker_embeddings_maps_labels_and_drops_nan()
+    test_speaker_embeddings_falls_back_on_typeerror()
     test_rejoin_trailing_fragment()
     print("\nALL DIALOGUE SEGMENT TESTS PASSED")
 

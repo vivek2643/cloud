@@ -1234,7 +1234,7 @@ function CutCardV3({
       in_ms: inMs,
       out_ms: outMs,
       content: cut.label,
-      speaker: cut.speaker,
+      speaker: cut.speaker_person,
     });
     e.dataTransfer.setData("application/x-cut", payload);
     e.dataTransfer.setData("text/plain", payload);
@@ -1344,9 +1344,9 @@ function CutCardV3({
           {fmtDur(playedMs)}
         </span>
         <div className="absolute bottom-2 left-2 z-10 flex items-center gap-1">
-          {cut.speaker && (
+          {cut.speaker_person && (
             <span className="rounded bg-black/60 px-1.5 py-0.5 text-[11px] font-medium text-white">
-              {cut.speaker}
+              {cut.speaker_person}
             </span>
           )}
           {cut.on_camera != null && (

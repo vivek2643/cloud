@@ -1,131 +1,158 @@
 """
-Derive `on_camera`, persist the identity map (identity_map.plan.md Phase 3).
-Called from `ingest.run_ingest` after `pass2.*`, before `post.assemble_
-cut_records` -- `on_camera` also feeds `total_quality` there, so the
-rewrite must land before assembly for the derived fact to actually count.
+Deterministic identity resolution (voice_first_identity.plan.md, Phases D/E/F
+orchestrated -- Phase B's voice clustering runs earlier in `ingest.py`,
+before pass 2, since `pass2.to_pass2_cuts` needs the global voice map to
+backfill `voice_ids`; this module receives it as `voice_of`). Clusters
+visible faces into persons (identity/reconcile.py), plans the close-burst
+frames that reveal who's speaking (identity/speaker_frames.py), runs the
+small per-voice binding pass (identity/speaker_pass.py), then derives
+on/off-camera per cut and composes the persisted cast payload.
 
-The single entry point, `run(...)`, does the whole bind -> reconcile ->
-rewrite pipeline and returns `(new_pass2_output, persisted_payload)`. Never
-fabricates: a file with no confident binding keeps pass 2a's original
-per-still `on_camera` guess untouched.
+Supersedes the old motion-correlation bind (`identity/bind.py`, now
+deleted) entirely: "the person talking moves more" was a whole-frame
+proxy that broke on animated listeners / still talkers. This module never
+guesses a talker from motion -- it looks at actual mouth movement in
+close, loud, sharp, isolated frames.
+
+The single entry point, `run(...)`, does the whole pipeline and returns
+`(new_pass2_output, persisted_payload)`. Never fabricates: a voice with no
+confident binding leaves its speech cuts' `speaker_person`/`on_camera`
+unset (owner unknown), never forced to a guess.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Set
+import logging
+from typing import Any, Dict, List, Optional, Tuple
 
-from app.services.l3.identity.bind import Binding, bind_file, bind_outlook_group
-from app.services.l3.identity.reconcile import reconcile
+from app.services.l3 import frames as fr
+from app.services.l3.identity import reconcile, speaker_frames, speaker_pass
+from app.services.l3.identity.reconcile import Occurrence
+from app.services.l3.image_plan import PlannedFrame
 from app.services.l3.lattice import Lattice
 from app.services.l3.pass2 import Pass2Cut, Pass2Output
 
-
-def _bind_all(
-    lattices: Dict[str, Lattice],
-    motion_by_file: Dict[str, dict],
-    groups: Dict[str, Dict[str, Any]],
-) -> Dict[str, Binding]:
-    fid_to_group = {fid: gid for gid, grp in groups.items() for fid in grp["members"]}
-    bindings: Dict[str, Binding] = {}
-
-    for grp in groups.values():
-        member_ids = sorted(grp["members"])
-        turns_by_file = {fid: lattices[fid].turns for fid in member_ids if fid in lattices}
-        energy_by_file = {fid: (motion_by_file.get(fid) or {}).get("action_energy") or [] for fid in member_ids}
-        hop_by_file = {fid: int((motion_by_file.get(fid) or {}).get("hop_ms") or 0) for fid in member_ids}
-        bindings.update(bind_outlook_group(member_ids, turns_by_file, energy_by_file, hop_by_file))
-
-    for fid, lattice in lattices.items():
-        if fid in fid_to_group:
-            continue
-        m = motion_by_file.get(fid) or {}
-        bindings[fid] = bind_file(lattice.turns, m.get("action_energy") or [], int(m.get("hop_ms") or 0))
-
-    return bindings
+logger = logging.getLogger(__name__)
 
 
-def _cuts_by_file(cuts: List[Pass2Cut]) -> Dict[str, List[Pass2Cut]]:
-    out: Dict[str, List[Pass2Cut]] = {}
-    for c in cuts:
-        out.setdefault(c.file_id, []).append(c)
+def _occurrences_from_cuts(cuts: List[Pass2Cut]) -> List[Occurrence]:
+    """Every visible-person sighting across the project's cuts -- the
+    per-cut-occurrence input identity/reconcile.py's Phase D clustering
+    needs (dropping the old one-person-per-FILE assumption)."""
+    out: List[Occurrence] = []
+    for cut in cuts:
+        box = cut.framing.subject_box if cut.framing else None
+        area = float(box[2]) * float(box[3]) if box else None
+        for i, p in enumerate(cut.people or []):
+            out.append(Occurrence(
+                file_id=cut.file_id, source_ref=cut.source_ref, person_index=i,
+                appearance=(p.get("appearance") or {}), description=p.get("description") or "",
+                is_speech_cut=(cut.kind == "speech"), subject_box_area=area,
+            ))
     return out
 
 
-def _multi_person_lone_files(cuts_by_file: Dict[str, List[Pass2Cut]], grouped_ids: Set[str]) -> Set[str]:
-    """Phase 1's documented edge case: a single (non-grouped) camera framing
-    >1 person has no motion basis to say WHICH of them is talking --
-    whole-frame `action_energy` can't separate them. Detected via >1
-    distinct people `position` across the file's own cuts. Grouped files are
-    exempt: the whole outlook premise is one camera per person, so a
-    genuinely multi-person angle there is out of scope, not this guard's job."""
-    flagged: Set[str] = set()
-    for fid, cuts in cuts_by_file.items():
-        if fid in grouped_ids:
-            continue
-        positions = {
-            p.get("position") for c in cuts for p in (c.people or []) if p.get("position")
-        }
-        if len(positions) > 1:
-            flagged.add(fid)
-    return flagged
+def _planned_frames_for_bursts(bursts: List[speaker_frames.Burst]) -> List[PlannedFrame]:
+    seen: set = set()
+    out: List[PlannedFrame] = []
+    for b in bursts:
+        for ts in b.ts_ms:
+            key = (b.file_id, ts)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(PlannedFrame(file_id=b.file_id, ts_ms=ts, reason="speaker_binding",
+                                    ref=b.window_id))
+    return out
 
 
-def _people_by_file(cuts_by_file: Dict[str, List[Pass2Cut]]) -> tuple[Dict[str, List[dict]], Dict[str, List[str]]]:
-    appearances: Dict[str, List[dict]] = {}
-    descriptions: Dict[str, List[str]] = {}
-    for fid, cuts in cuts_by_file.items():
-        for c in cuts:
-            for p in (c.people or []):
-                appearances.setdefault(fid, []).append(p.get("appearance") or {})
-                desc = p.get("description")
-                if desc:
-                    descriptions.setdefault(fid, []).append(desc)
-    return appearances, descriptions
+def _owned_voices_by_person(owner_by_voice: Dict[str, Optional[str]]) -> Dict[str, List[str]]:
+    out: Dict[str, List[str]] = {}
+    for voice, person in owner_by_voice.items():
+        if person is not None:
+            out.setdefault(person, []).append(voice)
+    for vlist in out.values():
+        vlist.sort()
+    return out
 
 
-def _rewrite_on_camera(cuts: List[Pass2Cut], bound_voice_by_file: Dict[str, Binding]) -> List[Pass2Cut]:
+def _rewrite_cuts(
+    cuts: List[Pass2Cut],
+    owner_by_voice: Dict[str, Optional[str]],
+    visible_persons: Dict[Tuple[str, str], List[str]],
+) -> List[Pass2Cut]:
+    """Per cut: `visible_persons` from Phase D always rides through.
+    `speaker_person` is the first of this cut's `voice_ids` (deterministic,
+    Pass 1 word-level diarization + voice clustering -- see pass2.
+    to_pass2_cuts) that resolved to a confident owner; a video cut (no
+    voice_ids) or an unbound voice leaves it None. `on_camera` is then
+    PURELY `speaker_person in visible_persons` -- never a guess, and only
+    ever set when both facts are actually known."""
     out: List[Pass2Cut] = []
     for cut in cuts:
-        if cut.kind != "speech" or not cut.speaker:
-            out.append(cut)  # video cut, or no speaker at all -- unchanged
-            continue
-        binding = bound_voice_by_file.get(cut.file_id)
-        voice = binding.voice if binding else None
-        if voice is None:
-            out.append(cut)  # no confident binding -- keep pass 2a's per-still guess
-            continue
-        speakers = [s.strip() for s in cut.speaker.split(",") if s.strip()]
-        out.append(cut.model_copy(update={"on_camera": voice in speakers}))
+        vis = visible_persons.get((cut.file_id, cut.source_ref), [])
+        speaker_person = None
+        for v in cut.voice_ids:
+            owner = owner_by_voice.get(v)
+            if owner is not None:
+                speaker_person = owner
+                break
+        on_camera = (speaker_person in vis) if speaker_person is not None else None
+        out.append(cut.model_copy(update={
+            "visible_persons": vis, "speaker_person": speaker_person, "on_camera": on_camera,
+        }))
     return out
 
 
 def run(
     pass2_output: Pass2Output,
     lattices: Dict[str, Lattice],
+    voice_of: Dict[Tuple[str, str], str],
+    turns_by_file: Dict[str, List[Tuple[int, int, str]]],
+    audio_by_file: Dict[str, dict],
     motion_by_file: Dict[str, dict],
-    groups: Dict[str, Dict[str, Any]],
-) -> tuple[Pass2Output, Dict[str, Any]]:
-    """The whole Phase 1-3 pipeline. `groups` is `sync.lattice_merge.
-    outlook_groups`'s output (`{group_id: {"auth", "members"}}`) -- the SAME
-    grouping the speech lattice merge already used, so binding and identity
-    share one notion of "these cameras are one moment"."""
-    cuts_by_file = _cuts_by_file(pass2_output.cuts)
-    grouped_ids = {fid for grp in groups.values() for fid in grp["members"]}
+    proxy_key_by_file: Dict[str, str],
+) -> Tuple[Pass2Output, Dict[str, Any]]:
+    """The whole Phase D/E/F pipeline. `voice_of` is identity/voices.
+    assign_voices's output, already computed once up front (before pass 2
+    ran) and reused here so voice identity is consistent project-wide.
+    `turns_by_file` is each file's `Lattice.turns` (re-based onto the
+    outlook group's authoritative clock where applicable, same as `voice_
+    of`'s own input) -- identity/speaker_frames.py's raw material for
+    finding clean speaking windows."""
+    cuts = pass2_output.cuts
+    occurrences = _occurrences_from_cuts(cuts)
+    face_result = reconcile.reconcile(occurrences)
+    visible_persons: Dict[Tuple[str, str], List[str]] = face_result["visible_persons"]
+    persons_by_id: Dict[str, Dict[str, Any]] = {p["person_id"]: p for p in face_result["persons"]}
 
-    bindings = _bind_all(lattices, motion_by_file, groups)
-    for fid in _multi_person_lone_files(cuts_by_file, grouped_ids):
-        bindings[fid] = Binding(voice=None, confidence=0.0)
+    cuts_by_file: Dict[str, List[Pass2Cut]] = {}
+    for c in cuts:
+        cuts_by_file.setdefault(c.file_id, []).append(c)
 
-    appearances_by_file, descriptions_by_file = _people_by_file(cuts_by_file)
-    bound_voice_by_file: Dict[str, Optional[str]] = {fid: b.voice for fid, b in bindings.items()}
-    identity = reconcile(appearances_by_file, descriptions_by_file, bound_voice_by_file, groups)
+    bursts, planning_off_camera = speaker_frames.plan_bursts(
+        turns_by_file, voice_of, cuts_by_file, lattices, visible_persons,
+        audio_by_file, motion_by_file,
+    )
 
-    new_cuts = _rewrite_on_camera(pass2_output.cuts, bindings)
+    planned_frames = _planned_frames_for_bursts(bursts)
+    images_b64 = fr.extract_for_planned_frames(planned_frames, proxy_key_by_file) if planned_frames else {}
+
+    owner_by_voice = speaker_pass.bind_voices(bursts, images_b64, persons_by_id)
+    off_camera_voices = set(planning_off_camera) | {v for v, p in owner_by_voice.items() if p is None}
+
+    owned_voices = _owned_voices_by_person(owner_by_voice)
+    for pid, vlist in owned_voices.items():
+        if pid in persons_by_id:
+            persons_by_id[pid]["owned_voices"] = vlist
+
+    new_cuts = _rewrite_cuts(cuts, owner_by_voice, visible_persons)
 
     payload = {
-        "persons": identity["persons"],
-        "file_person": identity["file_person"],
-        "bound_voice": {fid: v for fid, v in bound_voice_by_file.items() if v},
-        "oncam": identity["oncam"],
-        "alias": {f"{fid}|{voice}": display for (fid, voice), display in identity["alias"].items()},
+        "persons": list(persons_by_id.values()),
+        "voice_owner": {v: p for v, p in owner_by_voice.items() if p is not None},
+        "off_camera_voices": sorted(off_camera_voices),
     }
+    if payload["persons"]:
+        logger.info("identity: %d person(s), %d voice(s) bound, %d off-camera",
+                   len(payload["persons"]), len(payload["voice_owner"]), len(off_camera_voices))
     return Pass2Output(cuts=new_cuts), payload

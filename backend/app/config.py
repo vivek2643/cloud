@@ -129,6 +129,15 @@ class Settings(BaseSettings):
     # Only affects the gemini pass-2 path.
     ingest_pass2_thinking: str = "low"
 
+    # voice_first_identity.plan.md Phase F: the voice->face binding pass is a
+    # small, fixed Gemini call (a handful of calls per project, one per
+    # voice) -- not provider-configurable like pass 2, since there is no
+    # Anthropic path for it. Same Flash-Lite thinking guardrail as pass 2
+    # (see ingest_pass2_thinking): stays "low" -- this call's schema is tiny
+    # (a per-window vote), but the lesson (never risk a runaway-thinking
+    # spiral on Flash-Lite) applies regardless of task size.
+    identity_speaker_pass_model: str = "gemini-3.1-flash-lite"
+
     @property
     def r2_endpoint(self) -> str:
         return f"https://{self.r2_account_id}.r2.cloudflarestorage.com"

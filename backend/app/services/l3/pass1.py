@@ -282,6 +282,23 @@ def _no_speech_cut_swallows_atoms(output: Pass1Output, lattices: Dict[str, Latti
 # owns BOUNDARIES, and this is precisely a boundary. North Star #1.
 # --------------------------------------------------------------------------
 
+def _speaker_ids_for_span(words: List[dict], span: Tuple[int, int]) -> List[str]:
+    """Distinct diarized speaker labels across a word span, in first-
+    appearance order -- the deterministic ground truth for "who is talking
+    this beat" (voice_first_identity.plan.md: never the model's job to
+    guess -- word-level diarization already knows). Unset/None words
+    contribute nothing."""
+    a, b = span
+    seen: List[str] = []
+    seen_set: set = set()
+    for i in range(max(0, a), min(len(words), b + 1)):
+        spk = words[i].get("speaker")
+        if spk and spk not in seen_set:
+            seen_set.add(spk)
+            seen.append(spk)
+    return seen
+
+
 def _span_pieces(words: List[dict], atoms: List[Any], span: Tuple[int, int]) -> List[Tuple[int, int]]:
     """``span`` split at every inter-word gap that contains an atom (by
     midpoint -- robust to edge snapping either side). Always returns >= 1
@@ -1077,6 +1094,18 @@ def enforce_lattice_partition(
                 file_id=file_id, atom_ids=[x.atom_id for x in run]))
         logger.info("pass1 enforce: recovered %d ungrouped atom(s) in %s",
                     len(ungrouped), file_id)
+
+    # Deterministic per-beat voice (voice_first_identity.plan.md): "who is
+    # talking this beat" was never the model's job to guess -- word-level
+    # diarization already knows exactly who spoke each word. Stamp
+    # speaker_ids from the FINAL (post-split/merge/absorb) word span,
+    # overwriting whatever (always empty -- the model is never asked for
+    # this field) the raw cut carried in.
+    new_cuts = [
+        sc.model_copy(update={"speaker_ids": _speaker_ids_for_span(lattices[sc.file_id].words, sc.word_span)})
+        if sc.file_id in lattices and lattices[sc.file_id].words else sc
+        for sc in new_cuts
+    ]
 
     enforced = output.model_copy(update={"speech_cuts": new_cuts, "take_candidates": new_takes,
                                          "video_tentative_groups": new_groups})

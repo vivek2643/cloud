@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,16 @@ class DiarizationResult:
     # One label per input word (aligned by index); None if undiarizable.
     speaker_by_word: List[Optional[str]] = field(default_factory=list)
     num_speakers: int = 0
+    # voice_first_identity.plan.md Phase A: one voiceprint (embedding vector)
+    # per file-local speaker label ("S0" -> [..]), when pyannote's own
+    # clustering step could produce one -- the cross-clip identity spine
+    # `identity/voices.py` clusters on. Best-effort: empty when embeddings
+    # aren't available (an older pyannote build without `return_embeddings`,
+    # a speaker too short/unclear to embed, or diarization unavailable at
+    # all) -- NEVER required; a voice with no embedding just can't be
+    # cross-clip-clustered and falls back to being its own, unclustered
+    # voice (identity_map.plan.md's "over-split is the safe failure" stance).
+    embedding_by_speaker: Dict[str, List[float]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +141,40 @@ def _get_pyannote_pipeline():
     return _PYANNOTE_PIPELINE or None
 
 
+def _speaker_embeddings(pipe, wav_path: str, kwargs: Dict[str, int]):
+    """(annotation, {raw_label: embedding_vector}) -- pyannote's
+    SpeakerDiarization pipeline already computes one embedding per detected
+    speaker while clustering; `return_embeddings=True` surfaces it instead of
+    discarding it (voice_first_identity.plan.md Phase A). Best-effort: an
+    older pyannote build without this kwarg raises `TypeError`, caught here
+    -- the embedding capture must never be able to break diarization itself,
+    which is why this is a small separate function the caller wraps.
+    `annotation.labels()` order corresponds 1:1 with `embeddings`' rows (the
+    documented pyannote contract). A speaker embedding that pyannote
+    couldn't compute confidently (e.g. NaN) is dropped, not fabricated."""
+    try:
+        annotation, embeddings = pipe(wav_path, return_embeddings=True, **kwargs)
+    except TypeError:
+        return pipe(wav_path, **kwargs), {}
+    by_label: Dict[str, Any] = {}
+    try:
+        labels = annotation.labels()
+        for i, lab in enumerate(labels):
+            if i >= len(embeddings):
+                continue
+            try:
+                vec = [float(x) for x in embeddings[i]]
+            except (TypeError, ValueError):
+                continue
+            if vec and not any(v != v for v in vec):  # v != v <=> NaN
+                by_label[lab] = vec
+    except Exception:
+        logger.warning("pyannote: embedding extraction failed; continuing without voiceprints",
+                       exc_info=True)
+        by_label = {}
+    return annotation, by_label
+
+
 def _diarize_pyannote(
     wav_path: str,
     words: Sequence[dict],
@@ -149,7 +193,7 @@ def _diarize_pyannote(
     if min_speakers and min_speakers > 1:
         kwargs["min_speakers"] = int(min_speakers)
 
-    annotation = pipe(wav_path, **kwargs)
+    annotation, embedding_by_label = _speaker_embeddings(pipe, wav_path, kwargs)
 
     # (start_ms, end_ms, raw_label), chronological.
     segs: List[Tuple[int, int, str]] = [
@@ -185,7 +229,11 @@ def _diarize_pyannote(
 
     _smooth_speakers(words, speaker_by_word)
     num_speakers = len({v for v in speaker_by_word if v})
-    return DiarizationResult(speaker_by_word=speaker_by_word, num_speakers=num_speakers)
+    embedding_by_speaker = {
+        raw_to_name[lab]: vec for lab, vec in embedding_by_label.items() if lab in raw_to_name
+    }
+    return DiarizationResult(speaker_by_word=speaker_by_word, num_speakers=num_speakers,
+                             embedding_by_speaker=embedding_by_speaker)
 
 
 # ---------------------------------------------------------------------------

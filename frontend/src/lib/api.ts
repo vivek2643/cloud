@@ -206,7 +206,14 @@ export interface CutRecord {
   atom_ids: number[] | null;
   label: string;
   summary: string;
-  speaker: string | null;
+  // voice_first_identity.plan.md: all code-derived, never LLM-echoed.
+  // voice_ids = the global voice(s) heard; speaker_person = the global
+  // person id the voice was confidently bound to (null = unknown owner,
+  // e.g. narration); visible_persons = every global person id on screen
+  // in this cut. Absent/[] on a pre-migration run.
+  voice_ids?: string[];
+  speaker_person: string | null;
+  visible_persons?: string[];
   on_camera: boolean | null;
   take_group_id: string | null;
   take_role: TakeRole | null;

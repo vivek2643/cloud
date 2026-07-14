@@ -127,18 +127,18 @@ def insert_cut_records(ingest_run_id: str, records: List[CutRecord]) -> List[str
                 """
                 insert into cut_records (
                     ingest_run_id, file_id, src_in_ms, src_out_ms, kind,
-                    word_span, atom_ids, label, summary, speaker, on_camera,
+                    word_span, atom_ids, label, summary, on_camera,
                     take_group_id, take_role, junk, junk_reason,
                     framing, look, caption_zones, pace, hero_ts_ms, channel, continuity,
                     speech_quality, total_quality, characteristics, camera, sync_group_id,
-                    screen_text, salience
+                    screen_text, salience, voice_ids, speaker_person, visible_persons
                 ) values (
                     %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
                     %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s,
-                    %s, %s
+                    %s, %s, %s, %s, %s
                 )
                 returning id::text
                 """,
@@ -146,7 +146,7 @@ def insert_cut_records(ingest_run_id: str, records: List[CutRecord]) -> List[str
                     ingest_run_id, r.file_id, r.src_in_ms, r.src_out_ms, r.kind,
                     json.dumps(list(r.word_span)) if r.word_span else None,
                     json.dumps(r.atom_ids) if r.atom_ids is not None else None,
-                    r.label, r.summary, r.speaker, r.on_camera,
+                    r.label, r.summary, r.on_camera,
                     tg_map.get(r.take_group_id) if r.take_group_id else None, r.take_role,
                     r.junk, r.junk_reason,
                     json.dumps(r.framing), json.dumps(r.look),
@@ -156,6 +156,7 @@ def insert_cut_records(ingest_run_id: str, records: List[CutRecord]) -> List[str
                     r.speech_quality, r.total_quality, json.dumps(r.characteristics),
                     r.camera, r.sync_group_id,
                     r.screen_text, json.dumps(r.salience),
+                    json.dumps(r.voice_ids), r.speaker_person, json.dumps(r.visible_persons),
                 ),
             ).fetchone()
             ids.append(row[0])

@@ -748,6 +748,35 @@ def test_isolated_silent_word_is_dropped():
     print("ok  test_isolated_silent_word_is_dropped")
 
 
+def test_speaker_ids_for_span_distinct_first_appearance_order():
+    words = [
+        {"speaker": "S1"}, {"speaker": "S1"}, {"speaker": "S0"}, {"speaker": None}, {"speaker": "S1"},
+    ]
+    assert pass1._speaker_ids_for_span(words, (0, 4)) == ["S1", "S0"]
+    assert pass1._speaker_ids_for_span(words, (2, 2)) == ["S0"]
+    assert pass1._speaker_ids_for_span(words, (3, 3)) == []
+    print("ok  test_speaker_ids_for_span_distinct_first_appearance_order")
+
+
+def test_enforce_stamps_speaker_ids_from_word_diarization():
+    # voice_first_identity.plan.md: the model is never asked to emit
+    # speaker_ids (it always defaults to []) -- enforcement must stamp the
+    # deterministic ground truth from the lattice's own word-level
+    # diarization onto every FINAL speech cut.
+    lat = _make_lattice()
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [
+            {"file_id": "f1", "word_span": [0, 2], "label": "s1 bit"},
+            {"file_id": "f1", "word_span": [3, 4], "label": "s2 bit"},
+        ],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    by_span = {tuple(sc.word_span): sc.speaker_ids for sc in fixed.speech_cuts}
+    assert by_span[(0, 2)] == ["S1"], by_span
+    assert by_span[(3, 4)] == ["S2"], by_span
+    print("ok  test_enforce_stamps_speaker_ids_from_word_diarization")
+
+
 def test_no_overlapping_speech_cuts():
     bad = pass1.Pass1Output.model_validate({
         "speech_cuts": [
@@ -817,6 +846,8 @@ def main():
     test_runt_guard_does_not_absorb_a_take_member()
     test_runt_guard_does_not_absorb_flagged_junk()
     test_runt_guard_skips_outlook_synced_files()
+    test_speaker_ids_for_span_distinct_first_appearance_order()
+    test_enforce_stamps_speaker_ids_from_word_diarization()
     test_silent_trailing_word_is_folded_into_its_beat()
     test_isolated_silent_word_is_dropped()
     test_no_overlapping_speech_cuts()

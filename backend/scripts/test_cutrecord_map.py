@@ -25,7 +25,8 @@ def _row(**over):
     row = {
         "id": "cut-1", "file_id": "ffffffff-1111", "kind": "video",
         "src_in_ms": 1000, "src_out_ms": 5000, "label": "product reveal",
-        "summary": None, "speaker": None, "on_camera": None,
+        "summary": None, "voice_ids": None, "speaker_person": None,
+        "visible_persons": None, "on_camera": None,
         "take_group_id": None, "take_role": None, "channel": "shown",
         "junk": False, "framing": None, "look": None, "hero_ts_ms": 4200,
         "pace": {"min_ms": 800, "natural_ms": 4000, "max_ms": 4000, "natural_sound": True},
@@ -40,7 +41,8 @@ def test_to_cut_dict_maps_exact_keys_build_clip_tree_reads():
     row = _row()
     d = cm._to_cut_dict(row)
     for key in ("hero_id", "file_id", "channel", "subject", "label", "summary",
-                "speaker", "src_in_ms", "src_out_ms", "play_ms", "keep_spans",
+                "voice_ids", "speaker_person", "visible_persons", "on_camera",
+                "src_in_ms", "src_out_ms", "play_ms", "keep_spans",
                 "score", "flags", "audio", "mute", "people", "framing", "quality",
                 "ladder", "take_group_id", "take_role", "junk", "junk_reason", "continuity"):
         assert key in d, f"missing {key}"
@@ -60,7 +62,8 @@ def test_to_cut_dict_feeds_build_clip_tree_end_to_end():
     variants -- the actual integration point Phase 1/2 rely on."""
     cuts = [cm._to_cut_dict(_row()),
             cm._to_cut_dict(_row(id="cut-2", kind="speech", channel="said",
-                                 src_in_ms=5000, src_out_ms=8000, speaker="S0",
+                                 src_in_ms=5000, src_out_ms=8000,
+                                 voice_ids=["V0"], speaker_person="P0",
                                  label="", summary=None,
                                  pace={"min_ms": 3000, "natural_ms": 3000, "max_ms": 3000,
                                        "natural_sound": True, "remove_spans": [[5000, 5200]]}))]
@@ -113,9 +116,9 @@ def test_audio_mute_rule():
 
 
 def test_people_from_speaker():
-    assert cm._people_for(_row(speaker=None)) == []
-    people = cm._people_for(_row(speaker="S0", on_camera=True))
-    assert people == [{"person_id": "S0", "voice_speaker_id": "S0", "on_camera": True,
+    assert cm._people_for(_row(speaker_person=None)) == []
+    people = cm._people_for(_row(speaker_person="P0", on_camera=True))
+    assert people == [{"person_id": "P0", "voice_speaker_id": "P0", "on_camera": True,
                         "characteristics": []}]
     print("ok  test_people_from_speaker")
 

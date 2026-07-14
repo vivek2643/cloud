@@ -213,16 +213,19 @@ def _score_for(row: Dict[str, Any]) -> float:
 
 
 def _people_for(row: Dict[str, Any]) -> List[dict]:
-    """The people on screen for this cut: the diarized speaker (voice identity)
-    plus the pass-2 appearance fingerprints (characteristics) so the brain can
-    recognise the same person across cuts by description, not just voice id."""
+    """The Tier-1 raw appearance detail for this cut's speaker (when bound):
+    the global person id plus the pass-2 appearance fingerprints
+    (characteristics) so an on-demand inspection can recognise them by
+    description, not just id. PIC/SND rendering itself reads speaker_person/
+    visible_persons directly off the moment (see footage_map.py) -- this is
+    only the richer per-person detail for `inspect_moment`-style lookups."""
     chars = row.get("characteristics") or []
-    speaker = row.get("speaker")
-    if not speaker and not chars:
+    speaker_person = row.get("speaker_person")
+    if not speaker_person and not chars:
         return []
     return [{
-        "person_id": speaker,
-        "voice_speaker_id": speaker,
+        "person_id": speaker_person,
+        "voice_speaker_id": speaker_person,
         "on_camera": row.get("on_camera"),
         "characteristics": chars,
     }]
@@ -257,7 +260,16 @@ def _to_cut_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "subject": _SUBJECT_BY_CHANNEL.get(channel, "object"),
         "label": row.get("label") or "",
         "summary": row.get("summary"),
-        "speaker": row.get("speaker"),
+        # voice_first_identity.plan.md: all four code-derived, never LLM-
+        # echoed. voice_ids = the global voice(s) heard (Pass 1 word-level
+        # diarization + voice clustering); speaker_person/on_camera = the
+        # speaker pass's voice->person binding + whether that person is
+        # visible in THIS cut; visible_persons = every global person id on
+        # screen (per-cut-occurrence face clustering, not one-per-file).
+        "voice_ids": row.get("voice_ids") or [],
+        "speaker_person": row.get("speaker_person"),
+        "visible_persons": row.get("visible_persons") or [],
+        "on_camera": row.get("on_camera"),
         "src_in_ms": int(row["src_in_ms"]),
         "src_out_ms": int(row["src_out_ms"]),
         "play_ms": int(row["src_out_ms"]) - int(row["src_in_ms"]),

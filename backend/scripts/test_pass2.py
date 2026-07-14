@@ -53,7 +53,7 @@ def _lat(file_id):
 def test_pass2cut_constructs_with_all_fields():
     cut = pass2.Pass2Cut(
         source_ref="speech_cut[0]", kind="speech", file_id="f1", word_span=(0, 3),
-        label="intro", summary="says hello", speaker="S0", on_camera=True,
+        label="intro", summary="says hello", on_camera=True,
         junk=False, junk_reason="", framing=pass2.Framing(rotation_deg=90.0),
         look=pass2.Look(graded=True), caption_zones=[(0.1, 0.1, 0.2, 0.1)],
         taste_fences=pass2.TasteFences(max_tasteful_speed=1.5), readability_ms=800,
@@ -479,19 +479,23 @@ def test_no_cross_kind_ms_overlap_catches_a_speech_and_video_cut_overlapping():
 def test_to_pass2_cuts_converts_every_field():
     j = pass2.CutJudgment(
         source_ref="speech_cut[0]", kind="speech", file_id="f1", word_span=(0, 3),
-        label="intro", summary="says hello", speaker="S0", on_camera=True,
+        label="intro", summary="says hello",
         junk=False, natural_sound=True, channel="said",
         framing=pass2.Framing(rotation_deg=90.0), look=pass2.Look(graded=True),
         caption_zones=[(0.1, 0.1, 0.2, 0.1)],
         taste_fences=pass2.TasteFences(max_tasteful_speed=1.5), readability_ms=800,
-        people=[pass2.PersonLook(description="a person", position="left", speaking=True)],
+        people=[pass2.PersonLook(description="a person", position="left")],
     )
     cuts = pass2.to_pass2_cuts([j])
     assert len(cuts) == 1
     cut = cuts[0]
     assert cut.source_ref == "speech_cut[0]" and cut.kind == "speech" and cut.word_span == (0, 3)
-    assert cut.label == "intro" and cut.summary == "says hello" and cut.speaker == "S0"
-    assert cut.on_camera is True and cut.natural_sound is True and cut.channel == "said"
+    assert cut.label == "intro" and cut.summary == "says hello"
+    # voice_first_identity.plan.md: on_camera/speaker_person/visible_persons
+    # are purely code-derived, set later by identity/apply.py -- unset here.
+    assert cut.on_camera is None and cut.speaker_person is None and cut.visible_persons == []
+    assert cut.voice_ids == []   # no pass1/voice_of supplied -- nothing to backfill
+    assert cut.natural_sound is True and cut.channel == "said"
     assert cut.framing.rotation_deg == 90.0
     assert cut.look.graded is True
     assert cut.caption_zones == [(0.1, 0.1, 0.2, 0.1)]
@@ -501,13 +505,52 @@ def test_to_pass2_cuts_converts_every_field():
     assert cut.take_group_id is None and cut.take_role is None
     # people flattened to plain dicts, same shape the old merge produced
     assert cut.people == [{"description": "a person", "appearance": pass2.Appearance().model_dump(),
-                           "position": "left", "speaking": True}]
+                           "position": "left"}]
     print("ok  test_to_pass2_cuts_converts_every_field")
 
 
 def test_to_pass2_cuts_empty_is_a_noop():
     assert pass2.to_pass2_cuts([]) == []
     print("ok  test_to_pass2_cuts_empty_is_a_noop")
+
+
+def test_to_pass2_cuts_backfills_voice_ids_from_pass1_and_voice_map():
+    # voice_first_identity.plan.md Phase C: voice_ids is deterministic --
+    # Pass 1's own SpeechCut.speaker_ids (word-level diarization) for this
+    # cut's (file_id, word_span), mapped through the global voice map.
+    pass1 = Pass1Output(speech_cuts=[
+        SpeechCut(file_id="f1", word_span=(0, 3), label="intro", speaker_ids=["S0"]),
+    ])
+    voice_of = {("f1", "S0"): "V2"}
+    j = pass2.CutJudgment(source_ref="speech_cut[0]", kind="speech", file_id="f1",
+                          word_span=(0, 3), label="intro", summary="says hello")
+    cuts = pass2.to_pass2_cuts([j], pass1, voice_of)
+    assert cuts[0].voice_ids == ["V2"], cuts[0].voice_ids
+    print("ok  test_to_pass2_cuts_backfills_voice_ids_from_pass1_and_voice_map")
+
+
+def test_to_pass2_cuts_voice_ids_empty_when_voice_unresolved():
+    # A local speaker with no entry in voice_of (e.g. no embedding, no
+    # roster coverage) contributes nothing -- never a fabricated voice id.
+    pass1 = Pass1Output(speech_cuts=[
+        SpeechCut(file_id="f1", word_span=(0, 3), label="intro", speaker_ids=["S0"]),
+    ])
+    j = pass2.CutJudgment(source_ref="speech_cut[0]", kind="speech", file_id="f1",
+                          word_span=(0, 3), label="intro", summary="says hello")
+    cuts = pass2.to_pass2_cuts([j], pass1, {})
+    assert cuts[0].voice_ids == [], cuts[0].voice_ids
+    print("ok  test_to_pass2_cuts_voice_ids_empty_when_voice_unresolved")
+
+
+def test_to_pass2_cuts_video_cut_never_gets_voice_ids():
+    j = pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
+                          atom_ids=[0, 1], label="a shot", summary="something happens")
+    pass1 = Pass1Output(speech_cuts=[
+        SpeechCut(file_id="f1", word_span=(0, 3), label="intro", speaker_ids=["S0"]),
+    ])
+    cuts = pass2.to_pass2_cuts([j], pass1, {("f1", "S0"): "V0"})
+    assert cuts[0].voice_ids == [], cuts[0].voice_ids
+    print("ok  test_to_pass2_cuts_video_cut_never_gets_voice_ids")
 
 
 # --------------------------------------------------------------------------
@@ -708,6 +751,9 @@ def main():
     test_no_cross_kind_ms_overlap_catches_a_speech_and_video_cut_overlapping()
     test_to_pass2_cuts_converts_every_field()
     test_to_pass2_cuts_empty_is_a_noop()
+    test_to_pass2_cuts_backfills_voice_ids_from_pass1_and_voice_map()
+    test_to_pass2_cuts_voice_ids_empty_when_voice_unresolved()
+    test_to_pass2_cuts_video_cut_never_gets_voice_ids()
     test_build_pass2_batches_chunks_by_size()
     test_build_pass2_batches_groups_unique_refs_in_stable_order()
     test_build_pass2_batches_no_longer_co_locates_take_members()

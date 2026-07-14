@@ -415,7 +415,6 @@ class CutRecord:
     atom_ids: Optional[List[int]]
     label: str
     summary: str
-    speaker: Optional[str]
     on_camera: Optional[bool]
     junk: bool
     junk_reason: str
@@ -432,8 +431,8 @@ class CutRecord:
     # set and is what crowns a same-setting take group's winner.
     speech_quality: Optional[float]
     total_quality: float
-    # Per-person appearance fingerprints from pass 2b (list of {description,
-    # position, speaking}) -- lets take/outlook grouping + "show the speaker"
+    # Per-person appearance fingerprints from pass 2 (list of {description,
+    # position, appearance}) -- lets take/outlook grouping + "show the speaker"
     # arrange logic recognise the same person across cuts by eye.
     characteristics: List[Dict[str, Any]] = field(default_factory=list)
     # Deterministic per-cut continuity (cuts_v3_continuity.plan.md): this cut's
@@ -461,6 +460,17 @@ class CutRecord:
     # perception_upgrade.plan.md Part D ("F8"): the cut's single strongest
     # INSTANT, code-computed -- see _salience. {} on a cut with no signal.
     salience: Dict[str, Any] = field(default_factory=dict)
+    # voice_first_identity.plan.md Phase C/D/G -- all three code-derived,
+    # never LLM-echoed:
+    #   - voice_ids: global voice(s) heard in this cut (Pass 1 word-level
+    #     diarization, mapped through voice clustering). [] for a video cut.
+    #   - speaker_person: the global person id (Px) the speaker pass bound
+    #     the speaking voice to. None = honest "owner unknown", never a guess.
+    #   - visible_persons: every global person id visible on screen in this
+    #     cut (per-cut-occurrence face clustering) -- a cut can show several.
+    voice_ids: List[str] = field(default_factory=list)
+    speaker_person: Optional[str] = None
+    visible_persons: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -468,7 +478,7 @@ class CutRecord:
             "kind": self.kind,
             "word_span": list(self.word_span) if self.word_span else None,
             "atom_ids": self.atom_ids, "label": self.label, "summary": self.summary,
-            "speaker": self.speaker, "on_camera": self.on_camera,
+            "on_camera": self.on_camera,
             "junk": self.junk, "junk_reason": self.junk_reason,
             "framing": self.framing, "look": self.look,
             "caption_zones": [list(z) for z in self.caption_zones],
@@ -479,6 +489,8 @@ class CutRecord:
             "characteristics": self.characteristics, "camera": self.camera,
             "sync_group_id": self.sync_group_id,
             "screen_text": self.screen_text, "salience": self.salience,
+            "voice_ids": self.voice_ids, "speaker_person": self.speaker_person,
+            "visible_persons": self.visible_persons,
         }
 
 
@@ -674,7 +686,13 @@ def _clip_continuity(
         nxt_cut, ns, ne, _ = resolved[idxs[pos + 1]]
         verdict = classify_seam(Seam(
             same_clip=True,
-            same_speaker=(cur_cut.speaker == nxt_cut.speaker),
+            # voice_first_identity.plan.md: voice_ids is the deterministic
+            # ground truth (Pass 1 word-level diarization + voice
+            # clustering) -- unlike speaker_person it never depends on the
+            # speaker pass's binding succeeding. Two video cuts (both []) or
+            # two cuts sharing a voice both read as "same speaker" (a
+            # permissive default -- other seam signals still decide).
+            same_speaker=(set(cur_cut.voice_ids) == set(nxt_cut.voice_ids)),
             gap_ms=max(0, ns - ce),
             bridged_speech_ms=(ce - cs) + (ne - ns),
             has_scene_or_transition=_has_scene_or_transition(lattice.atoms, ce, ns, synced=synced),
@@ -828,7 +846,7 @@ def assemble_cut_records(
         out.append(CutRecord(
             file_id=cut.file_id, src_in_ms=s, src_out_ms=e, kind=cut.kind,
             word_span=cut.word_span, atom_ids=cut.atom_ids, label=cut.label, summary=cut.summary,
-            speaker=cut.speaker, on_camera=cut.on_camera,
+            on_camera=cut.on_camera,
             junk=cut.junk, junk_reason=cut.junk_reason,
             framing=framing_dict, look=look_dict,
             caption_zones=list(cut.caption_zones), hero_ts_ms=hero_ts, pace=pace,
@@ -845,6 +863,8 @@ def assemble_cut_records(
             camera=classify_camera_move(motion, s, e),
             sync_group_id=(sync_group_by_file or {}).get(cut.file_id),
             screen_text=cut.screen_text, salience=salience,
+            voice_ids=cut.voice_ids, speaker_person=cut.speaker_person,
+            visible_persons=cut.visible_persons,
         ))
     _enforce_take_winner(out)
     return out

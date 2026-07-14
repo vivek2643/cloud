@@ -1,9 +1,13 @@
 """
 Cuts v3, Pass 2: ONE per-cut vision call -- identity (label/summary/channel/
-on_camera/natural_sound/junk) + full visual judgment (framing/look/captions/
-taste/people), merged into a single ``CutJudgment`` the model emits per cut
+natural_sound/junk) + full visual judgment (framing/look/captions/taste/
+people), merged into a single ``CutJudgment`` the model emits per cut
 (pass2_merge.plan.md). Batches are pure size-based chunking (no co-location
 constraint) and images are sent to the model exactly ONCE per batch.
+``speaker``/``on_camera`` are NOT part of this call (voice_first_identity.
+plan.md): who is talking is Pass 1's word-level ``speaker_ids``, who is on
+camera is derived code-side by ``identity/apply.py`` from voice->person
+binding + this call's own ``people`` list.
 
 History: this used to be two calls -- ``pass2a.py`` (identity + take
 resolution, shards co-located by take group so the model could compare
@@ -145,7 +149,6 @@ class PersonLook(BaseModel):
     description: str                       # e.g. "man, short dark hair, beard, grey hoodie"
     appearance: Appearance = Field(default_factory=Appearance)  # stable-trait fingerprint, see Appearance
     position: str | None = None            # rough frame position: "left" | "center" | "right"
-    speaking: bool | None = None           # mouth visibly moving in these frames
 
 
 # --------------------------------------------------------------------------
@@ -187,8 +190,6 @@ class CutJudgment(BaseModel):
     atom_ids: List[int] | None = None           # video cuts only
     label: str
     summary: str
-    speaker: str | None = None
-    on_camera: bool | None = None
     channel: str | None = None      # "said" | "done" | "shown"
     natural_sound: bool = False
     junk: bool = False
@@ -200,7 +201,11 @@ class CutJudgment(BaseModel):
     readability_ms: int = 0
     # Every person visible in this cut, described well enough to re-identify by
     # eye across cuts (for identity_map + "show the speaker" arrange decisions).
-    # Empty for a cut with no people on screen.
+    # Empty for a cut with no people on screen. voice_first_identity.plan.md
+    # Part C: `speaker`/`on_camera` (the old per-still LLM guesses) are GONE --
+    # who is talking (SpeechCut.speaker_ids, deterministic from word-level
+    # diarization) and who is on camera (identity/apply.py, derived from
+    # voice->person binding + this `people` list) are now both code-owned.
     people: List[PersonLook] = Field(default_factory=list)
     # perception_upgrade.plan.md Part C3: any legible on-screen text/graphics
     # (title, lower-third, slide, UI) -- "" when none. Optional/prompt-nudged
@@ -264,7 +269,10 @@ class Pass2Cut(BaseModel):
     atom_ids: List[int] | None = None           # video cuts only
     label: str
     summary: str
-    speaker: str | None = None
+    # voice_first_identity.plan.md Phase C/G: `speaker`/`on_camera` are no
+    # longer LLM-echoed. `on_camera` stays as a field, but is now PURELY
+    # code-derived (identity/apply.py sets it after voice->person binding
+    # resolves; None until then, and None forever for an unbound cut).
     on_camera: bool | None = None
     junk: bool = False
     junk_reason: str = ""
@@ -279,37 +287,85 @@ class Pass2Cut(BaseModel):
     channel: str | None = None      # "said" | "done" | "shown" (video: done|shown)
     # Per-person visual fingerprints -- appearance descriptors used to
     # recognise the same person across cuts. List of {description, position,
-    # speaking, appearance}. See PersonLook.
+    # appearance}. See PersonLook.
     people: List[dict] = Field(default_factory=list)
     # perception_upgrade.plan.md Part C3: on-screen text/graphics, "" if none.
     screen_text: str = ""
+    # voice_first_identity.plan.md Phase C: the GLOBAL voice(s) heard in this
+    # cut, deterministic from Pass 1's word-level SpeechCut.speaker_ids
+    # mapped through voice clustering (identity/voices.py) -- backfilled in
+    # to_pass2_cuts, replacing the removed LLM `speaker` guess. Empty for a
+    # video cut or a speech cut with no resolvable voice.
+    voice_ids: List[str] = Field(default_factory=list)
+    # The global PERSON id (Px) the speaker pass bound the speaking voice
+    # to -- set later by identity/apply.py (Phase F/G), once the whole
+    # project's cast is reconciled (needs every batch's cuts assembled
+    # first, so it can't be known at to_pass2_cuts time). None until then,
+    # and None forever for a voice with no confident binding -- honest
+    # ignorance, never a guess.
+    speaker_person: str | None = None
+    # Every global PERSON id (Px) visible on screen in this cut -- from the
+    # per-cut-occurrence face clustering (identity/reconcile.py Phase D),
+    # set by identity/apply.py alongside speaker_person. Replaces the old
+    # one-person-per-FILE `oncam` assumption: a cut can now show several
+    # people at once. Empty until identity/apply.py runs, and empty forever
+    # for a cut with no confidently-clustered face.
+    visible_persons: List[str] = Field(default_factory=list)
 
 
 class Pass2Output(BaseModel):
     cuts: List[Pass2Cut] = Field(default_factory=list)
 
 
-def to_pass2_cuts(judgments: List[CutJudgment]) -> List[Pass2Cut]:
+def to_pass2_cuts(
+    judgments: List[CutJudgment],
+    pass1: Optional[Pass1Output] = None,
+    voice_of: Optional[Dict[Tuple[str, str], str]] = None,
+) -> List[Pass2Cut]:
     """A batch's validated, backfilled CutJudgments -> the final Pass2Cut
     shape post.py consumes. take_group_id/take_role start unset -- code
     (`apply_take_groups`) stamps them from pass 1's take_candidates. This is
     the direct replacement for the old `merge_identity_and_visual`: there's
     nothing to MERGE anymore (one call already emits the whole record), just
-    a straight field copy, `people` flattened to plain dicts same as before."""
-    return [
-        Pass2Cut(
+    a straight field copy, `people` flattened to plain dicts same as before.
+
+    voice_first_identity.plan.md Phase C: `voice_ids` is backfilled HERE
+    (not in `backfill_locators`, since it needs `word_span` already
+    resolved) from pass 1's own `SpeechCut.speaker_ids` for this cut's
+    (file_id, word_span), mapped through `voice_of` (identity/voices.
+    assign_voices, computed once up front from L1 embeddings -- available
+    before pass 2 ever runs). `speaker_person`/`on_camera` stay unset here:
+    they need the whole project's voice->person binding
+    (identity/speaker_pass.py), which can't run until every batch's cuts
+    are assembled -- `identity/apply.py` sets them afterward. `pass1`/
+    `voice_of` default to None/empty so existing callers (and every test
+    that doesn't care about voice identity) are unaffected -- voice_ids is
+    then simply empty for every cut, same as before this field existed."""
+    speaker_ids_by_span: Dict[Tuple[str, Tuple[int, int]], List[str]] = {}
+    if pass1 is not None:
+        for sc in pass1.speech_cuts:
+            speaker_ids_by_span[(sc.file_id, tuple(sc.word_span))] = sc.speaker_ids
+    voice_of = voice_of or {}
+
+    out: List[Pass2Cut] = []
+    for j in judgments:
+        voice_ids: List[str] = []
+        if j.kind == "speech" and j.word_span is not None:
+            local_ids = speaker_ids_by_span.get((j.file_id, tuple(j.word_span))) or []
+            voice_ids = sorted({voice_of[(j.file_id, s)] for s in local_ids if (j.file_id, s) in voice_of})
+        out.append(Pass2Cut(
             source_ref=j.source_ref, kind=j.kind, file_id=j.file_id,
             word_span=j.word_span, atom_ids=j.atom_ids,
-            label=j.label, summary=j.summary, speaker=j.speaker,
-            on_camera=j.on_camera, junk=j.junk, junk_reason=j.junk_reason,
+            label=j.label, summary=j.summary,
+            junk=j.junk, junk_reason=j.junk_reason,
             framing=j.framing, look=j.look, caption_zones=j.caption_zones,
             taste_fences=j.taste_fences, readability_ms=j.readability_ms,
             natural_sound=j.natural_sound, channel=j.channel,
             people=[p.model_dump() for p in j.people],
             screen_text=j.screen_text,
-        )
-        for j in judgments
-    ]
+            voice_ids=voice_ids,
+        ))
+    return out
 
 
 def apply_junk_suspects(pass2: Pass2Output, pass1: Pass1Output) -> Pass2Output:
@@ -433,7 +489,6 @@ _SYSTEM = (
     "across them -- never a static description of a still ('a man in a "
     "kitchen' is not a summary; 'he cracks an egg into the bowl and starts "
     "whisking' is).\n"
-    "  - on_camera (does the visible person match the diarized speaker)\n"
     "  - channel: the delivery CATEGORY -- for a video cut set \"done\" when "
     "an action is performed/demonstrated on screen (a swing, a catch, "
     "pouring, assembling, a gesture that IS the content) or \"shown\" when "
@@ -475,12 +530,11 @@ _SYSTEM = (
     "Also list `people`: every person visible in the cut with a concise "
     "description that would let someone recognise them again across cuts "
     "(apparent gender/age, hair, facial hair, clothing/colour, anything "
-    "distinctive), their rough frame position (left/center/right), and "
-    "whether their mouth is visibly moving (speaking). No people on screen "
-    "-> empty list. Describe appearance only; never guess names or assign "
-    "any score.\n\n"
+    "distinctive) and their rough frame position (left/center/right). No "
+    "people on screen -> empty list. Describe appearance only; never guess "
+    "names, never judge who is speaking, and never assign any score.\n\n"
     "Each person ALSO gets a structured `appearance` (nested inside that "
-    "person, alongside description/position/speaking): apparent_gender, "
+    "person, alongside description/position): apparent_gender, "
     "apparent_age_band, hair, hair_color, facial_hair, glasses, skin_tone, "
     "build -- each one of its listed categories, or omitted/\"unsure\" if "
     "not clearly visible. These are for matching the SAME PERSON across "
