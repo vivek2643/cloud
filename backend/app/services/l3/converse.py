@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -71,6 +72,13 @@ _LOOP_SYSTEM = (
     "Your edits apply DIRECTLY -- the user watches the timeline update and can "
     "undo -- so don't ask for confirmation or say 'I will'; make the edit, then "
     "tell them what you did in a sentence or two. Use only ids that appear below.\n\n"
+    "THE ASK IS YOUR CONTRACT. On a turn that changes the edit, open by restating "
+    "in ONE line how you read the goal -- the length if it was given, the must-haves, "
+    "and the tone -- then edit to THAT. If the ask is materially ambiguous, or you'd "
+    "need a rough length you cannot infer, use ask_user before editing rather than "
+    "guessing big. Match ambition to the ask: make the SIMPLEST edit that satisfies "
+    "the goal, and don't add layers, cutaways, effects, or pacing moves the ask "
+    "didn't call for.\n\n"
     "READING A BEAT LINE. When the shoot's cast was reconciled, a CAST line "
     "lists the shoot's named persons (Px) once, each a short description plus "
     "which voice(s) are confirmed theirs -- read it once to know who's who; "
@@ -123,6 +131,11 @@ _LOOP_SYSTEM = (
     "need clearly calls for it, and be extremely careful when you do. Your senses "
     "(read_state, predict, validate, diagnose, affordances) and edit verbs are "
     "described in the tools; call them as you need."
+    "\n\nFINISHING. When you stop editing you'll get one AUTOMATIC CHECK of the edit "
+    "against the contract. Never finish with STRUCTURAL problems -- fix them. If "
+    "you're over a target length, either trim to it or say in one line why the "
+    "current length is right. The rest (speaker runs, low-energy stretches, "
+    "redundant takes) is advisory -- act on what serves the goal, ignore the rest."
 )
 
 
@@ -264,6 +277,43 @@ def _seed_document(file_ids: List[str]) -> dict:
     }
 
 
+_DUR_RE = re.compile(
+    r"(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>s(?:ec(?:onds?)?)?|m(?:in(?:ute)?s?)?)\b",
+    re.IGNORECASE)
+_WORD_MIN_RE = re.compile(r"\b(?:a|one)\s+minute\b", re.IGNORECASE)
+
+
+def _extract_target_s(text: str) -> Optional[float]:
+    """Best-effort target LENGTH (seconds) parsed from the user's OWN words -- e.g.
+    '60s', '90 seconds', '2 min', 'a minute', '30-45s' (upper bound). Returns None
+    when no explicit length is stated: we never INVENT a target (design choice B)."""
+    if not text:
+        return None
+    best: Optional[float] = None
+    for m in _DUR_RE.finditer(text):
+        num = float(m.group("num"))
+        secs = num * 60.0 if m.group("unit").lower().startswith("m") else num
+        best = secs if best is None else max(best, secs)   # a range -> upper bound
+    if best is None and _WORD_MIN_RE.search(text):
+        best = 60.0
+    return best
+
+
+def _latest_user_text(messages: List[dict]) -> str:
+    """The newest user message as plain text (content may be a bare string or a
+    list of blocks -- see store.load_messages)."""
+    for m in reversed(messages):
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):
+            return " ".join(b.get("text", "") for b in c
+                            if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
 def respond(thread_id: str, *, llm: Optional[LLMClient] = None) -> ConverseResult:
     """Run one agentic turn on a thread.
 
@@ -286,6 +336,12 @@ def respond(thread_id: str, *, llm: Optional[LLMClient] = None) -> ConverseResul
         return ConverseResult(reply="Tell me what you'd like to do with these clips.")
 
     working = document if isinstance(document, dict) else _seed_document(file_ids)
+    # Anchor the contract: capture an EXPLICIT target length from the user's latest
+    # words into the brief so diagnose + the done-gate have something to check
+    # against. Only ever SET from a stated number -- never cleared, never invented.
+    _target_s = _extract_target_s(_latest_user_text(messages))
+    if _target_s is not None:
+        working.setdefault("brief", {})["target_duration_s"] = _target_s
     max_tokens = settings.autoedit_max_output_tokens
     try:
         ctx = observe.build_context(file_ids, run_id=pinned_run)

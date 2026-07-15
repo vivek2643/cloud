@@ -460,6 +460,48 @@ def _json(obj: Any) -> str:
 # The loop
 # --------------------------------------------------------------------------
 
+_STRUCT_MAX_TRIES = 3
+
+
+def _verify_before_finish(working: dict, ctx: EditContext,
+                          state: Dict[str, Any], steps: List[str]) -> str | None:
+    """The done-gate: when the brain tries to FINISH a turn that changed the edit,
+    check the result against the contract. Returns feedback the brain MUST act on
+    (the loop keeps going), or None to let it finish. HARD on structural legality
+    (would break the render); the editorial findings are surfaced for a single
+    review -- an over-target LENGTH is fix-or-justify, the rest is advisory -- so
+    the loop always terminates. A brain that already called ``diagnose``/``validate``
+    this turn has self-reviewed, so the advisory nudge is skipped."""
+    issues = observe.validate(working, ctx)
+    if issues and state["struct_tries"] < _STRUCT_MAX_TRIES:
+        state["struct_tries"] += 1
+        body = "; ".join(f"{i.get('kind')} {i.get('id')}: {i.get('message')}"
+                         for i in issues[:8])
+        return ("AUTOMATIC CHECK -- structural problems that would break the render. "
+                "Fix these before finishing:\n" + body)
+
+    findings = observe.diagnose(working, ctx)
+    over = [f for f in findings if "over target" in (f.get("message") or "")]
+    if over and not state["length_surfaced"]:
+        state["length_surfaced"] = True
+        return ("AUTOMATIC CHECK -- length: " + (over[0].get("message") or "") +
+                ". Either trim to the target, or say in one line why this length is "
+                "right, then finish.")
+
+    rest = [f for f in findings if "target" not in (f.get("message") or "")]
+    reviewed = "diagnose" in steps or "validate" in steps
+    if rest and not state["reviewed"] and not reviewed:
+        state["reviewed"] = True
+        body = "\n".join(
+            f"- [{f.get('severity') or 'info'}] "
+            + (f"{f['anchor']}: " if f.get("anchor") else "") + (f.get("message") or "")
+            for f in rest[:12])
+        return ("AUTOMATIC CHECK -- review the edit against the ask before you finish. "
+                "This is advisory: act on what serves the goal, ignore the rest, then "
+                "finish:\n" + body)
+    return None
+
+
 def run_edit_loop(llm: LLMClient, *, system: str, messages: List[dict],
                   ctx: EditContext, document: dict,
                   max_turns: int = _MAX_TURNS,
@@ -474,6 +516,7 @@ def run_edit_loop(llm: LLMClient, *, system: str, messages: List[dict],
     tools = _specs()
     last_text = ""
     questions: List[dict] = []
+    verify = {"struct_tries": 0, "length_surfaced": False, "reviewed": False}
 
     for turn in range(max_turns):
         resp = llm.run(system=system, messages=convo, tools=tools,
@@ -481,6 +524,13 @@ def run_edit_loop(llm: LLMClient, *, system: str, messages: List[dict],
         last_text = (resp.text or "").strip() or last_text
         convo.append(resp.assistant_message)
         if not resp.tool_calls:
+            # Finish attempt: don't let a changed edit exit unchecked against the
+            # contract (structural = hard, length = fix-or-justify, rest advisory).
+            if changed and turn < max_turns - 1:
+                feedback = _verify_before_finish(working, ctx, verify, steps)
+                if feedback is not None:
+                    convo.append(user_message(feedback))
+                    continue
             break
         results = []
         asked = False

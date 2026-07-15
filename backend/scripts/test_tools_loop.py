@@ -16,6 +16,13 @@ from app.services.l3 import footage_map as fm, observe, tools  # noqa: E402
 from app.services.l3.arrange import _MapIndex  # noqa: E402
 from app.services.llm import LLMResponse, ToolCall  # noqa: E402
 
+# This file is explicitly "no DB" (see module docstring): build_clip_tree
+# calls _said_text_for_span -> _sentences_for_file for every "said" cut
+# (beat_transcript.plan.md), which would otherwise hit a real Postgres
+# connection. Stub it the same way test_footage_map.py does -- the same
+# observable result as "no dialogue_segments row for this file."
+fm._sentences_for_file = lambda file_id: ()
+
 
 def _rung(level, in_ms, out_ms, text=""):
     return {"level": level, "spans": [{"in_ms": in_ms, "out_ms": out_ms}],
@@ -210,6 +217,95 @@ def test_loop_split_screen_after_answer():
     print("ok  loop: split_screen adds op + layout region")
 
 
+# --------------------------------------------------------------------------
+# edso_done_gate.plan.md: the done-gate (_verify_before_finish)
+# --------------------------------------------------------------------------
+
+def _gate_state():
+    return {"struct_tries": 0, "length_surfaced": False, "reviewed": False}
+
+
+def _clean_doc():
+    """A document `observe.validate` finds structurally clean (real file_id,
+    non-empty span within the file's known duration) -- so tests that stub
+    `observe.diagnose` actually reach the diagnose-based checks instead of
+    tripping the (unmocked, real) structural check first."""
+    return {"timeline": [{"seg_id": "s", "file_id": "ffffffff-1111", "in_ms": 0, "out_ms": 1000}],
+           "operations": [], "brief": {}}
+
+
+def test_gate_blocks_structural_error():
+    ctx = _ctx(_struct())
+    doc = {"timeline": [{"seg_id": "s0", "file_id": "ffffffff-1111",
+                         "in_ms": 0, "out_ms": 0}],  # empty span -> validate flags it
+           "operations": [], "brief": {}}
+    st = _gate_state()
+    fb = tools._verify_before_finish(doc, ctx, st, [])
+    assert fb and "structural" in fb.lower(), fb
+    assert st["struct_tries"] == 1, st
+    print("ok  gate: structural error forces a fix before finishing")
+
+
+def test_gate_clean_doc_finishes():
+    ctx = _ctx(_struct())
+    assert tools._verify_before_finish({"timeline": [], "operations": [], "brief": {}},
+                                       ctx, _gate_state(), []) is None
+    print("ok  gate: clean/empty edit finishes without nagging")
+
+
+def test_gate_length_is_fix_or_justify_once():
+    ctx = _ctx(_struct())
+    orig = observe.diagnose
+    observe.diagnose = lambda *a, **k: [
+        {"severity": "warn", "anchor": "whole", "message": "over target: 8.0s vs 5.0s"}]
+    try:
+        st = _gate_state()
+        fb1 = tools._verify_before_finish(_clean_doc(), ctx, st, [])
+        assert fb1 and "length" in fb1.lower() and st["length_surfaced"], fb1
+        fb2 = tools._verify_before_finish(_clean_doc(), ctx, st, [])
+        assert fb2 is None, fb2          # surfaced once; do not nag again
+    finally:
+        observe.diagnose = orig
+    print("ok  gate: over-target length is surfaced once (fix-or-justify)")
+
+
+def test_gate_advisory_review_skipped_when_already_diagnosed():
+    ctx = _ctx(_struct())
+    orig = observe.diagnose
+    observe.diagnose = lambda *a, **k: [
+        {"severity": "warn", "anchor": "cuts 1-2", "message": "same speaker back-to-back"}]
+    try:
+        st = _gate_state()
+        fb = tools._verify_before_finish(_clean_doc(), ctx, st, [])
+        assert fb and "advisory" in fb.lower() and st["reviewed"], fb
+        st2 = _gate_state()
+        fb2 = tools._verify_before_finish(_clean_doc(), ctx, st2,
+                                          ["place", "diagnose"])
+        assert fb2 is None, fb2          # brain self-reviewed -> no forced nudge
+    finally:
+        observe.diagnose = orig
+    print("ok  gate: advisory review fires once, skipped if brain already diagnosed")
+
+
+def test_gate_forces_length_reconcile_end_to_end():
+    ctx = _ctx(_struct())
+    doc = _seed_doc()
+    doc["brief"]["target_duration_s"] = 5      # the 8s edit will be over target (>1.2x)
+    script = [
+        [ToolCall(id="t1", name="place", input={"ref": "ffffffff:m00", "level": "balanced"})],
+        [ToolCall(id="t2", name="place", input={"ref": "ffffffff:m01", "level": "balanced"})],
+        "Placed both -- about 8 seconds.",                       # finish attempt #1
+        "Both beats are essential, so I'm keeping it at ~8s.",   # justify -> finish
+    ]
+    llm = _ScriptedLLM(script)
+    res = tools.run_edit_loop(llm, system="sys",
+                              messages=[{"role": "user", "content": "cut a 5s teaser"}],
+                              ctx=ctx, document=doc)
+    assert "keeping it" in res.reply, res.reply
+    assert llm.calls == 4, llm.calls           # the gate bought exactly one extra turn
+    print("ok  gate: over-target forces one length reconcile, then finishes")
+
+
 def main():
     test_loop_reads_then_places_then_replies()
     test_loop_pure_chat_no_change()
@@ -220,6 +316,11 @@ def main():
     test_normalize_questions_still_drops_under_two_options()
     test_normalize_questions_no_recommendation_omits_the_keys()
     test_loop_split_screen_after_answer()
+    test_gate_blocks_structural_error()
+    test_gate_clean_doc_finishes()
+    test_gate_length_is_fix_or_justify_once()
+    test_gate_advisory_review_skipped_when_already_diagnosed()
+    test_gate_forces_length_reconcile_end_to_end()
     print("\nall tool-loop tests passed")
 
 
