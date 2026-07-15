@@ -16,12 +16,14 @@ sparse or that disagrees with everyone stays its own person (over-splitting
 is the safe failure mode, not a wrong merge -- see identity_map.plan.md's
 "Known 1%", carried over unchanged).
 
-Every resulting person is ranked by PROMINENCE (how often they appear,
-whether they co-occur with speech, how large the cut's framing tends to be)
-and the top few are the shoot's "majors" -- named, described persons the
-cast table lists. Everyone else is still a real, distinct global id (an
-"other"), just not cast-table-worthy. A single cut with too many
-simultaneous people (a crowd shot) is excluded from clustering entirely --
+Every resulting person becomes a full, named cast-table member -- the cast
+table is UNCAPPED (as large as the shoot's real, distinct-clustered cast),
+so a five-person panel keeps all five just as a two-host podcast keeps both.
+A PROMINENCE signal (how often a person appears, whether they co-occur with
+speech, how large the cut's framing tends to be) is still computed for
+ordering, but no real person is ever hidden behind a fixed ceiling. A single
+cut with too many simultaneous people (a crowd shot) is excluded from
+clustering entirely --
 no basis to tell individuals apart occurrence by occurrence, and forcing an
 id per face there would be noise, not signal.
 """
@@ -123,10 +125,13 @@ def _normalize_fp(fp: Dict[str, str]) -> Dict[str, str]:
 # them are clustered or assigned a person id (identity_map.plan.md's "never
 # fabricate" stance, extended to crowds).
 CROWD_SIZE = 6
-# The shoot's "majors" (named cast-table entries, ranked by prominence);
-# everyone else is still a real, distinct person -- just an anonymous
-# "other" in the cast table, not a headline member.
-MAX_MAJORS = 3
+# The cast table is deliberately UNCAPPED: every reconciled person is a full,
+# named cast-table member (`is_major=True`), no matter how many the shoot has.
+# There used to be a top-N cap here (the "majors vs anonymous others" split),
+# but a fixed ceiling can't fit generic footage -- a five-person panel is as
+# valid as a two-host podcast. Correctness now rests entirely on the clustering
+# not over-splitting (its conservative, evidence-gated matching), not on hiding
+# real people behind a constant.
 
 # (file_id, source_ref, person_index within that cut's people[] list) --
 # uniquely identifies one visible-person sighting.
@@ -277,10 +282,10 @@ class Person:
     file_ids: List[str] = field(default_factory=list)
     appearance_count: int = 0
     is_major: bool = False
-    # Filled later by identity/apply.py (Phase F/G), once voice->person
-    # binding (identity/speaker_pass.py) has resolved which voice(s), if
-    # any, this person was confirmed speaking. Empty here -- Phase D never
-    # touches voices at all.
+    # Filled later by identity/apply.py, once voice->person binding
+    # (identity/voice_id.py, voice_id_pass.plan.md) has resolved which
+    # voice(s), if any, this person was confirmed speaking. Empty here --
+    # Phase D never touches voices at all.
     owned_voices: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -307,9 +312,8 @@ def build_persons(occurrence_person: Dict[OccurrenceKey, str], occurrences: List
     `description` prose seen across the cluster's occurrences (display
     only, never an identity claim); fingerprint = the union of the member
     occurrences' own fields (no conflicts possible, clustering already
-    required zero disagreement). Ranks the top `MAX_MAJORS` clusters by
-    prominence and marks them `is_major=True`, in place on the returned
-    dict."""
+    required zero disagreement). Every cluster is marked `is_major=True`
+    (the cast table is uncapped), in place on the returned dict."""
     by_key: Dict[OccurrenceKey, Occurrence] = {
         (occ.file_id, occ.source_ref, occ.person_index): occ for occ in occurrences
     }
@@ -340,8 +344,10 @@ def build_persons(occurrence_person: Dict[OccurrenceKey, str], occurrences: List
         persons[pid] = Person(person_id=pid, display=display, fingerprint=merged_fp,
                               file_ids=sorted(agg["file_ids"]), appearance_count=agg["appearance_count"])
 
-    ranked = sorted(agg_by_person.keys(), key=lambda pid: _prominence_key(agg_by_person[pid]), reverse=True)
-    for pid in ranked[:MAX_MAJORS]:
+    # Uncapped cast: every reconciled person is a full cast-table member. No
+    # one is demoted to an anonymous "other" (`_prominence_key` remains the
+    # definition of prominence, kept for ordering / diagnostics).
+    for pid in agg_by_person.keys():
         persons[pid].is_major = True
     return persons
 

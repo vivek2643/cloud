@@ -514,6 +514,25 @@ def test_to_pass2_cuts_empty_is_a_noop():
     print("ok  test_to_pass2_cuts_empty_is_a_noop")
 
 
+def test_to_pass2_cuts_caps_people_per_cut_keeping_the_first_most_prominent():
+    # Per-cut people ceiling: the model is asked to list most-prominent-first,
+    # and code caps the list to MAX_PEOPLE_PER_CUT regardless (a crowd/busy cut
+    # must not flood a single cut's roster). The project-wide cast table stays
+    # uncapped -- this only bounds how many any ONE cut contributes.
+    j = pass2.CutJudgment(
+        source_ref="video_group[0]", kind="video", file_id="f1", atom_ids=[0],
+        label="crowd", summary="a busy group shot",
+        people=[pass2.PersonLook(description=f"person {i}", position="center")
+                for i in range(7)],
+    )
+    cuts = pass2.to_pass2_cuts([j])
+    assert len(cuts[0].people) == pass2.MAX_PEOPLE_PER_CUT, cuts[0].people
+    # kept the FIRST (most-prominent-first) ones, in order
+    assert [p["description"] for p in cuts[0].people] == [
+        f"person {i}" for i in range(pass2.MAX_PEOPLE_PER_CUT)]
+    print("ok  test_to_pass2_cuts_caps_people_per_cut_keeping_the_first_most_prominent")
+
+
 def test_to_pass2_cuts_backfills_voice_ids_from_pass1_and_voice_map():
     # voice_first_identity.plan.md Phase C: voice_ids is deterministic --
     # Pass 1's own SpeechCut.speaker_ids (word-level diarization) for this
@@ -751,6 +770,7 @@ def main():
     test_no_cross_kind_ms_overlap_catches_a_speech_and_video_cut_overlapping()
     test_to_pass2_cuts_converts_every_field()
     test_to_pass2_cuts_empty_is_a_noop()
+    test_to_pass2_cuts_caps_people_per_cut_keeping_the_first_most_prominent()
     test_to_pass2_cuts_backfills_voice_ids_from_pass1_and_voice_map()
     test_to_pass2_cuts_voice_ids_empty_when_voice_unresolved()
     test_to_pass2_cuts_video_cut_never_gets_voice_ids()

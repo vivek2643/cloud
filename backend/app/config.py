@@ -129,14 +129,16 @@ class Settings(BaseSettings):
     # Only affects the gemini pass-2 path.
     ingest_pass2_thinking: str = "low"
 
-    # voice_first_identity.plan.md Phase F: the voice->face binding pass is a
-    # small, fixed Gemini call (a handful of calls per project, one per
+    # voice_id_pass.plan.md: the cast-blind voice->face lip-sync binding pass
+    # is a small, fixed Gemini call (a handful of calls per project, one per
     # voice) -- not provider-configurable like pass 2, since there is no
-    # Anthropic path for it. Same Flash-Lite thinking guardrail as pass 2
-    # (see ingest_pass2_thinking): stays "low" -- this call's schema is tiny
-    # (a per-window vote), but the lesson (never risk a runaway-thinking
-    # spiral on Flash-Lite) applies regardless of task size.
-    identity_speaker_pass_model: str = "gemini-3.1-flash-lite"
+    # Anthropic path for it. Plain Flash rather than Flash-Lite: this pass
+    # sends inline VIDEO+AUDIO clips (not stills), heavier than the still-image
+    # case Flash-Lite was validated for, and inline video/audio support on
+    # Flash-Lite is unconfirmed. Same thinking guardrail as pass 2 (see
+    # ingest_pass2_thinking): stays "low" regardless of task size.
+    identity_voice_id_model: str = "gemini-3.1-flash"
+    identity_voice_id_thinking: str = "low"
 
     @property
     def r2_endpoint(self) -> str:

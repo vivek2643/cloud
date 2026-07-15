@@ -36,8 +36,9 @@ if BACKEND not in sys.path:
 from app.config import get_settings  # noqa: E402
 from app.services.l3 import pass2  # noqa: E402
 from app.services.llm import client as ic  # noqa: E402
+from app.services.llm import gemini_client as gc  # noqa: E402
 from app.services.llm import ingest_gemini as ig  # noqa: E402
-from app.services.llm.base import text_block  # noqa: E402
+from app.services.llm.base import media_block, text_block  # noqa: E402
 from test_ingest_client import FakeBlock, FakeClient, FakeResponse  # noqa: E402
 
 
@@ -61,6 +62,23 @@ def _find_key(node, key, path=""):
         for i, v in enumerate(node):
             hits += _find_key(v, key, path + f"[{i}]")
     return hits
+
+
+# --------------------------------------------------------------------------
+# gemini_client._parts_for_content -- neutral block -> SDK Part conversion
+# --------------------------------------------------------------------------
+
+def test_media_block_becomes_a_from_bytes_part_with_its_mime_type():
+    import base64
+    types = _types()
+    raw = b"fake mp4 bytes"
+    content = [text_block("CLIP c0:"), media_block(base64.b64encode(raw).decode("ascii"), "video/mp4")]
+    parts = gc._parts_for_content(content, types, {})
+    assert len(parts) == 2
+    assert parts[0].text == "CLIP c0:"
+    assert parts[1].inline_data.data == raw
+    assert parts[1].inline_data.mime_type == "video/mp4"
+    print("ok  test_media_block_becomes_a_from_bytes_part_with_its_mime_type")
 
 
 def test_gemini_schema_strips_prefixitems_and_unsupported_keys():
@@ -640,6 +658,7 @@ def test_run_pass2_batch_omits_stable_blocks_when_a_cache_handle_is_active():
 
 
 def main():
+    test_media_block_becomes_a_from_bytes_part_with_its_mime_type()
     test_gemini_schema_strips_prefixitems_and_unsupported_keys()
     test_gemini_schema_tuple_becomes_fixed_length_number_array()
     test_gemini_schema_forces_non_empty_cuts()

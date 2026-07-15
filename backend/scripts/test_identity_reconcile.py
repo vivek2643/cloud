@@ -74,7 +74,7 @@ def test_cluster_occurrences_keeps_sparse_occurrences_separate():
     print("ok  test_cluster_occurrences_keeps_sparse_occurrences_separate")
 
 
-def test_build_persons_ranks_majors_by_prominence():
+def test_build_persons_marks_every_reconciled_person_a_cast_member():
     occs = []
     for i in range(3):    # person A: 3 appearances
         occs.append(_occ("f1", f"speech_cut[{i}]", 0,
@@ -85,7 +85,8 @@ def test_build_persons_ranks_majors_by_prominence():
     for i in range(2):    # person C: 2 appearances
         occs.append(_occ("f1", f"speech_cut[{i + 20}]", 0,
                          _app(apparent_gender="male", hair="short", facial_hair="moustache")))
-    # person D: 1 appearance -- must be the one excluded from majors
+    # person D: 1 appearance -- the least prominent, but with an uncapped cast
+    # table it is STILL a full cast member (no top-N cut).
     occs.append(_occ("f1", "speech_cut[30]", 0,
                      _app(apparent_gender="female", hair="short", facial_hair="stubble")))
 
@@ -94,10 +95,8 @@ def test_build_persons_ranks_majors_by_prominence():
     persons = rc.build_persons(occ_person, occs)
     assert len(persons) == 4, persons
     majors = {pid for pid, p in persons.items() if p.is_major}
-    assert len(majors) == rc.MAX_MAJORS, majors
-    d_pid = occ_person[("f1", "speech_cut[30]", 0)]
-    assert d_pid not in majors, (d_pid, majors)
-    print("ok  test_build_persons_ranks_majors_by_prominence")
+    assert majors == set(persons.keys()), majors
+    print("ok  test_build_persons_marks_every_reconciled_person_a_cast_member")
 
 
 def test_visible_persons_by_cut_groups_distinct_people_per_cut():
@@ -148,7 +147,7 @@ def main():
     test_cluster_occurrences_merges_zero_disagreement_enough_shared()
     test_cluster_occurrences_keeps_disagreeing_occurrences_separate()
     test_cluster_occurrences_keeps_sparse_occurrences_separate()
-    test_build_persons_ranks_majors_by_prominence()
+    test_build_persons_marks_every_reconciled_person_a_cast_member()
     test_visible_persons_by_cut_groups_distinct_people_per_cut()
     test_reconcile_excludes_crowd_cut_occurrences()
     test_reconcile_end_to_end_two_people_in_one_cut()

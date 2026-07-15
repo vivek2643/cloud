@@ -181,6 +181,16 @@ _CHANNEL_ALIASES = {
     "display": "shown", "scenery": "shown", "object": "shown",
 }
 
+# Per-cut people ceiling: list at most this many people PER CUT (the most
+# prominent), so a cut with a lot of people (a crowd, a busy background) stays a
+# tight, readable signal instead of an exhaustive roster the brain must wade
+# through. This is a PER-CUT cap only -- the project-wide cast table
+# (identity/reconcile.py) is uncapped and can hold as many distinct people as
+# the shoot really has; it just never sees more than this many from any single
+# cut. The prompt asks the model to order people most-prominent-first; this is
+# the deterministic backstop that enforces the ceiling regardless.
+MAX_PEOPLE_PER_CUT = 4
+
 
 class CutJudgment(BaseModel):
     source_ref: str                 # e.g. "speech_cut[2]" / "video_group[0]" -- joins back to pass 1
@@ -336,8 +346,9 @@ def to_pass2_cuts(
     assign_voices, computed once up front from L1 embeddings -- available
     before pass 2 ever runs). `speaker_person`/`on_camera` stay unset here:
     they need the whole project's voice->person binding
-    (identity/speaker_pass.py), which can't run until every batch's cuts
-    are assembled -- `identity/apply.py` sets them afterward. `pass1`/
+    (identity/voice_id.py, voice_id_pass.plan.md), which can't run until
+    every batch's cuts are assembled -- `identity/apply.py` sets them
+    afterward. `pass1`/
     `voice_of` default to None/empty so existing callers (and every test
     that doesn't care about voice identity) are unaffected -- voice_ids is
     then simply empty for every cut, same as before this field existed."""
@@ -361,7 +372,7 @@ def to_pass2_cuts(
             framing=j.framing, look=j.look, caption_zones=j.caption_zones,
             taste_fences=j.taste_fences, readability_ms=j.readability_ms,
             natural_sound=j.natural_sound, channel=j.channel,
-            people=[p.model_dump() for p in j.people],
+            people=[p.model_dump() for p in j.people[:MAX_PEOPLE_PER_CUT]],
             screen_text=j.screen_text,
             voice_ids=voice_ids,
         ))
@@ -527,12 +538,16 @@ _SYSTEM = (
     "image you were shown for that cut), taste fences (max/min tasteful "
     "playback speed for this content), and readability_ms (how long a "
     "viewer needs to read this frame if it holds as a still)\n\n"
-    "Also list `people`: every person visible in the cut with a concise "
-    "description that would let someone recognise them again across cuts "
-    "(apparent gender/age, hair, facial hair, clothing/colour, anything "
-    "distinctive) and their rough frame position (left/center/right). No "
-    "people on screen -> empty list. Describe appearance only; never guess "
-    "names, never judge who is speaking, and never assign any score.\n\n"
+    "Also list `people`: the people who MATTER in this cut -- at most the "
+    "FOUR most prominent (largest / most central / in the foreground), listed "
+    "MOST-PROMINENT FIRST -- each with a concise description that would let "
+    "someone recognise them again across cuts (apparent gender/age, hair, "
+    "facial hair, clothing/colour, anything distinctive) and their rough frame "
+    "position (left/center/right). If the cut is a crowd, list only its few "
+    "foreground figures and say 'crowd'/'group' in the summary rather than "
+    "trying to enumerate everyone. No people on screen -> empty list. Describe "
+    "appearance only; never guess names, never judge who is speaking, and "
+    "never assign any score.\n\n"
     "Each person ALSO gets a structured `appearance` (nested inside that "
     "person, alongside description/position): apparent_gender, "
     "apparent_age_band, hair, hair_color, facial_hair, glasses, skin_tone, "

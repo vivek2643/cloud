@@ -1,7 +1,9 @@
 """
 End-to-end tests for the identity orchestrator (app.services.l3.identity.
-apply) -- no DB, no R2, NO REAL API CALLS. Mocks frame extraction and the
-Gemini SDK client (same pattern test_identity_speaker_pass.py uses).
+apply) -- no DB, no R2, no model call. voice_id_pass.plan.md moved the
+model call (and clip extraction) upstream into Track A/B of ingest.py, so
+apply.run is now pure code: it takes Track B's already-computed clip
+verdicts directly and reconciles them against Track A's face clustering.
 
 Run:  .venv/bin/python scripts/test_identity_apply.py
 """
@@ -9,7 +11,6 @@ from __future__ import annotations
 
 import os
 import sys
-from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BACKEND = os.path.dirname(HERE)
@@ -18,27 +19,8 @@ if BACKEND not in sys.path:
 
 from app.services.l3 import pass2  # noqa: E402
 from app.services.l3.identity import apply as identity_apply  # noqa: E402
+from app.services.l3.identity import voice_id as vid  # noqa: E402
 from app.services.l3.lattice import Lattice  # noqa: E402
-from app.services.llm import ingest_gemini as ig  # noqa: E402
-
-
-def _types():
-    from google.genai import types
-    return types
-
-
-class _FakeUsageMD:
-    prompt_token_count = 100
-    candidates_token_count = 20
-    cached_content_token_count = 0
-    thoughts_token_count = 0
-
-
-class _FakeGeminiResp:
-    def __init__(self, text):
-        self.text = text
-        self.usage_metadata = _FakeUsageMD()
-        self.candidates = []
 
 
 def _lat():
@@ -63,6 +45,10 @@ def _app(**kw):
     return base
 
 
+def _verdict(voice, clip_id, verdict, center_ms):
+    return vid.ClipVerdict(voice=voice, clip_id=clip_id, file_id="f1", verdict=verdict, center_ms=center_ms)
+
+
 def test_run_binds_two_speakers_and_derives_on_camera():
     cuts = [
         _cut("speech_cut[0]", (0, 19), ["V0"],
@@ -73,31 +59,12 @@ def test_run_binds_two_speakers_and_derives_on_camera():
     pass2_output = pass2.Pass2Output(cuts=cuts)
     lattices = {"f1": _lat()}
     voice_of = {("f1", "S0"): "V0", ("f1", "S1"): "V1"}
-    turns_by_file = {"f1": [(0, 2000, "S0"), (2500, 4500, "S1")]}
-    audio_by_file = {"f1": {"rms_db": [-20.0] * 100, "hop_ms": 50}}
-    motion_by_file = {"f1": {"blur": [0.3] * 100, "hop_ms": 50}}
-    proxy_key_by_file = {"f1": "proxy-key"}
+    verdicts = [
+        _verdict("V0", "V0:c0:f1", "speaking", 50),      # inside speech_cut[0]'s span
+        _verdict("V1", "V1:c0:f1", "speaking", 2550),    # inside speech_cut[1]'s span
+    ]
 
-    responses = iter([
-        '{"votes": [{"window_id": "V0:w0", "speaking_person": "P0"}]}',
-        '{"votes": [{"window_id": "V1:w0", "speaking_person": "P1"}]}',
-    ])
-
-    def fake_generate_content(model, contents, config):
-        return _FakeGeminiResp(next(responses))
-
-    fake_client = mock.Mock()
-    fake_client.models.generate_content = fake_generate_content
-
-    def fake_extract(planned_frames, proxy_key_by_file, width=768):
-        return {(f.file_id, f.ts_ms): "eA==" for f in planned_frames}   # valid b64 for "x"
-
-    with mock.patch.object(ig, "_sdk", return_value=(fake_client, _types())), \
-         mock.patch.object(identity_apply.fr, "extract_for_planned_frames", side_effect=fake_extract):
-        new_output, payload = identity_apply.run(
-            pass2_output, lattices, voice_of, turns_by_file,
-            audio_by_file, motion_by_file, proxy_key_by_file,
-        )
+    new_output, payload = identity_apply.run(pass2_output, lattices, voice_of, verdicts)
 
     assert len(payload["persons"]) == 2, payload["persons"]
     assert payload["voice_owner"] == {"V0": "P0", "V1": "P1"}, payload["voice_owner"]
@@ -111,25 +78,16 @@ def test_run_binds_two_speakers_and_derives_on_camera():
 
 
 def test_run_leaves_a_narrator_voice_unbound_and_off_camera():
-    # V0 has a turn but NO covering cut/visible person anywhere -> pure
-    # narration. speaker_person/on_camera must stay unset, never guessed.
+    # V0 has voice_ids on its cut but NO visible person anywhere (pure
+    # narration) -- speaker_person/on_camera must stay unset, never guessed.
     cuts = [_cut("speech_cut[0]", (0, 19), ["V0"], _app())]
-    # Strip the person off this cut entirely -- nothing to see.
     cuts[0] = cuts[0].model_copy(update={"people": []})
     pass2_output = pass2.Pass2Output(cuts=cuts)
     lattices = {"f1": _lat()}
     voice_of = {("f1", "S0"): "V0"}
-    turns_by_file = {"f1": [(0, 2000, "S0")]}
-    audio_by_file = {"f1": {"rms_db": [-20.0] * 100, "hop_ms": 50}}
-    motion_by_file = {"f1": {"blur": [0.3] * 100, "hop_ms": 50}}
-    proxy_key_by_file = {"f1": "proxy-key"}
 
-    with mock.patch.object(identity_apply.fr, "extract_for_planned_frames") as mocked_extract:
-        new_output, payload = identity_apply.run(
-            pass2_output, lattices, voice_of, turns_by_file,
-            audio_by_file, motion_by_file, proxy_key_by_file,
-        )
-    mocked_extract.assert_not_called()   # no bursts planned -> nothing to extract
+    new_output, payload = identity_apply.run(pass2_output, lattices, voice_of, [])
+
     assert payload["persons"] == [], payload["persons"]
     assert payload["off_camera_voices"] == ["V0"], payload["off_camera_voices"]
     assert new_output.cuts[0].speaker_person is None
@@ -137,9 +95,28 @@ def test_run_leaves_a_narrator_voice_unbound_and_off_camera():
     print("ok  test_run_leaves_a_narrator_voice_unbound_and_off_camera")
 
 
+def test_run_marks_a_voice_with_zero_verdicts_off_camera_via_full_roster():
+    # V1 is in voice_of (the full project roster) but never produced a
+    # single clip verdict (e.g. Track A had no clean window for it) -- it
+    # must still land in off_camera_voices, not silently vanish.
+    cuts = [_cut("speech_cut[0]", (0, 19), ["V0"],
+                _app(apparent_gender="male", hair="bald", facial_hair="beard"))]
+    pass2_output = pass2.Pass2Output(cuts=cuts)
+    lattices = {"f1": _lat()}
+    voice_of = {("f1", "S0"): "V0", ("f1", "S1"): "V1"}
+    verdicts = [_verdict("V0", "V0:c0:f1", "speaking", 50)]
+
+    _new_output, payload = identity_apply.run(pass2_output, lattices, voice_of, verdicts)
+
+    assert "V1" in payload["off_camera_voices"], payload["off_camera_voices"]
+    assert "V1" not in payload["voice_owner"], payload["voice_owner"]
+    print("ok  test_run_marks_a_voice_with_zero_verdicts_off_camera_via_full_roster")
+
+
 def main():
     test_run_binds_two_speakers_and_derives_on_camera()
     test_run_leaves_a_narrator_voice_unbound_and_off_camera()
+    test_run_marks_a_voice_with_zero_verdicts_off_camera_via_full_roster()
     print("\nall identity-apply tests passed")
 
 

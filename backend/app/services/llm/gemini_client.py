@@ -4,6 +4,7 @@ Gemini implementation of the neutral LLMClient (built, off by default).
 Maps neutral blocks to the google-genai SDK:
   text         -> {"text": ...}
   image        -> inline_data part (decoded bytes)
+  media        -> inline_data part (decoded bytes, arbitrary mime type e.g. video/mp4)
   tool_use     -> function_call part (assistant/"model" turn)
   tool_result  -> function_response part (correlated by tool name, since Gemini
                   keys results by function name rather than an id)
@@ -67,6 +68,9 @@ def _parts_for_content(content: Any, types, id_to_name: Dict[str, str]) -> List[
             parts.append(
                 types.Part.from_bytes(data=raw, mime_type=b.get("media_type", "image/jpeg"))
             )
+        elif btype == "media":
+            raw = base64.b64decode(b["data"])
+            parts.append(types.Part.from_bytes(data=raw, mime_type=b["media_type"]))
         elif btype == "tool_use":
             parts.append(
                 types.Part(

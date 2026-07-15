@@ -2,12 +2,12 @@
 Cross-clip voice clustering (voice_first_identity.plan.md Phase B): cluster
 per-file diarized speaker voiceprints (L1 diarization Phase A embeddings)
 into GLOBAL voices V0..Vn, so the same person's voice across different clips
-resolves to one identity -- the cross-clip spine `identity/speaker_frames.py`
-and `identity/speaker_pass.py` key off.
+resolves to one identity -- the cross-clip spine `identity/voice_id.py` keys
+off (voice_id_pass.plan.md).
 
 Deterministic cosine-similarity agglomeration, CONSERVATIVE threshold.
 Identity anchor is the PERSON (face; see `identity/reconcile.py`), and the
-voice binds TO the person (`identity/speaker_pass.py`) -- so if voice
+voice binds TO the person (`identity/voice_id.py`) -- so if voice
 clustering OVER-SPLITS (the same person sounds different in two clips), both
 fragments still bind to the same person later and self-heal. The only
 dangerous direction is voice MERGING two different people's voices, so this
