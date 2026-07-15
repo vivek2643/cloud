@@ -9,7 +9,6 @@ import {
   Plus,
   Loader2,
   AlertCircle,
-  Film,
   Layers,
   Music,
   Scissors,
@@ -862,15 +861,13 @@ function DocumentView({
       style={{ background: "var(--background)", borderColor: "var(--border)" }}
     >
       <div className="flex items-center justify-between">
-        <span className="flex items-center gap-1.5 font-semibold">
-          <Film size={14} style={{ color: "var(--accent)" }} />
-          Edit plan
-          {version != null && (
-            <span className="text-xs font-normal" style={{ color: "var(--muted)" }}>
-              v{version}
-            </span>
-          )}
-        </span>
+        {version != null ? (
+          <span className="text-xs" style={{ color: "var(--muted)" }}>
+            v{version}
+          </span>
+        ) : (
+          <span />
+        )}
         <span className="text-xs" style={{ color: "var(--muted)" }}>
           {timeline.length} cut{timeline.length === 1 ? "" : "s"} · {fmtClock(totalMs)}
         </span>
