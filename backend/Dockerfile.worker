@@ -33,6 +33,15 @@ WORKDIR /app/backend
 COPY backend/requirements.txt ./requirements.txt
 RUN pip install -r requirements.txt
 
+# Bake the insightface buffalo_sc pack (SCRFD detector + ArcFace embedder) into
+# the image so the L1 active-speaker pass never downloads weights at runtime.
+# insightface's default root is ~/.insightface (= /root/.insightface here) --
+# exactly where active_speaker.py's FaceAnalysis(name="buffalo_sc") looks at run
+# time -- and it is NOT the mounted /models volume, so a runtime fetch would
+# otherwise re-download on every container start. Layer sits above COPY backend
+# so code changes don't invalidate it.
+RUN python -c "from insightface.app import FaceAnalysis; a = FaceAnalysis(name='buffalo_sc', providers=['CPUExecutionProvider']); a.prepare(ctx_id=-1)"
+
 COPY backend/ /app/backend/
 
 # Stateless worker; no EXPOSE needed. Provide env at runtime (see docs).
