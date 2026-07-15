@@ -208,6 +208,42 @@ def _iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def _sample_frames(cap: "cv2.VideoCapture", step_ms: int):
+    """Yield (t_ms, frame) on a fixed 0, step_ms, 2*step_ms, ... grid by
+    decoding the clip SEQUENTIALLY: grab() cheaply walks every frame and
+    retrieve() only fully decodes the ones that land on the grid.
+
+    This replaces a per-sample `cap.set(CAP_PROP_POS_MSEC)` seek, which forces
+    ffmpeg to re-seek to a keyframe and re-decode from there on EVERY sample --
+    O(n^2)-ish on a long H.264 proxy (minutes-long clips took longer than real
+    time, and multi-hour footage on the fleet would be unusable). The emitted
+    timestamps are the same grid points the seek-per-sample loop used, so the
+    sampling (and every downstream ASD/audio alignment) is unchanged -- only
+    the decode strategy is."""
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    if src_fps <= 0:
+        src_fps = 30.0  # container without reliable fps; assume ~30 for a sane grid
+    next_ms = 0.0
+    idx = -1
+    while True:
+        if not cap.grab():
+            return
+        idx += 1
+        cur_ms = idx / src_fps * 1000.0
+        if cur_ms + 1e-6 < next_ms:
+            continue
+        ok, frame = cap.retrieve()
+        if not ok or frame is None:
+            next_ms += step_ms
+            continue
+        yield int(round(next_ms)), frame
+        next_ms += step_ms
+        # If frames were dropped and we've already passed later grid points,
+        # skip them rather than emitting a burst for one decoded frame.
+        while next_ms <= cur_ms:
+            next_ms += step_ms
+
+
 def _detect_and_track(video_path: str, face_app) -> List[_RawTrack]:
     """One pass at TRACK_SAMPLE_FPS: detect faces (+ embeddings, insightface
     gives both from one forward pass), IoU-link consecutive detections into
@@ -219,28 +255,12 @@ def _detect_and_track(video_path: str, face_app) -> List[_RawTrack]:
         return []
     try:
         step_ms = int(1000 / TRACK_SAMPLE_FPS)
-        n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
-        duration_ms = int(n_frames / fps * 1000) if fps > 0 and n_frames > 0 else 0
-
         active: List[_RawTrack] = []
         finished: List[_RawTrack] = []
         next_id = 0
-        t_ms = 0
         max_gap_ms = int(MAX_TRACK_GAP_S * 1000)
-        # Sanity guard against a container with no reliable frame count -- 6h
-        # is far beyond any real upload; stops a runaway loop, never a real limit.
-        hard_stop_ms = duration_ms if duration_ms > 0 else 6 * 3600 * 1000
 
-        while t_ms < hard_stop_ms:
-            cap.set(cv2.CAP_PROP_POS_MSEC, float(t_ms))
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                if duration_ms == 0:
-                    break   # no known duration -> this read failure IS end-of-stream
-                t_ms += step_ms
-                continue
-
+        for t_ms, frame in _sample_frames(cap, step_ms):
             dets: List[Tuple[Tuple[int, int, int, int], List[float]]] = []
             for f in face_app.get(frame):
                 x1, y1, x2, y2 = [int(v) for v in f.bbox]
@@ -275,7 +295,6 @@ def _detect_and_track(video_path: str, face_app) -> List[_RawTrack]:
                 (closed if (t_ms - tr.last_t_ms) > max_gap_ms else still_active).append(tr)
             finished.extend(closed)
             active = still_active
-            t_ms += step_ms
 
         finished.extend(active)
         return [tr for tr in finished if len(tr.frames) >= MIN_TRACK_FRAMES]
@@ -358,13 +377,10 @@ def _dense_motion_energy(
     prev_crop: Dict[int, np.ndarray] = {}
     energy: Dict[int, List[Tuple[int, float]]] = {tr.track_id: [] for tr in tracks}
     try:
-        t_ms = 0
-        while t_ms <= duration_ms:
-            cap.set(cv2.CAP_PROP_POS_MSEC, float(t_ms))
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                t_ms += step_ms
-                continue
+        # Same fixed step_ms grid as before, but via one sequential decode
+        # (see _sample_frames) instead of a seek per sample -- at ASD_SAMPLE_FPS
+        # the old per-sample POS_MSEC seek dominated the whole pass.
+        for t_ms, frame in _sample_frames(cap, step_ms):
             for tr in tracks:
                 box = _box_at(frames_by_track[tr.track_id], t_ms, tol_ms)
                 if box is None:
@@ -376,7 +392,6 @@ def _dense_motion_energy(
                     diff = float(np.abs(crop.astype(np.int16) - prev_crop[tr.track_id].astype(np.int16)).mean())
                     energy[tr.track_id].append((t_ms, diff))
                 prev_crop[tr.track_id] = crop
-            t_ms += step_ms
     finally:
         cap.release()
     return energy
