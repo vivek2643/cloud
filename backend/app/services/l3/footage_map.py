@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import get_settings
@@ -106,7 +107,11 @@ logger = logging.getLogger(__name__)
 # a terse one-liner instead of the full rich line. Non-junk moments show their
 # own `cut:N/of` position + weld marks (↔ weldable / ⋯ hard) to each neighbor,
 # read off the persisted `continuity` (see cuts_v3_continuity.plan.md).
-TREE_VERSION = 19
+# v20: speech moments (channel == "said") carry `said_text` -- the verbatim
+# dialogue_segments transcript over the cut's own span (beat_transcript.
+# plan.md), joined at tree-build time so the resident line can quote the
+# actual words instead of just the vision-model paraphrase.
+TREE_VERSION = 20
 
 # Two moments are one continuous source run when the next starts within this gap
 # of where the previous ended (back-to-back in the original footage). Loose
@@ -262,6 +267,13 @@ def build_clip_tree(
             anchor = _flat_variant(cut)
             variants[anchor["level"]] = anchor
 
+        # beat_transcript.plan.md: the verbatim words for a speech beat's OWN
+        # span (never padded, unlike Tier-1's _span_detail window) -- reused
+        # by _moment_line to quote the actual dialogue instead of just the
+        # vision-model paraphrase. '' for a non-speech beat (never fabricated).
+        said_text = (_said_text_for_span(file_id, anchor["in_ms"], anchor["out_ms"])
+                    if cut.get("channel") == "said" else "")
+
         moments.append({
             "moment_id": f"{fid8}:m{idx:02d}",
             "file_id": file_id,
@@ -293,6 +305,9 @@ def build_clip_tree(
             "visible_persons": cut.get("visible_persons") or [],
             "on_camera": cut.get("on_camera"),
             "gist": cut.get("label") or "",
+            # beat_transcript.plan.md: verbatim dialogue_segments transcript
+            # over this speech beat's own span -- '' for a non-speech beat.
+            "said_text": said_text,
             "flags": cut.get("flags") or [],
             # Source-audio facet for video cuts: what's on the track ("speech"/
             # "ambient") and whether it's muted by default (stray speech under a
@@ -751,16 +766,31 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     pic = _pic_segment(m)
     snd = _snd_segment(m)
     gist = (m.get("gist") or "").strip().replace("\n", " ")
+    # beat_transcript.plan.md: a speech beat quotes the VERBATIM words first
+    # (what the brain should actually read to choose dialogue/takes) -- the
+    # vision-model gist rides along as a short secondary note (vis:"...")
+    # rather than being dropped. A beat with no transcript (older footage, no
+    # dialogue_segments row) falls back to the gist as the primary quote,
+    # exactly like before this plan.
+    said = (m.get("said_text") or "").strip().replace("\n", " ")
+    primary = said or gist
     # Resident mode gives the model the FULL line so it picks by reading, not
     # guessing; compact (paged) mode truncates and relies on inspect_moment.
-    if compact and len(gist) > 80:
-        gist = gist[:77] + "..."
+    if compact and len(primary) > 80:
+        primary = primary[:77] + "..."
+    vis_tag = f" vis:\"{_short_gist(gist)}\"" if said and gist else ""
     # A graphic's gist, only when speech doesn't already narrate it (else it's
     # redundant -- the brain hears it). Short tag; full text via inspect_moment.
     gloss = ""
     summ = (m.get("summary") or "").strip().replace("\n", " ")
     if summ and not m.get("summary_covered_by_speech"):
         gloss = f" graphic:\"{_short_gist(summ)}\""
+    # Delivery quality (crispness+loudness) for a speech beat -- camera-
+    # independent, so it's the same across an outlook group's angles: a clean
+    # "which take sounds best" signal alongside PIC's own q.XX (visual) score.
+    aud_tag = ""
+    if m.get("channel") == "said" and m.get("speech_quality") is not None:
+        aud_tag = f" aud:{float(m['speech_quality']):.2f}"
     # Legible on-screen text/graphics the model read off the pixels (slide,
     # lower-third, UI, title) -- distinct from the action gloss; rendered only
     # when present so text-free footage stays terse. "" on a pre-migration cut.
@@ -785,7 +815,8 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     alt = _alt_pic_segment(m)
     return (f"  {m['moment_id'].split(':')[-1]} {_capture_tag(m)} {pic} {snd} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])} {_dur_tag(m)}] "
-            f"\"{gist}\"{gloss}{scr_tag} · nrg:{nrg}{pace_tag}{cam_tag}{peak_tag}{outlook_tag}{cut_tag}{run}{alt}")
+            f"\"{primary}\"{vis_tag}{gloss}{scr_tag} · "
+            f"nrg:{nrg}{aud_tag}{pace_tag}{cam_tag}{peak_tag}{outlook_tag}{cut_tag}{run}{alt}")
 
 
 def _clip_block(tree: Dict[str, Any], *, compact: bool = False) -> str:
@@ -980,6 +1011,60 @@ def _as_doc(v: Any) -> Dict[str, Any]:
     return {}
 
 
+@lru_cache(maxsize=512)
+def _sentences_for_file(file_id: str) -> Tuple[Dict[str, Any], ...]:
+    """This file's `dialogue_segments` sentences (verbatim, speaker-labeled,
+    sentence granularity) -- the raw material both `_span_detail` (Tier-1,
+    padded window) and `build_clip_tree` (resident `said_text`, exact beat
+    span) join into text. One DB read per file for the life of this process
+    (`dialogue_segments` is immutable once L1 writes it, so no invalidation
+    concern -- unlike the tree cache, which DOES need one). Best-effort:
+    a missing/unreadable row yields an empty tuple, never a hard failure.
+    Returns a tuple (not a list) so the result is hashable for lru_cache."""
+    try:
+        with _pg_conn() as conn:
+            row = conn.execute(
+                "select segments from dialogue_segments where file_id = %s",
+                (file_id,),
+            ).fetchone()
+    except Exception:
+        logger.exception("_sentences_for_file: load failed for %s", file_id)
+        return ()
+    if not row:
+        return ()
+    segments = _as_doc(row[0])
+    return tuple(segments.get("sentence") or [])
+
+
+def _sentence_span(s: Dict[str, Any]) -> Tuple[int, int]:
+    try:
+        return int(s.get("src_in_ms", s.get("in_ms", 0)) or 0), int(s.get("src_out_ms", s.get("out_ms", 0)) or 0)
+    except (TypeError, ValueError):
+        return 0, 0
+
+
+def _said_text_for_span(file_id: str, in_ms: int, out_ms: int) -> str:
+    """Verbatim transcript for a SPEECH beat's own span (no padding, unlike
+    `_span_detail`'s Tier-1 window) -- the words actually spoken, joined into
+    one string for the resident beat line. Speaker labels are prefixed only
+    when the beat spans more than one speaker (post speaker-change-split,
+    almost always exactly one) -- otherwise just the words, since repeating
+    a lone speaker's name on every beat would be noise. '' when this file has
+    no transcript, or none of it overlaps the span (never a fabricated line)."""
+    in_span = sorted(
+        (s for s in _sentences_for_file(file_id) if _overlap_ms(*_sentence_span(s), in_ms, out_ms) > 0),
+        key=lambda s: _sentence_span(s)[0],
+    )
+    if not in_span:
+        return ""
+    speakers = {s.get("speaker") for s in in_span if s.get("speaker")}
+    if len(speakers) > 1:
+        parts = [f"{s.get('speaker')}: {(s.get('text') or '').strip()}" for s in in_span]
+    else:
+        parts = [(s.get("text") or "").strip() for s in in_span]
+    return " ".join(p for p in parts if p)
+
+
 # Context window padding when retrieving raw detail for a span -- a little before
 # and after the moment so the brain reads it in situ, not abruptly clipped.
 _DETAIL_PAD_MS = 1200
@@ -993,35 +1078,16 @@ def _span_detail(file_id: str, in_ms: int, out_ms: int) -> Dict[str, Any]:
     fewer fields."""
     lo, hi = in_ms - _DETAIL_PAD_MS, out_ms + _DETAIL_PAD_MS
 
-    def _ov(a0: Any, a1: Any) -> bool:
-        try:
-            return _overlap_ms(int(a0), int(a1), lo, hi) > 0
-        except Exception:
-            return False
-
-    out: Dict[str, Any] = {"transcript": []}
-    try:
-        with _pg_conn() as conn:
-            row = conn.execute(
-                "select segments from dialogue_segments where file_id = %s",
-                (file_id,),
-            ).fetchone()
-    except Exception:
-        logger.exception("moment_detail: span detail load failed for %s", file_id)
-        return out
-    if not row:
-        return out
-    segments = _as_doc(row[0])
-
     # Verbatim transcript window (sentence granularity) -- the words actually
     # spoken across the span, so the brain reads the line, not just the gist.
-    out["transcript"] = [
-        {"speaker": s.get("speaker"), "text": s.get("text"),
-         "in_ms": s.get("src_in_ms", s.get("in_ms")), "out_ms": s.get("src_out_ms", s.get("out_ms"))}
-        for s in (segments.get("sentence") or [])
-        if _ov(s.get("src_in_ms", s.get("in_ms", 0)), s.get("src_out_ms", s.get("out_ms", 0)))
-    ]
-    return out
+    return {
+        "transcript": [
+            {"speaker": s.get("speaker"), "text": s.get("text"),
+             "in_ms": s.get("src_in_ms", s.get("in_ms")), "out_ms": s.get("src_out_ms", s.get("out_ms"))}
+            for s in _sentences_for_file(file_id)
+            if _overlap_ms(*_sentence_span(s), lo, hi) > 0
+        ]
+    }
 
 
 def moment_detail(file_id: str, moment_id: str) -> Optional[Dict[str, Any]]:

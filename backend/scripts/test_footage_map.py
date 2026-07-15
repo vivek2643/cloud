@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import sys
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BACKEND = os.path.dirname(HERE)
@@ -18,6 +19,16 @@ if BACKEND not in sys.path:
 
 from app.services.l3 import footage_map as fm  # noqa: E402
 from app.services.l3.arrange import _MapIndex  # noqa: E402
+
+# This module is explicitly "no DB" (see module docstring): build_clip_tree
+# now calls _said_text_for_span -> _sentences_for_file for every "said" cut
+# (beat_transcript.plan.md), which would otherwise hit a real Postgres
+# connection. Replace it process-wide with an empty-transcript stub -- the
+# same observable result as "no dialogue_segments row for this file" -- so
+# every existing test keeps its pre-transcript behavior (said_text="" ->
+# falls back to the visual gist) with zero DB touches. Tests that exercise
+# the new transcript rendering override it locally via mock.patch.object.
+fm._sentences_for_file = lambda file_id: ()
 
 
 def _rung(level, in_ms, out_ms, text="", score=0.5, spans=None):
@@ -242,6 +253,116 @@ def test_said_beat_on_listener_camera_reads_pic_first_with_alt_pic():
     assert line.index("PIC:") < line.index("SND:"), line
     assert "·alt-PIC:P2→1aedb093:m13" in line, line
     print("ok  test_said_beat_on_listener_camera_reads_pic_first_with_alt_pic")
+
+
+def test_said_beat_with_transcript_quotes_verbatim_text_first():
+    """beat_transcript.plan.md: a speech beat's PRIMARY quote is now the
+    verbatim dialogue_segments text, not the vision-model gist -- but the
+    gist still rides along as a short vis:"..." note, never dropped."""
+    cut = _cut("f:tr0", 1000, 4000, "we shipped it fast", channel="said", score=0.6,
+               ladder=[_rung("balanced", 1000, 4000, "we shipped it fast", 0.6)])
+    sentences = ({"speaker": "S0", "text": "we actually shipped it in three days flat",
+                 "src_in_ms": 1000, "src_out_ms": 4000},)
+    with mock.patch.object(fm, "_sentences_for_file", return_value=sentences):
+        tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    m = tree["moments"][0]
+    assert m["said_text"] == "we actually shipped it in three days flat", m["said_text"]
+    line = fm._moment_line(m)
+    assert '"we actually shipped it in three days flat"' in line, line
+    assert 'vis:"we shipped it fast"' in line, line
+    assert line.index('"we actually shipped') < line.index("vis:"), line
+    print("ok  test_said_beat_with_transcript_quotes_verbatim_text_first")
+
+
+def test_said_beat_shows_aud_tag_from_speech_quality():
+    """speech_quality (delivery, camera-independent) surfaces as its own
+    aud: tag alongside PIC's own q.XX (visual) score."""
+    cut = _cut("f:tr1", 1000, 4000, "solid take", channel="said", score=0.6,
+               ladder=[_rung("balanced", 1000, 4000, "solid take", 0.6)], speech_quality=0.73)
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "aud:0.73" in line, line
+    print("ok  test_said_beat_shows_aud_tag_from_speech_quality")
+
+
+def test_aud_tag_absent_without_speech_quality():
+    cut = _cut("f:tr1b", 1000, 4000, "solid take", channel="said", score=0.6,
+               ladder=[_rung("balanced", 1000, 4000, "solid take", 0.6)])
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "aud:" not in line, line
+    print("ok  test_aud_tag_absent_without_speech_quality")
+
+
+def test_action_beat_never_gets_said_text():
+    """A done/shown beat's visual label stays primary, never overwritten by
+    transcript text that happens to overlap it in TIME -- said_text is only
+    ever computed for channel == 'said' cuts."""
+    cut = _cut("f:tr2", 1000, 3000, "nods thoughtfully", channel="done", subject="person",
+               score=0.6, ladder=[_rung("balanced", 1000, 3000, "nods thoughtfully", 0.6)])
+    sentences = ({"speaker": "S0", "text": "narration that happens to overlap in time",
+                 "src_in_ms": 1000, "src_out_ms": 3000},)
+    with mock.patch.object(fm, "_sentences_for_file", return_value=sentences):
+        tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    m = tree["moments"][0]
+    assert m["said_text"] == "", m["said_text"]
+    line = fm._moment_line(m)
+    assert '"nods thoughtfully"' in line, line
+    assert "narration that happens to overlap" not in line, line
+    print("ok  test_action_beat_never_gets_said_text")
+
+
+def test_said_beat_transcript_truncates_in_compact_mode():
+    """compact (paged) mode truncates the quote like today's gist; resident
+    mode shows it in full. The moment itself always stores the FULL text
+    (still reachable via moment_detail/_span_detail regardless of mode)."""
+    long_text = ("we shipped it in three days flat and honestly nobody thought "
+                "we could pull it off but the whole team just locked in")
+    assert len(long_text) > 80
+    cut = _cut("f:tr3", 1000, 4000, "short gist", channel="said", score=0.6,
+               ladder=[_rung("balanced", 1000, 4000, "short gist", 0.6)])
+    sentences = ({"speaker": "S0", "text": long_text, "src_in_ms": 1000, "src_out_ms": 4000},)
+    with mock.patch.object(fm, "_sentences_for_file", return_value=sentences):
+        tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    m = tree["moments"][0]
+    assert m["said_text"] == long_text, m["said_text"]
+    compact_line = fm._moment_line(m, compact=True)
+    assert "..." in compact_line, compact_line
+    assert long_text not in compact_line, compact_line
+    resident_line = fm._moment_line(m, compact=False)
+    assert long_text in resident_line, resident_line
+    print("ok  test_said_beat_transcript_truncates_in_compact_mode")
+
+
+def test_said_beat_with_no_transcript_falls_back_to_visual_gist():
+    """No dialogue_segments row for this file (older footage) -> graceful
+    fallback to the visual gist as the primary quote, exactly like before
+    this plan; no crash, no vis: tag (nothing to fold in separately)."""
+    cut = _cut("f:tr4", 1000, 4000, "we shipped it", channel="said", score=0.6,
+               ladder=[_rung("balanced", 1000, 4000, "we shipped it", 0.6)])
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    m = tree["moments"][0]
+    assert m["said_text"] == "", m["said_text"]
+    line = fm._moment_line(m)
+    assert '"we shipped it"' in line, line
+    assert "vis:" not in line, line
+    print("ok  test_said_beat_with_no_transcript_falls_back_to_visual_gist")
+
+
+def test_span_detail_pads_and_filters_via_shared_sentences_cache():
+    """_span_detail's refactor (beat_transcript.plan.md): it now reads
+    through the shared _sentences_for_file cache instead of its own inline
+    DB read, but keeps its OWN padded-window overlap filter (unlike
+    build_clip_tree's exact-span said_text) -- no behavior change there."""
+    sentences = (
+        {"speaker": "S0", "text": "just inside the pad", "src_in_ms": 200, "src_out_ms": 900},
+        {"speaker": "S0", "text": "far outside the span", "src_in_ms": 50000, "src_out_ms": 51000},
+    )
+    with mock.patch.object(fm, "_sentences_for_file", return_value=sentences):
+        detail = fm._span_detail("ffffffff-1111", 1000, 4000)
+    texts = [t["text"] for t in detail["transcript"]]
+    assert texts == ["just inside the pad"], texts
+    print("ok  test_span_detail_pads_and_filters_via_shared_sentences_cache")
 
 
 def test_alt_pic_absent_without_co_occurrence():
@@ -498,6 +619,13 @@ def main():
     test_map_text_lists_variants_no_atoms()
     test_reconciled_shows_face_and_cam_override()
     test_said_beat_on_listener_camera_reads_pic_first_with_alt_pic()
+    test_said_beat_with_transcript_quotes_verbatim_text_first()
+    test_said_beat_shows_aud_tag_from_speech_quality()
+    test_aud_tag_absent_without_speech_quality()
+    test_action_beat_never_gets_said_text()
+    test_said_beat_transcript_truncates_in_compact_mode()
+    test_said_beat_with_no_transcript_falls_back_to_visual_gist()
+    test_span_detail_pads_and_filters_via_shared_sentences_cache()
     test_alt_pic_absent_without_co_occurrence()
     test_done_beat_pic_first_parity_and_snd_silence()
     test_speaker_person_renders_on_cam_when_shown()
