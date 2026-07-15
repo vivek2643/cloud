@@ -808,6 +808,99 @@ def test_enforce_stamps_speaker_ids_from_word_diarization():
     print("ok  test_enforce_stamps_speaker_ids_from_word_diarization")
 
 
+def _spk_words(*pairs, wdur=1000):
+    """Words from (text, speaker) pairs on a back-to-back ``wdur``-ms grid."""
+    return [{"start_ms": i * wdur, "end_ms": (i + 1) * wdur, "text": t, "speaker": s}
+            for i, (t, s) in enumerate(pairs)]
+
+
+def test_split_at_speaker_changes_splits_a_real_turn():
+    # Two real turns lumped into one span -> split at the speaker change.
+    words = _spk_words(("launch", "S1"), ("today", "S1"), ("great", "S2"), ("design", "S2"))
+    assert pass1._split_at_speaker_changes(words, (0, 3)) == [(0, 1), (2, 3)]
+    print("ok  test_split_at_speaker_changes_splits_a_real_turn")
+
+
+def test_split_at_speaker_changes_folds_an_interior_backchannel():
+    # S1 holds the floor; S2 drops a "yeah" in the middle -> ONE beat, no cut.
+    words = _spk_words(("launch", "S1"), ("today", "S1"), ("yeah", "S2"),
+                       ("and", "S1"), ("tomorrow", "S1"))
+    assert pass1._split_at_speaker_changes(words, (0, 4)) == [(0, 4)]
+    print("ok  test_split_at_speaker_changes_folds_an_interior_backchannel")
+
+
+def test_split_at_speaker_changes_folds_a_trailing_backchannel():
+    words = _spk_words(("launch", "S1"), ("today", "S1"), ("yeah", "S2"))
+    assert pass1._split_at_speaker_changes(words, (0, 2)) == [(0, 2)]
+    # "right, exactly" -- multi-word, still all backchannel -> folded.
+    words2 = _spk_words(("launch", "S1"), ("today", "S1"), ("right", "S2"), ("exactly", "S2"))
+    assert pass1._split_at_speaker_changes(words2, (0, 3)) == [(0, 3)]
+    print("ok  test_split_at_speaker_changes_folds_a_trailing_backchannel")
+
+
+def test_split_at_speaker_changes_cuts_a_terse_real_answer():
+    # "No" is a real (terse) answer, NOT a backchannel token -> it cuts.
+    words = _spk_words(("agree", "S1"), ("no", "S2"))
+    assert pass1._split_at_speaker_changes(words, (0, 1)) == [(0, 0), (1, 1)]
+    print("ok  test_split_at_speaker_changes_cuts_a_terse_real_answer")
+
+
+def test_split_at_speaker_changes_folds_backchannel_but_cuts_the_real_turn():
+    # yeah (S2) folds into S1's beat; S2's later real turn splits off.
+    words = _spk_words(("launch", "S1"), ("today", "S1"), ("yeah", "S2"),
+                       ("and", "S1"), ("tomorrow", "S1"), ("actually", "S2"), ("disagree", "S2"))
+    assert pass1._split_at_speaker_changes(words, (0, 6)) == [(0, 4), (5, 6)]
+    print("ok  test_split_at_speaker_changes_folds_backchannel_but_cuts_the_real_turn")
+
+
+def test_enforce_splits_a_single_cut_at_a_bare_speaker_change():
+    # No atom in the speaker-change gap, so _seam_split can't split it -- the
+    # new speaker-change pass must, and stamp each turn's own voice.
+    lat = Lattice(file_id="f1", duration_ms=4000, turns=[], hints=[], atoms=[],
+                  words=_spk_words(("launch", "S1"), ("today", "S1"),
+                                   ("great", "S2"), ("design", "S2")))
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [{"file_id": "f1", "word_span": [0, 3], "label": "lumped beat"}],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    by_span = {tuple(sc.word_span): sc.speaker_ids for sc in fixed.speech_cuts}
+    assert sorted(by_span) == [(0, 1), (2, 3)], by_span
+    assert by_span[(0, 1)] == ["S1"] and by_span[(2, 3)] == ["S2"], by_span
+    print("ok  test_enforce_splits_a_single_cut_at_a_bare_speaker_change")
+
+
+def test_enforce_folds_a_backchannel_within_a_single_cut():
+    # A "yeah" (S2, 400ms) sits inside a long S1 beat -> stays ONE cut, and the
+    # sub-threshold S2 voice is dropped from attribution (_MINOR_VOICE_SHARE).
+    words = _spk_words(("launch", "S1"), ("today", "S1"), ("and", "S1"), ("tomorrow", "S1"))
+    words.insert(2, {"start_ms": 2000, "end_ms": 2400, "text": "yeah", "speaker": "S2"})
+    for k, w in enumerate(words):  # re-grid onto contiguous times after the insert
+        w["start_ms"], w["end_ms"] = k * 1000, k * 1000 + (400 if w["text"] == "yeah" else 1000)
+    lat = Lattice(file_id="f1", duration_ms=6000, turns=[], hints=[], atoms=[], words=words)
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [{"file_id": "f1", "word_span": [0, 4], "label": "one beat"}],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat})
+    assert [tuple(sc.word_span) for sc in fixed.speech_cuts] == [(0, 4)], fixed.speech_cuts
+    assert fixed.speech_cuts[0].speaker_ids == ["S1"], fixed.speech_cuts[0].speaker_ids
+    print("ok  test_enforce_folds_a_backchannel_within_a_single_cut")
+
+
+def test_enforce_splits_synced_file_at_speaker_change():
+    # Unlike the runt guard (skipped for synced files), the speaker-change split
+    # keys only on shared per-word speaker labels, so it's SAFE for outlook
+    # angles and still fires -- every angle splits identically.
+    lat = Lattice(file_id="f1", duration_ms=4000, turns=[], hints=[], atoms=[],
+                  words=_spk_words(("launch", "S1"), ("today", "S1"),
+                                   ("great", "S2"), ("design", "S2")))
+    out = pass1.Pass1Output.model_validate({
+        "speech_cuts": [{"file_id": "f1", "word_span": [0, 3], "label": "lumped"}],
+    })
+    fixed = pass1.enforce_lattice_partition(out, {"f1": lat}, outlook_file_ids={"f1"})
+    assert sorted(tuple(sc.word_span) for sc in fixed.speech_cuts) == [(0, 1), (2, 3)], fixed.speech_cuts
+    print("ok  test_enforce_splits_synced_file_at_speaker_change")
+
+
 def test_no_overlapping_speech_cuts():
     bad = pass1.Pass1Output.model_validate({
         "speech_cuts": [
@@ -881,6 +974,14 @@ def main():
     test_speaker_ids_for_span_orders_by_spoken_time_not_appearance()
     test_speaker_ids_for_span_drops_sub_threshold_backchannel()
     test_enforce_stamps_speaker_ids_from_word_diarization()
+    test_split_at_speaker_changes_splits_a_real_turn()
+    test_split_at_speaker_changes_folds_an_interior_backchannel()
+    test_split_at_speaker_changes_folds_a_trailing_backchannel()
+    test_split_at_speaker_changes_cuts_a_terse_real_answer()
+    test_split_at_speaker_changes_folds_backchannel_but_cuts_the_real_turn()
+    test_enforce_splits_a_single_cut_at_a_bare_speaker_change()
+    test_enforce_folds_a_backchannel_within_a_single_cut()
+    test_enforce_splits_synced_file_at_speaker_change()
     test_silent_trailing_word_is_folded_into_its_beat()
     test_isolated_silent_word_is_dropped()
     test_no_overlapping_speech_cuts()

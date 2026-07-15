@@ -130,7 +130,11 @@ _SYSTEM = (
     "ONLY when the footage between is continuous (no shot change, transition, "
     "or speaker change), so tag freely -- the deterministic guard blocks a "
     "wrong merge (e.g. it will NOT let a false start you flag as junk fuse "
-    "into the real line). Leave beat_id empty for a cut that stands alone.\n"
+    "into the real line). Code also SPLITS a cut at any real speaker change "
+    "(a listener's 'yeah'/'okay'/'right, exactly' stays folded in), so group "
+    "by meaning and don't fret about lumping a Q and its answer -- the turn "
+    "boundary is recovered for you. Leave beat_id empty for a cut that stands "
+    "alone.\n"
     "  - take_candidates: near-identical retakes of the same line (within or across "
     "clips); each member is one whole speech_cut.\n"
     "  - video_tentative_groups: visual moments worth keeping, each a group of "
@@ -331,6 +335,97 @@ def _speaker_ids_for_span(words: List[dict], span: Tuple[int, int]) -> List[str]
     kept = [ranked[0]]
     kept.extend(s for s in ranked[1:] if total > 0 and weight[s] / total >= _MINOR_VOICE_SHARE)
     return kept
+
+
+# Short acknowledgment/affirmation tokens a listener drops into whoever holds
+# the floor ("yeah", "okay", "right", "mm-hmm"). A run of ONLY these by the
+# OTHER speaker is TRANSPARENT to the speaker-change split below -- it stays
+# folded into the surrounding beat instead of forcing a cut. This is the whole
+# point of the split: a speaker change should cut ~always, EXCEPT a trivial
+# backchannel. Interjections that carry real content ("no", "wait", a question,
+# a real answer) are deliberately NOT here, so they DO cut. Hesitation fillers
+# (um/uh/mm) are already stripped upstream (l1/transcript.is_filler) and never
+# reach the lattice, so this is only the affirmations that survive as real
+# words. Mirrors l1/dialogue_segments.BACKCHANNEL_WORDS (kept local so pass 1's
+# enforcement has no cross-lens import).
+_BACKCHANNEL_WORDS = {
+    "yeah", "yea", "yeahyeah", "yep", "yup", "yes", "ya", "uhhuh", "mhm",
+    "mmhm", "mmhmm", "mm", "hmm", "huh", "okay", "ok", "kay", "right", "sure",
+    "exactly", "totally", "definitely", "absolutely", "correct", "gotcha",
+    "wow", "nice", "cool", "oh", "ah", "aha", "true",
+}
+# A same-speaker interjection at most this many words long, made up ENTIRELY of
+# backchannel tokens, is treated as a backchannel (not a turn). Longer runs, or
+# any run containing a content word, are a real turn and force a cut.
+_BACKCHANNEL_MAX_WORDS = 3
+
+
+def _bc_norm(text: str) -> str:
+    """Lowercase, letters/digits only -- 'mm-hmm' -> 'mmhmm', 'Yeah,' ->
+    'yeah', 'okay.' -> 'okay' -- so punctuation and hyphenation never hide a
+    backchannel token from ``_BACKCHANNEL_WORDS``."""
+    return "".join(_TAKE_WORD_RE.findall((text or "").lower()))
+
+
+def _is_backchannel_run(words: List[dict], lo: int, hi: int) -> bool:
+    """True if words[lo..hi] is a short run made up ENTIRELY of backchannel
+    tokens (``_BACKCHANNEL_WORDS``) -- an acknowledging "yeah"/"right, exactly"
+    a listener drops in, not a turn of their own."""
+    if hi - lo + 1 > _BACKCHANNEL_MAX_WORDS:
+        return False
+    toks = [_bc_norm(words[k].get("text") or "") for k in range(lo, hi + 1)]
+    return any(toks) and all(t in _BACKCHANNEL_WORDS for t in toks if t)
+
+
+def _split_at_speaker_changes(words: List[dict], span: Tuple[int, int]) -> List[Tuple[int, int]]:
+    """Split a word span into one piece per SUBSTANTIVE speaker turn: a real
+    speaker change becomes a cut boundary, but a short backchannel run
+    ("yeah"/"okay"/"right, exactly") by the OTHER speaker is TRANSPARENT -- it
+    stays folded into the surrounding beat rather than forcing a boundary.
+
+    Word-level diarization already knows exactly where the speaker changed, so
+    this is deterministic ground truth; the model tends to lump a Q+A or an
+    interjected turn into one span, and this recovers the turn boundary the
+    editor actually wants to cut on. Always returns >= 1 piece covering exactly
+    the same words, in order.
+
+    Keys ONLY on per-word ``speaker`` labels, which are shared by index across
+    a synced outlook group's angles (replicate_outlook_speech mirrors the
+    authoritative audio's words), so every angle splits identically -- the
+    byte-identical-span invariant group_outlooks relies on is preserved."""
+    a, b = span
+    lo = max(0, a)
+    hi = min(len(words) - 1, b)
+    if hi <= lo:
+        return [(a, b)]
+    # Contiguous runs of one speaker.
+    runs: List[Tuple[int, int, "str | None"]] = []
+    rs = lo
+    rspk = words[lo].get("speaker")
+    for i in range(lo + 1, hi + 1):
+        spk = words[i].get("speaker")
+        if spk != rspk:
+            runs.append((rs, i - 1, rspk))
+            rs, rspk = i, spk
+    runs.append((rs, hi, rspk))
+    if len(runs) == 1:
+        return [(a, b)]
+    # Walk runs; a backchannel run is transparent (doesn't change the current
+    # speaker or open a piece), a substantive run of a NEW speaker opens a cut.
+    pieces: List[Tuple[int, int]] = []
+    cur_start = a
+    cur_spk: "str | None" = None
+    for r_lo, r_hi, spk in runs:
+        if _is_backchannel_run(words, r_lo, r_hi):
+            continue
+        if cur_spk is None:
+            cur_spk = spk
+        elif spk != cur_spk:
+            pieces.append((cur_start, r_lo - 1))
+            cur_start = r_lo
+            cur_spk = spk
+    pieces.append((cur_start, b))
+    return pieces
 
 
 def _span_pieces(words: List[dict], atoms: List[Any], span: Tuple[int, int]) -> List[Tuple[int, int]]:
@@ -992,6 +1087,36 @@ def enforce_lattice_partition(
                 new_cuts.append(SpeechCut(file_id=file_id, word_span=(pa, pb),
                                           label="(recovered)", speaker_ids=[]))
             i = j
+
+    # Speaker-change split: a real speaker change is a cut boundary. The model
+    # routinely lumps a Q+A or an interjected turn into one span; word-level
+    # diarization already knows exactly where the speaker changed, so split
+    # there deterministically -- EXCEPT across a trivial backchannel
+    # ("yeah"/"okay"/"right, exactly") by the other speaker, which stays folded
+    # into the beat (``_split_at_speaker_changes``). Runs AFTER coverage fill
+    # (every word is now in some cut) and BEFORE beat-merge/runt-absorb: a
+    # speaker change is a HARD seam, so neither of those re-welds these pieces.
+    # Purely additive (only splits an existing cut, never merges two), and keyed
+    # only on per-word speaker labels -- shared by index across a synced outlook
+    # group's angles -- so it's safe to run for synced files too (every angle
+    # splits identically).
+    split_cuts: List[SpeechCut] = []
+    for sc in new_cuts:
+        lattice = lattices.get(sc.file_id)
+        if lattice is None or not lattice.words:
+            split_cuts.append(sc)
+            continue
+        pieces = _split_at_speaker_changes(lattice.words, tuple(sc.word_span))
+        if len(pieces) == 1:
+            split_cuts.append(sc.model_copy(update={"word_span": pieces[0]}))
+            continue
+        logger.info("pass1 enforce: splitting speech_cut %r words[%d-%d] into %d "
+                    "turn(s) at speaker changes", sc.label, sc.word_span[0],
+                    sc.word_span[1], len(pieces))
+        for j, (pa, pb) in enumerate(pieces, start=1):
+            label = f"{sc.label} ({j}/{len(pieces)})" if sc.label else sc.label
+            split_cuts.append(sc.model_copy(update={"word_span": (pa, pb), "label": label}))
+    new_cuts = split_cuts
 
     # Beat merge: fuse same-beat_id neighbours across a WELDABLE seam (the model
     # proposes with beat_id, code disposes via the deterministic seam guard).
