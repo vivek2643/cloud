@@ -45,42 +45,6 @@ def test_speaking_overlap_ms_sums_across_intervals():
 
 
 # --------------------------------------------------------------------------
-# _local_speaker_owner
-# --------------------------------------------------------------------------
-
-def test_local_speaker_owner_picks_the_most_overlapping_track():
-    tracks = {"f1": [_track(0, [(0, 900)]), _track(1, [(0, 100)])]}
-    track_to_person = {("f1", 0): "P0", ("f1", 1): "P1"}
-    owner = ba._local_speaker_owner("f1", [(0, 1000)], tracks, track_to_person)
-    assert owner == "P0", owner
-    print("ok  test_local_speaker_owner_picks_the_most_overlapping_track")
-
-
-def test_local_speaker_owner_sums_overlap_across_multiple_turns():
-    # Track 1 wins on total overlap across BOTH turns even though track 0
-    # wins the first turn alone.
-    tracks = {"f1": [_track(0, [(0, 600)]), _track(1, [(0, 400), (1000, 1900)])]}
-    track_to_person = {("f1", 0): "P0", ("f1", 1): "P1"}
-    owner = ba._local_speaker_owner("f1", [(0, 1000), (1000, 2000)], tracks, track_to_person)
-    assert owner == "P1", owner
-    print("ok  test_local_speaker_owner_sums_overlap_across_multiple_turns")
-
-
-def test_local_speaker_owner_none_when_no_track_overlaps():
-    tracks = {"f1": [_track(0, [(5000, 6000)])]}
-    track_to_person = {("f1", 0): "P0"}
-    owner = ba._local_speaker_owner("f1", [(0, 1000)], tracks, track_to_person)
-    assert owner is None, owner
-    print("ok  test_local_speaker_owner_none_when_no_track_overlaps")
-
-
-def test_local_speaker_owner_none_for_untracked_file():
-    owner = ba._local_speaker_owner("f-missing", [(0, 1000)], {}, {})
-    assert owner is None, owner
-    print("ok  test_local_speaker_owner_none_for_untracked_file")
-
-
-# --------------------------------------------------------------------------
 # bind (end to end)
 # --------------------------------------------------------------------------
 
@@ -137,8 +101,8 @@ def test_bind_ignores_turns_with_no_voice_mapping():
 
 
 def test_bind_majority_wins_when_one_file_disagrees_among_several():
-    # V0 = 3 (file, speaker) pairs voting P0, one voting P1 -- clear
-    # majority + margin, binds P0.
+    # V0 = 3 files' overlap points at P0, one at P1 -- P0's cumulative overlap
+    # (3000ms) clears the margin over P1 (1000ms), binds P0.
     turns_by_file = {f"f{i}": [(0, 1000, "S0")] for i in range(4)}
     voice_of = {(f"f{i}", "S0"): "V0" for i in range(4)}
     face_tracks_by_file = {f"f{i}": [_track(0, [(0, 1000)])] for i in range(4)}
@@ -150,19 +114,55 @@ def test_bind_majority_wins_when_one_file_disagrees_among_several():
     print("ok  test_bind_majority_wins_when_one_file_disagrees_among_several")
 
 
+def test_bind_magnitude_beats_equal_vote_tie_in_multicam_podcast():
+    # The real 2-person, single-face-per-camera podcast failure mode. Two
+    # cameras per person; each mic records BOTH voices, so each lone on-camera
+    # face is ASD-"speaking" over its whole clip and thus overlaps BOTH voices'
+    # turns. An equal per-file vote would tie every voice 2-2 (each voice draws
+    # one "owner" vote from P0's cameras and one from P1's) -> everything
+    # unbound. Magnitude aggregation instead sums overlap ms, so the true
+    # speaker wins: P0 accrues 200s on V0 vs 100s on V1; P1 the mirror.
+    def secs(*pairs):
+        return [(s * 1000, e * 1000) for s, e in pairs]
+
+    turns_by_file = {
+        # P0's cameras: V0 (S0) dominates the on-camera speaking.
+        "fA": [(0, 100_000, "S0"), (100_000, 190_000, "S1")],
+        "fB": [(0, 100_000, "S0"), (100_000, 110_000, "S1")],
+        # P1's cameras: V1 (S1) dominates.
+        "fC": [(0, 90_000, "S0"), (90_000, 190_000, "S1")],
+        "fD": [(0, 10_000, "S0"), (10_000, 110_000, "S1")],
+    }
+    voice_of = {(f, "S0"): "V0" for f in ("fA", "fB", "fC", "fD")}
+    voice_of.update({(f, "S1"): "V1" for f in ("fA", "fB", "fC", "fD")})
+    # One face per file, "speaking" over the WHOLE clip (mic carries both
+    # voices) -- so it overlaps both voices' turns, the exact ambiguity.
+    face_tracks_by_file = {
+        "fA": [_track(0, secs((0, 190)))],
+        "fB": [_track(0, secs((0, 110)))],
+        "fC": [_track(0, secs((0, 190)))],
+        "fD": [_track(0, secs((0, 110)))],
+    }
+    track_to_person = {
+        ("fA", 0): "P0", ("fB", 0): "P0",
+        ("fC", 0): "P1", ("fD", 0): "P1",
+    }
+    owner_by_voice, off_camera = ba.bind(turns_by_file, voice_of, face_tracks_by_file, track_to_person)
+    assert owner_by_voice == {"V0": "P0", "V1": "P1"}, owner_by_voice
+    assert off_camera == set(), off_camera
+    print("ok  test_bind_magnitude_beats_equal_vote_tie_in_multicam_podcast")
+
+
 def main():
     test_overlap_ms_partial_overlap()
     test_overlap_ms_no_overlap_is_zero()
     test_speaking_overlap_ms_sums_across_intervals()
-    test_local_speaker_owner_picks_the_most_overlapping_track()
-    test_local_speaker_owner_sums_overlap_across_multiple_turns()
-    test_local_speaker_owner_none_when_no_track_overlaps()
-    test_local_speaker_owner_none_for_untracked_file()
     test_bind_binds_two_clean_single_camera_voices()
     test_bind_unbound_when_a_voice_conflicts_across_files()
     test_bind_narrator_voice_has_no_vote_at_all()
     test_bind_ignores_turns_with_no_voice_mapping()
     test_bind_majority_wins_when_one_file_disagrees_among_several()
+    test_bind_magnitude_beats_equal_vote_tie_in_multicam_podcast()
     print("\nall identity-bind-asd tests passed")
 
 
