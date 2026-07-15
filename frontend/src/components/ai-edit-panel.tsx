@@ -525,8 +525,6 @@ export function AiEditPanel() {
           <QuestionCard questions={questions} onPick={(text) => handleSend(text)} />
         )}
 
-        {doc && <DocumentView doc={doc} version={thread?.document_version ?? null} />}
-
         {busy && (
           <div
             className="flex items-center gap-2 text-sm"
