@@ -748,14 +748,45 @@ def test_isolated_silent_word_is_dropped():
     print("ok  test_isolated_silent_word_is_dropped")
 
 
-def test_speaker_ids_for_span_distinct_first_appearance_order():
+def test_speaker_ids_for_span_dominant_first_no_timing_falls_back_to_counts():
+    # No word timings -> weight by raw word count. S1 (3 words) dominates S0
+    # (1 word, 25% >= 15% -> kept). Dominant listed first.
     words = [
         {"speaker": "S1"}, {"speaker": "S1"}, {"speaker": "S0"}, {"speaker": None}, {"speaker": "S1"},
     ]
     assert pass1._speaker_ids_for_span(words, (0, 4)) == ["S1", "S0"]
     assert pass1._speaker_ids_for_span(words, (2, 2)) == ["S0"]
     assert pass1._speaker_ids_for_span(words, (3, 3)) == []
-    print("ok  test_speaker_ids_for_span_distinct_first_appearance_order")
+    print("ok  test_speaker_ids_for_span_dominant_first_no_timing_falls_back_to_counts")
+
+
+def test_speaker_ids_for_span_orders_by_spoken_time_not_appearance():
+    # S0 speaks FIRST (3s, 30%) but S1 holds the floor (7s, 70%). Both clear
+    # the 15% bar, so both are kept -- but the dominant S1 must come first even
+    # though S0 appeared earlier, so speaker_person credits the real speaker.
+    words = [
+        {"speaker": "S0", "start_ms": 0, "end_ms": 3000},
+        {"speaker": "S1", "start_ms": 3000, "end_ms": 10000},
+    ]
+    assert pass1._speaker_ids_for_span(words, (0, 1)) == ["S1", "S0"]
+    print("ok  test_speaker_ids_for_span_orders_by_spoken_time_not_appearance")
+
+
+def test_speaker_ids_for_span_drops_sub_threshold_backchannel():
+    # A ~49s answer by S1 with a 400ms "yeah" from S0 (~0.8% of spoken time,
+    # well under 15%) -> S0 dropped, cut stays single-voice.
+    words = [
+        {"speaker": "S1", "start_ms": 0, "end_ms": 49000},
+        {"speaker": "S0", "start_ms": 49000, "end_ms": 49400},
+    ]
+    assert pass1._speaker_ids_for_span(words, (0, 1)) == ["S1"]
+    # A genuine ~40/60 two-person exchange keeps both (each >= 15%).
+    words2 = [
+        {"speaker": "S1", "start_ms": 0, "end_ms": 6000},
+        {"speaker": "S0", "start_ms": 6000, "end_ms": 10000},
+    ]
+    assert pass1._speaker_ids_for_span(words2, (0, 1)) == ["S1", "S0"]
+    print("ok  test_speaker_ids_for_span_drops_sub_threshold_backchannel")
 
 
 def test_enforce_stamps_speaker_ids_from_word_diarization():
@@ -846,7 +877,9 @@ def main():
     test_runt_guard_does_not_absorb_a_take_member()
     test_runt_guard_does_not_absorb_flagged_junk()
     test_runt_guard_skips_outlook_synced_files()
-    test_speaker_ids_for_span_distinct_first_appearance_order()
+    test_speaker_ids_for_span_dominant_first_no_timing_falls_back_to_counts()
+    test_speaker_ids_for_span_orders_by_spoken_time_not_appearance()
+    test_speaker_ids_for_span_drops_sub_threshold_backchannel()
     test_enforce_stamps_speaker_ids_from_word_diarization()
     test_silent_trailing_word_is_folded_into_its_beat()
     test_isolated_silent_word_is_dropped()

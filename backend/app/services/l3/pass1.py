@@ -282,21 +282,55 @@ def _no_speech_cut_swallows_atoms(output: Pass1Output, lattices: Dict[str, Latti
 # owns BOUNDARIES, and this is precisely a boundary. North Star #1.
 # --------------------------------------------------------------------------
 
+# A voice must own at least this share of the span's spoken TIME to count as
+# a real speaker of the beat. Below it (a "yeah"/"mm-hmm" backchannel, a
+# one-word interjection, a diarization glitch) it's dropped -- otherwise a
+# 70-second answer that happens to contain a two-word nod gets stamped as a
+# two-voice cut and (worse) can end up attributed to the wrong person. The
+# dominant speaker is ALWAYS kept regardless of share, so a beat never loses
+# its speaker.
+_MINOR_VOICE_SHARE = 0.15
+
+
 def _speaker_ids_for_span(words: List[dict], span: Tuple[int, int]) -> List[str]:
-    """Distinct diarized speaker labels across a word span, in first-
-    appearance order -- the deterministic ground truth for "who is talking
-    this beat" (voice_first_identity.plan.md: never the model's job to
-    guess -- word-level diarization already knows). Unset/None words
+    """The diarized speakers of a word span, DOMINANT-FIRST (most spoken time
+    first) with sub-threshold voices dropped -- the deterministic ground truth
+    for "who is talking this beat" (voice_first_identity.plan.md: never the
+    model's job to guess -- word-level diarization already knows).
+
+    Two jobs, both deterministic:
+      * ORDER by spoken time so the first id is the beat's dominant speaker.
+        Downstream (`identity/apply._rewrite_cuts`) attributes `speaker_person`
+        to this first voice, so a long answer with a brief interjection is
+        credited to the person who actually holds the floor, not whoever the
+        diarizer happened to emit first.
+      * DROP any non-dominant speaker below `_MINOR_VOICE_SHARE` of the span's
+        spoken time (backchannels / one-word nods / diar glitches), so a
+        single-speaker answer stays a single-voice cut. The top speaker is
+        always kept, so this never empties a real beat.
+
+    Spoken time (summed word durations) is the weight; when the lattice has no
+    word timings at all it falls back to raw word counts. Unset/None words
     contribute nothing."""
     a, b = span
-    seen: List[str] = []
-    seen_set: set = set()
+    ms: Dict[str, int] = {}
+    cnt: Dict[str, int] = {}
     for i in range(max(0, a), min(len(words), b + 1)):
         spk = words[i].get("speaker")
-        if spk and spk not in seen_set:
-            seen_set.add(spk)
-            seen.append(spk)
-    return seen
+        if not spk:
+            continue
+        cnt[spk] = cnt.get(spk, 0) + 1
+        ms[spk] = ms.get(spk, 0) + max(0, int(words[i].get("end_ms", 0)) - int(words[i].get("start_ms", 0)))
+    if not cnt:
+        return []
+    weight = ms if sum(ms.values()) > 0 else cnt
+    total = sum(weight.values())
+    # Dominant first; label as a stable tiebreak so equal-weight speakers order
+    # deterministically (never flap run-to-run).
+    ranked = sorted(weight, key=lambda s: (-weight[s], s))
+    kept = [ranked[0]]
+    kept.extend(s for s in ranked[1:] if total > 0 and weight[s] / total >= _MINOR_VOICE_SHARE)
+    return kept
 
 
 def _span_pieces(words: List[dict], atoms: List[Any], span: Tuple[int, int]) -> List[Tuple[int, int]]:
