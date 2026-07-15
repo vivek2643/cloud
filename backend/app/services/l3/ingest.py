@@ -15,16 +15,19 @@ into take/winner/outlook -- is now deterministic code
 there is no reason for a take's members to share a batch or for images to be
 sent to the model more than once.
 
-The voice-ID pass (voice_id_pass.plan.md, ``identity/voice_id.py``) also
-runs concurrently with pass 2, on its own background thread ("Track B") --
-it's cast-blind and depends only on pre-pass-2 data (the voice map, turns,
-outlook groups), so there's no reason to make it wait behind pass 2's
-image-heavy identity clustering. ``identity_apply.run`` joins the two right
-before it needs Track B's clip verdicts.
+Identity resolution (asd_identity.plan.md) is entirely code + CV now, no
+model call anywhere: L1's ``active_speaker`` pass already detected+tracked+
+embedded faces and scored each track's ASD-speaking timeline, once per
+file, persisted, and reused here (no per-project API cost, no "Track B"
+background thread to launch/join -- that whole voice_id_pass.plan.md
+mechanism is gone). ``identity/faces.py`` clusters those tracks into global
+persons; ``identity/bind_asd.py`` intersects diarization turns against
+ASD-speaking intervals to resolve voice ownership; ``identity/apply.py``
+does the final cut rewrite + payload assembly.
 
 THIS MODULE SPENDS REAL MONEY once invoked: ``run_ingest`` makes one real
-pass-1 API call, one real pass-2 call per batch, and one real voice-ID call
-per voice. Every deterministic step
+pass-1 API call and one real pass-2 call per batch (identity resolution is
+free -- it only reads already-computed L1 data). Every deterministic step
 it wires together (pass1's prompt building, image_plan, pass2's prompt
 building, post's assembly) already has its own zero-cost test coverage;
 ``scripts/test_ingest.py`` mocks every one of those seams so the
@@ -43,6 +46,7 @@ from typing import Any, Dict, List, Tuple
 
 from app.config import get_settings
 from app.services.jobs import app
+from app.services.l1 import active_speaker
 from app.services.l1.snapshot import build_l1_snapshot
 from app.services.l3 import frames as fr
 from app.services.l3 import image_plan as ip
@@ -50,9 +54,9 @@ from app.services.l3 import ingest_store as store
 from app.services.l3 import pass1
 from app.services.l3 import pass2
 from app.services.l3 import post
-from app.services.l3 import video_clips
 from app.services.l3.identity import apply as identity_apply
-from app.services.l3.identity import voice_id
+from app.services.l3.identity import bind_asd as identity_bind_asd
+from app.services.l3.identity import faces as identity_faces
 from app.services.l3.identity import voices as identity_voices
 from app.services.l3.lattice import Lattice
 from app.services.l3.sync import store as sync_store
@@ -127,21 +131,20 @@ def _proxy_keys_for_files(file_ids: List[str]) -> Dict[str, str]:
     return {fid: key for fid, key in rows if key}
 
 
-def _run_voice_id_track(
-    clip_reqs: List[voice_id.ClipRequest], proxy_keys: Dict[str, str],
-) -> List[voice_id.ClipVerdict]:
-    """Track B in full: clip extraction (video_clips) then the cast-blind
-    Gemini pass (voice_id.run_voice_id_pass), run on a background thread
-    so it overlaps Pass 2's own batches. Fail-open (voice_id_pass.plan.md
-    section 3.5): any failure here just means every voice ends up unbound
-    -- never worth failing the whole ingest run over an identity-binding
-    miss."""
-    try:
-        clips_b64 = video_clips.extract_for_clip_requests(clip_reqs, proxy_keys)
-        return voice_id.run_voice_id_pass(clip_reqs, clips_b64)
-    except Exception:
-        logger.exception("ingest: voice-ID pass (Track B) failed -- all voices will be off-camera")
-        return []
+def _face_tracks_for_files(file_ids: List[str]) -> Dict[str, List[active_speaker.FaceTrack]]:
+    """file_id -> its L1 active-speaker pass's face tracks (asd_identity.
+    plan.md), persisted once per file and reused across every ingest -- no
+    per-project compute, just a read. A file with no row yet (the L1 pass
+    hasn't run, or found no legible faces) is simply absent -- its cuts
+    fall back to id-less PIC/SND, never a hard failure."""
+    if not file_ids:
+        return {}
+    with pass1._pg_conn() as conn:
+        rows = conn.execute(
+            "select file_id::text, tracks from face_tracks where file_id = any(%s::uuid[])",
+            (file_ids,),
+        ).fetchall()
+    return {fid: [active_speaker.FaceTrack.from_dict(t) for t in (tracks or [])] for fid, tracks in rows}
 
 
 def _extract_and_upload_heroes(records: List[post.CutRecord], record_ids: List[str],
@@ -225,27 +228,16 @@ def run_ingest(project_id: str) -> str:
         # computed ONCE here -- after pass 1 (needs its word-level speaker_ids
         # roster) but BEFORE pass 2 (whose to_pass2_cuts backfills voice_ids
         # from this SAME map, so every batch agrees on one global voice
-        # identity). `turns_by_file` feeds identity/voice_id.py's clip
-        # planning next; `groups` is the SAME outlook grouping the speech
-        # lattice merge already used, so voice identity and speech boundaries
-        # share one notion of "these cameras are one moment."
+        # identity). `turns_by_file` feeds identity/bind_asd.py later;
+        # `groups` is the SAME outlook grouping the speech lattice merge
+        # already used, so voice identity and speech boundaries share one
+        # notion of "these cameras are one moment."
         embeddings_by_file = _embeddings_for_files(file_ids)
         all_speakers_by_file: Dict[str, List[str]] = {}
         for sc in pass1_output.speech_cuts:
             all_speakers_by_file.setdefault(sc.file_id, []).extend(sc.speaker_ids)
         voice_of = identity_voices.assign_voices(embeddings_by_file, groups, all_speakers_by_file)
         turns_by_file = {fid: lat.turns for fid, lat in lattices.items()}
-
-        # voice_id_pass.plan.md Track B: cast-blind lip-sync binding, launched
-        # here (right after the voice map/turns it depends on are ready) so it
-        # runs IN PARALLEL with Track A (image_plan -> Pass 2 -> reconcile)
-        # below. `identity_apply.run` joins on `verdict_future` right before it
-        # needs the result. A voice with no clean windows at all -> select_clips
-        # emits nothing for it -> it's simply absent from `verdicts`, resolved
-        # to off-camera by `identity_apply.run`'s full-roster reconciliation.
-        clip_reqs = voice_id.select_clips(turns_by_file, voice_of, groups, audio_by_file)
-        voice_id_pool = ThreadPoolExecutor(max_workers=1)
-        verdict_future = voice_id_pool.submit(_run_voice_id_track, clip_reqs, proxy_keys)
 
         store.set_status(ingest_run_id, "images")
         planned_frames = ip.build_image_plan(pass1_output, lattices, motion_by_file, scene_by_file,
@@ -319,21 +311,25 @@ def run_ingest(project_id: str) -> str:
         # assemble_cut_records call below).
         pass2_output = pass2.apply_take_groups(pass2_output, pass1_output)
 
-        # Join Track B (launched right after voice_of/turns_by_file were
-        # ready, above) -- by now it's had the ENTIRE Pass 2 batch loop's
-        # wall-clock to run concurrently, so this rarely actually blocks.
-        verdicts = verdict_future.result()
-        voice_id_pool.shutdown()
-
-        # Deterministic identity resolution (voice_first_identity.plan.md
-        # Phase D + voice_id_pass.plan.md Part B): cluster visible faces into
-        # persons, then map Track B's cast-blind clip verdicts onto those
-        # persons and derive on/off-camera per cut. Must run before
+        # Deterministic identity resolution (asd_identity.plan.md): cluster
+        # this project's files' L1 face tracks into global persons, resolve
+        # each cut's visible_persons from those tracks, intersect diarization
+        # turns against ASD-speaking intervals to bind voices to persons, then
+        # rewrite cuts with speaker_person/on_camera. Must run before
         # assemble_cut_records below -- on_camera also feeds total_quality
         # there, so the rewrite only counts if it lands first. `voice_of` is
         # the SAME voice map pass 2's own voice_ids backfill already used, so
-        # identity stays one consistent notion project-wide.
-        pass2_output, identity_map = identity_apply.run(pass2_output, lattices, voice_of, verdicts)
+        # identity stays one consistent notion project-wide. No model call
+        # anywhere in this block -- everything it reads was already computed
+        # (face tracks at L1, cuts by pass 2).
+        face_tracks_by_file = _face_tracks_for_files(file_ids)
+        track_to_person, persons = identity_faces.cluster(face_tracks_by_file)
+        visible_persons = identity_faces.visible_persons_by_cut(
+            track_to_person, face_tracks_by_file, pass2_output.cuts, lattices)
+        owner_by_voice, unbound_voices = identity_bind_asd.bind(
+            turns_by_file, voice_of, face_tracks_by_file, track_to_person)
+        pass2_output, identity_map = identity_apply.run(
+            pass2_output, voice_of, persons, visible_persons, owner_by_voice, unbound_voices)
         if identity_map.get("persons"):
             store.set_identity_map(ingest_run_id, identity_map)
 
@@ -351,13 +347,6 @@ def run_ingest(project_id: str) -> str:
 
         store.set_status(ingest_run_id, "ready")
     except Exception as e:
-        # A failure ABOVE the voice-ID join point (e.g. during pass 1/pass 2)
-        # would otherwise leak `voice_id_pool`'s background thread -- shut it
-        # down here too; a no-op once it's already been joined and shut down
-        # on the success path.
-        pool = locals().get("voice_id_pool")
-        if pool is not None:
-            pool.shutdown(wait=False, cancel_futures=True)
         logger.exception("ingest run %s failed", ingest_run_id)
         store.set_status(ingest_run_id, "failed", error=str(e))
         raise

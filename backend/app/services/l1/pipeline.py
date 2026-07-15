@@ -24,6 +24,7 @@ from procrastinate import RetryStrategy
 from app.config import get_settings
 from app.services import audit_log
 from app.services.jobs import app
+from app.services.l1 import active_speaker as asd_mod
 from app.services.l1 import audio_features as af_mod
 from app.services.l1 import color_stats as color_stats_mod
 from app.services.l1 import diarization as diar_mod
@@ -700,6 +701,26 @@ def _stage_color_stats(
     )
 
 
+def _stage_active_speaker(file_id: str, proxy_path: str, conn: psycopg.Connection) -> None:
+    """asd_identity.plan.md: face detect+track+embed+ASD off the canonical
+    1080p editing proxy. Best-effort -- compute_face_tracks never raises
+    (see active_speaker.py's own fail-open contract); an empty result is
+    still persisted (an explicit "no faces here" is as real a fact as a
+    populated track list, not a reason to skip the write)."""
+    tracks = asd_mod.compute_face_tracks(proxy_path)
+    conn.execute(
+        """
+        insert into face_tracks (file_id, schema_version, tracks)
+        values (%s, %s, %s::jsonb)
+        on conflict (file_id) do update set
+            schema_version = excluded.schema_version,
+            tracks = excluded.tracks
+        """,
+        (file_id, asd_mod.SCHEMA_VERSION, json.dumps([t.to_dict() for t in tracks])),
+    )
+    logger.info("Active speaker: %s -> %d face track(s)", file_id, len(tracks))
+
+
 # --- Helpers -------------------------------------------------------------
 
 def _run_stage(
@@ -919,6 +940,15 @@ def _prepare_from_raw(
         row = cur.fetchone()
         duration_s = float(row[0]) if row and row[0] else (duration or 0.0)
 
+    # This fallback path builds the editing proxy itself (l1_editing_proxy's
+    # OWN chain-enqueue never fires here, since the client-proxy fast path is
+    # what usually triggers that task) -- so the active-speaker pass is
+    # chained here too, exactly the same way.
+    try:
+        app.configure_task("l1_active_speaker", queue="gpu").defer(file_id=file_id)
+    except Exception:
+        logger.exception("Could not enqueue active-speaker pass for %s.", file_id)
+
     if demux_thread is not None:
         demux_thread.join()
         if "e" in demux_err:
@@ -995,6 +1025,56 @@ def l1_editing_proxy(file_id: str, r2_key: str) -> None:
             logger.info("File %s deleted mid editing-proxy; abandoning cleanly.", file_id)
             return
         logger.exception("Editing proxy failed for %s", file_id)
+        raise
+
+    # asd_identity.plan.md: the active-speaker pass needs the 1080p proxy
+    # (real video+audio+fps -- the client A/B analysis proxies are unusable
+    # for lip-sync, see active_speaker.py's own docstring), which the stage
+    # just above guarantees is present (freshly built or already done).
+    # Chaining here -- rather than enqueuing alongside from upload.py --
+    # means l1_active_speaker never has to poll/retry waiting on the proxy.
+    try:
+        app.configure_task("l1_active_speaker", queue="gpu").defer(file_id=file_id)
+    except Exception:
+        logger.exception("Could not enqueue active-speaker pass for %s.", file_id)
+
+
+@app.task(name="l1_active_speaker", queue="gpu", retry=RetryStrategy(max_attempts=3, exponential_wait=4))
+def l1_active_speaker(file_id: str) -> None:
+    """asd_identity.plan.md: detect+track+embed+ASD-score faces off the
+    canonical editing proxy. Idempotent via the 'active_speaker'
+    processing_jobs stage; chained off l1_editing_proxy above so the proxy
+    is guaranteed to exist by the time this runs. Best-effort throughout --
+    a failure here degrades identity to id-less PIC/SND for this file,
+    never fails the file's own L1/ingest."""
+    if not _file_exists(file_id):
+        logger.info("File %s gone; skipping active-speaker pass.", file_id)
+        return
+    if _file_type(file_id) == "audio":
+        return  # no video to detect faces in
+    try:
+        with _pg_conn() as conn:
+            row = conn.execute(
+                "select r2_proxy_key from files where id = %s", (file_id,)
+            ).fetchone()
+        proxy_key = row[0] if row else None
+        if not proxy_key:
+            logger.warning(
+                "File %s has no editing proxy yet; active-speaker pass has nothing to read.", file_id)
+            return
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proxy_path = os.path.join(tmpdir, "proxy.mp4")
+            _download_from_r2(proxy_key, proxy_path)
+            with _pg_conn() as conn:
+                _run_stage(conn, file_id, "active_speaker", _stage_active_speaker, file_id, proxy_path, conn)
+    except psycopg.errors.ForeignKeyViolation:
+        logger.info("File %s deleted mid active-speaker pass; abandoning cleanly.", file_id)
+        return
+    except Exception:
+        if not _file_exists(file_id):
+            logger.info("File %s deleted mid active-speaker pass; abandoning cleanly.", file_id)
+            return
+        logger.exception("Active-speaker pass failed for %s", file_id)
         raise
 
 

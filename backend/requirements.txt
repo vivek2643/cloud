@@ -37,6 +37,13 @@ speechbrain==1.0.2
 opencv-python-headless==4.11.0.86
 pydub==0.25.1
 pgvector==0.3.6
+# asd_identity.plan.md: L1 active-speaker pass -- face detect (SCRFD) + embed
+# (ArcFace) via insightface's buffalo_sc bundle, CPU-only (providers=[
+# "CPUExecutionProvider"] in app/services/l1/active_speaker.py). onnxruntime
+# is insightface's inference backend; pin it explicitly rather than letting
+# insightface resolve it transitively.
+insightface==0.7.3
+onnxruntime==1.19.2
 # Direct psycopg for raw queries we need outside the Supabase REST client
 psycopg[binary]==3.2.4
 numpy<2.0

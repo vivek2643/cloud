@@ -1,9 +1,9 @@
 """
-End-to-end tests for the identity orchestrator (app.services.l3.identity.
-apply) -- no DB, no R2, no model call. voice_id_pass.plan.md moved the
-model call (and clip extraction) upstream into Track A/B of ingest.py, so
-apply.run is now pure code: it takes Track B's already-computed clip
-verdicts directly and reconciles them against Track A's face clustering.
+End-to-end tests for the identity assembly step (app.services.l3.identity.
+apply) -- no DB, no R2, no model call, no CV. asd_identity.plan.md moved
+ALL the real work upstream into identity/faces.py (clustering) and
+identity/bind_asd.py (voice binding), both of which ingest.py now calls
+directly; apply.run is pure assembly, taking their already-computed output.
 
 Run:  .venv/bin/python scripts/test_identity_apply.py
 """
@@ -19,56 +19,37 @@ if BACKEND not in sys.path:
 
 from app.services.l3 import pass2  # noqa: E402
 from app.services.l3.identity import apply as identity_apply  # noqa: E402
-from app.services.l3.identity import voice_id as vid  # noqa: E402
-from app.services.l3.lattice import Lattice  # noqa: E402
 
 
-def _lat():
-    words = [{"start_ms": i * 100, "end_ms": i * 100 + 90} for i in range(50)]
-    return Lattice(file_id="f1", duration_ms=10000, words=words, turns=[], hints=[], atoms=[])
-
-
-def _cut(ref, word_span, voice_ids, appearance, position="center", subject_box=(0.2, 0.2, 0.3, 0.3)):
+def _cut(ref, voice_ids, visible=(), position="center", subject_box=(0.2, 0.2, 0.3, 0.3)):
     return pass2.Pass2Cut(
-        source_ref=ref, kind="speech", file_id="f1", word_span=word_span,
+        source_ref=ref, kind="speech", file_id="f1", word_span=(0, 1),
         label="x", summary="y", voice_ids=voice_ids,
-        people=[{"description": "someone", "appearance": appearance, "position": position}],
+        people=[{"description": "someone", "appearance": {}, "position": position}] if visible else [],
         framing=pass2.Framing(subject_box=subject_box),
     )
 
 
-def _app(**kw):
-    base = {"apparent_gender": None, "apparent_age_band": None, "hair": None,
-           "hair_color": None, "facial_hair": None, "glasses": None,
-           "skin_tone": None, "build": None}
-    base.update(kw)
-    return base
-
-
-def _verdict(voice, clip_id, verdict, center_ms):
-    return vid.ClipVerdict(voice=voice, clip_id=clip_id, file_id="f1", verdict=verdict, center_ms=center_ms)
+def _person(pid):
+    return {"person_id": pid, "appearance_count": 3, "is_major": True, "owned_voices": []}
 
 
 def test_run_binds_two_speakers_and_derives_on_camera():
-    cuts = [
-        _cut("speech_cut[0]", (0, 19), ["V0"],
-            _app(apparent_gender="male", hair="bald", facial_hair="beard")),
-        _cut("speech_cut[1]", (25, 44), ["V1"],
-            _app(apparent_gender="female", hair="long", facial_hair="none")),
-    ]
+    cuts = [_cut("speech_cut[0]", ["V0"], visible=True), _cut("speech_cut[1]", ["V1"], visible=True)]
     pass2_output = pass2.Pass2Output(cuts=cuts)
-    lattices = {"f1": _lat()}
     voice_of = {("f1", "S0"): "V0", ("f1", "S1"): "V1"}
-    verdicts = [
-        _verdict("V0", "V0:c0:f1", "speaking", 50),      # inside speech_cut[0]'s span
-        _verdict("V1", "V1:c0:f1", "speaking", 2550),    # inside speech_cut[1]'s span
-    ]
+    persons = {"P0": _person("P0"), "P1": _person("P1")}
+    visible_persons = {("f1", "speech_cut[0]"): ["P0"], ("f1", "speech_cut[1]"): ["P1"]}
+    owner_by_voice = {"V0": "P0", "V1": "P1"}
 
-    new_output, payload = identity_apply.run(pass2_output, lattices, voice_of, verdicts)
+    new_output, payload = identity_apply.run(
+        pass2_output, voice_of, persons, visible_persons, owner_by_voice, set())
 
     assert len(payload["persons"]) == 2, payload["persons"]
     assert payload["voice_owner"] == {"V0": "P0", "V1": "P1"}, payload["voice_owner"]
     assert payload["off_camera_voices"] == [], payload["off_camera_voices"]
+    owned = {p["person_id"]: p["owned_voices"] for p in payload["persons"]}
+    assert owned == {"P0": ["V0"], "P1": ["V1"]}, owned
 
     c0, c1 = new_output.cuts
     assert c0.speaker_person == "P0" and c0.on_camera is True, (c0.speaker_person, c0.on_camera)
@@ -78,15 +59,14 @@ def test_run_binds_two_speakers_and_derives_on_camera():
 
 
 def test_run_leaves_a_narrator_voice_unbound_and_off_camera():
-    # V0 has voice_ids on its cut but NO visible person anywhere (pure
-    # narration) -- speaker_person/on_camera must stay unset, never guessed.
-    cuts = [_cut("speech_cut[0]", (0, 19), ["V0"], _app())]
-    cuts[0] = cuts[0].model_copy(update={"people": []})
+    # V0 has voice_ids on its cut but bind_asd never resolved an owner for it
+    # (pure narration, no face ever ASD-tracks its speech) -- speaker_person/
+    # on_camera must stay unset, never guessed.
+    cuts = [_cut("speech_cut[0]", ["V0"], visible=False)]
     pass2_output = pass2.Pass2Output(cuts=cuts)
-    lattices = {"f1": _lat()}
     voice_of = {("f1", "S0"): "V0"}
 
-    new_output, payload = identity_apply.run(pass2_output, lattices, voice_of, [])
+    new_output, payload = identity_apply.run(pass2_output, voice_of, {}, {}, {}, {"V0"})
 
     assert payload["persons"] == [], payload["persons"]
     assert payload["off_camera_voices"] == ["V0"], payload["off_camera_voices"]
@@ -95,28 +75,50 @@ def test_run_leaves_a_narrator_voice_unbound_and_off_camera():
     print("ok  test_run_leaves_a_narrator_voice_unbound_and_off_camera")
 
 
-def test_run_marks_a_voice_with_zero_verdicts_off_camera_via_full_roster():
-    # V1 is in voice_of (the full project roster) but never produced a
-    # single clip verdict (e.g. Track A had no clean window for it) -- it
-    # must still land in off_camera_voices, not silently vanish.
-    cuts = [_cut("speech_cut[0]", (0, 19), ["V0"],
-                _app(apparent_gender="male", hair="bald", facial_hair="beard"))]
+def test_run_marks_a_voice_with_zero_asd_votes_off_camera_via_full_roster():
+    # V1 is in voice_of (the full project roster) but bind_asd.bind never
+    # produced ANY vote for it (absent from owner_by_voice entirely, not
+    # even as an explicit None) -- it must still land in off_camera_voices,
+    # not silently vanish.
+    cuts = [_cut("speech_cut[0]", ["V0"], visible=True)]
     pass2_output = pass2.Pass2Output(cuts=cuts)
-    lattices = {"f1": _lat()}
     voice_of = {("f1", "S0"): "V0", ("f1", "S1"): "V1"}
-    verdicts = [_verdict("V0", "V0:c0:f1", "speaking", 50)]
+    persons = {"P0": _person("P0")}
+    visible_persons = {("f1", "speech_cut[0]"): ["P0"]}
+    owner_by_voice = {"V0": "P0"}
 
-    _new_output, payload = identity_apply.run(pass2_output, lattices, voice_of, verdicts)
+    _new_output, payload = identity_apply.run(
+        pass2_output, voice_of, persons, visible_persons, owner_by_voice, set())
 
     assert "V1" in payload["off_camera_voices"], payload["off_camera_voices"]
     assert "V1" not in payload["voice_owner"], payload["voice_owner"]
-    print("ok  test_run_marks_a_voice_with_zero_verdicts_off_camera_via_full_roster")
+    print("ok  test_run_marks_a_voice_with_zero_asd_votes_off_camera_via_full_roster")
+
+
+def test_run_dominant_voice_only_no_fallthrough_to_a_bound_secondary():
+    # A cut's voice_ids[0] (dominant) is unbound; voice_ids[1] IS bound. The
+    # cut must still show speaker_person=None -- never falls through to a
+    # minor interjector's owner.
+    cuts = [_cut("speech_cut[0]", ["V0", "V1"], visible=True)]
+    pass2_output = pass2.Pass2Output(cuts=cuts)
+    voice_of = {("f1", "S0"): "V0", ("f1", "S1"): "V1"}
+    persons = {"P1": _person("P1")}
+    visible_persons = {("f1", "speech_cut[0]"): ["P1"]}
+    owner_by_voice = {"V0": None, "V1": "P1"}
+
+    new_output, _payload = identity_apply.run(
+        pass2_output, voice_of, persons, visible_persons, owner_by_voice, {"V0"})
+
+    assert new_output.cuts[0].speaker_person is None
+    assert new_output.cuts[0].on_camera is None
+    print("ok  test_run_dominant_voice_only_no_fallthrough_to_a_bound_secondary")
 
 
 def main():
     test_run_binds_two_speakers_and_derives_on_camera()
     test_run_leaves_a_narrator_voice_unbound_and_off_camera()
-    test_run_marks_a_voice_with_zero_verdicts_off_camera_via_full_roster()
+    test_run_marks_a_voice_with_zero_asd_votes_off_camera_via_full_roster()
+    test_run_dominant_voice_only_no_fallthrough_to_a_bound_secondary()
     print("\nall identity-apply tests passed")
 
 

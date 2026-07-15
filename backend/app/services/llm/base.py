@@ -5,7 +5,6 @@ adapter. Both the Anthropic and Gemini clients translate to/from these.
 Neutral content blocks (plain dicts) used inside message `content` lists:
   {"type": "text", "text": str}
   {"type": "image", "data": <base64 str>, "media_type": "image/jpeg"}
-  {"type": "media", "data": <base64 str>, "media_type": "video/mp4"}
   {"type": "tool_use", "id": str, "name": str, "input": dict}   (assistant)
   {"type": "tool_result", "tool_use_id": str, "content": [blocks]} (user)
 
@@ -59,13 +58,6 @@ def text_block(text: str) -> Block:
 
 def image_block(data_b64: str, media_type: str = "image/jpeg") -> Block:
     return {"type": "image", "data": data_b64, "media_type": media_type}
-
-
-def media_block(data_b64: str, media_type: str) -> Block:
-    """Inline video (or other non-image) media, e.g. a short clip for the
-    voice-ID pass (identity/voice_id.py) to judge lip-sync against heard
-    audio -- Gemini-only today (gemini_client._parts_for_content)."""
-    return {"type": "media", "data": data_b64, "media_type": media_type}
 
 
 def tool_use_block(id: str, name: str, input: Dict[str, Any]) -> Block:

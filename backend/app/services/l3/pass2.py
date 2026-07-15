@@ -363,7 +363,17 @@ def to_pass2_cuts(
         voice_ids: List[str] = []
         if j.kind == "speech" and j.word_span is not None:
             local_ids = speaker_ids_by_span.get((j.file_id, tuple(j.word_span))) or []
-            voice_ids = sorted({voice_of[(j.file_id, s)] for s in local_ids if (j.file_id, s) in voice_of})
+            # Preserve Pass 1's DOMINANT-FIRST order (SpeechCut.speaker_ids is
+            # already ordered by spoken time, sub-threshold voices dropped --
+            # see pass1._speaker_ids_for_span); dedupe order-preservingly rather
+            # than sorted() so voice_ids[0] stays the beat's dominant voice, which
+            # identity/apply._rewrite_cuts credits as speaker_person.
+            seen: set = set()
+            for s in local_ids:
+                v = voice_of.get((j.file_id, s))
+                if v is not None and v not in seen:
+                    seen.add(v)
+                    voice_ids.append(v)
         out.append(Pass2Cut(
             source_ref=j.source_ref, kind=j.kind, file_id=j.file_id,
             word_span=j.word_span, atom_ids=j.atom_ids,
