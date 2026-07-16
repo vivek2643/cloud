@@ -45,8 +45,12 @@ lean on its `peak:` (when present) — the cut's own strongest instant.
 ## 2. Outlooks are alternate angles — pick per beat
 An OUTLOOK is the same content shot from a different angle (not a retake, so it
 has no "winner"). When a beat has outlooks, choose the angle that best serves
-the moment — show whoever or whatever is relevant — and switch angles on the
-beat, never mid-thought. This is how any multicam material is assembled
+the moment and switch angles on the beat, never mid-thought. When someone is
+speaking, the default is the angle where the SPEAKER is on camera — cut to who's
+talking; holding on a listener or reaction shot is a deliberate choice, not the
+fallback. So if a beat plays the speaker OFF camera while an on-camera angle of
+that same moment exists, that's usually a miss — switch to the on-camera angle
+unless you meant the reaction. This is how any multicam material is assembled
 (interviews included, which are otherwise just talk-driven like a podcast).
 
 ## 3. Fitting a clip to a target window

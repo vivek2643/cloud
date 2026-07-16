@@ -907,6 +907,28 @@ def _head_tail_flags(seg: dict, anchor: str) -> List[dict]:
     return findings
 
 
+def _offcam_speaker_flag(meta: dict, anchor: str) -> List[dict]:
+    """Flag a speech cut that plays the speaker OFF camera WHILE an on-camera
+    angle of the same moment (an outlook sibling that shows the speaker) is
+    available -- a generic multicam fact ("you're not cutting to who's
+    talking"), never a prescribed fix. Silent when the speaker is on camera,
+    when there's no speaker, or when no sibling angle shows them (e.g. genuine
+    narration / voiceover-over-b-roll has no on-camera-speaker angle to prefer,
+    so it never trips)."""
+    spk = meta.get("speaker_person")
+    if not spk or meta.get("on_camera"):
+        return []
+    oncam = [a for a in (meta.get("alt_pic") or [])
+             if spk in (a.get("visible_persons") or [])]
+    if not oncam:
+        return []
+    refs = ", ".join(sorted({str(a.get("moment_id")) for a in oncam if a.get("moment_id")}))
+    where = f" ({refs})" if refs else ""
+    return [{"severity": "info", "anchor": anchor,
+             "message": f"plays speaker {spk} off camera while an on-camera angle of "
+                        f"the same moment is available{where}"}]
+
+
 def _overlay_fit_flags(resolved: "layers.ResolvedTimeline") -> List[dict]:
     """Flag a V2 coverage layer whose program window clearly overruns or
     underfills the spine beat it sits over -- a fact, never a prescribed
@@ -974,10 +996,16 @@ def review(document: dict, ctx: EditContext) -> dict:
             "played_ms": dur, "played_text": played_text, "words": words,
         })
         if is_speech:
+            anchor = f"cut {i + 1} ({seg.get('seg_id')})"
+            meta = ctx.meta_by_ref.get(seg.get("ref") or "") or {}
             try:
-                flags.extend(_head_tail_flags(seg, f"cut {i + 1} ({seg.get('seg_id')})"))
+                flags.extend(_head_tail_flags(seg, anchor))
             except Exception:
                 logger.exception("review: head/tail flags failed for seg %s", seg.get("seg_id"))
+            try:
+                flags.extend(_offcam_speaker_flag(meta, anchor))
+            except Exception:
+                logger.exception("review: off-camera flag failed for seg %s", seg.get("seg_id"))
         prog += dur
 
     try:

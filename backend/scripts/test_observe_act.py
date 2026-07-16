@@ -882,6 +882,44 @@ def test_review_flags_an_underfilling_overlay():
     print("ok  review flags an overlay that underfills the beat it sits over")
 
 
+def test_offcam_speaker_flag_only_when_an_oncam_angle_exists():
+    # off camera + a sibling angle shows the speaker -> flagged (with the ref)
+    f = observe._offcam_speaker_flag(
+        {"speaker_person": "P1", "on_camera": False,
+         "alt_pic": [{"moment_id": "1e529bed:m06", "visible_persons": ["P1"]}]},
+        "cut 1 (s0)")
+    assert f and "off camera" in f[0]["message"] and "1e529bed:m06" in f[0]["message"], f
+    assert "trim" not in f[0]["message"].lower()   # never a prescribed fix
+    # speaker already on camera -> nothing to switch to
+    assert observe._offcam_speaker_flag(
+        {"speaker_person": "P1", "on_camera": True,
+         "alt_pic": [{"moment_id": "x:m1", "visible_persons": ["P1"]}]}, "a") == []
+    # off camera but NO sibling shows the speaker (narration / voiceover-over-b-roll)
+    assert observe._offcam_speaker_flag(
+        {"speaker_person": "P1", "on_camera": False,
+         "alt_pic": [{"moment_id": "x:m1", "visible_persons": ["P0"]}]}, "a") == []
+    # no speaker at all -> silent
+    assert observe._offcam_speaker_flag({"on_camera": False, "alt_pic": []}, "a") == []
+    print("ok  off-camera-speaker flag fires only when an on-camera angle exists")
+
+
+def test_review_wires_the_offcam_speaker_flag():
+    doc = {"timeline": [
+        {"seg_id": "s0", "file_id": "ffffffff-1111", "in_ms": 0, "out_ms": 4000,
+         "axis": "speech", "ref": "ffffffff:m00"},
+    ], "operations": [], "brief": {}}
+    ctx = _ctx(_map())
+    ctx.index.moments["ffffffff:m00"] = {
+        "speaker_person": "P1", "on_camera": False,
+        "alt_pic": [{"moment_id": "1e529bed:m06", "visible_persons": ["P1"]}],
+    }
+    with mock.patch.object(fm, "_sentences_for_file", return_value=()):
+        out = observe.review(doc, ctx)
+    msgs = [f["message"] for f in out["flags"]]
+    assert any("off camera" in m and "1e529bed:m06" in m for m in msgs), msgs
+    print("ok  review surfaces the off-camera-speaker flag end-to-end")
+
+
 def main():
     test_read_state_reports_cuts_and_feel()
     test_place_adds_main_line_cut()
@@ -931,6 +969,8 @@ def main():
     test_review_played_text_reflects_the_excised_span_not_the_whole_cut()
     test_review_flags_an_overrunning_overlay()
     test_review_flags_an_underfilling_overlay()
+    test_offcam_speaker_flag_only_when_an_oncam_angle_exists()
+    test_review_wires_the_offcam_speaker_flag()
     print("\nall observe/act tests passed")
 
 
