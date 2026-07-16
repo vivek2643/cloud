@@ -27,7 +27,13 @@ from app.services.llm import LLMClient, tool_result_block, tool_spec, user_messa
 
 logger = logging.getLogger(__name__)
 
-_MAX_TURNS = 12
+# edso_think_act_check.plan.md change 5: modest bump from 12 -- a compound ask
+# (a length AND a split screen) needs room for both the spine and the added
+# feature, plus the done-gate's own overhead (up to _STRUCT_MAX_TRIES fix
+# turns, one length reconcile, one advisory review). The real churn reduction
+# is change 1 (think-first) removing place-then-remove trial-and-error, not
+# this cap -- don't over-raise it (every turn costs latency + tokens).
+_MAX_TURNS = 18
 # Snap sovereignty: the seam-snapper may move a split_screen raw-window edge at
 # most this far. Further than this, the brain's edge is kept and the seam is
 # only SUGGESTED.
@@ -94,9 +100,11 @@ def _specs() -> List[Dict[str, Any]]:
           "played_text (the verbatim words actually spoken over that cut's PLAYED "
           "span, after any trim) and word-level program-time offsets, plus "
           "total/target length and `flags` -- presented facts (never a prescribed "
-          "fix) about a rough head/tail (wrong-speaker lead-in, filler/backchannel, "
-          "leftover dead air) or a V2 overlay that overruns/underfills the beat it "
-          "sits over. Call this to double-check what you actually built before "
+          "fix), checked against your ask first (a feature you named -- split "
+          "screen, a music bed -- that isn't actually in the edit) then the "
+          "guidance (a rough head/tail -- wrong-speaker lead-in, filler/backchannel, "
+          "leftover dead air -- or a V2 overlay that overruns/underfills the beat "
+          "it sits over). Call this to double-check what you actually built before "
           "finishing.", obj({})),
         # --- ACT (edit verbs; each mutates the working document) ---
         S("place", "Adds a cut by its ref. channel 'V1' inserts on the main line "
@@ -340,7 +348,7 @@ def _normalize_questions(args: Dict[str, Any]) -> List[dict]:
 # --------------------------------------------------------------------------
 
 def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
-              doc: dict) -> Tuple[str, dict, bool]:
+              doc: dict, user_ask: str = "") -> Tuple[str, dict, bool]:
     snap_info: Dict[str, Any] = {}
     try:
         # OBSERVE (read-only)
@@ -358,7 +366,7 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
         if name == "audio_state":
             return _json(observe.audio_state(doc, ctx)), doc, False
         if name == "review":
-            return _json(observe.review(doc, ctx)), doc, False
+            return _json(observe.review(doc, ctx, user_ask=user_ask)), doc, False
 
         # ACT (mutate)
         if name == "place":
@@ -486,8 +494,27 @@ def _json(obj: Any) -> str:
 _STRUCT_MAX_TRIES = 3
 
 
+def _latest_user_text(messages: List[dict]) -> str:
+    """The newest user message as plain text (content may be a bare string or
+    a list of blocks -- see store.load_messages). Used only to detect an
+    explicitly requested feature (edso_think_act_check.plan.md change 4) for
+    the done-gate's audit. Mirrors converse._latest_user_text -- duplicated,
+    not imported, since converse.py already imports this module (a cycle)."""
+    for m in reversed(messages):
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):
+            return " ".join(b.get("text", "") for b in c
+                            if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
 def _verify_before_finish(working: dict, ctx: EditContext,
-                          state: Dict[str, Any], steps: List[str]) -> str | None:
+                          state: Dict[str, Any], steps: List[str],
+                          user_ask: str = "") -> str | None:
     """The done-gate: when the brain tries to FINISH a turn that changed the edit,
     check the result against the contract. Returns feedback the brain MUST act on
     (the loop keeps going), or None to let it finish. HARD on structural legality
@@ -498,7 +525,10 @@ def _verify_before_finish(working: dict, ctx: EditContext,
     skipped. edso_pacing_audit_timing.plan.md item 6: the advisory review now
     also folds in ``observe.review``'s program read-back flags (rough heads/
     tails, overlay fit) alongside ``diagnose``'s findings -- same one-shot,
-    never-a-prescribed-fix contract."""
+    never-a-prescribed-fix contract. edso_think_act_check.plan.md change 4:
+    ``review`` is passed ``user_ask`` so it also checks a NAMED feature (split
+    screen, a music bed) is actually present -- the ask/contract half of the
+    audit, checked ahead of the guidance-ceiling flags."""
     issues = observe.validate(working, ctx)
     if issues and state["struct_tries"] < _STRUCT_MAX_TRIES:
         state["struct_tries"] += 1
@@ -519,18 +549,20 @@ def _verify_before_finish(working: dict, ctx: EditContext,
     reviewed = "diagnose" in steps or "validate" in steps or "review" in steps
     if not state["reviewed"] and not reviewed:
         try:
-            rest = rest + (observe.review(working, ctx).get("flags") or [])
+            rest = rest + (observe.review(working, ctx, user_ask=user_ask).get("flags") or [])
         except Exception:
             logger.exception("_verify_before_finish: review() failed (continuing with diagnose only)")
         if rest:
             state["reviewed"] = True
             body = "\n".join(
-                f"- [{f.get('severity') or 'info'}] "
+                f"- [{f.get('severity') or 'info'}]"
+                + (f" ({f['category']})" if f.get("category") else "") + " "
                 + (f"{f['anchor']}: " if f.get("anchor") else "") + (f.get("message") or "")
                 for f in rest[:12])
-            return ("AUTOMATIC CHECK -- the assembled program has been read back; here's "
-                    "what's flagged. This is advisory: act on what serves the goal, "
-                    "ignore the rest, then finish:\n" + body)
+            return ("AUTOMATIC CHECK -- the assembled program has been checked against "
+                    "your ask, then the guidance; here's what's flagged. This is "
+                    "advisory: act on what serves the goal, ignore the rest, then "
+                    "finish:\n" + body)
     return None
 
 
@@ -549,6 +581,10 @@ def run_edit_loop(llm: LLMClient, *, system: str, messages: List[dict],
     last_text = ""
     questions: List[dict] = []
     verify = {"struct_tries": 0, "length_surfaced": False, "reviewed": False}
+    # edso_think_act_check.plan.md change 4: the done-gate's audit checks a
+    # NAMED feature (split screen, a music bed) is actually present -- needs
+    # the user's own latest words, computed once here.
+    user_ask = _latest_user_text(messages)
 
     for turn in range(max_turns):
         resp = llm.run(system=system, messages=convo, tools=tools,
@@ -559,7 +595,7 @@ def run_edit_loop(llm: LLMClient, *, system: str, messages: List[dict],
             # Finish attempt: don't let a changed edit exit unchecked against the
             # contract (structural = hard, length = fix-or-justify, rest advisory).
             if changed and turn < max_turns - 1:
-                feedback = _verify_before_finish(working, ctx, verify, steps)
+                feedback = _verify_before_finish(working, ctx, verify, steps, user_ask)
                 if feedback is not None:
                     convo.append(user_message(feedback))
                     continue
@@ -576,7 +612,7 @@ def run_edit_loop(llm: LLMClient, *, system: str, messages: List[dict],
                 trace.append({"turn": turn, "name": tc.name, "args": tc.input or {},
                               "applied": False, "result": "posed to user"})
                 continue
-            obs, working, did = _dispatch(tc.name, tc.input or {}, ctx, working)
+            obs, working, did = _dispatch(tc.name, tc.input or {}, ctx, working, user_ask)
             changed = changed or did
             results.append(tool_result_block(tc.id, obs))
             trace.append({"turn": turn, "name": tc.name, "args": tc.input or {},

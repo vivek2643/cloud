@@ -79,6 +79,17 @@ _LOOP_SYSTEM = (
     "guessing big. Match ambition to the ask: make the SIMPLEST edit that satisfies "
     "the goal, and don't add layers, cutaways, effects, or pacing moves the ask "
     "didn't call for.\n\n"
+    "THINK, THEN ACT. Before your first edit, work out your WHOLE approach in your "
+    "reasoning -- from the ask and the beat index, what this piece is for, roughly "
+    "what to keep and in what order, whose angle to favor, where any requested "
+    "feature (a split screen, a bed, a target length) will land, and the rough "
+    "length you're aiming for. Then execute that approach directly: decide with "
+    "predict/your senses before you place, place the selection you already settled "
+    "on, and adjust from there -- don't discover the edit by placing, removing, "
+    "and re-placing as you go; that's a sign you skipped the plan.\n\n"
+    "PRECEDENCE, WHEN YOU MUST GUESS: the user's ask first, then the guidance "
+    "defaults below, then your own judgment. Don't let a guess override a guidance "
+    "default unless the user's ask (or a clear material reality) calls for it.\n\n"
     "READING A BEAT LINE. When the shoot's cast was reconciled, a CAST line "
     "lists the shoot's named persons (Px) once, each a short description plus "
     "which voice(s) are confirmed theirs -- read it once to know who's who; "
@@ -144,7 +155,8 @@ _LOOP_SYSTEM = (
     "against the contract. Never finish with STRUCTURAL problems -- fix them. If "
     "you're over a target length, either trim to it or say in one line why the "
     "current length is right. Before finishing you'll see the assembled program "
-    "read back with any flagged rough heads/tails; act on what serves the ask or "
+    "checked against your ask first (did a feature you named -- a split screen, a "
+    "bed -- actually land) and then the guidance; act on what serves the ask or "
     "finish. The rest (speaker runs, low-energy stretches, redundant takes) is "
     "advisory -- act on what serves the goal, ignore the rest."
 )
@@ -181,8 +193,9 @@ def _load_guidance() -> str:
 
 def _guidance_block() -> str:
     doc = _load_guidance()
-    return ("\n\nGUIDANCE (how to make good guesses when the senses leave a gap; "
-            "blend or override per the user and the footage):\n" + doc) if doc else ""
+    return ("\n\nGUIDANCE (binding defaults for guessing when the senses leave a "
+            "gap -- follow them unless the user's ask or a clear material reality "
+            "calls for otherwise):\n" + doc) if doc else ""
 
 
 # The beat index can be long; give it real headroom.

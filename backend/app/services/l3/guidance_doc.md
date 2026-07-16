@@ -11,8 +11,10 @@
   in the system prompt, not here.
 
   How it's used: injected into Edso's system prompt (cached) and consulted in
-  the planning step. Everything here is a "lean toward", to be BLENDED or
-  OVERRIDDEN when the material or the user says otherwise.
+  the planning step. edso_think_act_check.plan.md change 2: these are BINDING
+  DEFAULTS now, not a soft "lean toward" -- follow them unless the user's ask
+  or a clear material reality calls for otherwise (see _guidance_block's own
+  framing text and _LOOP_SYSTEM's PRECEDENCE line, both in converse.py).
 -->
 
 # Guidance: how to guess

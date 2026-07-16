@@ -882,6 +882,54 @@ def test_review_flags_an_underfilling_overlay():
     print("ok  review flags an overlay that underfills the beat it sits over")
 
 
+# --------------------------------------------------------------------------
+# edso_think_act_check.plan.md change 4: requested-feature presence check
+# --------------------------------------------------------------------------
+
+def test_review_flags_a_named_feature_missing_from_the_edit():
+    doc = {"timeline": [], "operations": [], "brief": {}}
+    struct = _map()
+    out = observe.review(doc, _ctx(struct), user_ask="make it a split screen with music")
+    msgs = [f["message"] for f in out["flags"]]
+    assert any("split screen" in m and "doesn't have it" in m for m in msgs), msgs
+    assert any("a music bed" in m and "doesn't have it" in m for m in msgs), msgs
+    cats = {f["category"] for f in out["flags"]}
+    assert cats == {"ask"}, cats
+    print("ok  review flags a named feature (split screen, music) missing from the edit")
+
+
+def test_review_no_feature_flag_when_the_feature_is_present():
+    doc = {"timeline": [], "operations": [
+        {"op_id": "ov1", "type": "place_audio", "role": "music", "from_ms": 0, "to_ms": 1000,
+         "source_file_id": "f9", "src_in_ms": 0, "src_out_ms": 1000},
+    ], "layout_regions": [
+        {"region_id": "r1", "template": "split_h", "from_ms": 0, "to_ms": 1000, "cells": {}},
+    ], "brief": {}}
+    struct = _map()
+    out = observe.review(doc, _ctx(struct), user_ask="make it a split screen with music")
+    ask_flags = [f for f in out["flags"] if f.get("category") == "ask"]
+    assert ask_flags == [], ask_flags
+    print("ok  review doesn't flag a named feature that IS present")
+
+
+def test_review_no_feature_flag_without_an_ask():
+    doc = {"timeline": [], "operations": [], "brief": {}}
+    struct = _map()
+    out = observe.review(doc, _ctx(struct))   # default user_ask=""
+    assert out["flags"] == [], out["flags"]
+    print("ok  review runs no feature check at all with no user_ask given")
+
+
+def test_review_feature_flags_never_prescribe_a_fix():
+    doc = {"timeline": [], "operations": [], "brief": {}}
+    struct = _map()
+    out = observe.review(doc, _ctx(struct), user_ask="split screen please")
+    for f in out["flags"]:
+        msg = f["message"].lower()
+        assert "add " not in msg and "use split_screen" not in msg and "call " not in msg, f
+    print("ok  requested-feature flags state a fact, never a prescribed fix")
+
+
 def main():
     test_read_state_reports_cuts_and_feel()
     test_place_adds_main_line_cut()
@@ -931,6 +979,10 @@ def main():
     test_review_played_text_reflects_the_excised_span_not_the_whole_cut()
     test_review_flags_an_overrunning_overlay()
     test_review_flags_an_underfilling_overlay()
+    test_review_flags_a_named_feature_missing_from_the_edit()
+    test_review_no_feature_flag_when_the_feature_is_present()
+    test_review_no_feature_flag_without_an_ask()
+    test_review_feature_flags_never_prescribe_a_fix()
     print("\nall observe/act tests passed")
 
 

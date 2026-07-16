@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.services.l3 import feel, footage_map, framing, layers
 from app.services.l3.arrange import _MapIndex, _weld_segments
@@ -944,7 +944,55 @@ def _overlap_ms(a0: int, a1: int, b0: int, b1: int) -> int:
     return max(0, min(a1, b1) - max(a0, b0))
 
 
-def review(document: dict, ctx: EditContext) -> dict:
+def _tag_category(findings: List[dict], category: str) -> List[dict]:
+    for f in findings:
+        f["category"] = category
+    return findings
+
+
+# edso_think_act_check.plan.md change 4: the ask/contract half of the audit --
+# a GENERIC keyword -> structural-presence check, not a per-genre feature
+# list. Each group is (display name, phrases that name the feature in plain
+# English, a check against the assembled document). Deterministic, signal-
+# driven (post.py/cutrecord_map.py convention): a plain word match against
+# the user's own words, checked against a structural fact -- never an LLM
+# judgment call on whether the feature was "really" wanted.
+_FEATURE_GROUPS: Tuple[Tuple[str, Tuple[str, ...], Any], ...] = (
+    ("split screen",
+     ("split screen", "split-screen", "side by side", "side-by-side",
+      "picture in picture", "picture-in-picture"),
+     lambda doc: bool(doc.get("layout_regions"))),
+    ("a music bed",
+     ("music", "soundtrack", "background song", "backing track"),
+     lambda doc: any(o.get("type") == "place_audio" and o.get("role") == "music"
+                     for o in (doc.get("operations") or []))),
+)
+
+
+def _mentions(text: str, phrase: str) -> bool:
+    return re.search(r"\b" + re.escape(phrase) + r"\b", text) is not None
+
+
+def _requested_feature_flags(document: dict, user_ask: str) -> List[dict]:
+    """Flag a feature the user's own words named that isn't actually in the
+    assembled edit (e.g. "make it a split screen" but no layout_regions
+    exist) -- the check that would have caught a dropped split screen. A
+    fact ("the ask mentions X but the edit doesn't have it"), never a
+    prescribed fix; '' ask -> no check (never a false positive from a
+    missing ask). `category` marks these as ASK-level (vs. the guidance-
+    level flags below), so a caller can prioritize/label them."""
+    if not user_ask:
+        return []
+    text = user_ask.lower()
+    findings: List[dict] = []
+    for name, phrases, present in _FEATURE_GROUPS:
+        if any(_mentions(text, p) for p in phrases) and not present(document):
+            findings.append({"severity": "warn", "anchor": "whole", "category": "ask",
+                             "message": f"the ask mentions {name} but the edit doesn't have it"})
+    return findings
+
+
+def review(document: dict, ctx: EditContext, *, user_ask: str = "") -> dict:
     """The ASSEMBLED program read back, per timeline seg in SOURCE order --
     the brain's own "play back what I actually built" check, distinct from
     read_state (structure) and diagnose (aggregate editorial findings). Each
@@ -952,12 +1000,16 @@ def review(document: dict, ctx: EditContext) -> dict:
     the VERBATIM words actually spoken over the seg's PLAYED span (reuse
     footage_map._said_text_for_span; a non-speech seg gets ""), words are
     the same word->program offsets read_state's seg_id detail returns (item
-    3). Plus {total_ms, target_ms, cut_count} and `flags`: presented facts
-    about rough heads/tails or overrunning overlays -- NEVER a prescribed
-    fix ("trim to +Xms"); the brain decides what, if anything, to do."""
+    3). Plus {total_ms, target_ms, cut_count} and `flags`: presented facts,
+    checked in order against (1) the ask/contract -- a `user_ask`-named
+    feature (split screen, a music bed) missing from the edit, `category`
+    "ask" -- then (2) the guidance ceilings -- rough heads/tails, overlay
+    fit, `category` "guidance". NEVER a prescribed fix ("trim to +Xms"); the
+    brain decides what, if anything, to do. `user_ask` defaults to '' (no
+    ask-level check) so a direct `review` tool call still works without it."""
     timeline = document.get("timeline") or []
     items: List[Dict[str, Any]] = []
-    flags: List[dict] = []
+    flags: List[dict] = list(_requested_feature_flags(document, user_ask))
     prog = 0
     for i, seg in enumerate(timeline):
         dur = int(seg.get("out_ms", 0)) - int(seg.get("in_ms", 0))
@@ -975,14 +1027,15 @@ def review(document: dict, ctx: EditContext) -> dict:
         })
         if is_speech:
             try:
-                flags.extend(_head_tail_flags(seg, f"cut {i + 1} ({seg.get('seg_id')})"))
+                flags.extend(_tag_category(
+                    _head_tail_flags(seg, f"cut {i + 1} ({seg.get('seg_id')})"), "guidance"))
             except Exception:
                 logger.exception("review: head/tail flags failed for seg %s", seg.get("seg_id"))
         prog += dur
 
     try:
         resolved = layers.resolve(document, ctx.durations)
-        flags.extend(_overlay_fit_flags(resolved))
+        flags.extend(_tag_category(_overlay_fit_flags(resolved), "guidance"))
     except Exception:
         logger.exception("review: overlay-fit flags failed (continuing without them)")
 

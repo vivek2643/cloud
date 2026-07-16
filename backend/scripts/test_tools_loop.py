@@ -336,6 +336,58 @@ def test_gate_surfaces_review_flags_end_to_end():
     print("ok  gate: review flags surface end-to-end and the loop still terminates")
 
 
+# --------------------------------------------------------------------------
+# edso_think_act_check.plan.md
+# --------------------------------------------------------------------------
+
+def test_latest_user_text_reads_the_newest_user_message():
+    assert tools._latest_user_text([{"role": "user", "content": "cut a 5s teaser"}]) == "cut a 5s teaser"
+    assert tools._latest_user_text([
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": [{"type": "text", "text": "second, split screen"}]},
+    ]) == "second, split screen"
+    assert tools._latest_user_text([]) == ""
+    print("ok  _latest_user_text reads the newest user message, both content shapes")
+
+
+def test_gate_flags_a_requested_feature_missing_end_to_end():
+    """change 4: the done-gate's audit now also checks a NAMED feature (split
+    screen, a music bed) is actually present -- the check that would have
+    caught the motivating "never added the requested split screen" failure.
+    One extra turn, never a prescribed fix, then the loop still terminates."""
+    ctx = _ctx(_struct())
+    doc = _seed_doc()
+    script = [
+        [ToolCall(id="t1", name="place", input={"ref": "ffffffff:m00", "level": "balanced"})],
+        "Placed the beat.",                                          # finish #1 -> gate flags the missing split
+        "Added a split screen instead of skipping it -- fixed now.",  # act -> finish
+    ]
+    llm = _ScriptedLLM(script)
+    res = tools.run_edit_loop(llm, system="sys",
+                              messages=[{"role": "user", "content": "make it a split screen"}],
+                              ctx=ctx, document=doc)
+    assert "Added a split screen" in res.reply, res.reply
+    assert llm.calls == 3, llm.calls           # the gate bought exactly one extra turn
+    print("ok  gate: a requested-but-missing feature is flagged, then the loop still terminates")
+
+
+def test_gate_does_not_flag_a_feature_the_user_never_asked_for():
+    ctx = _ctx(_struct())
+    doc = _seed_doc()
+    script = [
+        [ToolCall(id="t1", name="place", input={"ref": "ffffffff:m00", "level": "balanced"})],
+        "Placed the beat.",
+    ]
+    llm = _ScriptedLLM(script)
+    res = tools.run_edit_loop(llm, system="sys",
+                              messages=[{"role": "user", "content": "just cut it together"}],
+                              ctx=ctx, document=doc)
+    assert res.reply == "Placed the beat.", res.reply
+    assert llm.calls == 2, llm.calls           # no gate nudge at all -- nothing to flag
+    print("ok  gate: no feature nudge when the ask never named one")
+
+
 def main():
     test_loop_reads_then_places_then_replies()
     test_loop_pure_chat_no_change()
@@ -352,6 +404,9 @@ def main():
     test_gate_advisory_review_skipped_when_already_diagnosed()
     test_gate_forces_length_reconcile_end_to_end()
     test_gate_surfaces_review_flags_end_to_end()
+    test_latest_user_text_reads_the_newest_user_message()
+    test_gate_flags_a_requested_feature_missing_end_to_end()
+    test_gate_does_not_flag_a_feature_the_user_never_asked_for()
     print("\nall tool-loop tests passed")
 
 
