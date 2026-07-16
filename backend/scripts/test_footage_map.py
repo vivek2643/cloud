@@ -609,6 +609,69 @@ def test_default_energy_from_genre():
     print("ok  test_default_energy_from_genre")
 
 
+def _sent(a, b, text="x", spk="S0"):
+    return {"speaker": spk, "text": text, "src_in_ms": a, "src_out_ms": b}
+
+
+def test_snap_merges_a_midsentence_seam():
+    """A dead-air jump-cut seam that falls INSIDE a sentence is merged away, so
+    the sentence stays contiguous and can't be split/removed (the m02 class)."""
+    sents = (_sent(0, 3000, "asked that question."),
+             _sent(3000, 10000, "so what was the biggest challenge when you joined?"))
+    with mock.patch.object(fm, "_sentences_for_file", return_value=sents):
+        out = fm.snap_speech_spans_to_sentences("f", [(0, 5000), (5060, 10000)])
+    assert out == [(0, 10000)], out   # 60ms mid-sentence gap swallowed
+    print("ok  snap merges a mid-sentence seam")
+
+
+def test_snap_keeps_a_between_sentence_seam():
+    """A seam whose edges land on sentence boundaries is a legit jump-cut and is
+    preserved (we only remove SEAMS that would sever a sentence)."""
+    sents = (_sent(0, 3000, "first sentence."), _sent(4000, 8000, "second sentence."))
+    with mock.patch.object(fm, "_sentences_for_file", return_value=sents):
+        out = fm.snap_speech_spans_to_sentences("f", [(0, 3000), (4000, 8000)])
+    assert out == [(0, 3000), (4000, 8000)], out
+    print("ok  snap keeps a between-sentence seam")
+
+
+def test_snap_drops_a_partial_tail_sliver_at_the_head():
+    """A head that only catches the tail sliver of a prior sentence snaps forward
+    to the next sentence start (the 'starts on think' class)."""
+    sents = (_sent(0, 5000, "...I think"), _sent(5000, 9000, "we look forward to more."))
+    with mock.patch.object(fm, "_sentences_for_file", return_value=sents):
+        out = fm.snap_speech_spans_to_sentences("f", [(4800, 9000)])
+    assert out == [(5000, 9000)], out
+    print("ok  snap drops a partial tail sliver at the head")
+
+
+def test_snap_keeps_a_mostly_present_head_sentence():
+    """A head that already holds MOST of its sentence keeps it -- never amputate a
+    near-whole opening line (the m01 non-regression)."""
+    sents = (_sent(4000, 7000, "it's been an incredible journey,"),
+             _sent(7000, 12000, "how has the journey been?"))
+    with mock.patch.object(fm, "_sentences_for_file", return_value=sents):
+        out = fm.snap_speech_spans_to_sentences("f", [(4200, 12000)])
+    assert out == [(4200, 12000)], out   # 200ms into a 3s sentence -> kept
+    print("ok  snap keeps a mostly-present head sentence")
+
+
+def test_snap_drops_a_dangling_tail_sentence():
+    """A tail that only catches the head sliver of a sentence snaps back to the
+    previous sentence end (the 'ends on or,' class)."""
+    sents = (_sent(0, 4000, "great projects."), _sent(4000, 9000, "whether it is X, or ..."))
+    with mock.patch.object(fm, "_sentences_for_file", return_value=sents):
+        out = fm.snap_speech_spans_to_sentences("f", [(0, 4600)])
+    assert out == [(0, 4000)], out
+    print("ok  snap drops a dangling tail sentence")
+
+
+def test_snap_is_noop_without_transcript():
+    with mock.patch.object(fm, "_sentences_for_file", return_value=()):
+        spans = [(100, 200), (300, 400)]
+        assert fm.snap_speech_spans_to_sentences("f", spans) == spans
+    print("ok  snap is a no-op without transcript")
+
+
 def main():
     test_thought_levels_become_variants()
     test_moment_line_flags_offcamera()
@@ -645,6 +708,12 @@ def main():
     test_cast_line_lists_majors_with_voices_and_others_by_id()
     test_cast_line_empty_with_no_persons()
     test_default_energy_from_genre()
+    test_snap_merges_a_midsentence_seam()
+    test_snap_keeps_a_between_sentence_seam()
+    test_snap_drops_a_partial_tail_sliver_at_the_head()
+    test_snap_keeps_a_mostly_present_head_sentence()
+    test_snap_drops_a_dangling_tail_sentence()
+    test_snap_is_noop_without_transcript()
     print("\nall footage-map tests passed")
 
 

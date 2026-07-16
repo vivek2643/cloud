@@ -19,10 +19,11 @@ unchanged (the caller diagnoses), never an exception that could crash a turn.
 """
 from __future__ import annotations
 
+import dataclasses
 import uuid
 from typing import List, Optional
 
-from app.services.l3 import cutrecord_map, layers
+from app.services.l3 import cutrecord_map, footage_map, layers
 from app.services.l3.grade.arc import ARC_INTENTS
 from app.services.l3.grade.cdl import Grade, compose
 from app.services.l3.grade.steer import solve_steer_grade
@@ -91,6 +92,24 @@ def _segments_from_cut(rc: ResolvedCut) -> List[dict]:
             "audio_offset_ms": rc.audio_offset_ms,
         })
     return out
+
+
+def _snap_cut_to_sentences(rc: ResolvedCut) -> ResolvedCut:
+    """Sentence-align a SPEECH cut's kept spans so it never opens/closes
+    mid-thought and no dead-air jump-cut seam severs a sentence (which is how a
+    placed line gets a filler head or loses its payload to a later remove). A
+    no-op for non-speech cuts or footage with no transcript. Reuses
+    ``footage_map.snap_speech_spans_to_sentences`` -- the only place the brain's
+    placements meet the sentence grid."""
+    if rc.channel != "said":
+        return rc
+    spans = rc.keep_spans or [(rc.src_in_ms, rc.src_out_ms)]
+    snapped = footage_map.snap_speech_spans_to_sentences(rc.file_id, spans)
+    if snapped == spans:
+        return rc
+    return dataclasses.replace(
+        rc, src_in_ms=snapped[0][0], src_out_ms=snapped[-1][1],
+        keep_spans=(None if len(snapped) == 1 else snapped))
 
 
 def _program_end(document: dict) -> int:
@@ -185,6 +204,7 @@ def place(document: dict, index: _MapIndex, ref: str, *,
     rc = index.resolve(p)
     if rc is None:
         return document
+    rc = _snap_cut_to_sentences(rc)
     doc = _clone(document)
 
     if channel.upper() == "V1":

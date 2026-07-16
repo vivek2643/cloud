@@ -195,6 +195,24 @@ def test_place_multispan_keep_spans_survives():
     print("ok  place survives multi-span keep_spans (pairs) -- the live-loop bug")
 
 
+def test_place_snaps_speech_cut_to_sentences():
+    """A placed SPEECH cut whose keep-span seam falls mid-sentence is merged to
+    one contiguous segment (footage_map sentence snap), so a later remove can't
+    sever the sentence -- the m02 fix. Non-speech / no-transcript paths no-op."""
+    c0 = _cut("f:t0", 0, 6000, "the question", ladder=[
+        _rung_multi("balanced", [(0, 3000), (3060, 6000)], "the question")])
+    tree = fm.build_clip_tree("ffffffff-2222", {"name": "Q", "duration_ms": 6000}, [c0])
+    idx = _MapIndex({"clips": [tree]})
+    sents = ({"speaker": "S0", "text": "so what was the biggest challenge here?",
+              "src_in_ms": 0, "src_out_ms": 6000},)
+    doc = {"format": {"aspect": "landscape"}, "timeline": [], "operations": []}
+    with mock.patch.object(fm, "_sentences_for_file", return_value=sents):
+        doc2 = act.place(doc, idx, "ffffffff:m00", level="balanced", channel="V1")
+    spans = [(s["in_ms"], s["out_ms"]) for s in doc2["timeline"]]
+    assert spans == [(0, 6000)], spans   # 60ms mid-sentence seam swallowed
+    print("ok  place snaps a speech cut's mid-sentence seam to one contiguous span")
+
+
 def test_norm_keep_spans_accepts_both_shapes():
     from app.services.l3.arrange import _norm_keep_spans
     assert _norm_keep_spans([[0, 1000], [1500, 3000]]) == [(0, 1000), (1500, 3000)]
@@ -882,6 +900,44 @@ def test_review_flags_an_underfilling_overlay():
     print("ok  review flags an overlay that underfills the beat it sits over")
 
 
+def test_offcam_speaker_flag_only_when_an_oncam_angle_exists():
+    # off camera + a sibling angle shows the speaker -> flagged (with the ref)
+    f = observe._offcam_speaker_flag(
+        {"speaker_person": "P1", "on_camera": False,
+         "alt_pic": [{"moment_id": "1e529bed:m06", "visible_persons": ["P1"]}]},
+        "cut 1 (s0)")
+    assert f and "off camera" in f[0]["message"] and "1e529bed:m06" in f[0]["message"], f
+    assert "trim" not in f[0]["message"].lower()   # never a prescribed fix
+    # speaker already on camera -> nothing to switch to
+    assert observe._offcam_speaker_flag(
+        {"speaker_person": "P1", "on_camera": True,
+         "alt_pic": [{"moment_id": "x:m1", "visible_persons": ["P1"]}]}, "a") == []
+    # off camera but NO sibling shows the speaker (narration / voiceover-over-b-roll)
+    assert observe._offcam_speaker_flag(
+        {"speaker_person": "P1", "on_camera": False,
+         "alt_pic": [{"moment_id": "x:m1", "visible_persons": ["P0"]}]}, "a") == []
+    # no speaker at all -> silent
+    assert observe._offcam_speaker_flag({"on_camera": False, "alt_pic": []}, "a") == []
+    print("ok  off-camera-speaker flag fires only when an on-camera angle exists")
+
+
+def test_review_wires_the_offcam_speaker_flag():
+    doc = {"timeline": [
+        {"seg_id": "s0", "file_id": "ffffffff-1111", "in_ms": 0, "out_ms": 4000,
+         "axis": "speech", "ref": "ffffffff:m00"},
+    ], "operations": [], "brief": {}}
+    ctx = _ctx(_map())
+    ctx.index.moments["ffffffff:m00"] = {
+        "speaker_person": "P1", "on_camera": False,
+        "alt_pic": [{"moment_id": "1e529bed:m06", "visible_persons": ["P1"]}],
+    }
+    with mock.patch.object(fm, "_sentences_for_file", return_value=()):
+        out = observe.review(doc, ctx)
+    msgs = [f["message"] for f in out["flags"]]
+    assert any("off camera" in m and "1e529bed:m06" in m for m in msgs), msgs
+    print("ok  review surfaces the off-camera-speaker flag end-to-end")
+
+
 # --------------------------------------------------------------------------
 # edso_think_act_check.plan.md change 4: requested-feature presence check
 # --------------------------------------------------------------------------
@@ -940,6 +996,7 @@ def main():
     test_predict_length_under_tighten()
     test_validate_flags_bad_span()
     test_place_multispan_keep_spans_survives()
+    test_place_snaps_speech_cut_to_sentences()
     test_norm_keep_spans_accepts_both_shapes()
     test_split_screen_adds_op_and_region()
     test_split_screen_resolves_to_dest_rects()
@@ -979,6 +1036,8 @@ def main():
     test_review_played_text_reflects_the_excised_span_not_the_whole_cut()
     test_review_flags_an_overrunning_overlay()
     test_review_flags_an_underfilling_overlay()
+    test_offcam_speaker_flag_only_when_an_oncam_angle_exists()
+    test_review_wires_the_offcam_speaker_flag()
     test_review_flags_a_named_feature_missing_from_the_edit()
     test_review_no_feature_flag_when_the_feature_is_present()
     test_review_no_feature_flag_without_an_ask()

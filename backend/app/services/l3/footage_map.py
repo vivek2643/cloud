@@ -1043,6 +1043,94 @@ def _sentence_span(s: Dict[str, Any]) -> Tuple[int, int]:
         return 0, 0
 
 
+# A cut edge within this of a sentence boundary is treated as already "on" it;
+# also the max sliver we'll drop when snapping a partial-sentence edge inward.
+_SENTENCE_SNAP_TOL_MS = 250
+
+
+def snap_speech_spans_to_sentences(
+    file_id: str, spans: List[Tuple[int, int]]
+) -> List[Tuple[int, int]]:
+    """Snap a SPEECH cut's kept spans to sentence boundaries so a cut never
+    starts/ends mid-thought and a jump-cut seam never severs a sentence.
+
+    Two moves, both deterministic and inward-only (never extends the span, never
+    fabricates content):
+
+    * Outer head/tail -> the nearest sentence boundary, dropping a partial-
+      sentence sliver (the "starts on 'think' / ends on 'or,'" class).
+    * Interior jump-cut seams (dead-air/filler removed WITHIN the span) that
+      don't land at a sentence boundary are merged away, so a single sentence
+      stays contiguous and can't be split into separately-removable pieces (the
+      m02 class, where a 60ms mid-sentence gap let the payload get cut).
+
+    Returns a new ordered ``[(in, out), ...]``; returns ``spans`` unchanged when
+    the file has no sentence transcript or snapping would empty the span
+    (best-effort, never destructive)."""
+    if not spans:
+        return spans
+    bounds = sorted(
+        (_sentence_span(s) for s in _sentences_for_file(file_id)),
+        key=lambda b: b[0],
+    )
+    bounds = [(a, b) for a, b in bounds if b > a]
+    if not bounds:
+        return spans
+    starts = [a for a, _ in bounds]
+    ends = [b for _, b in bounds]
+
+    outer_in, outer_out = spans[0][0], spans[-1][1]
+    tol = _SENTENCE_SNAP_TOL_MS
+    # Only a sliver smaller than half a sentence is dropped; a cut that already
+    # holds most of a sentence keeps it (don't amputate a near-whole line).
+    keep_frac = 0.5
+
+    def _snap_head(t: int) -> int:
+        for s0, s1 in bounds:
+            if s0 - tol <= t < s1:            # t sits at/inside this sentence
+                if t - s0 <= tol or (s1 - t) >= (s1 - s0) * keep_frac:
+                    return t                  # at start, or mostly present -> keep
+                return s1                     # only a tail sliver -> drop it
+        nxt = next((s0 for s0 in starts if s0 >= t), None)  # in a gap -> next start
+        return nxt if nxt is not None else t
+
+    def _snap_tail(t: int) -> int:
+        for s0, s1 in bounds:
+            if s0 < t <= s1 + tol:            # t sits at/inside this sentence
+                if s1 - t <= tol or (t - s0) >= (s1 - s0) * keep_frac:
+                    return t                  # at end, or mostly present -> keep
+                return s0                     # only a head sliver -> drop it
+        prev = next((s1 for s1 in reversed(ends) if s1 <= t), None)
+        return prev if prev is not None else t
+
+    new_in, new_out = _snap_head(outer_in), _snap_tail(outer_out)
+    if new_out - new_in <= 0:
+        return spans
+
+    def _on_boundary(t: int) -> bool:
+        return any(abs(t - a) <= tol for a in starts) or any(abs(t - e) <= tol for e in ends)
+
+    # Rebuild the kept list within [new_in, new_out], keeping only jump-cut seams
+    # whose BOTH edges fall on a sentence boundary; merge across the rest.
+    clipped = [
+        (max(a, new_in), min(b, new_out))
+        for a, b in spans
+        if min(b, new_out) - max(a, new_in) > 0
+    ]
+    if not clipped:
+        return spans
+    merged: List[Tuple[int, int]] = [clipped[0]]
+    for a, b in clipped[1:]:
+        prev_a, prev_b = merged[-1]
+        # The gap (prev_b, a) is a removed span; keep the seam only if it sits at
+        # a sentence boundary on both sides, else swallow the gap (stay contiguous).
+        if _on_boundary(prev_b) and _on_boundary(a):
+            merged.append((a, b))
+        else:
+            merged[-1] = (prev_a, b)
+    return merged
+
+
 def _said_text_for_span(file_id: str, in_ms: int, out_ms: int) -> str:
     """Verbatim transcript for a SPEECH beat's own span (no padding, unlike
     `_span_detail`'s Tier-1 window) -- the words actually spoken, joined into
