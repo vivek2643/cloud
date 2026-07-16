@@ -5,10 +5,14 @@ Where ``act`` mutates the document, ``observe`` reads it and reports, so the
 agentic loop can perceive -> act -> re-perceive cheaply (a coding agent reading
 the repo before/after an edit). Every function is a pure projection of the
 document + a per-turn ``EditContext`` (footage map, source durations) assembled
-ONCE by ``build_context`` -- the only place that touches the DB. The five
-senses:
+ONCE by ``build_context``. Most of the DB access happens there; a couple of
+senses (``review``, and ``read_state`` when asked for a ``seg_id`` detail) do
+their own SMALL, on-demand transcript fetch (edso_pacing_audit_timing.plan.md
+item 3/6) rather than loading every file's words into ``EditContext`` up
+front. The senses:
 
-  * read_state  -- what the edit IS now (cuts, channels, duration, feel).
+  * read_state  -- what the edit IS now (cuts, channels, duration, feel, the
+                   z-stack); optionally one cut's words resolved to program time.
   * predict     -- what a proposed change WOULD do (e.g. length after tightening)
                    without applying it.
   * validate    -- structural legality (spans in range, refs real, no bad ops).
@@ -16,17 +20,24 @@ senses:
                    redundant takes) -- read off feel + the map.
   * affordances -- what CAN be done, and to what (tighter takes, alternates,
                    mute toggles, channels) -- the brain's menu.
+  * audio_state -- the audio digest (beds, outlook-authoritative runs, unplaced assets).
+  * review      -- the ASSEMBLED program read back per cut (played text, word
+                   offsets) + presented (never prescribed) rough-head/tail and
+                   overlay-fit flags.
 
 Feel is delegated to ``feel.simulate`` (also pure). Nothing here renders.
 """
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from app.services.l3 import feel, footage_map, framing, layers
 from app.services.l3.arrange import _MapIndex, _weld_segments
+from app.services.l3.captions import resolver as captions_resolver
+from app.services.l3.captions import timing as captions_timing
 from app.services.l3.grade.steer import explain_grade
 
 logger = logging.getLogger(__name__)
@@ -321,9 +332,36 @@ def _fid8(s: str) -> str:
     return (s or "")[:8]
 
 
-def read_state(document: dict, ctx: EditContext) -> dict:
+def _word_offsets_for_seg(seg: dict, prog_start_ms: int) -> List[Dict[str, Any]]:
+    """Word-level program-time offsets for ONE timeline segment (edso_pacing_
+    audit_timing.plan.md item 3) -- reuses captions/timing.py's linear
+    source->program mapping. Correct and complete per segment even though
+    the mapping itself is linear/single-span: a cut's own keep_spans jump-
+    cuts are already flattened into SEPARATE timeline segments at placement
+    time (`act._segments_from_cut`), so every segment IS one contiguous
+    source window by construction -- there is no multi-span case left to
+    handle here. [] when the file has no transcript yet (never fabricated)."""
+    file_id = seg.get("file_id")
+    if not file_id:
+        return []
+    transcripts = captions_resolver.fetch_transcripts([file_id])
+    words_src = (transcripts.get(file_id) or {}).get("segments") or []
+    in_ms, out_ms = int(seg.get("in_ms", 0)), int(seg.get("out_ms", 0))
+    words = captions_timing.words_in_source_window(words_src, in_ms, out_ms)
+    out: List[Dict[str, Any]] = []
+    for w in words:
+        t_in, t_out = captions_timing._to_program(w, in_ms, prog_start_ms)
+        out.append({"text": w.get("text", ""), "prog_start_ms": t_in, "prog_end_ms": t_out})
+    return out
+
+
+def read_state(document: dict, ctx: EditContext, *, seg_id: Optional[str] = None) -> dict:
     """The current edit at a glance: ordered cuts, channels in use, duration, and
-    the feel narration. This is the brain's primary 'look at the timeline'."""
+    the feel narration. This is the brain's primary 'look at the timeline'.
+    `seg_id` (optional): also resolve that ONE main-line segment's spoken
+    words down to program-time offsets (item 3) -- e.g. to land an overlay
+    precisely on a line. On-demand only; omitted by default so a plain look
+    never pays a transcript fetch."""
     timeline = document.get("timeline") or []
     ops = document.get("operations") or []
     report = feel.simulate(timeline, ctx.meta_by_ref)
@@ -437,6 +475,44 @@ def read_state(document: dict, ctx: EditContext) -> dict:
               for o in ops if o.get("type") == "split_edit"]
     if splits:
         state["split_edits"] = splits
+
+    # edso_pacing_audit_timing.plan.md item 2: report the z-stack (coverage
+    # layers + layout), not just the spine `cuts` above, so this on-demand
+    # look matches what the Program Map already shows -- resolved FRESH here
+    # (not read off `document["resolved"]`, which is only as fresh as the
+    # LAST full turn's resolve_doc, stale for a tool call mid-loop).
+    try:
+        resolved = layers.resolve(document, ctx.durations)
+        coverage = [
+            {"layer_id": v.layer_id, "op_id": v.op_id, "z": v.z, "layout": v.layout,
+             "prog_start_ms": v.prog_start_ms, "prog_end_ms": v.prog_end_ms,
+             "source_file_id": _fid8(v.source_file_id)}
+            for v in resolved.video_layers if v.kind != "spine"
+        ]
+        if coverage:
+            state["video_stack"] = coverage
+        extra_audio = [
+            {"layer_id": a.layer_id, "op_id": a.op_id, "role": a.role, "kind": a.kind,
+             "prog_start_ms": a.prog_start_ms, "prog_end_ms": a.prog_end_ms,
+             "gain_db": a.gain_db, "duck_db": a.duck_db}
+            for a in resolved.audio_layers if a.kind != "spine"
+        ]
+        if extra_audio:
+            state["audio_layers"] = extra_audio
+    except Exception:
+        logger.exception("read_state: layer resolve failed (continuing without the z-stack)")
+
+    if seg_id:
+        seg = next((s for s in timeline if s.get("seg_id") == seg_id), None)
+        match = next((c for c in cuts if c["seg_id"] == seg_id), None)
+        if seg is not None and match is not None:
+            try:
+                state["word_offsets"] = {
+                    "seg_id": seg_id,
+                    "words": _word_offsets_for_seg(seg, match["prog_start_ms"]),
+                }
+            except Exception:
+                logger.exception("read_state: word-offset detail failed for seg %s", seg_id)
     return state
 
 
@@ -741,6 +817,186 @@ def diagnose(document: dict, ctx: EditContext) -> List[dict]:
 
 
 # --------------------------------------------------------------------------
+# 4b. review (the assembled program, read back -- edso_pacing_audit_timing.
+# plan.md item 6)
+# --------------------------------------------------------------------------
+
+# A sentence made up ENTIRELY of these reads as pure filler/backchannel
+# ("um", "yeah", "okay, right") rather than real content -- generic spoken-
+# language patterns, not a domain assumption (the same words show up in any
+# genre's dialogue).
+_FILLER_WORDS = frozenset("""
+um uh uhh umm er erm ah hm hmm mhm mm huh
+yeah yep yup okay ok so like right well
+""".split())
+
+# A gap this long between a cut's own boundary and the first/last word still
+# inside it reads as a real silent lead-in/tail worth flagging.
+_DEAD_AIR_HEAD_TAIL_MS = 400
+
+# An overlay covering less than this fraction of the beat it sits over
+# clearly underfills it; bleeding this many ms past the beat's own edge
+# clearly overruns into a neighboring one.
+_OVERLAY_UNDERFILL_RATIO = 0.5
+_OVERLAY_OVERRUN_MS = 500
+
+
+def _is_filler_sentence(text: Optional[str]) -> bool:
+    words = re.sub(r"[^a-zA-Z' ]", "", (text or "")).lower().split()
+    return bool(words) and all(w in _FILLER_WORDS for w in words)
+
+
+def _head_tail_flags(seg: dict, anchor: str) -> List[dict]:
+    """Facts about a SPEECH cut's played head/tail -- a speaker mismatch
+    against the cut's own majority speaker, a filler/backchannel line, or
+    silent dead air still inside the cut's own boundary. Presented, never a
+    prescribed fix -- the brain decides whether/how to trim."""
+    file_id = seg.get("file_id") or ""
+    in_ms, out_ms = int(seg.get("in_ms", 0)), int(seg.get("out_ms", 0))
+    sentences = sorted(
+        (s for s in footage_map._sentences_for_file(file_id)
+         if footage_map._overlap_ms(*footage_map._sentence_span(s), in_ms, out_ms) > 0),
+        key=lambda s: footage_map._sentence_span(s)[0],
+    )
+    if not sentences:
+        return []
+    findings: List[dict] = []
+
+    speakers = [s.get("speaker") for s in sentences if s.get("speaker")]
+    if len(set(speakers)) > 1:
+        # Dominance by TOTAL SPOKEN DURATION, not sentence count -- a single
+        # 300ms filler and a single 4s thought are both "one sentence", but
+        # only one of them is actually carrying the cut.
+        durations: Dict[str, int] = {}
+        for s in sentences:
+            spk = s.get("speaker")
+            if not spk:
+                continue
+            s0, s1 = footage_map._sentence_span(s)
+            durations[spk] = durations.get(spk, 0) + max(0, s1 - s0)
+        dominant = max(durations.items(), key=lambda kv: kv[1])[0]
+        head_spk, tail_spk = sentences[0].get("speaker"), sentences[-1].get("speaker")
+        if head_spk and head_spk != dominant:
+            findings.append({"severity": "info", "anchor": anchor,
+                             "message": f"lead-in spoken by {head_spk}, not this cut's "
+                                        f"dominant speaker ({dominant})"})
+        if len(sentences) > 1 and tail_spk and tail_spk != dominant:
+            findings.append({"severity": "info", "anchor": anchor,
+                             "message": f"tail spoken by {tail_spk}, not this cut's "
+                                        f"dominant speaker ({dominant})"})
+
+    if _is_filler_sentence(sentences[0].get("text")):
+        findings.append({"severity": "info", "anchor": anchor,
+                         "message": f"lead-in reads as filler/backchannel: "
+                                    f"\"{sentences[0].get('text')}\""})
+    if len(sentences) > 1 and _is_filler_sentence(sentences[-1].get("text")):
+        findings.append({"severity": "info", "anchor": anchor,
+                         "message": f"tail reads as filler/backchannel: "
+                                    f"\"{sentences[-1].get('text')}\""})
+
+    first_s, _first_e = footage_map._sentence_span(sentences[0])
+    _last_s, last_e = footage_map._sentence_span(sentences[-1])
+    if first_s - in_ms >= _DEAD_AIR_HEAD_TAIL_MS:
+        findings.append({"severity": "info", "anchor": anchor,
+                         "message": f"~{(first_s - in_ms) / 1000:.1f}s of dead air "
+                                    f"before the first word"})
+    if out_ms - last_e >= _DEAD_AIR_HEAD_TAIL_MS:
+        findings.append({"severity": "info", "anchor": anchor,
+                         "message": f"~{(out_ms - last_e) / 1000:.1f}s of dead air "
+                                    f"after the last word"})
+    return findings
+
+
+def _overlay_fit_flags(resolved: "layers.ResolvedTimeline") -> List[dict]:
+    """Flag a V2 coverage layer whose program window clearly overruns or
+    underfills the spine beat it sits over -- a fact, never a prescribed
+    fix (the brain decides whether/how to retime it)."""
+    findings: List[dict] = []
+    spine = [v for v in resolved.video_layers if v.kind == "spine"]
+    for cov in resolved.video_layers:
+        if cov.kind == "spine":
+            continue
+        host = max(
+            spine, key=lambda s: _overlap_ms(cov.prog_start_ms, cov.prog_end_ms,
+                                             s.prog_start_ms, s.prog_end_ms),
+            default=None,
+        )
+        if host is None or _overlap_ms(cov.prog_start_ms, cov.prog_end_ms,
+                                       host.prog_start_ms, host.prog_end_ms) <= 0:
+            continue
+        host_dur = host.prog_end_ms - host.prog_start_ms
+        cov_dur = cov.prog_end_ms - cov.prog_start_ms
+        anchor = f"overlay {cov.op_id or cov.layer_id}"
+        if host_dur > 0 and cov_dur < host_dur * _OVERLAY_UNDERFILL_RATIO:
+            findings.append({"severity": "info", "anchor": anchor,
+                             "message": f"covers {cov_dur}ms of a {host_dur}ms beat -- "
+                                        f"underfills the line it sits over"})
+        overrun_before = host.prog_start_ms - cov.prog_start_ms
+        overrun_after = cov.prog_end_ms - host.prog_end_ms
+        if overrun_before >= _OVERLAY_OVERRUN_MS or overrun_after >= _OVERLAY_OVERRUN_MS:
+            findings.append({"severity": "info", "anchor": anchor,
+                             "message": "extends past the beat it sits over into a "
+                                        "neighboring one"})
+    return findings
+
+
+def _overlap_ms(a0: int, a1: int, b0: int, b1: int) -> int:
+    return max(0, min(a1, b1) - max(a0, b0))
+
+
+def review(document: dict, ctx: EditContext) -> dict:
+    """The ASSEMBLED program read back, per timeline seg in SOURCE order --
+    the brain's own "play back what I actually built" check, distinct from
+    read_state (structure) and diagnose (aggregate editorial findings). Each
+    item: {idx, id, ref, played_ms, played_text, words} -- played_text is
+    the VERBATIM words actually spoken over the seg's PLAYED span (reuse
+    footage_map._said_text_for_span; a non-speech seg gets ""), words are
+    the same word->program offsets read_state's seg_id detail returns (item
+    3). Plus {total_ms, target_ms, cut_count} and `flags`: presented facts
+    about rough heads/tails or overrunning overlays -- NEVER a prescribed
+    fix ("trim to +Xms"); the brain decides what, if anything, to do."""
+    timeline = document.get("timeline") or []
+    items: List[Dict[str, Any]] = []
+    flags: List[dict] = []
+    prog = 0
+    for i, seg in enumerate(timeline):
+        dur = int(seg.get("out_ms", 0)) - int(seg.get("in_ms", 0))
+        is_speech = seg.get("axis") == "speech"
+        played_text = footage_map._said_text_for_span(
+            seg.get("file_id") or "", int(seg.get("in_ms", 0)), int(seg.get("out_ms", 0))
+        ) if is_speech else ""
+        try:
+            words = _word_offsets_for_seg(seg, prog) if is_speech else []
+        except Exception:
+            words = []
+        items.append({
+            "idx": i + 1, "id": seg.get("seg_id"), "ref": seg.get("ref"),
+            "played_ms": dur, "played_text": played_text, "words": words,
+        })
+        if is_speech:
+            try:
+                flags.extend(_head_tail_flags(seg, f"cut {i + 1} ({seg.get('seg_id')})"))
+            except Exception:
+                logger.exception("review: head/tail flags failed for seg %s", seg.get("seg_id"))
+        prog += dur
+
+    try:
+        resolved = layers.resolve(document, ctx.durations)
+        flags.extend(_overlay_fit_flags(resolved))
+    except Exception:
+        logger.exception("review: overlay-fit flags failed (continuing without them)")
+
+    target_s = (document.get("brief") or {}).get("target_duration_s")
+    return {
+        "items": items,
+        "total_ms": prog,
+        "target_ms": int(target_s * 1000) if target_s else None,
+        "cut_count": len(timeline),
+        "flags": flags,
+    }
+
+
+# --------------------------------------------------------------------------
 # 5. affordances (what can be done, to what)
 # --------------------------------------------------------------------------
 
@@ -813,7 +1069,8 @@ def affordances(document: dict, ctx: EditContext) -> dict:
         "verbs": ["place", "trim", "remove", "move", "set_audio", "place_audio",
                   "set_gain", "duck", "fade_audio", "crossfade", "replace_audio",
                   "tighten", "retime", "split_screen"],
-        "senses": ["read_state", "predict", "validate", "diagnose", "affordances", "audio_state"],
+        "senses": ["read_state", "predict", "validate", "diagnose", "affordances",
+                   "audio_state", "review"],
     }
 
 

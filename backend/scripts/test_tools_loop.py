@@ -306,6 +306,36 @@ def test_gate_forces_length_reconcile_end_to_end():
     print("ok  gate: over-target forces one length reconcile, then finishes")
 
 
+def test_gate_surfaces_review_flags_end_to_end():
+    """edso_pacing_audit_timing.plan.md item 6: the done-gate's advisory step
+    now folds in observe.review's program read-back flags (a foreign-speaker
+    lead-in here), reusing the SAME reviewed guard as diagnose -- one extra
+    turn, never a prescribed fix, then the loop still terminates."""
+    ctx = _ctx(_struct())
+    doc = _seed_doc()
+    sentences = (
+        {"speaker": "S9", "text": "um", "src_in_ms": 0, "src_out_ms": 300},
+        {"speaker": "S0", "text": "we almost shut down", "src_in_ms": 400, "src_out_ms": 4000},
+    )
+    script = [
+        [ToolCall(id="t1", name="place", input={"ref": "ffffffff:m00", "level": "balanced"})],
+        "Placed the beat.",                               # finish attempt #1 -> gate flags the head
+        "Kept it -- the lead-in is a natural warm-up.",    # acknowledge -> finish
+    ]
+    llm = _ScriptedLLM(script)
+    orig = fm._sentences_for_file
+    fm._sentences_for_file = lambda file_id: sentences
+    try:
+        res = tools.run_edit_loop(llm, system="sys",
+                                  messages=[{"role": "user", "content": "cut this"}],
+                                  ctx=ctx, document=doc)
+    finally:
+        fm._sentences_for_file = orig
+    assert "Kept it" in res.reply, res.reply
+    assert llm.calls == 3, llm.calls           # the gate bought exactly one extra turn
+    print("ok  gate: review flags surface end-to-end and the loop still terminates")
+
+
 def main():
     test_loop_reads_then_places_then_replies()
     test_loop_pure_chat_no_change()
@@ -321,6 +351,7 @@ def main():
     test_gate_length_is_fix_or_justify_once()
     test_gate_advisory_review_skipped_when_already_diagnosed()
     test_gate_forces_length_reconcile_end_to_end()
+    test_gate_surfaces_review_flags_end_to_end()
     print("\nall tool-loop tests passed")
 
 

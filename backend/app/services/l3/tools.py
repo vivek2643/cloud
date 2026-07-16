@@ -61,8 +61,11 @@ def _specs() -> List[Dict[str, Any]]:
         # --- OBSERVE (read-only senses) ---
         S("read_state", "Returns the current edit: ordered cuts (pos, seg_id, ref, "
           "duration, channel, speaker, muted, text, and a plain-language grade summary "
-          "when a cut has one), channels in use, total length, and a feel narration.",
-          obj({})),
+          "when a cut has one), channels in use, total length, a feel narration, and "
+          "the z-stack (any V2/coverage layers + layout, beyond the main-line cuts). "
+          "Pass seg_id to ALSO resolve that one cut's spoken words down to program-time "
+          "offsets -- e.g. to land an overlay precisely on a line; omit it for a plain look.",
+          obj({"seg_id": {"type": "string"}})),
         S("predict", "Returns the program LENGTH under a proposed change without "
           "applying it: set_level re-takes every main-line cut at that level, drop "
           "removes those seg_ids, add appends [{ref, level}] cuts. Gives "
@@ -87,6 +90,14 @@ def _specs() -> List[Dict[str, Any]]:
           "visible), continuous outlook-authoritative runs (one shared audio "
           "source across angle switches -- a fact, not a lock), and this user's "
           "uploaded audio files not yet placed.", obj({})),
+        S("review", "Returns the ASSEMBLED program read back, per cut in order: "
+          "played_text (the verbatim words actually spoken over that cut's PLAYED "
+          "span, after any trim) and word-level program-time offsets, plus "
+          "total/target length and `flags` -- presented facts (never a prescribed "
+          "fix) about a rough head/tail (wrong-speaker lead-in, filler/backchannel, "
+          "leftover dead air) or a V2 overlay that overruns/underfills the beat it "
+          "sits over. Call this to double-check what you actually built before "
+          "finishing.", obj({})),
         # --- ACT (edit verbs; each mutates the working document) ---
         S("place", "Adds a cut by its ref. channel 'V1' inserts on the main line "
           "(picture+sound) at index `at` (default append); 'V2' lays a silent video "
@@ -101,7 +112,10 @@ def _specs() -> List[Dict[str, Any]]:
           "(delta_in_ms/delta_out_ms; delta_in_ms:200 starts 200ms later). Targets a "
           "main-line seg_id, a V2 place_video op_id, or an A2 place_audio op_id "
           "(trims which part of the bed's source plays; its program window shifts "
-          "to match).",
+          "to match). Shortens the cut by the removed source span -- but internal "
+          "keep_spans (jump-cuts already excised) mean the exact resulting length "
+          "isn't purely linear; read it back from read_state/the Program Map rather "
+          "than computing it.",
           obj({"target_id": {"type": "string"},
                "in_ms": {"type": "integer"}, "out_ms": {"type": "integer"},
                "delta_in_ms": {"type": "integer"}, "delta_out_ms": {"type": "integer"}},
@@ -202,10 +216,13 @@ def _specs() -> List[Dict[str, Any]]:
               ["level"])),
         S("retime", "Sets a cut's PLAYBACK PACE. A VIDEO cut plays at that speed "
           "(levels are normalized across clips so a step stays consistent between "
-          "neighbours; 'natural'~=1x); this is RECORDED and shown in read_state but "
-          "the render does not bake speed into the export length yet. A SPEECH cut "
-          "is never pitched/sped: 'faster'/'much_faster' shave removable dead-air + "
-          "fillers, 'natural'/'slower' keep every pause. With seg_id -> that cut; "
+          "neighbours; 'natural'~=1x, so length scales roughly length/pace); this is "
+          "RECORDED and shown in read_state but the render does not bake speed into "
+          "the export length yet. A SPEECH cut is never pitched/sped: 'faster'/"
+          "'much_faster' shave removable dead-air + fillers (also shortens by "
+          "roughly the removed budget, not a pace multiplier), 'natural'/'slower' "
+          "keep every pause. Either way, read the exact resulting length back from "
+          "read_state/the Program Map -- don't compute it. With seg_id -> that cut; "
           "without -> the whole main line.",
           obj({"seg_id": {"type": "string"},
                "pace": {"type": "string", "enum": list(act._PACE_STEPS)}},
@@ -324,7 +341,7 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
     try:
         # OBSERVE (read-only)
         if name == "read_state":
-            return _json(observe.read_state(doc, ctx)), doc, False
+            return _json(observe.read_state(doc, ctx, seg_id=args.get("seg_id"))), doc, False
         if name == "predict":
             return _json(observe.predict(doc, ctx, set_level=args.get("set_level"),
                                          drop=args.get("drop"), add=args.get("add"))), doc, False
@@ -336,6 +353,8 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
             return _json(observe.affordances(doc, ctx)), doc, False
         if name == "audio_state":
             return _json(observe.audio_state(doc, ctx)), doc, False
+        if name == "review":
+            return _json(observe.review(doc, ctx)), doc, False
 
         # ACT (mutate)
         if name == "place":
@@ -470,8 +489,12 @@ def _verify_before_finish(working: dict, ctx: EditContext,
     (the loop keeps going), or None to let it finish. HARD on structural legality
     (would break the render); the editorial findings are surfaced for a single
     review -- an over-target LENGTH is fix-or-justify, the rest is advisory -- so
-    the loop always terminates. A brain that already called ``diagnose``/``validate``
-    this turn has self-reviewed, so the advisory nudge is skipped."""
+    the loop always terminates. A brain that already called ``diagnose``/
+    ``validate``/``review`` this turn has self-reviewed, so the advisory nudge is
+    skipped. edso_pacing_audit_timing.plan.md item 6: the advisory review now
+    also folds in ``observe.review``'s program read-back flags (rough heads/
+    tails, overlay fit) alongside ``diagnose``'s findings -- same one-shot,
+    never-a-prescribed-fix contract."""
     issues = observe.validate(working, ctx)
     if issues and state["struct_tries"] < _STRUCT_MAX_TRIES:
         state["struct_tries"] += 1
@@ -489,16 +512,21 @@ def _verify_before_finish(working: dict, ctx: EditContext,
                 "right, then finish.")
 
     rest = [f for f in findings if "target" not in (f.get("message") or "")]
-    reviewed = "diagnose" in steps or "validate" in steps
-    if rest and not state["reviewed"] and not reviewed:
-        state["reviewed"] = True
-        body = "\n".join(
-            f"- [{f.get('severity') or 'info'}] "
-            + (f"{f['anchor']}: " if f.get("anchor") else "") + (f.get("message") or "")
-            for f in rest[:12])
-        return ("AUTOMATIC CHECK -- review the edit against the ask before you finish. "
-                "This is advisory: act on what serves the goal, ignore the rest, then "
-                "finish:\n" + body)
+    reviewed = "diagnose" in steps or "validate" in steps or "review" in steps
+    if not state["reviewed"] and not reviewed:
+        try:
+            rest = rest + (observe.review(working, ctx).get("flags") or [])
+        except Exception:
+            logger.exception("_verify_before_finish: review() failed (continuing with diagnose only)")
+        if rest:
+            state["reviewed"] = True
+            body = "\n".join(
+                f"- [{f.get('severity') or 'info'}] "
+                + (f"{f['anchor']}: " if f.get("anchor") else "") + (f.get("message") or "")
+                for f in rest[:12])
+            return ("AUTOMATIC CHECK -- the assembled program has been read back; here's "
+                    "what's flagged. This is advisory: act on what serves the goal, "
+                    "ignore the rest, then finish:\n" + body)
     return None
 
 

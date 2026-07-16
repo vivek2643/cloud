@@ -16,13 +16,16 @@ document and ``observe.resolve_doc`` resolves it):
   * ``_MapIndex`` -- validate a ref + resolve (ref, level) -> a source span.
   * ``_weld_segments`` -- merge adjacent same-clip contiguous main-line cuts
     (used by ``observe.resolve_doc`` to keep the agentic timeline clean).
-  * ``render_timeline`` -- render the current timeline for a chat turn.
+  * ``render_program_map`` -- render the ASSEMBLED edit (the fully-resolved
+    layer stack) as two small tables for a chat turn.
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+
+from app.services.l3 import layers
 
 logger = logging.getLogger(__name__)
 
@@ -197,40 +200,88 @@ def _weld_segments(segments: List[dict]) -> List[dict]:
     return welded
 
 
-def render_timeline(document: Optional[dict]) -> str:
-    """Render the current timeline for a refinement turn.
+def _label(text: Optional[str]) -> str:
+    gist = (text or "").replace("\n", " ").strip()
+    return gist[:57] + "..." if len(gist) > 60 else gist
 
-    Each main-line (V1) segment is shown with its map id when known (so the model
-    can keep/move/replace it in the SAME vocabulary as the map) or as a raw source
-    span when it was hand-edited and no longer maps to a moment. V2 cutaways are
-    listed after. Returns "" when there is nothing to refine."""
+
+def _source_tag(seg: Optional[dict]) -> str:
+    """The same map-id vocabulary a `place`/`trim`/`retime` call uses: a moment
+    ref@level when the row traces back to one, else a raw source window --
+    matches how the BEAT INDEX and the old flat render both cite sources."""
+    if not seg:
+        return "?"
+    ref = seg.get("ref")
+    return f"{ref}@{seg.get('level', 'balanced')}" if ref \
+        else f"raw {str(seg.get('file_id', '?'))[:8]}"
+
+
+def render_program_map(document: Optional[dict], durations: Optional[Dict[str, int]] = None) -> str:
+    """Render the ASSEMBLED edit as two small, time-aligned tables (VIDEO,
+    AUDIO) built from the fully-resolved layer stack (``layers.resolve``) --
+    edso_pacing_audit_timing.plan.md item 2, replacing the old flat V1-then-V2
+    line-per-line render. Every row carries a STABLE id (a seg_id or op_id)
+    the brain can act on directly, plus its program window, layout, source
+    ref, and a neutral label -- so stacking/overlap (a V2 cutaway over two V1
+    spine cuts, a music bed under everything) is visible from the shared
+    clock + z alone, with no prose needed. Generic: no speaker/role-of-person
+    column, just the compositing structure. Returns "" when there is nothing
+    to show yet."""
     if not document:
         return ""
-    segs = document.get("timeline") or []
-    ops = [o for o in (document.get("operations") or [])
-           if isinstance(o, dict) and o.get("type") == "place_video"]
-    if not segs and not ops:
+    timeline = document.get("timeline") or []
+    operations = document.get("operations") or []
+    if not timeline and not operations:
         return ""
-    lines: List[str] = []
-    t = 0
-    for s in segs:
-        dur = int(s.get("out_ms", 0)) - int(s.get("in_ms", 0))
-        if dur <= 0:
-            continue
-        ref = s.get("ref")
-        if ref:
-            tag = f"{ref}@{s.get('level', 'balanced')}"
-        else:
-            tag = (f"raw {str(s.get('file_id', '?'))[:8]} "
-                   f"{int(s.get('in_ms', 0))}-{int(s.get('out_ms', 0))}ms")
-        gist = (s.get("content") or "").replace("\n", " ").strip()
-        if len(gist) > 60:
-            gist = gist[:57] + "..."
-        lines.append(f"  {_ms(t)} V1 {tag} \"{gist}\"")
-        t += dur
-    for o in ops:
-        f = int(o.get("from_ms", 0))
-        lines.append(f"  {_ms(f)} V2 cutaway raw {str(o.get('source_file_id', '?'))[:8]}")
+    resolved = layers.resolve(document, durations=durations)
+    if not resolved.video_layers and not resolved.audio_layers:
+        return ""
+
+    seg_by_id = {s["seg_id"]: s for s in timeline if s.get("seg_id")}
+    op_by_id = {o["op_id"]: o for o in operations if o.get("op_id")}
+
+    lines: List[str] = [
+        f"PROGRAM MAP  {_ms(0)}-{_ms(resolved.duration_ms)}  {resolved.aspect}"
+    ]
+
+    if resolved.video_layers:
+        lines.append("VIDEO")
+        lines.append("  lane id  z  prog(ms)  dur  layout  source  label")
+        for v in sorted(resolved.video_layers, key=lambda x: (x.kind != "spine", x.prog_start_ms)):
+            dur = v.prog_end_ms - v.prog_start_ms
+            if v.kind == "spine":
+                vid = v.layer_id[len("v_"):] if v.layer_id.startswith("v_") else v.layer_id
+                seg = seg_by_id.get(vid)
+                lane, source, label = "V1", _source_tag(seg), _label((seg or {}).get("content"))
+            else:
+                op = op_by_id.get(v.op_id or "")
+                lane = "V2"
+                source = f"raw {str(v.source_file_id)[:8]}"
+                vid = v.op_id or v.layer_id
+                label = _label((op or {}).get("rationale") or (op or {}).get("purpose"))
+            lines.append(f"  {lane} {vid}  z{v.z}  {v.prog_start_ms}-{v.prog_end_ms}ms "
+                         f"({dur}ms)  {v.layout}  {source}  \"{label}\"")
+
+    if resolved.audio_layers:
+        lines.append("AUDIO")
+        lines.append("  lane id  role  prog(ms)  source  gain/duck/fade")
+        for a in sorted(resolved.audio_layers, key=lambda x: (x.kind != "spine", x.prog_start_ms)):
+            if a.kind == "spine":
+                aid = a.layer_id[len("a_"):] if a.layer_id.startswith("a_") else a.layer_id
+                lane, source = "A1", "(main line)"
+            else:
+                aid = a.op_id or a.layer_id
+                lane, source = "A2", f"raw {str(a.source_file_id)[:8]}"
+            tags = [f"gain:{a.gain_db:.0f}"]
+            if a.duck_db:
+                tags.append(f"duck:{a.duck_db:.0f}")
+            if a.fade_in_ms:
+                tags.append(f"fade-in:{a.fade_in_ms}ms")
+            if a.fade_out_ms:
+                tags.append(f"fade-out:{a.fade_out_ms}ms")
+            lines.append(f"  {lane} {aid}  {a.role}  {a.prog_start_ms}-{a.prog_end_ms}ms  "
+                         f"{source}  {' '.join(tags)}")
+
     return "\n".join(lines)
 
 

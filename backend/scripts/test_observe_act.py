@@ -9,12 +9,19 @@ from __future__ import annotations
 
 import os
 import sys
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.services.l3 import act, layers, observe  # noqa: E402
+from app.services.l3 import act, arrange, layers, observe  # noqa: E402
 from app.services.l3 import footage_map as fm  # noqa: E402
 from app.services.l3.arrange import Placement, _MapIndex, _weld_segments  # noqa: E402
+
+# build_clip_tree calls _said_text_for_span -> _sentences_for_file for every
+# "said" cut (beat_transcript.plan.md), which would otherwise hit a real DB.
+# Stub it process-wide (same as test_footage_map.py/test_tools_loop.py) --
+# tests that need real transcript content override it locally.
+fm._sentences_for_file = lambda file_id: ()
 
 
 def _rung(level, in_ms, out_ms, text="", score=0.6):
@@ -714,6 +721,167 @@ def test_resolve_same_source_baked_coupling_is_zero_offset():
     print("ok  resolve: same-source baked coupling is zero-offset identity")
 
 
+# --------------------------------------------------------------------------
+# edso_pacing_audit_timing.plan.md Group 1
+# --------------------------------------------------------------------------
+
+def test_program_map_renders_video_and_audio_tables_with_stacking():
+    """A coverage layer (V2) appears with its own z/layout/program window,
+    distinct from the spine (V1) row it stacks over -- overlap is visible
+    from the shared clock + z, no prose needed."""
+    doc = {
+        "timeline": [
+            {"seg_id": "s0", "file_id": "ffffffff-1111", "in_ms": 0, "out_ms": 4000,
+             "ref": "ffffffff:m00", "level": "balanced", "content": "we almost shut down"},
+        ],
+        "operations": [
+            {"op_id": "ov1", "type": "place_video", "source_file_id": "9f0c1234-2222",
+             "src_in_ms": 0, "src_out_ms": 2000, "from_ms": 1000, "to_ms": 3000,
+             "layout": "pip", "z": layers.Z_COVERAGE, "opacity": 1.0,
+             "rationale": "inset detail", "mute": True},
+        ],
+    }
+    text = arrange.render_program_map(doc)
+    assert text.startswith("PROGRAM MAP"), text
+    assert "VIDEO" in text and "AUDIO" in text, text
+    assert "V1 s0" in text and "0-4000ms" in text, text
+    assert f"V2 ov1  z{layers.Z_COVERAGE}" in text, text
+    assert "1000-3000ms" in text and "pip" in text, text   # the coverage layer's OWN window
+    print("ok  Program Map renders VIDEO+AUDIO tables with correct z/layout/program window")
+
+
+def test_program_map_empty_document_is_empty_string():
+    assert arrange.render_program_map(None) == ""
+    assert arrange.render_program_map({"timeline": [], "operations": []}) == ""
+    print("ok  Program Map is empty for an empty document")
+
+
+def test_read_state_reports_video_stack_and_audio_layers():
+    struct = _map()
+    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    idx = _MapIndex(struct)
+    doc = act.place(doc, idx, "ffffffff:m01", channel="V2", from_ms=500)
+    st = observe.read_state(doc, _ctx(struct))
+    assert "video_stack" in st and len(st["video_stack"]) == 1, st
+    assert st["video_stack"][0]["z"] == layers.Z_COVERAGE, st["video_stack"]
+    assert st["video_stack"][0]["layout"] == "full_frame", st["video_stack"]
+    print("ok  read_state reports the z-stack (coverage layers)")
+
+
+def test_read_state_omits_z_stack_keys_when_theres_no_coverage():
+    struct = _map()
+    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    st = observe.read_state(doc, _ctx(struct))
+    assert "video_stack" not in st and "audio_layers" not in st, st
+    print("ok  read_state omits the z-stack keys when there's no coverage")
+
+
+def test_read_state_seg_id_detail_gives_word_program_offsets():
+    struct = _map()
+    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    seg_id = doc["timeline"][0]["seg_id"]
+    transcript_segments = [{"words": [
+        {"text": "we", "start_ms": 0, "end_ms": 300},
+        {"text": "almost", "start_ms": 400, "end_ms": 900},
+    ]}]
+    with mock.patch.object(observe.captions_resolver, "fetch_transcripts",
+                           return_value={"ffffffff-1111": {"segments": transcript_segments}}):
+        st = observe.read_state(doc, _ctx(struct), seg_id=seg_id)
+    words = st["word_offsets"]["words"]
+    assert words == [
+        {"text": "we", "prog_start_ms": 0, "prog_end_ms": 300},
+        {"text": "almost", "prog_start_ms": 400, "prog_end_ms": 900},
+    ], words
+    print("ok  read_state seg_id detail resolves word->program offsets")
+
+
+def test_word_offsets_stay_correct_after_an_upstream_trim():
+    struct = _map()
+    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    seg_id = doc["timeline"][0]["seg_id"]
+    # Trim 500ms off the front: in_ms moves 0 -> 500, but this seg is still
+    # FIRST on the main line so its own prog_start_ms stays 0 -- a word at
+    # src [600,900) should now land at prog [100,400).
+    doc = act.trim(doc, seg_id, delta_in_ms=500)
+    transcript_segments = [{"words": [{"text": "almost", "start_ms": 600, "end_ms": 900}]}]
+    with mock.patch.object(observe.captions_resolver, "fetch_transcripts",
+                           return_value={"ffffffff-1111": {"segments": transcript_segments}}):
+        st = observe.read_state(doc, _ctx(struct), seg_id=seg_id)
+    assert st["word_offsets"]["words"] == [
+        {"text": "almost", "prog_start_ms": 100, "prog_end_ms": 400}
+    ], st["word_offsets"]
+    print("ok  word offsets stay correct after an upstream trim")
+
+
+def test_review_flags_speaker_mismatch_filler_and_dead_air():
+    doc = {"timeline": [
+        {"seg_id": "s0", "file_id": "ffffffff-1111", "in_ms": 0, "out_ms": 5000,
+         "axis": "speech", "ref": "ffffffff:m00"},
+    ], "operations": [], "brief": {"target_duration_s": 3}}
+    sentences = (
+        {"speaker": "S9", "text": "um", "src_in_ms": 0, "src_out_ms": 300},
+        {"speaker": "S0", "text": "so the real point is this", "src_in_ms": 500, "src_out_ms": 3000},
+        {"speaker": "S0", "text": "and that changed everything", "src_in_ms": 3200, "src_out_ms": 4500},
+    )
+    struct = _map()
+    with mock.patch.object(fm, "_sentences_for_file", return_value=sentences):
+        out = observe.review(doc, _ctx(struct))
+    assert out["total_ms"] == 5000 and out["target_ms"] == 3000, out
+    msgs = [f["message"] for f in out["flags"]]
+    assert any("dominant speaker" in m for m in msgs), msgs
+    assert any("filler/backchannel" in m for m in msgs), msgs
+    assert any("dead air" in m for m in msgs), msgs
+    assert all("trim to" not in m.lower() for m in msgs)   # never a prescribed fix
+    print("ok  review flags speaker mismatch, filler lead-in, and trailing dead air")
+
+
+def test_review_played_text_reflects_the_excised_span_not_the_whole_cut():
+    doc = {"timeline": [
+        {"seg_id": "s0", "file_id": "ffffffff-1111", "in_ms": 1000, "out_ms": 2000,
+         "axis": "speech", "ref": "ffffffff:m00"},
+    ], "operations": [], "brief": {}}
+    sentences = (
+        {"speaker": "S0", "text": "before the trim", "src_in_ms": 0, "src_out_ms": 900},
+        {"speaker": "S0", "text": "inside the kept span", "src_in_ms": 1000, "src_out_ms": 2000},
+    )
+    struct = _map()
+    with mock.patch.object(fm, "_sentences_for_file", return_value=sentences):
+        out = observe.review(doc, _ctx(struct))
+    assert out["items"][0]["played_text"] == "inside the kept span", out["items"][0]
+    print("ok  review's played_text reflects only the segment's own (excised) span")
+
+
+def test_review_flags_an_overrunning_overlay():
+    doc = {"timeline": [
+        {"seg_id": "s0", "file_id": "ffffffff-1111", "in_ms": 0, "out_ms": 2000, "axis": "any"},
+    ], "operations": [
+        {"op_id": "ov1", "type": "place_video", "source_file_id": "9f0c1234-2222",
+         "src_in_ms": 0, "src_out_ms": 3000, "from_ms": 0, "to_ms": 3000,
+         "layout": "full_frame", "z": layers.Z_COVERAGE, "opacity": 1.0, "mute": True},
+    ], "brief": {}}
+    struct = _map()
+    out = observe.review(doc, _ctx(struct))
+    msgs = [f["message"] for f in out["flags"]]
+    assert any("extends past the beat" in m for m in msgs), msgs
+    assert all("trim to" not in m.lower() and "set " not in m.lower() for m in msgs)
+    print("ok  review flags an overlay that overruns the beat it sits over")
+
+
+def test_review_flags_an_underfilling_overlay():
+    doc = {"timeline": [
+        {"seg_id": "s0", "file_id": "ffffffff-1111", "in_ms": 0, "out_ms": 4000, "axis": "any"},
+    ], "operations": [
+        {"op_id": "ov1", "type": "place_video", "source_file_id": "9f0c1234-2222",
+         "src_in_ms": 0, "src_out_ms": 500, "from_ms": 0, "to_ms": 500,
+         "layout": "full_frame", "z": layers.Z_COVERAGE, "opacity": 1.0, "mute": True},
+    ], "brief": {}}
+    struct = _map()
+    out = observe.review(doc, _ctx(struct))
+    msgs = [f["message"] for f in out["flags"]]
+    assert any("underfills" in m for m in msgs), msgs
+    print("ok  review flags an overlay that underfills the beat it sits over")
+
+
 def main():
     test_read_state_reports_cuts_and_feel()
     test_place_adds_main_line_cut()
@@ -753,6 +921,16 @@ def main():
     test_resolve_plain_coupled_audio_with_no_coupling_or_route_at_all()
     test_resolve_audio_override_wins_over_baked_coupling()
     test_resolve_same_source_baked_coupling_is_zero_offset()
+    test_program_map_renders_video_and_audio_tables_with_stacking()
+    test_program_map_empty_document_is_empty_string()
+    test_read_state_reports_video_stack_and_audio_layers()
+    test_read_state_omits_z_stack_keys_when_theres_no_coverage()
+    test_read_state_seg_id_detail_gives_word_program_offsets()
+    test_word_offsets_stay_correct_after_an_upstream_trim()
+    test_review_flags_speaker_mismatch_filler_and_dead_air()
+    test_review_played_text_reflects_the_excised_span_not_the_whole_cut()
+    test_review_flags_an_overrunning_overlay()
+    test_review_flags_an_underfilling_overlay()
     print("\nall observe/act tests passed")
 
 

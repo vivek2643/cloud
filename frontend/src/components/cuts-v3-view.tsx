@@ -113,10 +113,11 @@ function tightenedSpan(cut: CutRecord, energy: number): { inMs: number; outMs: n
   return { inMs, outMs };
 }
 
-// How hard the dial leans on speech tightening. Even at max energy we only ever
-// remove this fraction of the removable budget, so a beat never feels clipped;
-// raise toward 1 to make the dial more aggressive. Single tuning knob.
-const SPEECH_TRIM_MAX = 0.85;
+// How hard the dial leans on speech tightening. edso_pacing_audit_timing.
+// plan.md SS7: raised to 1 -- sharp is the max-tight rung, so the only
+// remaining ceiling is the band's own energy value, not an extra cap on top.
+// Mirrors backend cutrecord_map._SPEECH_TRIM_MAX -- keep them equal.
+const SPEECH_TRIM_MAX = 1.0;
 
 type Segment = { inMs: number; outMs: number };
 

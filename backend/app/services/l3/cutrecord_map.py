@@ -39,10 +39,13 @@ _LEVELS = ("broad", "calm", "balanced", "tight", "sharp")
 _BAND_ENERGIES = (0.1, 0.3, 0.5, 0.7, 0.9)
 
 # Mirrors cuts-v3-view.tsx SPEECH_TRIM_MAX: even at max energy, only shave this
-# fraction of a speech cut's removable dead-air/filler budget, so a beat never
-# feels clipped. Kept identical to the frontend dial so the ladder's sharpest
-# rung matches what the editor's dial shows at energy 1.
-_SPEECH_TRIM_MAX = 0.85
+# fraction of a speech cut's removable dead-air/filler budget. Kept identical
+# to the frontend dial so the ladder's sharpest rung matches what the editor's
+# dial shows at energy 1. edso_pacing_audit_timing.plan.md SS7: raised from
+# 0.85 to 1.0 -- sharp is the max-tight rung, so the only remaining ceiling on
+# how much removable dead-air it shaves is the band's own energy value (see
+# _BAND_ENERGIES), not an extra artificial cap layered on top of it.
+_SPEECH_TRIM_MAX = 1.0
 
 # said -> person (who's talking), done -> person (an action performed by
 # someone), shown -> object (b-roll/display, no performed action). cut_records

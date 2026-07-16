@@ -5,9 +5,9 @@
   (label, summary, channel=said/done/shown, on-screen text, energy, camera move,
   quality scores, take role, continuity). When that leaves a gap -- what to put on screen next,
   which angle to show -- this doc says how to make the best GUESS. It is not a
-  rulebook and not per-format cookbook: two general principles cover almost
+  rulebook and not per-format cookbook: a few general principles cover almost
   every requirement, and the podcast section is one worked example that uses
-  both. General craft (move vocabulary, pacing, continuity/junk meaning) lives
+  the first two. General craft (move vocabulary, pacing, continuity/junk meaning) lives
   in the system prompt, not here.
 
   How it's used: injected into Edso's system prompt (cached) and consulted in
@@ -48,6 +48,16 @@ has no "winner"). When a beat has outlooks, choose the angle that best serves
 the moment — show whoever or whatever is relevant — and switch angles on the
 beat, never mid-thought. This is how any multicam material is assembled
 (interviews included, which are otherwise just talk-driven like a podcast).
+
+## 3. Fitting a clip to a target window
+Two situations are the SAME generic operation: landing an overlay on a specific
+line, and cutting a shot to a beat. Both just fit a clip to a target program
+window `[A,B]`. To do it: get `[A,B]` from whatever sense exposes it, then
+adjust the clip's length with `trim` or pace (`retime` for video's playback
+speed, or speech's dead-air trim). Don't compute the exact result — read the
+actual length back from `read_state`/the Program Map (or `review`, once
+placed) and adjust again if it's off; that loop is exact, blind arithmetic
+isn't.
 
 ## Podcast / multicam (worked example — uses both principles)
 Conversation filmed from several fixed angles. The alternate angles of one

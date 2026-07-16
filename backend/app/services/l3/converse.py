@@ -124,18 +124,29 @@ _LOOP_SYSTEM = (
     "assert a specific detail the senses don't support. Guess confidently when "
     "the context points somewhere; only ask when it genuinely underdetermines a "
     "choice that is the user's to make.\n\n"
-    "CHANNELS: the main line is V1 video + A1 audio in sequence; V2 is a silent "
-    "video layer over A1; A2 is a music/SFX bed. Keep each cut's audio joined to "
-    "its own picture by default -- mostly AVOID split_edit (decoupling the A1 "
-    "audio edge from the V1 video edge, a J/L cut); only do it when a specific "
-    "need clearly calls for it, and be extremely careful when you do. Your senses "
-    "(read_state, predict, validate, diagnose, affordances) and edit verbs are "
-    "described in the tools; call them as you need."
+    "COMPOSITING MODEL. Think of the edit as stacked tracks, like layers in a "
+    "photo or video editor. The bottom track is the main line -- it plays start "
+    "to finish and sets the total running time. A clip on any track above covers "
+    "what's below it for as long as it's there: if it fills the frame it hides "
+    "the track underneath; if it's an inset or side-by-side, you see both. All "
+    "sound tracks play at once and mix together; when two overlap, the more "
+    "important one stays up front and the other automatically dips beneath it. "
+    "Everything lines up on one clock -- positions are in program time (where it "
+    "lands in the finished video). Concretely: the main line is V1 video + A1 "
+    "audio in sequence; V2 is a silent video layer over A1; A2 is a music/SFX "
+    "bed. Keep each cut's audio joined to its own picture by default -- mostly "
+    "AVOID split_edit (decoupling the A1 audio edge from the V1 video edge, a "
+    "J/L cut); only do it when a specific need clearly calls for it, and be "
+    "extremely careful when you do. Your senses (read_state, predict, validate, "
+    "diagnose, affordances, audio_state, review) and edit verbs are described in "
+    "the tools; call them as you need."
     "\n\nFINISHING. When you stop editing you'll get one AUTOMATIC CHECK of the edit "
     "against the contract. Never finish with STRUCTURAL problems -- fix them. If "
     "you're over a target length, either trim to it or say in one line why the "
-    "current length is right. The rest (speaker runs, low-energy stretches, "
-    "redundant takes) is advisory -- act on what serves the goal, ignore the rest."
+    "current length is right. Before finishing you'll see the assembled program "
+    "read back with any flagged rough heads/tails; act on what serves the ask or "
+    "finish. The rest (speaker runs, low-energy stretches, redundant takes) is "
+    "advisory -- act on what serves the goal, ignore the rest."
 )
 
 
@@ -228,10 +239,13 @@ def _context_block(file_ids: List[str], document: Optional[dict],
                    ctx: "observe.EditContext") -> str:
     """CUT-CENTRIC context (cuts_v3_continuity.plan.md): no raw-footage
     continuous-source scan. A PROJECT OVERVIEW (the high-level clip summary the
-    workflow reads first), then the BEAT INDEX (every cut, PIC then SND then
-    the words/action, each with a ref, its pacing room + continuity -- position
-    among its clip's cuts and whether each neighbor welds; junk cuts are labeled
-    and skip-by-default) and the current timeline."""
+    workflow reads first), the BEAT INDEX (every cut, PIC then SND then the
+    words/action, each with a ref, its pacing room + continuity -- position
+    among its clip's cuts and whether each neighbor welds; junk cuts are
+    labeled and skip-by-default) -- the Footage Map (sources AVAILABLE) -- then
+    the PROGRAM MAP (edso_pacing_audit_timing.plan.md item 2): the assembled
+    edit ITSELF, every layer with a stable id, program window, and layout, so
+    stacking/overlap is visible from the shared clock + z alone."""
     parts: List[str] = []
     try:
         overview = _project_overview(ctx)
@@ -253,9 +267,16 @@ def _context_block(file_ids: List[str], document: Optional[dict],
                 "then the words/action, each with a ref you can place):\n" + text)
     except Exception:
         logger.exception("converse: map build failed (continuing without it)")
-    tl_text = arrange.render_timeline(document)
-    parts.append("CURRENT TIMELINE:\n" + tl_text if tl_text
-                 else "CURRENT TIMELINE: (empty -- no edit drafted yet)")
+    try:
+        # Program Map (edso_pacing_audit_timing.plan.md item 2): the ASSEMBLED
+        # edit as two small, time-aligned tables built from the fully-resolved
+        # layer stack -- pure/cheap, so always-on like everything else here.
+        pm_text = arrange.render_program_map(document, durations=ctx.durations)
+    except Exception:
+        logger.exception("converse: program map render failed (continuing without it)")
+        pm_text = ""
+    parts.append("CURRENT " + pm_text if pm_text
+                 else "CURRENT PROGRAM MAP: (empty -- no edit drafted yet)")
     return "\n\n".join(parts)
 
 
