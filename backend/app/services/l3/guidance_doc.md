@@ -63,6 +63,14 @@ actual length back from `read_state`/the Program Map (or `review`, once
 placed) and adjust again if it's off; that loop is exact, blind arithmetic
 isn't.
 
+## 4. Select for the video's purpose
+Most videos exist to serve a higher purpose for their audience — a teaser to
+spark curiosity, a tutorial to help viewers learn, a documentary to inform and
+keep them engaged. When the material is larger than the ask allows, let that
+purpose guide what to keep. Read the purpose from the user's ask and the
+material; when it's unclear and the selection hinges on it, ask rather than
+assume.
+
 ## Podcast / multicam (worked example — uses both principles)
 Conversation filmed from several fixed angles. The alternate angles of one
 speaker are outlooks (principle 2), and the transcript drives who to show
