@@ -232,7 +232,11 @@ def _specs() -> List[Dict[str, Any]]:
           "'split_v' (stacked), or 'pip' (inset over the main line). The second cell "
           "source is either a map `ref` or a raw window `file`+`in_ms`+`out_ms` "
           "(seam-snapped to the nearest clean boundary). The second cell is silent "
-          "unless audio:'keep'.",
+          "unless audio:'keep'. Its window [from_ms, to_ms] is pinned to program "
+          "time and does NOT follow later trims/removes -- so add split/PiP LAST, "
+          "once the main line's cuts and length are settled; if the main line "
+          "changes afterward the window goes stale (check it in the Program Map) "
+          "and you must re-lay it.",
           obj({"ref": {"type": "string"},
                "file": {"type": "string"},
                "in_ms": {"type": "integer"}, "out_ms": {"type": "integer"},
