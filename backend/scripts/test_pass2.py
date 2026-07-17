@@ -222,7 +222,7 @@ def test_locators_are_optional_at_parse_time_and_backfilled():
     filled = pass2.backfill_locators(out, p1)
     assert filled.cuts[0].word_span == (3, 9), filled.cuts[0]
     assert filled.cuts[1].atom_ids == [4, 5, 6], filled.cuts[1]
-    assert pass2._locators_resolved(filled) is None
+    assert pass2._locators_resolved(filled, p1) is None
     print("ok  test_locators_are_optional_at_parse_time_and_backfilled")
 
 
@@ -323,9 +323,89 @@ def test_backfill_leaves_split_video_groups_to_the_model():
                           label="b", summary="b"),   # split piece with no atom_ids
     ])
     filled2 = pass2.backfill_locators(missing_ids, p1)
-    err2 = pass2._locators_resolved(filled2)
+    err2 = pass2._locators_resolved(filled2, p1)
     assert err2 is not None and "atom_ids" in err2, err2
     print("ok  test_backfill_leaves_split_video_groups_to_the_model")
+
+
+# --------------------------------------------------------------------------
+# V4 (v4_cuts_as_primitive.plan.md): a video group with its own span and no
+# atoms is a FINISHED cut -- pass 2 never splits it, backfill never touches
+# atom_ids, and none of the atom-contract validators fire.
+# --------------------------------------------------------------------------
+
+def _v4_group(span):
+    return VideoTentativeGroup(file_id="f1", atom_ids=[], src_in_ms=span[0], src_out_ms=span[1])
+
+
+def test_v4_video_group_is_never_backfilled_with_atom_ids():
+    p1 = Pass1Output(video_tentative_groups=[_v4_group((1000, 2000))])
+    out = pass2.Pass2BatchOutput(cuts=[
+        pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
+                          label="x", summary="y"),
+    ])
+    filled = pass2.backfill_locators(out, p1)
+    assert filled.cuts[0].atom_ids is None, filled.cuts[0].atom_ids
+    print("ok  test_v4_video_group_is_never_backfilled_with_atom_ids")
+
+
+def test_v4_video_cut_passes_locators_resolved_with_no_atom_ids():
+    p1 = Pass1Output(video_tentative_groups=[_v4_group((1000, 2000))])
+    out = pass2.Pass2BatchOutput(cuts=[
+        pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
+                          label="x", summary="y"),
+    ])
+    assert pass2._locators_resolved(out, p1) is None
+    print("ok  test_v4_video_cut_passes_locators_resolved_with_no_atom_ids")
+
+
+def test_v4_video_group_never_needs_atom_partition_check():
+    p1 = Pass1Output(video_tentative_groups=[_v4_group((1000, 2000))])
+    # Even if the model DID (against instructions) emit two cuts for one V4
+    # ref, the atom-partition check must not fire -- there's no atom
+    # contract to violate on V4.
+    out = pass2.Pass2BatchOutput(cuts=[
+        pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
+                          label="a", summary="a"),
+        pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
+                          label="b", summary="b"),
+    ])
+    assert pass2._split_groups_partition_atoms(out, p1) is None
+    print("ok  test_v4_video_group_never_needs_atom_partition_check")
+
+
+def test_v4_n_groups_in_yields_n_labeled_cuts_out_no_split():
+    p1 = Pass1Output(video_tentative_groups=[
+        _v4_group((0, 1000)), _v4_group((2000, 3000)), _v4_group((4000, 4500)),
+    ])
+    out = pass2.Pass2BatchOutput(cuts=[
+        pass2.CutJudgment(source_ref=f"video_group[{i}]", kind="video", file_id="f1",
+                          label=f"cut {i}", summary=f"summary {i}")
+        for i in range(3)
+    ])
+    filled = pass2.backfill_locators(out, p1)
+    assert len(filled.cuts) == 3
+    assert all(c.atom_ids is None for c in filled.cuts), filled.cuts
+    assert pass2._locators_resolved(filled, p1) is None
+    assert pass2._split_groups_partition_atoms(filled, p1) is None
+    assert pass2._no_duplicate_atoms(filled) is None
+    print("ok  test_v4_n_groups_in_yields_n_labeled_cuts_out_no_split")
+
+
+def test_v4_system_prompt_drops_the_split_clause():
+    v3 = pass2.system_prompt("v3")
+    v4 = pass2.system_prompt("v4")
+    assert "MAY be split back" in v3
+    assert "MAY be split back" not in v4
+    assert "never split or merge" in v4
+    assert v3 != v4
+    print("ok  test_v4_system_prompt_drops_the_split_clause")
+
+
+def test_v3_system_prompt_is_byte_identical_to_the_default():
+    assert pass2.system_prompt() == pass2._SYSTEM
+    assert pass2.system_prompt("v3") == pass2._SYSTEM
+    print("ok  test_v3_system_prompt_is_byte_identical_to_the_default")
 
 
 def test_valid_cuts_round_trip():
@@ -801,6 +881,12 @@ def main():
     test_shape_normalizes_off_list_or_missing_to_center()
     test_shape_round_trips_through_to_pass2_cuts()
     test_backfill_leaves_split_video_groups_to_the_model()
+    test_v4_video_group_is_never_backfilled_with_atom_ids()
+    test_v4_video_cut_passes_locators_resolved_with_no_atom_ids()
+    test_v4_video_group_never_needs_atom_partition_check()
+    test_v4_n_groups_in_yields_n_labeled_cuts_out_no_split()
+    test_v4_system_prompt_drops_the_split_clause()
+    test_v3_system_prompt_is_byte_identical_to_the_default()
     test_valid_cuts_round_trip()
     test_pass2_batch_output_rejects_an_unexpected_wrapper_key()
     test_cutjudgment_defaults_are_safe()

@@ -81,3 +81,10 @@ REPRESENTATIVE_WINDOW_MS = 1500
 # novel-peak rate (peaks/sec) at/above this reads as "fully dense" (density=1);
 # a sparse/monotonous span reads near 0.
 DENSITY_PEAKS_PER_SEC_CAP = 1.0
+
+# v4_cuts_as_primitive.plan.md section 6: a finished cut shorter than this
+# isn't a distinct usable moment on its own (most likely a sliver left by the
+# cross-working-span overlap clamp) -- merge it into whichever neighbor it
+# sits closer to. Same perceptual scale as MIN_CUT_GAP_MS; duration-based,
+# never atom-ownership-based (atoms are no longer part of this module's loop).
+MIN_CUT_DURATION_MS = 400

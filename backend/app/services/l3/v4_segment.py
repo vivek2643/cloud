@@ -17,11 +17,12 @@ Two rules threaded throughout, per the plan:
     always decides *where* -- location is deterministic.
 
 Pure core: ``segment_video(...)`` takes already-loaded signals (the same
-``motion``/``scene`` shapes ``lattice.build_atoms`` consumes) and a built
-``Lattice`` (for atom_ids mapping only -- V4 does not carve its own atoms; it
-chooses spans directly on the motion hop grid, independent of the atom
-lattice's coarser shot/energy-regime boundaries). No model call, no DB call --
-see ``scripts/test_v4_segment.py``.
+``motion``/``scene`` shapes ``lattice.build_atoms`` consumes) and chooses
+spans directly on the motion hop grid. v4_cuts_as_primitive.plan.md: V4 does
+NOT carve atoms and does not map cuts onto them at all -- a V4 cut's span IS
+the primitive, carried as-is to the brain; atoms remain only the SPEECH
+substrate (built elsewhere, in ``lattice.build_atoms``, untouched by this
+module). No model call, no DB call -- see ``scripts/test_v4_segment.py``.
 """
 from __future__ import annotations
 
@@ -29,15 +30,15 @@ import statistics
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.services.l3.lattice import Lattice, _subtract
+from app.services.l3.lattice import _subtract
 from app.services.l3.post import _mean, _norm_in_clip, _series_lohi, _span_slice
 from app.services.l3.v4_segment_params import (
     CAMERA_MOVE_COHERENCE_MIN, CAMERA_MOVE_MAGNITUDE_MIN, CAMERA_MOVE_MIN_MS,
     DECAY_FRACTION, DENSITY_PEAKS_PER_SEC_CAP, EDGE_SNAP_SEARCH_MS,
-    EDGE_SNAP_STABILITY_MAX, FOLLOW_THROUGH_FLOOR_MS, MAX_PAD_MS, MIN_CUT_GAP_MS,
-    NOVELTY_ABSOLUTE_FLOOR, NOVELTY_BASELINE_RADIUS_MS, PEAK_MIN_GAP_MS,
-    PEAK_PROMINENCE_RATIO, PERIODICITY_SCORE_THRESHOLD, REPRESENTATIVE_WINDOW_MS,
-    RUN_UP_FLOOR_MS,
+    EDGE_SNAP_STABILITY_MAX, FOLLOW_THROUGH_FLOOR_MS, MAX_PAD_MS,
+    MIN_CUT_DURATION_MS, MIN_CUT_GAP_MS, NOVELTY_ABSOLUTE_FLOOR,
+    NOVELTY_BASELINE_RADIUS_MS, PEAK_MIN_GAP_MS, PEAK_PROMINENCE_RATIO,
+    PERIODICITY_SCORE_THRESHOLD, REPRESENTATIVE_WINDOW_MS, RUN_UP_FLOOR_MS,
 )
 
 
@@ -46,7 +47,6 @@ class VideoCut:
     file_id: str
     src_in_ms: int
     src_out_ms: int
-    atom_ids: List[int] = field(default_factory=list)
     # {peak_ms, score, kind: "point"|"span"|"none", span_ms: [in,out]|None} --
     # see post._salience's shape for the V3 analogue; V4 emits this directly
     # (code-owned, never recomputed downstream -- section 4 of the plan).
@@ -58,7 +58,7 @@ class VideoCut:
 
     def to_dict(self) -> Dict[str, Any]:
         return {"file_id": self.file_id, "src_in_ms": self.src_in_ms,
-                "src_out_ms": self.src_out_ms, "atom_ids": list(self.atom_ids),
+                "src_out_ms": self.src_out_ms,
                 "salience": dict(self.salience), "density": self.density}
 
 
@@ -478,22 +478,57 @@ def _consolidate(cuts: List[Tuple[int, int, Dict[str, Any]]]) -> List[Tuple[int,
     return out
 
 
-def _atom_ids_covering(lattice: Lattice, in_ms: int, out_ms: int) -> List[int]:
-    """Atoms (from the pre-existing lattice, shared with pass 1) whose span
-    overlaps [in_ms, out_ms) -- informational only (continuity/image_plan
-    compatibility per section 2 of the plan); V4's own span, not these atoms'
-    bounds, is what gets persisted -- see ingest.run_ingest's V4 branch. Atoms
-    tile the WHOLE non-speech remainder with zero gaps, so this is normally
-    non-empty for any real V4 span; falls back to the single nearest atom
-    (never truly empty while the file has any atom at all) so a downstream
-    consumer that requires >=1 atom_id per video cut (pass2.backfill_locators'
-    "split group" check) never sees a spuriously empty list."""
-    ids = sorted(a.atom_id for a in lattice.atoms if a.start_ms < out_ms and a.end_ms > in_ms)
-    if ids or not lattice.atoms:
-        return ids
-    mid = (in_ms + out_ms) // 2
-    nearest = min(lattice.atoms, key=lambda a: min(abs(a.start_ms - mid), abs(a.end_ms - mid)))
-    return [nearest.atom_id]
+def _merge_pair(cuts: List[VideoCut], j: int) -> List[VideoCut]:
+    """Merge ``cuts[j]`` into whichever adjacent neighbor it sits closer to
+    (by gap), keeping the stronger anchor's salience -- the same merge shape
+    ``_consolidate`` uses within one working span, applied here across the
+    whole file's finalized cuts."""
+    left = j - 1 if j - 1 >= 0 else None
+    right = j + 1 if j + 1 < len(cuts) else None
+
+    def _gap(x: int) -> int:
+        return (cuts[j].src_in_ms - cuts[x].src_out_ms) if x < j else (cuts[x].src_in_ms - cuts[j].src_out_ms)
+
+    pick = left if right is None else (right if left is None else (
+        left if _gap(left) <= _gap(right) else right))
+    a_, b_ = (pick, j) if pick < j else (j, pick)
+    ca, cb = cuts[a_], cuts[b_]
+    keep_sal = ca.salience if ca.salience.get("score", 0.0) >= cb.salience.get("score", 0.0) else cb.salience
+    merged = VideoCut(file_id=ca.file_id, src_in_ms=min(ca.src_in_ms, cb.src_in_ms),
+                      src_out_ms=max(ca.src_out_ms, cb.src_out_ms),
+                      salience=dict(keep_sal), density=max(ca.density, cb.density))
+    return cuts[:a_] + [merged] + cuts[b_ + 1:]
+
+
+def _finalize_cuts(cuts: List[VideoCut]) -> List[VideoCut]:
+    """Enforce the two invariants per-span logic can't, over ALL of a file's
+    cuts -- geometry only; no atoms in this loop at all
+    (v4_cuts_as_primitive.plan.md section 6):
+
+    * DISJOINT, CLAMPED TO ITS OWN WORKING SPAN. ``_consolidate`` only dedupes
+      WITHIN one working span; a cut whose edge was extended (peak +/-
+      run-up/follow-through, or a camera move's settle) past its span can
+      still collide with the next span's cut. Clamp the earlier cut's out
+      down to the later cut's in.
+    * MIN-DURATION FLOOR. A cut left too short by that clamp (or an unusually
+      tight anchor) isn't a distinct usable moment on its own -- merge it
+      into whichever neighbor it sits closer to (by duration, never by
+      atom-ownership -- the good reason the old merge existed, kept)."""
+    if not cuts:
+        return cuts
+    cuts = sorted(cuts, key=lambda c: c.src_in_ms)
+    for i in range(len(cuts) - 1):
+        if cuts[i + 1].src_in_ms < cuts[i].src_out_ms:
+            cuts[i].src_out_ms = cuts[i + 1].src_in_ms
+    cuts = [c for c in cuts if c.src_out_ms > c.src_in_ms]
+
+    while len(cuts) > 1:
+        short = next((i for i, c in enumerate(cuts)
+                     if c.src_out_ms - c.src_in_ms < MIN_CUT_DURATION_MS), None)
+        if short is None:
+            break
+        cuts = _merge_pair(cuts, short)
+    return cuts
 
 
 # --------------------------------------------------------------------------
@@ -502,7 +537,7 @@ def _atom_ids_covering(lattice: Lattice, in_ms: int, out_ms: int) -> List[int]:
 
 def segment_video(
     *, file_id: str, duration_ms: int, speech_spans: List[Tuple[int, int]],
-    motion: Dict[str, Any], audio: Dict[str, Any], scene: Dict[str, Any], lattice: Lattice,
+    motion: Dict[str, Any], audio: Dict[str, Any], scene: Dict[str, Any],
 ) -> List[VideoCut]:
     """The non-speech remainder of one file -> a small set of tight, salient
     video cuts (never the whole span by default). Pure and deterministic:
@@ -536,11 +571,18 @@ def segment_video(
     for span in spans:
         candidates = _candidates_for_span(span, motion, audio, hop_ms, ae_lohi, rms_lohi)
         for in_ms, out_ms, sal in _consolidate(candidates):
+            # Clamp to the working span: edge selection (peak +/- run-up/
+            # follow-through) and camera-move extension can push an edge PAST
+            # the span, so a cut leaks into the next shot's cut (video<->video)
+            # or an adjacent speech span (video<->speech) -- both are the
+            # post/pass2 "spans must be disjoint" failures. The span is already
+            # non-speech and single-shot, so clamping guarantees disjointness.
+            in_ms = max(in_ms, span[0])
+            out_ms = min(out_ms, span[1])
             if out_ms <= in_ms:
                 continue
             density = sal.pop("density", 0.0)
-            atom_ids = _atom_ids_covering(lattice, in_ms, out_ms)
             cuts.append(VideoCut(file_id=file_id, src_in_ms=in_ms, src_out_ms=out_ms,
-                                 atom_ids=atom_ids, salience=sal, density=density))
+                                 salience=sal, density=density))
     cuts.sort(key=lambda c: c.src_in_ms)
-    return cuts
+    return _finalize_cuts(cuts)

@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import re
 import statistics
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -62,7 +62,16 @@ class TakeCandidate(BaseModel):
 
 class VideoTentativeGroup(BaseModel):
     file_id: str
-    atom_ids: List[int]
+    # V3 (grounded-atom groups, LLM-emitted): the atoms this group covers.
+    # V4 (v4_cuts_as_primitive.plan.md section 3.1): always [] -- the group
+    # instead carries its own span directly below (ingest builds these in
+    # code, never from the model, so the default only matters for V3's own
+    # schema validation never seeing this field omitted).
+    atom_ids: List[int] = Field(default_factory=list)
+    # V4 only: the segmenter's own span (ground truth) for this cut. None on
+    # V3 (span comes from atom membership instead -- see post.py).
+    src_in_ms: Optional[int] = None
+    src_out_ms: Optional[int] = None
 
 
 class JunkSuspect(BaseModel):

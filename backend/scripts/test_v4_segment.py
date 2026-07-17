@@ -1,6 +1,8 @@
 """
 Pure unit tests for the V4 deterministic video segmenter
-(``app.services.l3.v4_segment``) -- no DB, no model call.
+(``app.services.l3.v4_segment``) -- no DB, no model call. The V4 cut IS the
+primitive (v4_cuts_as_primitive.plan.md): no atoms in this module's loop at
+all, so these tests never construct a Lattice/Atom fixture.
 
 Run:  .venv/bin/python scripts/test_v4_segment.py
 """
@@ -15,7 +17,7 @@ if BACKEND not in sys.path:
     sys.path.insert(0, BACKEND)
 
 from app.services.l3 import v4_segment as v4  # noqa: E402
-from app.services.l3.lattice import Atom, Lattice  # noqa: E402
+from app.services.l3.v4_segment_params import MIN_CUT_DURATION_MS  # noqa: E402
 
 
 def _flat_motion(n, hop=100, action=0.05, stability=0.95, coh=0.9):
@@ -27,16 +29,10 @@ def _flat_motion(n, hop=100, action=0.05, stability=0.95, coh=0.9):
     }
 
 
-def _lattice(duration_ms=10_000, atoms=None):
-    return Lattice(file_id="f1", duration_ms=duration_ms,
-                   atoms=atoms if atoms is not None else
-                   [Atom(0, "f1", 0, duration_ms, "clip_edge", "clip_edge", 0.05, 0.9)])
-
-
-def _segment(motion, audio=None, scene=None, lattice=None, speech_spans=None, duration_ms=10_000):
+def _segment(motion, audio=None, scene=None, speech_spans=None, duration_ms=10_000):
     return v4.segment_video(
         file_id="f1", duration_ms=duration_ms, speech_spans=speech_spans or [],
-        motion=motion, audio=audio or {}, scene=scene or {}, lattice=lattice or _lattice(duration_ms),
+        motion=motion, audio=audio or {}, scene=scene or {},
     )
 
 
@@ -106,7 +102,7 @@ def test_two_separated_bursts_yield_two_cuts():
     cuts = _segment(motion)
     assert len(cuts) == 2, cuts
     assert all(c.salience["kind"] == "point" for c in cuts), cuts
-    assert cuts[0].src_out_ms < cuts[1].src_in_ms, "must not overlap"
+    assert cuts[0].src_out_ms <= cuts[1].src_in_ms, "must not overlap"
     print("ok  test_two_separated_bursts_yield_two_cuts")
 
 
@@ -146,12 +142,10 @@ def test_contrast_based_peak_beats_absolute_level_on_ramp_then_plateau():
 
 
 # --------------------------------------------------------------------------
-# Speech subtraction + atom_ids mapping
+# Speech subtraction
 # --------------------------------------------------------------------------
 
 def test_speech_spans_are_subtracted_from_working_spans():
-    atoms = [Atom(0, "f1", 0, 4000, "clip_edge", "clip_edge", 0.05, 0.9),
-             Atom(1, "f1", 6000, 10_000, "clip_edge", "clip_edge", 0.05, 0.9)]
     motion = _flat_motion(100)
     ae = [0.05] * 100
     for i in range(15, 20):    # 1500-2000ms, INSIDE the speech span -> must vanish
@@ -159,33 +153,102 @@ def test_speech_spans_are_subtracted_from_working_spans():
     for i in range(70, 75):    # 7000-7500ms, outside speech -> must survive
         ae[i] = 0.9
     motion["action_energy"] = ae
-    cuts = _segment(motion, lattice=_lattice(atoms=atoms), speech_spans=[(1000, 3000)])
+    cuts = _segment(motion, speech_spans=[(1000, 3000)])
     assert all(c.src_in_ms >= 3000 or c.src_out_ms <= 1000 for c in cuts), cuts
     assert any(c.src_in_ms >= 6000 for c in cuts), "the surviving burst must still produce a cut"
     print("ok  test_speech_spans_are_subtracted_from_working_spans")
 
 
-def test_atom_ids_map_back_to_covering_atoms():
-    atoms = [Atom(0, "f1", 0, 4000, "clip_edge", "clip_edge", 0.05, 0.9),
-             Atom(1, "f1", 6000, 10_000, "clip_edge", "clip_edge", 0.05, 0.9)]
-    motion = _flat_motion(100)
-    ae = [0.05] * 100
+def test_no_cut_ever_crosses_into_a_speech_span():
+    """Every emitted cut must be fully outside every declared speech span --
+    the load-bearing invariant that lets post.py's own zero-overlap check
+    between video and speech cuts pass without ever needing to know V4's
+    internals."""
+    n = 100
+    motion = _flat_motion(n)
+    ae = [0.05] * n
+    for i in range(0, n):   # action everywhere, including inside speech
+        ae[i] = 0.9 if i % 7 == 0 else 0.05
+    motion["action_energy"] = ae
+    speech_spans = [(1000, 2500), (5000, 5800), (8000, 8600)]
+    cuts = _segment(motion, speech_spans=speech_spans)
+    for c in cuts:
+        for s, e in speech_spans:
+            assert c.src_out_ms <= s or c.src_in_ms >= e, (c, (s, e))
+    print("ok  test_no_cut_ever_crosses_into_a_speech_span")
+
+
+# --------------------------------------------------------------------------
+# v4_cuts_as_primitive.plan.md section 6/9: geometry-only finalize --
+# disjoint + clamped to working span, sub-min_ms sliver merges into neighbor.
+# --------------------------------------------------------------------------
+
+def test_finalize_cuts_are_always_disjoint_and_sorted():
+    n = 100
+    motion = _flat_motion(n)
+    ae = [0.05] * n
+    for i in range(10, 15):
+        ae[i] = 0.9
+    for i in range(30, 35):
+        ae[i] = 0.9
     for i in range(70, 75):
         ae[i] = 0.9
     motion["action_energy"] = ae
-    cuts = _segment(motion, lattice=_lattice(atoms=atoms), speech_spans=[(1000, 3000)])
-    burst = next(c for c in cuts if c.src_in_ms >= 6000)
-    assert burst.atom_ids == [1], burst.atom_ids
-    print("ok  test_atom_ids_map_back_to_covering_atoms")
+    cuts = _segment(motion)
+    ordered = sorted(cuts, key=lambda c: c.src_in_ms)
+    assert ordered == cuts, "segment_video must already return cuts in order"
+    for a, b in zip(ordered, ordered[1:]):
+        assert a.src_out_ms <= b.src_in_ms, f"overlap: {a.src_out_ms} > {b.src_in_ms}"
+    print("ok  test_finalize_cuts_are_always_disjoint_and_sorted")
 
 
-def test_no_atom_overlap_falls_back_to_nearest_atom_id():
-    """Never emit a video cut with an empty atom_ids list -- downstream
-    (pass2.backfill_locators) treats that as an unresolved locator."""
-    atoms = [Atom(0, "f1", 100, 200, "clip_edge", "clip_edge", 0.05, 0.9)]
-    ids = v4._atom_ids_covering(_lattice(atoms=atoms), 5000, 5100)
-    assert ids == [0], ids
-    print("ok  test_no_atom_overlap_falls_back_to_nearest_atom_id")
+def test_finalize_cuts_clamps_extended_edges_to_the_working_span():
+    """A shot boundary sits at 5000ms; a burst right before it has enough
+    follow-through padding to want to reach past 5000ms. The cut must clamp
+    to the shot boundary, never leak into the next shot's own working span."""
+    n = 100
+    motion = _flat_motion(n)
+    ae = [0.05] * n
+    for i in range(46, 50):   # burst at 4600-5000ms, right at the shot edge
+        ae[i] = 0.9
+    motion["action_energy"] = ae
+    scene = {"shot_points": [{"ts_ms": 5000}]}
+    cuts = _segment(motion, scene=scene)
+    for c in cuts:
+        assert c.src_out_ms <= 5000 or c.src_in_ms >= 5000, c
+    print("ok  test_finalize_cuts_clamps_extended_edges_to_the_working_span")
+
+
+def test_finalize_cuts_merges_a_sub_floor_sliver_into_its_nearest_neighbor():
+    """Force a degenerate short cut via the overlap clamp: two working spans
+    separated by a 1ms shot boundary gap, each producing a cut whose padded
+    edges collide right at the boundary -- the earlier cut gets clamped down
+    to a sliver shorter than MIN_CUT_DURATION_MS and must be merged away
+    rather than surviving as its own tiny cut."""
+    n = 100
+    motion = _flat_motion(n)
+    ae = [0.05] * n
+    for i in range(38, 42):    # burst just before the shot boundary
+        ae[i] = 0.9
+    for i in range(42, 46):    # burst just after -- close enough that both
+        ae[i] = 0.9             # cuts' padding reaches the shared boundary
+    motion["action_energy"] = ae
+    scene = {"shot_points": [{"ts_ms": 4200}]}
+    cuts = _segment(motion, scene=scene)
+    for c in cuts:
+        assert c.src_out_ms - c.src_in_ms >= MIN_CUT_DURATION_MS, \
+            f"a sub-floor sliver survived unmerged: {c}"
+    print("ok  test_finalize_cuts_merges_a_sub_floor_sliver_into_its_nearest_neighbor")
+
+
+def test_lone_cut_below_the_floor_survives_with_no_neighbor_to_merge_into():
+    """A single short representative-window cut with nothing else in the
+    file has no neighbor to merge into -- it must survive as-is rather than
+    vanish (better a short cut than none)."""
+    cuts = v4.segment_video(file_id="f1", duration_ms=300, speech_spans=[],
+                            motion=_flat_motion(3, hop=100), audio={}, scene={})
+    assert len(cuts) == 1, cuts
+    print("ok  test_lone_cut_below_the_floor_survives_with_no_neighbor_to_merge_into")
 
 
 # --------------------------------------------------------------------------
@@ -223,8 +286,11 @@ def main():
     test_two_near_bursts_consolidate_to_one()
     test_contrast_based_peak_beats_absolute_level_on_ramp_then_plateau()
     test_speech_spans_are_subtracted_from_working_spans()
-    test_atom_ids_map_back_to_covering_atoms()
-    test_no_atom_overlap_falls_back_to_nearest_atom_id()
+    test_no_cut_ever_crosses_into_a_speech_span()
+    test_finalize_cuts_are_always_disjoint_and_sorted()
+    test_finalize_cuts_clamps_extended_edges_to_the_working_span()
+    test_finalize_cuts_merges_a_sub_floor_sliver_into_its_nearest_neighbor()
+    test_lone_cut_below_the_floor_survives_with_no_neighbor_to_merge_into()
     test_density_is_higher_for_a_dense_span_than_a_sparse_one()
     print("\nall v4_segment tests passed")
 

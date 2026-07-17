@@ -252,11 +252,14 @@ def run_ingest(project_id: str) -> str:
                     file_id=fid, duration_ms=lat.duration_ms,
                     speech_spans=sorted(speech_spans_by_file.get(fid, [])),
                     motion=motion_by_file.get(fid) or {}, audio=audio_by_file.get(fid) or {},
-                    scene=scene_by_file.get(fid) or {}, lattice=lat,
+                    scene=scene_by_file.get(fid) or {},
                 ):
                     gi = len(video_tentative_groups)
-                    video_tentative_groups.append(
-                        pass1.VideoTentativeGroup(file_id=fid, atom_ids=list(vc.atom_ids)))
+                    # v4_cuts_as_primitive.plan.md section 3.1: the V4 cut IS
+                    # the primitive -- no atoms, its own span carried directly
+                    # on the group (never re-derived from atom membership).
+                    video_tentative_groups.append(pass1.VideoTentativeGroup(
+                        file_id=fid, atom_ids=[], src_in_ms=vc.src_in_ms, src_out_ms=vc.src_out_ms))
                     v4_meta_by_ref[f"video_group[{gi}]"] = {
                         "src_in_ms": vc.src_in_ms, "src_out_ms": vc.src_out_ms,
                         "salience": dict(vc.salience), "density": vc.density,
@@ -317,7 +320,8 @@ def run_ingest(project_id: str) -> str:
 
         if settings.ingest_pass2_provider == "gemini":
             from app.services.llm import ingest_gemini as ig
-            pass2_cache_name = ig.create_pass2_cache(pass2.gemini_system_prompt(), pass1.build_pass1_blocks(file_rows))
+            pass2_cache_name = ig.create_pass2_cache(
+                pass2.gemini_system_prompt(settings.cuts_segmenter), pass1.build_pass1_blocks(file_rows))
             if pass2_cache_name:
                 cache_ctx = ig.pass2_cache_scope(pass2_cache_name)
                 submit_batch = lambda pool, rows, frames: ig.submit_with_cache_context(  # noqa: E731

@@ -677,6 +677,28 @@ def _has_scene_or_transition(atoms: List, gap_lo: int, gap_hi: int, *, synced: b
     return False
 
 
+def _has_scene_or_transition_v4(motion: Optional[dict], gap_lo: int, gap_hi: int, *, synced: bool = False) -> bool:
+    """v4_cuts_as_primitive.plan.md section 5: the V4 seam test, keyed off
+    the CUTS' own boundaries rather than atom micro-edges (which a V4 cut's
+    span generally doesn't align with -- atoms are no longer part of the
+    video path at all). A nonzero gap between two adjacent V4 cuts means the
+    segmenter deliberately left that stretch out of both -- discarded scrap,
+    a real break. An edge-touching (zero-gap) seam is a hard break only if a
+    genuine transition (wipe/degenerate -- a motion-level signal, independent
+    of atoms) sits at the touch point; otherwise the two cuts are a
+    continuous, deliberately-adjacent moment (e.g. a camera-move cut's
+    settle immediately followed by the next one in the same shot)."""
+    if synced:
+        return False
+    if gap_hi > gap_lo:
+        return True
+    for p in (motion or {}).get("transition_points") or []:
+        ts = p.get("ts_ms")
+        if p.get("kind") in ("wipe", "degenerate") and ts is not None and gap_lo <= int(ts) <= gap_hi:
+            return True
+    return False
+
+
 def _has_flagged_break(junk_spans: List[Tuple[int, int]], gap_lo: int, gap_hi: int) -> bool:
     """A pass-1 junk suspect (production cue, false start, dead air) overlaps
     the gap -- or, for a zero-width gap (the cuts touch), contains the seam
@@ -693,13 +715,23 @@ def _has_flagged_break(junk_spans: List[Tuple[int, int]], gap_lo: int, gap_hi: i
 def _clip_continuity(
     file_id: str, idxs: List[int],
     resolved: List[Tuple[Pass2Cut, int, int, List[int]]],
-    lattice: Lattice, junk_spans: List[Tuple[int, int]], *, synced: bool = False,
+    lattice: Lattice, junk_spans: List[Tuple[int, int]],
+    motion: Optional[dict] = None, v4_meta_by_ref: Optional[Dict[str, Dict[str, Any]]] = None,
+    *, synced: bool = False,
 ) -> Dict[int, Dict[str, Any]]:
     """cut_no/of/prev_contiguous/next_contiguous/seam_reason_* for every cut on
     one clip, in source order over ALL cuts (incl. junk). One seam verdict per
     adjacent pair fills BOTH sides (cur's next_contiguous, next's
     prev_contiguous) so the two always agree. ``idxs`` must already be sorted
-    by src_in_ms. Returns ``{resolved_idx: continuity_dict}``."""
+    by src_in_ms. Returns ``{resolved_idx: continuity_dict}``.
+
+    ``v4_meta_by_ref`` (v4_cuts_as_primitive.plan.md section 5): when BOTH
+    cuts of a pair are V4 video cuts (their source_ref is a key in this dict),
+    the seam test keys off the cuts' own boundaries instead of atoms -- see
+    ``_has_scene_or_transition_v4``. Any pair involving a speech cut (or a V3
+    video cut) keeps reading the atom lattice exactly as before -- speech
+    boundaries are unaffected by V4. None/empty -> always the V3 atom path."""
+    v4_meta_by_ref = v4_meta_by_ref or {}
     n = len(idxs)
     conts = [{
         "clip": file_id, "cut_no": pos + 1, "of": n,
@@ -709,6 +741,9 @@ def _clip_continuity(
     for pos in range(n - 1):
         cur_cut, cs, ce, _ = resolved[idxs[pos]]
         nxt_cut, ns, ne, _ = resolved[idxs[pos + 1]]
+        both_v4 = cur_cut.source_ref in v4_meta_by_ref and nxt_cut.source_ref in v4_meta_by_ref
+        has_break = (_has_scene_or_transition_v4(motion, ce, ns, synced=synced) if both_v4
+                    else _has_scene_or_transition(lattice.atoms, ce, ns, synced=synced))
         verdict = classify_seam(Seam(
             same_clip=True,
             # voice_first_identity.plan.md: voice_ids is the deterministic
@@ -720,7 +755,7 @@ def _clip_continuity(
             same_speaker=(set(cur_cut.voice_ids) == set(nxt_cut.voice_ids)),
             gap_ms=max(0, ns - ce),
             bridged_speech_ms=(ce - cs) + (ne - ns),
-            has_scene_or_transition=_has_scene_or_transition(lattice.atoms, ce, ns, synced=synced),
+            has_scene_or_transition=has_break,
             has_flagged_break=_has_flagged_break(junk_spans, ce, ns),
         ))
         conts[pos]["next_contiguous"] = verdict.weldable
@@ -846,7 +881,8 @@ def assemble_cut_records(
             next_start[i] = resolved[idxs[pos + 1]][1] if pos + 1 < len(idxs) else duration_ms
         junk_spans = _junk_suspect_spans(junk_by_file.get(file_id, []), lattices[file_id])
         continuity_by_idx.update(_clip_continuity(
-            file_id, idxs, resolved, lattices[file_id], junk_spans, synced=file_id in synced_ids,
+            file_id, idxs, resolved, lattices[file_id], junk_spans,
+            motion_by_file.get(file_id), v4_meta_by_ref, synced=file_id in synced_ids,
         ))
 
     out: List[CutRecord] = []

@@ -314,8 +314,11 @@ def test_assemble_cut_records_end_to_end():
 # --------------------------------------------------------------------------
 
 def test_v4_meta_by_ref_overrides_span_and_salience_and_stamps_shape():
+    # v4_cuts_as_primitive.plan.md: a real V4 cut carries NO atom_ids at all
+    # (pass2.backfill_locators never fills it in) -- span/salience must come
+    # from v4_meta_by_ref alone, never from atom membership.
     p2 = Pass2Output(cuts=[
-        Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1", atom_ids=[0, 1],
+        Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1", atom_ids=None,
                 label="pan shot", summary="pans across the desk", shape="after"),
     ])
     v4_meta = {"video_group[0]": {
@@ -326,8 +329,6 @@ def test_v4_meta_by_ref_overrides_span_and_salience_and_stamps_shape():
     records = post.assemble_cut_records(p2, {"f1": _lattice()}, {"f1": _motion()}, {},
                                         v4_meta_by_ref=v4_meta)
     rec = records[0]
-    # The segmenter's own span wins over the (much wider) atom_ids bounding
-    # box ([0,1] resolves to [800,2000) via _lattice()'s atoms).
     assert (rec.src_in_ms, rec.src_out_ms) == (900, 1100), rec
     assert rec.salience == {"peak_ms": 950, "score": 0.8, "kind": "point",
                             "span_ms": None, "shape": "after"}, rec.salience
@@ -336,6 +337,120 @@ def test_v4_meta_by_ref_overrides_span_and_salience_and_stamps_shape():
     from app.services.l3.post_params import V4_MIN_MS_DENSE_BONUS, V4_MIN_MS_FLOOR
     assert rec.pace.min_ms == round(V4_MIN_MS_FLOOR + 0.6 * V4_MIN_MS_DENSE_BONUS), rec.pace
     print("ok  test_v4_meta_by_ref_overrides_span_and_salience_and_stamps_shape")
+
+
+def test_v4_cut_smaller_than_any_atom_resolves_cleanly():
+    """v4_cuts_as_primitive.plan.md section 1: the exact failure shape a
+    free-form V4 span used to hit against the grounded atom grid -- a cut
+    far smaller than the lattice's only atom, and no atom_ids at all. Must
+    resolve from v4_meta alone, never raise "no resolvable atoms"."""
+    p2 = Pass2Output(cuts=[
+        Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1", atom_ids=None,
+                label="tight cut", summary="a moment"),
+    ])
+    v4_meta = {"video_group[0]": {
+        "src_in_ms": 1650, "src_out_ms": 1680,   # 30ms, inside atom 1's [1400,2000)
+        "salience": {"peak_ms": 1665, "score": 0.5, "kind": "point", "span_ms": None},
+        "density": 0.2,
+    }}
+    records = post.assemble_cut_records(p2, {"f1": _lattice()}, {"f1": _motion()}, {},
+                                        v4_meta_by_ref=v4_meta)
+    assert (records[0].src_in_ms, records[0].src_out_ms) == (1650, 1680), records[0]
+    print("ok  test_v4_cut_smaller_than_any_atom_resolves_cleanly")
+
+
+def test_v4_cut_straddling_an_atom_boundary_resolves_cleanly():
+    """The other real failure shape: a V4 span that straddles the boundary
+    between two atoms (atoms 0/1 split at 1400ms; this cut spans 1300-1500)."""
+    p2 = Pass2Output(cuts=[
+        Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1", atom_ids=None,
+                label="straddle", summary="a moment"),
+    ])
+    v4_meta = {"video_group[0]": {
+        "src_in_ms": 1300, "src_out_ms": 1500,
+        "salience": {"peak_ms": 1400, "score": 0.5, "kind": "point", "span_ms": None},
+        "density": 0.2,
+    }}
+    records = post.assemble_cut_records(p2, {"f1": _lattice()}, {"f1": _motion()}, {},
+                                        v4_meta_by_ref=v4_meta)
+    assert (records[0].src_in_ms, records[0].src_out_ms) == (1300, 1500), records[0]
+    print("ok  test_v4_cut_straddling_an_atom_boundary_resolves_cleanly")
+
+
+def test_v4_continuity_keys_off_cut_boundaries_not_atoms():
+    """Two adjacent V4 video cuts with a nonzero gap between them (scrap the
+    segmenter deliberately dropped) must read as a HARD break, even though
+    neither cut's edge lines up with the lattice's atom boundaries at all."""
+    p2 = Pass2Output(cuts=[
+        Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1", atom_ids=None,
+                label="a", summary="a"),
+        Pass2Cut(source_ref="video_group[1]", kind="video", file_id="f1", atom_ids=None,
+                label="b", summary="b"),
+    ])
+    v4_meta = {
+        "video_group[0]": {"src_in_ms": 100, "src_out_ms": 500,
+                           "salience": {"peak_ms": 300, "score": 0.5, "kind": "point", "span_ms": None},
+                           "density": 0.2},
+        "video_group[1]": {"src_in_ms": 900, "src_out_ms": 1200,
+                           "salience": {"peak_ms": 1000, "score": 0.5, "kind": "point", "span_ms": None},
+                           "density": 0.2},
+    }
+    records = post.assemble_cut_records(p2, {"f1": _lattice()}, {"f1": _motion()}, {},
+                                        v4_meta_by_ref=v4_meta)
+    first = next(r for r in records if r.src_in_ms == 100)
+    assert first.continuity["next_contiguous"] is False, first.continuity
+    print("ok  test_v4_continuity_keys_off_cut_boundaries_not_atoms")
+
+
+def test_v4_continuity_edge_touching_cuts_with_no_transition_are_weldable():
+    """Two edge-touching V4 video cuts (zero gap) with no transition_point at
+    the seam are a continuous, deliberately-adjacent moment -- weldable."""
+    p2 = Pass2Output(cuts=[
+        Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1", atom_ids=None,
+                label="a", summary="a"),
+        Pass2Cut(source_ref="video_group[1]", kind="video", file_id="f1", atom_ids=None,
+                label="b", summary="b"),
+    ])
+    v4_meta = {
+        "video_group[0]": {"src_in_ms": 100, "src_out_ms": 500,
+                           "salience": {"peak_ms": 300, "score": 0.5, "kind": "point", "span_ms": None},
+                           "density": 0.2},
+        "video_group[1]": {"src_in_ms": 500, "src_out_ms": 900,
+                           "salience": {"peak_ms": 700, "score": 0.5, "kind": "point", "span_ms": None},
+                           "density": 0.2},
+    }
+    records = post.assemble_cut_records(p2, {"f1": _lattice()}, {"f1": _motion()}, {},
+                                        v4_meta_by_ref=v4_meta)
+    first = next(r for r in records if r.src_in_ms == 100)
+    assert first.continuity["next_contiguous"] is True, first.continuity
+    assert first.continuity["seam_reason_next"] == "continuous take", first.continuity
+    print("ok  test_v4_continuity_edge_touching_cuts_with_no_transition_are_weldable")
+
+
+def test_v4_continuity_edge_touching_transition_point_is_still_hard():
+    """An edge-touching seam with a genuine wipe/degenerate transition sitting
+    right at the touch point is still a hard break, even at zero gap."""
+    p2 = Pass2Output(cuts=[
+        Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1", atom_ids=None,
+                label="a", summary="a"),
+        Pass2Cut(source_ref="video_group[1]", kind="video", file_id="f1", atom_ids=None,
+                label="b", summary="b"),
+    ])
+    v4_meta = {
+        "video_group[0]": {"src_in_ms": 100, "src_out_ms": 500,
+                           "salience": {"peak_ms": 300, "score": 0.5, "kind": "point", "span_ms": None},
+                           "density": 0.2},
+        "video_group[1]": {"src_in_ms": 500, "src_out_ms": 900,
+                           "salience": {"peak_ms": 700, "score": 0.5, "kind": "point", "span_ms": None},
+                           "density": 0.2},
+    }
+    motion = dict(_motion())
+    motion["transition_points"] = [{"ts_ms": 500, "kind": "wipe"}]
+    records = post.assemble_cut_records(p2, {"f1": _lattice()}, {"f1": motion}, {},
+                                        v4_meta_by_ref=v4_meta)
+    first = next(r for r in records if r.src_in_ms == 100)
+    assert first.continuity["next_contiguous"] is False, first.continuity
+    print("ok  test_v4_continuity_edge_touching_transition_point_is_still_hard")
 
 
 def test_v3_video_cut_unaffected_when_v4_meta_by_ref_absent():
@@ -801,6 +916,11 @@ def main():
     test_validate_no_overlap_allows_no_cuts()
     test_assemble_cut_records_end_to_end()
     test_v4_meta_by_ref_overrides_span_and_salience_and_stamps_shape()
+    test_v4_cut_smaller_than_any_atom_resolves_cleanly()
+    test_v4_cut_straddling_an_atom_boundary_resolves_cleanly()
+    test_v4_continuity_keys_off_cut_boundaries_not_atoms()
+    test_v4_continuity_edge_touching_cuts_with_no_transition_are_weldable()
+    test_v4_continuity_edge_touching_transition_point_is_still_hard()
     test_v3_video_cut_unaffected_when_v4_meta_by_ref_absent()
     test_density_scales_min_ms_sparse_vs_dense()
     test_solo_cut_couples_to_its_own_file_at_zero_offset()
