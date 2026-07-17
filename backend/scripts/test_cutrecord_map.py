@@ -324,6 +324,17 @@ def _cluster_events():
     ]
 
 
+def _strong_cluster_events():
+    """Three genuinely-comparable, well-separated strong events -- none is
+    weak enough for the salience gate to drop, so they survive and split into
+    distinct pieces even at max energy."""
+    return [
+        {"peak_ms": 1500, "score": 0.95, "kind": "point", "onset_ms": 1100, "settle_ms": 2000, "span_ms": None},
+        {"peak_ms": 5000, "score": 1.0, "kind": "point", "onset_ms": 4600, "settle_ms": 5500, "span_ms": None},
+        {"peak_ms": 8500, "score": 0.9, "kind": "point", "onset_ms": 8100, "settle_ms": 9000, "span_ms": None},
+    ]
+
+
 def _cluster_row(events=None):
     return _row(kind="video", src_in_ms=0, src_out_ms=10000, hero_ts_ms=5000,
                salience={"peak_ms": 5000, "score": 1.0, "kind": "point", "span_ms": None,
@@ -339,24 +350,41 @@ def test_resolve_cluster_broad_is_one_piece_whole_cluster():
     print("ok  test_resolve_cluster_broad_is_one_piece_whole_cluster")
 
 
-def test_resolve_cluster_punchy_is_n_pieces():
+def test_resolve_cluster_punchy_prunes_weak_events_to_the_strongest():
+    """The rising salience gate: at max energy the weak events (0.6, 0.4) are
+    dropped and only the strongest (1.0 @ 5000) survives -- a single tight piece
+    around its peak, far smaller than the whole cluster (heavy trim)."""
     pieces, removed = cm.resolve_cluster(_cluster_events(), 0, 10000, 1.0)
-    assert len(pieces) == 3, pieces
-    # valleys = the complement of the pieces inside [0, 10000]
+    assert len(pieces) == 1, pieces
+    a, b = pieces[0]
+    assert a <= 5000 <= b, pieces          # keeps the strong peak
+    assert (b - a) < 4000, pieces          # tight, not the whole 10s cluster
+    # pieces + removed must still tile [0, 10000) exactly
     covered = sorted(list(pieces) + list(removed))
     cur = 0
-    for a, b in covered:
-        assert a == cur, (covered, "must tile [0,10000) with no gap/overlap")
-        cur = b
+    for x, y in covered:
+        assert x == cur, (covered, "must tile [0,10000) with no gap/overlap")
+        cur = y
     assert cur == 10000, covered
-    print("ok  test_resolve_cluster_punchy_is_n_pieces")
+    print("ok  test_resolve_cluster_punchy_prunes_weak_events_to_the_strongest")
 
 
-def test_resolve_cluster_piece_count_is_monotonic_with_energy():
-    counts = [len(cm.resolve_cluster(_cluster_events(), 0, 10000, e)[0])
-             for e in (0.0, 0.25, 0.5, 0.75, 1.0)]
-    assert counts == sorted(counts), counts
-    print("ok  test_resolve_cluster_piece_count_is_monotonic_with_energy")
+def test_resolve_cluster_strong_events_survive_and_split_at_punchy():
+    """Multiple genuinely-comparable strong events all clear the gate, so they
+    stay as separate tight pieces at max energy (split, not collapse)."""
+    pieces, _ = cm.resolve_cluster(_strong_cluster_events(), 0, 10000, 1.0)
+    assert len(pieces) == 3, pieces
+    print("ok  test_resolve_cluster_strong_events_survive_and_split_at_punchy")
+
+
+def test_resolve_cluster_kept_duration_is_monotonic_with_energy():
+    """Piece COUNT is no longer monotonic under pruning (it can rise as windows
+    separate, then fall as weak events drop), but the total KEPT duration must
+    only ever shrink as the dial rises -- compression is monotonic."""
+    kept = [sum(b - a for a, b in cm.resolve_cluster(_cluster_events(), 0, 10000, e)[0])
+            for e in (0.0, 0.25, 0.5, 0.75, 1.0)]
+    assert kept == sorted(kept, reverse=True), kept
+    print("ok  test_resolve_cluster_kept_duration_is_monotonic_with_energy")
 
 
 def test_resolve_cluster_pieces_are_always_disjoint_and_ordered():
@@ -381,7 +409,7 @@ def test_cluster_rung_broad_forces_one_piece_at_the_sampled_band():
 
 
 def test_cluster_rung_sharp_yields_multiple_tight_pieces():
-    row = _cluster_row()
+    row = _cluster_row(events=_strong_cluster_events())
     ladder = cm.synth_ladder(row, 0.8)
     sharp = ladder[-1]
     assert sharp["level"] == "sharp"
@@ -481,8 +509,9 @@ def main():
     test_v4_span_kind_trims_head_keeps_settle()
     test_v4_punchy_rung_never_clips_the_peak()
     test_resolve_cluster_broad_is_one_piece_whole_cluster()
-    test_resolve_cluster_punchy_is_n_pieces()
-    test_resolve_cluster_piece_count_is_monotonic_with_energy()
+    test_resolve_cluster_punchy_prunes_weak_events_to_the_strongest()
+    test_resolve_cluster_strong_events_survive_and_split_at_punchy()
+    test_resolve_cluster_kept_duration_is_monotonic_with_energy()
     test_resolve_cluster_pieces_are_always_disjoint_and_ordered()
     test_cluster_rung_broad_forces_one_piece_at_the_sampled_band()
     test_cluster_rung_sharp_yields_multiple_tight_pieces()

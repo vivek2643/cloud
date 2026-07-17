@@ -197,8 +197,30 @@ type Segment = { inMs: number; outMs: number };
 const EVENT_RUN_UP_FLOOR_MS = 300;
 const EVENT_FOLLOW_THROUGH_FLOOR_MS = 500;
 
+// Mirrors backend v4_segment_params.CLUSTER_PRUNE_GATE -- keep them equal.
+// Rising salience gate: as the dial rises, an event survives only if its
+// salience clears energy * GATE * (cluster's own max score), so weak/noise
+// events fall away first and the survivors compress + separate. Relative to
+// the cluster's own peak -> generic. The strongest event always survives.
+const CLUSTER_PRUNE_GATE = 0.8;
+
 function eventAnchor(ev: SalienceEvent): number {
   return ev.peak_ms;
+}
+
+function eventScore(ev: SalienceEvent): number {
+  return ev.score ?? 0;
+}
+
+// See backend cutrecord_map._prune_events -- must stay identical.
+function pruneEvents(events: SalienceEvent[], energy: number): SalienceEvent[] {
+  if (!events.length) return events;
+  const maxScore = Math.max(...events.map(eventScore));
+  if (maxScore <= 0) return events;
+  const thr = energy * CLUSTER_PRUNE_GATE * maxScore;
+  const survivors = events.filter((e) => eventScore(e) >= thr);
+  if (survivors.length) return survivors;
+  return [events.reduce((a, b) => (eventScore(b) > eventScore(a) ? b : a))];
 }
 
 function resolveCluster(
@@ -207,7 +229,7 @@ function resolveCluster(
   clusterE: number,
   energy: number
 ): Segment[] {
-  const ordered = [...events].sort((a, b) => eventAnchor(a) - eventAnchor(b));
+  const ordered = [...pruneEvents(events, energy)].sort((a, b) => eventAnchor(a) - eventAnchor(b));
   const n = ordered.length;
   const windows: Segment[] = ordered.map((ev, i) => {
     const peak = eventAnchor(ev);

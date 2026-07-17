@@ -576,7 +576,11 @@ def piece_breakdown(m: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
     in_ms, out_ms = int(m.get("in_ms", 0)), int(m.get("out_ms", 0))
     broad_s = max(0, out_ms - in_ms) / 1000.0
-    pieces, _removed = cutrecord_map.resolve_cluster(events, in_ms, out_ms, 1.0)
+    # UNGATED (prune=False): the brain's piece breakdown names every salience
+    # event, independent of where the rendered energy dial would gate weak ones
+    # out -- so each listed piece stays individually addressable via
+    # resolve_piece. Energy 1.0 = each event's own tightest window.
+    pieces, _removed = cutrecord_map.resolve_cluster(events, in_ms, out_ms, 1.0, prune=False)
     tight_s = (sum(b - a for a, b in pieces) / len(pieces) / 1000.0) if pieces else 0.0
 
     ordered = sorted(range(len(events)), key=lambda i: events[i].get("peak_ms", 0))
@@ -614,12 +618,14 @@ def resolve_piece(m: Dict[str, Any], piece: int) -> Optional[Tuple[int, int]]:
     """A single piece's own resolved span (v4_cluster_read_act.plan.md Part C):
     the brain addresses a piece by the same 1-based position it was shown in
     the Beat Index / read_state (``piece_breakdown``'s ``pos``) -- resolve that
-    back to its event, then to whichever ``resolve_cluster`` piece at
-    energy=1.0 (the tightest split) CONTAINS that event's own peak. Two events
-    can still be too close to separate even at max energy, in which case both
-    resolve to their shared merged span -- never a fabricated, impossibly
-    narrow one. None for a single-event moment, an out-of-range piece, or the
-    (shouldn't-happen) case where no resolved piece contains the peak."""
+    back to its event, then to whichever UNGATED (prune=False) ``resolve_cluster``
+    piece at energy=1.0 (the tightest split, every event kept) CONTAINS that
+    event's own peak. Prune=False so a piece stays addressable even where the
+    rendered dial would gate its event out. Two events can still be too close to
+    separate even at max energy, in which case both resolve to their shared
+    merged span -- never a fabricated, impossibly narrow one. None for a
+    single-event moment, an out-of-range piece, or the (shouldn't-happen) case
+    where no resolved piece contains the peak."""
     sal = m.get("salience") or {}
     events = sal.get("events") or []
     if len(events) <= 1:
@@ -633,7 +639,7 @@ def resolve_piece(m: Dict[str, Any], piece: int) -> Optional[Tuple[int, int]]:
         return None
     peak = int(events[ordered[pos - 1]].get("peak_ms", 0))
     in_ms, out_ms = int(m.get("in_ms", 0)), int(m.get("out_ms", 0))
-    pieces, _removed = cutrecord_map.resolve_cluster(events, in_ms, out_ms, 1.0)
+    pieces, _removed = cutrecord_map.resolve_cluster(events, in_ms, out_ms, 1.0, prune=False)
     for a, b in pieces:
         if a <= peak <= b:
             return (a, b)

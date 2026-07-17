@@ -103,8 +103,8 @@ MIN_CUT_DURATION_MS = 400
 # [MIN_CUT_GAP_MS, MAX_CLUSTER_SEPARATION_MS] below so one huge outlier gap
 # in a tiny sample can't blow the threshold out, and a very tight span still
 # gets SOME separation floor.
-CLUSTER_SEPARATION_MULTIPLIER = 2.5
-MAX_CLUSTER_SEPARATION_MS = 4000
+CLUSTER_SEPARATION_MULTIPLIER = 2.0
+MAX_CLUSTER_SEPARATION_MS = 3000
 
 # The tightest a single EVENT's own window is ever allowed to collapse to
 # inside the per-level cluster resolver (resolve_cluster) -- the per-piece
@@ -118,3 +118,17 @@ MIN_EVENT_PIECE_MS = RUN_UP_FLOOR_MS + FOLLOW_THROUGH_FLOOR_MS
 # list when there are more). Bounds the frame cost of a large, busy cluster
 # flat regardless of how many events it holds.
 MAX_CLUSTER_EVENT_FRAMES = 4
+
+# resolve_cluster's rising salience gate (the core "extract the usable, discard
+# the scrap" lever along the energy dial). As energy rises, an event survives
+# only if its (clip-normalized) salience clears energy * GATE * (cluster's OWN
+# max event score) -- so weak/connective/noise events fall away first and the
+# survivors trim tight and separate into distinct pieces. Relative to the
+# cluster's own peak (never an absolute score), so it's generic: a lone strong
+# peak keeps one piece, several genuinely-strong events keep several, a
+# monotonous span (all-low, periodicity-discounted) collapses toward its single
+# best window. The single strongest event is always kept (a cut is never
+# empty). At energy 0 the gate is 0 -> everything survives (broad = whole
+# moment). ~0.8 clears the noise floor at the sharp band (e=0.9 -> ~0.72*max)
+# while still keeping a cluster of genuinely comparable hits intact.
+CLUSTER_PRUNE_GATE = 0.8

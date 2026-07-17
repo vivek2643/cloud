@@ -737,6 +737,9 @@ def test_moment_line_multi_event_cluster_is_multiline_and_generic():
 
 def test_resolve_piece_addresses_each_separated_event():
     m = _cluster_moment()
+    # UNGATED addressing (prune=False): every event stays individually
+    # addressable at its own tightest window, even the weak one the rendered
+    # dial would gate out.
     assert fm.resolve_piece(m, 1) == (700, 1500)
     assert fm.resolve_piece(m, 2) == (4700, 5500)
     assert fm.resolve_piece(m, 3) == (8700, 9500)

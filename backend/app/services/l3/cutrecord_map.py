@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # _FOLLOW_THROUGH_FLOOR_MS/_LEAD_FLOOR_MS below, which are a DIFFERENT,
 # whole-cut-level asymmetry knob, unrelated to this per-event one).
 from app.services.l3.v4_segment_params import (
+    CLUSTER_PRUNE_GATE as _CLUSTER_PRUNE_GATE,
     FOLLOW_THROUGH_FLOOR_MS as _EVENT_FOLLOW_THROUGH_FLOOR_MS,
     RUN_UP_FLOOR_MS as _EVENT_RUN_UP_FLOOR_MS,
 )
@@ -42,7 +43,10 @@ logger = logging.getLogger(__name__)
 # the shared moment-tree shape in footage_map.py).
 # v2: junk cuts are no longer dropped -- carried through (labeled) with their
 # continuity block, per cuts_v3_continuity.plan.md.
-CUTRECORD_MAP_VERSION = 2
+# v3: cluster ladder gains the rising salience gate (_prune_events) -- a dense
+# cluster now compresses to its salient few as energy rises instead of keeping
+# every event's window, so cached rungs must rebuild.
+CUTRECORD_MAP_VERSION = 3
 
 # broad -> sharp, matching footage_map._LEVEL_NAMES; the same five band
 # centers the (now-retired) hero-cut ladders used to zoom at.
@@ -190,8 +194,31 @@ def _event_anchor(event: Dict[str, Any]) -> int:
     return int(event.get("peak_ms") or 0)
 
 
+def _event_score(event: Dict[str, Any]) -> float:
+    return float(event.get("score") or 0.0)
+
+
+def _prune_events(events: List[Dict[str, Any]], energy: float) -> List[Dict[str, Any]]:
+    """The rising salience gate (v4_segment_params.CLUSTER_PRUNE_GATE): keep only
+    events whose salience clears ``energy * GATE * max_score`` -- weak/connective/
+    noise events fall away first as the dial rises, so the survivors compress and
+    separate. Relative to the cluster's OWN strongest event, so it's generic (a
+    lone peak keeps one; several comparable hits keep several; an all-weak
+    monotonous span keeps just its best). Never empty -- the single strongest
+    event always survives. Energy 0 keeps everything (broad = whole moment)."""
+    if not events:
+        return events
+    max_score = max(_event_score(e) for e in events)
+    if max_score <= 0.0:
+        return events
+    thr = energy * _CLUSTER_PRUNE_GATE * max_score
+    survivors = [e for e in events if _event_score(e) >= thr]
+    return survivors or [max(events, key=_event_score)]
+
+
 def resolve_cluster(
     events: List[Dict[str, Any]], cluster_s: int, cluster_e: int, energy: float,
+    *, prune: bool = True,
 ) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
     """Multi-event per-level resolution (v4_cluster_tree_cuts.plan.md section
     5, "the heart"): every event's own window half-width slides between
@@ -214,8 +241,17 @@ def resolve_cluster(
     peak over dwelling before it") still applies uniformly.
 
     Returns (pieces, removed) -- pieces are the kept spans in time order,
-    removed is their complement inside [cluster_s, cluster_e]."""
-    ordered = sorted(events, key=_event_anchor)
+    removed is their complement inside [cluster_s, cluster_e]. When ``prune`` is
+    set (the RENDERED ladder -- the energy dial the timeline actually plays),
+    the rising salience gate (_prune_events) drops weak events as energy rises,
+    so a dense/noisy cluster compresses to its genuinely-salient few (dropped
+    regions become part of ``removed``) rather than keeping every event's window
+    forever. ``prune=False`` keeps every event -- used only for the brain's
+    piece ADDRESSING (footage_map.piece_breakdown / resolve_piece), where every
+    salience event must stay individually nameable and placeable regardless of
+    where the dial would gate it."""
+    src = _prune_events(events, energy) if prune else events
+    ordered = sorted(src, key=_event_anchor)
     n = len(ordered)
     windows: List[Tuple[int, int]] = []
     for i, ev in enumerate(ordered):
