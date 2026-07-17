@@ -986,6 +986,110 @@ def test_review_feature_flags_never_prescribe_a_fix():
     print("ok  requested-feature flags state a fact, never a prescribed fix")
 
 
+# --------------------------------------------------------------------------
+# v4_cluster_read_act.plan.md Part B/C: multi-event cluster piece read + act
+# --------------------------------------------------------------------------
+
+def _cluster_struct():
+    """One video moment holding a 3-event cluster (same fixture as
+    test_footage_map.py/test_cutrecord_map.py's _cluster_events): peaks at
+    1000/5000/9000ms inside a 0-10000ms cluster, far enough apart that
+    resolve_cluster at energy=1.0 keeps them as three separate pieces. Carries
+    a hand-built ladder ("broad" = the whole span, "sharp" = the 3-piece
+    split) so `place(ref, level=...)` can be regression-tested without
+    depending on the real ingest pipeline's ladder construction."""
+    events = [
+        {"peak_ms": 1000, "score": 0.6, "kind": "point", "onset_ms": 700, "settle_ms": 1500, "span_ms": None},
+        {"peak_ms": 5000, "score": 1.0, "kind": "point", "onset_ms": 4600, "settle_ms": 5500, "span_ms": None},
+        {"peak_ms": 9000, "score": 0.4, "kind": "point", "onset_ms": 8700, "settle_ms": 9400, "span_ms": None},
+    ]
+    salience = {"peak_ms": 5000, "score": 1.0, "kind": "point", "span_ms": None,
+                "events": events, "primary": 1, "density": 0.5, "shape": "center"}
+    c0 = {"hero_id": "f:cl", "file_id": "ffffffff-1111", "channel": "shown",
+          "subject": "person", "label": "cluster", "src_in_ms": 0, "src_out_ms": 10000,
+          "play_ms": 10000, "keep_spans": None, "score": 0.6, "speaker": None,
+          "flags": [], "take_count": 1, "salience": salience,
+          "ladder": [_rung("broad", 0, 10000, "whole cluster", 0.6),
+                     _rung_multi("sharp", [(700, 1500), (4700, 5500), (8700, 9500)], "punchy", 0.9)]}
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "C", "duration_ms": 10000}, [c0])
+    return {"clips": [tree]}
+
+
+def test_read_state_piece_breakdown_matches_beat_index_for_cluster():
+    struct = _cluster_struct()
+    idx = _MapIndex(struct)
+    m = idx.moments["ffffffff:m00"]
+    doc = act.place({"format": {"aspect": "landscape"}, "timeline": [], "operations": []},
+                    idx, "ffffffff:m00", level="broad", channel="V1")
+    st = observe.read_state(doc, _ctx(struct))
+    cut = st["cuts"][0]
+    # Same shared helper (footage_map.piece_breakdown) the Beat Index's
+    # _piece_lines renders from -- a deep look must agree with the up-front map.
+    assert cut["pieces"] == fm.piece_breakdown(m), cut.get("pieces")
+    assert cut["pieces"]["tight_count"] == 3, cut["pieces"]
+    print("ok  read_state's piece breakdown mirrors the Beat Index for a cluster")
+
+
+def test_read_state_omits_pieces_for_single_event_cut():
+    struct = _map()
+    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    st = observe.read_state(doc, _ctx(struct))
+    assert "pieces" not in st["cuts"][0], st["cuts"][0]
+    print("ok  read_state omits piece breakdown for a single-event cut")
+
+
+def test_place_cluster_whole_vs_pieces_via_level():
+    struct = _cluster_struct()
+    idx = _MapIndex(struct)
+    doc = {"format": {"aspect": "landscape"}, "timeline": [], "operations": []}
+    whole = act.place(doc, idx, "ffffffff:m00", level="broad", channel="V1")
+    assert [(s["in_ms"], s["out_ms"]) for s in whole["timeline"]] == [(0, 10000)], whole["timeline"]
+    pieces_doc = act.place(doc, idx, "ffffffff:m00", level="sharp", channel="V1")
+    spans = [(s["in_ms"], s["out_ms"]) for s in pieces_doc["timeline"]]
+    assert spans == [(700, 1500), (4700, 5500), (8700, 9500)], spans
+    print("ok  place(ref, level) resolves a cluster whole (broad) <-> pieces (sharp)")
+
+
+def test_place_piece_resolves_to_one_beat_span():
+    struct = _cluster_struct()
+    idx = _MapIndex(struct)
+    doc = {"format": {"aspect": "landscape"}, "timeline": [], "operations": []}
+    doc2 = act.place(doc, idx, "ffffffff:m00", piece=2, channel="V1")
+    assert len(doc2["timeline"]) == 1, doc2["timeline"]
+    seg = doc2["timeline"][0]
+    assert (seg["in_ms"], seg["out_ms"]) == (4700, 5500), seg
+    assert seg["level"] == "sharp", seg
+    print("ok  place(ref, piece=k) places just that one beat")
+
+
+def test_trim_works_on_a_placed_piece():
+    struct = _cluster_struct()
+    idx = _MapIndex(struct)
+    doc = act.place({"format": {"aspect": "landscape"}, "timeline": [], "operations": []},
+                    idx, "ffffffff:m00", piece=2, channel="V1")
+    seg_id = doc["timeline"][0]["seg_id"]
+    doc2 = act.trim(doc, seg_id, delta_in_ms=100)
+    assert doc2["timeline"][0]["in_ms"] == 4800, doc2["timeline"][0]
+    print("ok  trim works on a placed single-piece segment")
+
+
+def test_place_bad_piece_is_clean_noop():
+    struct = _cluster_struct()
+    idx = _MapIndex(struct)
+    doc = {"format": {"aspect": "landscape"}, "timeline": [], "operations": []}
+    assert act.place(doc, idx, "ffffffff:m00", piece=0, channel="V1") is doc
+    assert act.place(doc, idx, "ffffffff:m00", piece=99, channel="V1") is doc
+    print("ok  place(ref, piece=<out-of-range>) is a clean no-op")
+
+
+def test_place_piece_on_single_event_moment_is_noop():
+    struct = _map()
+    idx = _MapIndex(struct)
+    doc = {"format": {"aspect": "landscape"}, "timeline": [], "operations": []}
+    assert act.place(doc, idx, "ffffffff:m00", piece=1, channel="V1") is doc
+    print("ok  place(ref, piece=1) on a single-event moment is a clean no-op")
+
+
 def main():
     test_read_state_reports_cuts_and_feel()
     test_place_adds_main_line_cut()
@@ -1042,6 +1146,13 @@ def main():
     test_review_no_feature_flag_when_the_feature_is_present()
     test_review_no_feature_flag_without_an_ask()
     test_review_feature_flags_never_prescribe_a_fix()
+    test_read_state_piece_breakdown_matches_beat_index_for_cluster()
+    test_read_state_omits_pieces_for_single_event_cut()
+    test_place_cluster_whole_vs_pieces_via_level()
+    test_place_piece_resolves_to_one_beat_span()
+    test_trim_works_on_a_placed_piece()
+    test_place_bad_piece_is_clean_noop()
+    test_place_piece_on_single_event_moment_is_noop()
     print("\nall observe/act tests passed")
 
 

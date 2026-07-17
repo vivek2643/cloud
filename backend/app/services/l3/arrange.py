@@ -25,7 +25,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.services.l3 import layers
+from app.services.l3 import footage_map, layers
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,12 @@ class Placement:
     track: int = _MAIN_TRACK       # 0 = V1 main line; >=1 = V2+ cutaway lane
     from_ms: Optional[int] = None  # V2+ cutaway anchor on the program clock (track>=1)
     reason: str = ""
+    # v4_cluster_read_act.plan.md Part C: place ONE piece of a multi-event
+    # cluster instead of the whole moment -- the 1-based position the brain
+    # was shown in the Beat Index / read_state (footage_map.piece_breakdown's
+    # "pos"). None (the common case) places the whole moment at `level`, same
+    # as before this field existed.
+    piece: Optional[int] = None
     # Per-pick audio override on a video shot's DEFAULT mute policy: "keep" plays
     # its source sound (the shot's own audio is the point -- an action, a laugh,
     # applause, music), "mute" silences it, None = use the cut's default.
@@ -141,6 +147,25 @@ class _MapIndex:
         m = self.moments.get(p.ref)
         if m is None:
             return None
+        if p.piece is not None:
+            # v4_cluster_read_act.plan.md Part C: one piece of a multi-event
+            # cluster, not the whole moment. footage_map.resolve_piece already
+            # fails closed (None) for a single-event moment, an out-of-range
+            # piece, or the shouldn't-happen no-containing-piece case -- so a
+            # bad `piece` just falls through to this verb's normal unknown-ref
+            # no-op, same as any other illegal Placement.
+            span = footage_map.resolve_piece(m, p.piece)
+            if span is None:
+                return None
+            return ResolvedCut(
+                file_id=m["file_id"], src_in_ms=span[0], src_out_ms=span[1],
+                keep_spans=None, channel=m.get("channel"), label=m.get("gist") or "",
+                track=p.track, from_ms=p.from_ms, reason=p.reason,
+                ref=p.ref, level="sharp",
+                mute=_resolve_mute(bool(m.get("mute")), p.audio),
+                audio_file_id=m.get("audio_file_id") or m["file_id"],
+                audio_offset_ms=int(m.get("audio_offset_ms") or 0),
+            )
         variants = m.get("variants") or {}
         level = p.level if p.level in variants else "balanced"
         v = variants.get(level) or variants.get("balanced") or next(iter(variants.values()), None)

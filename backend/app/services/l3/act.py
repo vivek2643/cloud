@@ -190,17 +190,21 @@ def place_span(document: dict, file_id: str, *, in_ms: int, out_ms: int,
 def place(document: dict, index: _MapIndex, ref: str, *,
           level: str = "balanced", channel: str = "V1",
           at: Optional[int] = None, from_ms: Optional[int] = None,
-          audio: Optional[str] = None, reason: str = "") -> dict:
+          audio: Optional[str] = None, reason: str = "",
+          piece: Optional[int] = None) -> dict:
     """Add a cut from a map ``ref``.
 
     channel="V1": insert on the main line at index ``at`` (default append).
     channel="V2": lay a SILENT (unless audio="keep") video cutaway over the
     program at ``from_ms`` (default the current program end -> effectively a tail
     cutaway; pass from_ms to place it precisely).
-    Unknown/illegal ref -> unchanged doc.
+    ``piece`` (v4_cluster_read_act.plan.md Part C): place just ONE beat of a
+    multi-beat cluster (the 1-based position shown in the Beat Index /
+    read_state) instead of the whole moment; ``level`` is ignored when set.
+    Unknown/illegal ref, or an out-of-range/inapplicable piece -> unchanged doc.
     """
     p = Placement(ref=ref, level=level, track=(0 if channel.upper() == "V1" else 1),
-                  from_ms=from_ms, reason=reason, audio=audio)
+                  from_ms=from_ms, reason=reason, audio=audio, piece=piece)
     rc = index.resolve(p)
     if rc is None:
         return document

@@ -110,12 +110,18 @@ def _specs() -> List[Dict[str, Any]]:
         S("place", "Adds a cut by its ref. channel 'V1' inserts on the main line "
           "(picture+sound) at index `at` (default append); 'V2' lays a silent video "
           "layer over the ongoing audio at program `from_ms` (audio:'keep' plays its "
-          "own sound). `level` selects the energy take.",
+          "own sound). `level` selects the energy take. `piece` places just one "
+          "beat of a multi-beat cluster (the 1-based position shown in the Beat "
+          "Index/read_state) instead of the whole moment; omit for the whole moment "
+          "(`level` is ignored when `piece` is set).",
           obj({"ref": {"type": "string"}, "level": {"type": "string", "enum": list(observe._LEVELS)},
                "channel": {"type": "string", "enum": ["V1", "V2"]},
                "at": {"type": "integer"}, "from_ms": {"type": "integer"},
                "audio": {"type": "string", "enum": ["keep", "mute"]},
-               "reason": {"type": "string"}}, ["ref"])),
+               "reason": {"type": "string"},
+               "piece": {"type": "integer",
+                         "description": "index of a sub-beat within a multi-beat "
+                         "cluster; omit to place the whole moment"}}, ["ref"])),
         S("trim", "Changes a cut's SOURCE in/out. Absolute (in_ms/out_ms) or relative "
           "(delta_in_ms/delta_out_ms; delta_in_ms:200 starts 200ms later). Targets a "
           "main-line seg_id, a V2 place_video op_id, or an A2 place_audio op_id "
@@ -373,7 +379,8 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
             new = act.place(doc, ctx.index, args["ref"], level=args.get("level", "balanced"),
                             channel=args.get("channel", "V1"), at=args.get("at"),
                             from_ms=args.get("from_ms"),
-                            audio=args.get("audio"), reason=args.get("reason", ""))
+                            audio=args.get("audio"), reason=args.get("reason", ""),
+                            piece=args.get("piece"))
         elif name == "trim":
             new = act.trim(doc, args["target_id"], in_ms=args.get("in_ms"), out_ms=args.get("out_ms"),
                            delta_in_ms=args.get("delta_in_ms"), delta_out_ms=args.get("delta_out_ms"))

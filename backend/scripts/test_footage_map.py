@@ -672,6 +672,100 @@ def test_snap_is_noop_without_transcript():
     print("ok  snap is a no-op without transcript")
 
 
+# --------------------------------------------------------------------------
+# v4_cluster_read_act.plan.md Part B: multi-event cluster piece breakdown
+# --------------------------------------------------------------------------
+
+def _cluster_events():
+    # Same fixture as test_cutrecord_map.py's _cluster_events: three widely
+    # separated point events inside a 0-10000ms cluster, so resolve_cluster
+    # at energy=1.0 keeps them as three SEPARATE pieces (no merge).
+    return [
+        {"peak_ms": 1000, "score": 0.6, "kind": "point", "onset_ms": 700, "settle_ms": 1500, "span_ms": None},
+        {"peak_ms": 5000, "score": 1.0, "kind": "point", "onset_ms": 4600, "settle_ms": 5500, "span_ms": None},
+        {"peak_ms": 9000, "score": 0.4, "kind": "point", "onset_ms": 8700, "settle_ms": 9400, "span_ms": None},
+    ]
+
+
+def _cluster_moment(hero_id="f:cl", in_ms=0, out_ms=10000, events=None, primary=1):
+    events = _cluster_events() if events is None else events
+    cut = _salience_cut(hero_id, in_ms, out_ms,
+                        {"peak_ms": 5000, "score": 1.0, "kind": "point", "span_ms": None,
+                         "events": events, "primary": primary, "density": 0.5, "shape": "center"})
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": out_ms + 4000}, [cut])
+    return tree["moments"][0]
+
+
+def test_piece_breakdown_none_for_single_event_moment():
+    cut = _salience_cut("f:pk", 1000, 4000, {"peak_ms": 2500, "score": 0.9})
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    m = tree["moments"][0]
+    assert fm.piece_breakdown(m) is None
+    assert fm._piece_lines(m) == []
+    assert fm.resolve_piece(m, 1) is None
+    print("ok  test_piece_breakdown_none_for_single_event_moment")
+
+
+def test_piece_breakdown_shape_for_three_separated_events():
+    m = _cluster_moment()
+    b = fm.piece_breakdown(m)
+    assert b["broad_s"] == 10.0, b
+    assert b["tight_count"] == 3, b
+    assert b["tight_avg_s"] == 0.8, b
+    assert [p["pos"] for p in b["pieces"]] == [1, 2, 3], b
+    assert all(p["of"] == 3 for p in b["pieces"]), b
+    assert [p["strength"] for p in b["pieces"]] == ["moderate", "strongest", "weak"], b
+    assert [p["dur_s"] for p in b["pieces"]] == [0.8, 0.9, 0.7], b
+    assert all(p["kind"] == "point" for p in b["pieces"]), b
+    print("ok  test_piece_breakdown_shape_for_three_separated_events")
+
+
+def test_moment_line_multi_event_cluster_is_multiline_and_generic():
+    m = _cluster_moment()
+    line = fm._moment_line(m)
+    assert "\n" in line, line
+    assert "range: whole ~10.0s, or up to 3 tight pieces (~0.8s each)" in line, line
+    assert "1/3 moderate 0.8s point" in line, line
+    assert "2/3 strongest 0.9s point" in line, line
+    assert "3/3 weak 0.7s point" in line, line
+    # Generic/no-domain-words requirement (plan Part B): no speaker/action
+    # vocabulary leaks into the piece rows.
+    for banned in ("speaker", "action", "beat", "highlight"):
+        assert banned not in line.lower(), line
+    print("ok  test_moment_line_multi_event_cluster_is_multiline_and_generic")
+
+
+def test_resolve_piece_addresses_each_separated_event():
+    m = _cluster_moment()
+    assert fm.resolve_piece(m, 1) == (700, 1500)
+    assert fm.resolve_piece(m, 2) == (4700, 5500)
+    assert fm.resolve_piece(m, 3) == (8700, 9500)
+    print("ok  test_resolve_piece_addresses_each_separated_event")
+
+
+def test_resolve_piece_out_of_range_is_none():
+    m = _cluster_moment()
+    assert fm.resolve_piece(m, 0) is None
+    assert fm.resolve_piece(m, 4) is None
+    print("ok  test_resolve_piece_out_of_range_is_none")
+
+
+def test_resolve_piece_merged_events_share_one_span():
+    # Two events only 300ms apart -- even at energy=1.0 their tight windows
+    # (peak-300..peak+500) still overlap, so resolve_cluster fuses them into
+    # ONE piece. Both piece positions must resolve to that SAME merged span,
+    # not a naive (and wrong) per-event slice.
+    events = [
+        {"peak_ms": 5000, "score": 0.7, "kind": "point", "onset_ms": 4700, "settle_ms": 5300, "span_ms": None},
+        {"peak_ms": 5300, "score": 0.9, "kind": "point", "onset_ms": 5000, "settle_ms": 5600, "span_ms": None},
+    ]
+    m = _cluster_moment(hero_id="f:mg", in_ms=4000, out_ms=6000, events=events, primary=1)
+    merged = (4700, 5800)
+    assert fm.resolve_piece(m, 1) == merged
+    assert fm.resolve_piece(m, 2) == merged
+    print("ok  test_resolve_piece_merged_events_share_one_span")
+
+
 def main():
     test_thought_levels_become_variants()
     test_moment_line_flags_offcamera()
@@ -714,6 +808,12 @@ def main():
     test_snap_keeps_a_mostly_present_head_sentence()
     test_snap_drops_a_dangling_tail_sentence()
     test_snap_is_noop_without_transcript()
+    test_piece_breakdown_none_for_single_event_moment()
+    test_piece_breakdown_shape_for_three_separated_events()
+    test_moment_line_multi_event_cluster_is_multiline_and_generic()
+    test_resolve_piece_addresses_each_separated_event()
+    test_resolve_piece_out_of_range_is_none()
+    test_resolve_piece_merged_events_share_one_span()
     print("\nall footage-map tests passed")
 
 

@@ -34,6 +34,7 @@ from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import get_settings
+from app.services.l3 import cutrecord_map
 from app.services.l3.energy import default_energy_for
 
 logger = logging.getLogger(__name__)
@@ -560,6 +561,85 @@ def _framing_tag(m: Dict[str, Any]) -> str:
     return ""
 
 
+def piece_breakdown(m: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Structural, generic per-piece breakdown for a multi-event cluster
+    (v4_cluster_read_act.plan.md Part B): the cluster's broad<->punchy range,
+    then each event's position/relative salience/duration/kind -- enough for
+    the brain to pick "the strongest piece" or "the last beat" positionally,
+    with zero domain words. None for a single-event moment (the common case,
+    untouched). Shared by _piece_lines (the Beat Index's text rendering) and
+    observe.read_state (the same facts, structured, for a per-cut deep look)
+    so the two always agree."""
+    sal = m.get("salience") or {}
+    events = sal.get("events") or []
+    if len(events) <= 1:
+        return None
+    in_ms, out_ms = int(m.get("in_ms", 0)), int(m.get("out_ms", 0))
+    broad_s = max(0, out_ms - in_ms) / 1000.0
+    pieces, _removed = cutrecord_map.resolve_cluster(events, in_ms, out_ms, 1.0)
+    tight_s = (sum(b - a for a, b in pieces) / len(pieces) / 1000.0) if pieces else 0.0
+
+    ordered = sorted(range(len(events)), key=lambda i: events[i].get("peak_ms", 0))
+    primary_i = sal.get("primary")
+    hi = max((events[i].get("score", 0.0) for i in ordered), default=0.0)
+    piece_list = []
+    for pos, i in enumerate(ordered, start=1):
+        ev = events[i]
+        dur_ms = max(0, int(ev.get("settle_ms", 0)) - int(ev.get("onset_ms", 0)))
+        if i == primary_i:
+            strength = "strongest"
+        else:
+            rel = (ev.get("score", 0.0) / hi) if hi > 0 else 0.0
+            strength = "moderate" if rel >= 0.5 else "weak"
+        piece_list.append({"pos": pos, "of": len(ordered), "strength": strength,
+                           "dur_s": round(dur_ms / 1000.0, 1), "kind": ev.get("kind") or "point"})
+    return {"broad_s": round(broad_s, 1), "tight_count": len(pieces),
+           "tight_avg_s": round(tight_s, 1), "pieces": piece_list}
+
+
+def _piece_lines(m: Dict[str, Any]) -> List[str]:
+    """Text rendering of piece_breakdown for the Beat Index -- see there for
+    the shared facts. [] for a single-event moment."""
+    b = piece_breakdown(m)
+    if b is None:
+        return []
+    lines = [f"    range: whole ~{b['broad_s']:.1f}s, or up to {b['tight_count']} "
+             f"tight pieces (~{b['tight_avg_s']:.1f}s each)"]
+    for p in b["pieces"]:
+        lines.append(f"    {p['pos']}/{p['of']} {p['strength']} {p['dur_s']:.1f}s {p['kind']}")
+    return lines
+
+
+def resolve_piece(m: Dict[str, Any], piece: int) -> Optional[Tuple[int, int]]:
+    """A single piece's own resolved span (v4_cluster_read_act.plan.md Part C):
+    the brain addresses a piece by the same 1-based position it was shown in
+    the Beat Index / read_state (``piece_breakdown``'s ``pos``) -- resolve that
+    back to its event, then to whichever ``resolve_cluster`` piece at
+    energy=1.0 (the tightest split) CONTAINS that event's own peak. Two events
+    can still be too close to separate even at max energy, in which case both
+    resolve to their shared merged span -- never a fabricated, impossibly
+    narrow one. None for a single-event moment, an out-of-range piece, or the
+    (shouldn't-happen) case where no resolved piece contains the peak."""
+    sal = m.get("salience") or {}
+    events = sal.get("events") or []
+    if len(events) <= 1:
+        return None
+    try:
+        pos = int(piece)
+    except (TypeError, ValueError):
+        return None
+    ordered = sorted(range(len(events)), key=lambda i: events[i].get("peak_ms", 0))
+    if pos < 1 or pos > len(ordered):
+        return None
+    peak = int(events[ordered[pos - 1]].get("peak_ms", 0))
+    in_ms, out_ms = int(m.get("in_ms", 0)), int(m.get("out_ms", 0))
+    pieces, _removed = cutrecord_map.resolve_cluster(events, in_ms, out_ms, 1.0)
+    for a, b in pieces:
+        if a <= peak <= b:
+            return (a, b)
+    return None
+
+
 def _peak_tag(m: Dict[str, Any]) -> str:
     """`peak:+X.Xs` -- this cut's single strongest INSTANT (post._salience,
     code-computed), as an offset from the cut's own start; use it for
@@ -813,10 +893,12 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     # is entirely the brain's call and switching angles never jumps the audio.
     outlook_tag = f" outlook:{m['outlook_angle_count']}-angles" if m.get("outlook_angle_count") else ""
     alt = _alt_pic_segment(m)
-    return (f"  {m['moment_id'].split(':')[-1]} {_capture_tag(m)} {pic} {snd} "
+    line = (f"  {m['moment_id'].split(':')[-1]} {_capture_tag(m)} {pic} {snd} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])} {_dur_tag(m)}] "
             f"\"{primary}\"{vis_tag}{gloss}{scr_tag} · "
             f"nrg:{nrg}{aud_tag}{pace_tag}{cam_tag}{peak_tag}{outlook_tag}{cut_tag}{run}{alt}")
+    piece_lines = _piece_lines(m)
+    return "\n".join([line] + piece_lines) if piece_lines else line
 
 
 def _clip_block(tree: Dict[str, Any], *, compact: bool = False) -> str:

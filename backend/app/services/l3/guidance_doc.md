@@ -73,6 +73,9 @@ purpose guide what to keep. Read the purpose from the user's ask and the
 material; when it's unclear and the selection hinges on it, ask rather than
 assume.
 
+A moment may hold several beats — take it whole or take its key beat(s),
+guided by your length budget and the video's purpose.
+
 ## Podcast / multicam (worked example — uses both principles)
 Conversation filmed from several fixed angles. The alternate angles of one
 speaker are outlooks (principle 2), and the transcript drives who to show

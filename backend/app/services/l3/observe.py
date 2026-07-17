@@ -444,6 +444,13 @@ def read_state(document: dict, ctx: EditContext, *, seg_id: Optional[str] = None
             if seg.get("speed") is not None:
                 cut["speed"] = seg.get("speed")
                 cut["speed_note"] = "recorded; not yet applied to the export length"
+        # v4_cluster_read_act.plan.md Part B.3.2: a multi-event cluster's
+        # piece breakdown, mirroring the Beat Index's own (footage_map.
+        # piece_breakdown) so a deep look agrees with what the brain already
+        # saw up front. None (key omitted) for a single-event cut.
+        pieces = footage_map.piece_breakdown(meta)
+        if pieces is not None:
+            cut["pieces"] = pieces
         cuts.append(cut)
         prog += dur
 
