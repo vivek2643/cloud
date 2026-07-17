@@ -57,8 +57,10 @@ class EditContext:
     dup_groups: List[dict] = field(default_factory=list)
     # L1 audio_features (audio_brain.plan.md) for THIS turn's file_ids -- loudness,
     # musicality, bpm, onsets. file_id -> {integrated_lufs, is_musical, bpm,
-    # onsets_ms, silence_intervals} (missing entry -> that file has no L1 audio
-    # analysis yet; callers treat that as "no fact", never an error).
+    # onsets_ms, silence_intervals, sections, drop_ms} (missing entry -> that
+    # file has no L1 audio analysis yet; callers treat that as "no fact",
+    # never an error). sections/drop_ms (audio_and_audit.plan.md Phase 4) are
+    # optional even for a musical source -- omitted/None when undetected.
     audio_features: Dict[str, dict] = field(default_factory=dict)
     # This user's uploaded audio-type files available to place as a bed --
     # NOT limited to file_ids (an uploaded music/SFX file may never have been
@@ -152,13 +154,15 @@ def _fetch_audio_features(file_ids: List[str]) -> Dict[str, dict]:
     with _pg_conn() as conn:
         rows = conn.execute(
             """
-            select file_id::text, integrated_lufs, is_musical, bpm, onsets_ms
+            select file_id::text, integrated_lufs, is_musical, bpm, onsets_ms,
+                   sections, drop_ms
               from audio_features where file_id = any(%s::uuid[])
             """,
             (file_ids,),
         ).fetchall()
     return {
-        r[0]: {"integrated_lufs": r[1], "is_musical": r[2], "bpm": r[3], "onsets_ms": r[4]}
+        r[0]: {"integrated_lufs": r[1], "is_musical": r[2], "bpm": r[3], "onsets_ms": r[4],
+              "sections": r[5], "drop_ms": r[6]}
         for r in rows
     }
 
@@ -332,6 +336,18 @@ def _fid8(s: str) -> str:
     return (s or "")[:8]
 
 
+def _unused_audio_assets(document: dict, ctx: EditContext) -> List[dict]:
+    """This user's uploaded audio-type files not already placed as a bed in
+    THIS document (audio_and_audit.plan.md Phase 2 "candidate beds vs junk")
+    -- each already carries `is_musical`/`bpm` (a fact, `None` = not yet
+    analyzed, never a guess), so the brain can tell a usable bed from
+    silence/noise without a prose hint. Shared by `audio_state` (the full
+    digest) and `read_state` (so it's visible from a plain look too)."""
+    used = {o.get("source_file_id") for o in (document.get("operations") or [])
+           if o.get("type") == "place_audio"}
+    return [a for a in ctx.audio_assets if a["file_id"] not in used]
+
+
 def _word_offsets_for_seg(seg: dict, prog_start_ms: int) -> List[Dict[str, Any]]:
     """Word-level program-time offsets for ONE timeline segment (edso_pacing_
     audit_timing.plan.md item 3) -- reuses captions/timing.py's linear
@@ -498,16 +514,42 @@ def read_state(document: dict, ctx: EditContext, *, seg_id: Optional[str] = None
         ]
         if coverage:
             state["video_stack"] = coverage
-        extra_audio = [
-            {"layer_id": a.layer_id, "op_id": a.op_id, "role": a.role, "kind": a.kind,
-             "prog_start_ms": a.prog_start_ms, "prog_end_ms": a.prog_end_ms,
-             "gain_db": a.gain_db, "duck_db": a.duck_db}
-            for a in resolved.audio_layers if a.kind != "spine"
-        ]
+        extra_audio = []
+        for a in resolved.audio_layers:
+            if a.kind == "spine":
+                continue
+            entry = {"layer_id": a.layer_id, "op_id": a.op_id, "role": a.role, "kind": a.kind,
+                     "prog_start_ms": a.prog_start_ms, "prog_end_ms": a.prog_end_ms,
+                     "gain_db": a.gain_db, "duck_db": a.duck_db}
+            # Phase 2 "per-layer loudness": this layer's OWN source LUFS (a
+            # fact, never auto-normalized) alongside its gain/duck, so the
+            # brain can balance for constant loudness instead of balancing
+            # blind (guidance §5 "keep it level").
+            af = ctx.audio_features.get(a.source_file_id)
+            if af and af.get("integrated_lufs") is not None:
+                entry["loudness_lufs"] = af["integrated_lufs"]
+            extra_audio.append(entry)
         if extra_audio:
             state["audio_layers"] = extra_audio
+        # Phase 2 "audio gaps": stretches of the program with NO audible
+        # audio layer at all -- the "sound randomly missing in the middle"
+        # case, as data rather than a guess.
+        gaps = layers.audio_gaps(resolved)
+        if gaps:
+            state["audio_gaps"] = [{"from_ms": a, "to_ms": b} for a, b in gaps]
     except Exception:
         logger.exception("read_state: layer resolve failed (continuing without the z-stack)")
+
+    # Phase 2 "candidate beds vs junk": this user's unused audio assets,
+    # already carrying is_musical/bpm, visible from a plain read_state look
+    # (not just a separate audio_state call).
+    candidates = _unused_audio_assets(document, ctx)
+    if candidates:
+        state["audio_candidates"] = [
+            {"file": _fid8(a["file_id"]), "name": a["name"], "dur_ms": a["dur_ms"],
+             "is_musical": a["is_musical"], "bpm": a["bpm"]}
+            for a in candidates
+        ]
 
     if seg_id:
         seg = next((s for s in timeline if s.get("seg_id") == seg_id), None)
@@ -538,12 +580,10 @@ def audio_state(document: dict, ctx: EditContext) -> dict:
     dur_by_file = {a["file_id"]: a["dur_ms"] for a in ctx.audio_assets}
 
     beds = []
-    used_source_ids = set()
     for o in ops:
         if o.get("type") != "place_audio":
             continue
         src = o.get("source_file_id")
-        used_source_ids.add(src)
         window_ms = int(o.get("to_ms", 0)) - int(o.get("from_ms", 0))
         # `ctx.durations` only covers this turn's file_ids (video sources); an
         # uploaded audio-only asset's length lives in `ctx.audio_assets`.
@@ -603,13 +643,38 @@ def audio_state(document: dict, ctx: EditContext) -> dict:
     out = {
         "beds": beds,
         "continuous_beds": continuous_beds,
-        "assets": [a for a in ctx.audio_assets if a["file_id"] not in used_source_ids],
+        "assets": _unused_audio_assets(document, ctx),
         "channels": channels,
     }
     grid = _beat_grid(document, ctx)
     if grid:
         out["beat_grid"] = grid
     return out
+
+
+def _grid_entry(source_id: Optional[str], af: dict, prog_anchor: int,
+                src_in: int, window_ms: int) -> dict:
+    """One beat-grid entry: onsets, plus -- when the source's L1 analysis
+    detected them (Phase 4, optional) -- coarse sections/the drop, ALL mapped
+    from this source's OWN time into PROGRAM time and clipped to the window
+    it's actually playing (audio_brain.plan.md 2b). A source with no
+    sections/drop_ms just omits those keys -- never a fabricated one."""
+    src_hi = src_in + window_ms
+    onsets = [prog_anchor + (int(ms) - src_in) for ms in (af.get("onsets_ms") or [])
+             if src_in <= int(ms) < src_hi]
+    entry = {"source": source_id, "bpm": af.get("bpm"),
+            "from_ms": prog_anchor, "to_ms": prog_anchor + window_ms, "onsets_ms": onsets}
+    sections = []
+    for sec in af.get("sections") or []:
+        s, e = max(int(sec.get("start_ms", 0)), src_in), min(int(sec.get("end_ms", 0)), src_hi)
+        if e > s:
+            sections.append({"from_ms": prog_anchor + (s - src_in), "to_ms": prog_anchor + (e - src_in)})
+    if sections:
+        entry["sections"] = sections
+    drop = af.get("drop_ms")
+    if drop is not None and src_in <= int(drop) < src_hi:
+        entry["drop_ms"] = prog_anchor + (int(drop) - src_in)
+    return entry
 
 
 def _beat_grid(document: dict, ctx: EditContext) -> List[dict]:
@@ -624,23 +689,15 @@ def _beat_grid(document: dict, ctx: EditContext) -> List[dict]:
         af = ctx.audio_features.get(o.get("source_file_id") or "")
         if not af or not af.get("is_musical"):
             continue
-        src_in = int(o.get("src_in_ms", 0))
         f, t = int(o.get("from_ms", 0)), int(o.get("to_ms", 0))
-        onsets = [f + (int(ms) - src_in) for ms in (af.get("onsets_ms") or [])
-                 if src_in <= int(ms) < src_in + (t - f)]
-        grid.append({"source": o.get("op_id"), "bpm": af.get("bpm"),
-                     "from_ms": f, "to_ms": t, "onsets_ms": onsets})
+        grid.append(_grid_entry(o.get("op_id"), af, f, int(o.get("src_in_ms", 0)), t - f))
 
     prog = 0
     for seg in document.get("timeline") or []:
         dur = int(seg.get("out_ms", 0)) - int(seg.get("in_ms", 0))
         af = ctx.audio_features.get(seg.get("file_id") or "")
         if af and af.get("is_musical"):
-            src_in = int(seg.get("in_ms", 0))
-            onsets = [prog + (int(ms) - src_in) for ms in (af.get("onsets_ms") or [])
-                     if src_in <= int(ms) < src_in + dur]
-            grid.append({"source": seg.get("seg_id"), "bpm": af.get("bpm"),
-                        "from_ms": prog, "to_ms": prog + dur, "onsets_ms": onsets})
+            grid.append(_grid_entry(seg.get("seg_id"), af, prog, int(seg.get("in_ms", 0)), dur))
         prog += dur
     return grid
 
@@ -973,6 +1030,46 @@ def _overlap_ms(a0: int, a1: int, b0: int, b1: int) -> int:
     return max(0, min(a1, b1) - max(a0, b0))
 
 
+# A gap this short is a seam/rounding artifact, not a hole worth naming.
+_AUDIO_GAP_FLAG_MIN_MS = 500
+# A layer's own loudness this far off the program's median reads as an
+# imbalance -- "keep it level" (guidance §5) becomes checkable, not just advised.
+_LOUDNESS_IMBALANCE_LUFS = 6.0
+
+
+def _audio_gap_flags(resolved: "layers.ResolvedTimeline") -> List[dict]:
+    """A stretch of the program with NO audible audio layer covering it
+    (audio_and_audit.plan.md Phase 5 Stage 3, reusing Phase 2's
+    `layers.audio_gaps`) -- the 'sound randomly missing in the middle' case,
+    as data rather than a guess."""
+    return [
+        {"severity": "info", "anchor": f"{a / 1000:.1f}s-{b / 1000:.1f}s",
+         "message": f"~{(b - a) / 1000:.1f}s with no audio at all"}
+        for a, b in layers.audio_gaps(resolved) if b - a >= _AUDIO_GAP_FLAG_MIN_MS
+    ]
+
+
+def _loudness_imbalance_flags(resolved: "layers.ResolvedTimeline",
+                              audio_features: Dict[str, dict]) -> List[dict]:
+    """A layer whose own source loudness (+ its current gain) sits well off
+    the program's median -- fewer than 2 layers with a known LUFS fact means
+    nothing to compare, never a guess from an unmeasured source."""
+    levels: List[Tuple[Any, float]] = []
+    for a in resolved.audio_layers:
+        af = audio_features.get(a.source_file_id)
+        if af and af.get("integrated_lufs") is not None and a.gain_db > -60:
+            levels.append((a, float(af["integrated_lufs"]) + a.gain_db))
+    if len(levels) < 2:
+        return []
+    values = sorted(v for _, v in levels)
+    median = values[len(values) // 2]
+    return [
+        {"severity": "info", "anchor": f"{a.prog_start_ms / 1000:.1f}s-{a.prog_end_ms / 1000:.1f}s",
+         "message": f"loudness {v - median:+.1f}dB off the program's median -- may read as uneven"}
+        for a, v in levels if abs(v - median) >= _LOUDNESS_IMBALANCE_LUFS
+    ]
+
+
 def _tag_category(findings: List[dict], category: str) -> List[dict]:
     for f in findings:
         f["category"] = category
@@ -1033,9 +1130,12 @@ def review(document: dict, ctx: EditContext, *, user_ask: str = "") -> dict:
     checked in order against (1) the ask/contract -- a `user_ask`-named
     feature (split screen, a music bed) missing from the edit, `category`
     "ask" -- then (2) the guidance ceilings -- rough heads/tails, overlay
-    fit, `category` "guidance". NEVER a prescribed fix ("trim to +Xms"); the
-    brain decides what, if anything, to do. `user_ask` defaults to '' (no
-    ask-level check) so a direct `review` tool call still works without it."""
+    fit, `category` "guidance" -- then (3) deterministic craft sharpeners --
+    an audio gap (a stretch with no audible layer at all) or a layer whose
+    loudness sits well off the program's median, `category` "craft". NEVER a
+    prescribed fix ("trim to +Xms"); the brain decides what, if anything, to
+    do. `user_ask` defaults to '' (no ask-level check) so a direct `review`
+    tool call still works without it."""
     timeline = document.get("timeline") or []
     items: List[Dict[str, Any]] = []
     flags: List[dict] = list(_requested_feature_flags(document, user_ask))
@@ -1070,8 +1170,10 @@ def review(document: dict, ctx: EditContext, *, user_ask: str = "") -> dict:
     try:
         resolved = layers.resolve(document, ctx.durations)
         flags.extend(_tag_category(_overlay_fit_flags(resolved), "guidance"))
+        flags.extend(_tag_category(_audio_gap_flags(resolved), "craft"))
+        flags.extend(_tag_category(_loudness_imbalance_flags(resolved, ctx.audio_features), "craft"))
     except Exception:
-        logger.exception("review: overlay-fit flags failed (continuing without them)")
+        logger.exception("review: overlay-fit/audio flags failed (continuing without them)")
 
     target_s = (document.get("brief") or {}).get("target_duration_s")
     return {

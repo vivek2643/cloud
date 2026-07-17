@@ -83,6 +83,36 @@ listed beat stays reachable individually even if tightening would have dropped
 it — the Beat Index marks which beats are core (survive tightening) and which
 drop early, so you can sharpen for punch or pick out one beat deliberately.
 
+## 5. Working with music
+When a musical bed is in play the beat grid (bpm + onset positions in program
+time) is yours to build against — it appears only when a musical source exists,
+so where there's no music you don't try to snap to it. Music is a free
+instrument, not a fixed track:
+
+- Choose and combine. There may be several audio options, and not all are usable
+  — pick the ones that fit the piece, ignore the junk, and combine more than one
+  when it serves (a bed plus a one-shot accent, or a hand-off between two beds).
+  Don't feel bound to a single track.
+- Place it where it serves. A bed can sit under one stretch or several, and the
+  same asset can be dropped more than once — place it again to carry a longer
+  run, or repeat a short loop back-to-back to fill a gap.
+- Shift it so it lands. Music has strong moments (a drop, a hook, a downbeat);
+  slide the bed so one of those falls on the moment that matters most — the
+  climax, the reveal, the punchline — instead of leaving it wherever it started.
+- Cut to it. When music drives the pace, let cuts land on the beat; how dense
+  (a cut every beat, every bar, or a shot held across a phrase) is your choice,
+  read from the energy and the purpose of the piece.
+- Keep it level and under the story. Balance the gains so loudness stays steady
+  across the whole piece — no section jumping out or dropping away — and duck
+  the bed under speech so the words stay clear. Fade or crossfade at its edges so
+  it enters and leaves cleanly rather than snapping on and off.
+- Silence is a tool too — dropping the music out for a beat can hit harder than
+  another swell.
+
+Don't hand-compute the milliseconds. Beat-snap where it's offered and the
+fit-to-window loop (§3) land things on the grid exactly; you decide which beat
+and which moment, they handle the frames.
+
 ## Podcast / multicam (worked example — uses both principles)
 Conversation filmed from several fixed angles. The alternate angles of one
 speaker are outlooks (principle 2), and the transcript drives who to show

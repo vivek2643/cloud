@@ -151,13 +151,22 @@ _LOOP_SYSTEM = (
     "extremely careful when you do. Your senses (read_state, predict, validate, "
     "diagnose, affordances, audio_state, review) and edit verbs are described in "
     "the tools; call them as you need."
-    "\n\nFINISHING. When you stop editing you'll get one AUTOMATIC CHECK of the edit "
-    "against the contract. Never finish with STRUCTURAL problems -- fix them. If "
-    "you're over a target length, either trim to it or say in one line why the "
-    "current length is right. Before finishing you'll see the assembled program "
-    "checked against your ask first (did a feature you named -- a split screen, a "
-    "bed -- actually land) and then the guidance; act on what serves the ask or "
-    "finish. The rest (speaker runs, low-energy stretches, redundant takes) is "
+    "\n\nFINISHING. When you stop editing you'll get AUTOMATIC CHECKS of the edit, "
+    "in order. Never finish with STRUCTURAL problems -- fix them. If you're over a "
+    "target length, either trim to it or say in one line why the current length is "
+    "right. Then, in order:\n"
+    "(1) FIT TO INTENT -- did a feature you named (a split screen, a bed) actually "
+    "land; act on what serves the ask or finish.\n"
+    "(2) FIT TO CRAFT -- forget the ask entirely and judge the result the way you'd "
+    "judge any finished video handed to you cold: does it look and sound like a "
+    "real, high-quality piece of work? Fix what falls short. If you finish anyway "
+    "with a known flaw, you must name -- in ONE line -- which of exactly two "
+    "reasons applies: the user's ask required it, or the material can't support "
+    "better. No other reason ('looks fine anyway') is enough to let it pass; that's "
+    "rubber-stamping. Equally, don't invent a fix the material can't support just "
+    "to avoid saying (b) -- naming the ceiling honestly is the point.\n"
+    "(3) SPECIFIC FLAGS -- the rest (speaker runs, low-energy stretches, redundant "
+    "takes, rough heads/tails, overlay fit, audio gaps, loudness balance) is "
     "advisory -- act on what serves the goal, ignore the rest."
 )
 
@@ -284,7 +293,8 @@ def _context_block(file_ids: List[str], document: Optional[dict],
         # Program Map (edso_pacing_audit_timing.plan.md item 2): the ASSEMBLED
         # edit as two small, time-aligned tables built from the fully-resolved
         # layer stack -- pure/cheap, so always-on like everything else here.
-        pm_text = arrange.render_program_map(document, durations=ctx.durations)
+        pm_text = arrange.render_program_map(document, durations=ctx.durations,
+                                             audio_features=ctx.audio_features)
     except Exception:
         logger.exception("converse: program map render failed (continuing without it)")
         pm_text = ""

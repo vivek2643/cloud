@@ -718,6 +718,48 @@ def resolve(
     )
 
 
+# A layer at/below this gain reads as effectively silent (the spine's own
+# explicit mute sentinel is -120.0; duck alone -- typically -12..-20dB --
+# never drops a layer this low, so a merely-ducked-but-audible bed is never
+# mistaken for a gap).
+_SILENT_GAIN_DB = -60.0
+
+
+def audio_gaps(resolved: "ResolvedTimeline", *, silent_db: float = _SILENT_GAIN_DB) -> List[Tuple[int, int]]:
+    """Stretches of the program with NO audible audio layer covering them
+    (audio_and_audit.plan.md Phase 2) -- the 'sound randomly missing in the
+    middle' case, as data rather than a guess.
+
+    Every video source gets a spine dialogue AudioLayer by construction (even
+    when muted, at gain_db=-120), so 'no audio' isn't 'no layer object' --
+    it's every covering layer sitting at/below `silent_db`. Returns
+    ``[(from_ms, to_ms), ...]`` in program order; [] when audio covers the
+    whole program (or there's no program yet)."""
+    total = resolved.duration_ms
+    if total <= 0:
+        return []
+    audible = sorted(
+        (a.prog_start_ms, a.prog_end_ms)
+        for a in resolved.audio_layers
+        if a.gain_db > silent_db and a.prog_end_ms > a.prog_start_ms
+    )
+    merged: List[List[int]] = []
+    for s, e in audible:
+        if merged and s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    gaps: List[Tuple[int, int]] = []
+    cur = 0
+    for s, e in merged:
+        if s > cur:
+            gaps.append((cur, s))
+        cur = max(cur, e)
+    if cur < total:
+        gaps.append((cur, total))
+    return gaps
+
+
 def _overlaps(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
     return a_start < b_end and a_end > b_start
 

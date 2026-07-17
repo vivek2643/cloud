@@ -768,6 +768,25 @@ def test_program_map_renders_video_and_audio_tables_with_stacking():
     print("ok  Program Map renders VIDEO+AUDIO tables with correct z/layout/program window")
 
 
+def test_program_map_shows_per_layer_loudness_and_audio_gaps():
+    """audio_and_audit.plan.md Phase 2: each AUDIO row shows its own source
+    LUFS when known, and a trailing GAPS line names any stretch with no
+    audible layer at all (a muted seg between two audible ones)."""
+    doc = {
+        "timeline": [
+            {"seg_id": "s0", "file_id": "ffffffff-1111", "in_ms": 0, "out_ms": 2000},
+            {"seg_id": "s1", "file_id": "ffffffff-1111", "in_ms": 2000, "out_ms": 4000, "mute": True},
+            {"seg_id": "s2", "file_id": "ffffffff-1111", "in_ms": 4000, "out_ms": 6000},
+        ],
+        "operations": [],
+    }
+    text = arrange.render_program_map(
+        doc, audio_features={"ffffffff-1111": {"integrated_lufs": -18.3}})
+    assert "lufs:-18.3" in text, text
+    assert "GAPS (no audio): 0:02-0:04" in text, text
+    print("ok  Program Map shows per-layer loudness and a GAPS line")
+
+
 def test_program_map_empty_document_is_empty_string():
     assert arrange.render_program_map(None) == ""
     assert arrange.render_program_map({"timeline": [], "operations": []}) == ""
@@ -792,6 +811,83 @@ def test_read_state_omits_z_stack_keys_when_theres_no_coverage():
     st = observe.read_state(doc, _ctx(struct))
     assert "video_stack" not in st and "audio_layers" not in st, st
     print("ok  read_state omits the z-stack keys when there's no coverage")
+
+
+def test_read_state_shows_loudness_gaps_and_candidates():
+    """audio_and_audit.plan.md Phase 2: read_state ALONE (no separate
+    audio_state call) surfaces a bed's own loudness, a mid-program silence
+    hole (a muted seg between two audible ones), and this user's unused
+    audio assets (each with is_musical/bpm)."""
+    struct = _map()
+    doc = {
+        "timeline": [
+            {"seg_id": "s0", "file_id": "ffffffff-1111", "in_ms": 0, "out_ms": 2000},
+            {"seg_id": "s1", "file_id": "ffffffff-1111", "in_ms": 2000, "out_ms": 4000, "mute": True},
+            {"seg_id": "s2", "file_id": "ffffffff-1111", "in_ms": 4000, "out_ms": 6000},
+        ],
+        "operations": [
+            {"op_id": "pa1", "type": "place_audio", "role": "music",
+             "source_file_id": "bed1", "src_in_ms": 0, "src_out_ms": 1000,
+             "from_ms": 0, "to_ms": 1000, "gain_db": 0.0, "duck_db": 0.0},
+        ],
+    }
+    ctx = observe.EditContext(
+        file_ids=["ffffffff-1111"], index=_MapIndex(struct), map_struct=struct,
+        durations={"ffffffff-1111": 8000}, dup_groups=[],
+        audio_features={"bed1": {"integrated_lufs": -14.0}},
+        audio_assets=[{"file_id": "unused1", "name": "song.mp3", "dur_ms": 30000,
+                       "is_musical": True, "bpm": 120.0}],
+    )
+    st = observe.read_state(doc, ctx)
+    assert st["audio_layers"][0]["loudness_lufs"] == -14.0, st["audio_layers"]
+    assert st["audio_gaps"] == [{"from_ms": 2000, "to_ms": 4000}], st.get("audio_gaps")
+    assert st["audio_candidates"][0]["name"] == "song.mp3", st.get("audio_candidates")
+    assert st["audio_candidates"][0]["is_musical"] is True, st["audio_candidates"]
+    print("ok  read_state surfaces per-layer loudness, audio gaps, and candidate beds")
+
+
+def test_beat_grid_maps_sections_and_drop_into_program_time():
+    """audio_and_audit.plan.md Phase 4: a musical bed's OPTIONAL sections/
+    drop_ms (when its L1 analysis detected them) map into PROGRAM time
+    alongside onsets_ms -- clipped to the window it's actually playing, and
+    simply omitted (never fabricated) when they fall outside it."""
+    struct = _map()
+    doc = {"timeline": [], "operations": [
+        {"op_id": "pa1", "type": "place_audio", "role": "music",
+         "source_file_id": "bed1", "src_in_ms": 0, "src_out_ms": 4000,
+         "from_ms": 1000, "to_ms": 5000},
+    ]}
+    ctx = observe.EditContext(
+        file_ids=["ffffffff-1111"], index=_MapIndex(struct), map_struct=struct,
+        durations={"ffffffff-1111": 8000}, dup_groups=[],
+        audio_features={"bed1": {"is_musical": True, "bpm": 120.0, "onsets_ms": [500],
+                                 "sections": [{"start_ms": 0, "end_ms": 2000},
+                                              {"start_ms": 2000, "end_ms": 4000}],
+                                 "drop_ms": 1500}})
+    grid = observe._beat_grid(doc, ctx)
+    assert len(grid) == 1, grid
+    entry = grid[0]
+    # source time -> program time is +1000ms (from_ms) throughout.
+    assert entry["sections"] == [{"from_ms": 1000, "to_ms": 3000},
+                                 {"from_ms": 3000, "to_ms": 5000}], entry
+    assert entry["drop_ms"] == 2500, entry
+    print("ok  beat_grid maps a bed's sections/drop into program time")
+
+
+def test_beat_grid_omits_sections_and_drop_when_undetected():
+    struct = _map()
+    doc = {"timeline": [], "operations": [
+        {"op_id": "pa1", "type": "place_audio", "role": "music",
+         "source_file_id": "bed1", "src_in_ms": 0, "src_out_ms": 4000,
+         "from_ms": 0, "to_ms": 4000},
+    ]}
+    ctx = observe.EditContext(
+        file_ids=["ffffffff-1111"], index=_MapIndex(struct), map_struct=struct,
+        durations={"ffffffff-1111": 8000}, dup_groups=[],
+        audio_features={"bed1": {"is_musical": True, "bpm": 120.0, "onsets_ms": [500]}})
+    entry = observe._beat_grid(doc, ctx)[0]
+    assert "sections" not in entry and "drop_ms" not in entry, entry
+    print("ok  beat_grid omits sections/drop_ms when the source's analysis never detected them")
 
 
 def test_read_state_seg_id_detail_gives_word_program_offsets():
@@ -898,6 +994,47 @@ def test_review_flags_an_underfilling_overlay():
     msgs = [f["message"] for f in out["flags"]]
     assert any("underfills" in m for m in msgs), msgs
     print("ok  review flags an overlay that underfills the beat it sits over")
+
+
+def test_review_flags_a_mid_program_audio_gap():
+    """audio_and_audit.plan.md Phase 5 Stage 3: a stretch with no audible
+    layer at all (a muted seg between two audible ones) surfaces as a
+    craft-category flag -- the 'sound randomly missing in the middle' case."""
+    doc = {"timeline": [
+        {"seg_id": "s0", "file_id": "ffffffff-1111", "in_ms": 0, "out_ms": 2000, "axis": "any"},
+        {"seg_id": "s1", "file_id": "ffffffff-1111", "in_ms": 2000, "out_ms": 4000,
+         "axis": "any", "mute": True},
+        {"seg_id": "s2", "file_id": "ffffffff-1111", "in_ms": 4000, "out_ms": 6000, "axis": "any"},
+    ], "operations": [], "brief": {}}
+    struct = _map()
+    out = observe.review(doc, _ctx(struct))
+    gap_flags = [f for f in out["flags"] if f.get("category") == "craft" and "no audio" in f["message"]]
+    assert len(gap_flags) == 1 and "2.0s" in gap_flags[0]["message"], out["flags"]
+    print("ok  review flags a mid-program audio gap (craft category)")
+
+
+def test_review_flags_a_loudness_imbalance():
+    """A layer whose own source loudness sits well off the program's median
+    is checkable, not just advised (guidance §5 'keep it level')."""
+    doc = {"timeline": [
+        {"seg_id": "s0", "file_id": "ffffffff-1111", "in_ms": 0, "out_ms": 2000, "axis": "any"},
+    ], "operations": [
+        {"op_id": "pa1", "type": "place_audio", "role": "music",
+         "source_file_id": "bed1", "src_in_ms": 0, "src_out_ms": 2000,
+         "from_ms": 0, "to_ms": 2000, "gain_db": 0.0, "duck_db": 0.0},
+    ], "brief": {}}
+    struct = _map()
+    ctx = observe.EditContext(
+        file_ids=["ffffffff-1111"], index=_MapIndex(struct), map_struct=struct,
+        durations={"ffffffff-1111": 8000}, dup_groups=[],
+        audio_features={"ffffffff-1111": {"integrated_lufs": -24.0},
+                        "bed1": {"integrated_lufs": -8.0}})
+    out = observe.review(doc, ctx)
+    imbalance_flags = [f for f in out["flags"] if f.get("category") == "craft" and "loudness" in f["message"]]
+    # median picks one of the two layers as the reference (0 deviation from
+    # itself); only the OTHER layer's real deviation from it can flag.
+    assert len(imbalance_flags) == 1 and "-16.0dB" in imbalance_flags[0]["message"], out["flags"]
+    print("ok  review flags a loudness imbalance across layers (craft category)")
 
 
 def test_offcam_speaker_flag_only_when_an_oncam_angle_exists():
@@ -1136,15 +1273,21 @@ def main():
     test_resolve_audio_override_wins_over_baked_coupling()
     test_resolve_same_source_baked_coupling_is_zero_offset()
     test_program_map_renders_video_and_audio_tables_with_stacking()
+    test_program_map_shows_per_layer_loudness_and_audio_gaps()
     test_program_map_empty_document_is_empty_string()
     test_read_state_reports_video_stack_and_audio_layers()
     test_read_state_omits_z_stack_keys_when_theres_no_coverage()
+    test_read_state_shows_loudness_gaps_and_candidates()
+    test_beat_grid_maps_sections_and_drop_into_program_time()
+    test_beat_grid_omits_sections_and_drop_when_undetected()
     test_read_state_seg_id_detail_gives_word_program_offsets()
     test_word_offsets_stay_correct_after_an_upstream_trim()
     test_review_flags_speaker_mismatch_filler_and_dead_air()
     test_review_played_text_reflects_the_excised_span_not_the_whole_cut()
     test_review_flags_an_overrunning_overlay()
     test_review_flags_an_underfilling_overlay()
+    test_review_flags_a_mid_program_audio_gap()
+    test_review_flags_a_loudness_imbalance()
     test_offcam_speaker_flag_only_when_an_oncam_angle_exists()
     test_review_wires_the_offcam_speaker_flag()
     test_review_flags_a_named_feature_missing_from_the_edit()

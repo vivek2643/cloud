@@ -68,7 +68,11 @@ def _specs() -> List[Dict[str, Any]]:
         S("read_state", "Returns the current edit: ordered cuts (pos, seg_id, ref, "
           "duration, channel, speaker, muted, text, and a plain-language grade summary "
           "when a cut has one), channels in use, total length, a feel narration, and "
-          "the z-stack (any V2/coverage layers + layout, beyond the main-line cuts). "
+          "the z-stack (any V2/coverage layers + layout, beyond the main-line cuts) -- "
+          "each audio layer beyond the main line also carries its own source loudness "
+          "(loudness_lufs) when known. Also audio_gaps (stretches with NO audible audio "
+          "layer at all) and audio_candidates (this user's unused audio files, each with "
+          "is_musical/bpm so you can tell usable music from junk) when either applies. "
           "Pass seg_id to ALSO resolve that one cut's spoken words down to program-time "
           "offsets -- e.g. to land an overlay precisely on a line; omit it for a plain look.",
           obj({"seg_id": {"type": "string"}})),
@@ -94,17 +98,24 @@ def _specs() -> List[Dict[str, Any]]:
         S("audio_state", "Returns the audio digest: placed beds (role, program "
           "window, gain/duck, and asset-vs-window length so a shortfall is "
           "visible), continuous outlook-authoritative runs (one shared audio "
-          "source across angle switches -- a fact, not a lock), and this user's "
-          "uploaded audio files not yet placed.", obj({})),
+          "source across angle switches -- a fact, not a lock), this user's "
+          "uploaded audio files not yet placed (each with is_musical/bpm to tell "
+          "usable music from junk), and -- when a musical source is in play -- the "
+          "beat_grid (bpm + onset positions in program time per source, plus "
+          "sections and drop_ms when detected: coarse phrase boundaries and the "
+          "single strongest musical moment, a prior worth checking, not a fact).",
+          obj({})),
         S("review", "Returns the ASSEMBLED program read back, per cut in order: "
           "played_text (the verbatim words actually spoken over that cut's PLAYED "
           "span, after any trim) and word-level program-time offsets, plus "
           "total/target length and `flags` -- presented facts (never a prescribed "
-          "fix), checked against your ask first (a feature you named -- split "
-          "screen, a music bed -- that isn't actually in the edit) then the "
+          "fix), checked in order against your ask first (a feature you named -- "
+          "split screen, a music bed -- that isn't actually in the edit), then the "
           "guidance (a rough head/tail -- wrong-speaker lead-in, filler/backchannel, "
           "leftover dead air -- or a V2 overlay that overruns/underfills the beat "
-          "it sits over). Call this to double-check what you actually built before "
+          "it sits over), then specific craft sharpeners (an audio gap with no "
+          "sound at all, or a layer whose loudness sits well off the program's "
+          "median). Call this to double-check what you actually built before "
           "finishing.", obj({})),
         # --- ACT (edit verbs; each mutates the working document) ---
         S("place", "Adds a cut by its ref. channel 'V1' inserts on the main line "
@@ -136,10 +147,15 @@ def _specs() -> List[Dict[str, Any]]:
           "to match). Shortens the cut by the removed source span -- but internal "
           "keep_spans (jump-cuts already excised) mean the exact resulting length "
           "isn't purely linear; read it back from read_state/the Program Map rather "
-          "than computing it.",
+          "than computing it. For a V2/A2 op only: snap:'beat' lands the RESULTING "
+          "program edge (trim only ever moves that op's own program END) on the "
+          "nearest beat/onset (audio_state's beat_grid) if a musical source is in play.",
           obj({"target_id": {"type": "string"},
                "in_ms": {"type": "integer"}, "out_ms": {"type": "integer"},
-               "delta_in_ms": {"type": "integer"}, "delta_out_ms": {"type": "integer"}},
+               "delta_in_ms": {"type": "integer"}, "delta_out_ms": {"type": "integer"},
+               "snap": {"type": "string", "enum": ["beat"],
+                        "description": "snaps the resulting program edge to the "
+                        "nearest beat/onset; op targets only (place_video/place_audio)"}},
               ["target_id"])),
         S("remove", "Removes a main-line cut (seg_id) or an operation (op_id) -- "
           "including a place_audio bed.",
@@ -195,9 +211,21 @@ def _specs() -> List[Dict[str, Any]]:
         S("move", "Reorders a main-line cut to a new 0-based index (to_index), OR "
           "repositions a placed op -- a V2 place_video or A2 place_audio -- to start "
           "at program time to_ms, keeping its duration. Give to_index for a seg_id, "
-          "to_ms for an op_id.",
+          "to_ms for an op_id. Shift-to-align (op_id only): instead of naming to_ms "
+          "directly, give align_onset_ms (a CURRENT onset of this op's own source, "
+          "e.g. audio_state's beat_grid or drop_ms, in this op's OWN program time) "
+          "and align_to_ms (the program moment it should land on, e.g. a beat you "
+          "chose for the climax) -- the op shifts by (align_to_ms - align_onset_ms), "
+          "keeping its own duration; combine with snap:'beat' to land the final "
+          "position exactly on the grid.",
           obj({"target_id": {"type": "string"}, "to_index": {"type": "integer"},
                "to_ms": {"type": "integer"},
+               "align_onset_ms": {"type": "integer",
+                                  "description": "a current onset of this op's own "
+                                  "source, in program time, to use as the anchor"},
+               "align_to_ms": {"type": "integer",
+                               "description": "the program moment align_onset_ms "
+                               "should land on"},
                "snap": {"type": "string", "enum": ["beat"],
                         "description": "snaps to_ms to the nearest beat/onset "
                         "(audio_state's beat_grid) if a musical source is in play"}},
@@ -325,6 +353,42 @@ def _beat_grid_ms(document: dict, ctx: EditContext) -> List[int]:
            for ms in entry.get("onsets_ms") or []]
 
 
+def _snap_trim_to_beat(doc: dict, ctx: EditContext, target_id: str,
+                       in_ms: Any, out_ms: Any, delta_in_ms: Any, delta_out_ms: Any):
+    """Beat-snap a `trim`'s resulting program-time edge for a placed OP (a V2
+    place_video cutaway or an A2 place_audio bed -- audio_and_audit.plan.md
+    Phase 3.1, mirroring move/place_audio's existing pattern, which only ever
+    snaps a placed op's program anchor). `trim` moves an op's SOURCE span;
+    since its program START (`from_ms`) never moves via trim, whichever
+    source edge the brain names, there is exactly one derived program-time
+    quantity to snap: the resulting program END. Returns (new_in_ms,
+    new_out_ms, snap_info) as ABSOLUTE edges once computed, or None when
+    there's no grid/target op/valid span to snap against -- the caller then
+    leaves the original args untouched and act.trim's own validation still
+    applies."""
+    grid = _beat_grid_ms(doc, ctx)
+    if not grid:
+        return None
+    op = next((o for o in doc.get("operations") or [] if o.get("op_id") == target_id
+              and o.get("type") in ("place_video", "place_audio")), None)
+    if op is None:
+        return None
+    cur_in, cur_out = int(op["src_in_ms"]), int(op["src_out_ms"])
+    anchor = int(op.get("from_ms", 0))
+    new_in = int(in_ms) if in_ms is not None else cur_in + int(delta_in_ms or 0)
+    new_out = int(out_ms) if out_ms is not None else cur_out + int(delta_out_ms or 0)
+    if new_out <= new_in:
+        return None
+    naive_end = anchor + (new_out - new_in)
+    snap = observe.snap_to_beats(grid, naive_end, max_move_ms=_SNAP_CAP_MS)
+    if not snap.get("snapped") or "suggested_ms" in snap:
+        return None
+    delta = int(snap["ms"]) - naive_end
+    if out_ms is not None or delta_out_ms is not None:
+        return new_in, new_out + delta, snap
+    return new_in - delta, new_out, snap
+
+
 def _normalize_questions(args: Dict[str, Any]) -> List[dict]:
     """Coerce the brain's ask_user payload into surfaced questions: each needs a
     prompt + >= 2 concrete options (bad ones dropped). `recommended`/`why`/
@@ -389,8 +453,16 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
                             audio=args.get("audio"), reason=args.get("reason", ""),
                             piece=args.get("piece"))
         elif name == "trim":
-            new = act.trim(doc, args["target_id"], in_ms=args.get("in_ms"), out_ms=args.get("out_ms"),
-                           delta_in_ms=args.get("delta_in_ms"), delta_out_ms=args.get("delta_out_ms"))
+            tr_in, tr_out = args.get("in_ms"), args.get("out_ms")
+            tr_din, tr_dout = args.get("delta_in_ms"), args.get("delta_out_ms")
+            if args.get("snap") == "beat":
+                snapped = _snap_trim_to_beat(doc, ctx, args["target_id"],
+                                             tr_in, tr_out, tr_din, tr_dout)
+                if snapped is not None:
+                    tr_in, tr_out, snap_info = snapped
+                    tr_din = tr_dout = None
+            new = act.trim(doc, args["target_id"], in_ms=tr_in, out_ms=tr_out,
+                           delta_in_ms=tr_din, delta_out_ms=tr_dout)
         elif name == "remove":
             new = act.remove(doc, args["target_id"])
         elif name == "place_audio":
@@ -429,6 +501,14 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
                                     src_in_ms=args["src_in_ms"], src_out_ms=args["src_out_ms"])
         elif name == "move":
             mv_to_ms = args.get("to_ms")
+            align_onset, align_to = args.get("align_onset_ms"), args.get("align_to_ms")
+            if align_onset is not None and align_to is not None:
+                op = next((o for o in doc.get("operations") or []
+                          if o.get("op_id") == args["target_id"]
+                          and o.get("type") in ("place_video", "place_audio")), None)
+                if op is not None:
+                    offset = int(align_to) - int(align_onset)
+                    mv_to_ms = int(op.get("from_ms", 0)) + offset
             if args.get("snap") == "beat" and mv_to_ms is not None:
                 grid = _beat_grid_ms(doc, ctx)
                 snap_info = observe.snap_to_beats(grid, mv_to_ms, max_move_ms=_SNAP_CAP_MS)
@@ -529,20 +609,30 @@ def _latest_user_text(messages: List[dict]) -> str:
 def _verify_before_finish(working: dict, ctx: EditContext,
                           state: Dict[str, Any], steps: List[str],
                           user_ask: str = "") -> str | None:
-    """The done-gate: when the brain tries to FINISH a turn that changed the edit,
-    check the result against the contract. Returns feedback the brain MUST act on
-    (the loop keeps going), or None to let it finish. HARD on structural legality
-    (would break the render); the editorial findings are surfaced for a single
-    review -- an over-target LENGTH is fix-or-justify, the rest is advisory -- so
-    the loop always terminates. A brain that already called ``diagnose``/
-    ``validate``/``review`` this turn has self-reviewed, so the advisory nudge is
-    skipped. edso_pacing_audit_timing.plan.md item 6: the advisory review now
-    also folds in ``observe.review``'s program read-back flags (rough heads/
-    tails, overlay fit) alongside ``diagnose``'s findings -- same one-shot,
-    never-a-prescribed-fix contract. edso_think_act_check.plan.md change 4:
-    ``review`` is passed ``user_ask`` so it also checks a NAMED feature (split
-    screen, a music bed) is actually present -- the ask/contract half of the
-    audit, checked ahead of the guidance-ceiling flags."""
+    """The done-gate: when the brain tries to FINISH a turn that changed the
+    edit, check the result against the contract, IN ORDER (audio_and_audit.
+    plan.md Phase 5 -- the two-pass audit): structural legality (hard) ->
+    length (fix-or-justify) -> STAGE 1 fit to INTENT (a user_ask-named
+    feature actually present) -> STAGE 2 fit to CRAFT (a blind, whole-edit
+    verdict) -> STAGE 3 the rest of diagnose/review's findings (advisory).
+    Returns feedback the brain MUST act on (the loop keeps going), or None to
+    let it finish -- each stage surfaces at most ONCE (state-tracked) so the
+    loop always terminates.
+
+    STAGE 2's discipline (the key rule, stated to the brain in
+    ``converse._LOOP_SYSTEM`` -- this gate only forces the checkpoint, once,
+    for any turn that changed a non-empty edit; it never parses the brain's
+    reply, since the verdict is prose, same as the length justification
+    above): a known flaw may pass ONLY if the brain names, in one line, that
+    (a) the user's ask required it or (b) the material can't support better.
+
+    A brain that already called ``diagnose``/``validate``/``review`` this
+    turn has self-reviewed, so STAGE 3's redundant nudge is skipped -- STAGE
+    2 is NOT skippable this way: calling a deterministic sense is not the
+    same as producing the blind holistic verdict Stage 2 asks for.
+    edso_think_act_check.plan.md change 4 / Phase 5: ``review`` is passed
+    ``user_ask`` so its ``category=="ask"`` flags feed Stage 1, checked
+    ahead of Stage 3's guidance/craft flags."""
     issues = observe.validate(working, ctx)
     if issues and state["struct_tries"] < _STRUCT_MAX_TRIES:
         state["struct_tries"] += 1
@@ -559,24 +649,45 @@ def _verify_before_finish(working: dict, ctx: EditContext,
                 ". Either trim to the target, or say in one line why this length is "
                 "right, then finish.")
 
-    rest = [f for f in findings if "target" not in (f.get("message") or "")]
     reviewed = "diagnose" in steps or "validate" in steps or "review" in steps
-    if not state["reviewed"] and not reviewed:
+    review_out = None
+    if not reviewed:
         try:
-            rest = rest + (observe.review(working, ctx, user_ask=user_ask).get("flags") or [])
+            review_out = observe.review(working, ctx, user_ask=user_ask)
         except Exception:
             logger.exception("_verify_before_finish: review() failed (continuing with diagnose only)")
-        if rest:
-            state["reviewed"] = True
-            body = "\n".join(
-                f"- [{f.get('severity') or 'info'}]"
-                + (f" ({f['category']})" if f.get("category") else "") + " "
-                + (f"{f['anchor']}: " if f.get("anchor") else "") + (f.get("message") or "")
-                for f in rest[:12])
-            return ("AUTOMATIC CHECK -- the assembled program has been checked against "
-                    "your ask, then the guidance; here's what's flagged. This is "
-                    "advisory: act on what serves the goal, ignore the rest, then "
-                    "finish:\n" + body)
+
+    ask_flags = [f for f in (review_out or {}).get("flags", []) if f.get("category") == "ask"]
+    if ask_flags and not state["intent_surfaced"]:
+        state["intent_surfaced"] = True
+        body = "\n".join(f"- {f.get('message')}" for f in ask_flags[:8])
+        return ("AUTOMATIC CHECK -- Stage 1, fit to your ask: a feature you named "
+                "isn't actually in the edit:\n" + body +
+                "\nAdd it, or finish only if the material genuinely can't support it.")
+
+    if working.get("timeline") and not state["craft_surfaced"]:
+        state["craft_surfaced"] = True
+        return ("AUTOMATIC CHECK -- Stage 2, fit to craft: forget the ask entirely -- "
+                "judge this edit the way you'd judge any finished video handed to you "
+                "cold. Does it look and sound like a real, high-quality piece of work? "
+                "Fix what falls short. If you finish anyway with a known flaw, name in "
+                "ONE line which of exactly two reasons applies: (a) the user's ask "
+                "required it, or (b) the material can't support better. Any other "
+                "reason ('looks fine anyway') isn't enough -- fix it instead.")
+
+    if reviewed or state["reviewed"]:
+        return None
+    rest = [f for f in findings if "target" not in (f.get("message") or "")]
+    rest += [f for f in (review_out or {}).get("flags", []) if f.get("category") != "ask"]
+    if rest:
+        state["reviewed"] = True
+        body = "\n".join(
+            f"- [{f.get('severity') or 'info'}]"
+            + (f" ({f['category']})" if f.get("category") else "") + " "
+            + (f"{f['anchor']}: " if f.get("anchor") else "") + (f.get("message") or "")
+            for f in rest[:12])
+        return ("AUTOMATIC CHECK -- Stage 3, specific flags: advisory -- act on what "
+                "serves the goal, ignore the rest, then finish:\n" + body)
     return None
 
 
@@ -594,7 +705,8 @@ def run_edit_loop(llm: LLMClient, *, system: str, messages: List[dict],
     tools = _specs()
     last_text = ""
     questions: List[dict] = []
-    verify = {"struct_tries": 0, "length_surfaced": False, "reviewed": False}
+    verify = {"struct_tries": 0, "length_surfaced": False, "intent_surfaced": False,
+             "craft_surfaced": False, "reviewed": False}
     # edso_think_act_check.plan.md change 4: the done-gate's audit checks a
     # NAMED feature (split screen, a music bed) is actually present -- needs
     # the user's own latest words, computed once here.

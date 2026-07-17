@@ -241,7 +241,8 @@ def _source_tag(seg: Optional[dict]) -> str:
         else f"raw {str(seg.get('file_id', '?'))[:8]}"
 
 
-def render_program_map(document: Optional[dict], durations: Optional[Dict[str, int]] = None) -> str:
+def render_program_map(document: Optional[dict], durations: Optional[Dict[str, int]] = None,
+                       audio_features: Optional[Dict[str, dict]] = None) -> str:
     """Render the ASSEMBLED edit as two small, time-aligned tables (VIDEO,
     AUDIO) built from the fully-resolved layer stack (``layers.resolve``) --
     edso_pacing_audit_timing.plan.md item 2, replacing the old flat V1-then-V2
@@ -250,8 +251,11 @@ def render_program_map(document: Optional[dict], durations: Optional[Dict[str, i
     ref, and a neutral label -- so stacking/overlap (a V2 cutaway over two V1
     spine cuts, a music bed under everything) is visible from the shared
     clock + z alone, with no prose needed. Generic: no speaker/role-of-person
-    column, just the compositing structure. Returns "" when there is nothing
-    to show yet."""
+    column, just the compositing structure. ``audio_features`` (file_id ->
+    {integrated_lufs,...}, audio_and_audit.plan.md Phase 2) adds each audio
+    row's own source loudness and a trailing GAPS line for any stretch with
+    no audible layer at all -- omitted facts when not passed, never guessed.
+    Returns "" when there is nothing to show yet."""
     if not document:
         return ""
     timeline = document.get("timeline") or []
@@ -304,8 +308,15 @@ def render_program_map(document: Optional[dict], durations: Optional[Dict[str, i
                 tags.append(f"fade-in:{a.fade_in_ms}ms")
             if a.fade_out_ms:
                 tags.append(f"fade-out:{a.fade_out_ms}ms")
+            lufs = ((audio_features or {}).get(a.source_file_id) or {}).get("integrated_lufs")
+            if lufs is not None:
+                tags.append(f"lufs:{lufs:.1f}")
             lines.append(f"  {lane} {aid}  {a.role}  {a.prog_start_ms}-{a.prog_end_ms}ms  "
                          f"{source}  {' '.join(tags)}")
+        gaps = layers.audio_gaps(resolved)
+        if gaps:
+            lines.append("  GAPS (no audio): " +
+                        ", ".join(f"{_ms(a)}-{_ms(b)}" for a, b in gaps))
 
     return "\n".join(lines)
 

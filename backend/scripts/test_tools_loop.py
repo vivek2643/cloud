@@ -87,7 +87,8 @@ def test_loop_reads_then_places_then_replies():
         [ToolCall(id="t1", name="read_state", input={})],
         [ToolCall(id="t2", name="place", input={"ref": "ffffffff:m00", "level": "balanced"})],
         [ToolCall(id="t3", name="place", input={"ref": "ffffffff:m01", "level": "balanced"})],
-        "I placed both beats on V1 in order -- it runs about 8 seconds.",
+        "I placed both beats on V1 in order.",             # finish attempt -> Stage 2 (craft) fires once
+        "Reads clean -- it runs about 8 seconds.",          # blind verdict -> finish
     ]
     llm = _ScriptedLLM(script)
     res = tools.run_edit_loop(llm, system="sys", messages=[{"role": "user", "content": "build it"}],
@@ -98,6 +99,7 @@ def test_loop_reads_then_places_then_replies():
     # edit path) -- so both beats land as distinct main-line cuts.
     assert len(res.document["timeline"]) == 2, res.document["timeline"]
     assert "8 seconds" in res.reply
+    assert llm.calls == 5, llm.calls           # the Stage-2 craft check bought one extra turn
     print("ok  loop: read_state -> place x2 -> prose reply; doc mutated")
 
 
@@ -204,12 +206,15 @@ def test_loop_split_screen_after_answer():
         [ToolCall(id="t1", name="place", input={"ref": "ffffffff:m00", "level": "balanced"})],
         [ToolCall(id="t2", name="split_screen", input={
             "ref": "ffffffff:m01", "template": "split_h", "from_ms": 500, "to_ms": 3000})],
-        "Side-by-side over the first few seconds -- done.",
+        "Side-by-side over the first few seconds.",   # finish attempt -> Stage 2 (craft) fires once
+        "Reads clean -- done.",                       # blind verdict -> finish
     ]
-    res = tools.run_edit_loop(_ScriptedLLM(script), system="sys",
+    llm = _ScriptedLLM(script)
+    res = tools.run_edit_loop(llm, system="sys",
                               messages=[{"role": "user", "content": "split screen these two"}],
                               ctx=ctx, document=_seed_doc())
     assert res.changed is True and res.steps == ["place", "split_screen"], res.steps
+    assert llm.calls == 4, llm.calls           # the Stage-2 craft check bought one extra turn
     ops = [o for o in res.document["operations"] if o["type"] == "place_video"]
     assert len(ops) == 1, ops
     regs = res.document.get("layout_regions") or []
@@ -218,11 +223,77 @@ def test_loop_split_screen_after_answer():
 
 
 # --------------------------------------------------------------------------
+# audio_and_audit.plan.md Phase 3: beat-snap trim, shift-to-align move
+# --------------------------------------------------------------------------
+
+def _music_ctx():
+    struct = _struct()
+    return observe.EditContext(
+        file_ids=["ffffffff-1111"], index=_MapIndex(struct), map_struct=struct,
+        durations={"ffffffff-1111": 8000}, dup_groups=[],
+        audio_features={"bed1": {"integrated_lufs": -14.0, "is_musical": True,
+                                 "bpm": 120.0,
+                                 "onsets_ms": [0, 500, 1000, 1500, 2000, 2500, 3000]}})
+
+
+def _bed_doc():
+    return {"format": {"aspect": "landscape"}, "timeline": [], "operations": [
+        {"op_id": "pa1", "type": "place_audio", "role": "music",
+         "source_file_id": "bed1", "src_in_ms": 0, "src_out_ms": 2000,
+         "from_ms": 1000, "to_ms": 3000, "gain_db": 0.0, "duck_db": 0.0},
+    ]}
+
+
+def test_trim_snap_beat_lands_an_ops_resulting_edge_on_the_grid():
+    """trim only ever moves a placed op's program END (its program START,
+    from_ms, never moves via trim) -- snap:'beat' lands THAT resulting edge
+    on the nearest onset, then folds the correction back onto whichever
+    source edge the brain named (here delta_in_ms)."""
+    ctx = _music_ctx()
+    doc = _bed_doc()
+    obs, new, changed = tools._dispatch(
+        "trim", {"target_id": "pa1", "delta_in_ms": 200, "snap": "beat"}, ctx, doc)
+    assert changed, obs
+    op = next(o for o in new["operations"] if o["op_id"] == "pa1")
+    assert (op["src_in_ms"], op["src_out_ms"]) == (500, 2000), op
+    assert op["to_ms"] == 2500, op          # snapped onto the nearest onset (program 2500ms)
+    assert '"snap"' in obs, obs
+    print("ok  trim snap:'beat' lands an op's resulting program edge on the grid")
+
+
+def test_trim_snap_beat_is_a_noop_pass_through_without_music():
+    ctx = _ctx(_struct())    # no audio_features -- no musical source in play
+    doc = _bed_doc()
+    obs, new, changed = tools._dispatch(
+        "trim", {"target_id": "pa1", "delta_in_ms": 200, "snap": "beat"}, ctx, doc)
+    assert changed, obs                      # trim itself still applies -- just unsnapped
+    op = next(o for o in new["operations"] if o["op_id"] == "pa1")
+    assert (op["src_in_ms"], op["src_out_ms"]) == (200, 2000), op
+    assert '"snap"' not in obs, obs
+    print("ok  trim snap:'beat' passes through unsnapped when no musical source is in play")
+
+
+def test_move_shift_to_align_slides_an_op_by_the_computed_offset():
+    """Shift-to-align: the brain names a CURRENT onset (in this op's own
+    program time) and the program moment it should land on; the handle
+    computes the offset and slides the op, keeping its own duration."""
+    ctx = _music_ctx()
+    doc = _bed_doc()
+    obs, new, changed = tools._dispatch(
+        "move", {"target_id": "pa1", "align_onset_ms": 1500, "align_to_ms": 5000}, ctx, doc)
+    assert changed, obs
+    op = next(o for o in new["operations"] if o["op_id"] == "pa1")
+    assert op["from_ms"] == 4500 and op["to_ms"] == 6500, op   # +3500ms offset, duration kept
+    print("ok  move align_onset_ms/align_to_ms shifts an op by the computed offset")
+
+
+# --------------------------------------------------------------------------
 # edso_done_gate.plan.md: the done-gate (_verify_before_finish)
 # --------------------------------------------------------------------------
 
 def _gate_state():
-    return {"struct_tries": 0, "length_surfaced": False, "reviewed": False}
+    return {"struct_tries": 0, "length_surfaced": False, "intent_surfaced": False,
+           "craft_surfaced": False, "reviewed": False}
 
 
 def _clean_doc():
@@ -263,10 +334,31 @@ def test_gate_length_is_fix_or_justify_once():
         fb1 = tools._verify_before_finish(_clean_doc(), ctx, st, [])
         assert fb1 and "length" in fb1.lower() and st["length_surfaced"], fb1
         fb2 = tools._verify_before_finish(_clean_doc(), ctx, st, [])
-        assert fb2 is None, fb2          # surfaced once; do not nag again
+        assert fb2 and "stage 2" in fb2.lower() and st["craft_surfaced"], fb2
+        fb3 = tools._verify_before_finish(_clean_doc(), ctx, st, [])
+        assert fb3 is None, fb3          # nothing left to flag; loop can finish
     finally:
         observe.diagnose = orig
-    print("ok  gate: over-target length is surfaced once (fix-or-justify)")
+    print("ok  gate: length fix-or-justify, then the Stage-2 craft check, then finish")
+
+
+def test_gate_craft_check_fires_once_unconditionally():
+    """Phase 5: Stage 2 (fit to craft) fires exactly once for ANY turn that
+    changed a non-empty edit -- unlike Stage 3, it is NOT gated on whether
+    diagnose/review found anything (a clean-per-the-checklist edit still
+    gets the blind verdict), and NOT skippable via self-review (calling a
+    deterministic sense is not the same as producing the blind verdict)."""
+    ctx = _ctx(_struct())
+    st = _gate_state()
+    fb1 = tools._verify_before_finish(_clean_doc(), ctx, st, [])
+    assert fb1 and "stage 2" in fb1.lower() and st["craft_surfaced"], fb1
+    fb2 = tools._verify_before_finish(_clean_doc(), ctx, st, [])
+    assert fb2 is None, fb2          # nothing else to flag for this clean doc
+
+    st2 = _gate_state()
+    fb3 = tools._verify_before_finish(_clean_doc(), ctx, st2, ["place", "diagnose", "review"])
+    assert fb3 and "stage 2" in fb3.lower(), fb3   # fires even though the brain self-reviewed
+    print("ok  gate: Stage 2 craft check is unconditional and not skippable via self-review")
 
 
 def test_gate_advisory_review_skipped_when_already_diagnosed():
@@ -276,15 +368,43 @@ def test_gate_advisory_review_skipped_when_already_diagnosed():
         {"severity": "warn", "anchor": "cuts 1-2", "message": "same speaker back-to-back"}]
     try:
         st = _gate_state()
-        fb = tools._verify_before_finish(_clean_doc(), ctx, st, [])
-        assert fb and "advisory" in fb.lower() and st["reviewed"], fb
+        fb1 = tools._verify_before_finish(_clean_doc(), ctx, st, [])
+        assert fb1 and "stage 2" in fb1.lower(), fb1     # Stage 2 fires first
+        fb2 = tools._verify_before_finish(_clean_doc(), ctx, st, [])
+        assert fb2 and "advisory" in fb2.lower() and st["reviewed"], fb2
+
         st2 = _gate_state()
-        fb2 = tools._verify_before_finish(_clean_doc(), ctx, st2,
-                                          ["place", "diagnose"])
-        assert fb2 is None, fb2          # brain self-reviewed -> no forced nudge
+        fb3 = tools._verify_before_finish(_clean_doc(), ctx, st2, ["place", "diagnose"])
+        assert fb3 and "stage 2" in fb3.lower(), fb3     # Stage 2 still fires (self-review doesn't skip it)
+        fb4 = tools._verify_before_finish(_clean_doc(), ctx, st2, ["place", "diagnose"])
+        assert fb4 is None, fb4          # brain self-reviewed -> Stage 3's redundant nudge skipped
     finally:
         observe.diagnose = orig
-    print("ok  gate: advisory review fires once, skipped if brain already diagnosed")
+    print("ok  gate: Stage 3 advisory review fires once, skipped if brain already diagnosed")
+
+
+def test_gate_blocks_a_mid_program_audio_gap_unless_surfaced():
+    """audio_and_audit.plan.md Phase 5: a mid-program silence hole (Stage 3's
+    audio-gap flag, from layers.audio_gaps -- a muted seg between two audible
+    ones) can't finish silently; the brain must see it (the blind Stage-2
+    check, then Stage 3's concrete fact) before the gate lets a turn finish."""
+    ctx = _ctx(_struct())
+    doc = {
+        "timeline": [
+            {"seg_id": "s0", "file_id": "ffffffff-1111", "in_ms": 0, "out_ms": 2000},
+            {"seg_id": "s1", "file_id": "ffffffff-1111", "in_ms": 2000, "out_ms": 4000, "mute": True},
+            {"seg_id": "s2", "file_id": "ffffffff-1111", "in_ms": 4000, "out_ms": 6000},
+        ],
+        "operations": [], "brief": {},
+    }
+    st = _gate_state()
+    fb1 = tools._verify_before_finish(doc, ctx, st, [])
+    assert fb1 and "stage 2" in fb1.lower(), fb1     # the blind craft check fires first
+    fb2 = tools._verify_before_finish(doc, ctx, st, [])
+    assert fb2 and "no audio" in fb2.lower(), fb2    # Stage 3 surfaces the gap as a concrete fact
+    fb3 = tools._verify_before_finish(doc, ctx, st, [])
+    assert fb3 is None, fb3          # surfaced (twice); the gate itself never hard-blocks forever
+    print("ok  gate: a mid-program audio gap is surfaced (blind check, then the concrete fact)")
 
 
 def test_gate_forces_length_reconcile_end_to_end():
@@ -294,16 +414,17 @@ def test_gate_forces_length_reconcile_end_to_end():
     script = [
         [ToolCall(id="t1", name="place", input={"ref": "ffffffff:m00", "level": "balanced"})],
         [ToolCall(id="t2", name="place", input={"ref": "ffffffff:m01", "level": "balanced"})],
-        "Placed both -- about 8 seconds.",                       # finish attempt #1
-        "Both beats are essential, so I'm keeping it at ~8s.",   # justify -> finish
+        "Placed both -- about 8 seconds.",                       # finish attempt #1 -> length gate fires
+        "Both beats are essential, so I'm keeping it at ~8s.",   # justify -> Stage 2 (craft) fires
+        "Reads clean -- keeping it at ~8s.",                     # blind verdict -> finish
     ]
     llm = _ScriptedLLM(script)
     res = tools.run_edit_loop(llm, system="sys",
                               messages=[{"role": "user", "content": "cut a 5s teaser"}],
                               ctx=ctx, document=doc)
     assert "keeping it" in res.reply, res.reply
-    assert llm.calls == 4, llm.calls           # the gate bought exactly one extra turn
-    print("ok  gate: over-target forces one length reconcile, then finishes")
+    assert llm.calls == 5, llm.calls           # length + Stage 2 each bought one extra turn
+    print("ok  gate: over-target forces one length reconcile + the craft check, then finishes")
 
 
 def test_gate_surfaces_review_flags_end_to_end():
@@ -319,7 +440,8 @@ def test_gate_surfaces_review_flags_end_to_end():
     )
     script = [
         [ToolCall(id="t1", name="place", input={"ref": "ffffffff:m00", "level": "balanced"})],
-        "Placed the beat.",                               # finish attempt #1 -> gate flags the head
+        "Placed the beat.",                               # finish attempt #1 -> Stage 2 (craft) fires
+        "Reads clean.",                                   # blind verdict -> Stage 3 flags the head
         "Kept it -- the lead-in is a natural warm-up.",    # acknowledge -> finish
     ]
     llm = _ScriptedLLM(script)
@@ -332,8 +454,8 @@ def test_gate_surfaces_review_flags_end_to_end():
     finally:
         fm._sentences_for_file = orig
     assert "Kept it" in res.reply, res.reply
-    assert llm.calls == 3, llm.calls           # the gate bought exactly one extra turn
-    print("ok  gate: review flags surface end-to-end and the loop still terminates")
+    assert llm.calls == 4, llm.calls           # Stage 2 + Stage 3 each bought one extra turn
+    print("ok  gate: review flags surface end-to-end (after the craft check) and the loop still terminates")
 
 
 # --------------------------------------------------------------------------
@@ -360,15 +482,16 @@ def test_gate_flags_a_requested_feature_missing_end_to_end():
     doc = _seed_doc()
     script = [
         [ToolCall(id="t1", name="place", input={"ref": "ffffffff:m00", "level": "balanced"})],
-        "Placed the beat.",                                          # finish #1 -> gate flags the missing split
-        "Added a split screen instead of skipping it -- fixed now.",  # act -> finish
+        "Placed the beat.",                                          # finish #1 -> Stage 1 flags the missing split
+        "Added a split screen instead of skipping it -- fixed now.",  # claim fix -> Stage 2 (craft) fires
+        "Reads clean -- confirmed.",                                  # blind verdict -> finish
     ]
     llm = _ScriptedLLM(script)
     res = tools.run_edit_loop(llm, system="sys",
                               messages=[{"role": "user", "content": "make it a split screen"}],
                               ctx=ctx, document=doc)
-    assert "Added a split screen" in res.reply, res.reply
-    assert llm.calls == 3, llm.calls           # the gate bought exactly one extra turn
+    assert res.reply == "Reads clean -- confirmed.", res.reply
+    assert llm.calls == 4, llm.calls           # Stage 1 + Stage 2 each bought one extra turn
     print("ok  gate: a requested-but-missing feature is flagged, then the loop still terminates")
 
 
@@ -377,15 +500,16 @@ def test_gate_does_not_flag_a_feature_the_user_never_asked_for():
     doc = _seed_doc()
     script = [
         [ToolCall(id="t1", name="place", input={"ref": "ffffffff:m00", "level": "balanced"})],
-        "Placed the beat.",
+        "Placed the beat.",   # finish attempt -> Stage 1 has nothing to flag; Stage 2 (craft) still fires
+        "Reads clean.",       # blind verdict -> finish
     ]
     llm = _ScriptedLLM(script)
     res = tools.run_edit_loop(llm, system="sys",
                               messages=[{"role": "user", "content": "just cut it together"}],
                               ctx=ctx, document=doc)
-    assert res.reply == "Placed the beat.", res.reply
-    assert llm.calls == 2, llm.calls           # no gate nudge at all -- nothing to flag
-    print("ok  gate: no feature nudge when the ask never named one")
+    assert res.reply == "Reads clean.", res.reply
+    assert llm.calls == 3, llm.calls           # no Stage-1 nudge -- Stage 2's craft check still runs once
+    print("ok  gate: no Stage-1 feature nudge when the ask never named one (Stage 2 still runs)")
 
 
 def main():
@@ -398,10 +522,15 @@ def main():
     test_normalize_questions_still_drops_under_two_options()
     test_normalize_questions_no_recommendation_omits_the_keys()
     test_loop_split_screen_after_answer()
+    test_trim_snap_beat_lands_an_ops_resulting_edge_on_the_grid()
+    test_trim_snap_beat_is_a_noop_pass_through_without_music()
+    test_move_shift_to_align_slides_an_op_by_the_computed_offset()
     test_gate_blocks_structural_error()
     test_gate_clean_doc_finishes()
     test_gate_length_is_fix_or_justify_once()
+    test_gate_craft_check_fires_once_unconditionally()
     test_gate_advisory_review_skipped_when_already_diagnosed()
+    test_gate_blocks_a_mid_program_audio_gap_unless_surfaced()
     test_gate_forces_length_reconcile_end_to_end()
     test_gate_surfaces_review_flags_end_to_end()
     test_latest_user_text_reads_the_newest_user_message()

@@ -434,8 +434,8 @@ def _stage5_audio(file_id: str, wav_path: str, conn: psycopg.Connection) -> None
         insert into audio_features (
             file_id, integrated_lufs, true_peak_db,
             is_musical, bpm, onsets_ms, silence_intervals,
-            rms_db, prosody_hop_ms
-        ) values (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s)
+            rms_db, prosody_hop_ms, sections, drop_ms
+        ) values (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s::jsonb, %s)
         on conflict (file_id) do update set
             integrated_lufs = excluded.integrated_lufs,
             true_peak_db = excluded.true_peak_db,
@@ -444,7 +444,9 @@ def _stage5_audio(file_id: str, wav_path: str, conn: psycopg.Connection) -> None
             onsets_ms = excluded.onsets_ms,
             silence_intervals = excluded.silence_intervals,
             rms_db = excluded.rms_db,
-            prosody_hop_ms = excluded.prosody_hop_ms
+            prosody_hop_ms = excluded.prosody_hop_ms,
+            sections = excluded.sections,
+            drop_ms = excluded.drop_ms
         """,
         (
             file_id,
@@ -454,6 +456,8 @@ def _stage5_audio(file_id: str, wav_path: str, conn: psycopg.Connection) -> None
             json.dumps(af.silence_intervals),
             json.dumps(af.rms_db),
             af.prosody_hop_ms,
+            json.dumps(af.sections),
+            af.drop_ms,
         ),
     )
 
