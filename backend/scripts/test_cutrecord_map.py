@@ -312,6 +312,102 @@ def test_v4_punchy_rung_never_clips_the_peak():
     print("ok  test_v4_punchy_rung_never_clips_the_peak")
 
 
+# --------------------------------------------------------------------------
+# v4_cluster_tree_cuts.plan.md: multi-event clusters resolve into pieces
+# --------------------------------------------------------------------------
+
+def _cluster_events():
+    return [
+        {"peak_ms": 1000, "score": 0.6, "kind": "point", "onset_ms": 700, "settle_ms": 1500, "span_ms": None},
+        {"peak_ms": 5000, "score": 1.0, "kind": "point", "onset_ms": 4600, "settle_ms": 5500, "span_ms": None},
+        {"peak_ms": 9000, "score": 0.4, "kind": "point", "onset_ms": 8700, "settle_ms": 9400, "span_ms": None},
+    ]
+
+
+def _cluster_row(events=None):
+    return _row(kind="video", src_in_ms=0, src_out_ms=10000, hero_ts_ms=5000,
+               salience={"peak_ms": 5000, "score": 1.0, "kind": "point", "span_ms": None,
+                        "events": events if events is not None else _cluster_events(),
+                        "primary": 1, "density": 0.5, "shape": "center"},
+               pace={"min_ms": 800, "natural_ms": 10000, "max_ms": 10000, "natural_sound": True})
+
+
+def test_resolve_cluster_broad_is_one_piece_whole_cluster():
+    pieces, removed = cm.resolve_cluster(_cluster_events(), 0, 10000, 0.0)
+    assert pieces == [(0, 10000)], pieces
+    assert removed == [], removed
+    print("ok  test_resolve_cluster_broad_is_one_piece_whole_cluster")
+
+
+def test_resolve_cluster_punchy_is_n_pieces():
+    pieces, removed = cm.resolve_cluster(_cluster_events(), 0, 10000, 1.0)
+    assert len(pieces) == 3, pieces
+    # valleys = the complement of the pieces inside [0, 10000]
+    covered = sorted(list(pieces) + list(removed))
+    cur = 0
+    for a, b in covered:
+        assert a == cur, (covered, "must tile [0,10000) with no gap/overlap")
+        cur = b
+    assert cur == 10000, covered
+    print("ok  test_resolve_cluster_punchy_is_n_pieces")
+
+
+def test_resolve_cluster_piece_count_is_monotonic_with_energy():
+    counts = [len(cm.resolve_cluster(_cluster_events(), 0, 10000, e)[0])
+             for e in (0.0, 0.25, 0.5, 0.75, 1.0)]
+    assert counts == sorted(counts), counts
+    print("ok  test_resolve_cluster_piece_count_is_monotonic_with_energy")
+
+
+def test_resolve_cluster_pieces_are_always_disjoint_and_ordered():
+    for e in (0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0):
+        pieces, _ = cm.resolve_cluster(_cluster_events(), 0, 10000, e)
+        for a, b in pieces:
+            assert b > a, (e, pieces)
+        for (_, b0), (a1, _) in zip(pieces, pieces[1:]):
+            assert a1 >= b0, (e, pieces)
+    print("ok  test_resolve_cluster_pieces_are_always_disjoint_and_ordered")
+
+
+def test_cluster_rung_broad_forces_one_piece_at_the_sampled_band():
+    """The ladder never samples energy exactly 0 (broad = band-center 0.1) --
+    _cluster_rung must still force exactly one whole-cluster piece there."""
+    row = _cluster_row()
+    ladder = cm.synth_ladder(row, 0.8)
+    broad = ladder[0]
+    assert broad["level"] == "broad"
+    assert broad["spans"] == [{"in_ms": 0, "out_ms": 10000}], broad
+    print("ok  test_cluster_rung_broad_forces_one_piece_at_the_sampled_band")
+
+
+def test_cluster_rung_sharp_yields_multiple_tight_pieces():
+    row = _cluster_row()
+    ladder = cm.synth_ladder(row, 0.8)
+    sharp = ladder[-1]
+    assert sharp["level"] == "sharp"
+    assert len(sharp["spans"]) > 1, sharp
+    plays = [r["play_ms"] for r in ladder]
+    assert plays == sorted(plays, reverse=True), "should tighten monotonically broad->sharp"
+    print("ok  test_cluster_rung_sharp_yields_multiple_tight_pieces")
+
+
+def test_single_event_cluster_ladder_is_byte_identical_to_pre_cluster():
+    """A cluster of ONE event must produce EXACTLY the same ladder as a row
+    with no 'events' key at all (the backward-compat invariant)."""
+    row_no_events = _row(kind="video", src_in_ms=0, src_out_ms=10000, hero_ts_ms=5000,
+                         salience={"peak_ms": 5000, "score": 0.9, "kind": "point",
+                                  "shape": "before", "span_ms": None},
+                         pace={"min_ms": 800, "natural_ms": 10000, "max_ms": 10000, "natural_sound": True})
+    row_one_event = _row(kind="video", src_in_ms=0, src_out_ms=10000, hero_ts_ms=5000,
+                         salience={"peak_ms": 5000, "score": 0.9, "kind": "point",
+                                  "shape": "before", "span_ms": None, "primary": 0,
+                                  "events": [{"peak_ms": 5000, "score": 0.9, "kind": "point",
+                                            "onset_ms": 4000, "settle_ms": 6000, "span_ms": None}]},
+                         pace={"min_ms": 800, "natural_ms": 10000, "max_ms": 10000, "natural_sound": True})
+    assert cm.synth_ladder(row_no_events, 0.8) == cm.synth_ladder(row_one_event, 0.8)
+    print("ok  test_single_event_cluster_ladder_is_byte_identical_to_pre_cluster")
+
+
 def test_pinned_run_id_is_honored_without_live_resolve():
     """When a thread pins a run (migration 028), the projection reads THAT run
     and never falls back to `latest_run_for_files` -- so a re-ingest mid-thread
@@ -384,6 +480,13 @@ def main():
     test_v4_after_shape_in_edge_barely_moves_out_edge_absorbs_shrink()
     test_v4_span_kind_trims_head_keeps_settle()
     test_v4_punchy_rung_never_clips_the_peak()
+    test_resolve_cluster_broad_is_one_piece_whole_cluster()
+    test_resolve_cluster_punchy_is_n_pieces()
+    test_resolve_cluster_piece_count_is_monotonic_with_energy()
+    test_resolve_cluster_pieces_are_always_disjoint_and_ordered()
+    test_cluster_rung_broad_forces_one_piece_at_the_sampled_band()
+    test_cluster_rung_sharp_yields_multiple_tight_pieces()
+    test_single_event_cluster_ladder_is_byte_identical_to_pre_cluster()
     test_pinned_run_id_is_honored_without_live_resolve()
     test_unpinned_falls_back_to_latest_run()
     print("\nall cutrecord-map tests passed")

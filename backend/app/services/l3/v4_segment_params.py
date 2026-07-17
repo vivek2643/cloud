@@ -88,3 +88,33 @@ DENSITY_PEAKS_PER_SEC_CAP = 1.0
 # sits closer to. Same perceptual scale as MIN_CUT_GAP_MS; duration-based,
 # never atom-ownership-based (atoms are no longer part of this module's loop).
 MIN_CUT_DURATION_MS = 400
+
+# --------------------------------------------------------------------------
+# v4_cluster_tree_cuts.plan.md: a moment is now a CLUSTER of events, not one
+# flat span. Events within a cluster are close enough to fuse at the
+# broadest energy; a big dead gap starts a new cluster (a new VideoCut).
+# --------------------------------------------------------------------------
+
+# A gap between two consecutive events (by window edge, not peak) starts a
+# NEW cluster once it exceeds this many times the working span's OWN median
+# inter-event gap -- content-derived, not a fixed number: a burst of hits
+# 300ms apart reads a 900ms gap as "the same rally"; a burst 2s apart reads
+# the same 900ms gap as tight, not a break. Clamped to
+# [MIN_CUT_GAP_MS, MAX_CLUSTER_SEPARATION_MS] below so one huge outlier gap
+# in a tiny sample can't blow the threshold out, and a very tight span still
+# gets SOME separation floor.
+CLUSTER_SEPARATION_MULTIPLIER = 2.5
+MAX_CLUSTER_SEPARATION_MS = 4000
+
+# The tightest a single EVENT's own window is ever allowed to collapse to
+# inside the per-level cluster resolver (resolve_cluster) -- the per-piece
+# analogue of RUN_UP_FLOOR_MS/FOLLOW_THROUGH_FLOOR_MS combined. Never below
+# readability: an event narrower than this at max energy would flash by
+# unreadably rather than read as a hit.
+MIN_EVENT_PIECE_MS = RUN_UP_FLOOR_MS + FOLLOW_THROUGH_FLOOR_MS
+
+# image_plan.build_image_plan: at most this many of a cluster's own event
+# peaks get their own straddle frame pair (evenly sampled across the event
+# list when there are more). Bounds the frame cost of a large, busy cluster
+# flat regardless of how many events it holds.
+MAX_CLUSTER_EVENT_FRAMES = 4

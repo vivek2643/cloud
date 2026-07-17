@@ -12,6 +12,7 @@ import {
   type CutsV3Response,
   type FileRecord,
   type IngestStatus,
+  type SalienceEvent,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import {
@@ -178,6 +179,65 @@ const SPEECH_TRIM_MAX = 1.0;
 
 type Segment = { inMs: number; outMs: number };
 
+// v4_cluster_tree_cuts.plan.md section 5/9: a video cut with MORE THAN ONE
+// salience event is a CLUSTER, not a flat span -- mirrors backend
+// cutrecord_map.resolve_cluster exactly (the same per-event floors, same
+// "half the gap to the neighbor" capacity at energy 0, same monotonic
+// shrink toward each event's own tight floor at energy 1). Unlike the
+// backend's 5 FIXED band energies (which special-case the lowest band to
+// force exactly 1 piece), this dial is continuous, so no special-case is
+// needed: at energy 0 the formula already reaches each outer event's own
+// cluster bound and each interior gap's own midpoint EXACTLY, so windows
+// already touch and collapse to one piece by construction.
+//
+// Distinct from FOLLOW_THROUGH_FLOOR_MS/LEAD_FLOOR_MS above (300/300), which
+// are the WHOLE-CUT-level before/after asymmetry floor -- these are the
+// PER-EVENT floors, matching backend v4_segment_params.RUN_UP_FLOOR_MS/
+// FOLLOW_THROUGH_FLOOR_MS (300/500) exactly.
+const EVENT_RUN_UP_FLOOR_MS = 300;
+const EVENT_FOLLOW_THROUGH_FLOOR_MS = 500;
+
+function eventAnchor(ev: SalienceEvent): number {
+  return ev.peak_ms;
+}
+
+function resolveCluster(
+  events: SalienceEvent[],
+  clusterS: number,
+  clusterE: number,
+  energy: number
+): Segment[] {
+  const ordered = [...events].sort((a, b) => eventAnchor(a) - eventAnchor(b));
+  const n = ordered.length;
+  const windows: Segment[] = ordered.map((ev, i) => {
+    const peak = eventAnchor(ev);
+    const leftCap = Math.max(
+      i === 0 ? peak - clusterS : (peak - eventAnchor(ordered[i - 1])) / 2,
+      EVENT_RUN_UP_FLOOR_MS
+    );
+    const rightCap = Math.max(
+      i === n - 1 ? clusterE - peak : (eventAnchor(ordered[i + 1]) - peak) / 2,
+      EVENT_FOLLOW_THROUGH_FLOOR_MS
+    );
+    const wIn = EVENT_RUN_UP_FLOOR_MS + (1 - energy) * (leftCap - EVENT_RUN_UP_FLOOR_MS);
+    const wOut = EVENT_FOLLOW_THROUGH_FLOOR_MS + (1 - energy) * (rightCap - EVENT_FOLLOW_THROUGH_FLOOR_MS);
+    const inMs = Math.max(clusterS, Math.round(peak - wIn));
+    const outMs = Math.min(clusterE, Math.round(peak + wOut));
+    return { inMs: Math.min(inMs, peak), outMs: Math.max(outMs, peak) };
+  });
+
+  const pieces: Segment[] = [];
+  for (const w of windows) {
+    const prev = pieces[pieces.length - 1];
+    if (prev && w.inMs <= prev.outMs) {
+      prev.outMs = Math.max(prev.outMs, w.outMs);
+    } else {
+      pieces.push({ ...w });
+    }
+  }
+  return pieces;
+}
+
 // Shared pace level for the whole project. Maps to an index into pace.levels
 // (target velocities 0.5/0.8/1.0/1.3/1.8); "original" = native 1.0x, no change.
 type PaceMode = "original" | "low" | "medium" | "high";
@@ -242,7 +302,14 @@ function keptSegments(inMs: number, outMs: number, removed: Segment[]): Segment[
 // The play plan for a cut at a given dial position: video is one tightened span;
 // speech is the kept segments after the dial shaves dead air + fillers.
 function playSegments(cut: CutRecord, energy: number): Segment[] {
-  if (cut.kind !== "speech") return [tightenedSpan(cut, energy)];
+  if (cut.kind !== "speech") {
+    const events = cut.salience?.events;
+    if (events && events.length > 1) {
+      const pieces = resolveCluster(events, cut.src_in_ms, cut.src_out_ms, energy);
+      return pieces.length ? pieces : [{ inMs: cut.src_in_ms, outMs: cut.src_out_ms }];
+    }
+    return [tightenedSpan(cut, energy)];
+  }
   const removed = chosenRemoveSpans(cut, energy);
   if (!removed.length) return [{ inMs: cut.src_in_ms, outMs: cut.src_out_ms }];
   return keptSegments(cut.src_in_ms, cut.src_out_ms, removed);

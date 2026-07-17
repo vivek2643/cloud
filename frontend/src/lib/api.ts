@@ -196,6 +196,18 @@ export interface Continuity {
   seam_reason_next?: string | null;
 }
 
+// v4_cluster_tree_cuts.plan.md section 3: one salient event inside a video
+// cut's cluster. onset_ms/settle_ms are the raw, content-derived reach (not
+// floor-clamped) -- used by resolveCluster to size each event's own window.
+export interface SalienceEvent {
+  peak_ms: number;
+  score: number;
+  kind: "point" | "span" | "none";
+  onset_ms: number;
+  settle_ms: number;
+  span_ms?: [number, number] | null;
+}
+
 export interface CutRecord {
   id: string;
   file_id: string;
@@ -254,12 +266,21 @@ export interface CutRecord {
   // (cuts_v4_segmentation.plan.md) are present only on a V4-ingested video
   // cut -- kind absent/null means this is a V3 cut (or has no signal),
   // and the dial keeps the original hero_ts_ms-centered symmetric shrink.
+  // events/primary/density (v4_cluster_tree_cuts.plan.md): a video cut is a
+  // CLUSTER carrying every salient event inside it; peak_ms/score/kind/
+  // span_ms above are events[primary]'s own fields, broadcast to the top
+  // level for backward compat. events.length <= 1 is the degenerate,
+  // single-window case (today's behavior); > 1 is a genuine multi-event
+  // cluster the dial resolves into multiple pieces (see resolveCluster).
   salience?: {
     peak_ms: number;
     score: number;
     kind?: "point" | "span" | "none" | null;
     span_ms?: [number, number] | null;
     shape?: "before" | "after" | "both" | "center" | "none" | null;
+    events?: SalienceEvent[];
+    primary?: number;
+    density?: number;
   } | null;
   // av_coupling_authoritative.plan.md: this cut's baked AUTHORITATIVE audio
   // source, decided once at ingest (never re-derived lazily at render time).

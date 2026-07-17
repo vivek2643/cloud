@@ -24,6 +24,17 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+# v4_cluster_tree_cuts.plan.md section 5: the SAME per-event floors
+# v4_segment.py's own _broad_window_for_event uses, so resolve_cluster's
+# broadest per-event window agrees with how the cluster's own src_in_ms/
+# src_out_ms were computed at ingest time. Aliased (not the plan's own
+# _FOLLOW_THROUGH_FLOOR_MS/_LEAD_FLOOR_MS below, which are a DIFFERENT,
+# whole-cut-level asymmetry knob, unrelated to this per-event one).
+from app.services.l3.v4_segment_params import (
+    FOLLOW_THROUGH_FLOOR_MS as _EVENT_FOLLOW_THROUGH_FLOOR_MS,
+    RUN_UP_FLOOR_MS as _EVENT_RUN_UP_FLOOR_MS,
+)
+
 logger = logging.getLogger(__name__)
 
 # Bump to force footage_trees cache rebuilds when this module's projection or
@@ -175,6 +186,91 @@ def _span_rung(s: int, e: int, target: int, span_ms: Optional[List[Any]]) -> Tup
     return in_ms, e
 
 
+def _event_anchor(event: Dict[str, Any]) -> int:
+    return int(event.get("peak_ms") or 0)
+
+
+def resolve_cluster(
+    events: List[Dict[str, Any]], cluster_s: int, cluster_e: int, energy: float,
+) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+    """Multi-event per-level resolution (v4_cluster_tree_cuts.plan.md section
+    5, "the heart"): every event's own window half-width slides between
+    "reach exactly halfway to its neighbor (or the cluster's own outer
+    bound)" at energy 0 and "this event's own tight floor" at energy 1 --
+    the SAME per-event floors (_EVENT_RUN_UP_FLOOR_MS/_EVENT_FOLLOW_THROUGH_
+    FLOOR_MS) v4_segment.py's _broad_window_for_event uses. Adjacent windows
+    that still touch fuse into one piece. Because each event's outward
+    "capacity" is defined as exactly half the gap to its neighbor, energy 0
+    windows always touch their neighbor exactly at the midpoint -- callers
+    still special-case the "broad" rung to the cluster's own outer bound
+    directly (see _video_rung) rather than relying on that limit, since the
+    ladder never actually samples energy 0. Window half-widths shrink
+    monotonically as energy rises, so the piece count this produces is
+    monotonically non-decreasing (windows can only separate further, never
+    re-merge) -- shape (before/after) is deliberately NOT threaded into the
+    per-event asymmetry here (an internal valley between two hits has no
+    clear "build/reveal" reading); each event's own natural
+    run-up/follow-through floor asymmetry (500 > 300, "favor a beat past the
+    peak over dwelling before it") still applies uniformly.
+
+    Returns (pieces, removed) -- pieces are the kept spans in time order,
+    removed is their complement inside [cluster_s, cluster_e]."""
+    ordered = sorted(events, key=_event_anchor)
+    n = len(ordered)
+    windows: List[Tuple[int, int]] = []
+    for i, ev in enumerate(ordered):
+        peak = _event_anchor(ev)
+        left_cap = float(peak - cluster_s) if i == 0 else (peak - _event_anchor(ordered[i - 1])) / 2.0
+        right_cap = float(cluster_e - peak) if i == n - 1 else (_event_anchor(ordered[i + 1]) - peak) / 2.0
+        left_cap = max(left_cap, _EVENT_RUN_UP_FLOOR_MS)
+        right_cap = max(right_cap, _EVENT_FOLLOW_THROUGH_FLOOR_MS)
+        w_in = _EVENT_RUN_UP_FLOOR_MS + (1.0 - energy) * (left_cap - _EVENT_RUN_UP_FLOOR_MS)
+        w_out = _EVENT_FOLLOW_THROUGH_FLOOR_MS + (1.0 - energy) * (right_cap - _EVENT_FOLLOW_THROUGH_FLOOR_MS)
+        in_ms = max(cluster_s, round(peak - w_in))
+        out_ms = min(cluster_e, round(peak + w_out))
+        windows.append((min(in_ms, peak), max(out_ms, peak)))
+
+    pieces: List[Tuple[int, int]] = []
+    for a, b in windows:
+        if pieces and a <= pieces[-1][1]:
+            pieces[-1] = (pieces[-1][0], max(pieces[-1][1], b))
+        else:
+            pieces.append((a, b))
+
+    removed: List[Tuple[int, int]] = []
+    cur = cluster_s
+    for a, b in pieces:
+        if a > cur:
+            removed.append((cur, a))
+        cur = max(cur, b)
+    if cur < cluster_e:
+        removed.append((cur, cluster_e))
+    return pieces, removed
+
+
+def _cluster_rung(row: Dict[str, Any], events: List[Dict[str, Any]], energy: float,
+                  level: str, score: float) -> Dict[str, Any]:
+    """The multi-event ("spans", like a speech rung) branch of _video_rung --
+    section 5's "Broad: windows wide -> all touch -> 1 piece = whole
+    cluster" is enforced directly (not relied on as a limit of the energy-0
+    interpolation, since the ladder only ever samples energy 0.1)."""
+    s, e = int(row["src_in_ms"]), int(row["src_out_ms"])
+    if level == "broad":
+        pieces: List[Tuple[int, int]] = [(s, e)]
+    else:
+        pieces, _removed = resolve_cluster(events, s, e, energy)
+        pieces = [(max(s, a), min(e, b)) for a, b in pieces if min(e, b) > max(s, a)]
+        if not pieces:
+            pieces = [(s, e)]
+    return {
+        "level": level,
+        "spans": [{"in_ms": a, "out_ms": b} for a, b in pieces],
+        "in_ms": pieces[0][0], "out_ms": pieces[-1][1],
+        "play_ms": sum(b - a for a, b in pieces),
+        "score": score,
+    }
+
+
 def _video_rung(row: Dict[str, Any], energy: float, level: str, score: float) -> Dict[str, Any]:
     """One video rung, clamped to ``pace.min_ms`` -- energy 0 = full grounded
     span, energy 1 = the tightest safe inset, evaluated at this rung's
@@ -186,7 +282,18 @@ def _video_rung(row: Dict[str, Any], energy: float, level: str, score: float) ->
     before/after asymmetry; an unrecognized/missing shape (including VLM
     shape="none", by the plan's arbitration rule) falls through to the same
     symmetric-around-peak math as "both"/"center" -- `kind` alone (always
-    code-owned, never influenced by the VLM) decides point vs span vs none."""
+    code-owned, never influenced by the VLM) decides point vs span vs none.
+
+    v4_cluster_tree_cuts.plan.md: a cluster with 2+ events (salience.events)
+    dispatches to _cluster_rung instead -- a multi-piece ("spans") rung, like
+    speech. A cluster of exactly one event (or a V3/legacy row with no
+    "events" at all) falls straight through to the untouched single-window
+    math below -- byte-identical to the pre-cluster V4/V3 output."""
+    salience = row.get("salience") or {}
+    events = salience.get("events") or []
+    if len(events) > 1:
+        return _cluster_rung(row, events, energy, level, score)
+
     s, e = int(row["src_in_ms"]), int(row["src_out_ms"])
     natural = e - s
     pace = row.get("pace") or {}
@@ -196,7 +303,6 @@ def _video_rung(row: Dict[str, Any], energy: float, level: str, score: float) ->
     if target >= natural or target <= 0:
         in_ms, out_ms = s, e
     else:
-        salience = row.get("salience") or {}
         kind = salience.get("kind")
         if kind is None:
             in_ms, out_ms = _symmetric_rung(s, e, target, row.get("hero_ts_ms"))

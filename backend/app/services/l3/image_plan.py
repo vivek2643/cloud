@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.services.l3.lattice import Lattice, resolve_speech_span_ms
 from app.services.l3.pass1 import Pass1Output
+from app.services.l3.v4_segment_params import MAX_CLUSTER_EVENT_FRAMES
 from app.services.l3.video_segments import _sharpest_ms
 
 FRAME_BUDGET_PER_CLIP = 40
@@ -46,6 +47,10 @@ REASON_COMPOSITION_DRIFT = "composition_drift"
 # tell before/after/both apart, since it never sees a timestamp.
 REASON_SHAPE_STRADDLE = "shape_straddle"
 _STRADDLE_OFFSET_MS = 400
+# v4_cluster_tree_cuts.plan.md section 8: a multi-event cluster gets one
+# frame per (evenly-sampled) event peak instead of the single-peak straddle,
+# so the model sees every sub-moment even though it labels the cluster once.
+REASON_CLUSTER_EVENT = "cluster_event"
 # The 2nd (early/late pairing) frame for a unit that clears the runt guard --
 # its own extras tier, ranked above extra_anchors/drift but below the 1st
 # (mandatory, never-dropped) frame per unit (module docstring).
@@ -125,6 +130,20 @@ def _too_close(a_ms: int, b_ms: int, hop_ms: int) -> bool:
     """Two candidate instants within one hop of each other would be
     near-duplicate stills -- not worth sending both."""
     return abs(a_ms - b_ms) <= max(hop_ms, 1)
+
+
+def _evenly_sample_events(events: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
+    """At most ``n`` of a cluster's events, evenly spread across its own
+    TIME ORDER (always including the first and last) so the sampled frames
+    give visual coverage of the whole moment, not just its biggest few hits
+    clustered together. n<=1 keeps only the single strongest event."""
+    ordered = sorted(events, key=lambda ev: ev.get("peak_ms", 0))
+    if len(ordered) <= max(n, 1):
+        return ordered if n >= 1 else []
+    if n <= 1:
+        return [max(ordered, key=lambda ev: ev.get("score", 0.0))]
+    idxs = sorted({round(i * (len(ordered) - 1) / (n - 1)) for i in range(n)})
+    return [ordered[i] for i in idxs]
 
 
 def _early_late_ms(blur: List[float], hop_ms: int, s: int, e: int) -> Tuple[int, int]:
@@ -282,6 +301,36 @@ def build_image_plan(
         quarter = max(1, (e - s) // 4)
 
         v4_sal = ((v4_meta_by_ref or {}).get(ref) or {}).get("salience") or {}
+        v4_events = v4_sal.get("events") or []
+        if len(v4_events) > 1:
+            # A genuine multi-event cluster: one frame per (evenly-sampled)
+            # event peak instead of a single straddle pair, so pass 2 sees
+            # every sub-moment even though it labels the cluster once.
+            sampled = _evenly_sample_events(v4_events, MAX_CLUSTER_EVENT_FRAMES)
+            frames = []
+            for ev in sampled:
+                ts = max(s, min(e - 1, int(ev.get("peak_ms", mid))))
+                frames.append(ts)
+            # Dedup near-identical timestamps (a tight cluster's evenly-sampled
+            # peaks can land within one hop of each other).
+            deduped: List[int] = []
+            for ts in frames:
+                if not deduped or not _too_close(ts, deduped[-1], hop_ms):
+                    deduped.append(ts)
+            if len(deduped) == 2:
+                mandatory_by_file.setdefault(file_id, []).append(
+                    PlannedFrame(file_id, deduped[0], REASON_CLUSTER_EVENT, ref, "early"))
+                second_moment_by_file.setdefault(file_id, []).append(
+                    PlannedFrame(file_id, deduped[1], REASON_CLUSTER_EVENT, ref, "late"))
+            else:
+                mand, extra = deduped[0], deduped[1:]
+                mandatory_by_file.setdefault(file_id, []).append(
+                    PlannedFrame(file_id, mand, REASON_CLUSTER_EVENT, ref, "only"))
+                for ts in extra:
+                    second_moment_by_file.setdefault(file_id, []).append(
+                        PlannedFrame(file_id, ts, REASON_CLUSTER_EVENT, ref, "only"))
+            continue
+
         if v4_sal.get("kind") == "point":
             peak_ms = int(v4_sal.get("peak_ms", mid))
             early = max(s, peak_ms - _STRADDLE_OFFSET_MS)

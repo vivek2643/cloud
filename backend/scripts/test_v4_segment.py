@@ -276,6 +276,122 @@ def test_sub_floor_sliver_never_welds_across_a_speech_gap():
 
 
 # --------------------------------------------------------------------------
+# Cluster + tree (v4_cluster_tree_cuts.plan.md section 10)
+# --------------------------------------------------------------------------
+
+def test_single_event_cluster_has_exactly_one_event():
+    """A cluster of one is the degenerate, backward-compatible case: exactly
+    one entry in salience.events, primary=0, top-level peak_ms/score/kind
+    mirroring it."""
+    n = 100
+    motion = _flat_motion(n)
+    motion["action_energy"] = ([0.05] * 40
+                                + [0.05, 0.1, 0.3, 0.7, 0.95, 0.9, 0.6, 0.3, 0.15, 0.08]
+                                + [0.05] * 50)
+    cuts = _segment(motion)
+    assert len(cuts) == 1, cuts
+    sal = cuts[0].salience
+    assert len(sal["events"]) == 1, sal
+    assert sal["primary"] == 0, sal
+    ev = sal["events"][0]
+    assert sal["peak_ms"] == ev["peak_ms"] and sal["score"] == ev["score"] and sal["kind"] == ev["kind"]
+    print("ok  test_single_event_cluster_has_exactly_one_event")
+
+
+def test_two_pans_both_kept_not_just_the_longest():
+    """The pan-loss regression (section 4.2): _camera_move_cores must return
+    EVERY sustained move, not just the longest one via max()."""
+    n = 100
+    motion = _flat_motion(n)
+    motion["camera_dx"] = [0.0] * 10 + [0.08] * 15 + [0.0] * 10 + [0.08] * 15 + [0.0] * 50
+    cuts = _segment(motion)
+    assert len(cuts) == 1, cuts   # close enough to fuse into one cluster
+    sal = cuts[0].salience
+    span_events = [ev for ev in sal["events"] if ev["kind"] == "span"]
+    assert len(span_events) == 2, sal["events"]
+    print("ok  test_two_pans_both_kept_not_just_the_longest")
+
+
+def test_peak_and_pan_coexist_in_one_span():
+    """A novelty peak and a camera move in the same working span must BOTH
+    survive as events (section 4.1's "no first-match early-exit")."""
+    n = 100
+    motion = _flat_motion(n)
+    motion["camera_dx"] = [0.0] * 60 + [0.08] * 30 + [0.0] * 10
+    ae = [0.05] * n
+    for i in range(10, 15):
+        ae[i] = 0.9
+    motion["action_energy"] = ae
+    cuts = _segment(motion)
+    kinds = sorted(ev["kind"] for c in cuts for ev in c.salience["events"])
+    assert "point" in kinds and "span" in kinds, kinds
+    print("ok  test_peak_and_pan_coexist_in_one_span")
+
+
+def test_tight_cluster_of_peaks_yields_one_cluster_with_n_events():
+    n = 200
+    motion = _flat_motion(n)
+    ae = [0.05] * n
+    for start in (20, 60, 100):
+        for i in range(start, start + 4):
+            ae[i] = 0.9
+    motion["action_energy"] = ae
+    cuts = _segment(motion, duration_ms=20_000)
+    assert len(cuts) == 1, cuts
+    assert len(cuts[0].salience["events"]) == 3, cuts[0].salience["events"]
+    print("ok  test_tight_cluster_of_peaks_yields_one_cluster_with_n_events")
+
+
+def test_big_gap_between_bursts_yields_two_clusters():
+    n = 200
+    motion = _flat_motion(n)
+    ae = [0.05] * n
+    for i in range(10, 14):
+        ae[i] = 0.9
+    for i in range(180, 184):
+        ae[i] = 0.9
+    motion["action_energy"] = ae
+    cuts = _segment(motion, duration_ms=20_000)
+    assert len(cuts) == 2, cuts
+    assert all(len(c.salience["events"]) == 1 for c in cuts), cuts
+    print("ok  test_big_gap_between_bursts_yields_two_clusters")
+
+
+def test_noisy_curve_near_one_burst_still_yields_one_event():
+    """A wiggly rise/fall around a single real burst must not register as
+    several near-duplicate events -- the dedup step keeps only the strongest
+    overlapping detection."""
+    n = 100
+    motion = _flat_motion(n)
+    motion["action_energy"] = ([0.05] * 40
+                                + [0.05, 0.1, 0.3, 0.7, 0.95, 0.9, 0.6, 0.3, 0.15, 0.08]
+                                + [0.05] * 50)
+    cuts = _segment(motion)
+    assert len(cuts) == 1, cuts
+    assert len(cuts[0].salience["events"]) == 1, cuts[0].salience["events"]
+    print("ok  test_noisy_curve_near_one_burst_still_yields_one_event")
+
+
+def test_merged_sliver_unions_events_not_drops_them():
+    """When _finalize_cuts welds a sub-floor sliver into a same-span
+    neighbor, the merged cut's events must be the UNION of both -- never
+    silently drop the sliver's own event."""
+    n = 100
+    motion = _flat_motion(n)
+    ae = [0.05] * n
+    for i in range(38, 42):
+        ae[i] = 0.9
+    for i in range(42, 46):
+        ae[i] = 0.9
+    motion["action_energy"] = ae
+    scene = {"shot_points": [{"ts_ms": 4200}]}
+    cuts = _segment(motion, scene=scene)
+    total_events = sum(len(c.salience["events"]) for c in cuts)
+    assert total_events >= 2, cuts
+    print("ok  test_merged_sliver_unions_events_not_drops_them")
+
+
+# --------------------------------------------------------------------------
 # density (feeds post.compute_pace_envelope's content-aware min_ms)
 # --------------------------------------------------------------------------
 
@@ -316,6 +432,13 @@ def main():
     test_finalize_cuts_merges_a_sub_floor_sliver_into_its_nearest_neighbor()
     test_lone_cut_below_the_floor_survives_with_no_neighbor_to_merge_into()
     test_sub_floor_sliver_never_welds_across_a_speech_gap()
+    test_single_event_cluster_has_exactly_one_event()
+    test_two_pans_both_kept_not_just_the_longest()
+    test_peak_and_pan_coexist_in_one_span()
+    test_tight_cluster_of_peaks_yields_one_cluster_with_n_events()
+    test_big_gap_between_bursts_yields_two_clusters()
+    test_noisy_curve_near_one_burst_still_yields_one_event()
+    test_merged_sliver_unions_events_not_drops_them()
     test_density_is_higher_for_a_dense_span_than_a_sparse_one()
     print("\nall v4_segment tests passed")
 

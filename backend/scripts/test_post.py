@@ -339,6 +339,35 @@ def test_v4_meta_by_ref_overrides_span_and_salience_and_stamps_shape():
     print("ok  test_v4_meta_by_ref_overrides_span_and_salience_and_stamps_shape")
 
 
+def test_v4_multi_event_cluster_salience_round_trips_untouched():
+    """v4_cluster_tree_cuts.plan.md: assemble_cut_records needs NO cluster-
+    specific logic -- it already copies v4_meta's whole salience dict
+    opaquely, so events/primary/density (and shape, stamped as always)
+    survive the round trip unchanged."""
+    events = [
+        {"peak_ms": 1000, "score": 0.5, "kind": "point", "onset_ms": 700, "settle_ms": 1300, "span_ms": None},
+        {"peak_ms": 5000, "score": 1.0, "kind": "point", "onset_ms": 4600, "settle_ms": 5400, "span_ms": None},
+    ]
+    p2 = Pass2Output(cuts=[
+        Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1", atom_ids=None,
+                label="rally", summary="two hits", shape="center"),
+    ])
+    v4_meta = {"video_group[0]": {
+        "src_in_ms": 0, "src_out_ms": 6000,
+        "salience": {"peak_ms": 5000, "score": 1.0, "kind": "point", "span_ms": None,
+                    "events": events, "primary": 1, "density": 0.5},
+        "density": 0.5,
+    }}
+    records = post.assemble_cut_records(p2, {"f1": _lattice()}, {"f1": _motion()}, {},
+                                        v4_meta_by_ref=v4_meta)
+    rec = records[0]
+    assert rec.salience["events"] == events, rec.salience
+    assert rec.salience["primary"] == 1, rec.salience
+    assert rec.salience["density"] == 0.5, rec.salience
+    assert rec.salience["shape"] == "center", rec.salience
+    print("ok  test_v4_multi_event_cluster_salience_round_trips_untouched")
+
+
 def test_v4_cut_smaller_than_any_atom_resolves_cleanly():
     """v4_cuts_as_primitive.plan.md section 1: the exact failure shape a
     free-form V4 span used to hit against the grounded atom grid -- a cut
@@ -916,6 +945,7 @@ def main():
     test_validate_no_overlap_allows_no_cuts()
     test_assemble_cut_records_end_to_end()
     test_v4_meta_by_ref_overrides_span_and_salience_and_stamps_shape()
+    test_v4_multi_event_cluster_salience_round_trips_untouched()
     test_v4_cut_smaller_than_any_atom_resolves_cleanly()
     test_v4_cut_straddling_an_atom_boundary_resolves_cleanly()
     test_v4_continuity_keys_off_cut_boundaries_not_atoms()

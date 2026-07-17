@@ -1,5 +1,6 @@
 """
-Cuts V4 -- the deterministic video segmenter (cuts_v4_segmentation.plan.md).
+Cuts V4 -- the deterministic video segmenter (cuts_v4_segmentation.plan.md,
+v4_cuts_as_primitive.plan.md, v4_cluster_tree_cuts.plan.md).
 
 Replaces the video half of pass 1's job (grouping atoms into
 ``VideoTentativeGroup``s) with a signal-driven extractor built on one
@@ -8,21 +9,28 @@ discard the rest. Default is to trim hard to the usable core, never "keep the
 whole clip". Speech is untouched (pass 1 still owns speech grouping + junk);
 this module only decides the NON-SPEECH remainder's cuts.
 
-Two rules threaded throughout, per the plan:
+Three rules threaded throughout, per the plans:
   * Salience = contrast/novelty (how much a moment stands out from its LOCAL
     surroundings), not absolute level, and not requiring audio+motion
     consensus -- either channel alone can produce a point; agreement only
     raises confidence (they simply add).
   * The VLM (pass 2, elsewhere) decides *shape* (semantic); this module (code)
     always decides *where* -- location is deterministic.
+  * A video cut is a CLUSTER, not a flat span: one continuous moment carrying
+    every salient EVENT inside it (point and span kinds coexisting). The
+    energy ladder (cutrecord_map.resolve_cluster) resolves that cluster into
+    the right piece-set at every level -- broad = the whole moment as one
+    cut, punchy = each event as its own tight piece. A cluster of exactly one
+    event degenerates to exactly today's single-window V4 cut at every level
+    (backward compatible by construction).
 
 Pure core: ``segment_video(...)`` takes already-loaded signals (the same
 ``motion``/``scene`` shapes ``lattice.build_atoms`` consumes) and chooses
-spans directly on the motion hop grid. v4_cuts_as_primitive.plan.md: V4 does
-NOT carve atoms and does not map cuts onto them at all -- a V4 cut's span IS
-the primitive, carried as-is to the brain; atoms remain only the SPEECH
-substrate (built elsewhere, in ``lattice.build_atoms``, untouched by this
-module). No model call, no DB call -- see ``scripts/test_v4_segment.py``.
+spans directly on the motion hop grid. V4 does NOT carve atoms and does not
+map cuts onto them at all -- a V4 cut's span IS the primitive, carried as-is
+to the brain; atoms remain only the SPEECH substrate (built elsewhere, in
+``lattice.build_atoms``, untouched by this module). No model call, no DB
+call -- see ``scripts/test_v4_segment.py``.
 """
 from __future__ import annotations
 
@@ -34,11 +42,12 @@ from app.services.l3.lattice import _subtract
 from app.services.l3.post import _mean, _norm_in_clip, _series_lohi, _span_slice
 from app.services.l3.v4_segment_params import (
     CAMERA_MOVE_COHERENCE_MIN, CAMERA_MOVE_MAGNITUDE_MIN, CAMERA_MOVE_MIN_MS,
-    DECAY_FRACTION, DENSITY_PEAKS_PER_SEC_CAP, EDGE_SNAP_SEARCH_MS,
-    EDGE_SNAP_STABILITY_MAX, FOLLOW_THROUGH_FLOOR_MS, MAX_PAD_MS,
-    MIN_CUT_DURATION_MS, MIN_CUT_GAP_MS, NOVELTY_ABSOLUTE_FLOOR,
-    NOVELTY_BASELINE_RADIUS_MS, PEAK_MIN_GAP_MS, PEAK_PROMINENCE_RATIO,
-    PERIODICITY_SCORE_THRESHOLD, REPRESENTATIVE_WINDOW_MS, RUN_UP_FLOOR_MS,
+    CLUSTER_SEPARATION_MULTIPLIER, DECAY_FRACTION, DENSITY_PEAKS_PER_SEC_CAP,
+    EDGE_SNAP_SEARCH_MS, EDGE_SNAP_STABILITY_MAX, FOLLOW_THROUGH_FLOOR_MS,
+    MAX_CLUSTER_SEPARATION_MS, MAX_PAD_MS, MIN_CUT_DURATION_MS, MIN_CUT_GAP_MS,
+    NOVELTY_ABSOLUTE_FLOOR, NOVELTY_BASELINE_RADIUS_MS, PEAK_MIN_GAP_MS,
+    PEAK_PROMINENCE_RATIO, PERIODICITY_SCORE_THRESHOLD, REPRESENTATIVE_WINDOW_MS,
+    RUN_UP_FLOOR_MS,
 )
 
 
@@ -47,13 +56,25 @@ class VideoCut:
     file_id: str
     src_in_ms: int
     src_out_ms: int
-    # {peak_ms, score, kind: "point"|"span"|"none", span_ms: [in,out]|None} --
-    # see post._salience's shape for the V3 analogue; V4 emits this directly
-    # (code-owned, never recomputed downstream -- section 4 of the plan).
+    # Multi-peak, v4_cluster_tree_cuts.plan.md section 3:
+    #   {"peak_ms", "score", "kind", "span_ms"}  -- events[primary]'s own
+    #     fields, broadcast to the top level so every existing single-anchor
+    #     reader (post.py, cutrecord_map._video_rung's single-event path,
+    #     image_plan's straddle bias, the frontend dial) keeps working
+    #     unchanged on a cluster of one.
+    #   "events": [{"peak_ms","score","kind","onset_ms","settle_ms",
+    #               "span_ms"}, ...] -- every salient event in this cluster,
+    #     time-ordered. The merge tree/dendrogram is DELIBERATELY not
+    #     materialized as a separate structure (section 4.3): it's fully
+    #     recoverable from this ordered list's own inter-event gaps (sort
+    #     ascending -> merge order), which is what resolve_cluster consumes.
+    #   "primary": index into "events" of the strongest one (by score).
+    #   "density": this cluster's own novelty-peak-rate stat, 0..1 (also
+    #     carried as VideoCut.density below for post.compute_pace_envelope).
     salience: Dict[str, Any] = field(default_factory=dict)
     # Event density/novelty stat (0..1) feeding post.compute_pace_envelope's
-    # content-aware min_ms (section 6): sparse/monotonous -> collapses hard;
-    # dense -> holds more room at the same energy.
+    # content-aware min_ms: sparse/monotonous -> collapses hard; dense ->
+    # holds more room at the same energy.
     density: float = 0.0
     # Transient (NOT persisted -- absent from to_dict): the working span this cut
     # was carved from. Lets _finalize_cuts weld a sub-floor sliver ONLY into a
@@ -235,7 +256,8 @@ def _novelty_curve(
 
 
 # --------------------------------------------------------------------------
-# Step 3: anchor selection
+# Step 3: event detection (every kind coexists -- v4_cluster_tree_cuts.plan.md
+# section 4.1/4.2)
 # --------------------------------------------------------------------------
 
 def _find_peaks(curve: List[float], min_gap_hops: int) -> List[int]:
@@ -281,12 +303,14 @@ def _true_runs(flags: List[bool]) -> List[Tuple[int, int]]:
     return runs
 
 
-def _camera_move_core(motion: dict, span: Tuple[int, int], hop_ms: int) -> Optional[Tuple[int, int]]:
-    """(start_ms, end_ms) of the dominant sustained, coherent camera move in
-    ``span``, or None -- Step 3.3. A hop counts as "moving" once its combined
+def _camera_move_cores(motion: dict, span: Tuple[int, int], hop_ms: int) -> List[Tuple[int, int]]:
+    """(start_ms, end_ms) of EVERY sustained, coherent camera move in
+    ``span`` -- v4_cluster_tree_cuts.plan.md section 4.2 (the pan-loss bug):
+    a SECOND good pan must not be silently dropped just because an earlier
+    one happened to be longer. A hop counts as "moving" once its combined
     |dx|+|dy|+|zoom| clears CAMERA_MOVE_MAGNITUDE_MIN AND coherence clears
-    CAMERA_MOVE_COHERENCE_MIN (deliberate, not shake); the longest such run
-    must sustain CAMERA_MOVE_MIN_MS to count as a real payload."""
+    CAMERA_MOVE_COHERENCE_MIN (deliberate, not shake); each run must sustain
+    CAMERA_MOVE_MIN_MS to count as a real payload."""
     s, e = span
     dx = _span_slice(motion.get("camera_dx") or [], hop_ms, s, e)
     dy = _span_slice(motion.get("camera_dy") or [], hop_ms, s, e)
@@ -294,7 +318,7 @@ def _camera_move_core(motion: dict, span: Tuple[int, int], hop_ms: int) -> Optio
     coh = _span_slice(motion.get("camera_coherence") or [], hop_ms, s, e)
     n = max(len(dx), len(dy), len(dz))
     if n == 0:
-        return None
+        return []
 
     def _at(arr: List[float], i: int, default: float) -> float:
         return arr[i] if i < len(arr) else default
@@ -304,13 +328,12 @@ def _camera_move_core(motion: dict, span: Tuple[int, int], hop_ms: int) -> Optio
         and _at(coh, i, 0.0) >= CAMERA_MOVE_COHERENCE_MIN
         for i in range(n)
     ]
-    runs = _true_runs(moving)
-    if not runs:
-        return None
-    start_i, end_i = max(runs, key=lambda r: r[1] - r[0])
-    if (end_i - start_i) * hop_ms < CAMERA_MOVE_MIN_MS:
-        return None
-    return s + start_i * hop_ms, min(e, s + end_i * hop_ms)
+    out: List[Tuple[int, int]] = []
+    for start_i, end_i in _true_runs(moving):
+        if (end_i - start_i) * hop_ms < CAMERA_MOVE_MIN_MS:
+            continue
+        out.append((s + start_i * hop_ms, min(e, s + end_i * hop_ms)))
+    return out
 
 
 def _representative_window(motion: dict, span: Tuple[int, int], hop_ms: int) -> Tuple[int, int]:
@@ -338,7 +361,13 @@ def _representative_window(motion: dict, span: Tuple[int, int], hop_ms: int) -> 
 
 
 # --------------------------------------------------------------------------
-# Step 4: edges
+# Step 4: edges. onset_ms/settle_ms are the RAW decay-walk bounds (no floor,
+# no MAX_PAD, no quality snap) -- the event's own natural, content-derived
+# reach, persisted so resolve_cluster can interpolate a per-event window at
+# any energy. _broad_window_for_event separately derives the FLOOR/MAX_PAD-
+# clamped, quality-snapped "broad" (energy=0) window from those raw bounds --
+# byte-identical to the pre-cluster _point_edges formula, used for cluster
+# grouping and the single-event fast path.
 # --------------------------------------------------------------------------
 
 def _decay_bound(curve: List[float], peak_i: int, direction: int, floor_i: int, ceil_i: int) -> int:
@@ -378,24 +407,58 @@ def _snap_to_quality_gate(motion: dict, hop_ms: int, ts_ms: int, lo_ms: int, hi_
     return best_i * hop_ms if stability[best_i] <= EDGE_SNAP_STABILITY_MAX else ts_ms
 
 
-def _point_edges(curve: List[float], span: Tuple[int, int], hop_ms: int,
-                  peak_i: int, motion: dict) -> Tuple[int, int]:
+def _score_at(curve: List[float], i: int) -> float:
+    lo, hi = min(curve), max(curve)
+    if hi - lo < 1e-9:
+        return 1.0 if curve[i] > 0 else 0.0
+    return max(0.0, min(1.0, (curve[i] - lo) / (hi - lo)))
+
+
+def _point_event(curve: List[float], span: Tuple[int, int], hop_ms: int,
+                  peak_i: int, peak_ms_override: Optional[int] = None) -> Dict[str, Any]:
+    """One point event from a novelty-curve peak (or a transition seam, via
+    ``peak_ms_override``): peak_ms/score plus the RAW decay-walk onset/settle
+    (unclamped -- see module note above)."""
     s, _e = span
     n = len(curve)
     back_i = _decay_bound(curve, peak_i, -1, 0, n - 1)
     fwd_i = _decay_bound(curve, peak_i, +1, 0, n - 1)
-    run_up = max(RUN_UP_FLOOR_MS, min(MAX_PAD_MS, (peak_i - back_i) * hop_ms))
-    follow_through = max(FOLLOW_THROUGH_FLOOR_MS, min(MAX_PAD_MS, (fwd_i - peak_i) * hop_ms))
-    peak_ms = s + peak_i * hop_ms
-    in_ms = max(span[0], peak_ms - run_up)
-    out_ms = min(span[1], peak_ms + follow_through)
-    in_ms = _snap_to_quality_gate(motion, hop_ms, in_ms, span[0], peak_ms)
-    out_ms = _snap_to_quality_gate(motion, hop_ms, out_ms, peak_ms, span[1])
-    return min(in_ms, peak_ms), max(out_ms, peak_ms)
+    peak_ms = peak_ms_override if peak_ms_override is not None else s + peak_i * hop_ms
+    onset_ms = min(s + back_i * hop_ms, peak_ms)
+    settle_ms = max(s + fwd_i * hop_ms, peak_ms)
+    return {"peak_ms": peak_ms, "score": _score_at(curve, peak_i), "kind": "point",
+            "onset_ms": onset_ms, "settle_ms": settle_ms, "span_ms": None}
+
+
+def _broad_window_for_event(event: Dict[str, Any], motion: dict, hop_ms: int,
+                            span: Tuple[int, int]) -> Tuple[int, int]:
+    """The event's own BROAD (energy=0) window -- floor/MAX_PAD-clamped and
+    quality-gate-snapped. Byte-identical to the pre-cluster _point_edges
+    formula for a point event (given the RAW onset/settle _point_event
+    produces), so a cluster of one event reproduces today's V4 span exactly.
+    A span event's own core, clamped to the working span; the representative-
+    window fallback's own bounds verbatim (already inside the span)."""
+    kind = event.get("kind")
+    if kind == "span":
+        s0, e0 = event["span_ms"]
+        return max(span[0], int(s0)), min(span[1], int(e0))
+    if kind == "none":
+        return event["onset_ms"], event["settle_ms"]
+    peak = event["peak_ms"]
+    run_up = max(RUN_UP_FLOOR_MS, min(MAX_PAD_MS, peak - event["onset_ms"]))
+    follow_through = max(FOLLOW_THROUGH_FLOOR_MS, min(MAX_PAD_MS, event["settle_ms"] - peak))
+    in_ms = max(span[0], peak - run_up)
+    out_ms = min(span[1], peak + follow_through)
+    in_ms = _snap_to_quality_gate(motion, hop_ms, in_ms, span[0], peak)
+    out_ms = _snap_to_quality_gate(motion, hop_ms, out_ms, peak, span[1])
+    return min(in_ms, peak), max(out_ms, peak)
 
 
 # --------------------------------------------------------------------------
-# Step 5/6: per-working-span anchors -> candidate cuts, consolidated
+# Step 3 (cont'd): collect EVERY event in a working span -- point and span
+# kinds coexisting (v4_cluster_tree_cuts.plan.md section 4.1). The
+# representative-window fallback fires only when the span produced no
+# events of any kind at all.
 # --------------------------------------------------------------------------
 
 def _novelty_density(curve: List[float], hop_ms: int) -> float:
@@ -407,90 +470,153 @@ def _novelty_density(curve: List[float], hop_ms: int) -> float:
     return max(0.0, min(1.0, len(peaks) / dur_s / DENSITY_PEAKS_PER_SEC_CAP))
 
 
-def _score_at(curve: List[float], i: int) -> float:
-    lo, hi = min(curve), max(curve)
-    if hi - lo < 1e-9:
-        return 1.0 if curve[i] > 0 else 0.0
-    return max(0.0, min(1.0, (curve[i] - lo) / (hi - lo)))
+def _dedupe_point_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Merge point events whose decay-walk windows overlap into ONE (the
+    stronger by score) -- a noisy/wiggly curve near a single real burst can
+    surface several nearby local maxima that all clear the prominence bar
+    (e.g. a slight dip mid-rise, or on the way back down), and those are
+    detections of the SAME moment, not separate events. Span events pass
+    through untouched (§4.2 wants every sustained move kept, not deduped)."""
+    points = sorted((ev for ev in events if ev["kind"] == "point"), key=lambda ev: ev["onset_ms"])
+    others = [ev for ev in events if ev["kind"] != "point"]
+    merged: List[Dict[str, Any]] = []
+    for ev in points:
+        if merged and ev["onset_ms"] <= merged[-1]["settle_ms"]:
+            if ev["score"] > merged[-1]["score"]:
+                merged[-1] = ev
+        else:
+            merged.append(ev)
+    return merged + others
 
 
-def _candidates_for_span(
+def _events_for_span(
     span: Tuple[int, int], motion: dict, audio: dict, hop_ms: int,
     ae_lohi: Tuple[Optional[float], Optional[float]], rms_lohi: Tuple[Optional[float], Optional[float]],
-) -> List[Tuple[int, int, Dict[str, Any]]]:
-    """[(in_ms, out_ms, salience_dict), ...] for one working span, anchors
-    chosen in preference order (Step 3), edges carved per anchor kind
-    (Step 4). Always >= 1 candidate (the representative-window fallback)."""
+) -> Tuple[List[Dict[str, Any]], float]:
+    """Every salient event in one working span, plus this span's own density
+    stat. Point events (transition seams + novelty peaks) and span events
+    (every sustained camera move) all coexist -- never a first-match
+    early-exit. Falls back to one synthetic kind="none" representative-window
+    event only when nothing else fired at all."""
     s, e = span
-    density_curve = _novelty_curve(span, motion, audio, hop_ms, ae_lohi, rms_lohi)
-    density = _novelty_density(density_curve, hop_ms)
+    curve = _novelty_curve(span, motion, audio, hop_ms, ae_lohi, rms_lohi)
+    density = _novelty_density(curve, hop_ms)
 
-    # 1. Transition points strictly inside the span -- a premium natural seam.
+    events: List[Dict[str, Any]] = []
+
+    # Transition seams -- a premium natural seam, always a point event.
     transitions = [int(p["ts_ms"]) for p in (motion.get("transition_points") or [])
                    if s < int(p.get("ts_ms", -1)) < e]
-    out: List[Tuple[int, int, Dict[str, Any]]] = []
-    if transitions and density_curve:
+    transition_idxs: set = set()
+    if curve:
         for ts in transitions:
-            i = min(max((ts - s) // hop_ms, 0), len(density_curve) - 1)
-            in_ms, out_ms = _point_edges(density_curve, span, hop_ms, i, motion)
-            out.append((in_ms, out_ms, {"peak_ms": ts, "score": _score_at(density_curve, i),
-                                         "kind": "point", "span_ms": None}))
+            i = min(max((ts - s) // hop_ms, 0), len(curve) - 1)
+            transition_idxs.add(i)
+            events.append(_point_event(curve, span, hop_ms, i, peak_ms_override=ts))
 
-    # 2. Novelty peaks clearing the span's own prominence bar.
-    if not out and density_curve:
-        peaks = _prominent_peaks(density_curve, hop_ms)
-        for i in peaks:
-            in_ms, out_ms = _point_edges(density_curve, span, hop_ms, i, motion)
-            peak_ms = s + i * hop_ms
-            out.append((in_ms, out_ms, {"peak_ms": peak_ms, "score": _score_at(density_curve, i),
-                                         "kind": "point", "span_ms": None}))
+    # Novelty peaks clearing the span's own prominence bar -- point events.
+    # Skip an index already emitted as a transition (same instant, not a
+    # second event).
+    if curve:
+        for i in _prominent_peaks(curve, hop_ms):
+            if i in transition_idxs:
+                continue
+            events.append(_point_event(curve, span, hop_ms, i))
 
-    # 3. Camera-move payload -- a SPAN anchor, not a point.
-    if not out:
-        core = _camera_move_core(motion, span, hop_ms)
-        if core is not None:
-            core_s, core_e = core
-            coh = _span_slice(motion.get("camera_coherence") or [], hop_ms, core_s, core_e)
-            score = max(0.0, min(1.0, _mean(coh) or 0.0))
-            out.append((core_s, core_e, {"peak_ms": core_s + (core_e - core_s) // 2, "score": score,
-                                          "kind": "span", "span_ms": [core_s, core_e]}))
+    events = _dedupe_point_events(events)
 
-    # 4. Fallback: representative window, salience kind="none".
-    if not out:
+    # EVERY sustained camera move -- span events (never just the longest).
+    for core_s, core_e in _camera_move_cores(motion, span, hop_ms):
+        coh = _span_slice(motion.get("camera_coherence") or [], hop_ms, core_s, core_e)
+        score = max(0.0, min(1.0, _mean(coh) or 0.0))
+        events.append({"peak_ms": core_s + (core_e - core_s) // 2, "score": score,
+                       "kind": "span", "onset_ms": core_s, "settle_ms": core_e,
+                       "span_ms": [core_s, core_e]})
+
+    if not events:
         win_s, win_e = _representative_window(motion, span, hop_ms)
-        out.append((win_s, win_e, {"peak_ms": win_s + (win_e - win_s) // 2, "score": 0.0,
-                                    "kind": "none", "span_ms": None}))
+        events.append({"peak_ms": win_s + (win_e - win_s) // 2, "score": 0.0,
+                       "kind": "none", "onset_ms": win_s, "settle_ms": win_e, "span_ms": None})
 
-    for i in range(len(out)):
-        s0, e0, sal = out[i]
-        out[i] = (s0, e0, dict(sal, density=density))
-    return out
+    return events, density
 
 
-def _consolidate(cuts: List[Tuple[int, int, Dict[str, Any]]]) -> List[Tuple[int, int, Dict[str, Any]]]:
-    """Merge any two candidates whose gap (or overlap) is below
-    MIN_CUT_GAP_MS, keeping the stronger anchor's salience, spanning the
-    union -- Step 5. Guarantees zero overlap as a side effect (any actual
-    overlap has a negative gap, which is always < the floor)."""
-    ordered = sorted(cuts, key=lambda c: c[0])
-    out: List[Tuple[int, int, Dict[str, Any]]] = []
-    for c in ordered:
-        if out and c[0] - out[-1][1] < MIN_CUT_GAP_MS:
-            prev = out[-1]
-            keep_sal = prev[2] if prev[2].get("score", 0.0) >= c[2].get("score", 0.0) else c[2]
-            out[-1] = (min(prev[0], c[0]), max(prev[1], c[1]), keep_sal)
+# --------------------------------------------------------------------------
+# Step 5: cluster grouping -- events close enough to fuse (at the broadest
+# window) belong to one cluster (one VideoCut); a big dead gap starts a new
+# one (v4_cluster_tree_cuts.plan.md section 4.3). The merge tree is the
+# ordered event list itself (sort inter-event gaps ascending -> merge order)
+# -- deliberately not materialized as a separate structure; resolve_cluster
+# (cutrecord_map.py) consumes the ordered events + their own onset/settle
+# directly.
+# --------------------------------------------------------------------------
+
+def _cluster_separation_ms(gaps: List[int]) -> int:
+    """The gap a working span's OWN event spacing has to clear to count as a
+    genuine break, not just this burst's normal rhythm -- content-derived
+    (a multiple of the span's own median inter-event gap), clamped to
+    [MIN_CUT_GAP_MS, MAX_CLUSTER_SEPARATION_MS] so one outlier gap in a tiny
+    sample can't blow the threshold out, and a very tight span still gets
+    some separation floor. Degenerate (no positive gaps) -> the floor."""
+    positive = [g for g in gaps if g > 0]
+    if not positive:
+        return MIN_CUT_GAP_MS
+    return int(max(MIN_CUT_GAP_MS, min(MAX_CLUSTER_SEPARATION_MS,
+                                       statistics.median(positive) * CLUSTER_SEPARATION_MULTIPLIER)))
+
+
+def _cluster_events(events: List[Dict[str, Any]], motion: dict, hop_ms: int,
+                    span: Tuple[int, int]) -> List[List[Dict[str, Any]]]:
+    """Group one working span's events into clusters by their own BROAD
+    (energy=0) window gaps -- the same window ``_broad_window_for_event``
+    already computes for cluster-extent purposes, so "close enough to fuse
+    at the broadest window" is judged on the exact windows that fusion would
+    use. Always >= 1 cluster when ``events`` is non-empty."""
+    if not events:
+        return []
+    windows = sorted(((_broad_window_for_event(ev, motion, hop_ms, span), ev) for ev in events),
+                     key=lambda x: x[0][0])
+    gaps = [windows[i + 1][0][0] - windows[i][0][1] for i in range(len(windows) - 1)]
+    threshold = _cluster_separation_ms(gaps)
+    clusters: List[List[Dict[str, Any]]] = [[windows[0][1]]]
+    for i in range(1, len(windows)):
+        gap = windows[i][0][0] - windows[i - 1][0][1]
+        if gap > threshold:
+            clusters.append([windows[i][1]])
         else:
-            out.append(c)
-    return out
+            clusters[-1].append(windows[i][1])
+    return clusters
 
+
+def _build_salience(events: List[Dict[str, Any]], density: float) -> Dict[str, Any]:
+    """The multi-peak salience dict (v4_cluster_tree_cuts.plan.md section 3):
+    events + which one is strongest (primary) + this cluster's density,
+    PLUS the primary event's own fields broadcast to the top level so every
+    existing single-anchor reader keeps working unchanged."""
+    primary = max(range(len(events)), key=lambda i: events[i].get("score", 0.0))
+    prim = events[primary]
+    return {
+        "peak_ms": prim["peak_ms"], "score": prim["score"], "kind": prim["kind"],
+        "span_ms": prim["span_ms"],
+        "events": [dict(ev) for ev in events],
+        "primary": primary,
+        "density": density,
+    }
+
+
+# --------------------------------------------------------------------------
+# Step 6: finalize -- geometry only, no atoms in this loop at all
+# (v4_cuts_as_primitive.plan.md section 6).
+# --------------------------------------------------------------------------
 
 def _merge_pair(cuts: List[VideoCut], j: int) -> List[VideoCut]:
     """Merge ``cuts[j]`` into whichever SAME-WORKING-SPAN neighbor it sits closer
-    to (by gap), keeping the stronger anchor's salience -- the same merge shape
-    ``_consolidate`` uses within one working span. Only same-span neighbors are
-    eligible: welding across the gap between two spans (a speech span, or another
-    shot) would produce a union that swallows the content between them. Caller
-    guarantees at least one same-span neighbor exists."""
+    to (by gap) -- the union's events are the UNION of both clusters' events
+    (never just one side's salience wholesale, or a merged sliver's own event(s)
+    would silently vanish), re-scored via _build_salience. Only same-span
+    neighbors are eligible: welding across the gap between two spans (a speech
+    span, or another shot) would produce a union that swallows the content
+    between them. Caller guarantees at least one same-span neighbor exists."""
     same = cuts[j].span_key
     left = j - 1 if j - 1 >= 0 and cuts[j - 1].span_key == same else None
     right = j + 1 if j + 1 < len(cuts) and cuts[j + 1].span_key == same else None
@@ -502,28 +628,31 @@ def _merge_pair(cuts: List[VideoCut], j: int) -> List[VideoCut]:
         left if _gap(left) <= _gap(right) else right))
     a_, b_ = (pick, j) if pick < j else (j, pick)
     ca, cb = cuts[a_], cuts[b_]
-    keep_sal = ca.salience if ca.salience.get("score", 0.0) >= cb.salience.get("score", 0.0) else cb.salience
+    events = list(ca.salience.get("events") or []) + list(cb.salience.get("events") or [])
+    density = max(ca.density, cb.density)
     merged = VideoCut(file_id=ca.file_id, src_in_ms=min(ca.src_in_ms, cb.src_in_ms),
                       src_out_ms=max(ca.src_out_ms, cb.src_out_ms),
-                      salience=dict(keep_sal), density=max(ca.density, cb.density),
+                      salience=_build_salience(events, density), density=density,
                       span_key=same)
     return cuts[:a_] + [merged] + cuts[b_ + 1:]
 
 
 def _finalize_cuts(cuts: List[VideoCut]) -> List[VideoCut]:
-    """Enforce the two invariants per-span logic can't, over ALL of a file's
-    cuts -- geometry only; no atoms in this loop at all
-    (v4_cuts_as_primitive.plan.md section 6):
+    """Enforce the two invariants per-cluster logic can't, over ALL of a
+    file's cuts -- geometry only; no atoms in this loop at all:
 
-    * DISJOINT, CLAMPED TO ITS OWN WORKING SPAN. ``_consolidate`` only dedupes
-      WITHIN one working span; a cut whose edge was extended (peak +/-
-      run-up/follow-through, or a camera move's settle) past its span can
-      still collide with the next span's cut. Clamp the earlier cut's out
-      down to the later cut's in.
-    * MIN-DURATION FLOOR. A cut left too short by that clamp (or an unusually
-      tight anchor) isn't a distinct usable moment on its own -- merge it
-      into whichever neighbor it sits closer to (by duration, never by
-      atom-ownership -- the good reason the old merge existed, kept)."""
+    * DISJOINT, CLAMPED TO ITS OWN WORKING SPAN. Cluster grouping only
+      dedupes WITHIN one working span; a cluster whose edge was extended
+      (an event's own run-up/follow-through, or a camera move's settle)
+      past its span can still collide with the next span's cluster. Clamp
+      the earlier cut's out down to the later cut's in.
+    * MIN-DURATION FLOOR. A cluster left too short by that clamp (or an
+      unusually tight single-event anchor) isn't a distinct usable moment
+      on its own -- merge it into whichever same-span neighbor it sits
+      closer to. A cluster spanning multiple events is never below the
+      floor by construction (events have gaps between them), so this only
+      ever affects a degenerate single-event cluster -- unchanged behavior
+      there from the pre-cluster V4."""
     if not cuts:
         return cuts
     cuts = sorted(cuts, key=lambda c: c.src_in_ms)
@@ -561,8 +690,9 @@ def segment_video(
     motion: Dict[str, Any], audio: Dict[str, Any], scene: Dict[str, Any],
 ) -> List[VideoCut]:
     """The non-speech remainder of one file -> a small set of tight, salient
-    video cuts (never the whole span by default). Pure and deterministic:
-    same signals always produce the same cuts."""
+    video CLUSTERS (never the whole span by default), each carrying every
+    event inside it. Pure and deterministic: same signals always produce the
+    same clusters."""
     motion = motion or {}
     audio = audio or {}
     scene = scene or {}
@@ -590,20 +720,15 @@ def segment_video(
 
     cuts: List[VideoCut] = []
     for span in spans:
-        candidates = _candidates_for_span(span, motion, audio, hop_ms, ae_lohi, rms_lohi)
-        for in_ms, out_ms, sal in _consolidate(candidates):
-            # Clamp to the working span: edge selection (peak +/- run-up/
-            # follow-through) and camera-move extension can push an edge PAST
-            # the span, so a cut leaks into the next shot's cut (video<->video)
-            # or an adjacent speech span (video<->speech) -- both are the
-            # post/pass2 "spans must be disjoint" failures. The span is already
-            # non-speech and single-shot, so clamping guarantees disjointness.
-            in_ms = max(in_ms, span[0])
-            out_ms = min(out_ms, span[1])
+        events, density = _events_for_span(span, motion, audio, hop_ms, ae_lohi, rms_lohi)
+        for cluster in _cluster_events(events, motion, hop_ms, span):
+            windows = [_broad_window_for_event(ev, motion, hop_ms, span) for ev in cluster]
+            in_ms = max(span[0], min(w[0] for w in windows))
+            out_ms = min(span[1], max(w[1] for w in windows))
             if out_ms <= in_ms:
                 continue
-            density = sal.pop("density", 0.0)
             cuts.append(VideoCut(file_id=file_id, src_in_ms=in_ms, src_out_ms=out_ms,
-                                 salience=sal, density=density, span_key=span))
+                                 salience=_build_salience(cluster, density), density=density,
+                                 span_key=span))
     cuts.sort(key=lambda c: c.src_in_ms)
     return _finalize_cuts(cuts)

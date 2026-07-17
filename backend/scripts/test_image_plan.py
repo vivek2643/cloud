@@ -294,6 +294,45 @@ def test_v4_point_salience_straddles_the_peak():
     print("ok  test_v4_point_salience_straddles_the_peak")
 
 
+def test_v4_multi_event_cluster_samples_one_frame_per_event():
+    atoms = [_atom(0, 0, 10000, anchors=[])]
+    lat = _lattice_with_atoms("f1", 0, atoms)
+    pass1 = Pass1Output(video_tentative_groups=[VideoTentativeGroup(file_id="f1", atom_ids=[0])])
+    events = [
+        {"peak_ms": 1000, "score": 0.5, "kind": "point", "onset_ms": 700, "settle_ms": 1300, "span_ms": None},
+        {"peak_ms": 5000, "score": 1.0, "kind": "point", "onset_ms": 4600, "settle_ms": 5400, "span_ms": None},
+        {"peak_ms": 9000, "score": 0.4, "kind": "point", "onset_ms": 8700, "settle_ms": 9400, "span_ms": None},
+    ]
+    v4_meta = {"video_group[0]": {"src_in_ms": 0, "src_out_ms": 10000,
+                                  "salience": {"peak_ms": 5000, "score": 1.0, "kind": "point",
+                                             "span_ms": None, "events": events, "primary": 1}}}
+    frames = ip.build_image_plan(pass1, {"f1": lat}, {}, {}, {}, v4_meta_by_ref=v4_meta)
+    assert len(frames) == 3, frames
+    assert all(f.reason == ip.REASON_CLUSTER_EVENT for f in frames), frames
+    ts = sorted(f.ts_ms for f in frames)
+    assert ts == [1000, 5000, 9000], ts
+    print("ok  test_v4_multi_event_cluster_samples_one_frame_per_event")
+
+
+def test_v4_multi_event_cluster_caps_frames_at_max_and_samples_evenly():
+    atoms = [_atom(0, 0, 10000, anchors=[])]
+    lat = _lattice_with_atoms("f1", 0, atoms)
+    pass1 = Pass1Output(video_tentative_groups=[VideoTentativeGroup(file_id="f1", atom_ids=[0])])
+    events = [{"peak_ms": ts, "score": 0.5, "kind": "point", "onset_ms": ts - 200,
+              "settle_ms": ts + 200, "span_ms": None} for ts in range(500, 10000, 700)]
+    assert len(events) > ip.MAX_CLUSTER_EVENT_FRAMES
+    v4_meta = {"video_group[0]": {"src_in_ms": 0, "src_out_ms": 10000,
+                                  "salience": {"peak_ms": events[0]["peak_ms"], "score": 0.5, "kind": "point",
+                                             "span_ms": None, "events": events, "primary": 0}}}
+    frames = ip.build_image_plan(pass1, {"f1": lat}, {}, {}, {}, v4_meta_by_ref=v4_meta)
+    assert len(frames) <= ip.MAX_CLUSTER_EVENT_FRAMES, frames
+    # evenly sampled -> first and last event's peak must both be represented
+    ts = sorted(f.ts_ms for f in frames)
+    assert ts[0] == events[0]["peak_ms"], ts
+    assert ts[-1] == events[-1]["peak_ms"], ts
+    print("ok  test_v4_multi_event_cluster_caps_frames_at_max_and_samples_evenly")
+
+
 def test_v4_none_kind_uses_segmenter_span_not_atom_bounds():
     """A V4 cut's frame timestamps must fall inside the segmenter's own
     (tighter) span, never the wider atom-membership bounding box the ref's
@@ -351,6 +390,8 @@ def main():
     test_runt_speech_cut_stays_single_frame()
     test_anchored_video_group_gets_first_and_last_anchor_when_far_apart()
     test_v4_point_salience_straddles_the_peak()
+    test_v4_multi_event_cluster_samples_one_frame_per_event()
+    test_v4_multi_event_cluster_caps_frames_at_max_and_samples_evenly()
     test_v4_none_kind_uses_segmenter_span_not_atom_bounds()
     test_unknown_file_id_skipped_gracefully()
     test_no_pass1_content_yields_no_frames()

@@ -508,13 +508,16 @@ _SYSTEM_PREFIX = (
     "below -- the pass-1 result may mention other clips, but those are "
     "handled in separate calls; never emit a cut for a clip you were not "
     "shown images for.\n\n"
-    "You may see up to TWO frames for one cut, labelled early/late in their "
-    "captions: they are the SAME cut at two different moments. Read them "
-    "TOGETHER and describe what CHANGES between them (a gesture completing, "
-    "a camera move, an expression shifting, an object entering/leaving "
-    "frame) -- that change IS the content worth judging. NEVER emit two cut "
-    "records for one source_ref just because it has two frames; it is still "
-    "exactly one cut (see the one-record-per-ref rule below).\n\n"
+    "You may see more than one frame for one cut. Two frames labelled "
+    "early/late in their captions are a PAIR, the SAME cut at two different "
+    "moments -- read them TOGETHER and describe what CHANGES between them "
+    "(a gesture completing, a camera move, an expression shifting, an "
+    "object entering/leaving frame) -- that change IS the content worth "
+    "judging. More than two frames for one cut are separate glimpses across "
+    "a busier moment, not a pair -- read across all of them for the overall "
+    "arc, still one judgment. NEVER emit more than one cut record for one "
+    "source_ref just because it has multiple frames; it is still exactly "
+    "one cut (see the one-record-per-ref rule below).\n\n"
 )
 
 # cuts_v4_segmentation.plan.md / v4_cuts_as_primitive.plan.md section 3.2:
