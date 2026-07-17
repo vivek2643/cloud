@@ -129,6 +129,14 @@ class Settings(BaseSettings):
     # Only affects the gemini pass-2 path.
     ingest_pass2_thinking: str = "low"
 
+    # cuts_v4_segmentation.plan.md: "v3" keeps the LLM-grouped video-cut path
+    # (pass1.video_tentative_groups); "v4" replaces JUST the non-speech video
+    # segmentation with a deterministic, signal-driven extractor
+    # (app.services.l3.v4_segment) that trims each raw span to its usable
+    # core instead of keeping it whole. Speech stays on pass 1 either way.
+    # Same cut_record contract both ways -- flip freely per ingest run.
+    cuts_segmenter: str = "v3"
+
     @property
     def r2_endpoint(self) -> str:
         return f"https://{self.r2_account_id}.r2.cloudflarestorage.com"

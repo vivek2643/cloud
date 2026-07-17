@@ -40,6 +40,12 @@ REASON_SPEECH_CUT = "speech_cut"
 REASON_VIDEO_GROUP_ANCHOR = "video_group_anchor"
 REASON_VIDEO_GROUP_CALM = "video_group_calm"
 REASON_COMPOSITION_DRIFT = "composition_drift"
+# cuts_v4_segmentation.plan.md section 7: for a V4 video cut with a "point"
+# salience, the two frames straddle the peak (one shortly before, one shortly
+# after) instead of the generic early/late halves -- so pass 2 can actually
+# tell before/after/both apart, since it never sees a timestamp.
+REASON_SHAPE_STRADDLE = "shape_straddle"
+_STRADDLE_OFFSET_MS = 400
 # The 2nd (early/late pairing) frame for a unit that clears the runt guard --
 # its own extras tier, ranked above extra_anchors/drift but below the 1st
 # (mandatory, never-dropped) frame per unit (module docstring).
@@ -151,11 +157,15 @@ def build_image_plan(
     motion_by_file: Dict[str, Dict[str, Any]],
     scene_by_file: Dict[str, Dict[str, Any]],
     silences_by_file: Dict[str, List[dict]],
+    v4_meta_by_ref: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[PlannedFrame]:
     """Turn pass 1's output into a concrete, budgeted list of frames to pull
     and hand to pass 2. Deterministic: same inputs always produce the same
     plan. Files absent from ``lattices`` are silently skipped (not yet
-    ingest-ready)."""
+    ingest-ready). ``v4_meta_by_ref`` (cuts_v4_segmentation.plan.md): {ref:
+    {"salience": {...}, ...}} for a V4 ingest's video cuts -- a "point"
+    salience straddles its peak instead of the generic early/late split (see
+    REASON_SHAPE_STRADDLE). None/empty -> identical to today (V3)."""
     # --- Pass 0: resolve every mandatory unit's (file_id, s, e, ...) up
     # front -- needed BEFORE deciding 1-vs-2 frames, since the runt guard
     # compares a unit's span against its OWN clip's median unit span.
@@ -178,7 +188,19 @@ def build_image_plan(
     for gi, vg in enumerate(pass1.video_tentative_groups):
         if vg.file_id not in lattices:
             continue
-        s, e, anchors = _atom_group_span(lattices, vg.file_id, vg.atom_ids)
+        ref0 = f"video_group[{gi}]"
+        v4_meta = (v4_meta_by_ref or {}).get(ref0)
+        if v4_meta is not None:
+            # The segmenter's own tight span, NOT the bounding box of the
+            # (coarser, informational-only) atoms it happens to overlap --
+            # using the atom span here would let mandatory/extra frames land
+            # outside what the V4 cut actually plays. No atom-derived
+            # anchors either: a "point" salience gets its own straddle
+            # frames below; "span"/"none" fall through to the calm+sharp
+            # instant within the segmenter's real bounds.
+            s, e, anchors = int(v4_meta["src_in_ms"]), int(v4_meta["src_out_ms"]), []
+        else:
+            s, e, anchors = _atom_group_span(lattices, vg.file_id, vg.atom_ids)
         if e <= s:
             continue
         video_units.append((vg.file_id, s, e, anchors, f"video_group[{gi}]"))
@@ -258,6 +280,21 @@ def build_image_plan(
         hop_ms = int(motion.get("hop_ms") or 0)
         mid = s + (e - s) // 2
         quarter = max(1, (e - s) // 4)
+
+        v4_sal = ((v4_meta_by_ref or {}).get(ref) or {}).get("salience") or {}
+        if v4_sal.get("kind") == "point":
+            peak_ms = int(v4_sal.get("peak_ms", mid))
+            early = max(s, peak_ms - _STRADDLE_OFFSET_MS)
+            late = min(e - 1, peak_ms + _STRADDLE_OFFSET_MS)
+            if late > early and not _too_close(early, late, hop_ms):
+                mandatory_by_file.setdefault(file_id, []).append(
+                    PlannedFrame(file_id, early, REASON_SHAPE_STRADDLE, ref, "early"))
+                second_moment_by_file.setdefault(file_id, []).append(
+                    PlannedFrame(file_id, late, REASON_SHAPE_STRADDLE, ref, "late"))
+            else:
+                mandatory_by_file.setdefault(file_id, []).append(
+                    PlannedFrame(file_id, peak_ms, REASON_SHAPE_STRADDLE, ref, "only"))
+            continue
 
         if anchors:
             early_ts = anchors[0]

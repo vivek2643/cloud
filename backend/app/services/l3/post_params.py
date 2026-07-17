@@ -52,3 +52,14 @@ CAMERA_SHAKE_COHERENCE = 0.5    # mean coherence below this = not one rigid move
 # holds together reads as the camera FOLLOWING the subject, not a free pan.
 CAMERA_FOLLOW_ACTION = 0.35     # mean action_energy (file-normalized) over the span
 CAMERA_FOLLOW_COHERENCE = 0.6
+
+# --------------------------------------------------------------------------
+# cuts_v4_segmentation.plan.md section 6: min_ms becomes CONTENT-aware for a
+# V4 video cut instead of anchor-derived -- a sparse/monotonous span collapses
+# hard at high energy (small floor), a dense one holds more room so real
+# events aren't clipped. density (v4_segment.VideoCut.density) is 0..1;
+# min_ms floors at V4_MIN_MS_FLOOR (sparse) and rises toward
+# V4_MIN_MS_FLOOR + V4_MIN_MS_DENSE_BONUS (fully dense).
+# --------------------------------------------------------------------------
+V4_MIN_MS_FLOOR = 400
+V4_MIN_MS_DENSE_BONUS = 1200

@@ -250,8 +250,17 @@ export interface CutRecord {
   screen_text?: string;
   // This cut's single strongest INSTANT, code-computed (post._salience) --
   // distinct from hero_ts_ms (the best STILL for display). null/absent on a
-  // pre-migration run or a cut with no usable signal.
-  salience?: { peak_ms: number; score: number } | null;
+  // pre-migration run or a cut with no usable signal. kind/span_ms/shape
+  // (cuts_v4_segmentation.plan.md) are present only on a V4-ingested video
+  // cut -- kind absent/null means this is a V3 cut (or has no signal),
+  // and the dial keeps the original hero_ts_ms-centered symmetric shrink.
+  salience?: {
+    peak_ms: number;
+    score: number;
+    kind?: "point" | "span" | "none" | null;
+    span_ms?: [number, number] | null;
+    shape?: "before" | "after" | "both" | "center" | "none" | null;
+  } | null;
   // av_coupling_authoritative.plan.md: this cut's baked AUTHORITATIVE audio
   // source, decided once at ingest (never re-derived lazily at render time).
   // audio_file_id defaults to this cut's own file_id (same-source, offset 0)

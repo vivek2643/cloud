@@ -54,11 +54,12 @@ from app.services.l3 import ingest_store as store
 from app.services.l3 import pass1
 from app.services.l3 import pass2
 from app.services.l3 import post
+from app.services.l3 import v4_segment as v4seg
 from app.services.l3.identity import apply as identity_apply
 from app.services.l3.identity import bind_asd as identity_bind_asd
 from app.services.l3.identity import faces as identity_faces
 from app.services.l3.identity import voices as identity_voices
-from app.services.l3.lattice import Lattice
+from app.services.l3.lattice import Lattice, resolve_speech_span_ms
 from app.services.l3.sync import store as sync_store
 from app.services.l3.sync.lattice_merge import apply_outlook_groups, outlook_groups
 from app.services.l3.pass2_params import MAX_PARALLEL_PASS2_BATCHES, STILL_WIDTH_PX
@@ -100,9 +101,13 @@ def _load_signals(
         silences_by_file[fid] = af.get("silence_intervals") or []
         # rms_db (dB energy envelope) + its hop feed the speech_quality loudness
         # term in post.assemble_cut_records; empty when a clip has no audio_features.
-        # onsets_ms feeds post._salience's proximity-bump term (Part D).
+        # onsets_ms feeds post._salience's proximity-bump term (Part D). is_musical
+        # gates whether onsets_ms is trusted as an event signal at all (only
+        # meaningful for musical clips) -- v4_segment.segment_video's novelty
+        # curve reads it the same way (cuts_v4_segmentation.plan.md).
         audio_by_file[fid] = {"rms_db": af.get("rms_db") or [], "hop_ms": af.get("prosody_hop_ms") or 0,
-                              "onsets_ms": onsets_by_file.get(fid) or []}
+                              "onsets_ms": onsets_by_file.get(fid) or [],
+                              "is_musical": bool(af.get("is_musical"))}
     return motion_by_file, scene_by_file, silences_by_file, audio_by_file
 
 
@@ -221,6 +226,45 @@ def run_ingest(project_id: str) -> str:
         # -- pass 2a resolves each as an outlook (no winner), feeding
         # footage_map/observe's alt-PIC angle switching.
         pass1_output = pass1.group_outlooks(pass1_output, groups)
+
+        # cuts_v4_segmentation.plan.md: replace pass 1's own LLM video groups
+        # with the deterministic, signal-driven segmenter's cuts. Speech +
+        # junk stay pass 1's (untouched above); v4_meta_by_ref carries each
+        # V4 cut's real span + salience + density to image_plan/identity/post
+        # below (empty on the V3 path -- every one of those params is a no-op
+        # when empty, byte-identical to today).
+        v4_meta_by_ref: Dict[str, Dict[str, Any]] = {}
+        if settings.cuts_segmenter == "v4":
+            speech_spans_by_file: Dict[str, List[Tuple[int, int]]] = {}
+            for sc in pass1_output.speech_cuts:
+                lat = lattices.get(sc.file_id)
+                if lat is None or not lat.words:
+                    continue
+                s, e = resolve_speech_span_ms(lat.words, lat.atoms, tuple(sc.word_span),
+                                              silences_by_file.get(sc.file_id, []))
+                if e > s:
+                    speech_spans_by_file.setdefault(sc.file_id, []).append((s, e))
+
+            video_tentative_groups: List[pass1.VideoTentativeGroup] = []
+            for fid in file_ids:
+                lat = lattices[fid]
+                for vc in v4seg.segment_video(
+                    file_id=fid, duration_ms=lat.duration_ms,
+                    speech_spans=sorted(speech_spans_by_file.get(fid, [])),
+                    motion=motion_by_file.get(fid) or {}, audio=audio_by_file.get(fid) or {},
+                    scene=scene_by_file.get(fid) or {}, lattice=lat,
+                ):
+                    gi = len(video_tentative_groups)
+                    video_tentative_groups.append(
+                        pass1.VideoTentativeGroup(file_id=fid, atom_ids=list(vc.atom_ids)))
+                    v4_meta_by_ref[f"video_group[{gi}]"] = {
+                        "src_in_ms": vc.src_in_ms, "src_out_ms": vc.src_out_ms,
+                        "salience": dict(vc.salience), "density": vc.density,
+                    }
+            logger.info("ingest: v4 segmenter produced %d video cut(s) across %d file(s)",
+                       len(video_tentative_groups), len(file_ids))
+            pass1_output = pass1_output.model_copy(update={"video_tentative_groups": video_tentative_groups})
+
         store.record_pass1_result(ingest_run_id, pass1_output.model_dump(), pass1_completion.usage,
                                   pass1_output.project_summary)
 
@@ -241,7 +285,7 @@ def run_ingest(project_id: str) -> str:
 
         store.set_status(ingest_run_id, "images")
         planned_frames = ip.build_image_plan(pass1_output, lattices, motion_by_file, scene_by_file,
-                                             silences_by_file)
+                                             silences_by_file, v4_meta_by_ref=v4_meta_by_ref or None)
         images_b64 = fr.extract_for_planned_frames(planned_frames, proxy_keys)
 
         # Still reported as "pass2" -- the DB status column's check
@@ -324,8 +368,14 @@ def run_ingest(project_id: str) -> str:
         # (face tracks at L1, cuts by pass 2).
         face_tracks_by_file = _face_tracks_for_files(file_ids)
         track_to_person, persons = identity_faces.cluster(face_tracks_by_file)
+        # cuts_v4_segmentation.plan.md: a V4 video cut's real span is the
+        # segmenter's own, not the atom-membership bounding box -- see
+        # identity/faces._cut_span_ms. Empty on the V3 path (no-op).
+        v4_span_override = {ref: (meta["src_in_ms"], meta["src_out_ms"])
+                            for ref, meta in v4_meta_by_ref.items()}
         visible_persons = identity_faces.visible_persons_by_cut(
-            track_to_person, face_tracks_by_file, pass2_output.cuts, lattices)
+            track_to_person, face_tracks_by_file, pass2_output.cuts, lattices,
+            span_override=v4_span_override or None)
         owner_by_voice, unbound_voices = identity_bind_asd.bind(
             turns_by_file, voice_of, face_tracks_by_file, track_to_person)
         pass2_output, identity_map = identity_apply.run(
@@ -339,7 +389,8 @@ def run_ingest(project_id: str) -> str:
                                             audio_by_file=audio_by_file,
                                             synced_file_ids=outlook_file_ids,
                                             sync_group_by_file=outlook_group_by_file,
-                                            sync_info_by_file=outlook_by_file)
+                                            sync_info_by_file=outlook_by_file,
+                                            v4_meta_by_ref=v4_meta_by_ref or None)
 
         store.delete_cut_records_for_run(ingest_run_id)
         record_ids = store.insert_cut_records(ingest_run_id, records)

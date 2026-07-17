@@ -38,6 +38,12 @@ CUTRECORD_MAP_VERSION = 2
 _LEVELS = ("broad", "calm", "balanced", "tight", "sharp")
 _BAND_ENERGIES = (0.1, 0.3, 0.5, 0.7, 0.9)
 
+# cuts_v4_segmentation.plan.md section 6: small floors so a punchy "before"/
+# "after" rung never clips the impact/lead it's built around -- always lands a
+# hair past/before the salience peak (itself coarse, ~100ms audio hops).
+_FOLLOW_THROUGH_FLOOR_MS = 300
+_LEAD_FLOOR_MS = 300
+
 # Mirrors cuts-v3-view.tsx SPEECH_TRIM_MAX: even at max energy, only shave this
 # fraction of a speech cut's removable dead-air/filler budget. Kept identical
 # to the frontend dial so the ladder's sharpest rung matches what the editor's
@@ -96,11 +102,91 @@ def signatures_for(file_ids: List[str], run_id: Optional[str] = None) -> Dict[st
 # Ladder synthesis (Fork A, LOCKED): mirrors the frontend energy dial exactly.
 # --------------------------------------------------------------------------
 
+def _symmetric_rung(s: int, e: int, target: int, anchor_ms: Optional[int]) -> Tuple[int, int]:
+    """Anchor-protected negative padding toward ``anchor_ms`` -- the original
+    (V3, hero_ts_ms-centered) shrink, reused for a V4 cut whose salience has
+    no directional shape (kind="span" excluded -- see _video_rung) with the
+    anchor swapped to the salience peak."""
+    anchor = min(max(int(anchor_ms), s), e) if anchor_ms is not None else (s + e) // 2
+    in_ms = round(anchor - target / 2)
+    out_ms = in_ms + target
+    if in_ms < s:
+        in_ms, out_ms = s, s + target
+    if out_ms > e:
+        out_ms, in_ms = e, e - target
+    return in_ms, out_ms
+
+
+def _shrink_fraction(natural: int, min_dur: int, target: int) -> float:
+    """0 at energy 0 (target == natural) -> 1 at max tightening (target ==
+    min_dur) -- how far through the shrink this rung's energy sits, used to
+    interpolate the SLOW-moving edge of a before/after rung. (Not simply
+    ``1 - target/natural``: that only reaches 1.0 at target==0, so a rung
+    whose min_dur floor sits well above zero would never fully settle onto
+    its floor edge, letting the peak drift outside the window at max energy.)"""
+    span = natural - min_dur
+    if span <= 0:
+        return 0.0
+    return max(0.0, min(1.0, (natural - target) / span))
+
+
+def _before_rung(s: int, e: int, target: int, min_dur: int, peak_ms: Optional[int], natural: int) -> Tuple[int, int]:
+    """shape="before" (point): the OUT edge anchors near peak +
+    follow-through-floor and barely moves (it's already close to the peak);
+    the IN edge absorbs the shrink. As energy rises the window ends closer to
+    the impact with a shrinking lead-in."""
+    peak = min(max(int(peak_ms), s), e) if peak_ms is not None else (s + e) // 2
+    out_floor = min(e, peak + _FOLLOW_THROUGH_FLOOR_MS)
+    out_ms = round(e - _shrink_fraction(natural, min_dur, target) * (e - out_floor))
+    in_ms = out_ms - target
+    if in_ms < s:
+        in_ms, out_ms = s, s + target
+    # Never clip the peak itself, whatever the floors/rounding worked out to.
+    if out_ms < peak:
+        out_ms, in_ms = min(e, peak), min(e, peak) - target
+    return in_ms, out_ms
+
+
+def _after_rung(s: int, e: int, target: int, min_dur: int, peak_ms: Optional[int], natural: int) -> Tuple[int, int]:
+    """shape="after" (point): the mirror of _before_rung -- the IN edge
+    anchors near peak - lead-floor and barely moves; the OUT edge (tail/
+    settle) absorbs the shrink."""
+    peak = min(max(int(peak_ms), s), e) if peak_ms is not None else (s + e) // 2
+    in_floor = max(s, peak - _LEAD_FLOOR_MS)
+    in_ms = round(s + _shrink_fraction(natural, min_dur, target) * (in_floor - s))
+    out_ms = in_ms + target
+    if out_ms > e:
+        out_ms, in_ms = e, e - target
+    # Never clip the peak itself, whatever the floors/rounding worked out to.
+    if in_ms > peak:
+        in_ms, out_ms = max(s, peak), max(s, peak) + target
+    return in_ms, out_ms
+
+
+def _span_rung(s: int, e: int, target: int, span_ms: Optional[List[Any]]) -> Tuple[int, int]:
+    """salience.kind="span" (camera move): trim the head (drop the slow
+    ramp-in), keep the settle -- OUT stays at the cut's own natural out
+    (already the move's settle, by construction of v4_segment._camera_move_
+    core); as energy rises IN moves toward the move's dynamic core start,
+    never past it (never end mid-move on the other side either, since OUT
+    never moves)."""
+    core_s = max(s, min(int(span_ms[0]), e)) if span_ms else s
+    in_ms = max(core_s, e - target)
+    return in_ms, e
+
+
 def _video_rung(row: Dict[str, Any], energy: float, level: str, score: float) -> Dict[str, Any]:
-    """One video rung: anchor-protected negative padding toward ``hero_ts_ms``,
-    clamped to ``pace.min_ms`` -- the exact math of cuts-v3-view.tsx's
-    ``tightenedSpan`` (energy 0 = full grounded span, energy 1 = the tightest
-    anchor-safe inset), evaluated at this rung's band-center energy."""
+    """One video rung, clamped to ``pace.min_ms`` -- energy 0 = full grounded
+    span, energy 1 = the tightest safe inset, evaluated at this rung's
+    band-center energy. V3 (no ``salience.kind``) keeps the original
+    hero_ts_ms-centered symmetric shrink exactly (cuts-v3-view.tsx's
+    ``tightenedSpan``); a V4 cut (``salience.kind`` present) collapses toward
+    the salience anchor instead, asymmetrically per shape -- see
+    cuts_v4_segmentation.plan.md section 6. `shape` only ever picks the
+    before/after asymmetry; an unrecognized/missing shape (including VLM
+    shape="none", by the plan's arbitration rule) falls through to the same
+    symmetric-around-peak math as "both"/"center" -- `kind` alone (always
+    code-owned, never influenced by the VLM) decides point vs span vs none."""
     s, e = int(row["src_in_ms"]), int(row["src_out_ms"])
     natural = e - s
     pace = row.get("pace") or {}
@@ -110,14 +196,21 @@ def _video_rung(row: Dict[str, Any], energy: float, level: str, score: float) ->
     if target >= natural or target <= 0:
         in_ms, out_ms = s, e
     else:
-        hero = row.get("hero_ts_ms")
-        hero = min(max(int(hero), s), e) if hero is not None else (s + e) // 2
-        in_ms = round(hero - target / 2)
-        out_ms = in_ms + target
-        if in_ms < s:
-            in_ms, out_ms = s, s + target
-        if out_ms > e:
-            out_ms, in_ms = e, e - target
+        salience = row.get("salience") or {}
+        kind = salience.get("kind")
+        if kind is None:
+            in_ms, out_ms = _symmetric_rung(s, e, target, row.get("hero_ts_ms"))
+        elif kind == "span":
+            in_ms, out_ms = _span_rung(s, e, target, salience.get("span_ms"))
+        else:
+            shape = salience.get("shape") or "center"
+            peak_ms = salience.get("peak_ms")
+            if shape == "before":
+                in_ms, out_ms = _before_rung(s, e, target, min_dur, peak_ms, natural)
+            elif shape == "after":
+                in_ms, out_ms = _after_rung(s, e, target, min_dur, peak_ms, natural)
+            else:
+                in_ms, out_ms = _symmetric_rung(s, e, target, peak_ms)
     return {"level": level, "in_ms": int(in_ms), "out_ms": int(out_ms),
             "play_ms": int(out_ms - in_ms), "score": score}
 

@@ -309,6 +309,64 @@ def test_assemble_cut_records_end_to_end():
 
 
 # --------------------------------------------------------------------------
+# V4 (cuts_v4_segmentation.plan.md): v4_meta_by_ref overrides span/salience,
+# density scales min_ms instead of the anchor-span formula.
+# --------------------------------------------------------------------------
+
+def test_v4_meta_by_ref_overrides_span_and_salience_and_stamps_shape():
+    p2 = Pass2Output(cuts=[
+        Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1", atom_ids=[0, 1],
+                label="pan shot", summary="pans across the desk", shape="after"),
+    ])
+    v4_meta = {"video_group[0]": {
+        "src_in_ms": 900, "src_out_ms": 1100,
+        "salience": {"peak_ms": 950, "score": 0.8, "kind": "point", "span_ms": None},
+        "density": 0.6,
+    }}
+    records = post.assemble_cut_records(p2, {"f1": _lattice()}, {"f1": _motion()}, {},
+                                        v4_meta_by_ref=v4_meta)
+    rec = records[0]
+    # The segmenter's own span wins over the (much wider) atom_ids bounding
+    # box ([0,1] resolves to [800,2000) via _lattice()'s atoms).
+    assert (rec.src_in_ms, rec.src_out_ms) == (900, 1100), rec
+    assert rec.salience == {"peak_ms": 950, "score": 0.8, "kind": "point",
+                            "span_ms": None, "shape": "after"}, rec.salience
+    # density-scaled min_ms (post_params.V4_MIN_MS_FLOOR + density * V4_MIN_MS_DENSE_BONUS),
+    # not the V3 anchor-span formula.
+    from app.services.l3.post_params import V4_MIN_MS_DENSE_BONUS, V4_MIN_MS_FLOOR
+    assert rec.pace.min_ms == round(V4_MIN_MS_FLOOR + 0.6 * V4_MIN_MS_DENSE_BONUS), rec.pace
+    print("ok  test_v4_meta_by_ref_overrides_span_and_salience_and_stamps_shape")
+
+
+def test_v3_video_cut_unaffected_when_v4_meta_by_ref_absent():
+    """No v4_meta_by_ref (or a ref not present in it) -> byte-identical to
+    today: span from atom membership, salience from post._salience, no
+    density in the pace envelope."""
+    p2 = Pass2Output(cuts=[
+        Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1", atom_ids=[0, 1],
+                label="pan shot", summary="pans across the desk"),
+    ])
+    records = post.assemble_cut_records(p2, {"f1": _lattice()}, {"f1": _motion()}, {}, v4_meta_by_ref={})
+    rec = records[0]
+    assert (rec.src_in_ms, rec.src_out_ms) == (800, 2000), rec
+    assert "kind" not in rec.salience, rec.salience
+    print("ok  test_v3_video_cut_unaffected_when_v4_meta_by_ref_absent")
+
+
+def test_density_scales_min_ms_sparse_vs_dense():
+    from app.services.l3.post_params import V4_MIN_MS_DENSE_BONUS, V4_MIN_MS_FLOOR
+    kwargs = dict(kind="video", s=0, e=10000, readability_ms=0, anchors=[],
+                 action_energy=[0.1] * 100, hop_ms=100, next_cut_start_ms=10000,
+                 max_tasteful_speed=2.0, min_tasteful_speed=0.5, natural_sound=False)
+    sparse = post.compute_pace_envelope(density=0.0, **kwargs)
+    dense = post.compute_pace_envelope(density=1.0, **kwargs)
+    assert sparse.min_ms == V4_MIN_MS_FLOOR, sparse
+    assert dense.min_ms == V4_MIN_MS_FLOOR + V4_MIN_MS_DENSE_BONUS, dense
+    assert dense.min_ms > sparse.min_ms, "a dense span must hold more room than a sparse one"
+    print("ok  test_density_scales_min_ms_sparse_vs_dense")
+
+
+# --------------------------------------------------------------------------
 # A/V coupling (av_coupling_authoritative.plan.md)
 # --------------------------------------------------------------------------
 
@@ -742,6 +800,9 @@ def main():
     test_validate_no_overlap_allows_middle_gap()
     test_validate_no_overlap_allows_no_cuts()
     test_assemble_cut_records_end_to_end()
+    test_v4_meta_by_ref_overrides_span_and_salience_and_stamps_shape()
+    test_v3_video_cut_unaffected_when_v4_meta_by_ref_absent()
+    test_density_scales_min_ms_sparse_vs_dense()
     test_solo_cut_couples_to_its_own_file_at_zero_offset()
     test_synced_cut_couples_to_authoritative_file_with_refined_offset()
     test_synced_cut_falls_back_to_global_delta_with_no_authoritative_envelope()

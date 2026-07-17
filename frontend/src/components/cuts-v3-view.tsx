@@ -94,10 +94,64 @@ const STATUS_LABEL: Record<IngestStatus, string> = {
 // The energy dial as pure view-math (cuts_v3_boundaries_v2.plan.md §D). Both
 // modes are non-destructive -- they only change what the preview PLAYS.
 //
-// VIDEO: trims the played span INWARD toward the cut's anchor (hero_ts_ms) as
-// energy rises -- "negative padding". energy 0 -> the full grounded span;
-// energy 1 -> pace.min_ms (the anchor-protected floor, so the payoff frame is
-// never trimmed away). Stays one contiguous span.
+// VIDEO: trims the played span INWARD toward the cut's anchor as energy rises
+// -- "negative padding". energy 0 -> the full grounded span; energy 1 ->
+// pace.min_ms (the anchor-protected floor, so the payoff frame is never
+// trimmed away). Stays one contiguous span. A V3 cut (no salience.kind) keeps
+// the original hero_ts_ms-centered symmetric shrink exactly; a V4 cut
+// collapses toward the salience anchor instead, asymmetrically per shape --
+// mirrors backend cutrecord_map._video_rung (cuts_v4_segmentation.plan.md §6)
+// exactly, so this project's cuts tab previews the SAME ladder pass2/post
+// synthesize server-side.
+const FOLLOW_THROUGH_FLOOR_MS = 300;
+const LEAD_FLOOR_MS = 300;
+
+function symmetricRung(inMs0: number, outMs0: number, targetDur: number, anchorMs: number | null | undefined) {
+  const anchor = anchorMs != null ? Math.min(Math.max(anchorMs, inMs0), outMs0) : (inMs0 + outMs0) / 2;
+  let inMs = Math.round(anchor - targetDur / 2);
+  let outMs = inMs + targetDur;
+  if (inMs < inMs0) { inMs = inMs0; outMs = inMs + targetDur; }
+  if (outMs > outMs0) { outMs = outMs0; inMs = outMs - targetDur; }
+  return { inMs, outMs };
+}
+
+// 0 at energy 0 (target == natural) -> 1 at max tightening (target ==
+// min_dur). Not simply `1 - target/natural`: that only reaches 1.0 at
+// target==0, so a rung whose min_dur floor sits well above zero would never
+// fully settle onto its floor edge, letting the peak drift outside the
+// window at max energy.
+function shrinkFraction(naturalDur: number, minDur: number, targetDur: number): number {
+  const span = naturalDur - minDur;
+  if (span <= 0) return 0;
+  return Math.max(0, Math.min(1, (naturalDur - targetDur) / span));
+}
+
+function beforeRung(inMs0: number, outMs0: number, targetDur: number, minDur: number, naturalDur: number, peakMs: number | null | undefined) {
+  const peak = peakMs != null ? Math.min(Math.max(peakMs, inMs0), outMs0) : (inMs0 + outMs0) / 2;
+  const outFloor = Math.min(outMs0, peak + FOLLOW_THROUGH_FLOOR_MS);
+  let outMs = Math.round(outMs0 - shrinkFraction(naturalDur, minDur, targetDur) * (outMs0 - outFloor));
+  let inMs = outMs - targetDur;
+  if (inMs < inMs0) { inMs = inMs0; outMs = inMs0 + targetDur; }
+  if (outMs < peak) { outMs = Math.min(outMs0, peak); inMs = outMs - targetDur; }  // never clip the peak
+  return { inMs, outMs };
+}
+
+function afterRung(inMs0: number, outMs0: number, targetDur: number, minDur: number, naturalDur: number, peakMs: number | null | undefined) {
+  const peak = peakMs != null ? Math.min(Math.max(peakMs, inMs0), outMs0) : (inMs0 + outMs0) / 2;
+  const inFloor = Math.max(inMs0, peak - LEAD_FLOOR_MS);
+  let inMs = Math.round(inMs0 + shrinkFraction(naturalDur, minDur, targetDur) * (inFloor - inMs0));
+  let outMs = inMs + targetDur;
+  if (outMs > outMs0) { outMs = outMs0; inMs = outMs0 - targetDur; }
+  if (inMs > peak) { inMs = Math.max(inMs0, peak); outMs = inMs + targetDur; }  // never clip the peak
+  return { inMs, outMs };
+}
+
+function spanRung(inMs0: number, outMs0: number, targetDur: number, spanMs: [number, number] | null | undefined) {
+  const coreS = spanMs ? Math.max(inMs0, Math.min(spanMs[0], outMs0)) : inMs0;
+  const inMs = Math.max(coreS, outMs0 - targetDur);
+  return { inMs, outMs: outMs0 };
+}
+
 function tightenedSpan(cut: CutRecord, energy: number): { inMs: number; outMs: number } {
   const inMs0 = cut.src_in_ms;
   const outMs0 = cut.src_out_ms;
@@ -105,12 +159,15 @@ function tightenedSpan(cut: CutRecord, energy: number): { inMs: number; outMs: n
   const minDur = Math.min(cut.pace?.min_ms ?? naturalDur, naturalDur);
   const targetDur = Math.round(naturalDur - energy * (naturalDur - minDur));
   if (targetDur >= naturalDur || targetDur <= 0) return { inMs: inMs0, outMs: outMs0 };
-  const hero = cut.hero_ts_ms ?? (inMs0 + outMs0) / 2;
-  let inMs = Math.round(hero - targetDur / 2);
-  let outMs = inMs + targetDur;
-  if (inMs < inMs0) { inMs = inMs0; outMs = inMs + targetDur; }
-  if (outMs > outMs0) { outMs = outMs0; inMs = outMs - targetDur; }
-  return { inMs, outMs };
+
+  const salience = cut.salience;
+  const kind = salience?.kind;
+  if (!kind) return symmetricRung(inMs0, outMs0, targetDur, cut.hero_ts_ms);
+  if (kind === "span") return spanRung(inMs0, outMs0, targetDur, salience?.span_ms);
+  const shape = salience?.shape ?? "center";
+  if (shape === "before") return beforeRung(inMs0, outMs0, targetDur, minDur, naturalDur, salience?.peak_ms);
+  if (shape === "after") return afterRung(inMs0, outMs0, targetDur, minDur, naturalDur, salience?.peak_ms);
+  return symmetricRung(inMs0, outMs0, targetDur, salience?.peak_ms);
 }
 
 // How hard the dial leans on speech tightening. edso_pacing_audit_timing.

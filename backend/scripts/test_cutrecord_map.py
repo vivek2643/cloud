@@ -208,6 +208,110 @@ def test_speech_ladder_threads_remove_spans_into_keep_spans():
     print("ok  test_speech_ladder_threads_remove_spans_into_keep_spans")
 
 
+# --------------------------------------------------------------------------
+# V4 shape-aware ladder (cuts_v4_segmentation.plan.md section 6)
+# --------------------------------------------------------------------------
+
+def test_v3_row_without_salience_kind_keeps_hero_centered_symmetric_shrink():
+    """A row with no salience.kind at all (V3, or a pre-migration row) must
+    ladder EXACTLY as before -- hero_ts_ms-centered, ignoring any stray
+    salience/shape data that might otherwise be present."""
+    row = _row(src_in_ms=0, src_out_ms=10000, hero_ts_ms=8500,
+              salience={"peak_ms": 1000, "score": 0.9},  # present but no "kind" -> ignored
+              pace={"min_ms": 1500, "natural_ms": 10000, "max_ms": 10000, "natural_sound": True})
+    rung = cm._video_rung(row, energy=1.0, level="sharp", score=0.5)
+    assert rung["in_ms"] <= 8500 <= rung["out_ms"], rung
+    assert not (1000 - 100 <= (rung["in_ms"] + rung["out_ms"]) / 2 <= 1000 + 100), \
+        "must center on hero_ts_ms, not the unrelated salience.peak_ms"
+    print("ok  test_v3_row_without_salience_kind_keeps_hero_centered_symmetric_shrink")
+
+
+def test_v4_both_shape_is_symmetric_around_salience_peak_not_hero():
+    row = _row(src_in_ms=0, src_out_ms=10000, hero_ts_ms=2000,
+              salience={"peak_ms": 7000, "score": 0.8, "kind": "point", "shape": "both", "span_ms": None},
+              pace={"min_ms": 1000, "natural_ms": 10000, "max_ms": 10000, "natural_sound": True})
+    rung = cm._video_rung(row, energy=1.0, level="sharp", score=0.5)
+    center = (rung["in_ms"] + rung["out_ms"]) / 2
+    assert abs(center - 7000) < 50, rung
+    print("ok  test_v4_both_shape_is_symmetric_around_salience_peak_not_hero")
+
+
+def test_v4_before_shape_out_edge_barely_moves_in_edge_absorbs_shrink():
+    """shape="before": the impact is near the natural OUT edge -- as energy
+    rises the window should end close to where it always did (near the
+    peak/impact) while the IN edge does almost all the shrinking."""
+    row = _row(src_in_ms=0, src_out_ms=10000, hero_ts_ms=9999,
+              salience={"peak_ms": 9600, "score": 0.9, "kind": "point", "shape": "before", "span_ms": None},
+              pace={"min_ms": 800, "natural_ms": 10000, "max_ms": 10000, "natural_sound": True})
+    low = cm._video_rung(row, energy=0.1, level="broad", score=0.5)
+    high = cm._video_rung(row, energy=1.0, level="sharp", score=0.5)
+    # OUT barely moves (stays within a follow-through floor of the natural out);
+    # IN moves a lot (absorbs almost the entire shrink).
+    assert abs(low["out_ms"] - high["out_ms"]) < 500, (low, high)
+    assert high["in_ms"] - low["in_ms"] > 5000, (low, high)
+    # Never clips the impact: out must always land at/after the peak.
+    assert high["out_ms"] >= 9600, high
+    print("ok  test_v4_before_shape_out_edge_barely_moves_in_edge_absorbs_shrink")
+
+
+def test_v4_after_shape_in_edge_barely_moves_out_edge_absorbs_shrink():
+    """shape="after": the reveal is near the natural IN edge -- mirror of
+    shape="before"."""
+    row = _row(src_in_ms=0, src_out_ms=10000, hero_ts_ms=1,
+              salience={"peak_ms": 400, "score": 0.9, "kind": "point", "shape": "after", "span_ms": None},
+              pace={"min_ms": 800, "natural_ms": 10000, "max_ms": 10000, "natural_sound": True})
+    low = cm._video_rung(row, energy=0.1, level="broad", score=0.5)
+    high = cm._video_rung(row, energy=1.0, level="sharp", score=0.5)
+    assert abs(low["in_ms"] - high["in_ms"]) < 500, (low, high)
+    assert low["out_ms"] - high["out_ms"] > 5000, (low, high)
+    # Never clips the lead-in: in must always land at/before the peak.
+    assert high["in_ms"] <= 400, high
+    print("ok  test_v4_after_shape_in_edge_barely_moves_out_edge_absorbs_shrink")
+
+
+def test_v4_span_kind_trims_head_keeps_settle():
+    """salience.kind="span" (camera move): OUT stays pinned at the cut's
+    natural out (the move's settle) at every energy; IN moves toward the
+    move's own dynamic core start but never past it."""
+    # min_ms == exactly the core's own width (10000-3000): at max energy the
+    # target-length window should reach precisely span_ms[0], never past it.
+    row = _row(src_in_ms=0, src_out_ms=10000, hero_ts_ms=5000,
+              salience={"peak_ms": 5000, "score": 0.7, "kind": "span", "shape": "center",
+                       "span_ms": [3000, 10000]},
+              pace={"min_ms": 7000, "natural_ms": 10000, "max_ms": 10000, "natural_sound": True})
+    for energy in (0.0, 0.25, 0.5, 0.75, 1.0):
+        rung = cm._video_rung(row, energy=energy, level="x", score=0.5)
+        assert rung["out_ms"] == 10000, rung
+    for energy in (0.25, 0.5, 0.75, 1.0):   # energy 0 keeps the full natural span (no trim yet)
+        rung = cm._video_rung(row, energy=energy, level="x", score=0.5)
+        assert rung["in_ms"] >= 3000, rung   # never trims into the move's own core
+    tight = cm._video_rung(row, energy=1.0, level="sharp", score=0.5)
+    assert tight["in_ms"] == 3000, "at max energy the head trims exactly to the core start"
+
+    # A tighter floor than the core's width (min_ms < 7000) must still clamp
+    # at span_ms[0] rather than trim past it into the ramp-in's own core.
+    tiny_floor = _row(src_in_ms=0, src_out_ms=10000, hero_ts_ms=5000,
+                      salience={"peak_ms": 5000, "score": 0.7, "kind": "span", "shape": "center",
+                               "span_ms": [3000, 10000]},
+                      pace={"min_ms": 500, "natural_ms": 10000, "max_ms": 10000, "natural_sound": True})
+    clamped = cm._video_rung(tiny_floor, energy=1.0, level="sharp", score=0.5)
+    assert clamped["in_ms"] == 9500 and clamped["out_ms"] == 10000, clamped
+    print("ok  test_v4_span_kind_trims_head_keeps_settle")
+
+
+def test_v4_punchy_rung_never_clips_the_peak():
+    """At max energy, a point cut's window must still contain its own
+    salience peak -- the whole point of the follow-through/lead floors."""
+    for shape in ("before", "after", "both", "center"):
+        row = _row(src_in_ms=0, src_out_ms=10000, hero_ts_ms=5000,
+                  salience={"peak_ms": 5000, "score": 0.9, "kind": "point", "shape": shape,
+                           "span_ms": None},
+                  pace={"min_ms": 400, "natural_ms": 10000, "max_ms": 10000, "natural_sound": True})
+        rung = cm._video_rung(row, energy=1.0, level="sharp", score=0.5)
+        assert rung["in_ms"] <= 5000 <= rung["out_ms"], (shape, rung)
+    print("ok  test_v4_punchy_rung_never_clips_the_peak")
+
+
 def test_pinned_run_id_is_honored_without_live_resolve():
     """When a thread pins a run (migration 028), the projection reads THAT run
     and never falls back to `latest_run_for_files` -- so a re-ingest mid-thread
@@ -274,6 +378,12 @@ def main():
     test_ladder_clamps_to_min_ms_floor()
     test_speech_ladder_stays_full_span_with_no_removable_budget()
     test_speech_ladder_threads_remove_spans_into_keep_spans()
+    test_v3_row_without_salience_kind_keeps_hero_centered_symmetric_shrink()
+    test_v4_both_shape_is_symmetric_around_salience_peak_not_hero()
+    test_v4_before_shape_out_edge_barely_moves_in_edge_absorbs_shrink()
+    test_v4_after_shape_in_edge_barely_moves_out_edge_absorbs_shrink()
+    test_v4_span_kind_trims_head_keeps_settle()
+    test_v4_punchy_rung_never_clips_the_peak()
     test_pinned_run_id_is_honored_without_live_resolve()
     test_unpinned_falls_back_to_latest_run()
     print("\nall cutrecord-map tests passed")

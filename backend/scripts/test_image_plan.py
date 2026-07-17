@@ -277,6 +277,39 @@ def test_anchored_video_group_gets_first_and_last_anchor_when_far_apart():
     print("ok  test_anchored_video_group_gets_first_and_last_anchor_when_far_apart")
 
 
+def test_v4_point_salience_straddles_the_peak():
+    atoms = [_atom(0, 0, 5000, anchors=[])]
+    lat = _lattice_with_atoms("f1", 0, atoms)
+    pass1 = Pass1Output(video_tentative_groups=[VideoTentativeGroup(file_id="f1", atom_ids=[0])])
+    v4_meta = {"video_group[0]": {"src_in_ms": 1000, "src_out_ms": 3000,
+                                  "salience": {"peak_ms": 2000, "score": 0.9, "kind": "point", "span_ms": None}}}
+    frames = ip.build_image_plan(pass1, {"f1": lat}, {}, {}, {}, v4_meta_by_ref=v4_meta)
+    straddle = sorted(frames, key=lambda f: f.ts_ms)
+    assert len(straddle) == 2, frames
+    assert all(f.reason == ip.REASON_SHAPE_STRADDLE for f in straddle), frames
+    assert straddle[0].phase == "early" and straddle[1].phase == "late", straddle
+    assert straddle[0].ts_ms < 2000 < straddle[1].ts_ms, straddle
+    # Frames stay inside the segmenter's own tight span, not the atom's [0,5000).
+    assert 1000 <= straddle[0].ts_ms and straddle[1].ts_ms <= 3000, straddle
+    print("ok  test_v4_point_salience_straddles_the_peak")
+
+
+def test_v4_none_kind_uses_segmenter_span_not_atom_bounds():
+    """A V4 cut's frame timestamps must fall inside the segmenter's own
+    (tighter) span, never the wider atom-membership bounding box the ref's
+    atom_ids happen to resolve to."""
+    atoms = [_atom(0, 0, 10000, anchors=[])]
+    lat = _lattice_with_atoms("f1", 0, atoms)
+    pass1 = Pass1Output(video_tentative_groups=[VideoTentativeGroup(file_id="f1", atom_ids=[0])])
+    v4_meta = {"video_group[0]": {"src_in_ms": 4000, "src_out_ms": 4800,
+                                  "salience": {"peak_ms": 4400, "score": 0.0, "kind": "none", "span_ms": None}}}
+    frames = ip.build_image_plan(pass1, {"f1": lat}, {}, {}, {}, v4_meta_by_ref=v4_meta)
+    assert frames, "must still get at least one frame"
+    for f in frames:
+        assert 4000 <= f.ts_ms <= 4800, f
+    print("ok  test_v4_none_kind_uses_segmenter_span_not_atom_bounds")
+
+
 def test_unknown_file_id_skipped_gracefully():
     pass1 = Pass1Output(
         speech_cuts=[SpeechCut(file_id="missing", word_span=(0, 1), label="x")],
@@ -317,6 +350,8 @@ def main():
     test_long_speech_cut_gets_early_and_late_frames()
     test_runt_speech_cut_stays_single_frame()
     test_anchored_video_group_gets_first_and_last_anchor_when_far_apart()
+    test_v4_point_salience_straddles_the_peak()
+    test_v4_none_kind_uses_segmenter_span_not_atom_bounds()
     test_unknown_file_id_skipped_gracefully()
     test_no_pass1_content_yields_no_frames()
     test_planned_frame_to_dict()

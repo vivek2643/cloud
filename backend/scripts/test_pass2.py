@@ -250,6 +250,46 @@ def test_channel_alias_is_normalized_at_parse_time():
     print("ok  test_channel_alias_is_normalized_at_parse_time")
 
 
+# --------------------------------------------------------------------------
+# shape (cuts_v4_segmentation.plan.md section 5) -- a coarse semantic prior,
+# never a timestamp; off-list/missing always falls back to "center".
+# --------------------------------------------------------------------------
+
+def test_shape_defaults_to_center_when_unset():
+    c = pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
+                          atom_ids=[0], label="x", summary="y")
+    assert c.shape == "center", c.shape
+    print("ok  test_shape_defaults_to_center_when_unset")
+
+
+def test_shape_accepts_every_listed_value():
+    for shape in pass2.SHAPES:
+        c = pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
+                              atom_ids=[0], label="x", summary="y", shape=shape)
+        assert c.shape == shape, (shape, c.shape)
+    print("ok  test_shape_accepts_every_listed_value")
+
+
+def test_shape_normalizes_off_list_or_missing_to_center():
+    # A stray/garbled value never burns a re-ask -- shape is a coarse prior,
+    # not worth failing a batch over (section 5's arbitration stance).
+    c = pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
+                          atom_ids=[0], label="x", summary="y", shape="sideways")
+    assert c.shape == "center", c.shape
+    c2 = pass2.CutJudgment(source_ref="video_group[1]", kind="video", file_id="f1",
+                           atom_ids=[1], label="x", summary="y", shape="BEFORE")
+    assert c2.shape == "before", c2.shape   # case-insensitive on the valid path
+    print("ok  test_shape_normalizes_off_list_or_missing_to_center")
+
+
+def test_shape_round_trips_through_to_pass2_cuts():
+    j = pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
+                          atom_ids=[0], label="x", summary="y", shape="after")
+    cuts = pass2.to_pass2_cuts([j])
+    assert cuts[0].shape == "after", cuts[0].shape
+    print("ok  test_shape_round_trips_through_to_pass2_cuts")
+
+
 def test_backfill_leaves_split_video_groups_to_the_model():
     # A video group split into two cuts: backfill must NOT overwrite the
     # pieces' own atom_ids (that split IS the model's judgment); the
@@ -756,6 +796,10 @@ def main():
     test_locators_are_optional_at_parse_time_and_backfilled()
     test_kind_alias_is_normalized_at_parse_time()
     test_channel_alias_is_normalized_at_parse_time()
+    test_shape_defaults_to_center_when_unset()
+    test_shape_accepts_every_listed_value()
+    test_shape_normalizes_off_list_or_missing_to_center()
+    test_shape_round_trips_through_to_pass2_cuts()
     test_backfill_leaves_split_video_groups_to_the_model()
     test_valid_cuts_round_trip()
     test_pass2_batch_output_rejects_an_unexpected_wrapper_key()

@@ -30,6 +30,7 @@ from app.services.l3.post_params import (
     ANCHOR_PAD_MS, CAMERA_FOLLOW_ACTION, CAMERA_FOLLOW_COHERENCE, CAMERA_PAN_RATE,
     CAMERA_SHAKE_COHERENCE, CAMERA_SHAKE_RATE, CAMERA_ZOOM_RATE, ENERGY_GRADE_BANDS,
     FLATLINE_BAND, PACE_LEVEL_TARGETS, SPEED_CEIL, SPEED_FLOOR,
+    V4_MIN_MS_DENSE_BONUS, V4_MIN_MS_FLOOR,
 )
 from app.services.l3.seam import BREAK_BOUNDARY_REASONS, Seam, classify_seam
 from app.services.l3.sync import av_couple
@@ -579,7 +580,7 @@ def compute_pace_envelope(
     *, kind: str, s: int, e: int, readability_ms: int, anchors: List[int],
     action_energy: List[float], hop_ms: int,
     next_cut_start_ms: int, max_tasteful_speed: float, min_tasteful_speed: float,
-    natural_sound: bool,
+    natural_sound: bool, density: Optional[float] = None,
 ) -> PaceEnvelope:
     natural_ms = max(1, e - s)
     mean_ae = _mean_in_span(action_energy, hop_ms, s, e)
@@ -591,10 +592,17 @@ def compute_pace_envelope(
                             max_ms=natural_ms, levels=[1.0] * len(PACE_LEVEL_TARGETS),
                             energy_grade=grade, natural_sound=natural_sound)
 
-    # min_ms floors tightening at readability + the anchor envelope (impacts
-    # stay in frame). No camera-move floor: the derived pan label is gone
-    # (deterministic-keep), and pace stays purely signal-driven.
-    min_ms = max(readability_ms, _anchor_span_ms(anchors))
+    # min_ms floors tightening at readability + either the anchor envelope
+    # (V3 -- impacts stay in frame) or, for a V4 cut (density given), the
+    # segmenter's own event density: a sparse/monotonous span collapses hard
+    # at high energy, a dense one holds more room so real events aren't
+    # clipped (cuts_v4_segmentation.plan.md section 6). No camera-move floor
+    # either way: the derived pan label is gone (deterministic-keep), and
+    # pace stays purely signal-driven.
+    if density is not None:
+        min_ms = max(readability_ms, round(V4_MIN_MS_FLOOR + density * V4_MIN_MS_DENSE_BONUS))
+    else:
+        min_ms = max(readability_ms, _anchor_span_ms(anchors))
     flatline_end_ms = _flatline_bound_ms(action_energy, hop_ms, e, next_cut_start_ms)
     max_ms = max(natural_ms, flatline_end_ms - s)
     levels = _pace_levels(mean_ae, min_tasteful_speed, max_tasteful_speed)
@@ -744,6 +752,7 @@ def assemble_cut_records(
     synced_file_ids: Optional[set] = None,
     sync_group_by_file: Optional[Dict[str, str]] = None,
     sync_info_by_file: Optional[Dict[str, Dict[str, Any]]] = None,
+    v4_meta_by_ref: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[CutRecord]:
     """Resolve every judged cut to its final ms span (word/atom edges only,
     by construction), enforce zero-overlap per file (gaps are legal -- cuts are
@@ -761,9 +770,15 @@ def assemble_cut_records(
     ...}}}}``) -- fed straight through to ``sync.av_couple.authoritative_for``
     /``refine_offset`` to bake each cut's coupled ``(audio_file_id,
     audio_offset_ms)``. None/empty -> every cut couples to its own file at
-    offset 0 (today's behavior). Raises ``ValueError`` (stage ``post``, per
-    the plan's "no fallback" rule) on any invariant violation -- the caller
-    marks the ingest run ``failed`` for re-run."""
+    offset 0 (today's behavior). ``v4_meta_by_ref`` (cuts_v4_segmentation.
+    plan.md): {source_ref: {"src_in_ms", "src_out_ms", "salience", "density"}}
+    for a V4 ingest's video cuts -- when present for a cut, its span and
+    salience come straight from the segmenter (v4_segment.VideoCut) instead
+    of atom membership / post._salience, and its pace envelope's min_ms is
+    density-scaled instead of anchor-derived. None/empty -> every video cut
+    resolves exactly as today (V3). Raises ``ValueError`` (stage ``post``,
+    per the plan's "no fallback" rule) on any invariant violation -- the
+    caller marks the ingest run ``failed`` for re-run."""
     junk_by_file: Dict[str, List[JunkSuspect]] = {}
     for js in (junk_suspects or []):
         junk_by_file.setdefault(js.file_id, []).append(js)
@@ -785,6 +800,13 @@ def assemble_cut_records(
         if cut.kind == "speech":
             silences = silences_by_file.get(cut.file_id, [])
             s, e = resolve_speech_span_ms(lattice.words, lattice.atoms, cut.word_span, silences)
+        elif v4_meta_by_ref and cut.source_ref in v4_meta_by_ref:
+            # cuts_v4_segmentation.plan.md: the segmenter's own tight span --
+            # NOT the bounding box of the (coarser, informational-only) atoms
+            # it happens to overlap. See v4_segment.segment_video's docstring
+            # for why atom_ids can't drive this resolution for a V4 cut.
+            meta = v4_meta_by_ref[cut.source_ref]
+            s, e = int(meta["src_in_ms"]), int(meta["src_out_ms"])
         else:
             atoms_by_id = {a.atom_id: a for a in lattice.atoms}
             members = [atoms_by_id[i] for i in (cut.atom_ids or []) if i in atoms_by_id]
@@ -834,6 +856,7 @@ def assemble_cut_records(
         hop_ms = int(motion.get("hop_ms") or 0)
         action_energy = motion.get("action_energy") or []
         audio = audio_by_file.get(cut.file_id) or {}
+        v4_meta = (v4_meta_by_ref or {}).get(cut.source_ref) if cut.kind == "video" else None
         hero_ts = pick_hero_ts_ms(anchors, blur, hop_ms, s, e)
         pace = compute_pace_envelope(
             kind=cut.kind, s=s, e=e, readability_ms=cut.readability_ms, anchors=anchors,
@@ -842,6 +865,7 @@ def assemble_cut_records(
             max_tasteful_speed=cut.taste_fences.max_tasteful_speed,
             min_tasteful_speed=cut.taste_fences.min_tasteful_speed,
             natural_sound=cut.natural_sound,
+            density=(v4_meta.get("density") if v4_meta is not None else None),
         )
         speech_quality: Optional[float] = None
         if cut.kind == "speech":
@@ -860,13 +884,26 @@ def assemble_cut_records(
             cut.on_camera, framing_dict, look_dict, blur, hop_ms, s, e, blur_lo, blur_hi)
         total_quality = compute_total_quality(cut.kind, speech_quality, visual_score)
 
-        ae_lo, ae_hi = ae_lohi.get(cut.file_id, (None, None))
-        rms_lo, rms_hi = rms_lohi.get(cut.file_id, (None, None))
-        salience = _salience(
-            action_energy, hop_ms, s, e, ae_lo, ae_hi,
-            audio.get("rms_db") or [], int(audio.get("hop_ms") or 0), rms_lo, rms_hi,
-            anchors, audio.get("onsets_ms") or [], hero_ts,
-        )
+        if v4_meta is not None:
+            # cuts_v4_segmentation.plan.md section 4: the segmenter already
+            # computed the novelty curve and the anchor kind -- emit its
+            # salience directly rather than recomputing an absolute-level
+            # peak in post._salience. `shape` (pass 2's coarse semantic
+            # prior, arbitrated by construction -- see cutrecord_map._video_
+            # rung's branch order: `kind` is always code-owned and decides
+            # point/span/none; `shape` only ever picks the ladder's
+            # before/after asymmetry, defaulting safely to symmetric
+            # otherwise) rides alongside it.
+            salience = dict(v4_meta.get("salience") or {})
+            salience["shape"] = cut.shape
+        else:
+            ae_lo, ae_hi = ae_lohi.get(cut.file_id, (None, None))
+            rms_lo, rms_hi = rms_lohi.get(cut.file_id, (None, None))
+            salience = _salience(
+                action_energy, hop_ms, s, e, ae_lo, ae_hi,
+                audio.get("rms_db") or [], int(audio.get("hop_ms") or 0), rms_lo, rms_hi,
+                anchors, audio.get("onsets_ms") or [], hero_ts,
+            )
 
         # av_coupling_authoritative.plan.md: bake this cut's coupled audio
         # source NOW (assembly time), never re-derived lazily at render time.

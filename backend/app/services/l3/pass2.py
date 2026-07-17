@@ -82,6 +82,13 @@ SHOT_QUALITY = (
     "stable", "shaky", "whip", "soft_focus", "racking_focus", "exposure_shift", "unsure",
 )
 
+# cuts_v4_segmentation.plan.md section 5: a coarse SEMANTIC prior on which side
+# of a moment carries the value -- NEVER a timestamp (the VLM only ever sees
+# ~2 frames, so it can name "what kind of moment" but never "when"; location
+# stays fully deterministic, owned by v4_segment.py). Used only in a V4 ingest
+# run's shape-aware ladder (cutrecord_map._video_rung); ignored entirely on V3.
+SHAPES = ("before", "after", "both", "center", "none")
+
 
 class Framing(BaseModel):
     subject_box: Tuple[float, float, float, float] | None = None   # normalized x,y,w,h
@@ -221,6 +228,9 @@ class CutJudgment(BaseModel):
     # (title, lower-third, slide, UI) -- "" when none. Optional/prompt-nudged
     # only (Flash-Lite guardrail: never required).
     screen_text: str = ""
+    # cuts_v4_segmentation.plan.md section 5: which side of the cut's key
+    # moment carries the value -- see SHAPES. V3 ingests never read this field.
+    shape: str = "center"
 
     @field_validator("channel", mode="before")
     @classmethod
@@ -229,6 +239,16 @@ class CutJudgment(BaseModel):
             key = v.strip().lower()
             return _CHANNEL_ALIASES.get(key, key)
         return v
+
+    @field_validator("shape", mode="before")
+    @classmethod
+    def _normalize_shape(cls, v: Any) -> Any:
+        # Off-list/missing -> the safe "center" default (section 5: "Default
+        # when VLM missing or low-info: center") rather than a schema error --
+        # shape is a coarse prior, never worth burning a re-ask over.
+        if isinstance(v, str) and v.strip().lower() in SHAPES:
+            return v.strip().lower()
+        return "center"
 
     @field_validator("kind", mode="before")
     @classmethod
@@ -321,6 +341,9 @@ class Pass2Cut(BaseModel):
     # people at once. Empty until identity/apply.py runs, and empty forever
     # for a cut with no confidently-clustered face.
     visible_persons: List[str] = Field(default_factory=list)
+    # cuts_v4_segmentation.plan.md section 5: carried straight through from
+    # CutJudgment. Ignored on a V3 ingest run.
+    shape: str = "center"
 
 
 class Pass2Output(BaseModel):
@@ -384,7 +407,7 @@ def to_pass2_cuts(
             natural_sound=j.natural_sound, channel=j.channel,
             people=[p.model_dump() for p in j.people[:MAX_PEOPLE_PER_CUT]],
             screen_text=j.screen_text,
-            voice_ids=voice_ids,
+            voice_ids=voice_ids, shape=j.shape,
         ))
     return out
 
@@ -516,6 +539,14 @@ _SYSTEM = (
     "it is b-roll/an object/scenery/a display with no performed action "
     "(speech cuts are always \"said\" -- you may omit channel for them)\n"
     "  - natural_sound (does the cut carry sound worth keeping)\n"
+    "  - shape: which side of the cut's key moment carries the value -- "
+    "\"before\" (everything before it matters; it's a build-to-impact, end "
+    "ON it), \"after\" (everything after it matters; it's a reveal/payoff, "
+    "keep the tail), \"both\" (the moment and both sides matter), \"center\" "
+    "(no strong asymmetry -- the safe default), \"none\" (nothing to trim "
+    "to, e.g. a screen recording or uniform footage). This is a coarse call "
+    "from what kind of moment it is, NEVER a timestamp -- you are not "
+    "judging exactly when it happens, only which side of it matters more.\n"
     "  - junk (+reason): BINARY, by MEANING -- set junk=true ONLY when the "
     "cut is clearly not part of the piece (a camera cue like 'and go'/"
     "'3-2-1'/'take three', pre-roll setup, obvious dead air). Junk is "

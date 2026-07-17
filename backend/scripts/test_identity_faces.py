@@ -17,7 +17,7 @@ if BACKEND not in sys.path:
 from app.services.l1.active_speaker import FaceFrame, FaceTrack  # noqa: E402
 from app.services.l3 import pass2  # noqa: E402
 from app.services.l3.identity import faces as fc  # noqa: E402
-from app.services.l3.lattice import Lattice  # noqa: E402
+from app.services.l3.lattice import Atom, Lattice  # noqa: E402
 
 
 def _track(track_id, embedding, frames):
@@ -150,6 +150,26 @@ def test_visible_persons_by_cut_caps_a_crowd_to_the_most_prominent():
     print("ok  test_visible_persons_by_cut_caps_a_crowd_to_the_most_prominent")
 
 
+def test_visible_persons_by_cut_uses_span_override_for_a_v4_video_cut():
+    """cuts_v4_segmentation.plan.md: a V4 video cut's atom_ids resolve to a
+    much WIDER atom bounding box; span_override must win so a face outside
+    the segmenter's own tight span (but inside the wider atom bounds) is
+    correctly excluded."""
+    atoms = [Atom(atom_id=0, file_id="f1", start_ms=0, end_ms=10000,
+                  state_in="clip_edge", state_out="clip_edge", action_energy=0.1, coherence=0.9)]
+    lat = Lattice(file_id="f1", duration_ms=10000, words=[], turns=[], hints=[], atoms=atoms)
+    cut = pass2.Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1",
+                         atom_ids=[0], label="x", summary="y")
+    # Face visible at 8000ms -- inside the atom's [0,10000) bounding box, but
+    # OUTSIDE the V4 segmenter's own tight [1000,2000) span.
+    face_tracks_by_file = {"f1": [_track(0, [1.0, 0.0], [(8000, (0, 0, 10, 10))])]}
+    track_to_person = {("f1", 0): "P0"}
+    vis = fc.visible_persons_by_cut(track_to_person, face_tracks_by_file, [cut], {"f1": lat},
+                                    span_override={"video_group[0]": (1000, 2000)})
+    assert ("f1", "video_group[0]") not in vis, vis
+    print("ok  test_visible_persons_by_cut_uses_span_override_for_a_v4_video_cut")
+
+
 def test_visible_persons_by_cut_unresolvable_span_is_skipped():
     # A video cut with no atom_ids resolves no span at all.
     cut = pass2.Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1",
@@ -169,6 +189,7 @@ def main():
     test_visible_persons_by_cut_includes_a_track_with_a_frame_in_span()
     test_visible_persons_by_cut_excludes_a_track_with_no_frame_in_span()
     test_visible_persons_by_cut_caps_a_crowd_to_the_most_prominent()
+    test_visible_persons_by_cut_uses_span_override_for_a_v4_video_cut()
     test_visible_persons_by_cut_unresolvable_span_is_skipped()
     print("\nall identity-faces tests passed")
 
