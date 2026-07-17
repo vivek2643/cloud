@@ -110,18 +110,25 @@ def _specs() -> List[Dict[str, Any]]:
         S("place", "Adds a cut by its ref. channel 'V1' inserts on the main line "
           "(picture+sound) at index `at` (default append); 'V2' lays a silent video "
           "layer over the ongoing audio at program `from_ms` (audio:'keep' plays its "
-          "own sound). `level` selects the energy take. `piece` places just one "
-          "beat of a multi-beat cluster (the 1-based position shown in the Beat "
-          "Index/read_state) instead of the whole moment; omit for the whole moment "
-          "(`level` is ignored when `piece` is set).",
+          "own sound). A moment holding several beats (shown in the Beat Index as a "
+          "range: line) can be taken three ways: (1) WHOLE -- omit `piece` and use "
+          "level 'broad' for the full continuous stretch; (2) TIGHTENED to a level "
+          "'broad'\u2192'sharp' via `level` -- tightening keeps only the strongest "
+          "beats and drops the weaker/connective ones (so 'sharp' yields fewer, "
+          "tighter beats than 'broad'); (3) a SINGLE beat via `piece` = the 1-based "
+          "position shown in the Beat Index/read_state, which places just that one "
+          "beat on its own EVEN IF tightening would have dropped it (every listed "
+          "beat stays reachable). `level` is ignored when `piece` is set.",
           obj({"ref": {"type": "string"}, "level": {"type": "string", "enum": list(observe._LEVELS)},
                "channel": {"type": "string", "enum": ["V1", "V2"]},
                "at": {"type": "integer"}, "from_ms": {"type": "integer"},
                "audio": {"type": "string", "enum": ["keep", "mute"]},
                "reason": {"type": "string"},
                "piece": {"type": "integer",
-                         "description": "index of a sub-beat within a multi-beat "
-                         "cluster; omit to place the whole moment"}}, ["ref"])),
+                         "description": "1-based position of one beat within a "
+                         "multi-beat moment (from the Beat Index range: list); places "
+                         "just that beat, reachable even when tightening would drop "
+                         "it. Omit to place the whole moment / a level take."}}, ["ref"])),
         S("trim", "Changes a cut's SOURCE in/out. Absolute (in_ms/out_ms) or relative "
           "(delta_in_ms/delta_out_ms; delta_in_ms:200 starts 200ms later). Targets a "
           "main-line seg_id, a V2 place_video op_id, or an A2 place_audio op_id "

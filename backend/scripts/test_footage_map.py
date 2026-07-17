@@ -717,20 +717,46 @@ def test_piece_breakdown_shape_for_three_separated_events():
     assert [p["strength"] for p in b["pieces"]] == ["moderate", "strongest", "weak"], b
     assert [p["dur_s"] for p in b["pieces"]] == [0.8, 0.9, 0.7], b
     assert all(p["kind"] == "point" for p in b["pieces"]), b
+    # The RENDERED filtering: at the sharpest band (energy 0.9) the salience
+    # gate drops the two weak events (0.6, 0.4) and keeps only the strongest
+    # (1.0) -- so punchy_count is 1 and only the strongest piece is `core`.
+    assert b["punchy_count"] == 1, b
+    assert b["punchy_avg_s"] > 0.0, b
+    assert [p["core"] for p in b["pieces"]] == [False, True, False], b
     print("ok  test_piece_breakdown_shape_for_three_separated_events")
+
+
+def test_piece_breakdown_all_strong_events_are_all_core():
+    """When every event is genuinely comparable (none weak enough to gate out),
+    all survive the sharp band -> every piece is core, punchy_count == of."""
+    m = _cluster_moment(events=[
+        {"peak_ms": 1500, "score": 0.95, "kind": "point", "onset_ms": 1100, "settle_ms": 2000, "span_ms": None},
+        {"peak_ms": 5000, "score": 1.0, "kind": "point", "onset_ms": 4600, "settle_ms": 5500, "span_ms": None},
+        {"peak_ms": 8500, "score": 0.9, "kind": "point", "onset_ms": 8100, "settle_ms": 9000, "span_ms": None},
+    ], primary=1)
+    b = fm.piece_breakdown(m)
+    assert b["punchy_count"] == 3, b
+    assert all(p["core"] for p in b["pieces"]), b
+    print("ok  test_piece_breakdown_all_strong_events_are_all_core")
 
 
 def test_moment_line_multi_event_cluster_is_multiline_and_generic():
     m = _cluster_moment()
     line = fm._moment_line(m)
     assert "\n" in line, line
-    assert "range: whole ~10.0s, or up to 3 tight pieces (~0.8s each)" in line, line
-    assert "1/3 moderate 0.8s point" in line, line
-    assert "2/3 strongest 0.9s point" in line, line
-    assert "3/3 weak 0.7s point" in line, line
-    # Generic/no-domain-words requirement (plan Part B): no speaker/action
-    # vocabulary leaks into the piece rows.
-    for banned in ("speaker", "action", "beat", "highlight"):
+    # The range line now makes the filtering explicit: plays whole, splits into
+    # N addressable beats, or tightens down to the strongest few (punchy).
+    assert "plays whole ~10.0s" in line, line
+    assert "splits into its 3 beats" in line, line
+    assert "down to ~1" in line, line
+    # Per-piece rows carry the core/drops marking so the brain sees which beats
+    # survive tightening and which fall away first.
+    assert "1/3 moderate 0.8s point \u00b7 drops when tight" in line, line
+    assert "2/3 strongest 0.9s point \u00b7 core" in line, line
+    assert "3/3 weak 0.7s point \u00b7 drops when tight" in line, line
+    # Generic/no-domain-words requirement (plan Part B): no domain vocabulary
+    # leaks into the piece rows.
+    for banned in ("speaker", "action", "highlight", "rally", "tennis", "podcast"):
         assert banned not in line.lower(), line
     print("ok  test_moment_line_multi_event_cluster_is_multiline_and_generic")
 
@@ -813,6 +839,7 @@ def main():
     test_snap_is_noop_without_transcript()
     test_piece_breakdown_none_for_single_event_moment()
     test_piece_breakdown_shape_for_three_separated_events()
+    test_piece_breakdown_all_strong_events_are_all_core()
     test_moment_line_multi_event_cluster_is_multiline_and_generic()
     test_resolve_piece_addresses_each_separated_event()
     test_resolve_piece_out_of_range_is_none()

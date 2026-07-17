@@ -569,7 +569,16 @@ def piece_breakdown(m: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     with zero domain words. None for a single-event moment (the common case,
     untouched). Shared by _piece_lines (the Beat Index's text rendering) and
     observe.read_state (the same facts, structured, for a per-cut deep look)
-    so the two always agree."""
+    so the two always agree.
+
+    Beyond the addressable set it also conveys the RENDERED FILTERING the
+    energy dial applies: as the cluster is tightened, a rising salience gate
+    (cutrecord_map._prune_events) drops the weaker events and keeps only the
+    strongest few. ``punchy_count``/``punchy_avg_s`` describe what survives at
+    the sharpest band (energy 0.9 -- the tightest rung the timeline plays), and
+    each piece's ``core`` flag marks whether that event is one of the survivors
+    (True) or one of the connective/droppable beats that fall away first
+    (False). The single strongest event is always core."""
     sal = m.get("salience") or {}
     events = sal.get("events") or []
     if len(events) <= 1:
@@ -582,6 +591,16 @@ def piece_breakdown(m: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     # resolve_piece. Energy 1.0 = each event's own tightest window.
     pieces, _removed = cutrecord_map.resolve_cluster(events, in_ms, out_ms, 1.0, prune=False)
     tight_s = (sum(b - a for a, b in pieces) / len(pieces) / 1000.0) if pieces else 0.0
+
+    # GATED (prune=True) at the sharpest band (energy 0.9, the tightest rung the
+    # rendered ladder actually plays): the weak/connective events drop and only
+    # the strongest few survive. `survivors` is a subset of the SAME event dicts
+    # (identity), so a piece is `core` iff its event is one of them.
+    sharp_energy = cutrecord_map._BAND_ENERGIES[-1]
+    survivors = cutrecord_map._prune_events(events, sharp_energy)
+    survivor_ids = {id(e) for e in survivors}
+    punchy_pieces, _ = cutrecord_map.resolve_cluster(events, in_ms, out_ms, sharp_energy, prune=True)
+    punchy_avg_s = (sum(b - a for a, b in punchy_pieces) / len(punchy_pieces) / 1000.0) if punchy_pieces else 0.0
 
     ordered = sorted(range(len(events)), key=lambda i: events[i].get("peak_ms", 0))
     primary_i = sal.get("primary")
@@ -596,21 +615,34 @@ def piece_breakdown(m: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             rel = (ev.get("score", 0.0) / hi) if hi > 0 else 0.0
             strength = "moderate" if rel >= 0.5 else "weak"
         piece_list.append({"pos": pos, "of": len(ordered), "strength": strength,
-                           "dur_s": round(dur_ms / 1000.0, 1), "kind": ev.get("kind") or "point"})
+                           "dur_s": round(dur_ms / 1000.0, 1), "kind": ev.get("kind") or "point",
+                           "core": id(ev) in survivor_ids})
     return {"broad_s": round(broad_s, 1), "tight_count": len(pieces),
-           "tight_avg_s": round(tight_s, 1), "pieces": piece_list}
+           "tight_avg_s": round(tight_s, 1),
+           "punchy_count": len(survivors), "punchy_avg_s": round(punchy_avg_s, 1),
+           "pieces": piece_list}
 
 
 def _piece_lines(m: Dict[str, Any]) -> List[str]:
     """Text rendering of piece_breakdown for the Beat Index -- see there for
-    the shared facts. [] for a single-event moment."""
+    the shared facts. [] for a single-event moment.
+
+    Makes the RENDERED FILTERING explicit: the moment can play whole, split
+    into all its individually-addressable beats, or be tightened -- and
+    tightening keeps only the strongest few (``punchy_count``), dropping the
+    weaker/connective ones. Each piece is tagged ``core`` (survives tightening)
+    or ``drops when tight`` so the brain knows which beats vanish as it sharpens
+    and can place any one of them on its own regardless."""
     b = piece_breakdown(m)
     if b is None:
         return []
-    lines = [f"    range: whole ~{b['broad_s']:.1f}s, or up to {b['tight_count']} "
-             f"tight pieces (~{b['tight_avg_s']:.1f}s each)"]
+    n = len(b["pieces"])
+    lines = [f"    range: plays whole ~{b['broad_s']:.1f}s, or splits into its {n} "
+             f"beats; tightening keeps only the strongest, down to ~{b['punchy_count']} "
+             f"(~{b['punchy_avg_s']:.1f}s each) at the sharpest, dropping the weaker ones:"]
     for p in b["pieces"]:
-        lines.append(f"    {p['pos']}/{p['of']} {p['strength']} {p['dur_s']:.1f}s {p['kind']}")
+        tag = " \u00b7 core" if p["core"] else " \u00b7 drops when tight"
+        lines.append(f"    {p['pos']}/{p['of']} {p['strength']} {p['dur_s']:.1f}s {p['kind']}{tag}")
     return lines
 
 

@@ -1027,6 +1027,11 @@ def test_read_state_piece_breakdown_matches_beat_index_for_cluster():
     # _piece_lines renders from -- a deep look must agree with the up-front map.
     assert cut["pieces"] == fm.piece_breakdown(m), cut.get("pieces")
     assert cut["pieces"]["tight_count"] == 3, cut["pieces"]
+    # The new filtering fields flow through unchanged, so a deep look shows the
+    # same punchy floor + per-beat core marking the Beat Index does.
+    assert cut["pieces"]["punchy_count"] == 1, cut["pieces"]
+    assert "punchy_avg_s" in cut["pieces"], cut["pieces"]
+    assert [p["core"] for p in cut["pieces"]["pieces"]] == [False, True, False], cut["pieces"]
     print("ok  read_state's piece breakdown mirrors the Beat Index for a cluster")
 
 

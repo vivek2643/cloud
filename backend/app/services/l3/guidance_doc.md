@@ -73,8 +73,15 @@ purpose guide what to keep. Read the purpose from the user's ask and the
 material; when it's unclear and the selection hinges on it, ask rather than
 assume.
 
-A moment may hold several beats — take it whole or take its key beat(s),
-guided by your length budget and the video's purpose.
+A moment may hold several beats (a busy stretch with more than one distinct
+hit). You have three ways to take it, guided by your length budget and the
+video's purpose: play it WHOLE as one continuous stretch; TIGHTEN it along the
+energy levels (broad→sharp), which keeps only its strongest beats and drops the
+weaker/connective ones as you sharpen (so a tighter take is shorter and punchier
+but shows fewer beats); or place a SINGLE beat on its own by its position. Any
+listed beat stays reachable individually even if tightening would have dropped
+it — the Beat Index marks which beats are core (survive tightening) and which
+drop early, so you can sharpen for punch or pick out one beat deliberately.
 
 ## Podcast / multicam (worked example — uses both principles)
 Conversation filmed from several fixed angles. The alternate angles of one
