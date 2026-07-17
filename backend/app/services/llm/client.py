@@ -30,9 +30,12 @@ from __future__ import annotations
 
 import json
 import logging
+import random
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Type, TypeVar
 
+import anthropic
 from pydantic import BaseModel, ValidationError
 
 from app.config import get_settings
@@ -60,6 +63,49 @@ class IngestFailure(Exception):
         self.stage = stage
         self.reason = reason
         super().__init__(f"ingest stage {stage!r} failed: {reason}")
+
+
+# Transient server-side conditions (Anthropic "Overloaded"/529, 5xx, 429 rate
+# limits, connection blips) are NOT model/schema failures -- they say "try
+# again shortly", not "your request is bad". A whole batch of ingests shouldn't
+# die because the API was briefly overloaded, so retry the raw call with
+# exponential backoff + jitter BEFORE the (separate) schema re-ask logic runs.
+# This is orthogonal to North Star #4: we still never fall back or silently
+# degrade a *valid* response -- we just don't treat a 529 as a permanent error.
+_TRANSIENT_RETRIES = 6
+_TRANSIENT_BASE_DELAY_S = 2.0
+_TRANSIENT_MAX_DELAY_S = 60.0
+_TRANSIENT_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
+
+
+def _is_transient(exc: Exception) -> bool:
+    if isinstance(exc, (anthropic.APIConnectionError, anthropic.APITimeoutError,
+                        anthropic.RateLimitError, anthropic.InternalServerError)):
+        return True
+    if isinstance(exc, anthropic.APIStatusError):
+        if getattr(exc, "status_code", None) in _TRANSIENT_STATUS:
+            return True
+        body = getattr(exc, "body", None)
+        etype = (body or {}).get("error", {}).get("type") if isinstance(body, dict) else None
+        return etype in {"overloaded_error", "api_error", "rate_limit_error"}
+    return False
+
+
+def _with_transient_retry(fn: Callable[[], Any], stage: str) -> Any:
+    """Run ``fn`` (a raw API call), retrying only TRANSIENT failures with
+    exponential backoff + full jitter. Re-raises immediately on a non-transient
+    error, and re-raises the last transient error once the budget is spent."""
+    for attempt in range(_TRANSIENT_RETRIES + 1):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 -- re-raised below unless transient
+            if not _is_transient(exc) or attempt == _TRANSIENT_RETRIES:
+                raise
+            delay = min(_TRANSIENT_MAX_DELAY_S, _TRANSIENT_BASE_DELAY_S * (2 ** attempt))
+            delay = random.uniform(0, delay)
+            logger.warning("ingest stage %s: transient API error (%s), retry %d/%d in %.1fs",
+                           stage, type(exc).__name__, attempt + 1, _TRANSIENT_RETRIES, delay)
+            time.sleep(delay)
 
 
 @dataclass
@@ -303,7 +349,7 @@ def complete(
             stream.until_done()
             return stream.get_final_message()
 
-    resp = _call(max_tokens)
+    resp = _with_transient_retry(lambda: _call(max_tokens), stage)
     usage = _usage_of(resp)
     if _truncated(resp):
         err = f"response truncated at max_tokens={max_tokens} before the tool call finished"
@@ -348,7 +394,7 @@ def complete(
         })
     else:
         messages.append({"role": "user", "content": [{"type": "text", "text": correction}]})
-    resp2 = _call(retry_tokens)
+    resp2 = _with_transient_retry(lambda: _call(retry_tokens), stage)
     usage2 = _usage_of(resp2)
     total_usage = _sum_usage(usage, usage2)
     if _truncated(resp2):

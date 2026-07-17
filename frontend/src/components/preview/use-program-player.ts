@@ -236,7 +236,11 @@ function isIdentityGrade(grade: ResolvedGrade | undefined): boolean {
   if (!grade) return true;
   if (grade.creative_lut_ref) return false;
   if (grade.soft_local?.vignette && grade.soft_local.vignette.strength > 0) return false;
-  const { slope, offset, power, sat } = grade.cdl;
+  // cdl is typed non-optional but can be absent at runtime (partial/server-baked
+  // grades carrying only soft_local or a LUT) -- a missing CDL is identity here.
+  const cdl = grade.cdl as typeof grade.cdl | undefined;
+  if (!cdl) return true;
+  const { slope, offset, power, sat } = cdl;
   const eps = 1e-9;
   return (
     slope.every((v) => Math.abs(v - 1) < eps) &&
