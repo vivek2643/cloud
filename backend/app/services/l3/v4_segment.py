@@ -55,6 +55,12 @@ class VideoCut:
     # content-aware min_ms (section 6): sparse/monotonous -> collapses hard;
     # dense -> holds more room at the same energy.
     density: float = 0.0
+    # Transient (NOT persisted -- absent from to_dict): the working span this cut
+    # was carved from. Lets _finalize_cuts weld a sub-floor sliver ONLY into a
+    # same-shot/same-span neighbor, never across the speech (or shot) gap between
+    # two spans -- a cross-gap union would engulf the content between them (the
+    # video-cut-swallows-speech overlap).
+    span_key: Optional[Tuple[int, int]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {"file_id": self.file_id, "src_in_ms": self.src_in_ms,
@@ -479,12 +485,15 @@ def _consolidate(cuts: List[Tuple[int, int, Dict[str, Any]]]) -> List[Tuple[int,
 
 
 def _merge_pair(cuts: List[VideoCut], j: int) -> List[VideoCut]:
-    """Merge ``cuts[j]`` into whichever adjacent neighbor it sits closer to
-    (by gap), keeping the stronger anchor's salience -- the same merge shape
-    ``_consolidate`` uses within one working span, applied here across the
-    whole file's finalized cuts."""
-    left = j - 1 if j - 1 >= 0 else None
-    right = j + 1 if j + 1 < len(cuts) else None
+    """Merge ``cuts[j]`` into whichever SAME-WORKING-SPAN neighbor it sits closer
+    to (by gap), keeping the stronger anchor's salience -- the same merge shape
+    ``_consolidate`` uses within one working span. Only same-span neighbors are
+    eligible: welding across the gap between two spans (a speech span, or another
+    shot) would produce a union that swallows the content between them. Caller
+    guarantees at least one same-span neighbor exists."""
+    same = cuts[j].span_key
+    left = j - 1 if j - 1 >= 0 and cuts[j - 1].span_key == same else None
+    right = j + 1 if j + 1 < len(cuts) and cuts[j + 1].span_key == same else None
 
     def _gap(x: int) -> int:
         return (cuts[j].src_in_ms - cuts[x].src_out_ms) if x < j else (cuts[x].src_in_ms - cuts[j].src_out_ms)
@@ -496,7 +505,8 @@ def _merge_pair(cuts: List[VideoCut], j: int) -> List[VideoCut]:
     keep_sal = ca.salience if ca.salience.get("score", 0.0) >= cb.salience.get("score", 0.0) else cb.salience
     merged = VideoCut(file_id=ca.file_id, src_in_ms=min(ca.src_in_ms, cb.src_in_ms),
                       src_out_ms=max(ca.src_out_ms, cb.src_out_ms),
-                      salience=dict(keep_sal), density=max(ca.density, cb.density))
+                      salience=dict(keep_sal), density=max(ca.density, cb.density),
+                      span_key=same)
     return cuts[:a_] + [merged] + cuts[b_ + 1:]
 
 
@@ -523,8 +533,19 @@ def _finalize_cuts(cuts: List[VideoCut]) -> List[VideoCut]:
     cuts = [c for c in cuts if c.src_out_ms > c.src_in_ms]
 
     while len(cuts) > 1:
-        short = next((i for i, c in enumerate(cuts)
-                     if c.src_out_ms - c.src_in_ms < MIN_CUT_DURATION_MS), None)
+        short = None
+        for i, c in enumerate(cuts):
+            if c.src_out_ms - c.src_in_ms >= MIN_CUT_DURATION_MS:
+                continue
+            # Weldable only into a SAME-SPAN neighbor. A sub-floor sliver with no
+            # same-span neighbor (e.g. isolated between two speech spans) stays
+            # as-is: a slightly-short but disjoint cut is acceptable, an overlap
+            # (from welding across the speech between spans) is not.
+            has_same = ((i > 0 and cuts[i - 1].span_key == c.span_key) or
+                        (i < len(cuts) - 1 and cuts[i + 1].span_key == c.span_key))
+            if has_same:
+                short = i
+                break
         if short is None:
             break
         cuts = _merge_pair(cuts, short)
@@ -583,6 +604,6 @@ def segment_video(
                 continue
             density = sal.pop("density", 0.0)
             cuts.append(VideoCut(file_id=file_id, src_in_ms=in_ms, src_out_ms=out_ms,
-                                 salience=sal, density=density))
+                                 salience=sal, density=density, span_key=span))
     cuts.sort(key=lambda c: c.src_in_ms)
     return _finalize_cuts(cuts)

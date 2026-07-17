@@ -251,6 +251,30 @@ def test_lone_cut_below_the_floor_survives_with_no_neighbor_to_merge_into():
     print("ok  test_lone_cut_below_the_floor_survives_with_no_neighbor_to_merge_into")
 
 
+def test_sub_floor_sliver_never_welds_across_a_speech_gap():
+    """Two working spans split by a speech span, each with a short burst near the
+    speech edge that yields a sub-floor sliver. The min-duration merge must NOT
+    weld the two slivers across the speech between them -- a cross-span union
+    would swallow the speech, producing the exact video<->speech overlap that
+    broke real ingests (f48da65f: [6860-9640] engulfing speech [8640-9560]).
+    Every cut must stay wholly on its own side of the speech span."""
+    n = 100
+    motion = _flat_motion(n)
+    ae = [0.05] * n
+    for i in range(36, 39):    # burst just before the speech span
+        ae[i] = 0.9
+    for i in range(62, 65):    # burst just after the speech span
+        ae[i] = 0.9
+    motion["action_energy"] = ae
+    speech = [(4000, 6000)]
+    cuts = _segment(motion, speech_spans=speech)
+    assert cuts, "expected video cuts around the speech"
+    for c in cuts:
+        assert c.src_out_ms <= 4000 or c.src_in_ms >= 6000, \
+            f"a video cut welded into / across the speech span [4000-6000]: {c}"
+    print("ok  test_sub_floor_sliver_never_welds_across_a_speech_gap")
+
+
 # --------------------------------------------------------------------------
 # density (feeds post.compute_pace_envelope's content-aware min_ms)
 # --------------------------------------------------------------------------
@@ -291,6 +315,7 @@ def main():
     test_finalize_cuts_clamps_extended_edges_to_the_working_span()
     test_finalize_cuts_merges_a_sub_floor_sliver_into_its_nearest_neighbor()
     test_lone_cut_below_the_floor_survives_with_no_neighbor_to_merge_into()
+    test_sub_floor_sliver_never_welds_across_a_speech_gap()
     test_density_is_higher_for_a_dense_span_than_a_sparse_one()
     print("\nall v4_segment tests passed")
 
