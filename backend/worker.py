@@ -40,7 +40,24 @@ def _warmup() -> None:
         logger.exception("Whisper warmup failed; will lazy-load on first job.")
 
 
+def _check_schema() -> None:
+    """Fail loud (uncaught SchemaDriftError) if the live schema has drifted
+    from backend/migrations/ -- see app/services/db_migrations.py and
+    migration_runner.plan.md for exactly what this does and does not catch.
+    Bypass via MIGRATION_GUARD=off (local dev only, never in production)."""
+    import psycopg
+    from app.config import get_settings
+    from app.services.db_migrations import assert_up_to_date
+
+    conn = psycopg.connect(get_settings().database_url, autocommit=True)
+    try:
+        assert_up_to_date(conn)
+    finally:
+        conn.close()
+
+
 async def main() -> None:
+    _check_schema()
     register_tasks()
 
     # Concurrency defaults to 1 (Whisper + SigLIP saturate one CPU). On a GPU

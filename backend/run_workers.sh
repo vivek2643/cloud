@@ -45,6 +45,16 @@ export WORKER_CONCURRENCY="${WORKER_CONCURRENCY:-1}"
 
 echo "Fleet: NUM_GPUS=$NUM_GPUS GPU_WORKERS=$GPU_WORKERS CPU_WORKERS=$CPU_WORKERS concurrency=$WORKER_CONCURRENCY ingest_concurrency=$INGEST_CONCURRENCY"
 
+# --- apply pending migrations ---------------------------------------------
+# The one gated deploy step that's allowed to write schema (see
+# migration_runner.plan.md) -- runs once here, before any worker forks, so
+# every worker.py process below starts against an up-to-date schema. Safe to
+# invoke even if this script is ever run concurrently on multiple boxes: the
+# applier takes a Postgres advisory lock, so only one call actually applies
+# and the rest find nothing pending.
+echo "Applying pending migrations..."
+python scripts/migrate.py apply || exit 1
+
 pids=()
 cleanup() { echo "Stopping fleet..."; kill "${pids[@]}" 2>/dev/null || true; }
 trap cleanup INT TERM EXIT

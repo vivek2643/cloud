@@ -196,7 +196,7 @@ call blocks, then proceeds cleanly once released).
 **Files:** `backend/run_workers.sh`.
 
 1. At the very top of `run_workers.sh`, before GPU detection / before any
-   `worker.py` fork: `python migrate.py apply || exit 1`. This makes the
+   `worker.py` fork: `python scripts/migrate.py apply || exit 1`. This makes the
    applier a genuinely single, gated step for the deployment shape that
    actually exists today (one container, `run_workers.sh` runs once, forks
    happen after) — the advisory lock from Step 2 is then defense-in-depth

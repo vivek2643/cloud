@@ -1,5 +1,6 @@
 import logging
 import traceback
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,7 +10,30 @@ from app.routers import folders, files, upload, logs as logs_router, edit_thread
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Edso API", version="0.1.0")
+
+def _check_schema() -> None:
+    """Fail loud (uncaught SchemaDriftError) if the live schema has drifted
+    from backend/migrations/ -- see app/services/db_migrations.py and
+    migration_runner.plan.md for exactly what this does and does not catch.
+    Bypass via MIGRATION_GUARD=off (local dev only, never in production)."""
+    import psycopg
+    from app.config import get_settings
+    from app.services.db_migrations import assert_up_to_date
+
+    conn = psycopg.connect(get_settings().database_url, autocommit=True)
+    try:
+        assert_up_to_date(conn)
+    finally:
+        conn.close()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _check_schema()
+    yield
+
+
+app = FastAPI(title="Edso API", version="0.1.0", lifespan=lifespan)
 
 # Permissive CORS in dev so the browser can reach us from localhost / 127.0.0.1
 # / the LAN IP that Next.js prints on startup. The regex matches:
