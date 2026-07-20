@@ -61,6 +61,21 @@ def identity_grade() -> Grade:
     return Grade()
 
 
+def identity_grade_json(working_space: str = "rec709") -> Dict[str, Any]:
+    """The `resolve_clip_grade`-shaped dict for a flat/no-op grade -- the
+    graceful-fallback value `layers.resolve` uses under `v1` when a shot has
+    no persisted `resolved_grades` row yet (color_grading_upgrade.plan.md
+    Step 1.0 §5: preview must always render, never block on the job)."""
+    g = Grade()
+    return {
+        "cdl": g.to_dict(),
+        "creative_lut_ref": None,
+        "working_space": working_space,
+        "soft_local": None,
+        "grade_hash": grade_hash(g, working_space=working_space),
+    }
+
+
 def is_identity(grade: Grade, eps: float = 1e-9) -> bool:
     return (
         all(abs(s - 1.0) < eps for s in grade.slope)

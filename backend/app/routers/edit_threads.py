@@ -19,6 +19,7 @@ by hand (PUT /document) and undo via version history.
 from __future__ import annotations
 
 import json
+import logging
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -29,6 +30,7 @@ from app.services.l3 import auto_edit
 from app.services.l3 import store
 from app.services.l3.grade.cdl import Grade
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/edit/threads", tags=["edit"])
 
 
@@ -198,9 +200,17 @@ def put_document(
     if body.captions is not None:
         new_doc["captions"] = body.captions
     new_doc.pop("resolved", None)  # force a fresh recompute below
-    new_doc["resolved"] = resolve_document(new_doc)
+    new_doc["resolved"] = resolve_document(new_doc, thread_id=thread_id)
 
     version = store.save_document(thread_id, new_doc, created_by="user")
+    # color_grading_upgrade.plan.md Step 1.0 §4: a look OR timeline-structure
+    # change (both land here) may invalidate the persisted `v1` grades --
+    # enqueue iff the input_hash actually changed (a no-op under `legacy`).
+    try:
+        from app.services.l3.grade.job import maybe_enqueue
+        maybe_enqueue(thread_id, new_doc)
+    except Exception:
+        logger.exception("put_document: grade job enqueue failed for thread %s (continuing)", thread_id)
     return {"version": version, "document": new_doc}
 
 
@@ -254,6 +264,40 @@ def grade_export(
         content=text, media_type=media_type,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@router.get("/{thread_id}/grade-status")
+def grade_status(thread_id: str, user_id: str = Depends(get_current_user_id)):
+    """color_grading_upgrade.plan.md Step 1.0 §6: the `v1` background grade
+    job's live progress, for the frontend's determinate progress bar
+    (Phase 4). `idle` (never run, or `legacy`) reports progress 0 with no
+    error -- not a state the UI needs to poll against."""
+    from app.services.l3.grade.job import get_job_state
+
+    _owned_thread(thread_id, user_id)
+    job = get_job_state(thread_id)
+    if not job:
+        return {"state": "idle", "progress": 0.0, "error": None}
+    total = int(job.get("total") or 0)
+    done = int(job.get("done") or 0)
+    progress = (done / total) if total > 0 else (1.0 if job.get("state") == "done" else 0.0)
+    return {"state": job.get("state") or "idle", "progress": progress, "error": job.get("error")}
+
+
+@router.post("/{thread_id}/grade")
+def trigger_grade(thread_id: str, user_id: str = Depends(get_current_user_id)):
+    """Explicitly (re)enqueue the `v1` grade job for the thread's CURRENT
+    document -- idempotent (`maybe_enqueue` no-ops if the input_hash hasn't
+    changed and a job for it is already grading/done). A no-op under
+    `legacy`."""
+    from app.services.l3.grade.job import maybe_enqueue
+
+    _owned_thread(thread_id, user_id)
+    doc, _head = store.latest_document(thread_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="No edit document yet")
+    maybe_enqueue(thread_id, doc)
+    return {"enqueued": True}
 
 
 @router.get("/{thread_id}/versions")

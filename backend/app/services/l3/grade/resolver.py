@@ -47,12 +47,13 @@ from app.services.l3.grade.correct import solve_correct_grade
 from app.services.l3.grade.presets import get_preset
 from app.services.l3.grade.reference_transfer import solve_reference_transfer
 from app.services.l3.grade.softlocal import solve_vignette
+from app.services.l3.grade.tone import WORKING_SPACE_V1, from_working, to_working
 
 DEFAULT_WORKING_SPACE = "rec709"
 
 
 def _corrected_source_stats(
-    color_stats: Optional[Dict[str, Any]], stack: Grade
+    color_stats: Optional[Dict[str, Any]], stack: Grade, *, pipeline: str = "legacy"
 ) -> Optional[Dict[str, Any]]:
     """Project a file's measured `rgb_mean`/`rgb_std` through the correct+match
     `stack` so the Look layer solves against the image AS CORRECTED, not the raw
@@ -62,12 +63,33 @@ def _corrected_source_stats(
 
     correct+match only ever produce slope/offset (power=1, sat=1 by
     construction), so mean' = clamp(mean*slope+offset) and std' = std*slope is
-    exact for that stack, not an approximation."""
+    exact for that stack, not an approximation.
+
+    `pipeline=="v1"` (color_grading_upgrade.plan.md Step 1.5): the CDL the
+    stack composes into runs INSIDE the working-space wrapper at bake time
+    (Step 1.1), so the mean projection is done there too -- linearize,
+    apply slope/offset, re-encode -- keeping the corrected stats in the SAME
+    space the reference image's own stats were measured in (display-encoded,
+    `reference_transfer.compute_image_stats`), so the two sides of the
+    transfer stay comparable. `std` stays a plain slope scale either way
+    (the working-space encode/decode is nonlinear, so std doesn't project
+    through it exactly -- an approximation already accepted for the legacy
+    path too, not a new one)."""
     if not color_stats:
         return None
     mean = color_stats.get("rgb_mean") or [0.5, 0.5, 0.5]
     std = color_stats.get("rgb_std") or [0.2, 0.2, 0.2]
-    corr_mean = [min(1.0, max(0.0, mean[c] * stack.slope[c] + stack.offset[c])) for c in range(3)]
+    if pipeline == "v1":
+        import numpy as np
+
+        working_mean = to_working(np.array(mean, dtype=np.float32), WORKING_SPACE_V1)
+        corr_working = np.clip(
+            working_mean * np.array(stack.slope, dtype=np.float32)
+            + np.array(stack.offset, dtype=np.float32), 0.0, 1.0,
+        )
+        corr_mean = from_working(corr_working, WORKING_SPACE_V1).tolist()
+    else:
+        corr_mean = [min(1.0, max(0.0, mean[c] * stack.slope[c] + stack.offset[c])) for c in range(3)]
     corr_std = [max(0.0, std[c] * stack.slope[c]) for c in range(3)]
     return {**color_stats, "rgb_mean": corr_mean, "rgb_std": corr_std}
 
@@ -98,6 +120,7 @@ def resolve_clip_grade(
     sequence_look: Optional[Dict[str, Any]] = None,
     already_graded: bool = False,
     match_delta: Optional[Grade] = None,
+    pipeline: str = "legacy",
 ) -> Dict[str, Any]:
     """Resolve ONE clip's (spine segment or op) final grade descriptor.
 
@@ -111,14 +134,21 @@ def resolve_clip_grade(
     callers that have it available should pass it through. `match_delta` is
     this clip's SS6 grade-groups delta (this file's nudge toward its group's
     anchor), already resolved once for the whole document by the caller.
+    `pipeline` (color_grading_upgrade.plan.md Step 1.1/1.3/1.5): "legacy"
+    (default) is today's exact stack -- callers that never pass it get
+    byte-identical output. "v1" selects the percentile-based correct layer,
+    the `rec709_v1` working space (baked into the CDL's tone response at
+    bake time), and projects the Look layer's corrected-source stats through
+    that same working space.
     """
-    stack = solve_correct_grade(color_stats, already_graded=already_graded)
+    stack = solve_correct_grade(color_stats, already_graded=already_graded, pipeline=pipeline)
     if match_delta is not None:
         stack = compose(stack, match_delta, 1.0)
     # The Look layer sits on top of correct+match, so it must be solved against
     # the ALREADY-CORRECTED image (see _corrected_source_stats). Passing the raw
     # color_stats here is what made a reference drop double-stretch the exposure.
-    stack = compose(stack, _solve_look(sequence_look, _corrected_source_stats(color_stats, stack)), 1.0)
+    corrected_stats = _corrected_source_stats(color_stats, stack, pipeline=pipeline)
+    stack = compose(stack, _solve_look(sequence_look, corrected_stats), 1.0)
     arc_intensity = (sequence_look or {}).get("arc_intensity")
     stack = compose(stack, solve_arc_grade(item.get("arc_intent"), arc_intensity), 1.0)
 
@@ -128,19 +158,24 @@ def resolve_clip_grade(
     creative_lut_ref = (sequence_look or {}).get("lut_ref") if sequence_look else None
     if sequence_look and sequence_look.get("mode") != "lut":
         creative_lut_ref = None
-    working_space = item.get("working_space") or DEFAULT_WORKING_SPACE
+    default_ws = WORKING_SPACE_V1 if pipeline == "v1" else DEFAULT_WORKING_SPACE
+    working_space = item.get("working_space") or default_ws
 
     # SS9 soft-local: opt-in only (never a surprise vignette on untouched
-    # footage) via sequence_look.vignette_strength; subject_box isn't wired
-    # in yet (needs the same segment->cut_records mapping already flagged
-    # as a follow-up for already_graded/white_reference), so it's always
-    # center-anchored for now.
+    # footage) via sequence_look.vignette_strength. `item.get("subject_box")`
+    # (color_grading_upgrade.plan.md Step 1.7: the masking-foundation seam)
+    # is the normalized (x,y,w,h) box a caller that's already done the
+    # segment->cut_records.framing.subject_box mapping can pass through --
+    # no caller does that mapping yet in Phase 1, so this stays center-
+    # anchored/absent in practice (no visual change), but resolve -> hash ->
+    # bake all already carry it end-to-end for Phase 3 to wire for real.
     vignette_strength = (sequence_look or {}).get("vignette_strength")
-    soft_local = (
-        {"vignette": solve_vignette(strength=float(vignette_strength))}
-        if vignette_strength
-        else None
-    )
+    subject_box = item.get("subject_box")
+    soft_local = None
+    if vignette_strength:
+        soft_local = {"vignette": solve_vignette(subject_box, strength=float(vignette_strength))}
+        if subject_box:
+            soft_local["subject_box"] = list(subject_box)
 
     h = grade_hash(
         resolved,

@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import List, Optional, Tuple
 
 from app.services.l3.grade.cdl import Grade, apply_cdl
+from app.services.l3.grade.tone import from_working, to_working
 
 DEFAULT_LUT_SIZE = 33
 
@@ -92,14 +93,25 @@ def bake_cube_text(
     size: int = DEFAULT_LUT_SIZE,
     creative_lut_grid: Optional[Tuple] = None,
     title: str = "edso_grade",
+    working_space: str = "rec709",
 ) -> str:
     """Bake `grade`'s CDL (and, if given, compose a parsed creative LUT on
     top) into `.cube` text. `creative_lut_grid` is the `(grid, size)` tuple
-    `parse_cube_text` returns -- pass it straight through."""
+    `parse_cube_text` returns -- pass it straight through.
+
+    `working_space` (color_grading_upgrade.plan.md Step 1.1): any value other
+    than `tone.WORKING_SPACE_V1` (including the `legacy` default) makes
+    `to_working`/`from_working` pure identity, so the pipeline collapses back
+    to exactly `apply_cdl(grid, grade)` -- byte-identical to before this
+    step existed. Under `v1`, the CDL runs INSIDE the working-space wrapper
+    (linearize -> CDL -> filmic shoulder -> re-encode), which is what turns
+    a flat slope/offset filter into something that reads as graded."""
     import numpy as np
 
-    grid = _identity_grid(size)               # (size,size,size,3) [b,g,r] index order
-    out = apply_cdl(grid, grade)               # CDL first (SS3 stack: Correct/Match/Arc live in cdl)
+    grid = _identity_grid(size)                       # (size,size,size,3) [b,g,r] index order
+    working = to_working(grid, working_space)
+    graded = apply_cdl(working, grade)                 # CDL (SS3 stack: Correct/Match/Arc live in cdl)
+    out = from_working(graded, working_space)
 
     if creative_lut_grid is not None:
         lut_grid, _lut_size = creative_lut_grid

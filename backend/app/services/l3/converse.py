@@ -388,7 +388,7 @@ def respond(thread_id: str, *, llm: Optional[LLMClient] = None) -> ConverseResul
         working.setdefault("brief", {})["target_duration_s"] = _target_s
     max_tokens = settings.autoedit_max_output_tokens
     try:
-        ctx = observe.build_context(file_ids, run_id=pinned_run)
+        ctx = observe.build_context(file_ids, run_id=pinned_run, thread_id=thread_id)
         system = (_LOOP_SYSTEM + _guidance_block()
                   + "\n\n" + _context_block(file_ids, document, ctx))
         result = tools.run_edit_loop(llm, system=system, messages=messages,
@@ -403,6 +403,11 @@ def respond(thread_id: str, *, llm: Optional[LLMClient] = None) -> ConverseResul
             observe.resolve_doc(result.document, ctx)
         except Exception:
             logger.exception("converse: resolve after edit failed for thread %s", thread_id)
+        try:
+            from app.services.l3.grade.job import maybe_enqueue
+            maybe_enqueue(thread_id, result.document)
+        except Exception:
+            logger.exception("converse: grade job enqueue failed for thread %s", thread_id)
     return ConverseResult(reply=reply, document=result.document, changed=result.changed,
                           questions=result.questions, awaiting_user=result.awaiting_user,
                           trace=result.trace)

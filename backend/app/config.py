@@ -137,6 +137,20 @@ class Settings(BaseSettings):
     # Same cut_record contract both ways -- flip freely per ingest run.
     cuts_segmenter: str = "v3"
 
+    # color_grading_upgrade.plan.md: "legacy" is today's exact inline-resolve
+    # stack (byte-identical output, no background job). "v1" moves grading to
+    # a background job (grade/job.py::run_grade_job) that measures each shot's
+    # OWN span, matches neighbors, and pre-bakes cubes -- layers.resolve then
+    # READS the persisted result instead of computing it. Flip only once
+    # Phase 1's parity tests are green.
+    grade_pipeline: str = "legacy"
+    # Phase 2: bounded across-shot exposure/tonal-placement leveling (a smooth
+    # target curve, capped correction). Off by default -- opt-in until verified.
+    grade_even_lighting: bool = False
+    # Phase 3: subject-aware leveling + semantic scene grouping for matching +
+    # narrative-driven arc. Off by default.
+    grade_semantic: bool = False
+
     @property
     def r2_endpoint(self) -> str:
         return f"https://{self.r2_account_id}.r2.cloudflarestorage.com"

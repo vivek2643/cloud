@@ -60,6 +60,14 @@ LOG_FLAT_PRE_LIFT = 1.06          # gentle extra contrast on top of the levels s
 # toward full range instead of snapping to it) makes the correction never-worse
 # regardless of whether the log/flat guess was right.
 LEVELS_SLOPE_MAX = 1.5
+# color_grading_upgrade.plan.md Step 1.3: a natural on-screen mid-gray target
+# (a touch below the classic 18%-card 0.46 sRGB convention, so the nudge never
+# reads as washed-out/over-brightened).
+TARGET_MID_GRAY = 0.42
+# The mid-gray retarget is a SMALL extra nudge on top of the already-anchored
+# black/white stretch, not a second independent correction -- bounded tight
+# so it can't fight the levels stretch or blow past LEVELS_SLOPE_MAX on its own.
+MID_GRAY_EXTRA_CLAMP = 1.2
 
 
 def _compose(s1: float, o1: float, s2: float, o2: float) -> Tuple[float, float]:
@@ -107,18 +115,48 @@ def _solve_levels(color_stats: Dict[str, Any], clip_shadow: float, clip_highligh
     return slope, offset
 
 
+def _solve_levels_v1(color_stats: Dict[str, Any], clip_shadow: float, clip_highlight: float) -> Tuple[float, float]:
+    """Percentile-based exposure (Step 1.3): start from the SAME never-worse
+    black/white anchoring `_solve_levels` already does, then ALSO nudge the
+    resulting `mid_gray` toward `TARGET_MID_GRAY` -- a small, tightly-clamped
+    extra multiplier, re-anchored the same way (blacks stay pinned to
+    target, `LEVELS_SLOPE_MAX` re-applied if the composed slope would exceed
+    it). This catches a shot whose black/white points are already fine (so
+    the legacy stretch alone is a no-op) but whose overall exposure still
+    reads dim/bright -- the case percentile-only correction can't reach."""
+    slope, offset = _solve_levels(color_stats, clip_shadow, clip_highlight)
+    mid = color_stats.get("mid_gray")
+    if mid is None:
+        return slope, offset
+    projected_mid = float(mid) * slope + offset
+    if projected_mid <= 1e-6:
+        return slope, offset
+    extra = max(1.0 / MID_GRAY_EXTRA_CLAMP, min(MID_GRAY_EXTRA_CLAMP, TARGET_MID_GRAY / projected_mid))
+    new_slope = slope * extra
+    black = float(color_stats.get("black_point") if color_stats.get("black_point") is not None else 0.0)
+    target_low = TARGET_BLACK if black > TARGET_BLACK else black
+    if new_slope > LEVELS_SLOPE_MAX:
+        new_slope = LEVELS_SLOPE_MAX
+    new_offset = target_low - black * new_slope
+    return new_slope, new_offset
+
+
 def solve_correct_grade(
     color_stats: Optional[Dict[str, Any]],
     *,
     already_graded: bool = False,
     white_reference_rgb: Optional[Tuple[float, float, float]] = None,
+    pipeline: str = "legacy",
 ) -> Grade:
     """Deterministic correction from ONE file's `color_stats` row (see
     `grade.measure.fetch_color_stats`), optionally refined by a verified
     `white_reference_rgb` sample (SS2.3 -- see module docstring for what
     "verified" means and what's not built yet). Identity when there's
     nothing safe to do: no measurement, already-graded footage (semantic
-    gate), or footage with significant existing clipping (never-worse gate)."""
+    gate), or footage with significant existing clipping (never-worse gate).
+    `pipeline=="v1"` (color_grading_upgrade.plan.md Step 1.3) additionally
+    targets a mid-gray placement via `_solve_levels_v1`; `legacy` is the
+    untouched black/white-only stretch."""
     if not color_stats or already_graded:
         return Grade()
 
@@ -127,7 +165,8 @@ def solve_correct_grade(
     black = float(color_stats.get("black_point") if color_stats.get("black_point") is not None else 0.0)
 
     wb_r, wb_g, wb_b = _solve_wb(color_stats, white_reference_rgb)
-    luma_slope, luma_offset = _solve_levels(color_stats, clip_shadow, clip_highlight)
+    levels_fn = _solve_levels_v1 if pipeline == "v1" else _solve_levels
+    luma_slope, luma_offset = levels_fn(color_stats, clip_shadow, clip_highlight)
 
     if color_stats.get("is_log_flat") and clip_shadow <= MAX_CLIP_PCT_FOR_STRETCH:
         # Pivot-preserving around REC709's standard mid-gray target so the

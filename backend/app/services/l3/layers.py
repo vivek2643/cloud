@@ -26,8 +26,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from app.services.l3.grade.cdl import identity_grade_json
 from app.services.l3.grade.match import solve_match_deltas
 from app.services.l3.grade.resolver import resolve_clip_grade
+from app.services.l3.grade.tone import WORKING_SPACE_V1
 
 # Z bands so layer kinds stack predictably regardless of insertion order.
 Z_SPINE_VIDEO = 0
@@ -564,6 +566,9 @@ def resolve(
     durations: Optional[Dict[str, int]] = None,
     color_stats: Optional[Dict[str, dict]] = None,
     audio_routes: Optional[Dict[str, dict]] = None,
+    *,
+    grade_pipeline: str = "legacy",
+    grade_lookup: Optional[Dict[str, dict]] = None,
 ) -> ResolvedTimeline:
     """Compile the spine + operations into the flat resolved layer set.
 
@@ -585,17 +590,31 @@ def resolve(
     document built before this feature, or a hand-placed `place_span` span
     (no cut to bake coupling from) -- byte-identical to before this
     feature existed. `audio_override` (`replace_audio`) wins over both.
-    """
+
+    `grade_pipeline`/`grade_lookup` (color_grading_upgrade.plan.md Step 1.0):
+    "legacy" (default) computes every clip's grade inline via
+    `resolve_clip_grade`/`solve_match_deltas`, byte-identical to before this
+    step existed -- every EXISTING caller that never passes these two params
+    gets exactly that. "v1" instead READS each shot's grade from
+    `grade_lookup` (shot_key -> the `resolve_clip_grade`-shaped dict a
+    caller pre-fetched from `resolved_grades`, see `grade.job.
+    fetch_latest_grades`) -- never computes. A shot_key missing from
+    `grade_lookup` (the background job hasn't produced it yet) falls back to
+    plain identity, never an error: preview must always render, even while
+    the job is still catching up."""
     durations = durations or {}
     color_stats = color_stats or {}
     audio_routes = audio_routes or {}
+    grade_lookup = grade_lookup or {}
+    v1_grades = grade_pipeline == "v1"
     timeline = document.get("timeline") or []
     operations = document.get("operations") or []
     spans, total = spine_spans(timeline)
     sequence_look = document.get("look")
     # SS6 match layer: grade-groups are a whole-document clustering decision,
-    # so resolve every file's delta ONCE here rather than per-clip.
-    match_deltas = solve_match_deltas(color_stats) if color_stats else {}
+    # so resolve every file's delta ONCE here rather than per-clip. Skipped
+    # entirely under v1 -- that grading already happened in the job.
+    match_deltas = {} if v1_grades else (solve_match_deltas(color_stats) if color_stats else {})
 
     video: List[VideoLayer] = []
     audio: List[AudioLayer] = []
@@ -610,10 +629,11 @@ def resolve(
             prog_start_ms=s.prog_start_ms, prog_end_ms=s.prog_end_ms,
             z=Z_SPINE_VIDEO, kind="spine",
             transform=solve_transform(document, seg.get("transform")),
-            grade=resolve_clip_grade(
-                seg, color_stats=color_stats.get(seg["file_id"]), sequence_look=sequence_look,
-                match_delta=match_deltas.get(seg["file_id"]),
-            ),
+            grade=(grade_lookup.get(seg["seg_id"]) or identity_grade_json(WORKING_SPACE_V1)) if v1_grades
+                else resolve_clip_grade(
+                    seg, color_stats=color_stats.get(seg["file_id"]), sequence_look=sequence_look,
+                    match_delta=match_deltas.get(seg["file_id"]),
+                ),
         ))
         # Audio source priority (av_coupling_authoritative.plan.md):
         #  1. `replace_audio`'s override (audio_brain.plan.md) -- the escape
@@ -679,10 +699,11 @@ def resolve(
                 opacity=float(op.get("opacity", 1.0)),
                 kind="coverage", op_id=op["op_id"],
                 transform=solve_transform(document, op.get("transform")),
-                grade=resolve_clip_grade(
-                    op, color_stats=color_stats.get(op["source_file_id"]), sequence_look=sequence_look,
-                    match_delta=match_deltas.get(op["source_file_id"]),
-                ),
+                grade=(grade_lookup.get(op["op_id"]) or identity_grade_json(WORKING_SPACE_V1)) if v1_grades
+                    else resolve_clip_grade(
+                        op, color_stats=color_stats.get(op["source_file_id"]), sequence_look=sequence_look,
+                        match_delta=match_deltas.get(op["source_file_id"]),
+                    ),
             ))
         elif t == "place_audio":
             # "voiceover" is a plain ROLE_DIALOGUE bed at render time (a fact

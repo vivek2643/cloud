@@ -73,6 +73,12 @@ class EditContext:
     # every projection in the turn (the map struct + the re-assembled BEAT INDEX
     # text) reads the SAME snapshot. None when nothing is ingested yet.
     run_id: Optional[str] = None
+    # color_grading_upgrade.plan.md Step 1.0: the edit thread id, needed only
+    # to look up persisted `v1` grades (`resolve_doc`'s `grade_lookup`) --
+    # None for any caller that never passes it (e.g. a test harness with no
+    # real thread), which just means the resolve falls back to `legacy`-style
+    # inline computation for that turn.
+    thread_id: Optional[str] = None
 
     @property
     def meta_by_ref(self) -> Dict[str, dict]:
@@ -80,7 +86,8 @@ class EditContext:
         return self.index.moments
 
 
-def build_context(file_ids: List[str], run_id: Optional[str] = None) -> EditContext:
+def build_context(file_ids: List[str], run_id: Optional[str] = None,
+                  thread_id: Optional[str] = None) -> EditContext:
     """Assemble the per-turn context once (footage map + durations). All DB reads
     live here; the sense functions stay pure over the result.
 
@@ -134,6 +141,7 @@ def build_context(file_ids: List[str], run_id: Optional[str] = None) -> EditCont
         audio_features=audio_features,
         audio_assets=audio_assets,
         run_id=eff_run,
+        thread_id=thread_id,
     )
 
 
@@ -218,7 +226,23 @@ def resolve_doc(document: dict, ctx: EditContext) -> dict:
         framing.annotate_document(document)
     except Exception:
         logger.exception("observe: framing annotation failed (continuing)")
-    document["resolved"] = layers.resolve(document, ctx.durations, ctx.color_stats).to_dict()
+    # color_grading_upgrade.plan.md Step 1.0: under `v1`, read every shot's
+    # freshest persisted grade instead of computing inline (graceful fallback
+    # to identity for a shot the background job hasn't produced yet).
+    from app.config import get_settings
+    grade_pipeline = get_settings().grade_pipeline
+    grade_lookup: Dict[str, dict] = {}
+    if grade_pipeline == "v1" and ctx.thread_id:
+        try:
+            from app.services.l3.grade.job import fetch_latest_grades, ordered_shots
+            shot_keys = [s.key for s in ordered_shots(document)]
+            grade_lookup = fetch_latest_grades(ctx.thread_id, shot_keys)
+        except Exception:
+            logger.exception("resolve_doc: grade lookup failed for thread %s (continuing)", ctx.thread_id)
+    document["resolved"] = layers.resolve(
+        document, ctx.durations, ctx.color_stats,
+        grade_pipeline=grade_pipeline, grade_lookup=grade_lookup,
+    ).to_dict()
     return document
 
 
