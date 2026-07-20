@@ -26,9 +26,14 @@ from app.services.l3.grade import job as grade_job  # noqa: E402
 from app.services.l3.grade import tone  # noqa: E402
 from app.services.l3.grade.cdl import Grade, apply_cdl, identity_grade_json  # noqa: E402
 from app.services.l3.grade.correct import solve_correct_grade  # noqa: E402
+from app.services.l3.grade.leveling import (  # noqa: E402
+    ShotLevelInput, solve_exposure_leveling, solve_leveling, solve_tonal_leveling,
+)
 from app.services.l3.grade.lut_bake import bake_cube_text  # noqa: E402
 from app.services.l3.grade.match import ShotStats, group_neighbors, solve_sequence_match  # noqa: E402
+from app.services.l3.grade.measure_span import _measure_subject_luma  # noqa: E402
 from app.services.l3.grade.resolver import resolve_clip_grade  # noqa: E402
+from app.services.l3.grade.scene_group import ShotSceneMeta, group_shots_semantically  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -410,7 +415,7 @@ def test_run_grade_job_end_to_end_mocked():
     upserted_rows = []
     status_calls = []
 
-    def fake_measure_span(file_id, in_ms, out_ms, *, hero_ts_ms=None):
+    def fake_measure_span(file_id, in_ms, out_ms, *, hero_ts_ms=None, subject_box=None):
         return _cs(rgb_mean=[0.4, 0.5, 0.6], mid_gray=0.3)
 
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
@@ -465,6 +470,230 @@ def test_run_grade_job_skips_when_already_done_for_current_hash():
     print("ok  job: run_grade_job no-ops when already done for the current input_hash")
 
 
+# --------------------------------------------------------------------------
+# Phase 2: grade/leveling.py (exposure + tonal-placement leveling)
+# --------------------------------------------------------------------------
+
+def test_leveling_flattens_jittery_brightness():
+    jittery = [ShotLevelInput(key=f"s{i}", mid_gray=mg, black_point=0.02, white_point=0.95)
+              for i, mg in enumerate([0.4, 0.55, 0.3, 0.5, 0.35, 0.45, 0.32])]
+    deltas = solve_exposure_leveling(jittery)
+    assert len(deltas) >= 5, deltas   # most shots need SOME nudge in a jittery sequence
+    print("ok  leveling: flattens a jittery-brightness montage")
+
+
+def test_leveling_preserves_an_intentional_arc():
+    arc = [ShotLevelInput(key=f"s{i}", mid_gray=mg, black_point=0.02, white_point=0.95)
+          for i, mg in enumerate([0.6, 0.55, 0.5, 0.45, 0.4, 0.35, 0.3, 0.25, 0.2, 0.15])]
+    deltas = solve_exposure_leveling(arc)
+    projected = [s.mid_gray * (deltas[s.key].slope[0] if s.key in deltas else 1.0) for s in arc]
+    assert projected[0] > projected[-1] + 0.2, projected   # the overall day->night trend survives
+    print("ok  leveling: an intentional day->night arc survives (the smooth target follows it)")
+
+
+def test_leveling_exposure_gain_is_bounded():
+    spike = [ShotLevelInput(key=f"s{i}", mid_gray=0.4, black_point=0.02, white_point=0.95) for i in range(5)]
+    spike[2] = ShotLevelInput(key="s2", mid_gray=0.05, black_point=0.02, white_point=0.95)
+    deltas = solve_exposure_leveling(spike)
+    cap = 2.0 ** 0.5   # EXPOSURE_CAP_STOPS
+    assert abs(deltas["s2"].slope[0] - cap) < 1e-6, deltas["s2"].slope
+    print("ok  leveling: exposure gain never exceeds the stop cap")
+
+
+def test_leveling_tonal_converges_low_contrast_and_punchy():
+    scene = [
+        ShotLevelInput(key="low1", mid_gray=0.5, black_point=0.15, white_point=0.75),
+        ShotLevelInput(key="punchy", mid_gray=0.5, black_point=0.01, white_point=0.99),
+        ShotLevelInput(key="low2", mid_gray=0.5, black_point=0.13, white_point=0.77),
+    ]
+    deltas = solve_tonal_leveling(scene)
+    assert "low1" in deltas and "low2" in deltas
+    print("ok  leveling: low-contrast and punchy shots in one scene converge")
+
+
+def test_leveling_tonal_skips_cross_scene_outlier():
+    outlier_scene = [
+        ShotLevelInput(key="a", black_point=0.1, white_point=0.8, mid_gray=0.5),
+        ShotLevelInput(key="b", black_point=0.1, white_point=0.8, mid_gray=0.5),
+        ShotLevelInput(key="weird", black_point=0.45, white_point=0.55, mid_gray=0.5),
+        ShotLevelInput(key="c", black_point=0.1, white_point=0.8, mid_gray=0.5),
+        ShotLevelInput(key="d", black_point=0.1, white_point=0.8, mid_gray=0.5),
+    ]
+    deltas = solve_tonal_leveling(outlier_scene)
+    assert "weird" not in deltas, "a genuinely different scene must not be forced to fit"
+    print("ok  leveling: a cross-scene outlier is skipped, not forced to fit")
+
+
+def test_leveling_tonal_never_pushes_toward_clipping():
+    near_full = [ShotLevelInput(key=f"s{i}", black_point=0.0, white_point=1.0, mid_gray=0.5) for i in range(4)]
+    deltas = solve_tonal_leveling(near_full)
+    for k, g in deltas.items():
+        proj_b, proj_w = 0.0 * g.slope[0] + g.offset[0], 1.0 * g.slope[0] + g.offset[0]
+        assert -0.011 <= proj_b and proj_w <= 1.011, (k, proj_b, proj_w)
+    print("ok  leveling: tonal alignment never pushes a shot toward clipping")
+
+
+def test_leveling_never_crashes_on_a_true_black_point():
+    """Regression: black_point == 0.0 exactly (a common, legitimate value)
+    must not break the outlier check (a ratio-based check on black_point
+    itself would divide by ~0)."""
+    mixed = [ShotLevelInput(key="z0", black_point=0.0, white_point=0.9, mid_gray=0.4),
+            ShotLevelInput(key="z1", black_point=0.05, white_point=0.85, mid_gray=0.4),
+            ShotLevelInput(key="z2", black_point=0.0, white_point=0.92, mid_gray=0.4)]
+    solve_tonal_leveling(mixed)   # must not raise
+    print("ok  leveling: a true black_point of 0.0 never crashes the outlier check")
+
+
+def test_leveling_subject_luma_used_when_not_a_silhouette():
+    """Step 3.1: exposure leveling targets subject_luma (not whole-frame
+    mid_gray) when a usable one is present."""
+    shots = [ShotLevelInput(key=f"s{i}", mid_gray=0.5, black_point=0.02, white_point=0.95,
+                            subject_luma=sl)
+            for i, sl in enumerate([0.3, 0.5, 0.28, 0.48, 0.32])]
+    deltas = solve_exposure_leveling(shots)
+    # subject_luma jitters (0.3/0.5 alternating) while mid_gray is FLAT at
+    # 0.5 -- if subject_luma weren't being used, nothing would need leveling.
+    assert len(deltas) >= 2, deltas
+    print("ok  leveling: subject-aware exposure targets subject_luma, not whole-frame mid_gray")
+
+
+def test_leveling_subject_luma_ignored_when_silhouette():
+    """Step 3.1's gate: a subject_luma far enough from the frame's own
+    mid_gray (a deliberate silhouette/backlit shot) is NOT treated as a
+    wrong exposure -- falls back to whole-frame mid_gray, which is already
+    flat/consistent here, so nothing should move."""
+    shots = [ShotLevelInput(key=f"s{i}", mid_gray=0.5, black_point=0.02, white_point=0.95,
+                            subject_luma=0.05)   # a silhouette: subject WAY darker than the frame
+            for i in range(5)]
+    deltas = solve_exposure_leveling(shots)
+    assert deltas == {}, deltas
+    print("ok  leveling: a deliberate silhouette's subject_luma is ignored (falls back to mid_gray)")
+
+
+def test_leveling_composed_result_includes_both_stages():
+    shots = [
+        ShotLevelInput(key="a", mid_gray=0.3, black_point=0.1, white_point=0.8),
+        ShotLevelInput(key="b", mid_gray=0.5, black_point=0.02, white_point=0.95),
+        ShotLevelInput(key="c", mid_gray=0.3, black_point=0.1, white_point=0.8),
+    ]
+    composed = solve_leveling(shots)
+    exposure_only = solve_exposure_leveling(shots)
+    tonal_only = solve_tonal_leveling(shots)
+    assert set(composed) == set(exposure_only) | set(tonal_only)
+    print("ok  leveling: solve_leveling composes exposure + tonal into one delta per shot")
+
+
+# --------------------------------------------------------------------------
+# Step 3.1: measure_span's subject-luma crop (pure -- synthetic frame, no ffmpeg)
+# --------------------------------------------------------------------------
+
+def test_measure_subject_luma_reads_the_box_not_the_whole_frame():
+    import numpy as np
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+    frame[:, :] = [20, 20, 20]         # dark background
+    frame[40:60, 40:60] = [230, 230, 230]   # a bright subject box, center 40%x40%..60%x60%
+    luma = _measure_subject_luma(frame, (0.4, 0.4, 0.2, 0.2))
+    assert luma is not None and luma > 0.8, luma   # reads the bright box, not the dark background
+    whole_frame_luma = _measure_subject_luma(frame, (0.0, 0.0, 1.0, 1.0))
+    assert whole_frame_luma < luma   # the whole-frame average is dragged down by the dark background
+    print("ok  measure_span: subject_luma reads inside the box, not the whole frame")
+
+
+def test_measure_subject_luma_none_for_degenerate_box():
+    import numpy as np
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+    assert _measure_subject_luma(frame, (0.5, 0.5, 0.0, 0.0)) is None
+    assert _measure_subject_luma(frame, (1.5, 1.5, 0.1, 0.1)) is None
+    print("ok  measure_span: subject_luma is None for a degenerate/out-of-frame box")
+
+
+# --------------------------------------------------------------------------
+# Step 3.2: grade/scene_group.py
+# --------------------------------------------------------------------------
+
+def test_scene_group_same_speaker_different_file_groups():
+    meta = [
+        ShotSceneMeta(key="s0", file_id="f1", speaker_person="P1", on_camera=True),
+        ShotSceneMeta(key="s1", file_id="f2", speaker_person="P1", on_camera=True),
+    ]
+    assert group_shots_semantically(meta) == [[0, 1]]
+    print("ok  scene_group: same speaker across different files groups")
+
+
+def test_scene_group_no_shared_signal_does_not_group():
+    meta = [
+        ShotSceneMeta(key="a", file_id="f1", speaker_person="P1"),
+        ShotSceneMeta(key="b", file_id="f2", speaker_person="P2", label="kitchen"),
+    ]
+    assert group_shots_semantically(meta) == [[0], [1]]
+    print("ok  scene_group: no shared trusted signal -> no group")
+
+
+def test_scene_group_overrides_rgb_grouping_in_solve_sequence_match():
+    """Step 3.2's acceptance: shots from one setup grade together even when
+    a transient skews their RGB (RGB-based grouping alone would miss it)."""
+    shots = [
+        ShotStats(key="s0", file_id="f1",
+                  stats={"black_point": 0.02, "white_point": 0.9, "mid_gray": 0.35,
+                        "rgb_mean": [0.9, 0.1, 0.1]}, quality=0.5),
+        ShotStats(key="s1", file_id="f2",
+                  stats={"black_point": 0.05, "white_point": 0.8, "mid_gray": 0.3,
+                        "rgb_mean": [0.1, 0.9, 0.1]}, quality=0.8),
+    ]
+    assert solve_sequence_match(shots) == {}, "RGB-only grouping should NOT match these"
+    forced = solve_sequence_match(shots, groups=[[0, 1]])
+    assert "s0" in forced, "semantic groups must override the default RGB grouping"
+    print("ok  scene_group: semantic groups align a same-setup pair RGB alone would miss")
+
+
+# --------------------------------------------------------------------------
+# Phase 2/3: run_grade_job actually exercises leveling + semantic grouping
+# when their flags are on (mocked -- no DB/ffmpeg)
+# --------------------------------------------------------------------------
+
+def test_run_grade_job_applies_leveling_and_semantic_grouping_when_flagged():
+    doc = {
+        "timeline": [
+            {"seg_id": "s0", "file_id": "f1", "in_ms": 0, "out_ms": 2000,
+             "speaker_person": "P1", "on_camera": True},
+            {"seg_id": "s1", "file_id": "f2", "in_ms": 0, "out_ms": 2000,
+             "speaker_person": "P1", "on_camera": True},
+        ],
+        "operations": [], "look": {},
+    }
+    call_log = []
+
+    def fake_measure_span(file_id, in_ms, out_ms, *, hero_ts_ms=None, subject_box=None):
+        # very different RGB (so RGB-based grouping would isolate them) but
+        # jittery mid_gray (so leveling has something to do), same speaker
+        # (so semantic grouping should force a match despite the RGB gap).
+        return {"black_point": 0.02, "white_point": 0.9,
+               "mid_gray": 0.3 if file_id == "f1" else 0.55,
+               "rgb_mean": [0.9, 0.1, 0.1] if file_id == "f1" else [0.1, 0.9, 0.1],
+               "rgb_std": [0.1, 0.1, 0.1]}
+
+    fake_settings = mock.Mock(grade_pipeline="v1", grade_even_lighting=True, grade_semantic=True)
+
+    with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
+         mock.patch("app.services.l3.grade.job._upsert_job_status", side_effect=lambda tid, **kw: call_log.append(("status", kw))), \
+         mock.patch("app.services.l3.grade.job._upsert_grade_row",
+                    side_effect=lambda tid, key, h, gj, cube: call_log.append(("row", key, gj))), \
+         mock.patch("app.services.l3.grade.job.fetch_color_stats", return_value={}), \
+         mock.patch("app.services.l3.grade.job.measure_span", side_effect=fake_measure_span), \
+         mock.patch("app.services.l3.grade.job.ensure_cube_file", return_value=None), \
+         mock.patch("app.services.l3.grade.job.get_settings", return_value=fake_settings), \
+         mock.patch("app.services.l3.store.latest_document", return_value=(doc, 1), create=True):
+        grade_job.run_grade_job("thread-flags")
+
+    rows = {r[1]: r[2] for r in call_log if r[0] == "row"}
+    assert set(rows) == {"s0", "s1"}
+    # both shots ended up graded (leveling + semantic-forced match both ran
+    # without crashing and produced a real, non-identity result somewhere).
+    non_identity = [k for k, gj in rows.items() if Grade.from_dict(gj["cdl"]) != Grade()]
+    assert non_identity, rows
+    print("ok  job: run_grade_job runs leveling + semantic grouping when both flags are on")
+
+
 def main():
     test_tone_legacy_is_exact_identity()
     test_tone_v1_black_stays_black()
@@ -497,6 +726,22 @@ def main():
     test_run_grade_job_end_to_end_mocked()
     test_run_grade_job_records_error_never_crashes()
     test_run_grade_job_skips_when_already_done_for_current_hash()
+    test_leveling_flattens_jittery_brightness()
+    test_leveling_preserves_an_intentional_arc()
+    test_leveling_exposure_gain_is_bounded()
+    test_leveling_tonal_converges_low_contrast_and_punchy()
+    test_leveling_tonal_skips_cross_scene_outlier()
+    test_leveling_tonal_never_pushes_toward_clipping()
+    test_leveling_never_crashes_on_a_true_black_point()
+    test_leveling_subject_luma_used_when_not_a_silhouette()
+    test_leveling_subject_luma_ignored_when_silhouette()
+    test_leveling_composed_result_includes_both_stages()
+    test_measure_subject_luma_reads_the_box_not_the_whole_frame()
+    test_measure_subject_luma_none_for_degenerate_box()
+    test_scene_group_same_speaker_different_file_groups()
+    test_scene_group_no_shared_signal_does_not_group()
+    test_scene_group_overrides_rgb_grouping_in_solve_sequence_match()
+    test_run_grade_job_applies_leveling_and_semantic_grouping_when_flagged()
     print("\nall grade tests passed")
 
 

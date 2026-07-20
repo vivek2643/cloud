@@ -113,6 +113,13 @@ Don't hand-compute the milliseconds. Beat-snap where it's offered and the
 fit-to-window loop (§3) land things on the grid exactly; you decide which beat
 and which moment, they handle the frames.
 
+## 6. Color can follow the story
+When it serves the piece, the grade can track the story's arc — a tense beat
+settling cooler, a resolution warming — the same way pacing or a music swell
+would. This is a categorical position (tag it, don't compute a color), and it
+only shows once the user has turned up how strongly the arc should read;
+never reach for it as a default look.
+
 ## Podcast / multicam (worked example — uses both principles)
 Conversation filmed from several fixed angles. The alternate angles of one
 speaker are outlooks (principle 2), and the transcript drives who to show

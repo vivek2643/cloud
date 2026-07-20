@@ -1021,6 +1021,22 @@ export function getGradePresets(token: string) {
   return request<GradePresetSummary[]>("/api/grade/presets", { token });
 }
 
+// color_grading_upgrade.plan.md Step 1.0 §6 / Phase 4: the `v1` background
+// grade job's live progress -- polled by the panel's determinate progress
+// bar while `state === "grading"`. `idle` under `legacy` (or before any job
+// has ever run) -- not a state the UI needs to poll against.
+export interface GradeStatus {
+  state: "idle" | "grading" | "done" | "error";
+  progress: number; // 0..1 (done/total)
+  done: number;
+  total: number;
+  error: string | null;
+}
+
+export function getGradeStatus(threadId: string, token: string) {
+  return request<GradeStatus>(`/api/edit/threads/${threadId}/grade-status`, { token });
+}
+
 // --- Captions (captions.plan.md SS13) ---
 
 export interface CaptionFontSummary {

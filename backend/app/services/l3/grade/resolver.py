@@ -6,15 +6,20 @@ JSON-safe descriptor (`{cdl, creative_lut_ref, working_space, grade_hash}`)
 that gets baked into `document["resolved"]`, same place `layers.py`
 already bakes geometric `transform`.
 
-Stack order (SS3): Measure -> Correct -> Match -> Look -> Arc -> Soft-local
--> NL trims -> BAKE. This module is the seam every later build step plugs
-into:
+Stack order (SS3): Measure -> Correct -> Match -> Leveling -> Look -> Arc ->
+Soft-local -> NL trims -> BAKE. This module is the seam every later build
+step plugs into:
   - SS5 (correct) is wired: `grade.correct.solve_correct_grade` composes
     onto the stack first, using the file's `color_stats` row.
   - SS6 (match) is wired: a pre-computed per-file delta (see
     `grade.match.solve_match_deltas`, computed ONCE per document resolve in
     `layers.resolve` since grade-groups are a whole-document clustering, not
     a per-clip decision) composes next.
+  - Leveling (color_grading_upgrade.plan.md Phase 2, gated on `settings.
+    grade_even_lighting`) composes next: a pre-computed per-shot bounded
+    exposure/tonal-placement nudge toward the sequence's smooth target (see
+    `grade.leveling.solve_leveling`), same "computed once per document,
+    passed in as a delta" pattern as match.
   - SS7 (look) is wired: `sequence_look.mode` selects ONE of the three input
     modes (SS7) -- a preset recipe, a reference-image transfer (needs
     pre-computed `reference_stats`, see `reference_transfer.py`), or a
@@ -120,6 +125,7 @@ def resolve_clip_grade(
     sequence_look: Optional[Dict[str, Any]] = None,
     already_graded: bool = False,
     match_delta: Optional[Grade] = None,
+    leveling_delta: Optional[Grade] = None,
     pipeline: str = "legacy",
 ) -> Dict[str, Any]:
     """Resolve ONE clip's (spine segment or op) final grade descriptor.
@@ -139,14 +145,21 @@ def resolve_clip_grade(
     byte-identical output. "v1" selects the percentile-based correct layer,
     the `rec709_v1` working space (baked into the CDL's tone response at
     bake time), and projects the Look layer's corrected-source stats through
-    that same working space.
+    that same working space. `leveling_delta` (Phase 2, gated by the caller
+    on `settings.grade_even_lighting`) is this shot's bounded exposure/
+    tonal-placement nudge toward the sequence's smooth target (`grade.
+    leveling.solve_leveling`), already resolved once for the whole document
+    -- composed between Match and Look, same pattern as `match_delta`, so
+    the Look layer still solves against the fully-corrected-so-far image.
     """
     stack = solve_correct_grade(color_stats, already_graded=already_graded, pipeline=pipeline)
     if match_delta is not None:
         stack = compose(stack, match_delta, 1.0)
-    # The Look layer sits on top of correct+match, so it must be solved against
-    # the ALREADY-CORRECTED image (see _corrected_source_stats). Passing the raw
-    # color_stats here is what made a reference drop double-stretch the exposure.
+    if leveling_delta is not None:
+        stack = compose(stack, leveling_delta, 1.0)
+    # The Look layer sits on top of correct+match+leveling, so it must be solved
+    # against the ALREADY-CORRECTED image (see _corrected_source_stats). Passing
+    # the raw color_stats here is what made a reference drop double-stretch exposure.
     corrected_stats = _corrected_source_stats(color_stats, stack, pipeline=pipeline)
     stack = compose(stack, _solve_look(sequence_look, corrected_stats), 1.0)
     arc_intensity = (sequence_look or {}).get("arc_intensity")

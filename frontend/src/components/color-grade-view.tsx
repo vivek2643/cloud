@@ -19,11 +19,14 @@ import { useEditDocStore } from "@/stores/edit-doc-store";
 import { useTimelineView } from "@/stores/timeline-view";
 import { useAuthStore } from "@/stores/auth-store";
 import {
+  getEditThread,
   getGradePresets,
+  getGradeStatus,
   saveEditDocument,
   sendThreadMessage,
   type EditLook,
   type GradePresetSummary,
+  type GradeStatus,
 } from "@/lib/api";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -108,6 +111,53 @@ export function ColorGradeView() {
   const refInputRef = useRef<HTMLInputElement>(null);
   const lutInputRef = useRef<HTMLInputElement>(null);
 
+  // --- Grading progress (color_grading_upgrade.plan.md Step 1.0 §6 / Phase 4) ---
+  // A DETERMINATE bar reflecting the real background v1 grade job, not a
+  // fake spinner (Phase 1 made grading a real job with real progress).
+  const [gradeStatus, setGradeStatus] = useState<GradeStatus | null>(null);
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const pollGradeStatus = useCallback(async () => {
+    if (!threadId || !token) return;
+    let status: GradeStatus;
+    try {
+      status = await getGradeStatus(threadId, token);
+    } catch {
+      return; // transient network hiccup -- next trigger (or the retry below) will re-check
+    }
+    if (status.state === "grading") {
+      setGradeStatus(status);
+      pollTimerRef.current = setTimeout(() => void pollGradeStatus(), 750);
+      return;
+    }
+    if (status.state === "error") {
+      setError(status.error || "Grading failed.");
+      setGradeStatus(null);
+      return;
+    }
+    if (status.state === "done") {
+      // Refresh on done: re-fetch so the preview picks up the newly
+      // persisted grades, without touching the working timeline/undo stack.
+      try {
+        const thread = await getEditThread(threadId, token);
+        if (thread.document) wdCommitLook(thread.document_version ?? 0, thread.document);
+      } catch {
+        // Best-effort refresh; the next natural save/reload still picks it up.
+      }
+    }
+    setGradeStatus(null); // done or idle -- clear the bar
+  }, [threadId, token, wdCommitLook]);
+
+  // Catch a job already in flight (e.g. from a timeline edit made elsewhere)
+  // when the panel opens/thread changes.
+  useEffect(() => {
+    void pollGradeStatus();
+    return () => {
+      if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [threadId, token]);
+
   useEffect(() => {
     if (!token) return;
     getGradePresets(token).then(setPresets).catch(() => {});
@@ -142,6 +192,9 @@ export function ColorGradeView() {
         token
       );
       wdCommitLook(res.version, res.document);
+      // A look change may have enqueued a v1 grade job (Step 1.0 §4) --
+      // check once now; pollGradeStatus keeps itself going while grading.
+      void pollGradeStatus();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not save the grade.");
     } finally {
@@ -150,7 +203,7 @@ export function ColorGradeView() {
       // The user changed the look again while we were saving -> persist newest.
       if (pendingRef.current !== next) void flushLook();
     }
-  }, [token, wdCommitLook]);
+  }, [token, wdCommitLook, pollGradeStatus]);
 
   const applyLook = useCallback(
     (next: EditLook | undefined, immediate = false) => {
@@ -300,6 +353,27 @@ export function ColorGradeView() {
           {gradeBypass ? "Showing: before" : "Showing: after"}
         </button>
       </div>
+
+      {gradeStatus?.state === "grading" && (
+        <div className="space-y-1">
+          <div
+            className="h-1 w-full overflow-hidden rounded-full"
+            style={{ background: "var(--border)" }}
+            role="progressbar"
+            aria-valuenow={Math.round(gradeStatus.progress * 100)}
+            aria-valuemin={0}
+            aria-valuemax={100}
+          >
+            <div
+              className="h-full rounded-full transition-[width] duration-300"
+              style={{ width: `${Math.round(gradeStatus.progress * 100)}%`, background: "var(--accent)" }}
+            />
+          </div>
+          <p className="text-[11px]" style={{ color: "var(--muted)" }}>
+            Grading… {gradeStatus.done}/{gradeStatus.total}
+          </p>
+        </div>
+      )}
 
       {/* Look picker gallery */}
       <section>

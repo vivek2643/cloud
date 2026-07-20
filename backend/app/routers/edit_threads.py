@@ -277,11 +277,12 @@ def grade_status(thread_id: str, user_id: str = Depends(get_current_user_id)):
     _owned_thread(thread_id, user_id)
     job = get_job_state(thread_id)
     if not job:
-        return {"state": "idle", "progress": 0.0, "error": None}
+        return {"state": "idle", "progress": 0.0, "done": 0, "total": 0, "error": None}
     total = int(job.get("total") or 0)
     done = int(job.get("done") or 0)
     progress = (done / total) if total > 0 else (1.0 if job.get("state") == "done" else 0.0)
-    return {"state": job.get("state") or "idle", "progress": progress, "error": job.get("error")}
+    return {"state": job.get("state") or "idle", "progress": progress,
+            "done": done, "total": total, "error": job.get("error")}
 
 
 @router.post("/{thread_id}/grade")

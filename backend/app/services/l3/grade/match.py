@@ -184,15 +184,24 @@ def _levels_delta_toward(
     return slope, offset
 
 
-def solve_sequence_match(ordered_shots: List[ShotStats]) -> Dict[str, Grade]:
+def solve_sequence_match(
+    ordered_shots: List[ShotStats], groups: Optional[List[List[int]]] = None,
+) -> Dict[str, Grade]:
     """shot_key -> a conservative CDL delta nudging that shot's SPAN-measured
     color toward its neighbor-group's anchor (the highest-quality span in a
     run of 2+ adjacent/same-file shots; ties broken by `key`). The anchor
     itself gets no delta. Percentile-based (black/white/mid-gray placement)
     PLUS a damped per-channel cast nudge, composed -- see module docstring
-    for why grouping is neighbor-only, not global clustering."""
+    for why grouping is neighbor-only, not global clustering.
+
+    `groups` (color_grading_upgrade.plan.md Step 3.2, optional): a
+    pre-computed grouping (`grade.scene_group.group_shots_semantically`) to
+    use INSTEAD of the default RGB-based `group_neighbors` -- lets matching
+    align shots that are the same scene BY MEANING even when a transient
+    (a bright object entering) skews their RGB. None (default) keeps Step
+    1.4's behavior exactly."""
     out: Dict[str, Grade] = {}
-    for idxs in group_neighbors(ordered_shots):
+    for idxs in (groups if groups is not None else group_neighbors(ordered_shots)):
         if len(idxs) < 2:
             continue
         members = [ordered_shots[i] for i in idxs]

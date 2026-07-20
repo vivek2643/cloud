@@ -33,10 +33,14 @@ from app.config import get_settings
 from app.services.jobs import app as jobs_app
 from app.services.l3.grade.cache import ensure_cube_file
 from app.services.l3.grade.cdl import Grade
+from app.services.l3.grade.leveling import ShotLevelInput, solve_leveling
 from app.services.l3.grade.match import ShotStats, solve_sequence_match
 from app.services.l3.grade.measure import fetch_color_stats
 from app.services.l3.grade.measure_span import measure_span
 from app.services.l3.grade.resolver import resolve_clip_grade
+from app.services.l3.grade.scene_group import ShotSceneMeta as SceneMeta
+from app.services.l3.grade.scene_group import group_shots_semantically
+from app.services.l3.grade.tone import WORKING_SPACE_V1, to_working
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +56,19 @@ _CUBE_CACHE_DIR = os.path.join(tempfile.gettempdir(), "edso_grade_cubes")
 
 def _pg() -> psycopg.Connection:
     return psycopg.connect(get_settings().database_url, autocommit=True)
+
+
+def _to_working_scalar(value: Optional[float], default: Optional[float]) -> float:
+    """Project one DISPLAY-encoded scalar (a measured mid_gray/black_point/
+    white_point/subject_luma) into the v1 working space -- same transform
+    Step 1.5's `_corrected_source_stats` applies to `rgb_mean`, just for a
+    single luma value instead of an RGB triple. `value is None` -> `default`
+    (already assumed working-space-safe, e.g. the levels solver's own
+    fallback constants)."""
+    if value is None:
+        return default if default is not None else 0.0
+    import numpy as np
+    return float(to_working(np.array([float(value)], dtype=np.float32), WORKING_SPACE_V1)[0])
 
 
 # --------------------------------------------------------------------------
@@ -110,7 +127,11 @@ def compute_input_hash(document: Dict[str, Any]) -> str:
         "shots": [
             {"key": s.key, "file_id": s.file_id, "in_ms": s.in_ms, "out_ms": s.out_ms,
              "grade": s.item.get("grade"), "arc_intent": s.item.get("arc_intent"),
-             "working_space": s.item.get("working_space"), "subject_box": s.item.get("subject_box")}
+             "working_space": s.item.get("working_space"), "subject_box": s.item.get("subject_box"),
+             # Phase 3.2's semantic grouping keys off these -- a speaker
+             # re-identification or a relabel can change which shots match.
+             "speaker_person": s.item.get("speaker_person"), "on_camera": s.item.get("on_camera"),
+             "label": s.item.get("label"), "summary": s.item.get("summary")}
             for s in shots
         ],
         "look": document.get("look") or {},
@@ -258,23 +279,62 @@ def run_grade_job(thread_id: str) -> None:
     shots = ordered_shots(document)
     _upsert_job_status(thread_id, state="grading", total=len(shots), done=0, input_hash=h)
     try:
+        settings = get_settings()
         file_ids = list({s.file_id for s in shots})
         color_stats = fetch_color_stats(file_ids)
         sequence_look = document.get("look")
 
-        # Step 1.2: measure the span actually used; never-worse fallback to
-        # whole-file color_stats when span measurement fails/unavailable.
+        # Step 1.2 (+ Step 3.1): measure the span actually used; never-worse
+        # fallback to whole-file color_stats when span measurement fails/
+        # unavailable. subject_box (when the semantic flag is on and the
+        # item carries one -- see resolver.py's Step 1.7 note on why no
+        # caller derives it automatically yet) also measures subject_luma.
         shot_stats: Dict[str, ShotStats] = {}
         for s in shots:
-            stats = measure_span(s.file_id, s.in_ms, s.out_ms, hero_ts_ms=s.hero_ts_ms)
+            subject_box = s.item.get("subject_box") if settings.grade_semantic else None
+            stats = measure_span(s.file_id, s.in_ms, s.out_ms, hero_ts_ms=s.hero_ts_ms,
+                                 subject_box=subject_box)
             if stats is None:
                 stats = color_stats.get(s.file_id)
             shot_stats[s.key] = ShotStats(key=s.key, file_id=s.file_id, stats=stats)
 
-        # Step 1.4: ONE sequence-match pass over the whole ordered timeline.
+        # Step 1.4 (+ Step 3.2): ONE sequence-match pass over the whole
+        # ordered timeline -- semantic grouping (when the shots carry the
+        # structural facts it needs) overrides the default RGB-adjacency
+        # grouping so matching aligns shots that are the same scene BY
+        # MEANING, not merely RGB-close.
+        semantic_groups = None
+        if settings.grade_semantic:
+            scene_meta = [
+                SceneMeta(key=s.key, file_id=s.file_id,
+                         speaker_person=s.item.get("speaker_person"),
+                         on_camera=s.item.get("on_camera"),
+                         label=str(s.item.get("label") or ""), summary=str(s.item.get("summary") or ""))
+                for s in shots
+            ]
+            semantic_groups = group_shots_semantically(scene_meta)
         match_deltas: Dict[str, Grade] = solve_sequence_match(
-            [shot_stats[s.key] for s in shots]
+            [shot_stats[s.key] for s in shots], groups=semantic_groups,
         )
+
+        # Phase 2: ONE leveling pass (exposure + tonal placement), gated on
+        # grade_even_lighting -- working-space-projected scalars, same
+        # projection Step 1.5's _corrected_source_stats already uses.
+        leveling_deltas: Dict[str, Grade] = {}
+        if settings.grade_even_lighting:
+            level_inputs = []
+            for s in shots:
+                stats = shot_stats[s.key].stats or {}
+                mid_gray = _to_working_scalar(stats.get("mid_gray"), 0.5)
+                black = _to_working_scalar(stats.get("black_point"), 0.0)
+                white = _to_working_scalar(stats.get("white_point"), 1.0)
+                subj = stats.get("subject_luma")
+                subject_luma = _to_working_scalar(subj, None) if subj is not None else None
+                level_inputs.append(ShotLevelInput(
+                    key=s.key, mid_gray=mid_gray, black_point=black, white_point=white,
+                    subject_luma=subject_luma,
+                ))
+            leveling_deltas = solve_leveling(level_inputs)
 
         cube_cache: Dict[str, Optional[str]] = {}
         done = 0
@@ -282,7 +342,8 @@ def run_grade_job(thread_id: str) -> None:
             stats = shot_stats[s.key].stats
             grade_json = resolve_clip_grade(
                 s.item, color_stats=stats, sequence_look=sequence_look,
-                match_delta=match_deltas.get(s.key), pipeline="v1",
+                match_delta=match_deltas.get(s.key), leveling_delta=leveling_deltas.get(s.key),
+                pipeline="v1",
             )
             gh = grade_json.get("grade_hash")
             if gh not in cube_cache:
