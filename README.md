@@ -28,7 +28,24 @@ cp .env.example .env
 
 ### Database
 
-Run the migration in `backend/migrations/001_initial.sql` against your Supabase project via the SQL Editor.
+Migrations live in `backend/migrations/*.sql` and are applied via the runner, not by hand:
+
+```bash
+cd backend
+.venv/bin/python scripts/migrate.py apply   # applies every pending migration, in order
+.venv/bin/python scripts/migrate.py check   # read-only: reports pending/drifted files, exits non-zero if any
+```
+
+`apply` takes a Postgres advisory lock, so it's safe to run from multiple
+processes/deploys concurrently -- only one actually applies, the rest find
+nothing pending. Every migration file runs in its own transaction (fully
+atomic) unless its first line is the literal comment `-- migrate:no-transaction`,
+which a handful of statements (`CREATE INDEX CONCURRENTLY`, `ALTER TYPE ...
+ADD VALUE` pre-Postgres-12, `VACUUM`) require -- those run in autocommit
+mode instead and should contain exactly one statement each. See
+`migration_runner.plan.md` for the full design, including what the
+startup drift guard (`app/services/db_migrations.py::assert_up_to_date`,
+bypassable locally via `MIGRATION_GUARD=off`) does and does not catch.
 
 ### Frontend
 

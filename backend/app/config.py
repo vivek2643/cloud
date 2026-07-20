@@ -151,6 +151,14 @@ class Settings(BaseSettings):
     # narrative-driven arc. Off by default.
     grade_semantic: bool = False
 
+    # migration_runner.plan.md: the startup guard's sanctioned local-dev
+    # bypass. "on" (default) means every process refuses to boot on schema
+    # drift; "off" disables that check for THIS process only, loudly (a
+    # warning is logged). Never set "off" in production -- it exists so a
+    # dev with a deliberately divergent local DB has a named escape hatch
+    # instead of quietly commenting out the check itself.
+    migration_guard: str = "on"
+
     @property
     def r2_endpoint(self) -> str:
         return f"https://{self.r2_account_id}.r2.cloudflarestorage.com"
