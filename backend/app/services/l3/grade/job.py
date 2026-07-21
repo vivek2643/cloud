@@ -73,7 +73,11 @@ logger = logging.getLogger(__name__)
 # subject_luma -> Leveling chain existed but was dormant), and Leveling
 # converges a grouped shot's subject_luma toward the group's median subject
 # luma instead of the group's whole-frame mid_gray. Grade math changed.
-INPUT_HASH_SCHEMA_VERSION = 6
+# v7 (color_skin_vibrance.plan.md): the Correct layer gains a skin-anchored
+# tint vote (blended into the WB solve) and a bounded global saturation
+# floor (chroma_mean -> sat), both gated on grade_skin_vibrance. Grade math
+# changed whenever the flag is on.
+INPUT_HASH_SCHEMA_VERSION = 7
 
 # Same local-disk, content-addressed cube cache the preview cube endpoint and
 # the render compositor already use (grade/cache.py's documented "not shared
@@ -234,6 +238,7 @@ def compute_input_hash(document: Dict[str, Any]) -> str:
             "grade_shot_match_v2": settings.grade_shot_match_v2,
             "grade_scene_join": settings.grade_scene_join,
             "grade_subject_exposure": settings.grade_subject_exposure,
+            "grade_skin_vibrance": settings.grade_skin_vibrance,
         },
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
@@ -637,7 +642,7 @@ def run_grade_job(thread_id: str) -> None:
                 s.item, color_stats=stats, sequence_look=sequence_look,
                 balance_delta=balance_deltas.get(s.key),
                 match_delta=match_deltas.get(s.key), leveling_delta=leveling_deltas.get(s.key),
-                pipeline="v1",
+                pipeline="v1", skin_vibrance=settings.grade_skin_vibrance,
             )
             gh = grade_json.get("grade_hash")
             if gh not in cube_cache:

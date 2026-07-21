@@ -175,6 +175,14 @@ class Settings(BaseSettings):
     # only when grade_semantic is also on (the subject signal is semantic).
     grade_subject_exposure: bool = False
 
+    # color_skin_vibrance.plan.md: skin-anchored tint correction (fairness-safe:
+    # removes only the off-locus green/magenta cast on skin, never targets a
+    # skin tone) + a bounded global saturation floor for flat/desaturated
+    # footage. v1-only; the subject_lab (face-region) skin refinement additionally
+    # requires grade_semantic (it rides the grade_subject_exposure box). Off =
+    # today's WB (gray-world/white-patch) and sat=1.0 exactly.
+    grade_skin_vibrance: bool = False
+
     # migration_runner.plan.md: the startup guard's sanctioned local-dev
     # bypass. "on" (default) means every process refuses to boot on schema
     # drift; "off" disables that check for THIS process only, loudly (a

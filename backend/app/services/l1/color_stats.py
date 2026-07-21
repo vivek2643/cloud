@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 # Bump when the measurement logic/shape changes so cached rows recompute even
 # if the underlying proxy did not.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 COLOR_STATS_W = 320
 COLOR_STATS_H = 180
@@ -84,6 +84,7 @@ class ColorStats:
     is_log_flat: bool = False
     skin_lab: Optional[List[float]] = None                      # [L*, a*, b*], center-weighted proxy region
     palette: List[List[float]] = field(default_factory=list)    # up to PALETTE_K dominant [r,g,b] (0..1), by prevalence
+    chroma_mean: float = 0.0                                     # mean per-pixel Lab chroma sqrt(a*^2+b*^2); color_skin_vibrance.plan.md
 
     def to_dict(self) -> Dict:
         return {
@@ -104,6 +105,7 @@ class ColorStats:
             "is_log_flat": self.is_log_flat,
             "skin_lab": self.skin_lab,
             "palette": self.palette,
+            "chroma_mean": self.chroma_mean,
         }
 
 
@@ -192,6 +194,14 @@ def _aggregate(frames) -> ColorStats:
     # OpenCV 8-bit Lab packing: L in 0..255 (scale /255*100), a/b offset +128.
     a_mean = float(lab_stacked[..., 1].mean() - 128.0)
     b_mean = float(lab_stacked[..., 2].mean() - 128.0)
+    # color_skin_vibrance.plan.md: mean PER-PIXEL Lab chroma (not chroma of the
+    # mean a*/b* -- a whole-frame cast can average near-neutral even when every
+    # pixel is individually saturated, e.g. complementary colors on opposite
+    # sides of frame). Vibrance needs "how colorful is this footage," which is
+    # this per-pixel mean, not lab_ab_cast's mean-then-magnitude.
+    a_px = lab_stacked[..., 1] - 128.0
+    b_px = lab_stacked[..., 2] - 128.0
+    chroma_mean = float(np.sqrt(a_px * a_px + b_px * b_px).mean())
 
     eps = 1e-6
     r_mean, g_mean, b_mean_ch = rgb_mean
@@ -267,6 +277,7 @@ def _aggregate(frames) -> ColorStats:
         is_log_flat=is_log_flat,
         skin_lab=skin_lab,
         palette=palette,
+        chroma_mean=chroma_mean,
     )
 
 

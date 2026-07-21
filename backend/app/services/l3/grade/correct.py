@@ -39,10 +39,11 @@ flatter-than-target source, never manufacture headroom that isn't there.
 """
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, Optional, Tuple
 
 from app.services.l3.grade.cdl import Grade
-from app.services.l3.grade.colorspace import is_neutral
+from app.services.l3.grade.colorspace import is_neutral, lab_to_srgb
 from app.services.l3.grade.tone import WORKING_SPACE_V1, to_working_scalar
 
 TARGET_BLACK = 0.02
@@ -70,6 +71,26 @@ TARGET_MID_GRAY = 0.42
 # so it can't fight the levels stretch or blow past LEVELS_SLOPE_MAX on its own.
 MID_GRAY_EXTRA_CLAMP = 1.2
 
+# color_skin_vibrance.plan.md S4.3: skin-anchored tint correction. Human skin
+# across all tones clusters along a line through the origin in the Lab a*/b*
+# plane at this hue angle (+a* red, +b* yellow); what varies legitimately
+# between people/lighting is position ALONG that line (warmth) and L*
+# (lightness) -- never touched. What's never natural on skin is displacement
+# PERPENDICULAR to it, the green<->magenta cast a bad/mixed white balance
+# adds -- that's the only thing corrected, so no skin tone is privileged.
+SKIN_LOCUS_DEG = 50.0
+SKIN_TINT_STRENGTH = 0.7     # remove this fraction of the perpendicular (tint) residual
+SKIN_WB_WEIGHT = 0.5         # skin gets a VOTE in WB, not a veto (blended with gray-world)
+SKIN_L_MIN, SKIN_L_MAX = 20.0, 92.0   # plausible skin lightness; outside -> not skin, skip
+SKIN_MIN_CHROMA = 3.0        # near-neutral sample -> not a confident skin read, skip
+SKIN_MAX_PERP = 25.0         # residual bigger than this -> not skin (colored object), skip
+
+# color_skin_vibrance.plan.md S4.4: vibrance normalization. A bounded global
+# saturation lift toward a target mean Lab chroma -- raises the floor on
+# lifeless log/flat clips, never touches already-vivid footage.
+TARGET_CHROMA = 22.0     # target mean Lab chroma; below -> boost, at/above -> leave
+SAT_BOOST_MAX = 1.25     # hard cap: a global sat lift past this over-saturates skin/reds
+
 
 def _compose(s1: float, o1: float, s2: float, o2: float) -> Tuple[float, float]:
     """Chain two linear ops (apply op1 then op2): out = (in*s1+o1)*s2+o2."""
@@ -90,13 +111,52 @@ def _project(value: float, working_space: str) -> float:
     return to_working_scalar(value, None, WORKING_SPACE_V1)
 
 
+def _skin_multiplier(skin_lab: Optional[Any]) -> Optional[Tuple[float, float, float]]:
+    """color_skin_vibrance.plan.md S4.3: given a skin `[L*, a*, b*]` sample,
+    decide whether it's a confident skin read and, if so, return the
+    per-channel RGB multiplier that pulls its off-locus (perpendicular) tint
+    residual toward the universal skin locus -- WITHOUT touching along-locus
+    warmth or L* (the fairness-safe half: never a skin-tone target). None
+    when the sample doesn't gate as skin (implausible lightness, too neutral
+    to read confidently, or too far off-locus to be skin rather than a
+    colored object) -- the caller then casts no skin vote at all."""
+    if not skin_lab:
+        return None
+    try:
+        L, a, b = (float(v) for v in skin_lab)
+    except (TypeError, ValueError):
+        return None
+    if not (SKIN_L_MIN <= L <= SKIN_L_MAX):
+        return None
+    if math.hypot(a, b) < SKIN_MIN_CHROMA:
+        return None
+    theta = math.radians(SKIN_LOCUS_DEG)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    r_par = a * cos_t + b * sin_t
+    d_perp = -a * sin_t + b * cos_t
+    if abs(d_perp) >= SKIN_MAX_PERP:
+        return None
+    d_perp_target = d_perp * (1.0 - SKIN_TINT_STRENGTH)
+    a_target = r_par * cos_t - d_perp_target * sin_t
+    b_target = r_par * sin_t + d_perp_target * cos_t
+
+    eps = 1e-6
+    measured_rgb = lab_to_srgb((L, a, b))
+    target_rgb = lab_to_srgb((L, a_target, b_target))
+    m = [target_rgb[c] / max(eps, measured_rgb[c]) for c in range(3)]
+    clamped = tuple(max(1.0 / WB_MULTIPLIER_CLAMP, min(WB_MULTIPLIER_CLAMP, float(v))) for v in m)
+    return clamped  # type: ignore[return-value]
+
+
 def _solve_wb(
-    color_stats: Dict[str, Any], white_reference_rgb: Optional[Tuple[float, float, float]]
+    color_stats: Dict[str, Any], white_reference_rgb: Optional[Tuple[float, float, float]],
+    skin_lab: Optional[Any] = None,
 ) -> Tuple[float, float, float]:
     if white_reference_rgb is not None and is_neutral(white_reference_rgb):
         # A verified real neutral surface beats two statistical guesses --
         # same white-patch formula (this IS a white patch, just one a human/
-        # VLM pointed at instead of "brightest pixels").
+        # VLM pointed at instead of "brightest pixels"). Wins over the skin
+        # vote too, same priority as gray-world/white-patch.
         eps = 1e-6
         peak = max(white_reference_rgb)
         wb = [peak / max(eps, c) for c in white_reference_rgb]
@@ -110,6 +170,11 @@ def _solve_wb(
         # Two independent estimates agreeing raises confidence; averaging
         # damps either one's individual error rather than trusting one alone.
         wb = [(gray_world[i] + patch[i]) / 2.0 for i in range(3)]
+    skin_m = _skin_multiplier(skin_lab)
+    if skin_m is not None:
+        # A VOTE, not a veto: blended in at SKIN_WB_WEIGHT so gray-world stays
+        # the temperature workhorse and skin only nudges the tint it's blind to.
+        wb = [wb[i] * (1.0 + (skin_m[i] - 1.0) * SKIN_WB_WEIGHT) for i in range(3)]
     clamped = [max(1.0 / WB_MULTIPLIER_CLAMP, min(WB_MULTIPLIER_CLAMP, float(v))) for v in wb]
     return clamped[0], clamped[1], clamped[2]
 
@@ -181,6 +246,7 @@ def solve_correct_grade(
     already_graded: bool = False,
     white_reference_rgb: Optional[Tuple[float, float, float]] = None,
     pipeline: str = "legacy",
+    skin_vibrance: bool = False,
 ) -> Grade:
     """Deterministic correction from ONE file's `color_stats` row (see
     `grade.measure.fetch_color_stats`), optionally refined by a verified
@@ -190,7 +256,15 @@ def solve_correct_grade(
     gate), or footage with significant existing clipping (never-worse gate).
     `pipeline=="v1"` (color_grading_upgrade.plan.md Step 1.3) additionally
     targets a mid-gray placement via `_solve_levels_v1`; `legacy` is the
-    untouched black/white-only stretch."""
+    untouched black/white-only stretch.
+
+    `skin_vibrance` (color_skin_vibrance.plan.md, v1-only): also folds a
+    skin-anchored tint vote into the WB solve (`subject_lab` -- the
+    face-region sample from `measure_span`, when a subject box was resolved
+    -- preferred over `skin_lab`'s center-weighted proxy; neither present ->
+    no skin vote) and lifts `sat` toward `TARGET_CHROMA` when `chroma_mean`
+    reads low (missing/high chroma -> `sat=1.0`, never-worse). Off (default)
+    -> byte-identical to today: no skin vote, `sat=1.0`."""
     if not color_stats or already_graded:
         return Grade()
 
@@ -199,7 +273,9 @@ def solve_correct_grade(
     black = float(color_stats.get("black_point") if color_stats.get("black_point") is not None else 0.0)
 
     working_space = WORKING_SPACE_V1 if pipeline == "v1" else "rec709"
-    wb_r, wb_g, wb_b = _solve_wb(color_stats, white_reference_rgb)
+    skin_active = skin_vibrance and pipeline == "v1"
+    skin_lab = (color_stats.get("subject_lab") or color_stats.get("skin_lab")) if skin_active else None
+    wb_r, wb_g, wb_b = _solve_wb(color_stats, white_reference_rgb, skin_lab=skin_lab)
     levels_fn = _solve_levels_v1 if pipeline == "v1" else _solve_levels
     luma_slope, luma_offset = levels_fn(color_stats, clip_shadow, clip_highlight, working_space=working_space)
 
@@ -218,6 +294,16 @@ def solve_correct_grade(
             luma_slope = LEVELS_SLOPE_MAX
             luma_offset = _project(target_low, working_space) - _project(black, working_space) * luma_slope
 
+    sat = 1.0
+    if skin_active:
+        chroma = color_stats.get("chroma_mean")
+        if chroma is not None:
+            chroma = float(chroma)
+            if chroma > 1e-6:
+                # Only ever >= 1.0 -- never desaturate; already-vivid footage
+                # (chroma >= TARGET_CHROMA) leaves sat at 1.0 unchanged.
+                sat = max(1.0, min(SAT_BOOST_MAX, TARGET_CHROMA / chroma))
+
     slope = (wb_r * luma_slope, wb_g * luma_slope, wb_b * luma_slope)
     offset = (luma_offset, luma_offset, luma_offset)
-    return Grade(slope=slope, offset=offset, power=(1.0, 1.0, 1.0), sat=1.0)
+    return Grade(slope=slope, offset=offset, power=(1.0, 1.0, 1.0), sat=sat)

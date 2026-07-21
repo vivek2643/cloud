@@ -12,6 +12,7 @@ Run:  .venv/bin/python scripts/test_grade.py
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 from unittest import mock
@@ -25,13 +26,17 @@ from app.services.l3 import layers  # noqa: E402
 from app.services.l3.grade import job as grade_job  # noqa: E402
 from app.services.l3.grade import tone  # noqa: E402
 from app.services.l3.grade.cdl import Grade, apply_cdl, identity_grade_json  # noqa: E402
-from app.services.l3.grade.correct import solve_correct_grade  # noqa: E402
+from app.services.l3.grade.colorspace import lab_to_srgb, srgb_to_lab  # noqa: E402
+from app.services.l3.grade.correct import (  # noqa: E402
+    SAT_BOOST_MAX, SKIN_LOCUS_DEG, TARGET_CHROMA, WB_MULTIPLIER_CLAMP,
+    _skin_multiplier, _solve_wb, solve_correct_grade,
+)
 from app.services.l3.grade.leveling import (  # noqa: E402
     SILHOUETTE_RATIO, ShotLevelInput, solve_exposure_leveling, solve_leveling, solve_tonal_leveling,
 )
 from app.services.l3.grade.lut_bake import bake_cube_text  # noqa: E402
 from app.services.l3.grade.match import ShotStats, group_neighbors, solve_sequence_match  # noqa: E402
-from app.services.l3.grade.measure_span import _measure_subject_luma  # noqa: E402
+from app.services.l3.grade.measure_span import _measure_subject_lab, _measure_subject_luma  # noqa: E402
 from app.services.l3.grade.reference import GroupReference, compute_group_reference  # noqa: E402
 from app.services.l3.grade.resolver import resolve_clip_grade  # noqa: E402
 from app.services.l3.grade.scene_group import ShotSceneMeta, group_shots_semantically  # noqa: E402
@@ -1067,6 +1072,7 @@ def test_run_grade_job_shot_match_v2_off_reproduces_pre_redesign_path():
     rows = {}
     fake_settings = mock.Mock(
         grade_pipeline="v1", grade_even_lighting=False, grade_semantic=False, grade_shot_match_v2=False,
+        grade_skin_vibrance=False,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1200,6 +1206,7 @@ def test_run_grade_job_groups_multi_file_reel_via_scene_join():
     fake_settings = mock.Mock(
         grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
         grade_shot_match_v2=True, grade_scene_join=True, grade_subject_exposure=False,
+        grade_skin_vibrance=False,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1240,6 +1247,7 @@ def test_run_grade_job_scene_join_does_not_over_group_unrelated_shots():
     fake_settings = mock.Mock(
         grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
         grade_shot_match_v2=True, grade_scene_join=True, grade_subject_exposure=False,
+        grade_skin_vibrance=False,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1281,6 +1289,7 @@ def test_run_grade_job_scene_join_fail_open_on_db_error():
     fake_settings = mock.Mock(
         grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
         grade_shot_match_v2=True, grade_scene_join=True, grade_subject_exposure=False,
+        grade_skin_vibrance=False,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1323,6 +1332,7 @@ def test_run_grade_job_scene_join_off_keeps_pre_plan_behavior():
     fake_settings = mock.Mock(
         grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
         grade_shot_match_v2=True, grade_scene_join=False, grade_subject_exposure=False,
+        grade_skin_vibrance=False,
     )
     join_spy = mock.Mock(side_effect=AssertionError("join must not be called when grade_scene_join=False"))
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
@@ -1497,6 +1507,7 @@ def test_run_grade_job_hero_ts_ms_fallback_only_when_box_resolves():
     fake_settings = mock.Mock(
         grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
         grade_shot_match_v2=False, grade_scene_join=False, grade_subject_exposure=True,
+        grade_skin_vibrance=False,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1544,6 +1555,7 @@ def test_run_grade_job_subject_exposure_converges_grouped_subjects():
         fake_settings = mock.Mock(
             grade_pipeline="v1", grade_even_lighting=True, grade_semantic=True,
             grade_shot_match_v2=True, grade_scene_join=True,
+            grade_skin_vibrance=False,
             grade_subject_exposure=subject_exposure_on,
         )
         with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
@@ -1594,6 +1606,7 @@ def test_run_grade_job_subject_exposure_gated_on_grade_semantic_too():
     fake_settings = mock.Mock(
         grade_pipeline="v1", grade_even_lighting=False, grade_semantic=False,
         grade_shot_match_v2=False, grade_scene_join=False, grade_subject_exposure=True,
+        grade_skin_vibrance=False,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1655,6 +1668,7 @@ def test_run_grade_job_applies_leveling_and_semantic_grouping_when_flagged():
     fake_settings = mock.Mock(
         grade_pipeline="v1", grade_even_lighting=True, grade_semantic=True,
         grade_shot_match_v2=True, grade_scene_join=True, grade_subject_exposure=False,
+        grade_skin_vibrance=False,
     )
     joined_meta = {
         "s0": ShotCutMeta(speaker_person="P1", on_camera=True),
@@ -1680,6 +1694,164 @@ def test_run_grade_job_applies_leveling_and_semantic_grouping_when_flagged():
     non_identity = [k for k, gj in rows.items() if Grade.from_dict(gj["cdl"]) != Grade()]
     assert non_identity, rows
     print("ok  job: run_grade_job runs leveling + semantic grouping when both flags are on")
+
+
+# --------------------------------------------------------------------------
+# color_skin_vibrance.plan.md: bounded global vibrance + skin-anchored tint
+# correction (both v1-only, gated on skin_vibrance)
+# --------------------------------------------------------------------------
+
+def test_vibrance_boosts_low_chroma_bounded():
+    g = solve_correct_grade(_cs(chroma_mean=10.0), pipeline="v1", skin_vibrance=True)
+    assert 1.0 < g.sat <= SAT_BOOST_MAX, g.sat
+    g_very_low = solve_correct_grade(_cs(chroma_mean=0.5), pipeline="v1", skin_vibrance=True)
+    assert g_very_low.sat == SAT_BOOST_MAX, g_very_low.sat   # hard cap, not an uncapped ratio
+    print("ok  correct: vibrance boosts low-chroma footage, bounded by SAT_BOOST_MAX")
+
+
+def test_vibrance_no_desaturation_on_vivid_footage():
+    at_target = solve_correct_grade(_cs(chroma_mean=TARGET_CHROMA), pipeline="v1", skin_vibrance=True)
+    assert at_target.sat == 1.0, at_target.sat
+    above_target = solve_correct_grade(_cs(chroma_mean=40.0), pipeline="v1", skin_vibrance=True)
+    assert above_target.sat == 1.0, above_target.sat
+    print("ok  correct: vibrance never desaturates already-vivid footage (sat==1.0 at/above target chroma)")
+
+
+def test_vibrance_missing_chroma_is_identity():
+    g = solve_correct_grade(_cs(), pipeline="v1", skin_vibrance=True)
+    assert g.sat == 1.0, g.sat
+    print("ok  correct: vibrance is identity (sat=1.0) when chroma_mean is missing (fail-open)")
+
+
+def test_vibrance_flag_off_and_legacy_sat_is_one():
+    g_off = solve_correct_grade(_cs(chroma_mean=5.0), pipeline="v1", skin_vibrance=False)
+    assert g_off.sat == 1.0, g_off.sat
+    g_legacy = solve_correct_grade(_cs(chroma_mean=5.0), pipeline="legacy", skin_vibrance=True)
+    assert g_legacy.sat == 1.0, g_legacy.sat
+    print("ok  correct: vibrance is inert with the flag off or under the legacy pipeline")
+
+
+def _on_locus(L, r):
+    """A skin Lab sample exactly ON the skin locus (d_perp=0) at radius `r`
+    -- the "no cast, just warmth+saturation" fixture the tint tests build on."""
+    theta = math.radians(SKIN_LOCUS_DEG)
+    return [L, r * math.cos(theta), r * math.sin(theta)]
+
+
+def _push_perp(lab, d):
+    """Displace a Lab sample by `d` along the axis PERPENDICULAR to the skin
+    locus -- injects a controlled tint cast without touching along-locus
+    warmth or L*."""
+    theta = math.radians(SKIN_LOCUS_DEG)
+    L, a, b = lab
+    return [L, a - d * math.sin(theta), b + d * math.cos(theta)]
+
+
+def test_skin_tint_corrects_green_cast_bounded():
+    skin_on_locus = _on_locus(60.0, 20.0)
+    skin_green = _push_perp(skin_on_locus, 12.0)   # a confident, in-gate tint cast
+    m = _skin_multiplier(skin_green)
+    assert m is not None, "a confident skin sample must not be gated out"
+    # Removing a green cast means turning DOWN the green channel relative to
+    # red/blue -- the direction a fluorescent/mixed-light green tint needs.
+    assert m[1] < m[0] and m[1] < m[2], m
+    for v in m:
+        assert 1.0 / WB_MULTIPLIER_CLAMP <= v <= WB_MULTIPLIER_CLAMP, m
+    print("ok  correct: skin tint correction pulls a green cast toward the locus, bounded by WB_MULTIPLIER_CLAMP")
+
+
+def test_skin_tint_preserves_warmth_and_tone():
+    warm_on_locus = _on_locus(55.0, 35.0)    # a saturated, warm (golden-hour) skin sample
+    dark_on_locus = _on_locus(30.0, 15.0)    # a darker skin tone, same locus
+    m_warm = _skin_multiplier(warm_on_locus)
+    m_dark = _skin_multiplier(dark_on_locus)
+    for m in (m_warm, m_dark):
+        assert m is not None
+        for v in m:
+            assert abs(v - 1.0) < 1e-6, m   # on-locus -> no correction, regardless of warmth or tone
+    print("ok  correct: on-locus skin (any warmth, any tone) is left unchanged -- no privileging")
+
+
+def test_skin_tint_skips_non_skin():
+    baseline = _solve_wb(_cs(), None, skin_lab=None)
+    too_dark = _solve_wb(_cs(), None, skin_lab=[10.0, 10.0, 10.0])          # L below SKIN_L_MIN
+    too_bright = _solve_wb(_cs(), None, skin_lab=[95.0, 10.0, 10.0])        # L above SKIN_L_MAX
+    near_neutral = _solve_wb(_cs(), None, skin_lab=[60.0, 1.0, 1.0])        # chroma below SKIN_MIN_CHROMA
+    colored_object = _solve_wb(_cs(), None, skin_lab=_push_perp(_on_locus(60.0, 20.0), 30.0))  # d_perp too big
+    assert too_dark == baseline
+    assert too_bright == baseline
+    assert near_neutral == baseline
+    assert colored_object == baseline
+    print("ok  correct: a non-skin sample (bad lightness/near-neutral/too-far-off-locus) casts no WB vote")
+
+
+def test_skin_prefers_subject_lab_over_center_proxy():
+    skin_center = _push_perp(_on_locus(60.0, 20.0), 12.0)     # center-proxy: pushed one way
+    subject_lab = _push_perp(_on_locus(60.0, 20.0), -12.0)    # face-region: pushed the OTHER way
+    both = solve_correct_grade(_cs(skin_lab=skin_center, subject_lab=subject_lab), pipeline="v1", skin_vibrance=True)
+    subject_only = solve_correct_grade(_cs(subject_lab=subject_lab), pipeline="v1", skin_vibrance=True)
+    skin_only = solve_correct_grade(_cs(skin_lab=skin_center), pipeline="v1", skin_vibrance=True)
+    assert both.slope == subject_only.slope, (both.slope, subject_only.slope)
+    assert both.slope != skin_only.slope, "subject_lab must win over the center-proxy skin_lab, not average with it"
+    print("ok  correct: when both are present, the face-region subject_lab drives the correction, not skin_lab")
+
+
+def test_lab_to_srgb_round_trips():
+    colors = [
+        (0.5, 0.5, 0.5), (0.8, 0.6, 0.5), (0.3, 0.2, 0.15),   # incl. two skin-ish tones
+        (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.1, 0.1, 0.9),
+        (0.0, 0.0, 0.0), (1.0, 1.0, 1.0),
+    ]
+    for rgb in colors:
+        back = lab_to_srgb(srgb_to_lab(rgb))
+        for a, b in zip(rgb, back):
+            assert abs(a - b) < 1e-4, (rgb, back)
+    print("ok  colorspace: lab_to_srgb(srgb_to_lab(rgb)) round-trips within tolerance")
+
+
+def test_correct_flag_off_byte_identical():
+    cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38,
+             skin_lab=_push_perp(_on_locus(60.0, 20.0), 12.0), chroma_mean=8.0)
+    default_call = resolve_clip_grade({}, color_stats=cs, pipeline="v1")
+    explicit_off = resolve_clip_grade({}, color_stats=cs, pipeline="v1", skin_vibrance=False)
+    assert default_call == explicit_off
+    # Rich skin/chroma data present but the flag is off -> identical to a
+    # color_stats row that never had those fields at all (new fields inert).
+    cs_no_new_fields = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
+    without_new_fields = resolve_clip_grade({}, color_stats=cs_no_new_fields, pipeline="v1")
+    assert default_call["grade_hash"] == without_new_fields["grade_hash"]
+    print("ok  correct/resolver: skin_vibrance=False is byte-identical regardless of skin/chroma data present")
+
+
+def test_white_reference_still_wins_over_skin():
+    white_ref = (0.5, 0.5, 0.5)   # perfectly neutral, verified
+    skin_lab = _push_perp(_on_locus(60.0, 20.0), 12.0)
+    with_skin = solve_correct_grade(
+        _cs(skin_lab=skin_lab), pipeline="v1", skin_vibrance=True, white_reference_rgb=white_ref,
+    )
+    without_skin = solve_correct_grade(_cs(), pipeline="v1", white_reference_rgb=white_ref)
+    assert with_skin.slope == without_skin.slope, (with_skin.slope, without_skin.slope)
+    print("ok  correct: a verified white_reference still overrides the skin vote")
+
+
+def test_measure_subject_lab_reads_the_box_not_the_whole_frame():
+    import numpy as np
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+    frame[:, :] = [20, 20, 20]              # dark neutral background
+    frame[40:60, 40:60] = [200, 150, 120]   # a warm, skin-ish box
+    lab = _measure_subject_lab(frame, (0.4, 0.4, 0.2, 0.2))
+    assert lab is not None
+    whole_frame_lab = _measure_subject_lab(frame, (0.0, 0.0, 1.0, 1.0))
+    assert abs(lab[1] - whole_frame_lab[1]) > 1.0 or abs(lab[2] - whole_frame_lab[2]) > 1.0, (lab, whole_frame_lab)
+    print("ok  measure_span: subject_lab reads inside the box, not the whole frame")
+
+
+def test_measure_subject_lab_none_for_degenerate_box():
+    import numpy as np
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+    assert _measure_subject_lab(frame, (0.5, 0.5, 0.0, 0.0)) is None
+    assert _measure_subject_lab(frame, (1.5, 1.5, 0.1, 0.1)) is None
+    print("ok  measure_span: subject_lab is None for a degenerate/out-of-frame box")
 
 
 def main():
@@ -1763,6 +1935,19 @@ def main():
     test_run_grade_job_subject_exposure_gated_on_grade_semantic_too()
     test_legacy_unchanged_regardless_of_subject_exposure_flag()
     test_run_grade_job_applies_leveling_and_semantic_grouping_when_flagged()
+    test_vibrance_boosts_low_chroma_bounded()
+    test_vibrance_no_desaturation_on_vivid_footage()
+    test_vibrance_missing_chroma_is_identity()
+    test_vibrance_flag_off_and_legacy_sat_is_one()
+    test_skin_tint_corrects_green_cast_bounded()
+    test_skin_tint_preserves_warmth_and_tone()
+    test_skin_tint_skips_non_skin()
+    test_skin_prefers_subject_lab_over_center_proxy()
+    test_lab_to_srgb_round_trips()
+    test_correct_flag_off_byte_identical()
+    test_white_reference_still_wins_over_skin()
+    test_measure_subject_lab_reads_the_box_not_the_whole_frame()
+    test_measure_subject_lab_none_for_degenerate_box()
     print("\nall grade tests passed")
 
 

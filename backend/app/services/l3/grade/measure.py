@@ -19,6 +19,7 @@ _COLS = (
     "file_id", "black_point", "white_point", "mid_gray", "rgb_mean",
     "rgb_median", "rgb_std", "lab_ab_cast", "wb_gray_world", "wb_white_patch",
     "clip_shadow_pct", "clip_highlight_pct", "is_log_flat", "skin_lab",
+    "chroma_mean",
 )
 
 

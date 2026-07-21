@@ -29,7 +29,7 @@ from app.services.processing import _download_from_r2
 logger = logging.getLogger(__name__)
 
 # Bump when the cached shape changes so stale cache rows recompute.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 # Cheap: a handful of frames within the span is plenty for mean/percentile
 # stats (vs. L1's whole-file COLOR_STATS_MAX_FRAMES=12 over a much longer
 # window) -- span durations are typically a few seconds, not tens of.
@@ -107,6 +107,32 @@ def _measure_subject_luma(frame: Any, subject_box: Any) -> Optional[float]:
     return float(luma.mean())
 
 
+def _measure_subject_lab(frame: Any, subject_box: Any) -> Optional[List[float]]:
+    """Mean [L*, a*, b*] inside the normalized (x,y,w,h) `subject_box` on one
+    decoded RGB frame (uint8, H,W,3) -- color_skin_vibrance.plan.md's
+    face-region skin sample, a refinement over color_stats's center-weighted
+    proxy. None when the box doesn't resolve to any real pixels (mirrors
+    `_measure_subject_luma`)."""
+    import cv2
+    import numpy as np
+
+    try:
+        x, y, w, h = (float(v) for v in subject_box)
+    except (TypeError, ValueError):
+        return None
+    fh, fw = frame.shape[0], frame.shape[1]
+    x0, y0 = int(max(0.0, x) * fw), int(max(0.0, y) * fh)
+    x1, y1 = int(min(1.0, x + w) * fw), int(min(1.0, y + h) * fh)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    crop_lab = cv2.cvtColor(frame[y0:y1, x0:x1, :], cv2.COLOR_RGB2LAB).astype(np.float32)
+    return [
+        float(crop_lab[..., 0].mean() * (100.0 / 255.0)),
+        float(crop_lab[..., 1].mean() - 128.0),
+        float(crop_lab[..., 2].mean() - 128.0),
+    ]
+
+
 def measure_span(
     file_id: str, in_ms: int, out_ms: int, *, hero_ts_ms: Optional[int] = None,
     subject_box: Optional[Any] = None,
@@ -169,6 +195,9 @@ def measure_span(
                 subject_luma = _measure_subject_luma(hero_frame, subject_box)
                 if subject_luma is not None:
                     stats["subject_luma"] = subject_luma
+                subject_lab = _measure_subject_lab(hero_frame, subject_box)
+                if subject_lab is not None:
+                    stats["subject_lab"] = subject_lab
     except Exception:
         logger.exception("measure_span failed for %s [%d,%d)", file_id, in_ms, out_ms)
         return None

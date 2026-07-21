@@ -666,9 +666,9 @@ def _stage_color_stats(
             (file_id, schema_version, frames_sampled, luma_hist, black_point,
              white_point, mid_gray, rgb_mean, rgb_median, rgb_std, lab_ab_cast,
              wb_gray_world, wb_white_patch, clip_shadow_pct, clip_highlight_pct,
-             is_log_flat, skin_lab, palette)
+             is_log_flat, skin_lab, palette, chroma_mean)
         values (%s, %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb,
-                %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb, %s::jsonb)
+                %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
         on conflict (file_id) do update set
             schema_version     = excluded.schema_version,
             frames_sampled     = excluded.frames_sampled,
@@ -686,7 +686,8 @@ def _stage_color_stats(
             clip_highlight_pct = excluded.clip_highlight_pct,
             is_log_flat        = excluded.is_log_flat,
             skin_lab           = excluded.skin_lab,
-            palette            = excluded.palette
+            palette            = excluded.palette,
+            chroma_mean        = excluded.chroma_mean
         """,
         (
             file_id, color_stats_mod.SCHEMA_VERSION, cs.frames_sampled,
@@ -697,6 +698,7 @@ def _stage_color_stats(
             cs.clip_shadow_pct, cs.clip_highlight_pct, cs.is_log_flat,
             json.dumps(cs.skin_lab) if cs.skin_lab is not None else None,
             json.dumps(cs.palette),
+            cs.chroma_mean,
         ),
     )
     logger.info(

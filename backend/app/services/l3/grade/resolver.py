@@ -206,6 +206,7 @@ def resolve_clip_grade(
     balance_delta: Optional[Grade] = None,
     leveling_delta: Optional[Grade] = None,
     pipeline: str = "legacy",
+    skin_vibrance: bool = False,
 ) -> Dict[str, Any]:
     """Resolve ONE clip's (spine segment or op) final grade descriptor.
 
@@ -235,8 +236,15 @@ def resolve_clip_grade(
     leveling.solve_leveling`), already resolved once for the whole document
     -- composed between Match and Look, same pattern as `match_delta`, so
     the Look layer still solves against the fully-corrected-so-far image.
+    `skin_vibrance` (color_skin_vibrance.plan.md, v1-only): threaded straight
+    through to `solve_correct_grade` -- gates the skin-anchored WB tint vote
+    and the chroma-based saturation floor. Off (default) -> Correct layer
+    unchanged.
     """
-    stack = solve_correct_grade(color_stats, already_graded=already_graded, pipeline=pipeline)
+    stack = solve_correct_grade(
+        color_stats, already_graded=already_graded, pipeline=pipeline,
+        skin_vibrance=skin_vibrance,
+    )
     if balance_delta is not None:
         stack = compose(stack, balance_delta, 1.0)
     if match_delta is not None:
