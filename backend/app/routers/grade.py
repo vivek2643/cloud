@@ -25,6 +25,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from app.auth import get_current_user_id
 from app.services.l3.grade.cache import ensure_cube_file
 from app.services.l3.grade.cdl import Grade, grade_hash
+from app.services.l3.grade.look_engine import list_engine_looks
 from app.services.l3.grade.lut_bake import parse_cube_text
 from app.services.l3.grade.presets import list_presets
 from app.services.processing import _download_from_r2, _upload_to_r2
@@ -39,10 +40,13 @@ MAX_LUT_UPLOAD_BYTES = 8 * 1024 * 1024  # generous headroom over a 65^3 cube (~5
 
 @router.get("/api/grade/presets")
 def get_grade_presets(_user_id: str = Depends(get_current_user_id)) -> list:
-    """Look layer mode 1 gallery listing (SS7/SS12) -- id/label/description
-    for every authored preset. The frontend bakes its own live thumbnail per
-    preset via the cube endpoint; this just names them."""
-    return list_presets()
+    """Look layer gallery listing (SS7/SS12): CDL presets (mode 1) PLUS
+    color_response_engine.plan.md's engine looks -- one combined list, each
+    entry tagged `mode` ("preset" vs "engine") so the frontend knows which
+    id field (`preset_id` vs `look_id`) to set when the user picks one. The
+    frontend bakes its own live thumbnail per entry via the cube endpoint;
+    this just names them. Additive: existing preset entries are unchanged."""
+    return list_presets() + list_engine_looks()
 
 
 @router.post("/api/grade/lut")
@@ -108,23 +112,33 @@ def get_grade_cube(
     creative_lut_ref: Optional[str] = Query(None),
     size: int = Query(DEFAULT_LUT_SIZE, ge=2, le=65),
     tone_contrast: float = Query(0.0, description="color_tone_contrast.plan.md filmic S-curve strength"),
+    look_engine: Optional[str] = Query(
+        None, description="color_response_engine.plan.md: JSON-encoded LookSpec dict",
+    ),
     _user_id: str = Depends(get_current_user_id),
 ) -> Response:
     try:
         cdl_dict = json.loads(cdl)
     except (json.JSONDecodeError, TypeError):
         raise HTTPException(status_code=400, detail="cdl must be a JSON object")
+    look_engine_dict = None
+    if look_engine:
+        try:
+            look_engine_dict = json.loads(look_engine)
+        except (json.JSONDecodeError, TypeError):
+            raise HTTPException(status_code=400, detail="look_engine must be a JSON object")
 
     grade_obj = Grade.from_dict(cdl_dict)
     h = grade_hash(
         grade_obj, creative_lut_ref=creative_lut_ref, working_space=working_space, lut_size=size,
-        tone_contrast=tone_contrast,
+        tone_contrast=tone_contrast, look_engine=look_engine_dict,
     )
     descriptor = {
         "cdl": grade_obj.to_dict(),
         "creative_lut_ref": creative_lut_ref,
         "working_space": working_space,
         "tone_contrast": tone_contrast,
+        "look_engine": look_engine_dict,
         "grade_hash": h,
     }
     path = ensure_cube_file(

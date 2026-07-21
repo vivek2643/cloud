@@ -379,8 +379,24 @@ export function ColorGradeView() {
     [flushLook]
   );
 
-  function selectPreset(presetId: string) {
-    applyLook({ ...(look ?? {}), mode: "preset", preset_id: presetId, lut_ref: null }, true);
+  // color_response_engine.plan.md: the gallery now mixes CDL presets and
+  // engine looks (see getGradePresets) -- `entry.mode` decides which id
+  // field to set and which SequenceLook.mode the resolver should apply.
+  // Picking either always clears BOTH lut_ref (mode=="lut") and the other
+  // mode's id field, so switching between them never leaves a stale
+  // selector behind for the resolver to (mutually-exclusively) prefer.
+  function selectLook(entry: GradePresetSummary) {
+    if (entry.mode === "engine") {
+      applyLook(
+        { ...(look ?? {}), mode: "engine", look_id: entry.look_id, look_params: null, lut_ref: null, preset_id: null },
+        true
+      );
+    } else {
+      applyLook(
+        { ...(look ?? {}), mode: "preset", preset_id: entry.preset_id, lut_ref: null, look_id: null, look_params: null },
+        true
+      );
+    }
   }
 
   function setArcIntensity(v: number) {
@@ -529,11 +545,14 @@ export function ColorGradeView() {
         <SectionLabel>Look</SectionLabel>
         <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
           {presets.map((p) => {
-            const active = look?.mode === "preset" && look.preset_id === p.preset_id;
+            const active =
+              p.mode === "engine"
+                ? look?.mode === "engine" && look.look_id === p.look_id
+                : look?.mode === "preset" && look.preset_id === p.preset_id;
             return (
               <button
-                key={p.preset_id}
-                onClick={() => selectPreset(p.preset_id)}
+                key={`${p.mode}:${p.mode === "engine" ? p.look_id : p.preset_id}`}
+                onClick={() => selectLook(p)}
                 title={p.description}
                 className="truncate rounded-lg border px-2 py-2 text-left text-[11px] font-medium transition-colors"
                 style={{

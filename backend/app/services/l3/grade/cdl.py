@@ -146,15 +146,18 @@ def grade_hash(
     working_space: str = "rec709",
     soft_local: Optional[Dict[str, Any]] = None,
     lut_size: int = 33,
-    schema_version: int = 1,
+    schema_version: int = 2,
     tone_contrast: float = 0.0,
+    look_engine: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Stable content hash for a fully-resolved grade -- the cache key every
     baked .cube is stored/served under (color_grading.plan.md SS4/SS11:
     "cache by grade_hash(clip)"). Anything that can change the baked cube's
     bytes MUST be part of this payload -- `tone_contrast`
-    (color_tone_contrast.plan.md) included, since it changes `from_working`'s
-    output during the bake."""
+    (color_tone_contrast.plan.md) and `look_engine`
+    (color_response_engine.plan.md) included, since both change the bake's
+    output. `schema_version` bumped 1->2 for `look_engine`'s addition --
+    forces a one-time cube rebake (identical bytes while no caller sets it)."""
     payload = {
         "v": schema_version,
         "cdl": grade.to_dict(),
@@ -163,6 +166,7 @@ def grade_hash(
         "soft_local": soft_local or {},
         "lut_size": lut_size,
         "tone_contrast": tone_contrast,
+        "look_engine": look_engine or {},
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]

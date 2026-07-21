@@ -102,7 +102,13 @@ def get_preset(preset_id: str) -> Preset | None:
 
 
 def list_presets() -> List[Dict[str, str]]:
-    """Gallery listing (SS12): id/label/description only -- the frontend
-    renders a live thumbnail per preset itself (baking a preview frame
-    through each preset's cube is a UI-layer concern, not this catalog's)."""
-    return [{"preset_id": p.preset_id, "label": p.label, "description": p.description} for p in PRESETS]
+    """Gallery listing (SS12): id/label/description -- the frontend renders
+    a live thumbnail per preset itself (baking a preview frame through each
+    preset's cube is a UI-layer concern, not this catalog's). `mode` tags
+    every entry "preset" (color_response_engine.plan.md's combined gallery
+    also lists "engine" entries from `look_engine.list_engine_looks` --
+    the frontend needs this to know which `look.mode`/id field to set)."""
+    return [
+        {"preset_id": p.preset_id, "label": p.label, "description": p.description, "mode": "preset"}
+        for p in PRESETS
+    ]

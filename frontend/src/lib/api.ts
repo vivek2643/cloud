@@ -608,13 +608,19 @@ export interface ResolvedGrade {
   /** color_tone_contrast.plan.md: filmic S-curve strength baked into the
    * cube at bake time (not part of the CDL) -- 0/absent is identity. */
   tone_contrast?: number;
+  /** color_response_engine.plan.md: a LookSpec dict baked into the creative
+   * LUT grid (mutually exclusive with creative_lut_ref) -- absent/null is
+   * identity, same "not part of the CDL, changes the bake" pattern as
+   * tone_contrast. Shape mirrors backend `grade.look_engine.LookSpec.to_dict`. */
+  look_engine?: Record<string, unknown> | null;
   grade_hash?: string;
 }
 
-/** Sequence-level look selection (SS2.4/SS7): one of three input modes
- * (preset / reference-image / .cube upload) collapsing into the same CDL
- * spine, plus the user's single arc intensity dial (SS8). */
-export type LookMode = "preset" | "reference" | "lut";
+/** Sequence-level look selection (SS2.4/SS7): one of four input modes
+ * (preset / reference-image / .cube upload / color_response_engine.plan.md's
+ * parametric engine) collapsing into the same CDL spine (or, for "engine",
+ * a baked LUT grid instead), plus the user's single arc intensity dial (SS8). */
+export type LookMode = "preset" | "reference" | "lut" | "engine";
 
 export interface SequenceLook {
   mode?: LookMode;
@@ -628,6 +634,13 @@ export interface SequenceLook {
   match_strength?: number;     // reference-image mode: 0..1
   arc_intensity?: number;      // 0 = flat, 1 = full arc (SS8)
   vignette_strength?: number;  // 0 = off (default), 1 = strongest (SS9)
+  /** color_response_engine.plan.md, mode=="engine": a catalog look id (see
+   * `GradePresetSummary.look_id` from the combined gallery) -- preferred
+   * over look_params when both are present. */
+  look_id?: string | null;
+  /** mode=="engine" inline/preview spec (a `LookSpec.to_dict()`-shaped
+   * object), used when `look_id` doesn't name a catalog look. */
+  look_params?: Record<string, unknown> | null;
 }
 
 /** A time-scoped spatial layout (split-screen / PiP): mirrors backend
@@ -1014,8 +1027,15 @@ export function saveEditDocument(id: string, body: SaveEditBody, token: string) 
 
 // --- Color grading ---
 
+/** One entry in the combined Look gallery (`GET /api/grade/presets`) --
+ * either a CDL preset (`mode: "preset"`, `preset_id` set) or a
+ * color_response_engine.plan.md engine look (`mode: "engine"`, `look_id`
+ * set instead). `mode` decides which id field to read and which
+ * `SequenceLook` shape to apply on selection -- see color-grade-view.tsx. */
 export interface GradePresetSummary {
-  preset_id: string;
+  mode: "preset" | "engine";
+  preset_id?: string;
+  look_id?: string;
   label: string;
   description: string;
 }

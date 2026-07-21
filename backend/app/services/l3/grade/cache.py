@@ -47,11 +47,21 @@ def ensure_cube_file(
 
     cdl = Grade.from_dict(grade.get("cdl"))
     creative_grid = None
-    lut_ref = grade.get("creative_lut_ref")
-    if lut_ref and fetch_creative_lut is not None:
-        text = fetch_creative_lut(lut_ref)
-        if text:
-            creative_grid = parse_cube_text(text)
+    look_engine = grade.get("look_engine")
+    if look_engine:
+        # color_response_engine.plan.md: the engine grid and an uploaded LUT
+        # both fill this one slot and are mutually exclusive (the resolver
+        # already nulls creative_lut_ref when an engine look is active) --
+        # prefer the engine grid so a stale lut_ref on the same look dict
+        # can never silently win.
+        from app.services.l3.grade.look_engine import LookSpec, build_look_grid
+        creative_grid = build_look_grid(LookSpec.from_dict(look_engine), size=lut_size)
+    else:
+        lut_ref = grade.get("creative_lut_ref")
+        if lut_ref and fetch_creative_lut is not None:
+            text = fetch_creative_lut(lut_ref)
+            if text:
+                creative_grid = parse_cube_text(text)
 
     working_space = str(grade.get("working_space") or "rec709")
     tone_contrast = float(grade.get("tone_contrast") or 0.0)

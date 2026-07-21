@@ -45,6 +45,9 @@ export function gradeCubeUrl(grade: ResolvedGrade): string {
   // in-memory cache key above) or the preview cube would silently omit the
   // curve the export bake includes -- see backend/app/routers/grade.py.
   if (grade.tone_contrast) params.set("tone_contrast", String(grade.tone_contrast));
+  // color_response_engine.plan.md: same reasoning -- omitting this would
+  // silently preview a plain CDL while export bakes the engine look's grid.
+  if (grade.look_engine) params.set("look_engine", JSON.stringify(grade.look_engine));
   return `${API_URL}/api/grade/cube?${params.toString()}`;
 }
 

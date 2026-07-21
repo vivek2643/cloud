@@ -189,6 +189,11 @@ class Settings(BaseSettings):
     grade_tone_contrast: bool = False
     grade_tone_contrast_strength: float = 0.9   # g = 1 + strength; tune per contact sheet
 
+    # color_response_engine.plan.md: parametric Look engine (mode=="engine") that
+    # bakes a LookSpec into the creative LUT grid. Off = engine looks ignored
+    # (byte-identical; existing preset/reference/lut/no-look paths never change).
+    grade_look_engine: bool = False
+
     # migration_runner.plan.md: the startup guard's sanctioned local-dev
     # bypass. "on" (default) means every process refuses to boot on schema
     # drift; "off" disables that check for THIS process only, loudly (a

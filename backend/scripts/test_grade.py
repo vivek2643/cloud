@@ -34,7 +34,11 @@ from app.services.l3.grade.correct import (  # noqa: E402
 from app.services.l3.grade.leveling import (  # noqa: E402
     SILHOUETTE_RATIO, ShotLevelInput, solve_exposure_leveling, solve_leveling, solve_tonal_leveling,
 )
-from app.services.l3.grade.lut_bake import bake_cube_text  # noqa: E402
+from app.services.l3.grade.look_engine import (  # noqa: E402
+    LookSpec, _apply_hue_rotate, _apply_hue_sat, _apply_split_tone, _rgb_to_hsv,
+    build_look_grid, resolve_look_spec,
+)
+from app.services.l3.grade.lut_bake import _identity_grid, _sample_lut_trilinear, bake_cube_text, parse_cube_text  # noqa: E402
 from app.services.l3.grade.match import ShotStats, group_neighbors, solve_sequence_match  # noqa: E402
 from app.services.l3.grade.measure_span import _measure_subject_lab, _measure_subject_luma  # noqa: E402
 from app.services.l3.grade.reference import GroupReference, compute_group_reference  # noqa: E402
@@ -1075,6 +1079,7 @@ def test_run_grade_job_shot_match_v2_off_reproduces_pre_redesign_path():
         grade_pipeline="v1", grade_even_lighting=False, grade_semantic=False, grade_shot_match_v2=False,
         grade_skin_vibrance=False,
         grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
+        grade_look_engine=False,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1210,6 +1215,7 @@ def test_run_grade_job_groups_multi_file_reel_via_scene_join():
         grade_shot_match_v2=True, grade_scene_join=True, grade_subject_exposure=False,
         grade_skin_vibrance=False,
         grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
+        grade_look_engine=False,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1252,6 +1258,7 @@ def test_run_grade_job_scene_join_does_not_over_group_unrelated_shots():
         grade_shot_match_v2=True, grade_scene_join=True, grade_subject_exposure=False,
         grade_skin_vibrance=False,
         grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
+        grade_look_engine=False,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1295,6 +1302,7 @@ def test_run_grade_job_scene_join_fail_open_on_db_error():
         grade_shot_match_v2=True, grade_scene_join=True, grade_subject_exposure=False,
         grade_skin_vibrance=False,
         grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
+        grade_look_engine=False,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1339,6 +1347,7 @@ def test_run_grade_job_scene_join_off_keeps_pre_plan_behavior():
         grade_shot_match_v2=True, grade_scene_join=False, grade_subject_exposure=False,
         grade_skin_vibrance=False,
         grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
+        grade_look_engine=False,
     )
     join_spy = mock.Mock(side_effect=AssertionError("join must not be called when grade_scene_join=False"))
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
@@ -1515,6 +1524,7 @@ def test_run_grade_job_hero_ts_ms_fallback_only_when_box_resolves():
         grade_shot_match_v2=False, grade_scene_join=False, grade_subject_exposure=True,
         grade_skin_vibrance=False,
         grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
+        grade_look_engine=False,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1564,6 +1574,7 @@ def test_run_grade_job_subject_exposure_converges_grouped_subjects():
             grade_shot_match_v2=True, grade_scene_join=True,
             grade_skin_vibrance=False,
             grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
+            grade_look_engine=False,
             grade_subject_exposure=subject_exposure_on,
         )
         with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
@@ -1616,6 +1627,7 @@ def test_run_grade_job_subject_exposure_gated_on_grade_semantic_too():
         grade_shot_match_v2=False, grade_scene_join=False, grade_subject_exposure=True,
         grade_skin_vibrance=False,
         grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
+        grade_look_engine=False,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1679,6 +1691,7 @@ def test_run_grade_job_applies_leveling_and_semantic_grouping_when_flagged():
         grade_shot_match_v2=True, grade_scene_join=True, grade_subject_exposure=False,
         grade_skin_vibrance=False,
         grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
+        grade_look_engine=False,
     )
     joined_meta = {
         "s0": ShotCutMeta(speaker_person="P1", on_camera=True),
@@ -1998,6 +2011,205 @@ def test_compositor_grade_key_distinguishes_tone_contrast_from_identity():
     print("ok  compositor: _grade_key does not collapse an identity-CDL + tone_contrast>0 grade to ''")
 
 
+# --------------------------------------------------------------------------
+# color_response_engine.plan.md: parametric Look engine (mode == "engine")
+# --------------------------------------------------------------------------
+
+_PUNCHY_SPEC = LookSpec(
+    contrast=0.15,
+    shadow_tint=(-0.03, 0.01, 0.04),
+    highlight_tint=(0.04, 0.02, -0.03),
+    hue_sat=((30.0, 40.0, 1.25), (150.0, 50.0, 0.8)),
+    sat=1.08,
+)
+
+
+def test_look_identity_spec_is_identity_grid():
+    grid, size = build_look_grid(LookSpec(), size=17)
+    ident = _identity_grid(17)
+    assert size == 17
+    assert bool((grid == ident).all()), float((grid - ident).max())
+    print("ok  look_engine: an empty LookSpec builds the EXACT identity grid")
+
+
+def test_look_grid_deterministic():
+    g1, _ = build_look_grid(_PUNCHY_SPEC, size=17)
+    g2, _ = build_look_grid(_PUNCHY_SPEC, size=17)
+    assert g1.tobytes() == g2.tobytes()
+    print("ok  look_engine: the same spec builds a byte-identical grid twice")
+
+
+def test_look_grid_no_clip_no_nan():
+    import numpy as np
+
+    strong = LookSpec(
+        contrast=0.5,
+        shadow_tint=(-0.08, 0.02, 0.09), mid_tint=(0.02, -0.01, 0.0), highlight_tint=(0.09, 0.03, -0.07),
+        hue_rotate=((30.0, 40.0, 40.0), (200.0, 60.0, -30.0)),
+        hue_sat=((30.0, 40.0, 1.4), (140.0, 50.0, 0.4)),
+        sat=1.3,
+    )
+    grid, size = build_look_grid(strong, size=33)
+    assert np.isfinite(grid).all(), "NaN/inf in a strong look's grid"
+    assert grid.min() >= 0.0 and grid.max() <= 1.0, (grid.min(), grid.max())
+    diag = np.array([grid[i, i, i] for i in range(size)])   # neutral ramp (r=g=b)
+    luma = diag[:, 0] * 0.2126 + diag[:, 1] * 0.7152 + diag[:, 2] * 0.0722
+    assert bool(np.all(np.diff(luma) >= -1e-6)), luma
+    print("ok  look_engine: a strong spec never clips/NaNs; the neutral ramp stays monotonic")
+
+
+def test_look_split_tone_directional():
+    import numpy as np
+
+    dark_gray = np.array([[0.05, 0.05, 0.05]], dtype=np.float32)
+    light_gray = np.array([[0.95, 0.95, 0.95]], dtype=np.float32)
+    shadow_spec = LookSpec(shadow_tint=(0.0, 0.0, 0.08))
+    d_shift = float(_apply_split_tone(dark_gray, shadow_spec)[0, 2] - dark_gray[0, 2])
+    l_shift = float(_apply_split_tone(light_gray, shadow_spec)[0, 2] - light_gray[0, 2])
+    assert d_shift > 0.05, d_shift          # dark gray bluer
+    assert l_shift < 0.001, l_shift          # light gray ~unchanged (w_shadow ~0 there)
+
+    highlight_spec = LookSpec(highlight_tint=(0.0, 0.0, 0.08))
+    d2_shift = float(_apply_split_tone(dark_gray, highlight_spec)[0, 2] - dark_gray[0, 2])
+    l2_shift = float(_apply_split_tone(light_gray, highlight_spec)[0, 2] - light_gray[0, 2])
+    assert l2_shift > 0.05, l2_shift         # the inverse: light gray bluer
+    assert d2_shift < 0.001, d2_shift        # dark gray ~unchanged
+    print("ok  look_engine: split-tone tints are zone-directional (shadow vs highlight, inverse)")
+
+
+def test_look_hue_rotate_only_targets_band():
+    import numpy as np
+
+    orange = np.array([[1.0, 0.5, 0.0]], dtype=np.float32)    # hue ~30
+    blue = np.array([[0.0, 0.2, 1.0]], dtype=np.float32)       # hue ~228, well outside the band
+    gray = np.array([[0.5, 0.5, 0.5]], dtype=np.float32)
+    spec = LookSpec(hue_rotate=((30.0, 40.0, 25.0),))
+
+    h_before, _, _ = _rgb_to_hsv(orange)
+    h_after, _, _ = _rgb_to_hsv(_apply_hue_rotate(orange, spec))
+    assert abs(float(h_after[0] - h_before[0]) - 25.0) < 0.5, (h_before, h_after)   # band center: full rotate_deg
+
+    hb_before, _, _ = _rgb_to_hsv(blue)
+    hb_after, _, _ = _rgb_to_hsv(_apply_hue_rotate(blue, spec))
+    assert abs(float(hb_after[0] - hb_before[0])) < 0.5, (hb_before, hb_after)
+
+    gray_out = _apply_hue_rotate(gray, spec)
+    assert np.array_equal(gray_out, gray), (gray, gray_out)   # achromatic guard: EXACT, not approximate
+    print("ok  look_engine: hue_rotate only moves the targeted band; grays are exactly unchanged")
+
+
+def test_look_hue_sat_only_targets_band():
+    import numpy as np
+
+    green = np.array([[0.1, 0.8, 0.1]], dtype=np.float32)     # hue ~113, inside a (140,50) band
+    orange = np.array([[1.0, 0.5, 0.0]], dtype=np.float32)     # hue ~30, well outside
+    gray = np.array([[0.5, 0.5, 0.5]], dtype=np.float32)
+    spec = LookSpec(hue_sat=((140.0, 50.0, 0.5),))
+
+    _, sg_before, _ = _rgb_to_hsv(green)
+    _, sg_after, _ = _rgb_to_hsv(_apply_hue_sat(green, spec))
+    assert float(sg_after[0]) < float(sg_before[0]) * 0.9, (sg_before, sg_after)   # meaningfully desaturated
+
+    _, so_before, _ = _rgb_to_hsv(orange)
+    _, so_after, _ = _rgb_to_hsv(_apply_hue_sat(orange, spec))
+    assert abs(float(so_after[0] - so_before[0])) < 0.01, (so_before, so_after)
+
+    gray_out = _apply_hue_sat(gray, spec)
+    assert np.array_equal(gray_out, gray), (gray, gray_out)   # achromatic guard: EXACT
+    print("ok  look_engine: hue_sat only scales saturation in the targeted band; grays are exactly unchanged")
+
+
+def test_look_engine_bake_parity():
+    """Proves preview == export for engine looks: sampling the grid DIRECTLY
+    must match trilinearly sampling the SAME grid round-tripped through
+    bake_cube_text -> parse_cube_text (the real preview/export path)."""
+    import numpy as np
+
+    grid, size = build_look_grid(_PUNCHY_SPEC, size=33)
+    cube_text = bake_cube_text(Grade(), size=size, creative_lut_grid=(grid, size), working_space="rec709")
+    parsed_grid, parsed_size = parse_cube_text(cube_text)
+    assert parsed_size == size
+
+    probes = np.array([
+        [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [0.5, 0.5, 0.5],
+        [0.9, 0.4, 0.2], [0.05, 0.6, 0.95],
+    ], dtype=np.float32)
+    direct = _sample_lut_trilinear(grid, probes)
+    baked = _sample_lut_trilinear(parsed_grid, probes)
+    max_err = float(np.max(np.abs(direct - baked)))
+    assert max_err < 0.01, f"engine-look bake parity exceeded tolerance: {max_err}"
+    print(f"ok  look_engine: baked-cube trilinear sample matches the direct grid (max err {max_err:.5f})")
+
+
+def test_resolver_engine_off_byte_identical():
+    cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
+    seq = {"mode": "engine", "look_id": "engine_punchy"}
+    off = resolve_clip_grade({}, color_stats=cs, sequence_look=seq, pipeline="v1", look_engine_enabled=False)
+    baseline = resolve_clip_grade({}, color_stats=cs, pipeline="v1")
+    assert off["grade_hash"] == baseline["grade_hash"]
+    assert off.get("look_engine") is None
+    print("ok  resolver: mode='engine' with the flag off is byte-identical to no look at all")
+
+
+def test_resolver_engine_on_sets_look_engine_and_changes_hash():
+    cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
+    seq = {"mode": "engine", "look_id": "engine_punchy"}
+    off = resolve_clip_grade({}, color_stats=cs, sequence_look=seq, pipeline="v1", look_engine_enabled=False)
+    on = resolve_clip_grade({}, color_stats=cs, sequence_look=seq, pipeline="v1", look_engine_enabled=True)
+    assert on.get("look_engine"), on.get("look_engine")
+    assert on["grade_hash"] != off["grade_hash"]
+    assert on.get("creative_lut_ref") is None   # engine + uploaded LUT are mutually exclusive
+
+    # the identity catalog entry stays inert even with the flag on -- an
+    # empty spec skips the grid entirely (byte-identical to no look).
+    seq_identity = {"mode": "engine", "look_id": "engine_identity"}
+    identity_on = resolve_clip_grade(
+        {}, color_stats=cs, sequence_look=seq_identity, pipeline="v1", look_engine_enabled=True,
+    )
+    baseline = resolve_clip_grade({}, color_stats=cs, pipeline="v1")
+    assert identity_on.get("look_engine") is None
+    assert identity_on["grade_hash"] == baseline["grade_hash"]
+    print("ok  resolver: mode='engine' with the flag on sets look_engine + rehashes; the identity look stays inert")
+
+
+def test_grade_hash_look_engine_in_payload():
+    h0 = grade_hash(Grade(), working_space=tone.WORKING_SPACE_V1, look_engine=None)
+    h1 = grade_hash(Grade(), working_space=tone.WORKING_SPACE_V1, look_engine=_PUNCHY_SPEC.to_dict())
+    assert h0 != h1, "grade_hash must change when look_engine changes, or the cube never rebakes per-look"
+    print("ok  cdl: grade_hash changes with look_engine (cube correctly rebakes per look)")
+
+
+def test_compositor_grade_key_distinguishes_look_engine_from_identity():
+    """Same class of gap as tone_contrast's: an identity CDL with a
+    non-identity look_engine dict is NOT a no-op bake."""
+    identity_cdl = Grade().to_dict()
+    no_engine = {"cdl": identity_cdl, "working_space": "rec709", "look_engine": None, "grade_hash": "aaa"}
+    with_engine = {"cdl": identity_cdl, "working_space": "rec709",
+                   "look_engine": _PUNCHY_SPEC.to_dict(), "grade_hash": "bbb"}
+    assert _grade_key(no_engine) == ""
+    assert _grade_key(with_engine) != ""
+    assert _grade_key(with_engine) != _grade_key(no_engine)
+    print("ok  compositor: _grade_key does not collapse an identity-CDL + look_engine grade to ''")
+
+
+def test_resolve_look_spec_prefers_catalog_over_inline_params():
+    catalog = resolve_look_spec({"look_id": "engine_punchy"})
+    assert catalog == _PUNCHY_SPEC
+
+    inline = resolve_look_spec({"look_params": {"sat": 1.2}})
+    assert inline is not None and abs(inline.sat - 1.2) < 1e-9
+
+    both = resolve_look_spec({"look_id": "engine_punchy", "look_params": {"sat": 1.2}})
+    assert both == _PUNCHY_SPEC   # a valid catalog look_id wins over inline params
+
+    unknown = resolve_look_spec({"look_id": "not_a_real_look"})
+    assert unknown is None
+
+    nothing = resolve_look_spec({})
+    assert nothing is None
+    print("ok  look_engine: resolve_look_spec prefers a valid catalog look_id, falls back to look_params, else None")
+
+
 def main():
     test_tone_legacy_is_exact_identity()
     test_tone_v1_black_stays_black()
@@ -2101,6 +2313,18 @@ def main():
     test_resolver_flag_off_byte_identical()
     test_grade_hash_changes_with_tone_contrast()
     test_compositor_grade_key_distinguishes_tone_contrast_from_identity()
+    test_look_identity_spec_is_identity_grid()
+    test_look_grid_deterministic()
+    test_look_grid_no_clip_no_nan()
+    test_look_split_tone_directional()
+    test_look_hue_rotate_only_targets_band()
+    test_look_hue_sat_only_targets_band()
+    test_look_engine_bake_parity()
+    test_resolver_engine_off_byte_identical()
+    test_resolver_engine_on_sets_look_engine_and_changes_hash()
+    test_grade_hash_look_engine_in_payload()
+    test_compositor_grade_key_distinguishes_look_engine_from_identity()
+    test_resolve_look_spec_prefers_catalog_over_inline_params()
     print("\nall grade tests passed")
 
 

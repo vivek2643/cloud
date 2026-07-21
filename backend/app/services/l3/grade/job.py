@@ -80,7 +80,11 @@ logger = logging.getLogger(__name__)
 # v8 (color_tone_contrast.plan.md): a filmic contrast S-curve is baked into
 # tone.from_working (gated on grade_tone_contrast), changing the baked cube
 # (not the CDL itself) whenever the flag is on.
-INPUT_HASH_SCHEMA_VERSION = 8
+# v9 (color_response_engine.plan.md): the Look layer gains a new "engine"
+# mode -- a LookSpec baked into the creative LUT grid (gated on
+# grade_look_engine) -- changing the baked cube whenever a document's
+# document["look"] selects it and the flag is on.
+INPUT_HASH_SCHEMA_VERSION = 9
 
 # Same local-disk, content-addressed cube cache the preview cube endpoint and
 # the render compositor already use (grade/cache.py's documented "not shared
@@ -244,6 +248,7 @@ def compute_input_hash(document: Dict[str, Any]) -> str:
             "grade_skin_vibrance": settings.grade_skin_vibrance,
             "grade_tone_contrast": settings.grade_tone_contrast,
             "grade_tone_contrast_strength": settings.grade_tone_contrast_strength,
+            "grade_look_engine": settings.grade_look_engine,
         },
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
@@ -652,6 +657,7 @@ def run_grade_job(thread_id: str) -> None:
                     settings.grade_tone_contrast_strength
                     if settings.grade_tone_contrast and settings.grade_pipeline == "v1" else 0.0
                 ),
+                look_engine_enabled=settings.grade_look_engine,
             )
             gh = grade_json.get("grade_hash")
             if gh not in cube_cache:

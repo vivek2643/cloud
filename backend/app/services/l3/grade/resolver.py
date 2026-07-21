@@ -56,6 +56,7 @@ from typing import Any, Dict, Optional
 from app.services.l3.grade.arc import solve_arc_grade
 from app.services.l3.grade.cdl import Grade, compose, grade_hash
 from app.services.l3.grade.correct import solve_correct_grade
+from app.services.l3.grade.look_engine import resolve_look_spec
 from app.services.l3.grade.presets import get_preset
 from app.services.l3.grade.reference_transfer import solve_reference_transfer
 from app.services.l3.grade.softlocal import solve_vignette
@@ -191,6 +192,12 @@ def _solve_look(sequence_look: Optional[Dict[str, Any]], color_stats: Optional[D
         strength = sequence_look.get("match_strength")
         kwargs = {"match_strength": float(strength)} if strength is not None else {}
         return solve_reference_transfer(color_stats, ref_stats, **kwargs)
+    # mode == "engine" (color_response_engine.plan.md): the whole look lives
+    # in the baked 3D LUT grid (see resolve_clip_grade's look_engine
+    # descriptor field), never a CDL delta -- same "composes at bake time,
+    # not here" pattern as mode == "lut" below.
+    if mode == "engine":
+        return Grade()
     # mode == "lut" (or unset): the .cube itself composes at bake time via
     # creative_lut_ref, not as a CDL delta here.
     return Grade()
@@ -208,6 +215,7 @@ def resolve_clip_grade(
     pipeline: str = "legacy",
     skin_vibrance: bool = False,
     tone_contrast: float = 0.0,
+    look_engine_enabled: bool = False,
 ) -> Dict[str, Any]:
     """Resolve ONE clip's (spine segment or op) final grade descriptor.
 
@@ -245,6 +253,10 @@ def resolve_clip_grade(
     strength baked into `from_working` at bake time -- carried through the
     descriptor and the `grade_hash` payload (NOT applied to the CDL itself)
     so the cube rebakes when it changes. `0.0` (default) -> byte-identical.
+    `look_engine_enabled` (color_response_engine.plan.md): gates the new
+    `mode == "engine"` Look mode -- a `LookSpec` baked into the creative LUT
+    grid (mutually exclusive with an uploaded `.cube`; see below). Off
+    (default) -> `look_engine` never set, byte-identical to before this plan.
     """
     stack = solve_correct_grade(
         color_stats, already_graded=already_graded, pipeline=pipeline,
@@ -279,6 +291,20 @@ def resolve_clip_grade(
     default_ws = WORKING_SPACE_V1 if pipeline == "v1" else DEFAULT_WORKING_SPACE
     working_space = item.get("working_space") or default_ws
 
+    # color_response_engine.plan.md: mode=="engine" bakes a LookSpec into the
+    # creative LUT grid instead of an uploaded .cube -- the two are mutually
+    # exclusive (both fill the same `creative_lut_grid` slot at bake time),
+    # so an engine look wins over any stale `lut_ref` on the same look dict.
+    # `spec.is_identity()` (empty spec, unknown look_id/params) skips the
+    # grid entirely -- byte-identical to no look, same never-worse discipline
+    # as every other new-field-off-by-default plan in this stack.
+    look_engine = None
+    if look_engine_enabled and sequence_look and sequence_look.get("mode") == "engine":
+        spec = resolve_look_spec(sequence_look)
+        if spec is not None and not spec.is_identity():
+            look_engine = spec.to_dict()
+            creative_lut_ref = None
+
     # SS9 soft-local: opt-in only (never a surprise vignette on untouched
     # footage) via sequence_look.vignette_strength. `item.get("subject_box")`
     # (color_grading_upgrade.plan.md Step 1.7: the masking-foundation seam)
@@ -301,6 +327,7 @@ def resolve_clip_grade(
         working_space=working_space,
         soft_local=soft_local,
         tone_contrast=tone_contrast,
+        look_engine=look_engine,
     )
     return {
         "cdl": resolved.to_dict(),
@@ -308,5 +335,6 @@ def resolve_clip_grade(
         "working_space": working_space,
         "soft_local": soft_local,
         "tone_contrast": tone_contrast,
+        "look_engine": look_engine,
         "grade_hash": h,
     }
