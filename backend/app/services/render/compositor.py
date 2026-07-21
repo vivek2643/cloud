@@ -279,15 +279,23 @@ def _transform_key(transform: Optional[Dict[str, Any]]) -> str:
 
 def _grade_key(grade: Optional[Dict[str, Any]]) -> str:
     """Stable cache token for a resolved grade; identity (no CDL, no creative
-    LUT, no soft-local) collapses to '' so ungraded segments keep their
-    existing cache entries, mirroring `_transform_key`'s identity-collapse
-    contract."""
+    LUT, no soft-local, no tone_contrast) collapses to '' so ungraded
+    segments keep their existing cache entries, mirroring `_transform_key`'s
+    identity-collapse contract.
+
+    color_tone_contrast.plan.md: `tone_contrast` (baked into `from_working`
+    independent of the CDL) MUST be part of this identity check too -- an
+    identity CDL with `tone_contrast>0` is NOT a no-op bake, and without this
+    check it would collapse to the SAME '' token as a truly-identity segment
+    rendered before the flag existed, silently reusing a stale cached
+    segment clip that never got the contrast curve."""
     if not grade:
         return ""
     cdl = Grade.from_dict(grade.get("cdl"))
     lut_ref = grade.get("creative_lut_ref")
     soft_local = grade.get("soft_local")
-    if is_identity(cdl) and not lut_ref and not soft_local:
+    tone_contrast = float(grade.get("tone_contrast") or 0.0)
+    if is_identity(cdl) and not lut_ref and not soft_local and tone_contrast <= 0.0:
         return ""
     h = grade.get("grade_hash")
     return f"g{h}" if h else ""

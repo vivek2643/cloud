@@ -49,6 +49,12 @@ _SRGB_DISPLAY_THRESH = 0.04045    # display value where the sRGB EOTF's two bran
 # toward 1.0 instead of hard-clipping.
 _SHOULDER_START = 0.8
 
+# color_tone_contrast.plan.md: display-space pivot the contrast curve rotates
+# about (~linear mid-gray 0.18 re-encoded through the sRGB OETF). Fixed, not
+# derived from data -- the curve's endpoints (0, 1) and this pivot are always
+# preserved regardless of strength.
+TONE_PIVOT = 0.435
+
 
 def to_working(rgb_display, working_space: str):
     """Display-encoded (gamma) RGB, 0..1 -> scene-referred linear RGB.
@@ -105,9 +111,30 @@ def _tonemap_shoulder(x):
     return np.where(x <= _SHOULDER_START, x, _SHOULDER_START + compressed)
 
 
-def from_working(rgb_working, working_space: str):
+def _contrast_pivot(x, g, p: float = TONE_PIVOT):
+    """A pivoted double-power S-curve over DISPLAY-encoded `x` in 0..1: the
+    standard "contrast around a pivot," monotonic, C1-continuous at the
+    pivot (slope `g` on both sides), and endpoint-pinned (`f(0)=0`,
+    `f(1)=1`, `f(p)=p`) so it can never clip or invert regardless of `g`.
+    `g=1.0` -> identity; `g>1.0` -> more contrast (darker below the pivot,
+    brighter above)."""
+    import numpy as np
+
+    lo = p * np.power(x / p, g)
+    hi = 1.0 - (1.0 - p) * np.power((1.0 - x) / (1.0 - p), g)
+    return np.where(x <= p, lo, hi)
+
+
+def from_working(rgb_working, working_space: str, *, contrast: float = 0.0):
     """Scene-referred linear RGB -> filmic-tone-mapped, display-encoded RGB.
-    Identity unless `working_space == WORKING_SPACE_V1`."""
+    Identity unless `working_space == WORKING_SPACE_V1`.
+
+    `contrast` (color_tone_contrast.plan.md, v1-only): a filmic S-curve
+    applied to the final display-encoded output, AFTER the highlight
+    shoulder + sRGB OETF above. `contrast=0.0` (default) is exact identity
+    (`g=1.0` in `_contrast_pivot`) -- reproduces today's bytes bit-for-bit.
+    `contrast>0.0` maps to `g = 1.0 + contrast`. Never touched when
+    `working_space != WORKING_SPACE_V1` (legacy stays byte-for-byte)."""
     import numpy as np
 
     arr = np.asarray(rgb_working, dtype=np.float32)
@@ -117,4 +144,7 @@ def from_working(rgb_working, working_space: str):
     toned = np.clip(_tonemap_shoulder(arr), 0.0, 1.0)
     lo = toned * 12.92
     hi = (1.0 + _SRGB_A) * np.power(toned, 1.0 / 2.4) - _SRGB_A
-    return np.where(toned <= _SRGB_LINEAR_THRESH, lo, hi).astype(np.float32)
+    display = np.where(toned <= _SRGB_LINEAR_THRESH, lo, hi).astype(np.float32)
+    if contrast > 0.0:
+        display = np.clip(_contrast_pivot(display, 1.0 + contrast), 0.0, 1.0).astype(np.float32)
+    return display

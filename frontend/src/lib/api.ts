@@ -605,6 +605,9 @@ export interface ResolvedGrade {
   creative_lut_ref?: string | null;
   working_space: string;
   soft_local?: SoftLocalDescriptor | null;
+  /** color_tone_contrast.plan.md: filmic S-curve strength baked into the
+   * cube at bake time (not part of the CDL) -- 0/absent is identity. */
+  tone_contrast?: number;
   grade_hash?: string;
 }
 

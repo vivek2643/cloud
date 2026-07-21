@@ -77,7 +77,10 @@ logger = logging.getLogger(__name__)
 # tint vote (blended into the WB solve) and a bounded global saturation
 # floor (chroma_mean -> sat), both gated on grade_skin_vibrance. Grade math
 # changed whenever the flag is on.
-INPUT_HASH_SCHEMA_VERSION = 7
+# v8 (color_tone_contrast.plan.md): a filmic contrast S-curve is baked into
+# tone.from_working (gated on grade_tone_contrast), changing the baked cube
+# (not the CDL itself) whenever the flag is on.
+INPUT_HASH_SCHEMA_VERSION = 8
 
 # Same local-disk, content-addressed cube cache the preview cube endpoint and
 # the render compositor already use (grade/cache.py's documented "not shared
@@ -239,6 +242,8 @@ def compute_input_hash(document: Dict[str, Any]) -> str:
             "grade_scene_join": settings.grade_scene_join,
             "grade_subject_exposure": settings.grade_subject_exposure,
             "grade_skin_vibrance": settings.grade_skin_vibrance,
+            "grade_tone_contrast": settings.grade_tone_contrast,
+            "grade_tone_contrast_strength": settings.grade_tone_contrast_strength,
         },
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
@@ -643,6 +648,10 @@ def run_grade_job(thread_id: str) -> None:
                 balance_delta=balance_deltas.get(s.key),
                 match_delta=match_deltas.get(s.key), leveling_delta=leveling_deltas.get(s.key),
                 pipeline="v1", skin_vibrance=settings.grade_skin_vibrance,
+                tone_contrast=(
+                    settings.grade_tone_contrast_strength
+                    if settings.grade_tone_contrast and settings.grade_pipeline == "v1" else 0.0
+                ),
             )
             gh = grade_json.get("grade_hash")
             if gh not in cube_cache:

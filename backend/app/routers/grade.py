@@ -107,6 +107,7 @@ def get_grade_cube(
     working_space: str = Query("rec709"),
     creative_lut_ref: Optional[str] = Query(None),
     size: int = Query(DEFAULT_LUT_SIZE, ge=2, le=65),
+    tone_contrast: float = Query(0.0, description="color_tone_contrast.plan.md filmic S-curve strength"),
     _user_id: str = Depends(get_current_user_id),
 ) -> Response:
     try:
@@ -117,11 +118,13 @@ def get_grade_cube(
     grade_obj = Grade.from_dict(cdl_dict)
     h = grade_hash(
         grade_obj, creative_lut_ref=creative_lut_ref, working_space=working_space, lut_size=size,
+        tone_contrast=tone_contrast,
     )
     descriptor = {
         "cdl": grade_obj.to_dict(),
         "creative_lut_ref": creative_lut_ref,
         "working_space": working_space,
+        "tone_contrast": tone_contrast,
         "grade_hash": h,
     }
     path = ensure_cube_file(

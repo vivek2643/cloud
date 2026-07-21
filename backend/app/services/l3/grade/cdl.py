@@ -147,11 +147,14 @@ def grade_hash(
     soft_local: Optional[Dict[str, Any]] = None,
     lut_size: int = 33,
     schema_version: int = 1,
+    tone_contrast: float = 0.0,
 ) -> str:
     """Stable content hash for a fully-resolved grade -- the cache key every
     baked .cube is stored/served under (color_grading.plan.md SS4/SS11:
     "cache by grade_hash(clip)"). Anything that can change the baked cube's
-    bytes MUST be part of this payload."""
+    bytes MUST be part of this payload -- `tone_contrast`
+    (color_tone_contrast.plan.md) included, since it changes `from_working`'s
+    output during the bake."""
     payload = {
         "v": schema_version,
         "cdl": grade.to_dict(),
@@ -159,6 +162,7 @@ def grade_hash(
         "working_space": working_space,
         "soft_local": soft_local or {},
         "lut_size": lut_size,
+        "tone_contrast": tone_contrast,
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]

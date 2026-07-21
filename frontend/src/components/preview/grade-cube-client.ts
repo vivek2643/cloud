@@ -41,6 +41,10 @@ export function gradeCubeUrl(grade: ResolvedGrade): string {
     working_space: grade.working_space,
   });
   if (grade.creative_lut_ref) params.set("creative_lut_ref", grade.creative_lut_ref);
+  // color_tone_contrast.plan.md: must be in the URL (and therefore the
+  // in-memory cache key above) or the preview cube would silently omit the
+  // curve the export bake includes -- see backend/app/routers/grade.py.
+  if (grade.tone_contrast) params.set("tone_contrast", String(grade.tone_contrast));
   return `${API_URL}/api/grade/cube?${params.toString()}`;
 }
 

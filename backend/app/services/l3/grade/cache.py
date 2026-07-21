@@ -54,8 +54,9 @@ def ensure_cube_file(
             creative_grid = parse_cube_text(text)
 
     working_space = str(grade.get("working_space") or "rec709")
+    tone_contrast = float(grade.get("tone_contrast") or 0.0)
     cube_text = bake_cube_text(cdl, size=lut_size, creative_lut_grid=creative_grid, title=h,
-                               working_space=working_space)
+                               working_space=working_space, tone_contrast=tone_contrast)
     tmp_path = f"{path}.tmp{os.getpid()}"
     with open(tmp_path, "w") as f:
         f.write(cube_text)

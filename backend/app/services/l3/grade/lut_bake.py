@@ -94,6 +94,7 @@ def bake_cube_text(
     creative_lut_grid: Optional[Tuple] = None,
     title: str = "edso_grade",
     working_space: str = "rec709",
+    tone_contrast: float = 0.0,
 ) -> str:
     """Bake `grade`'s CDL (and, if given, compose a parsed creative LUT on
     top) into `.cube` text. `creative_lut_grid` is the `(grid, size)` tuple
@@ -105,13 +106,17 @@ def bake_cube_text(
     to exactly `apply_cdl(grid, grade)` -- byte-identical to before this
     step existed. Under `v1`, the CDL runs INSIDE the working-space wrapper
     (linearize -> CDL -> filmic shoulder -> re-encode), which is what turns
-    a flat slope/offset filter into something that reads as graded."""
+    a flat slope/offset filter into something that reads as graded.
+
+    `tone_contrast` (color_tone_contrast.plan.md): the filmic S-curve
+    strength passed straight through to `from_working`'s `contrast` kwarg --
+    `0.0` (default) is exact identity, matching today's bytes."""
     import numpy as np
 
     grid = _identity_grid(size)                       # (size,size,size,3) [b,g,r] index order
     working = to_working(grid, working_space)
     graded = apply_cdl(working, grade)                 # CDL (SS3 stack: Correct/Match/Arc live in cdl)
-    out = from_working(graded, working_space)
+    out = from_working(graded, working_space, contrast=tone_contrast)
 
     if creative_lut_grid is not None:
         lut_grid, _lut_size = creative_lut_grid

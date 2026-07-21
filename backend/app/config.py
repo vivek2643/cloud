@@ -183,6 +183,12 @@ class Settings(BaseSettings):
     # today's WB (gray-world/white-patch) and sat=1.0 exactly.
     grade_skin_vibrance: bool = False
 
+    # color_tone_contrast.plan.md: adds a filmic contrast S-curve to the v1 tone
+    # map (tone.from_working), baked into the cube so preview == export. Off =
+    # today's shoulder-only tone map (byte-identical). v1-only.
+    grade_tone_contrast: bool = False
+    grade_tone_contrast_strength: float = 0.9   # g = 1 + strength; tune per contact sheet
+
     # migration_runner.plan.md: the startup guard's sanctioned local-dev
     # bypass. "on" (default) means every process refuses to boot on schema
     # drift; "off" disables that check for THIS process only, loudly (a

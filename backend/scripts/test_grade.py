@@ -25,7 +25,7 @@ if BACKEND not in sys.path:
 from app.services.l3 import layers  # noqa: E402
 from app.services.l3.grade import job as grade_job  # noqa: E402
 from app.services.l3.grade import tone  # noqa: E402
-from app.services.l3.grade.cdl import Grade, apply_cdl, identity_grade_json  # noqa: E402
+from app.services.l3.grade.cdl import Grade, apply_cdl, grade_hash, identity_grade_json  # noqa: E402
 from app.services.l3.grade.colorspace import lab_to_srgb, srgb_to_lab  # noqa: E402
 from app.services.l3.grade.correct import (  # noqa: E402
     SAT_BOOST_MAX, SKIN_LOCUS_DEG, TARGET_CHROMA, WB_MULTIPLIER_CLAMP,
@@ -41,6 +41,7 @@ from app.services.l3.grade.reference import GroupReference, compute_group_refere
 from app.services.l3.grade.resolver import resolve_clip_grade  # noqa: E402
 from app.services.l3.grade.scene_group import ShotSceneMeta, group_shots_semantically  # noqa: E402
 from app.services.l3.grade.scene_meta import ShotCutMeta, lookup_shot_cut_meta  # noqa: E402
+from app.services.render.compositor import _grade_key  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -1073,6 +1074,7 @@ def test_run_grade_job_shot_match_v2_off_reproduces_pre_redesign_path():
     fake_settings = mock.Mock(
         grade_pipeline="v1", grade_even_lighting=False, grade_semantic=False, grade_shot_match_v2=False,
         grade_skin_vibrance=False,
+        grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1207,6 +1209,7 @@ def test_run_grade_job_groups_multi_file_reel_via_scene_join():
         grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
         grade_shot_match_v2=True, grade_scene_join=True, grade_subject_exposure=False,
         grade_skin_vibrance=False,
+        grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1248,6 +1251,7 @@ def test_run_grade_job_scene_join_does_not_over_group_unrelated_shots():
         grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
         grade_shot_match_v2=True, grade_scene_join=True, grade_subject_exposure=False,
         grade_skin_vibrance=False,
+        grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1290,6 +1294,7 @@ def test_run_grade_job_scene_join_fail_open_on_db_error():
         grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
         grade_shot_match_v2=True, grade_scene_join=True, grade_subject_exposure=False,
         grade_skin_vibrance=False,
+        grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1333,6 +1338,7 @@ def test_run_grade_job_scene_join_off_keeps_pre_plan_behavior():
         grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
         grade_shot_match_v2=True, grade_scene_join=False, grade_subject_exposure=False,
         grade_skin_vibrance=False,
+        grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
     )
     join_spy = mock.Mock(side_effect=AssertionError("join must not be called when grade_scene_join=False"))
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
@@ -1508,6 +1514,7 @@ def test_run_grade_job_hero_ts_ms_fallback_only_when_box_resolves():
         grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
         grade_shot_match_v2=False, grade_scene_join=False, grade_subject_exposure=True,
         grade_skin_vibrance=False,
+        grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1556,6 +1563,7 @@ def test_run_grade_job_subject_exposure_converges_grouped_subjects():
             grade_pipeline="v1", grade_even_lighting=True, grade_semantic=True,
             grade_shot_match_v2=True, grade_scene_join=True,
             grade_skin_vibrance=False,
+            grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
             grade_subject_exposure=subject_exposure_on,
         )
         with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
@@ -1607,6 +1615,7 @@ def test_run_grade_job_subject_exposure_gated_on_grade_semantic_too():
         grade_pipeline="v1", grade_even_lighting=False, grade_semantic=False,
         grade_shot_match_v2=False, grade_scene_join=False, grade_subject_exposure=True,
         grade_skin_vibrance=False,
+        grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1669,6 +1678,7 @@ def test_run_grade_job_applies_leveling_and_semantic_grouping_when_flagged():
         grade_pipeline="v1", grade_even_lighting=True, grade_semantic=True,
         grade_shot_match_v2=True, grade_scene_join=True, grade_subject_exposure=False,
         grade_skin_vibrance=False,
+        grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
     )
     joined_meta = {
         "s0": ShotCutMeta(speaker_person="P1", on_camera=True),
@@ -1854,6 +1864,140 @@ def test_measure_subject_lab_none_for_degenerate_box():
     print("ok  measure_span: subject_lab is None for a degenerate/out-of-frame box")
 
 
+# --------------------------------------------------------------------------
+# color_tone_contrast.plan.md: filmic contrast S-curve in tone.from_working
+# --------------------------------------------------------------------------
+
+def test_tone_contrast_zero_is_exact_identity():
+    import numpy as np
+    x = np.array([0.0, 0.18, 0.5, 0.8, 1.0], dtype=np.float32)
+    default_call = tone.from_working(x, tone.WORKING_SPACE_V1)
+    explicit_zero = tone.from_working(x, tone.WORKING_SPACE_V1, contrast=0.0)
+    assert np.array_equal(default_call, explicit_zero)
+    print("ok  tone: contrast=0.0 is bit-for-bit identical to the pre-plan from_working")
+
+
+def test_tone_contrast_endpoints_pinned():
+    """`_contrast_pivot` itself (a pure function over DISPLAY 0..1) is exactly
+    endpoint-pinned: f(0)=0, f(1)=1 regardless of strength. `from_working`'s
+    COMPOSED output is separately checked for never exceeding [0,1] --
+    it can't reach display=1.0 for any finite linear input even with
+    contrast=0 (the pre-existing shoulder is only asymptotic), so pinning is
+    a property of the curve, not of the full round-trip."""
+    import numpy as np
+    x = np.array([0.0, 1.0], dtype=np.float32)
+    for g in (1.3, 1.9, 2.5):
+        out = tone._contrast_pivot(x, g)
+        assert abs(float(out[0])) < 1e-6, (g, out)
+        assert abs(float(out[1]) - 1.0) < 1e-6, (g, out)
+    for c in (0.3, 0.9, 1.5):
+        vals = tone.from_working(
+            np.array([0.0, 0.5, 0.8, 1.0, 3.0, 50.0], dtype=np.float32), tone.WORKING_SPACE_V1, contrast=c,
+        )
+        assert float(vals.min()) >= -1e-6 and float(vals.max()) <= 1.0 + 1e-6, (c, vals)
+    print("ok  tone: contrast curve is exactly endpoint-pinned; from_working never clips past [0,1]")
+
+
+def test_tone_contrast_monotonic():
+    import numpy as np
+    sweep = np.linspace(0, 1, 500).astype(np.float32)
+    for c in (0.3, 0.9, 1.5):
+        out = tone.from_working(sweep, tone.WORKING_SPACE_V1, contrast=c)
+        assert bool(np.all(np.diff(out) >= -1e-6)), c
+    print("ok  tone: contrast curve is monotonic non-decreasing at every strength")
+
+
+def test_tone_contrast_increases_midtone_slope():
+    """A real S-shape: pick LINEAR (working-space) inputs whose contrast=0
+    DISPLAY output lands clearly below/above TONE_PIVOT (the shoulder+OETF
+    between from_working's linear input and its display output means a
+    linear value equal to TONE_PIVOT does NOT itself land on the pivot --
+    verified via the off/off fixture-sanity asserts below), then verify
+    contrast=0.9 pushes the below-pivot point further DOWN and the
+    above-pivot point further UP. The pivot-fixed invariant itself is
+    checked directly on `_contrast_pivot` (a pure display-space function),
+    not through this round-trip."""
+    import numpy as np
+    x = np.array([0.05, 0.5], dtype=np.float32)
+    off = tone.from_working(x, tone.WORKING_SPACE_V1, contrast=0.0)
+    on = tone.from_working(x, tone.WORKING_SPACE_V1, contrast=0.9)
+    assert off[0] < tone.TONE_PIVOT < off[1], off   # fixture sanity
+    assert on[0] < off[0], (on[0], off[0])     # below pivot moves down
+    assert on[1] > off[1], (on[1], off[1])     # above pivot moves up
+    for g in (1.3, 1.9, 2.5):
+        at_pivot = tone._contrast_pivot(np.array([tone.TONE_PIVOT], dtype=np.float32), g)
+        assert abs(float(at_pivot[0]) - tone.TONE_PIVOT) < 1e-5, (g, at_pivot)   # pivot itself is fixed
+    print("ok  tone: contrast increases midtone slope (below moves down, above moves up, pivot fixed)")
+
+
+def test_tone_contrast_legacy_and_nonv1_identity():
+    import numpy as np
+    x = np.array([0.0, 0.18, 0.5, 0.8, 1.0], dtype=np.float32)
+    for ws in ("rec709_legacy", "rec709"):
+        out = tone.from_working(x, ws, contrast=0.9)
+        assert np.array_equal(out, x), (ws, out)
+    print("ok  tone: contrast is inert for legacy/non-v1 working_space, regardless of strength")
+
+
+def test_bake_parity_with_contrast():
+    """Step 1.1's parity acceptance test, extended: direct-compute must still
+    match the trilinearly-sampled baked cube WITH the contrast curve on."""
+    import numpy as np
+    from app.services.l3.grade.lut_bake import _sample_lut_trilinear, parse_cube_text
+
+    grade = Grade(slope=(1.15, 1.05, 0.9), offset=(0.02, 0.0, -0.01))
+    size = 33
+    cube_text = bake_cube_text(grade, size=size, working_space=tone.WORKING_SPACE_V1, tone_contrast=0.9)
+    grid, parsed_size = parse_cube_text(cube_text)
+    assert parsed_size == size
+
+    probes = np.array([
+        [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [0.5, 0.5, 0.5],
+        [0.18, 0.18, 0.18], [0.9, 0.4, 0.2], [0.05, 0.6, 0.95],
+    ], dtype=np.float32)
+    direct = tone.from_working(apply_cdl(tone.to_working(probes, tone.WORKING_SPACE_V1), grade),
+                               tone.WORKING_SPACE_V1, contrast=0.9)
+    sampled = _sample_lut_trilinear(grid, probes)
+    max_err = float(np.max(np.abs(direct - sampled)))
+    assert max_err < 0.02, f"direct-vs-baked-cube parity (with contrast) exceeded tolerance: {max_err}"
+    print(f"ok  lut_bake: v1 direct-vs-baked-cube parity holds WITH the contrast curve (max err {max_err:.4f})")
+
+
+def test_resolver_flag_off_byte_identical():
+    cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
+    default_call = resolve_clip_grade({}, color_stats=cs, pipeline="v1")
+    explicit_zero = resolve_clip_grade({}, color_stats=cs, pipeline="v1", tone_contrast=0.0)
+    assert default_call == explicit_zero
+    assert default_call["grade_hash"] == explicit_zero["grade_hash"]
+    print("ok  resolver: tone_contrast=0.0 (default) is byte-identical, same grade_hash")
+
+
+def test_grade_hash_changes_with_tone_contrast():
+    g = Grade(slope=(1.1, 1.0, 0.95))
+    h0 = grade_hash(g, working_space=tone.WORKING_SPACE_V1, tone_contrast=0.0)
+    h1 = grade_hash(g, working_space=tone.WORKING_SPACE_V1, tone_contrast=0.9)
+    assert h0 != h1, "grade_hash must change when tone_contrast changes, or the cube never rebakes"
+    print("ok  cdl: grade_hash changes with tone_contrast (cube correctly rebakes)")
+
+
+def test_compositor_grade_key_distinguishes_tone_contrast_from_identity():
+    """Regression for a real gap found while implementing this plan:
+    render/compositor.py's segment-cache identity-collapse only checked the
+    CDL, not tone_contrast -- an identity-CDL shot with the contrast curve on
+    would collapse to the SAME '' cache token as a truly-identity shot
+    rendered before the flag existed, silently reusing a stale segment clip
+    that never got the curve. tone_contrast>0 must break the collapse."""
+    identity_cdl = Grade().to_dict()
+    no_contrast = {"cdl": identity_cdl, "working_space": tone.WORKING_SPACE_V1,
+                   "tone_contrast": 0.0, "grade_hash": "aaa"}
+    with_contrast = {"cdl": identity_cdl, "working_space": tone.WORKING_SPACE_V1,
+                      "tone_contrast": 0.9, "grade_hash": "bbb"}
+    assert _grade_key(no_contrast) == ""
+    assert _grade_key(with_contrast) != ""
+    assert _grade_key(with_contrast) != _grade_key(no_contrast)
+    print("ok  compositor: _grade_key does not collapse an identity-CDL + tone_contrast>0 grade to ''")
+
+
 def main():
     test_tone_legacy_is_exact_identity()
     test_tone_v1_black_stays_black()
@@ -1948,6 +2092,15 @@ def main():
     test_white_reference_still_wins_over_skin()
     test_measure_subject_lab_reads_the_box_not_the_whole_frame()
     test_measure_subject_lab_none_for_degenerate_box()
+    test_tone_contrast_zero_is_exact_identity()
+    test_tone_contrast_endpoints_pinned()
+    test_tone_contrast_monotonic()
+    test_tone_contrast_increases_midtone_slope()
+    test_tone_contrast_legacy_and_nonv1_identity()
+    test_bake_parity_with_contrast()
+    test_resolver_flag_off_byte_identical()
+    test_grade_hash_changes_with_tone_contrast()
+    test_compositor_grade_key_distinguishes_tone_contrast_from_identity()
     print("\nall grade tests passed")
 
 

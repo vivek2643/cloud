@@ -207,6 +207,7 @@ def resolve_clip_grade(
     leveling_delta: Optional[Grade] = None,
     pipeline: str = "legacy",
     skin_vibrance: bool = False,
+    tone_contrast: float = 0.0,
 ) -> Dict[str, Any]:
     """Resolve ONE clip's (spine segment or op) final grade descriptor.
 
@@ -240,6 +241,10 @@ def resolve_clip_grade(
     through to `solve_correct_grade` -- gates the skin-anchored WB tint vote
     and the chroma-based saturation floor. Off (default) -> Correct layer
     unchanged.
+    `tone_contrast` (color_tone_contrast.plan.md, v1-only): a filmic S-curve
+    strength baked into `from_working` at bake time -- carried through the
+    descriptor and the `grade_hash` payload (NOT applied to the CDL itself)
+    so the cube rebakes when it changes. `0.0` (default) -> byte-identical.
     """
     stack = solve_correct_grade(
         color_stats, already_graded=already_graded, pipeline=pipeline,
@@ -295,11 +300,13 @@ def resolve_clip_grade(
         creative_lut_ref=creative_lut_ref,
         working_space=working_space,
         soft_local=soft_local,
+        tone_contrast=tone_contrast,
     )
     return {
         "cdl": resolved.to_dict(),
         "creative_lut_ref": creative_lut_ref,
         "working_space": working_space,
         "soft_local": soft_local,
+        "tone_contrast": tone_contrast,
         "grade_hash": h,
     }
