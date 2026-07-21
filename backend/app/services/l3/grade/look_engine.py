@@ -58,6 +58,13 @@ class LookSpec:
     hue_sat: Tuple[Tuple[float, float, float], ...] = ()
     # Global saturation multiplier (1.0 = unchanged), applied last.
     sat: float = 1.0
+    # halation_grain.plan.md: spatial finishing (SS9 follow-up) -- NOT baked
+    # into the grid (build_look_grid ignores these two fields entirely; a
+    # 3D color LUT has no notion of neighboring pixels or randomness, see
+    # that module's docstring). Routed into the soft_local spatial
+    # descriptor by resolve_clip_grade instead, alongside the vignette.
+    halation: float = 0.0   # 0 = off; ~0.15-0.4 tasteful. Glow strength.
+    grain: float = 0.0      # 0 = off; ~0.02-0.08 tasteful. Noise amplitude.
 
     def to_dict(self) -> Dict[str, Any]:
         """Canonical (lists, not tuples; every field present) so the same
@@ -71,6 +78,8 @@ class LookSpec:
             "hue_rotate": [list(b) for b in self.hue_rotate],
             "hue_sat": [list(b) for b in self.hue_sat],
             "sat": self.sat,
+            "halation": self.halation,
+            "grain": self.grain,
         }
 
     @staticmethod
@@ -110,6 +119,8 @@ class LookSpec:
             hue_rotate=_bands(d.get("hue_rotate")),
             hue_sat=_bands(d.get("hue_sat")),
             sat=float(d.get("sat") if d.get("sat") is not None else 1.0),
+            halation=float(d.get("halation") or 0.0),
+            grain=float(d.get("grain") or 0.0),
         )
 
     def is_identity(self, eps: float = 1e-9) -> bool:
@@ -121,6 +132,8 @@ class LookSpec:
             and not self.hue_rotate
             and not self.hue_sat
             and abs(self.sat - 1.0) < eps
+            and abs(self.halation) < eps
+            and abs(self.grain) < eps
         )
 
 
@@ -256,7 +269,14 @@ def build_look_grid(spec: LookSpec, size: int = 33):
     straight into `bake_cube_text(creative_lut_grid=...)`. Pure/deterministic:
     the whole look is a function of `spec` alone. Fixed op order (split-tone
     -> hue-rotate -> hue-sat -> global-sat -> contrast) -- documented, not
-    incidental; the validation looks and contact-sheet tuning assume it."""
+    incidental; the validation looks and contact-sheet tuning assume it.
+
+    Deliberately does NOT read `spec.halation`/`spec.grain`
+    (halation_grain.plan.md) -- those are spatial/stochastic (neighbor +
+    randomness), which a pointwise 3D LUT grid cannot express by
+    construction (see `lut_bake.py`'s module docstring). `resolve_clip_grade`
+    routes them into the `soft_local` descriptor instead, alongside the
+    vignette."""
     import numpy as np
 
     from app.services.l3.grade.lut_bake import _identity_grid
@@ -314,6 +334,21 @@ LOOKS: List[EngineLook] = [
             highlight_tint=(0.04, 0.02, -0.03),
             hue_sat=((30.0, 40.0, 1.25), (150.0, 50.0, 0.8)),
             sat=1.08,
+        ),
+    ),
+    EngineLook(
+        "engine_film", "Engine Film",
+        "engine_punchy's color response plus halation glow + film grain "
+        "(halation_grain.plan.md) -- proves the spatial finishing pass "
+        "end to end, not a finished film-look library entry.",
+        LookSpec(
+            contrast=0.15,
+            shadow_tint=(-0.03, 0.01, 0.04),
+            highlight_tint=(0.04, 0.02, -0.03),
+            hue_sat=((30.0, 40.0, 1.25), (150.0, 50.0, 0.8)),
+            sat=1.08,
+            halation=0.25,
+            grain=0.04,
         ),
     ),
 ]

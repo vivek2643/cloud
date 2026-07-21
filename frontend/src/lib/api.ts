@@ -596,8 +596,22 @@ export interface VignetteDescriptor {
   strength: number;
 }
 
+/** halation_grain.plan.md: look-scoped spatial film texture, same
+ * approximate-parity trade as the vignette (ffmpeg `noise`/`gblur` on
+ * export vs an independent WebGL implementation in preview -- reads as
+ * the same effect at the same strength, not pixel-identical). */
+export interface HalationDescriptor {
+  strength: number;
+}
+
+export interface GrainDescriptor {
+  strength: number;
+}
+
 export interface SoftLocalDescriptor {
   vignette?: VignetteDescriptor | null;
+  halation?: HalationDescriptor | null;
+  grain?: GrainDescriptor | null;
 }
 
 export interface ResolvedGrade {

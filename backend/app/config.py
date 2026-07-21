@@ -194,6 +194,12 @@ class Settings(BaseSettings):
     # (byte-identical; existing preset/reference/lut/no-look paths never change).
     grade_look_engine: bool = False
 
+    # halation_grain.plan.md: look-scoped spatial film texture (halation
+    # glow + film grain), applied as a soft_local pass on both sides (approximate
+    # parity, like the vignette). Off = no halation/grain keys in soft_local
+    # (byte-identical). Rides engine looks; requires grade_look_engine too.
+    grade_film_texture: bool = False
+
     # migration_runner.plan.md: the startup guard's sanctioned local-dev
     # bypass. "on" (default) means every process refuses to boot on schema
     # drift; "off" disables that check for THIS process only, loudly (a

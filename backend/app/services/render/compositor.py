@@ -34,7 +34,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from app.services.l3.captions.ass_export import captions_to_ass
 from app.services.l3.grade.cache import ensure_cube_file
 from app.services.l3.grade.cdl import is_identity, Grade
-from app.services.l3.grade.softlocal import vignette_ffmpeg_filter
+from app.services.l3.grade.softlocal import grain_ffmpeg_filter, halation_ffmpeg_subgraph, vignette_ffmpeg_filter
 from app.services.processing import _download_from_r2, _upload_to_r2
 from app.services.r2 import generate_presigned_get
 
@@ -222,11 +222,15 @@ def _render_spine_concat(
         if not (os.path.exists(cache_path) and os.path.getsize(cache_path) > 0):
             src = _source_path(entry, cfg, tmp, src_cache)
             cube_path = ensure_cube_file(grade, cube_dir)
-            vignette_filter = vignette_ffmpeg_filter((grade.get("soft_local") or {}).get("vignette"))
+            soft_local = grade.get("soft_local") or {}
+            vignette_filter = vignette_ffmpeg_filter(soft_local.get("vignette"))
+            halation_filter = halation_ffmpeg_subgraph(soft_local.get("halation"), frame_height=cfg["height"])
+            grain_filter = grain_ffmpeg_filter(soft_local.get("grain"))
             report(_pct(i, n, 8, 78), f"cut {i + 1}/{n}")
             _produce_segment(src=src, dst=cache_path, in_ms=in_ms, out_ms=out_ms,
                              cfg=cfg, transform=transform, cube_path=cube_path,
-                             vignette_filter=vignette_filter)
+                             vignette_filter=vignette_filter,
+                             halation_filter=halation_filter, grain_filter=grain_filter)
         else:
             report(_pct(i, n, 8, 78), f"cut {i + 1}/{n} (cache)")
         segments.append(cache_path)
@@ -443,14 +447,16 @@ def _transform_vf(
     transform: Optional[Dict[str, Any]] = None,
     cube_path: Optional[str] = None,
     vignette_filter: Optional[str] = None,
+    halation_filter: Optional[str] = None,
+    grain_filter: Optional[str] = None,
 ) -> str:
     """Filter chain that frames a source onto the canvas for ONE video layer,
     in the canonical order rotate -> fit -> zoom-crop -> grade -> soft-local.
     An empty/None transform is the identity (contain, no rotate, no zoom) --
     byte-identical to the old normalize so untouched edits keep their warm
     segment cache; likewise `cube_path=None` (no grade) emits no color
-    filter and `vignette_filter=None` (no soft-local, SS9) emits no spatial
-    filter at all.
+    filter and `vignette_filter`/`halation_filter`/`grain_filter=None` (no
+    soft-local, SS9) emits no spatial filter at all.
 
     The LUT is applied in 8-bit RGB (`format=gbrp`), matching the WebGL
     preview shader's own 8-bit texture sampling (browsers hand back 8-bit
@@ -461,7 +467,13 @@ def _transform_vf(
     `vignette_filter` (from `grade.softlocal.vignette_ffmpeg_filter`) is
     applied AFTER the LUT (a vignette is a final polish over the graded
     picture) and is an approximate-parity effect by design -- see
-    `softlocal.py`'s module docstring."""
+    `softlocal.py`'s module docstring. `halation_filter`/`grain_filter`
+    (halation_grain.plan.md, `grade.softlocal.halation_ffmpeg_subgraph`/
+    `grain_ffmpeg_filter`) apply AFTER the vignette, in that order -- halation
+    is a glow over the graded+vignetted picture, grain is the final texture
+    on top of everything (real film grain is in the emulsion, i.e. last).
+    Both pre-built (like `vignette_filter`) by the caller, which knows the
+    frame height `halation_ffmpeg_subgraph` needs to scale its blur radius."""
     W, H, FPS = cfg["width"], cfg["height"], cfg["fps"]
     t = transform or {}
     rotate = int(t.get("rotate") or 0)
@@ -498,6 +510,10 @@ def _transform_vf(
         parts.append("format=yuv420p")
     if vignette_filter:
         parts.append(vignette_filter)
+    if halation_filter:
+        parts.append(halation_filter)
+    if grain_filter:
+        parts.append(grain_filter)
     parts.append("setsar=1")
     parts.append(f"fps={FPS}")
     return ",".join(parts)
@@ -526,6 +542,8 @@ def _produce_segment(
     transform: Optional[Dict[str, Any]] = None,
     cube_path: Optional[str] = None,
     vignette_filter: Optional[str] = None,
+    halation_filter: Optional[str] = None,
+    grain_filter: Optional[str] = None,
 ) -> None:
     in_s = max(in_ms / 1000.0, 0.0)
     dur_s = max((out_ms - in_ms) / 1000.0, 0.05)
@@ -533,7 +551,8 @@ def _produce_segment(
     cmd = [
         "ffmpeg", "-y",
         "-ss", f"{in_s:.3f}", "-i", src, "-t", f"{dur_s:.3f}",
-        "-vf", _transform_vf(cfg, transform, cube_path=cube_path, vignette_filter=vignette_filter),
+        "-vf", _transform_vf(cfg, transform, cube_path=cube_path, vignette_filter=vignette_filter,
+                             halation_filter=halation_filter, grain_filter=grain_filter),
         "-c:v", cfg["video_codec"], "-preset", cfg["video_preset"], "-crf", str(cfg["video_crf"]),
         "-pix_fmt", "yuv420p",
         "-c:a", cfg["audio_codec"], "-b:a", cfg["audio_bitrate"], "-ar", "48000", "-ac", "2",
@@ -612,10 +631,17 @@ def _render_layers(
         ov_xy = f"x={cell[0]}:y={cell[1]}:" if cell else ""
         v_grade = v.get("grade") or {}
         cube_path = ensure_cube_file(v_grade, cube_dir)
-        vignette_filter = vignette_ffmpeg_filter((v_grade.get("soft_local") or {}).get("vignette"))
+        v_soft_local = v_grade.get("soft_local") or {}
+        vignette_filter = vignette_ffmpeg_filter(v_soft_local.get("vignette"))
+        halation_filter = halation_ffmpeg_subgraph(v_soft_local.get("halation"), frame_height=vf_cfg["height"])
+        grain_filter = grain_ffmpeg_filter(v_soft_local.get("grain"))
+        layer_vf = _transform_vf(
+            vf_cfg, v.get("transform"), cube_path=cube_path, vignette_filter=vignette_filter,
+            halation_filter=halation_filter, grain_filter=grain_filter,
+        )
         chain = (
             f"[{idx}:v]trim=start={in_s:.3f}:end={out_s:.3f},setpts=PTS-STARTPTS,"
-            f"{_transform_vf(vf_cfg, v.get('transform'), cube_path=cube_path, vignette_filter=vignette_filter)},format=yuva420p"
+            f"{layer_vf},format=yuva420p"
         )
         if opacity < 0.999:
             chain += f",colorchannelmixer=aa={max(0.0, min(1.0, opacity)):.3f}"

@@ -236,6 +236,18 @@ function isIdentityGrade(grade: ResolvedGrade | undefined): boolean {
   if (!grade) return true;
   if (grade.creative_lut_ref) return false;
   if (grade.soft_local?.vignette && grade.soft_local.vignette.strength > 0) return false;
+  // color_tone_contrast.plan.md / color_response_engine.plan.md /
+  // halation_grain.plan.md: none of these bake into the CDL -- they change
+  // the baked cube (tone_contrast, look_engine) or the spatial pass
+  // (halation/grain), independent of whether slope/offset/power/sat happen
+  // to be identity. Without this check, a shot with an identity CDL but a
+  // non-zero one of these would wrongly skip the WebGL overlay and preview
+  // the raw ungraded video while export renders correctly -- a real
+  // preview/export parity break, not just a missed optimization.
+  if (grade.tone_contrast && grade.tone_contrast > 0) return false;
+  if (grade.look_engine && Object.keys(grade.look_engine).length > 0) return false;
+  if (grade.soft_local?.halation && grade.soft_local.halation.strength > 0) return false;
+  if (grade.soft_local?.grain && grade.soft_local.grain.strength > 0) return false;
   // cdl is typed non-optional but can be absent at runtime (partial/server-baked
   // grades carrying only soft_local or a LUT) -- a missing CDL is identity here.
   const cdl = grade.cdl as typeof grade.cdl | undefined;
@@ -422,7 +434,7 @@ export function useProgramPlayer(
     renderer.canvas.style.zIndex = String(clip.z);
     renderer.draw(
       slot.el, framing.fit, { cx: framing.focusCx, cy: framing.focusCy },
-      clip.grade?.soft_local?.vignette
+      clip.grade?.soft_local
     );
     renderer.canvas.style.opacity = "1";
     return true;

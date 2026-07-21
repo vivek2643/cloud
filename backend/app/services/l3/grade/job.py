@@ -84,7 +84,11 @@ logger = logging.getLogger(__name__)
 # mode -- a LookSpec baked into the creative LUT grid (gated on
 # grade_look_engine) -- changing the baked cube whenever a document's
 # document["look"] selects it and the flag is on.
-INPUT_HASH_SCHEMA_VERSION = 9
+# v10 (halation_grain.plan.md): an active engine look's halation/grain
+# params now route into soft_local (gated on grade_film_texture, requires
+# grade_look_engine too), changing the render -vf chain / preview pass
+# whenever both flags are on and the look carries texture.
+INPUT_HASH_SCHEMA_VERSION = 10
 
 # Same local-disk, content-addressed cube cache the preview cube endpoint and
 # the render compositor already use (grade/cache.py's documented "not shared
@@ -249,6 +253,7 @@ def compute_input_hash(document: Dict[str, Any]) -> str:
             "grade_tone_contrast": settings.grade_tone_contrast,
             "grade_tone_contrast_strength": settings.grade_tone_contrast_strength,
             "grade_look_engine": settings.grade_look_engine,
+            "grade_film_texture": settings.grade_film_texture,
         },
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
@@ -658,6 +663,7 @@ def run_grade_job(thread_id: str) -> None:
                     if settings.grade_tone_contrast and settings.grade_pipeline == "v1" else 0.0
                 ),
                 look_engine_enabled=settings.grade_look_engine,
+                film_texture_enabled=settings.grade_film_texture,
             )
             gh = grade_json.get("grade_hash")
             if gh not in cube_cache:

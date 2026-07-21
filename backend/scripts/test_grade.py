@@ -45,7 +45,8 @@ from app.services.l3.grade.reference import GroupReference, compute_group_refere
 from app.services.l3.grade.resolver import resolve_clip_grade  # noqa: E402
 from app.services.l3.grade.scene_group import ShotSceneMeta, group_shots_semantically  # noqa: E402
 from app.services.l3.grade.scene_meta import ShotCutMeta, lookup_shot_cut_meta  # noqa: E402
-from app.services.render.compositor import _grade_key  # noqa: E402
+from app.services.l3.grade.softlocal import grain_ffmpeg_filter, halation_ffmpeg_subgraph  # noqa: E402
+from app.services.render.compositor import _grade_key, _transform_vf  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -1080,6 +1081,7 @@ def test_run_grade_job_shot_match_v2_off_reproduces_pre_redesign_path():
         grade_skin_vibrance=False,
         grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
         grade_look_engine=False,
+        grade_film_texture=False,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1216,6 +1218,7 @@ def test_run_grade_job_groups_multi_file_reel_via_scene_join():
         grade_skin_vibrance=False,
         grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
         grade_look_engine=False,
+        grade_film_texture=False,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1259,6 +1262,7 @@ def test_run_grade_job_scene_join_does_not_over_group_unrelated_shots():
         grade_skin_vibrance=False,
         grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
         grade_look_engine=False,
+        grade_film_texture=False,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1303,6 +1307,7 @@ def test_run_grade_job_scene_join_fail_open_on_db_error():
         grade_skin_vibrance=False,
         grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
         grade_look_engine=False,
+        grade_film_texture=False,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1348,6 +1353,7 @@ def test_run_grade_job_scene_join_off_keeps_pre_plan_behavior():
         grade_skin_vibrance=False,
         grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
         grade_look_engine=False,
+        grade_film_texture=False,
     )
     join_spy = mock.Mock(side_effect=AssertionError("join must not be called when grade_scene_join=False"))
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
@@ -1525,6 +1531,7 @@ def test_run_grade_job_hero_ts_ms_fallback_only_when_box_resolves():
         grade_skin_vibrance=False,
         grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
         grade_look_engine=False,
+        grade_film_texture=False,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1575,6 +1582,7 @@ def test_run_grade_job_subject_exposure_converges_grouped_subjects():
             grade_skin_vibrance=False,
             grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
             grade_look_engine=False,
+            grade_film_texture=False,
             grade_subject_exposure=subject_exposure_on,
         )
         with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
@@ -1628,6 +1636,7 @@ def test_run_grade_job_subject_exposure_gated_on_grade_semantic_too():
         grade_skin_vibrance=False,
         grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
         grade_look_engine=False,
+        grade_film_texture=False,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1692,6 +1701,7 @@ def test_run_grade_job_applies_leveling_and_semantic_grouping_when_flagged():
         grade_skin_vibrance=False,
         grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
         grade_look_engine=False,
+        grade_film_texture=False,
     )
     joined_meta = {
         "s0": ShotCutMeta(speaker_person="P1", on_camera=True),
@@ -2210,6 +2220,141 @@ def test_resolve_look_spec_prefers_catalog_over_inline_params():
     print("ok  look_engine: resolve_look_spec prefers a valid catalog look_id, falls back to look_params, else None")
 
 
+# --------------------------------------------------------------------------
+# halation_grain.plan.md: look-scoped spatial film texture (halation + grain)
+# --------------------------------------------------------------------------
+
+def test_lookspec_texture_roundtrip():
+    spec = LookSpec(halation=0.4, grain=0.1)
+    d = spec.to_dict()
+    assert d["halation"] == 0.4 and d["grain"] == 0.1
+    back = LookSpec.from_dict(d)
+    assert back == spec
+    assert not spec.is_identity()
+    print("ok  look_engine: halation/grain round-trip to_dict/from_dict; a texture-only spec is not identity")
+
+
+def test_build_look_grid_ignores_texture():
+    import numpy as np
+
+    with_texture, _ = build_look_grid(LookSpec(halation=0.4, grain=0.1, sat=1.2), size=17)
+    without_texture, _ = build_look_grid(LookSpec(sat=1.2), size=17)
+    assert np.array_equal(with_texture, without_texture)
+    print("ok  look_engine: build_look_grid ignores halation/grain -- texture never bakes into the color grid")
+
+
+def test_resolver_film_texture_off_byte_identical():
+    cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
+    seq = {"mode": "engine", "look_id": "engine_film"}
+    off = resolve_clip_grade({}, color_stats=cs, sequence_look=seq, pipeline="v1",
+                             look_engine_enabled=True, film_texture_enabled=False)
+    baseline_engine_only = resolve_clip_grade({}, color_stats=cs, sequence_look=seq, pipeline="v1",
+                                              look_engine_enabled=True, film_texture_enabled=True)
+    no_look = resolve_clip_grade({}, color_stats=cs, pipeline="v1")
+    assert off.get("soft_local") is None
+    assert off["grade_hash"] != baseline_engine_only["grade_hash"]   # texture ON does change the hash
+    # flag off is otherwise identical to a plain no-look v1 resolve on the
+    # non-soft-local fields (the color engine itself is independently gated
+    # by look_engine_enabled, already covered by the response-engine plan's
+    # own tests -- this test's job is just "texture off touches nothing").
+    assert off["cdl"] == no_look["cdl"]
+    print("ok  resolver: film_texture_enabled=False never populates soft_local, regardless of the look")
+
+
+def test_resolver_film_texture_on_populates_soft_local():
+    cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
+    seq_film = {"mode": "engine", "look_id": "engine_film"}
+    on = resolve_clip_grade({}, color_stats=cs, sequence_look=seq_film, pipeline="v1",
+                            look_engine_enabled=True, film_texture_enabled=True)
+    off = resolve_clip_grade({}, color_stats=cs, sequence_look=seq_film, pipeline="v1",
+                             look_engine_enabled=True, film_texture_enabled=False)
+    assert on["soft_local"] == {"halation": {"strength": 0.25}, "grain": {"strength": 0.04}}
+    assert on["grade_hash"] != off["grade_hash"]
+
+    # a look with color but zero texture (engine_punchy) -> texture-on flag
+    # has nothing to route, soft_local stays None (triple-safe: flag, look,
+    # AND look's own params must all be non-zero).
+    seq_punchy = {"mode": "engine", "look_id": "engine_punchy"}
+    punchy_on = resolve_clip_grade({}, color_stats=cs, sequence_look=seq_punchy, pipeline="v1",
+                                   look_engine_enabled=True, film_texture_enabled=True)
+    assert punchy_on.get("soft_local") is None
+    print("ok  resolver: film_texture_enabled=True + a texture look populates soft_local.halation/.grain")
+
+
+def test_grain_ffmpeg_filter():
+    assert grain_ffmpeg_filter(None) is None
+    assert grain_ffmpeg_filter({"strength": 0.0}) is None
+    low = grain_ffmpeg_filter({"strength": 0.1})
+    high = grain_ffmpeg_filter({"strength": 0.8})
+    assert low is not None and high is not None
+    assert low.startswith("noise=alls=") and "allf=t+u" in low
+
+    def _alls(clause):
+        return int(clause.split("alls=")[1].split(":")[0])
+
+    assert _alls(high) > _alls(low)   # monotonic in strength
+    print("ok  softlocal: grain_ffmpeg_filter is None at zero, a noise=... clause otherwise, monotonic in strength")
+
+
+def test_halation_subgraph_shape():
+    assert halation_ffmpeg_subgraph(None) is None
+    assert halation_ffmpeg_subgraph({"strength": 0.0}) is None
+    frag = halation_ffmpeg_subgraph({"strength": 0.3}, frame_height=1080)
+    assert frag is not None
+    assert "split" in frag and "gblur" in frag and "blend=all_mode=screen" in frag
+    assert "[hbase]" in frag and "[hglow]" in frag
+    # frame-height scaling: a 4K frame blurs more (larger sigma) than a
+    # 240p one, both taken from a fixed reference constant.
+    small = halation_ffmpeg_subgraph({"strength": 0.3}, frame_height=240)
+    large = halation_ffmpeg_subgraph({"strength": 0.3}, frame_height=2160)
+
+    def _sigma(clause):
+        return float(clause.split("gblur=sigma=")[1].split("[")[0])
+
+    assert _sigma(large) > _sigma(small)
+    print("ok  softlocal: halation_ffmpeg_subgraph is None at zero, a split/gblur/screen-blend graph otherwise")
+
+
+def test_grade_hash_changes_with_texture():
+    h0 = grade_hash(Grade(), working_space=tone.WORKING_SPACE_V1, soft_local=None)
+    h1 = grade_hash(Grade(), working_space=tone.WORKING_SPACE_V1,
+                    soft_local={"halation": {"strength": 0.25}, "grain": {"strength": 0.04}})
+    assert h0 != h1, "grade_hash must change when soft_local texture changes, or nothing re-bakes/re-renders"
+    print("ok  cdl: grade_hash changes with soft_local halation/grain (re-bakes/re-renders)")
+
+
+def test_grade_key_not_collapsed_with_texture():
+    """Verifies the plan's own claim that _grade_key's existing identity
+    collapse ALREADY covers this (a non-empty soft_local is already
+    truthy) -- no compositor.py change was needed for this specific gap,
+    unlike tone_contrast/look_engine which each needed a dedicated fix."""
+    identity_cdl = Grade().to_dict()
+    no_texture = {"cdl": identity_cdl, "working_space": "rec709", "soft_local": None, "grade_hash": "aaa"}
+    with_texture = {"cdl": identity_cdl, "working_space": "rec709",
+                    "soft_local": {"halation": {"strength": 0.25}}, "grade_hash": "bbb"}
+    assert _grade_key(no_texture) == ""
+    assert _grade_key(with_texture) != ""
+    assert _grade_key(with_texture) != _grade_key(no_texture)
+    print("ok  compositor: _grade_key does not collapse an identity-CDL + soft_local.halation grade to ''")
+
+
+def test_transform_vf_texture_order_and_off_is_untouched():
+    """Order (both sides): LUT -> vignette -> halation -> grain. Flag/texture
+    off -> byte-identical -vf chain to before this plan (no dedicated flag
+    threads into _transform_vf itself; None args are the off state)."""
+    cfg = {"width": 640, "height": 360, "fps": 30}
+    off = _transform_vf(cfg, None, cube_path=None, vignette_filter=None)
+    assert "vignette" not in off and "split" not in off and "noise" not in off
+
+    vignette = "vignette=angle=0.5:x0=w*0.5:y0=h*0.5"
+    halation = halation_ffmpeg_subgraph({"strength": 0.3}, frame_height=360)
+    grain = grain_ffmpeg_filter({"strength": 0.1})
+    on = _transform_vf(cfg, None, cube_path=None, vignette_filter=vignette,
+                       halation_filter=halation, grain_filter=grain)
+    assert on.index(vignette) < on.index("split=2") < on.index("noise=")
+    print("ok  compositor: _transform_vf appends halation then grain after the vignette; off is untouched")
+
+
 def main():
     test_tone_legacy_is_exact_identity()
     test_tone_v1_black_stays_black()
@@ -2325,6 +2470,15 @@ def main():
     test_grade_hash_look_engine_in_payload()
     test_compositor_grade_key_distinguishes_look_engine_from_identity()
     test_resolve_look_spec_prefers_catalog_over_inline_params()
+    test_lookspec_texture_roundtrip()
+    test_build_look_grid_ignores_texture()
+    test_resolver_film_texture_off_byte_identical()
+    test_resolver_film_texture_on_populates_soft_local()
+    test_grain_ffmpeg_filter()
+    test_halation_subgraph_shape()
+    test_grade_hash_changes_with_texture()
+    test_grade_key_not_collapsed_with_texture()
+    test_transform_vf_texture_order_and_off_is_untouched()
     print("\nall grade tests passed")
 
 

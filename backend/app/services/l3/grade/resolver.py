@@ -56,7 +56,7 @@ from typing import Any, Dict, Optional
 from app.services.l3.grade.arc import solve_arc_grade
 from app.services.l3.grade.cdl import Grade, compose, grade_hash
 from app.services.l3.grade.correct import solve_correct_grade
-from app.services.l3.grade.look_engine import resolve_look_spec
+from app.services.l3.grade.look_engine import LookSpec, resolve_look_spec
 from app.services.l3.grade.presets import get_preset
 from app.services.l3.grade.reference_transfer import solve_reference_transfer
 from app.services.l3.grade.softlocal import solve_vignette
@@ -216,6 +216,7 @@ def resolve_clip_grade(
     skin_vibrance: bool = False,
     tone_contrast: float = 0.0,
     look_engine_enabled: bool = False,
+    film_texture_enabled: bool = False,
 ) -> Dict[str, Any]:
     """Resolve ONE clip's (spine segment or op) final grade descriptor.
 
@@ -257,6 +258,12 @@ def resolve_clip_grade(
     `mode == "engine"` Look mode -- a `LookSpec` baked into the creative LUT
     grid (mutually exclusive with an uploaded `.cube`; see below). Off
     (default) -> `look_engine` never set, byte-identical to before this plan.
+    `film_texture_enabled` (halation_grain.plan.md): gates routing an active
+    engine look's `halation`/`grain` params into `soft_local`, alongside the
+    vignette -- both are spatial/stochastic, so they apply as an additional
+    pass, never baked into the CDL/LUT. Off (default), or no engine look, or
+    a look with zero texture -> `soft_local` byte-identical to before this
+    plan.
     """
     stack = solve_correct_grade(
         color_stats, already_graded=already_graded, pipeline=pipeline,
@@ -315,9 +322,34 @@ def resolve_clip_grade(
     # bake all already carry it end-to-end for Phase 3 to wire for real.
     vignette_strength = (sequence_look or {}).get("vignette_strength")
     subject_box = item.get("subject_box")
+    vignette = solve_vignette(subject_box, strength=float(vignette_strength)) if vignette_strength else None
+
+    # halation_grain.plan.md: spatial finishing (halation glow + film grain),
+    # declared by the SAME engine look already resolved above -- reuse
+    # `look_engine` (the dict, or None) rather than re-resolving the spec.
+    # Requires BOTH `film_texture_enabled` and an active engine look
+    # (`look_engine` is only ever non-None when `look_engine_enabled` was
+    # already true), so this rides `grade_look_engine` too, per the plan's
+    # own "requires grade_look_engine" framing, without a second explicit
+    # flag check here.
+    halation = None
+    grain = None
+    if film_texture_enabled and look_engine:
+        texture_spec = LookSpec.from_dict(look_engine)
+        if texture_spec.halation > 0.0:
+            halation = {"strength": min(1.0, texture_spec.halation)}
+        if texture_spec.grain > 0.0:
+            grain = {"strength": min(1.0, texture_spec.grain)}
+
     soft_local = None
-    if vignette_strength:
-        soft_local = {"vignette": solve_vignette(subject_box, strength=float(vignette_strength))}
+    if vignette or halation or grain:
+        soft_local = {}
+        if vignette:
+            soft_local["vignette"] = vignette
+        if halation:
+            soft_local["halation"] = halation
+        if grain:
+            soft_local["grain"] = grain
         if subject_box:
             soft_local["subject_box"] = list(subject_box)
 

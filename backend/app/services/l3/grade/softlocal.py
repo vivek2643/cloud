@@ -32,6 +32,15 @@ from typing import Any, Dict, Optional, Tuple
 DEFAULT_STRENGTH = 0.25  # gentle by default -- "all feathered, no hard masks"
 MAX_ANGLE_RAD = 1.0472   # PI/3 -- ffmpeg vignette's angle at strength=1.0
 
+# halation_grain.plan.md: film-texture finishing (SS9 follow-up). Fixed
+# sub-params kept as CONSTANTS (not LookSpec fields) to keep the look
+# vocabulary small -- a look only ever dials `halation`/`grain` strength.
+HALATION_THRESHOLD = 0.75    # 0..1 luma; only pixels brighter than this glow
+HALATION_SIGMA = 8.0         # gblur sigma at HALATION_SIGMA_REF_H, scaled by frame height
+HALATION_SIGMA_REF_H = 1080  # reference height the sigma constant above is tuned for
+HALATION_TINT = (1.0, 0.35, 0.1)   # red-orange per-channel scale (colorchannelmixer rr:gg:bb)
+GRAIN_MAX_ALLS = 40           # ffmpeg noise filter's `alls` at grain strength=1.0
+
 
 def solve_vignette(
     subject_box: Optional[Tuple[float, float, float, float]] = None,
@@ -64,3 +73,73 @@ def vignette_ffmpeg_filter(vignette: Optional[Dict[str, Any]]) -> Optional[str]:
     cx, cy = float(vignette.get("cx", 0.5)), float(vignette.get("cy", 0.5))
     angle = strength * MAX_ANGLE_RAD
     return f"vignette=angle={angle:.4f}:x0=w*{cx:.4f}:y0=h*{cy:.4f}"
+
+
+def grain_ffmpeg_filter(grain: Optional[Dict[str, Any]]) -> Optional[str]:
+    """`grain` descriptor -> an ffmpeg `noise` filter clause, or None for a
+    no-op (absent/zero strength). Temporal + uniform (`allf=t+u`) so it reads
+    as film-emulsion texture, not a static overlay -- a NEW random field every
+    frame, uniformly distributed rather than Gaussian (cheap, visually close
+    enough for the "subtle texture" bar this pass sets, per the plan's own
+    "simplest, temporal" framing)."""
+    if not grain:
+        return None
+    strength = float(grain.get("strength") or 0.0)
+    if strength <= 0.001:
+        return None
+    alls = max(1, min(GRAIN_MAX_ALLS, round(strength * GRAIN_MAX_ALLS)))
+    return f"noise=alls={alls}:allf=t+u"
+
+
+def halation_ffmpeg_subgraph(halation: Optional[Dict[str, Any]], *, frame_height: int = HALATION_SIGMA_REF_H) -> Optional[str]:
+    """`halation` descriptor -> an ffmpeg filtergraph FRAGMENT (not a single
+    clause like the vignette/noise above): isolate highlights, red-orange
+    tint them, blur into a glow, screen-blend back over the untouched frame.
+    None for a no-op (absent/zero strength).
+
+    Unlike a single filter clause, this uses named pads (`split`/labeled
+    sub-chains/`blend`) -- valid spliced into one comma-joined `-vf` string
+    (ffmpeg's filtergraph mini-language allows `;`-separated labeled chains
+    inside a single `-vf`), as long as the fragment's OWN start/end still
+    resolve to one implicit (unlabeled) input/output, which this does: it
+    reads its input implicitly from whatever precedes it in the chain (the
+    `split`'s input) and writes its output implicitly from the final
+    `blend` (no trailing label), so the caller can just treat it as one
+    more comma-joined chain element, exactly like `vignette_ffmpeg_filter`'s
+    return value.
+
+    Runs on an 8-bit YUV frame (matches where this is spliced in
+    `_transform_vf`, right after the LUT's `format=yuv420p`), but converts
+    to `gbrp` ONCE up front and keeps BOTH `blend` inputs (the untouched
+    base and the isolated/tinted/blurred glow) in that same RGB space the
+    whole way through, converting back to `yuv420p` only ONCE, after the
+    blend. Verified live (real footage, real ffmpeg): converting `[hbase]`
+    and `[hglow]` to `yuv420p` INDEPENDENTLY before blending -- two separate
+    gbrp->yuv420p conversions of nominally "the same format" -- produced a
+    visible magenta cast across the WHOLE frame (even pure-black letterbox
+    bars, which the highlight threshold guarantees get zero glow
+    contribution, so the cast could only be a range/space mismatch in
+    `blend`'s raw per-sample arithmetic, not a real color choice). Doing
+    the blend itself in `gbrp` and converting once afterward removed it.
+
+    `frame_height` scales `HALATION_SIGMA` (tuned at `HALATION_SIGMA_REF_H`)
+    so the glow's blur radius reads the same relative size on a 480p proxy
+    and a 4K export, not a fixed pixel radius that looks tiny/huge depending
+    on render resolution."""
+    if not halation:
+        return None
+    strength = float(halation.get("strength") or 0.0)
+    if strength <= 0.001:
+        return None
+    threshold_8bit = round(max(0.0, min(1.0, HALATION_THRESHOLD)) * 255.0)
+    sigma = max(1.0, HALATION_SIGMA * (max(1, frame_height) / float(HALATION_SIGMA_REF_H)))
+    tint_r, tint_g, tint_b = HALATION_TINT
+    keep_bright = f"if(gt(val\\,{threshold_8bit})\\,val\\,0)"
+    return (
+        "format=gbrp,split=2[hbase][htmp];"
+        f"[htmp]lutrgb=r='{keep_bright}':g='{keep_bright}':b='{keep_bright}',"
+        f"colorchannelmixer=rr={tint_r:.3f}:gg={tint_g:.3f}:bb={tint_b:.3f},"
+        f"gblur=sigma={sigma:.3f}[hglow];"
+        f"[hbase][hglow]blend=all_mode=screen:all_opacity={max(0.0, min(1.0, strength)):.3f},"
+        "format=yuv420p"
+    )

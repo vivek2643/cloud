@@ -146,7 +146,7 @@ def grade_hash(
     working_space: str = "rec709",
     soft_local: Optional[Dict[str, Any]] = None,
     lut_size: int = 33,
-    schema_version: int = 2,
+    schema_version: int = 3,
     tone_contrast: float = 0.0,
     look_engine: Optional[Dict[str, Any]] = None,
 ) -> str:
@@ -156,8 +156,11 @@ def grade_hash(
     bytes MUST be part of this payload -- `tone_contrast`
     (color_tone_contrast.plan.md) and `look_engine`
     (color_response_engine.plan.md) included, since both change the bake's
-    output. `schema_version` bumped 1->2 for `look_engine`'s addition --
-    forces a one-time cube rebake (identical bytes while no caller sets it)."""
+    output. `schema_version` bumped 1->2 for `look_engine`'s addition, 2->3
+    for halation_grain.plan.md's `soft_local.halation`/`.grain` keys (no
+    payload signature change needed -- `soft_local` was already in the
+    payload; only the schema bump forces the one-time reindex) -- forces a
+    one-time cube rebake (identical bytes while no caller sets them)."""
     payload = {
         "v": schema_version,
         "cdl": grade.to_dict(),
