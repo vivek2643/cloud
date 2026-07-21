@@ -143,13 +143,22 @@ class Settings(BaseSettings):
     # OWN span, matches neighbors, and pre-bakes cubes -- layers.resolve then
     # READS the persisted result instead of computing it. Flip only once
     # Phase 1's parity tests are green.
-    grade_pipeline: str = "legacy"
+    grade_pipeline: str = "v1"
     # Phase 2: bounded across-shot exposure/tonal-placement leveling (a smooth
-    # target curve, capped correction). Off by default -- opt-in until verified.
-    grade_even_lighting: bool = False
+    # target curve, capped correction). On for frontend validation across all
+    # projects (revert to False to disable).
+    grade_even_lighting: bool = True
     # Phase 3: subject-aware leveling + semantic scene grouping for matching +
-    # narrative-driven arc. Off by default.
-    grade_semantic: bool = False
+    # narrative-driven arc. On for frontend validation (revert to False).
+    grade_semantic: bool = True
+
+    # color_shot_matching.plan.md: the two-stage group->balance->match
+    # redesign (graceful RGB grouping fallback + a robust median-member
+    # reference both Balance and Match converge on). Off falls back to the
+    # pre-redesign v1 matching (semantic-or-nothing grouping, no balance,
+    # weaker match strengths) -- a single kill switch for rollback without
+    # a revert.
+    grade_shot_match_v2: bool = True
 
     # migration_runner.plan.md: the startup guard's sanctioned local-dev
     # bypass. "on" (default) means every process refuses to boot on schema

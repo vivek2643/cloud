@@ -6,11 +6,18 @@ JSON-safe descriptor (`{cdl, creative_lut_ref, working_space, grade_hash}`)
 that gets baked into `document["resolved"]`, same place `layers.py`
 already bakes geometric `transform`.
 
-Stack order (SS3): Measure -> Correct -> Match -> Leveling -> Look -> Arc ->
-Soft-local -> NL trims -> BAKE. This module is the seam every later build
-step plugs into:
+Stack order (SS3): Measure -> Correct -> Balance -> Match -> Leveling ->
+Look -> Arc -> Soft-local -> NL trims -> BAKE. This module is the seam
+every later build step plugs into:
   - SS5 (correct) is wired: `grade.correct.solve_correct_grade` composes
     onto the stack first, using the file's `color_stats` row.
+  - Balance (color_shot_matching.plan.md Phase 2b, v1-only) composes next:
+    a pre-computed per-shot delta pulling exposure/white-balance/contrast
+    toward its scene-group's robust reference (`grade.balance.solve_balance`,
+    `grade.reference.compute_group_reference`) -- the missing "shot match"
+    step that Match alone (a placement + cast nudge, not a full exposure
+    convergence) never fully closed. Same "computed once per document,
+    passed in as a delta" pattern as match/leveling.
   - SS6 (match) is wired: a pre-computed per-file delta (see
     `grade.match.solve_match_deltas`, computed ONCE per document resolve in
     `layers.resolve` since grade-groups are a whole-document clustering, not
@@ -55,6 +62,41 @@ from app.services.l3.grade.softlocal import solve_vignette
 from app.services.l3.grade.tone import WORKING_SPACE_V1, from_working, to_working
 
 DEFAULT_WORKING_SPACE = "rec709"
+
+# --------------------------------------------------------------------------
+# Composite guardrails (color_grading_upgrade.plan.md -- v1 only).
+#
+# Every upstream layer bounds ITSELF (correct's LEVELS_SLOPE_MAX, match's
+# CAST_CLAMP, leveling's stop caps), but Correct + Match + Leveling + the
+# log-flat pre-lift COMPOSE MULTIPLICATIVELY, so the stacked CDL can exceed
+# any single layer's cap (an observed composite slope ~2.65). These clamp the
+# FINAL composed CDL so no combination of layers can over-contrast or crush
+# shadows. They operate in the v1 working (linear) space -- the space the CDL
+# actually runs in at bake time (tone.to_working -> apply_cdl -> from_working).
+COMPOSITE_SLOPE_MAX = 2.0
+# A nominal linear mid-gray = display 0.5 projected into the v1 working space
+# (~0.214). The composed per-channel offset is floored so this mid-gray can
+# never be pushed below COMPOSITE_MID_FLOOR (linear) -- i.e. the stack may
+# darken, but can't collapse midtones/shadows to black, which was the original
+# "everything too dark" failure (a display-space negative offset applied to a
+# linearized midtone). Deliberately a low floor (well under a corrected mid's
+# ~0.146 linear target), so it's an outlier backstop, not a per-clip tuning.
+COMPOSITE_MID_FLOOR = 0.02
+
+
+def _clamp_composite_v1(grade: Grade) -> Grade:
+    """Apply the composite slope ceiling + negative-offset floor to a fully
+    composed v1 CDL (see the module constants above for the reasoning)."""
+    import numpy as np
+
+    mid_lin = float(to_working(np.array([0.5], dtype=np.float32), WORKING_SPACE_V1)[0])
+    slope = tuple(min(float(s), COMPOSITE_SLOPE_MAX) for s in grade.slope)
+    # offset floored per channel so mid_lin*slope + offset >= COMPOSITE_MID_FLOOR
+    offset = tuple(
+        max(float(grade.offset[c]), COMPOSITE_MID_FLOOR - mid_lin * slope[c])
+        for c in range(3)
+    )
+    return Grade(slope=slope, offset=offset, power=grade.power, sat=grade.sat)
 
 
 def _corrected_source_stats(
@@ -125,6 +167,7 @@ def resolve_clip_grade(
     sequence_look: Optional[Dict[str, Any]] = None,
     already_graded: bool = False,
     match_delta: Optional[Grade] = None,
+    balance_delta: Optional[Grade] = None,
     leveling_delta: Optional[Grade] = None,
     pipeline: str = "legacy",
 ) -> Dict[str, Any]:
@@ -140,6 +183,11 @@ def resolve_clip_grade(
     callers that have it available should pass it through. `match_delta` is
     this clip's SS6 grade-groups delta (this file's nudge toward its group's
     anchor), already resolved once for the whole document by the caller.
+    `balance_delta` (color_shot_matching.plan.md Phase 2b, v1-only): this
+    shot's exposure/white-balance/contrast nudge toward its scene-group's
+    robust median reference (`grade.balance.solve_balance`), already
+    resolved once for the whole document -- composed BETWEEN Correct and
+    Match so the two stages converge on the same target instead of fighting.
     `pipeline` (color_grading_upgrade.plan.md Step 1.1/1.3/1.5): "legacy"
     (default) is today's exact stack -- callers that never pass it get
     byte-identical output. "v1" selects the percentile-based correct layer,
@@ -153,6 +201,8 @@ def resolve_clip_grade(
     the Look layer still solves against the fully-corrected-so-far image.
     """
     stack = solve_correct_grade(color_stats, already_graded=already_graded, pipeline=pipeline)
+    if balance_delta is not None:
+        stack = compose(stack, balance_delta, 1.0)
     if match_delta is not None:
         stack = compose(stack, match_delta, 1.0)
     if leveling_delta is not None:
@@ -167,6 +217,12 @@ def resolve_clip_grade(
 
     override = Grade.from_dict(item.get("grade")) if item.get("grade") else None
     resolved = compose(stack, override, 1.0) if override is not None else stack
+
+    # v1 only: bound the FINAL composed CDL so the multiplicatively-stacked
+    # layers (correct+match+leveling+lift+override) can't over-contrast or
+    # crush shadows regardless of how they combine (Fixes 2 & 3).
+    if pipeline == "v1":
+        resolved = _clamp_composite_v1(resolved)
 
     creative_lut_ref = (sequence_look or {}).get("lut_ref") if sequence_look else None
     if sequence_look and sequence_look.get("mode") != "lut":

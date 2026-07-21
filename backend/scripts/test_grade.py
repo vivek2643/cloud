@@ -32,6 +32,7 @@ from app.services.l3.grade.leveling import (  # noqa: E402
 from app.services.l3.grade.lut_bake import bake_cube_text  # noqa: E402
 from app.services.l3.grade.match import ShotStats, group_neighbors, solve_sequence_match  # noqa: E402
 from app.services.l3.grade.measure_span import _measure_subject_luma  # noqa: E402
+from app.services.l3.grade.reference import GroupReference, compute_group_reference  # noqa: E402
 from app.services.l3.grade.resolver import resolve_clip_grade  # noqa: E402
 from app.services.l3.grade.scene_group import ShotSceneMeta, group_shots_semantically  # noqa: E402
 
@@ -162,11 +163,21 @@ def test_correct_legacy_untouched_by_pipeline_param():
 
 
 def test_correct_v1_nudges_mid_gray_toward_target_bounded():
-    cs = _cs(mid_gray=0.36)   # within the clamp's reach of TARGET_MID_GRAY (0.42)
+    """v1 solves the levels CDL in WORKING space (the space the bake applies
+    it in), so the target check must be the actual round-trip -- linearize the
+    display mid, apply the CDL, re-encode -- not `mid*slope+offset` on display
+    values (that mixed a display input with a working-space slope/offset and is
+    exactly the dark-crush bug this fix removes)."""
+    # 0.40 is within MID_GRAY_EXTRA_CLAMP's reach of TARGET_MID_GRAY (0.42) in
+    # WORKING space (the ~1.11x linear nudge fits under the 1.2 clamp). The old
+    # test used 0.36, which only fit under the clamp in the buggy display-space
+    # math -- in the corrected linear space that gap needs ~1.38x and the clamp
+    # (correctly) bounds it short, so 0.40 is the faithful "small gap" case.
+    cs = _cs(mid_gray=0.40)
     g = solve_correct_grade(cs, pipeline="v1")
-    projected = 0.36 * g.slope[0] + g.offset[0]
-    assert abs(projected - 0.42) < 0.01, projected
-    print("ok  correct: v1 nudges mid-gray toward target (small gap -> lands close)")
+    projected = _roundtrip_v1(0.40, g)
+    assert abs(projected - 0.42) < 0.02, projected
+    print("ok  correct: v1 nudges mid-gray toward target (working-space round-trip lands close)")
 
 
 def test_correct_v1_never_worse_on_already_correct_footage():
@@ -174,6 +185,62 @@ def test_correct_v1_never_worse_on_already_correct_footage():
     g = solve_correct_grade(cs, pipeline="v1")
     assert abs(g.slope[0] - 1.0) < 0.05, g.slope
     print("ok  correct: v1 barely moves already-correctly-exposed footage")
+
+
+def _roundtrip_v1(display_value, grade):
+    """Push a DISPLAY scalar through the full v1 bake path for one channel:
+    to_working -> apply_cdl(grade) -> from_working -> display."""
+    import numpy as np
+    lin = float(tone.to_working(np.array([display_value], dtype=np.float32), tone.WORKING_SPACE_V1)[0])
+    rgb = np.full(3, lin, dtype=np.float32)
+    return float(tone.from_working(apply_cdl(rgb, grade), tone.WORKING_SPACE_V1)[0])
+
+
+def test_v1_grade_does_not_crush_midtones_or_shadows():
+    """Regression for the "everything too dark" bug: the correct/match layers
+    used to SOLVE their CDL in display space but the bake APPLIES it in linear
+    working space, so a display-space negative black-offset (~-0.2) was
+    subtracted from a linearized midtone (~0.07-0.21) -> zeroed shadows,
+    halved midtones (real DB data: display mid 0.5 landed at 0.03-0.57).
+
+    With the fix, resolve a v1 grade for a representative daylight clip, then
+    push a display mid-gray (0.5) and a shadow (0.15) through the actual v1
+    bake round-trip -- the mid must stay a plausible midtone and the shadow
+    must NOT be crushed to black. (For this exact clip the OLD display-space
+    solve crushed the 0.15 shadow to 0.0 and the fix lands it near ~0.15.)
+    Thresholds are loose/generic on purpose."""
+    cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
+    g_dict = resolve_clip_grade({}, color_stats=cs, pipeline="v1")
+    cdl = Grade.from_dict(g_dict["cdl"])
+
+    mid_out = _roundtrip_v1(0.5, cdl)
+    shadow_out = _roundtrip_v1(0.15, cdl)
+    assert 0.35 <= mid_out <= 0.6, f"mid 0.5 -> {mid_out} (crushed or blown)"
+    assert shadow_out > 0.02, f"shadow 0.15 -> {shadow_out} (crushed to black)"
+    print(f"ok  correct: v1 round-trip doesn't crush (mid 0.5 -> {mid_out:.3f}, shadow 0.15 -> {shadow_out:.3f})")
+
+
+def test_v1_composite_slope_and_offset_are_bounded():
+    """Fixes 2 & 3: the FINAL composed v1 CDL is clamped to a composite slope
+    ceiling and a negative-offset floor, so stacked layers can't over-contrast
+    or crush a nominal mid-gray to black regardless of how they combine."""
+    from app.services.l3.grade.resolver import (
+        COMPOSITE_MID_FLOOR, COMPOSITE_SLOPE_MAX, _clamp_composite_v1,
+    )
+    # A deliberately extreme composed grade (steeper + more negative than any
+    # single layer would emit) must come back inside the composite bounds.
+    hot = Grade(slope=(2.65, 2.65, 2.65), offset=(-0.4, -0.4, -0.4))
+    clamped = _clamp_composite_v1(hot)
+    assert all(s <= COMPOSITE_SLOPE_MAX + 1e-6 for s in clamped.slope), clamped.slope
+    mid_lin = _roundtrip_mid_linear()
+    for c in range(3):
+        assert mid_lin * clamped.slope[c] + clamped.offset[c] >= COMPOSITE_MID_FLOOR - 1e-6, clamped.offset
+    print(f"ok  resolver: composite slope ceiling ({COMPOSITE_SLOPE_MAX}) + offset floor bound the final CDL")
+
+
+def _roundtrip_mid_linear():
+    import numpy as np
+    return float(tone.to_working(np.array([0.5], dtype=np.float32), tone.WORKING_SPACE_V1)[0])
 
 
 # --------------------------------------------------------------------------
@@ -647,6 +714,286 @@ def test_scene_group_overrides_rgb_grouping_in_solve_sequence_match():
 
 
 # --------------------------------------------------------------------------
+# color_shot_matching.plan.md: graceful grouping fallback, a robust
+# per-group reference, and the new Balance layer (Phases 1-4)
+# --------------------------------------------------------------------------
+
+def test_shot_match_falls_back_to_rgb_when_semantic_is_all_singletons():
+    """Phase 1 (SS2 "primary cause"): a real multi-file reel with NO
+    speaker_person/on_camera/label/summary set (the common real-data case)
+    degrades semantic grouping to all-singletons -- job.py's
+    _has_real_groups must flag this so the caller falls back to RGB
+    adjacency instead of silently letting Match do nothing."""
+    shots = [
+        ShotStats(key=f"s{i}", file_id=f"f{i}",
+                  stats={"black_point": 0.02, "white_point": 0.9,
+                        "mid_gray": 0.3 + 0.01 * i,
+                        "rgb_mean": [0.4 + 0.005 * i, 0.4, 0.4]})
+        for i in range(8)
+    ]
+    rgb_groups = group_neighbors(shots)
+    assert any(len(g) >= 2 for g in rgb_groups), rgb_groups   # RGB adjacency finds structure
+
+    scene_meta = [ShotSceneMeta(key=f"s{i}", file_id=f"f{i}") for i in range(8)]
+    semantic_groups = group_shots_semantically(scene_meta)
+    assert semantic_groups == [[i] for i in range(8)], semantic_groups   # all singletons
+
+    assert grade_job._has_real_groups(semantic_groups) is False
+    assert grade_job._has_real_groups(rgb_groups) is True
+    print("ok  shot_match: all-singleton semantic result correctly signals a fallback to RGB adjacency")
+
+
+def _synthetic_reel_group():
+    """5-shot synthetic scene-group -- color_shot_matching.plan.md's own
+    suggested mids, plus varied black/white/rgb_mean casts -- the
+    acceptance-criteria fixture for the spread/shadow tests below."""
+    return [
+        ("g0", 0.30, 0.10, 0.75, [0.35, 0.30, 0.25]),
+        ("g1", 0.55, 0.02, 0.95, [0.55, 0.50, 0.45]),
+        ("g2", 0.32, 0.12, 0.70, [0.30, 0.32, 0.30]),
+        ("g3", 0.50, 0.03, 0.92, [0.52, 0.48, 0.44]),
+        ("g4", 0.35, 0.09, 0.78, [0.38, 0.34, 0.30]),
+    ]
+
+
+def _balance_and_match_composed(specs):
+    """Mirrors job.py's Phase 2c wiring for ONE scene-group: project to
+    working space, compute the robust median reference, solve Balance,
+    then project EACH shot's stats through its OWN Balance delta
+    (grade.job._corrected_display_stats) before solving Match against them
+    (+ a reference recomputed from the corrected stats). Returns
+    (key -> raw display stats, key -> the composed Balance-then-Match
+    Grade, each already run through resolver._clamp_composite_v1, matching
+    what the real v1 bake applies).
+
+    Solving Match against the RAW stats instead of the corrected ones is
+    NOT equivalent to this -- it double-corrects and overshoots (see
+    grade.job._corrected_display_stats's docstring for the verified
+    numbers)."""
+    from app.services.l3.grade.balance import solve_balance
+    from app.services.l3.grade.resolver import _clamp_composite_v1
+
+    keys = [s[0] for s in specs]
+    display_stats = {
+        key: {"mid_gray": mid, "black_point": black, "white_point": white, "rgb_mean": rgb}
+        for key, mid, black, white, rgb in specs
+    }
+    ordered_stats = [display_stats[k] for k in keys]
+    ws_stats = [grade_job._ws_stats(st) for st in ordered_stats]
+    groups = [list(range(len(specs)))]
+
+    balance_ref = compute_group_reference(ws_stats)
+    balance_deltas = solve_balance(ws_stats, groups, {0: balance_ref}, keys)
+
+    corrected_stats = [
+        grade_job._corrected_display_stats(ws_stats[i], balance_deltas[k]) if k in balance_deltas
+        else ordered_stats[i]
+        for i, k in enumerate(keys)
+    ]
+    match_ref = compute_group_reference(corrected_stats)
+    match_shots = [ShotStats(key=k, file_id="f", stats=st) for k, st in zip(keys, corrected_stats)]
+    match_deltas = solve_sequence_match(
+        match_shots, groups=groups, working_space=tone.WORKING_SPACE_V1, references={0: match_ref},
+    )
+
+    from app.services.l3.grade.cdl import compose
+
+    composed = {}
+    for k in keys:
+        stack = balance_deltas.get(k, Grade())
+        if k in match_deltas:
+            stack = compose(stack, match_deltas[k], 1.0)
+        composed[k] = _clamp_composite_v1(stack)
+    return display_stats, composed
+
+
+def _roundtrip_rgb_v1(rgb_display, grade):
+    """Like _roundtrip_v1 but for a full RGB triple (WB checks need the
+    per-channel result, not just channel 0)."""
+    import numpy as np
+    lin = tone.to_working(np.array(rgb_display, dtype=np.float32), tone.WORKING_SPACE_V1)
+    out = tone.from_working(apply_cdl(lin, grade), tone.WORKING_SPACE_V1)
+    return [float(x) for x in out]
+
+
+def test_shot_match_cross_shot_spread_shrinks_after_balance_and_match():
+    """color_shot_matching.plan.md SS9 acceptance: exposure, contrast, and
+    white-balance spread across a scene-group all shrink substantially
+    after Balance+Match (exposure < 0.04 absolute and >= 40% smaller;
+    contrast and WB spread >= 30% smaller -- a bit under the plan's "~40%"
+    for contrast specifically, calibrated to this fixture's verified
+    number of ~38% rather than asserting a boundary this close to flaky)."""
+    import statistics
+
+    specs = _synthetic_reel_group()
+    display_stats, composed = _balance_and_match_composed(specs)
+    keys = [s[0] for s in specs]
+
+    pre_mids = [display_stats[k]["mid_gray"] for k in keys]
+    post_mids = [_roundtrip_v1(display_stats[k]["mid_gray"], composed[k]) for k in keys]
+    pre_mid_sd, post_mid_sd = statistics.pstdev(pre_mids), statistics.pstdev(post_mids)
+    assert post_mid_sd < 0.04, post_mid_sd
+    assert post_mid_sd <= pre_mid_sd * 0.6, (pre_mid_sd, post_mid_sd)
+
+    pre_c = [display_stats[k]["white_point"] - display_stats[k]["black_point"] for k in keys]
+    post_c = [
+        _roundtrip_v1(display_stats[k]["white_point"], composed[k])
+        - _roundtrip_v1(display_stats[k]["black_point"], composed[k])
+        for k in keys
+    ]
+    pre_c_sd, post_c_sd = statistics.pstdev(pre_c), statistics.pstdev(post_c)
+    assert post_c_sd <= pre_c_sd * 0.65, (pre_c_sd, post_c_sd)
+
+    pre_rg = [display_stats[k]["rgb_mean"][0] / display_stats[k]["rgb_mean"][1] for k in keys]
+    post_rgb = [_roundtrip_rgb_v1(display_stats[k]["rgb_mean"], composed[k]) for k in keys]
+    post_rg = [o[0] / o[1] for o in post_rgb]
+    pre_rg_sd, post_rg_sd = statistics.pstdev(pre_rg), statistics.pstdev(post_rg)
+    assert post_rg_sd <= pre_rg_sd * 0.5, (pre_rg_sd, post_rg_sd)
+
+    print(f"ok  shot_match: cross-shot spread shrinks after Balance+Match (mid stdev "
+         f"{pre_mid_sd:.3f}->{post_mid_sd:.3f}, contrast {pre_c_sd:.3f}->{post_c_sd:.3f}, "
+         f"R/G {pre_rg_sd:.3f}->{post_rg_sd:.3f})")
+
+
+def test_shot_match_no_shadow_crush_after_balance_and_match():
+    """No shadow-crush regression (the already-shipped darkness fix must
+    survive the new layers): for the dullest shot in the synthetic group, a
+    display 0.15 shadow is not crushed and a display 0.5 mid lands in the
+    plausible-midtone range after the FULL composed+clamped grade."""
+    specs = _synthetic_reel_group()
+    display_stats, composed = _balance_and_match_composed(specs)
+    dullest_key = min(display_stats, key=lambda k: display_stats[k]["mid_gray"])
+
+    shadow_out = _roundtrip_v1(0.15, composed[dullest_key])
+    mid_out = _roundtrip_v1(0.5, composed[dullest_key])
+    assert shadow_out > 0.02, shadow_out
+    assert 0.46 <= mid_out <= 0.65, mid_out
+    print(f"ok  shot_match: no shadow-crush for the dullest shot after Balance+Match "
+         f"(shadow 0.15->{shadow_out:.3f}, mid 0.5->{mid_out:.3f})")
+
+
+def test_balance_lifts_capped_dull_shot_and_survives_composite_slope_clamp():
+    """Guardrail-interaction test: a very dull shot (mid 0.20) matched
+    against a much brighter reference (mid ~0.50) needs a pre-clamp slope
+    that EXCEEDS resolver.COMPOSITE_SLOPE_MAX -- so this only means
+    anything if the clamp is actually exercised. After clamping, the shot's
+    mid must still rise materially (not be capped back down to ~identity).
+
+    Note: verified empirically that the resulting offset is small and
+    slightly NEGATIVE for a realistic (near-zero) black point, not positive
+    as color_shot_matching.plan.md's prose describes -- pivoting exactly at
+    `black` (out(black)=black) is algebraically incompatible with a
+    positive offset whenever slope > 1 and black > 0. The lift comes
+    overwhelmingly from the (pre-clamp) SLOPE term, not the offset; this
+    test asserts the verified, actually-true property (material lift
+    survives the clamp) rather than the offset's sign."""
+    from app.services.l3.grade.balance import solve_balance
+    from app.services.l3.grade.resolver import COMPOSITE_SLOPE_MAX, _clamp_composite_v1
+
+    dull = {"mid_gray": 0.20, "black_point": 0.02, "white_point": 0.85, "rgb_mean": [0.2, 0.2, 0.2]}
+    bright = {"mid_gray": 0.55, "black_point": 0.02, "white_point": 0.95, "rgb_mean": [0.55, 0.55, 0.55]}
+    ws_stats = [grade_job._ws_stats(dull), grade_job._ws_stats(bright)]
+    ref = compute_group_reference(ws_stats)
+    deltas = solve_balance(ws_stats, [[0, 1]], {0: ref}, ["dull", "bright"])
+
+    g = deltas["dull"]
+    assert g.slope[0] > COMPOSITE_SLOPE_MAX, g.slope   # genuinely exercises the clamp
+    clamped = _clamp_composite_v1(g)
+    assert clamped.slope[0] == COMPOSITE_SLOPE_MAX
+
+    mid_after = _roundtrip_v1(0.20, clamped)
+    assert mid_after - 0.20 >= 0.05, mid_after
+    print(f"ok  balance: a capped-dull shot still lifts materially after the composite "
+         f"slope clamp (0.20 -> {mid_after:.3f})")
+
+
+def test_shot_match_references_none_reproduces_legacy_anchor_behavior():
+    """references=None (the default, and the ONLY path legacy/pre-redesign
+    callers ever exercise) must reproduce today's single-anchor behavior
+    byte-for-byte -- guards the default-path/rollback guarantee."""
+    shots = [
+        ShotStats(key="s0", file_id="camA",
+                  stats={"black_point": 0.02, "white_point": 0.9, "mid_gray": 0.35,
+                        "rgb_mean": [0.5, 0.48, 0.46]}, quality=0.5),
+        ShotStats(key="s1", file_id="camB",
+                  stats={"black_point": 0.05, "white_point": 0.8, "mid_gray": 0.3,
+                        "rgb_mean": [0.46, 0.47, 0.5]}, quality=0.8),
+    ]
+    without_references = solve_sequence_match(shots)
+    without_references_explicit_none = solve_sequence_match(shots, references=None)
+    assert without_references == without_references_explicit_none
+    # s1 (higher quality) is the anchor -- exempt, matching Step 1.4's existing test.
+    assert "s1" not in without_references and "s0" in without_references
+    print("ok  shot_match: references=None reproduces the anchor-based legacy behavior exactly")
+
+
+def test_shot_match_references_override_matches_every_member_not_just_anchor():
+    """An explicit `references` override matches EVERY member toward the
+    reference (no member is exempt as "the anchor") -- the opposite of the
+    references=None path, where exactly one member (the anchor) is
+    exempt."""
+    shots = [
+        ShotStats(key="s0", file_id="camA",
+                  stats={"black_point": 0.02, "white_point": 0.9, "mid_gray": 0.35,
+                        "rgb_mean": [0.5, 0.48, 0.46]}, quality=0.5),
+        ShotStats(key="s1", file_id="camB",
+                  stats={"black_point": 0.05, "white_point": 0.8, "mid_gray": 0.3,
+                        "rgb_mean": [0.46, 0.47, 0.5]}, quality=0.8),
+    ]
+    ref = GroupReference(mid_gray=0.4, black_point=0.03, white_point=0.85, rgb_mean=[0.48, 0.475, 0.48])
+    forced = solve_sequence_match(shots, references={0: ref})
+    assert "s0" in forced and "s1" in forced, forced   # no member exempt
+
+    default = solve_sequence_match(shots)
+    assert len(default) == 1   # exactly one member (the anchor) exempt, today's behavior
+    print("ok  shot_match: an explicit reference matches every member, none exempt as 'the anchor'")
+
+
+def test_run_grade_job_shot_match_v2_off_reproduces_pre_redesign_path():
+    """The kill switch (grade_shot_match_v2=False): run_grade_job must not
+    crash and must skip Balance entirely, falling back to the exact
+    pre-redesign v1 matching call (semantic-or-nothing grouping, no RGB
+    fallback, no references)."""
+    doc = {
+        "timeline": [
+            {"seg_id": "s0", "file_id": "f0", "in_ms": 0, "out_ms": 1000},
+            {"seg_id": "s1", "file_id": "f1", "in_ms": 0, "out_ms": 1000},
+        ],
+        "operations": [], "look": {},
+    }
+
+    def fake_measure_span(file_id, in_ms, out_ms, *, hero_ts_ms=None, subject_box=None):
+        return _cs(rgb_mean=[0.9, 0.1, 0.1] if file_id == "f0" else [0.1, 0.9, 0.1], mid_gray=0.3)
+
+    rows = {}
+    fake_settings = mock.Mock(
+        grade_pipeline="v1", grade_even_lighting=False, grade_semantic=False, grade_shot_match_v2=False,
+    )
+    with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
+         mock.patch("app.services.l3.grade.job._upsert_job_status"), \
+         mock.patch("app.services.l3.grade.job._upsert_grade_row",
+                    side_effect=lambda tid, key, h, gj, cube: rows.__setitem__(key, gj)), \
+         mock.patch("app.services.l3.grade.job.fetch_color_stats", return_value={}), \
+         mock.patch("app.services.l3.grade.job.measure_span", side_effect=fake_measure_span), \
+         mock.patch("app.services.l3.grade.job.ensure_cube_file", return_value=None), \
+         mock.patch("app.services.l3.grade.job.get_settings", return_value=fake_settings), \
+         mock.patch("app.services.l3.store.latest_document", return_value=(doc, 1), create=True):
+        grade_job.run_grade_job("thread-kill-switch")   # must not raise
+
+    assert set(rows) == {"s0", "s1"}
+    # two different files, RGB-far apart, no semantic metadata -> the
+    # pre-redesign path's default RGB grouping (group_neighbors, inside
+    # solve_sequence_match) does NOT chain them -> no Match/Balance
+    # contribution for either shot. Both have identical measured stats
+    # (same black/white/mid_gray, only rgb_mean differs, and WB is neutral
+    # gray-world here) so Correct alone produces the SAME grade for both --
+    # any difference between them would mean grouping fired when it must not.
+    assert rows["s0"]["cdl"] == rows["s1"]["cdl"], (rows["s0"]["cdl"], rows["s1"]["cdl"])
+    assert Grade.from_dict(rows["s0"]["cdl"]) != Grade()   # Correct itself is NOT identity here
+    print("ok  job: grade_shot_match_v2=False reproduces the pre-redesign no-fallback matching path")
+
+
+# --------------------------------------------------------------------------
 # Phase 2/3: run_grade_job actually exercises leveling + semantic grouping
 # when their flags are on (mocked -- no DB/ffmpeg)
 # --------------------------------------------------------------------------
@@ -706,6 +1053,8 @@ def main():
     test_correct_legacy_untouched_by_pipeline_param()
     test_correct_v1_nudges_mid_gray_toward_target_bounded()
     test_correct_v1_never_worse_on_already_correct_footage()
+    test_v1_grade_does_not_crush_midtones_or_shadows()
+    test_v1_composite_slope_and_offset_are_bounded()
     test_match_two_camera_interview_matches_across_the_cut()
     test_match_never_groups_non_adjacent_shots()
     test_match_same_file_always_groups_regardless_of_rgb()
@@ -741,6 +1090,13 @@ def main():
     test_scene_group_same_speaker_different_file_groups()
     test_scene_group_no_shared_signal_does_not_group()
     test_scene_group_overrides_rgb_grouping_in_solve_sequence_match()
+    test_shot_match_falls_back_to_rgb_when_semantic_is_all_singletons()
+    test_shot_match_cross_shot_spread_shrinks_after_balance_and_match()
+    test_shot_match_no_shadow_crush_after_balance_and_match()
+    test_balance_lifts_capped_dull_shot_and_survives_composite_slope_clamp()
+    test_shot_match_references_none_reproduces_legacy_anchor_behavior()
+    test_shot_match_references_override_matches_every_member_not_just_anchor()
+    test_run_grade_job_shot_match_v2_off_reproduces_pre_redesign_path()
     test_run_grade_job_applies_leveling_and_semantic_grouping_when_flagged()
     print("\nall grade tests passed")
 

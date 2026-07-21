@@ -64,6 +64,34 @@ def to_working(rgb_display, working_space: str):
     return np.where(arr <= _SRGB_DISPLAY_THRESH, lo, hi).astype(np.float32)
 
 
+def to_working_scalar(value, default=None, working_space: str = WORKING_SPACE_V1) -> float:
+    """Project ONE display-encoded scalar (a measured mid_gray/black_point/
+    white_point/subject_luma, or a target anchor) into `working_space` -- the
+    single-value companion to `to_working`, so callers that solve a levels CDL
+    in the space it's actually applied (correct.py/match.py/job.py) don't each
+    re-implement the sRGB math. `value is None` -> `default` (assumed already
+    working-space-safe, e.g. a solver's own fallback constants). Identity when
+    `working_space != WORKING_SPACE_V1` (legacy stays byte-for-byte)."""
+    if value is None:
+        return default if default is not None else 0.0
+    import numpy as np
+
+    return float(to_working(np.array([float(value)], dtype=np.float32), working_space)[0])
+
+
+def from_working_scalar(value: float, working_space: str = WORKING_SPACE_V1) -> float:
+    """Project ONE working-space scalar back to display encoding -- the
+    inverse companion to `to_working_scalar`. color_shot_matching.plan.md
+    Phase 2c uses this to turn an already-Balance-corrected working-space
+    stat back into display space so a LATER stage (Match) can solve against
+    the image AS CORRECTED (same discipline as resolver.py's
+    `_corrected_source_stats`), without each caller hand-rolling the numpy
+    array wrapping. Identity when `working_space != WORKING_SPACE_V1`."""
+    import numpy as np
+
+    return float(from_working(np.array([float(value)], dtype=np.float32), working_space)[0])
+
+
 def _tonemap_shoulder(x):
     """Reinhard-style highlight shoulder: identity below `_SHOULDER_START`
     (C1-continuous at the boundary -- both sides approach slope 1 there, so

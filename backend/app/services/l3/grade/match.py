@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.services.l3.grade.cdl import Grade, compose
+from app.services.l3.grade.reference import GroupReference
+from app.services.l3.grade.tone import WORKING_SPACE_V1, to_working_scalar
 
 RGB_DIST_MAX = 0.12       # mean-RGB Euclidean distance (0..1 scale) to group two files
 MATCH_STRENGTH = 0.4      # conservative: nudge 40% of the way toward the anchor, never all the way
@@ -30,6 +32,19 @@ MATCH_STRENGTH = 0.4      # conservative: nudge 40% of the way toward the anchor
 
 def _rgb_dist(a: List[float], b: List[float]) -> float:
     return sum((a[i] - b[i]) ** 2 for i in range(3)) ** 0.5
+
+
+def _proj(value: Optional[float], working_space: str) -> Optional[float]:
+    """Project a DISPLAY scalar into the space the match delta is APPLIED.
+    Under v1 the composed CDL runs between `to_working` and `from_working`
+    (lut_bake.py), so a levels/cast delta solved on raw display span stats
+    would be applied to LINEARIZED values and mis-anchor (the same
+    display-vs-linear mismatch that crushed the correct layer). Legacy is
+    identity (no float32 round-trip -> byte-for-byte unchanged). `None` passes
+    through so the mid-gray nudge's optional-input handling is preserved."""
+    if value is None or working_space != WORKING_SPACE_V1:
+        return value
+    return to_working_scalar(value, None, WORKING_SPACE_V1)
 
 
 def cluster_grade_groups(
@@ -113,10 +128,18 @@ def solve_match_deltas(
 # rgb_mean -- span stats are the more precise signal (Step 1.2), so the same
 # threshold now catches matches whole-file measurement diluted away.
 SPAN_RGB_DIST_MAX = 0.12
-SPAN_MATCH_STRENGTH = 0.4     # mirrors MATCH_STRENGTH: a nudge, never a full match
-CAST_MATCH_STRENGTH = 0.3     # gentler -- this composes ON TOP of the levels nudge
+# color_shot_matching.plan.md Phase 4a: with Balance (job.py) now owning the
+# bulk of exposure convergence toward the same group reference, Match's
+# strengths were raised so the residual placement/cast spread actually
+# closes instead of leaving ~60%/70% of it in place. Safe because the
+# composite guardrails (resolver.COMPOSITE_SLOPE_MAX/MID_FLOOR) still bound
+# the final stacked CDL regardless. Only consumed by `solve_sequence_match`
+# (the v1-only path) -- legacy's `solve_match_deltas` uses the separate
+# `MATCH_STRENGTH` constant above and is unaffected.
+SPAN_MATCH_STRENGTH = 0.85    # was 0.4 -- converge placement hard toward the group reference
+CAST_MATCH_STRENGTH = 0.6     # was 0.3 -- lift cast convergence for genuine same-scene groups
 CAST_CLAMP = 1.3              # never-worse ceiling on the per-channel cast multiplier
-MID_MATCH_CLAMP = 1.2         # never-worse ceiling on the extra mid-gray nudge
+MID_MATCH_CLAMP = 1.5         # was 1.2 -- allow a real exposure convergence, still bounded
 
 
 @dataclass
@@ -186,6 +209,7 @@ def _levels_delta_toward(
 
 def solve_sequence_match(
     ordered_shots: List[ShotStats], groups: Optional[List[List[int]]] = None,
+    working_space: str = "rec709", references: Optional[Dict[int, GroupReference]] = None,
 ) -> Dict[str, Grade]:
     """shot_key -> a conservative CDL delta nudging that shot's SPAN-measured
     color toward its neighbor-group's anchor (the highest-quality span in a
@@ -199,29 +223,54 @@ def solve_sequence_match(
     use INSTEAD of the default RGB-based `group_neighbors` -- lets matching
     align shots that are the same scene BY MEANING even when a transient
     (a bright object entering) skews their RGB. None (default) keeps Step
-    1.4's behavior exactly."""
+    1.4's behavior exactly.
+
+    `working_space` (v1): the space the resulting delta is APPLIED in at bake
+    time. GROUPING stays in display space (a perceptual "same scene?" gate,
+    unchanged by this arg), but the slope/offset/cast DELTAS are solved on
+    working-space-projected span stats so they anchor correctly through the
+    v1 bake wrapper (see `_proj`). Legacy default solves in display space.
+
+    `references` (color_shot_matching.plan.md Phase 3, optional): group-index
+    -> a robust `GroupReference` (DISPLAY-space, same as `_proj` expects --
+    see job.py's comment on building two references per group to avoid
+    double-projection) to match EVERY member toward, replacing the
+    single-shot `max(quality, key)` anchor -- and replacing "the anchor is
+    exempt" with "every member gets a delta," since there's no longer a
+    distinguished member. `None` (default) reproduces today's anchor-based
+    behavior exactly, byte-for-byte -- only `run_grade_job` (v1, when
+    `settings.grade_shot_match_v2`) passes `references`."""
     out: Dict[str, Grade] = {}
-    for idxs in (groups if groups is not None else group_neighbors(ordered_shots)):
+    for gi, idxs in enumerate(groups if groups is not None else group_neighbors(ordered_shots)):
         if len(idxs) < 2:
             continue
         members = [ordered_shots[i] for i in idxs]
-        anchor = max(members, key=lambda s: (s.quality, s.key))
-        a = anchor.stats or {}
-        a_black = float(a.get("black_point") if a.get("black_point") is not None else 0.0)
-        a_white = float(a.get("white_point") if a.get("white_point") is not None else 1.0)
-        a_mid = a.get("mid_gray")
-        a_mid = float(a_mid) if a_mid is not None else None
-        a_rgb = a.get("rgb_mean") or [0.5, 0.5, 0.5]
+        ref = (references or {}).get(gi)
+        if ref is not None:
+            a_black = _proj(float(ref.black_point), working_space)
+            a_white = _proj(float(ref.white_point), working_space)
+            a_mid = _proj(float(ref.mid_gray), working_space)
+            a_rgb = [_proj(float(c), working_space) for c in ref.rgb_mean]
+            anchor_key = None   # no member is "the anchor" -- every member matches the reference
+        else:
+            anchor = max(members, key=lambda s: (s.quality, s.key))
+            a = anchor.stats or {}
+            a_black = _proj(float(a.get("black_point") if a.get("black_point") is not None else 0.0), working_space)
+            a_white = _proj(float(a.get("white_point") if a.get("white_point") is not None else 1.0), working_space)
+            a_mid = a.get("mid_gray")
+            a_mid = _proj(float(a_mid), working_space) if a_mid is not None else None
+            a_rgb = [_proj(float(c), working_space) for c in (a.get("rgb_mean") or [0.5, 0.5, 0.5])]
+            anchor_key = anchor.key
 
         for s in members:
-            if s.key == anchor.key:
+            if anchor_key is not None and s.key == anchor_key:
                 continue
             m = s.stats or {}
-            m_black = float(m.get("black_point") if m.get("black_point") is not None else 0.0)
-            m_white = float(m.get("white_point") if m.get("white_point") is not None else 1.0)
+            m_black = _proj(float(m.get("black_point") if m.get("black_point") is not None else 0.0), working_space)
+            m_white = _proj(float(m.get("white_point") if m.get("white_point") is not None else 1.0), working_space)
             m_mid = m.get("mid_gray")
-            m_mid = float(m_mid) if m_mid is not None else None
-            m_rgb = m.get("rgb_mean") or [0.5, 0.5, 0.5]
+            m_mid = _proj(float(m_mid), working_space) if m_mid is not None else None
+            m_rgb = [_proj(float(c), working_space) for c in (m.get("rgb_mean") or [0.5, 0.5, 0.5])]
 
             luma_slope, luma_offset = _levels_delta_toward(
                 m_black, m_white, a_black, a_white, m_mid, a_mid, SPAN_MATCH_STRENGTH,

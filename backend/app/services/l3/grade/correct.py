@@ -43,6 +43,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from app.services.l3.grade.cdl import Grade
 from app.services.l3.grade.colorspace import is_neutral
+from app.services.l3.grade.tone import WORKING_SPACE_V1, to_working_scalar
 
 TARGET_BLACK = 0.02
 TARGET_WHITE = 0.97
@@ -75,6 +76,20 @@ def _compose(s1: float, o1: float, s2: float, o2: float) -> Tuple[float, float]:
     return s1 * s2, o1 * s2 + o2
 
 
+def _project(value: float, working_space: str) -> float:
+    """Project a DISPLAY scalar into the space the CDL is actually applied.
+    v1 bakes the CDL BETWEEN `to_working` (display->linear) and `from_working`
+    (lut_bake.py), so a levels solve targeting display anchors must be solved
+    on the LINEARIZED points to round-trip correctly (otherwise a
+    display-space negative offset gets subtracted from a linearized midtone and
+    crushes it -- the "everything too dark" bug). Legacy solves in display
+    space exactly as before -- identity here (no float32 round-trip, so
+    byte-for-byte unchanged)."""
+    if working_space != WORKING_SPACE_V1:
+        return value
+    return to_working_scalar(value, None, WORKING_SPACE_V1)
+
+
 def _solve_wb(
     color_stats: Dict[str, Any], white_reference_rgb: Optional[Tuple[float, float, float]]
 ) -> Tuple[float, float, float]:
@@ -99,13 +114,23 @@ def _solve_wb(
     return clamped[0], clamped[1], clamped[2]
 
 
-def _solve_levels(color_stats: Dict[str, Any], clip_shadow: float, clip_highlight: float) -> Tuple[float, float]:
+def _solve_levels(
+    color_stats: Dict[str, Any], clip_shadow: float, clip_highlight: float,
+    working_space: str = "rec709",
+) -> Tuple[float, float]:
     black = float(color_stats.get("black_point") if color_stats.get("black_point") is not None else 0.0)
     white = float(color_stats.get("white_point") if color_stats.get("white_point") is not None else 1.0)
     if clip_shadow > MAX_CLIP_PCT_FOR_STRETCH or clip_highlight > MAX_CLIP_PCT_FOR_STRETCH or white <= black:
         return 1.0, 0.0
+    # Pick the never-worse display-space anchors first (the >/< comparisons are
+    # monotone under to_working, so the CHOICE is space-independent), then solve
+    # slope/offset in whichever space the CDL is applied (see `_project`).
     target_low = TARGET_BLACK if black > TARGET_BLACK else black
     target_high = TARGET_WHITE if white < TARGET_WHITE else white
+    black = _project(black, working_space)
+    white = _project(white, working_space)
+    target_low = _project(target_low, working_space)
+    target_high = _project(target_high, working_space)
     slope = (target_high - target_low) / max(1e-4, (white - black))
     slope = min(slope, LEVELS_SLOPE_MAX)
     # Re-anchor with the (possibly capped) slope so blacks still land on
@@ -115,7 +140,10 @@ def _solve_levels(color_stats: Dict[str, Any], clip_shadow: float, clip_highligh
     return slope, offset
 
 
-def _solve_levels_v1(color_stats: Dict[str, Any], clip_shadow: float, clip_highlight: float) -> Tuple[float, float]:
+def _solve_levels_v1(
+    color_stats: Dict[str, Any], clip_shadow: float, clip_highlight: float,
+    working_space: str = WORKING_SPACE_V1,
+) -> Tuple[float, float]:
     """Percentile-based exposure (Step 1.3): start from the SAME never-worse
     black/white anchoring `_solve_levels` already does, then ALSO nudge the
     resulting `mid_gray` toward `TARGET_MID_GRAY` -- a small, tightly-clamped
@@ -124,17 +152,23 @@ def _solve_levels_v1(color_stats: Dict[str, Any], clip_shadow: float, clip_highl
     it). This catches a shot whose black/white points are already fine (so
     the legacy stretch alone is a no-op) but whose overall exposure still
     reads dim/bright -- the case percentile-only correction can't reach."""
-    slope, offset = _solve_levels(color_stats, clip_shadow, clip_highlight)
+    slope, offset = _solve_levels(color_stats, clip_shadow, clip_highlight, working_space=working_space)
     mid = color_stats.get("mid_gray")
     if mid is None:
         return slope, offset
-    projected_mid = float(mid) * slope + offset
+    # slope/offset already live in `working_space`; project the mid measurement
+    # and its target into the SAME space so the nudge is solved consistently.
+    mid = _project(float(mid), working_space)
+    target_mid = _project(TARGET_MID_GRAY, working_space)
+    projected_mid = mid * slope + offset
     if projected_mid <= 1e-6:
         return slope, offset
-    extra = max(1.0 / MID_GRAY_EXTRA_CLAMP, min(MID_GRAY_EXTRA_CLAMP, TARGET_MID_GRAY / projected_mid))
+    extra = max(1.0 / MID_GRAY_EXTRA_CLAMP, min(MID_GRAY_EXTRA_CLAMP, target_mid / projected_mid))
     new_slope = slope * extra
     black = float(color_stats.get("black_point") if color_stats.get("black_point") is not None else 0.0)
     target_low = TARGET_BLACK if black > TARGET_BLACK else black
+    black = _project(black, working_space)
+    target_low = _project(target_low, working_space)
     if new_slope > LEVELS_SLOPE_MAX:
         new_slope = LEVELS_SLOPE_MAX
     new_offset = target_low - black * new_slope
@@ -164,22 +198,25 @@ def solve_correct_grade(
     clip_highlight = float(color_stats.get("clip_highlight_pct") or 0.0)
     black = float(color_stats.get("black_point") if color_stats.get("black_point") is not None else 0.0)
 
+    working_space = WORKING_SPACE_V1 if pipeline == "v1" else "rec709"
     wb_r, wb_g, wb_b = _solve_wb(color_stats, white_reference_rgb)
     levels_fn = _solve_levels_v1 if pipeline == "v1" else _solve_levels
-    luma_slope, luma_offset = levels_fn(color_stats, clip_shadow, clip_highlight)
+    luma_slope, luma_offset = levels_fn(color_stats, clip_shadow, clip_highlight, working_space=working_space)
 
     if color_stats.get("is_log_flat") and clip_shadow <= MAX_CLIP_PCT_FOR_STRETCH:
         # Pivot-preserving around REC709's standard mid-gray target so the
-        # extra lift doesn't drag overall brightness with it.
+        # extra lift doesn't drag overall brightness with it. Under v1 the
+        # levels op above is in working (linear) space, so the pivot must be
+        # too -- otherwise the lift composes across two different spaces.
         lift_slope = LOG_FLAT_PRE_LIFT
-        lift_offset = MID_GRAY_PIVOT * (1.0 - LOG_FLAT_PRE_LIFT)
+        lift_offset = _project(MID_GRAY_PIVOT, working_space) * (1.0 - LOG_FLAT_PRE_LIFT)
         luma_slope, luma_offset = _compose(luma_slope, luma_offset, lift_slope, lift_offset)
         # The lift composes ON TOP of the already-capped stretch, so the product
         # can exceed the ceiling again -- re-clamp, re-anchoring blacks to target.
         if luma_slope > LEVELS_SLOPE_MAX:
             target_low = TARGET_BLACK if black > TARGET_BLACK else black
             luma_slope = LEVELS_SLOPE_MAX
-            luma_offset = target_low - black * luma_slope
+            luma_offset = _project(target_low, working_space) - _project(black, working_space) * luma_slope
 
     slope = (wb_r * luma_slope, wb_g * luma_slope, wb_b * luma_slope)
     offset = (luma_offset, luma_offset, luma_offset)

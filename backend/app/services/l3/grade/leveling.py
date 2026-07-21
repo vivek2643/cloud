@@ -39,7 +39,11 @@ from app.services.l3.grade.cdl import Grade, compose
 
 # A low-pass window this wide (in SHOTS, not ms) flattens shot-to-shot
 # flicker while still tracking a real slow arc across a scene.
-LEVELING_WINDOW = 5
+# color_shot_matching.plan.md Phase 4b: widened from 5 -- a narrower window
+# let Leveling re-diverge what Match/Balance had just converged (it was
+# targeting a different, LOCAL reference than their group reference). A
+# wider low-pass tracks only a slow arc, so it stops fighting them.
+LEVELING_WINDOW = 9
 
 # Never move a shot's exposure/tonal placement by more than this many
 # "stops" (2**stops multiplier in working-space linear terms) -- large
@@ -65,12 +69,25 @@ class ShotLevelInput:
     on the hero frame; when present and not a silhouette (see
     `_usable_subject_luma`), exposure leveling targets IT instead of the
     whole-frame `mid_gray` -- the perceptually correct evenness for people
-    content (a consistent face brightness, not a consistent frame average)."""
+    content (a consistent face brightness, not a consistent frame average).
+
+    `target_*` (color_shot_matching.plan.md Phase 4b escalation, optional):
+    an EXPLICIT target -- a scene-group's robust reference, already solved
+    by Balance/Match -- to level toward INSTEAD OF the local smooth-target
+    average. Without this, Leveling's own local window average can
+    re-diverge what Balance/Match just converged toward a DIFFERENT
+    (robust-reference) target (verified: on an adversarial synthetic
+    multi-shot group, local-window leveling alone re-introduced most of the
+    spread Balance+Match had just closed). `None` (default, and always for
+    singleton/ungrouped shots) keeps today's smooth-target behavior."""
     key: str
     mid_gray: float
     black_point: float
     white_point: float
     subject_luma: Optional[float] = None
+    target_mid_gray: Optional[float] = None
+    target_black_point: Optional[float] = None
+    target_white_point: Optional[float] = None
 
 
 def _smooth_target(values: List[float]) -> List[float]:
@@ -136,11 +153,17 @@ def _exposure_value(s: ShotLevelInput) -> float:
 def solve_exposure_leveling(ordered_shots: List[ShotLevelInput]) -> Dict[str, Grade]:
     """Step 2.1 (+ Step 3.1's subject-aware extension): nudge each shot's
     exposure toward a smooth target across the sequence, bounded. <2 shots
-    -> nothing to level against."""
+    -> nothing to level against. A shot with `target_mid_gray` set (Phase
+    4b) uses that EXPLICIT target instead of the local smooth-target
+    average."""
     if len(ordered_shots) < 2:
         return {}
     values = [_exposure_value(s) for s in ordered_shots]
-    targets = _smooth_target(values)
+    smooth_targets = _smooth_target(values)
+    targets = [
+        s.target_mid_gray if s.target_mid_gray is not None else t
+        for s, t in zip(ordered_shots, smooth_targets)
+    ]
     out: Dict[str, Grade] = {}
     for s, value, target in zip(ordered_shots, values, targets):
         gain = _capped_gain(value, target, EXPOSURE_CAP_STOPS)
@@ -153,13 +176,23 @@ def solve_exposure_leveling(ordered_shots: List[ShotLevelInput]) -> Dict[str, Gr
 def solve_tonal_leveling(ordered_shots: List[ShotLevelInput]) -> Dict[str, Grade]:
     """Step 2.2: align each shot's shadow/highlight PLACEMENT toward the
     sequence's smooth target -- a bounded levels-style remap, skipping
-    statistical outliers and never pushing toward clipping."""
+    statistical outliers and never pushing toward clipping. A shot with
+    `target_black_point`/`target_white_point` set (Phase 4b) uses those
+    EXPLICIT targets instead of the local smooth-target average."""
     if len(ordered_shots) < 2:
         return {}
     blacks = [s.black_point for s in ordered_shots]
     whites = [s.white_point for s in ordered_shots]
-    black_targets = _smooth_target(blacks)
-    white_targets = _smooth_target(whites)
+    smooth_black_targets = _smooth_target(blacks)
+    smooth_white_targets = _smooth_target(whites)
+    black_targets = [
+        s.target_black_point if s.target_black_point is not None else t
+        for s, t in zip(ordered_shots, smooth_black_targets)
+    ]
+    white_targets = [
+        s.target_white_point if s.target_white_point is not None else t
+        for s, t in zip(ordered_shots, smooth_white_targets)
+    ]
 
     out: Dict[str, Grade] = {}
     for s, b_target, w_target in zip(ordered_shots, black_targets, white_targets):

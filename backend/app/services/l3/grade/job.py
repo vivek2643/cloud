@@ -31,22 +31,33 @@ import psycopg
 
 from app.config import get_settings
 from app.services.jobs import app as jobs_app
+from app.services.l3.grade.balance import solve_balance
 from app.services.l3.grade.cache import ensure_cube_file
 from app.services.l3.grade.cdl import Grade
 from app.services.l3.grade.leveling import ShotLevelInput, solve_leveling
-from app.services.l3.grade.match import ShotStats, solve_sequence_match
+from app.services.l3.grade.match import ShotStats, group_neighbors, solve_sequence_match
 from app.services.l3.grade.measure import fetch_color_stats
 from app.services.l3.grade.measure_span import measure_span
+from app.services.l3.grade.reference import GroupReference, compute_group_reference
 from app.services.l3.grade.resolver import resolve_clip_grade
 from app.services.l3.grade.scene_group import ShotSceneMeta as SceneMeta
 from app.services.l3.grade.scene_group import group_shots_semantically
-from app.services.l3.grade.tone import WORKING_SPACE_V1, to_working
+from app.services.l3.grade.tone import WORKING_SPACE_V1, from_working_scalar, to_working_scalar
 
 logger = logging.getLogger(__name__)
 
 # Bump when compute_input_hash's payload shape changes so old hashes never
-# collide with a differently-computed new one.
-INPUT_HASH_SCHEMA_VERSION = 1
+# collide with a differently-computed new one -- OR when the grade MATH itself
+# changes (the produced grade for the same payload differs), so every thread's
+# cached `done` grades are invalidated and re-graded on next run.
+# v2: Correct/Match now solve in the v1 working space + composite guardrails
+# (was solving in display space then applying in linear -> crushed shadows).
+# v3 (color_shot_matching.plan.md): two-stage group->balance->match redesign
+# -- graceful RGB grouping fallback, a new Balance layer, a robust
+# median-member group reference replacing the arbitrary anchor, stronger
+# Match strengths, a wider Leveling window. The grade math changed, so every
+# cached grade must be recomputed.
+INPUT_HASH_SCHEMA_VERSION = 3
 
 # Same local-disk, content-addressed cube cache the preview cube endpoint and
 # the render compositor already use (grade/cache.py's documented "not shared
@@ -59,16 +70,81 @@ def _pg() -> psycopg.Connection:
 
 
 def _to_working_scalar(value: Optional[float], default: Optional[float]) -> float:
-    """Project one DISPLAY-encoded scalar (a measured mid_gray/black_point/
-    white_point/subject_luma) into the v1 working space -- same transform
-    Step 1.5's `_corrected_source_stats` applies to `rgb_mean`, just for a
-    single luma value instead of an RGB triple. `value is None` -> `default`
-    (already assumed working-space-safe, e.g. the levels solver's own
-    fallback constants)."""
+    """Thin wrapper over the shared `tone.to_working_scalar` (kept for this
+    module's call sites) -- projects one DISPLAY-encoded scalar (a measured
+    mid_gray/black_point/white_point/subject_luma) into the v1 working space,
+    the same transform correct.py/match.py now use to solve their levels
+    CDL in the space it's applied. `value is None` -> `default`."""
+    return to_working_scalar(value, default, WORKING_SPACE_V1)
+
+
+def _has_real_groups(groups: Optional[List[List[int]]]) -> bool:
+    """color_shot_matching.plan.md Phase 1: True iff at least one group has
+    2+ members (i.e. grouping actually found structure to match on). All-
+    singletons means the semantic signals were absent/unhelpful for this
+    document -- fall back to RGB adjacency (`match.group_neighbors`)
+    instead of silently letting matching do nothing."""
+    return bool(groups) and any(len(g) >= 2 for g in groups)
+
+
+def _ws_stats(stats: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """color_shot_matching.plan.md Phase 2: project one shot's DISPLAY-space
+    color_stats dict into WORKING-space scalars -- the shape both
+    `reference.compute_group_reference` and `balance.solve_balance` operate
+    on (Balance's math has to live in the same space the CDL is applied,
+    same reasoning as correct.py/match.py's `_project`/`_proj`)."""
+    stats = stats or {}
+    mid = stats.get("mid_gray")
+    return {
+        "mid_gray": _to_working_scalar(mid, None) if mid is not None else None,
+        "black_point": _to_working_scalar(stats.get("black_point"), 0.0),
+        "white_point": _to_working_scalar(stats.get("white_point"), 1.0),
+        "rgb_mean": [_to_working_scalar(c, 0.5) for c in (stats.get("rgb_mean") or [0.5, 0.5, 0.5])],
+    }
+
+
+def _apply_working_scalar(value: Optional[float], grade: Grade, channel: int = 1) -> Optional[float]:
+    """Apply one channel of an already-solved `grade`'s slope/offset to a
+    WORKING-space scalar. Channel 1 (green) by construction is never
+    touched by Balance's white-balance term (balance.py always normalizes
+    so the green multiplier is exactly 1.0), so this isolates the
+    exposure/contrast contribution -- the right channel for projecting an
+    ACHROMATIC scalar (black/white/mid_gray) through a per-channel grade."""
     if value is None:
-        return default if default is not None else 0.0
-    import numpy as np
-    return float(to_working(np.array([float(value)], dtype=np.float32), WORKING_SPACE_V1)[0])
+        return None
+    return value * grade.slope[channel] + grade.offset[channel]
+
+
+def _corrected_display_stats(ws: Dict[str, Any], grade: Grade) -> Dict[str, Any]:
+    """color_shot_matching.plan.md Phase 2c: project a shot's WORKING-space
+    stats (`_ws_stats`) through an already-solved `grade` (its Balance
+    delta) and back to DISPLAY space, so a LATER stage (Match) solves
+    against the image AS CORRECTED, not the raw source -- the same "solve
+    against the corrected image" discipline resolver.py's
+    `_corrected_source_stats` already uses for the Look layer.
+
+    This is NOT optional polish: composing two independently-solved "move
+    toward the same group reference" deltas (Balance's, then Match's, both
+    aimed at the raw source) does not converge -- it overshoots, because
+    Match's own delta was solved assuming the shot was still at its RAW
+    position. Verified empirically (an adversarial synthetic 5-shot group,
+    color_shot_matching.plan.md's own suggested mids [0.30, 0.55, 0.32,
+    0.50, 0.35]): composing Match-on-raw-stats on top of Balance left
+    cross-shot mid_gray stdev at 0.101 (vs 0.101 pre-redesign -- a virtual
+    no-op) and actually WORSENED contrast stdev (0.138 -> 0.218); Match
+    solved against THESE corrected stats instead converges mid_gray stdev
+    to 0.011 and contrast stdev to 0.081 on the same fixture."""
+    mid = ws.get("mid_gray")
+    rgb = ws.get("rgb_mean") or [0.5, 0.5, 0.5]
+    corrected_mid = _apply_working_scalar(mid, grade, 1)
+    return {
+        "black_point": from_working_scalar(_apply_working_scalar(ws.get("black_point"), grade, 1), WORKING_SPACE_V1),
+        "white_point": from_working_scalar(_apply_working_scalar(ws.get("white_point"), grade, 1), WORKING_SPACE_V1),
+        "mid_gray": from_working_scalar(corrected_mid, WORKING_SPACE_V1) if corrected_mid is not None else None,
+        "rgb_mean": [
+            from_working_scalar(_apply_working_scalar(rgb[c], grade, c), WORKING_SPACE_V1) for c in range(3)
+        ],
+    }
 
 
 # --------------------------------------------------------------------------
@@ -139,6 +215,7 @@ def compute_input_hash(document: Dict[str, Any]) -> str:
             "grade_pipeline": settings.grade_pipeline,
             "grade_even_lighting": settings.grade_even_lighting,
             "grade_semantic": settings.grade_semantic,
+            "grade_shot_match_v2": settings.grade_shot_match_v2,
         },
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
@@ -244,7 +321,17 @@ def maybe_enqueue(thread_id: str, document: Dict[str, Any]) -> None:
         return
     _upsert_job_status(thread_id, state="idle", input_hash=h)
     try:
-        jobs_app.configure_task("run_grade_job", queue="grade").defer(thread_id=thread_id)
+        # Short-lived, per-call connector opened around the defer -- mirrors
+        # upload.py::_enqueue_l1 / renders.py::_enqueue. The API process never
+        # opens the shared `jobs_app`, so `jobs_app.configure_task(...).defer()`
+        # raised AppNotOpen, got swallowed by the except below, and NO grade job
+        # was ever enqueued (every look/trim silently no-op'd the preview).
+        from procrastinate import App, PsycopgConnector
+
+        enqueue_app = App(connector=PsycopgConnector(
+            conninfo=get_settings().database_url, min_size=1, max_size=2))
+        with enqueue_app.open():
+            enqueue_app.configure_task("run_grade_job", queue="grade").defer(thread_id=thread_id)
     except Exception:
         logger.exception("grade.job: failed to enqueue run_grade_job for thread %s", thread_id)
 
@@ -313,27 +400,123 @@ def run_grade_job(thread_id: str) -> None:
                 for s in shots
             ]
             semantic_groups = group_shots_semantically(scene_meta)
-        match_deltas: Dict[str, Grade] = solve_sequence_match(
-            [shot_stats[s.key] for s in shots], groups=semantic_groups,
-        )
+
+        ordered = [shot_stats[s.key] for s in shots]
+        # Safe defaults for the kill-switch (grade_shot_match_v2=False) path
+        # below, so the Leveling block (which runs regardless of the flag)
+        # can branch on `groups`/`balance_references` without a NameError.
+        groups: List[List[int]] = []
+        ws_stats: List[Dict[str, Any]] = []
+        balance_references: Dict[int, GroupReference] = {}
+        if settings.grade_shot_match_v2:
+            # color_shot_matching.plan.md Phase 1: an all-singleton semantic
+            # result means the signals were absent/unhelpful for THIS
+            # document (the common real-data case: speaker_person/on_camera/
+            # label/summary all unset) -- degrade to the RGB fallback
+            # instead of silently letting Match do nothing (SS2 "primary
+            # cause": singleton groups are skipped, and a non-None `groups`
+            # bypasses group_neighbors entirely).
+            if not _has_real_groups(semantic_groups):
+                semantic_groups = None
+            groups = semantic_groups if semantic_groups is not None else group_neighbors(ordered)
+
+            # Phase 2a: Balance's robust reference, solved on WORKING-space
+            # stats (Balance's math has to live in the space the CDL is
+            # applied).
+            display_stats = [o.stats or {} for o in ordered]
+            ws_stats = [_ws_stats(o.stats) for o in ordered]
+            for gi, idxs in enumerate(groups):
+                b_ref = compute_group_reference([ws_stats[i] for i in idxs])
+                if b_ref is not None:
+                    balance_references[gi] = b_ref
+
+            balance_deltas: Dict[str, Grade] = solve_balance(
+                ws_stats, groups, balance_references, [s.key for s in shots],
+            )
+
+            # Phase 2c: Match solves against the AS-BALANCED image, not the
+            # raw span stats -- same "corrected source" discipline
+            # resolver.py's _corrected_source_stats already uses for the
+            # Look layer. Composing two independently-solved "toward the
+            # same reference" deltas on the RAW stats does not converge, it
+            # overshoots (see _corrected_display_stats's docstring for the
+            # verified numbers) -- this is what makes Balance and Match
+            # actually reinforce instead of fight.
+            balanced_display_stats = [
+                display_stats[i] if o.key not in balance_deltas
+                else _corrected_display_stats(ws_stats[i], balance_deltas[o.key])
+                for i, o in enumerate(ordered)
+            ]
+            match_references: Dict[int, GroupReference] = {}
+            for gi, idxs in enumerate(groups):
+                m_ref = compute_group_reference([balanced_display_stats[i] for i in idxs])
+                if m_ref is not None:
+                    match_references[gi] = m_ref
+            balanced_shots = [
+                ShotStats(key=o.key, file_id=o.file_id, stats=balanced_display_stats[i])
+                for i, o in enumerate(ordered)
+            ]
+            match_deltas: Dict[str, Grade] = solve_sequence_match(
+                balanced_shots, groups=groups, working_space=WORKING_SPACE_V1,
+                references=match_references,
+            )
+        else:
+            # Kill switch (color_shot_matching.plan.md SS6): the exact
+            # pre-redesign v1 path -- semantic-or-nothing grouping (no RGB
+            # fallback), no Balance, no robust reference (single-anchor
+            # matching at the old, weaker strengths is NOT reproduced here
+            # since those constants changed in place -- see match.py's
+            # comment on why that's an accepted, documented tradeoff of the
+            # "flag-gates only the structural additions" rollback shape).
+            balance_deltas = {}
+            match_deltas = solve_sequence_match(
+                ordered, groups=semantic_groups, working_space=WORKING_SPACE_V1,
+            )
 
         # Phase 2: ONE leveling pass (exposure + tonal placement), gated on
         # grade_even_lighting -- working-space-projected scalars, same
         # projection Step 1.5's _corrected_source_stats already uses.
         leveling_deltas: Dict[str, Grade] = {}
         if settings.grade_even_lighting:
+            from app.services.l3.grade.cdl import compose as _compose
+
             level_inputs = []
-            for s in shots:
+            for i, s in enumerate(shots):
                 stats = shot_stats[s.key].stats or {}
-                mid_gray = _to_working_scalar(stats.get("mid_gray"), 0.5)
-                black = _to_working_scalar(stats.get("black_point"), 0.0)
-                white = _to_working_scalar(stats.get("white_point"), 1.0)
                 subj = stats.get("subject_luma")
                 subject_luma = _to_working_scalar(subj, None) if subj is not None else None
-                level_inputs.append(ShotLevelInput(
-                    key=s.key, mid_gray=mid_gray, black_point=black, white_point=white,
-                    subject_luma=subject_luma,
-                ))
+
+                # Phase 4b: for a shot that's a member of a real (2+) Balance
+                # /Match group, level its CURRENT value from the AS-CORRECTED
+                # (post Balance+Match) stats, toward an EXPLICIT target (the
+                # SAME group reference Balance/Match already converged on)
+                # instead of the local smooth-target average -- otherwise
+                # Leveling's own window average re-diverges what they just
+                # aligned. Ungrouped shots keep the original local-smoothing
+                # behavior exactly (target_* stays None).
+                group_idx = next((gi for gi, idxs in enumerate(groups) if i in idxs), None)
+                ref = balance_references.get(group_idx) if group_idx is not None else None
+                if ref is not None and ws_stats:
+                    bm_grade = _compose(balance_deltas.get(s.key, Grade()), match_deltas.get(s.key, Grade()), 1.0)
+                    mid_gray = _apply_working_scalar(ws_stats[i].get("mid_gray"), bm_grade, 1)
+                    if mid_gray is None:
+                        mid_gray = 0.5   # same uncorrected fallback constant as the no-group path
+                    black = _apply_working_scalar(ws_stats[i]["black_point"], bm_grade, 1)
+                    white = _apply_working_scalar(ws_stats[i]["white_point"], bm_grade, 1)
+                    level_inputs.append(ShotLevelInput(
+                        key=s.key, mid_gray=mid_gray, black_point=black, white_point=white,
+                        subject_luma=subject_luma,
+                        target_mid_gray=ref.mid_gray, target_black_point=ref.black_point,
+                        target_white_point=ref.white_point,
+                    ))
+                else:
+                    mid_gray = _to_working_scalar(stats.get("mid_gray"), 0.5)
+                    black = _to_working_scalar(stats.get("black_point"), 0.0)
+                    white = _to_working_scalar(stats.get("white_point"), 1.0)
+                    level_inputs.append(ShotLevelInput(
+                        key=s.key, mid_gray=mid_gray, black_point=black, white_point=white,
+                        subject_luma=subject_luma,
+                    ))
             leveling_deltas = solve_leveling(level_inputs)
 
         cube_cache: Dict[str, Optional[str]] = {}
@@ -342,6 +525,7 @@ def run_grade_job(thread_id: str) -> None:
             stats = shot_stats[s.key].stats
             grade_json = resolve_clip_grade(
                 s.item, color_stats=stats, sequence_look=sequence_look,
+                balance_delta=balance_deltas.get(s.key),
                 match_delta=match_deltas.get(s.key), leveling_delta=leveling_deltas.get(s.key),
                 pipeline="v1",
             )
