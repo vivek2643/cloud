@@ -68,7 +68,12 @@ logger = logging.getLogger(__name__)
 # could crush a display ~0.15 shadow to pure black while mid-gray stayed
 # safely above the old floor; verified live on 7 of 53 real shots). The
 # grade math changed, so every cached grade must be recomputed.
-INPUT_HASH_SCHEMA_VERSION = 5
+# v6 (color_subject_exposure.plan.md): subject_box now gets populated from
+# cut_records.framing.subject_box (was always None -- the whole
+# subject_luma -> Leveling chain existed but was dormant), and Leveling
+# converges a grouped shot's subject_luma toward the group's median subject
+# luma instead of the group's whole-frame mid_gray. Grade math changed.
+INPUT_HASH_SCHEMA_VERSION = 6
 
 # Same local-disk, content-addressed cube cache the preview cube endpoint and
 # the render compositor already use (grade/cache.py's documented "not shared
@@ -228,6 +233,7 @@ def compute_input_hash(document: Dict[str, Any]) -> str:
             "grade_semantic": settings.grade_semantic,
             "grade_shot_match_v2": settings.grade_shot_match_v2,
             "grade_scene_join": settings.grade_scene_join,
+            "grade_subject_exposure": settings.grade_subject_exposure,
         },
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
@@ -383,15 +389,58 @@ def run_grade_job(thread_id: str) -> None:
         color_stats = fetch_color_stats(file_ids)
         sequence_look = document.get("look")
 
-        # Step 1.2 (+ Step 3.1): measure the span actually used; never-worse
-        # fallback to whole-file color_stats when span measurement fails/
-        # unavailable. subject_box (when the semantic flag is on and the
-        # item carries one -- see resolver.py's Step 1.7 note on why no
-        # caller derives it automatically yet) also measures subject_luma.
+        # color_subject_exposure.plan.md: the cut_records join (scene_meta's
+        # metadata + subject_box) must resolve BEFORE the measure loop below
+        # -- measure_span needs the subject box up front to measure
+        # subject_luma on the hero frame, whereas previously the join only
+        # ran AFTER measurement (scene grouping never needed anything from
+        # measure_span). One join, reused by both consumers: grade_scene_join
+        # gates whether the METADATA (label/summary/speaker/etc, used for
+        # grouping below) is attached; grade_subject_exposure gates whether
+        # the SUBJECT BOX (used for measurement) is attached. Either flag
+        # alone triggers the join; each flag independently controls only its
+        # own downstream usage, so toggling one never changes the other's
+        # behavior (verified: flip only grade_subject_exposure and grouping
+        # output is byte-identical; flip only grade_scene_join and no box
+        # ever reaches measure_span).
+        cut_meta = {}
+        if settings.grade_semantic and (settings.grade_scene_join or settings.grade_subject_exposure):
+            from app.services.l3.grade.scene_meta import lookup_shot_cut_meta
+
+            cut_meta = lookup_shot_cut_meta(
+                [(s.key, s.file_id, s.in_ms, s.out_ms) for s in shots]
+            )
+        subject_boxes: Dict[str, List[float]] = (
+            {k: m.subject_box for k, m in cut_meta.items() if m.subject_box}
+            if settings.grade_semantic and settings.grade_subject_exposure else {}
+        )
+
+        # Step 1.2 (+ Step 3.1, + color_subject_exposure.plan.md): measure
+        # the span actually used; never-worse fallback to whole-file
+        # color_stats when span measurement fails/unavailable. subject_box
+        # (the joined cut_records.framing.subject_box; an item-level
+        # subject_box -- always None today, no caller ever writes one --
+        # wins if somehow present, for forward-compat) also measures
+        # subject_luma, but ONLY on the hero frame -- and no real timeline
+        # seg carries its own hero_ts_ms (verified live: 0/many documents),
+        # so without a fallback the whole subject_luma chain stays inert
+        # even with a valid box. cut_records.hero_ts_ms is 100% populated
+        # and on the SAME source-time axis as in_ms/out_ms (the exact axis
+        # scene_meta's own overlap join already assumes) -- use it as a
+        # fallback, but ONLY when we're actually resolving a subject box,
+        # so a document/shot not using this feature never has its color-
+        # stats SAMPLE POINTS shifted (measure_span reuses hero_ts_ms to
+        # pick timestamps[0] even without a box -- scoping this narrowly
+        # keeps that pre-existing behavior byte-identical when unused).
         shot_stats: Dict[str, ShotStats] = {}
         for s in shots:
-            subject_box = s.item.get("subject_box") if settings.grade_semantic else None
-            stats = measure_span(s.file_id, s.in_ms, s.out_ms, hero_ts_ms=s.hero_ts_ms,
+            subject_box = s.item.get("subject_box") or subject_boxes.get(s.key)
+            hero_ts_ms = s.hero_ts_ms
+            if hero_ts_ms is None and subject_box is not None:
+                cm = cut_meta.get(s.key)
+                if cm is not None and cm.hero_ts_ms is not None:
+                    hero_ts_ms = cm.hero_ts_ms
+            stats = measure_span(s.file_id, s.in_ms, s.out_ms, hero_ts_ms=hero_ts_ms,
                                  subject_box=subject_box)
             if stats is None:
                 stats = color_stats.get(s.file_id)
@@ -404,24 +453,18 @@ def run_grade_job(thread_id: str) -> None:
         # shots that are the same scene BY MEANING, not merely RGB-close.
         # The raw timeline seg never carries speaker_person/on_camera/label/
         # summary (they live on cut_records, one join away) -- when
-        # grade_scene_join is on, join each shot to its covering cut_record
-        # for the real values, plus its own span rgb_mean as scene_group's
-        # graceful RGB base (see scene_group.py's trust hierarchy). Off:
-        # scene_meta carries no metadata AND no rgb_mean, so
-        # group_shots_semantically returns all-singletons exactly as before
-        # this plan, and the existing RGB-adjacency fallback below engages.
+        # grade_scene_join is on, use the (already-joined, see above) real
+        # values, plus its own span rgb_mean as scene_group's graceful RGB
+        # base (see scene_group.py's trust hierarchy). Off: scene_meta
+        # carries no metadata AND no rgb_mean, so group_shots_semantically
+        # returns all-singletons exactly as before this plan, and the
+        # existing RGB-adjacency fallback below engages -- regardless of
+        # whether the join above ran for grade_subject_exposure's sake.
         semantic_groups = None
         if settings.grade_semantic:
-            cut_meta = {}
-            if settings.grade_scene_join:
-                from app.services.l3.grade.scene_meta import lookup_shot_cut_meta
-
-                cut_meta = lookup_shot_cut_meta(
-                    [(s.key, s.file_id, s.in_ms, s.out_ms) for s in shots]
-                )
             scene_meta = []
             for s in shots:
-                cm = cut_meta.get(s.key)
+                cm = cut_meta.get(s.key) if settings.grade_scene_join else None
                 span_rgb = (shot_stats[s.key].stats or {}).get("rgb_mean") if settings.grade_scene_join else None
                 scene_meta.append(SceneMeta(
                     key=s.key, file_id=s.file_id,
@@ -515,7 +558,12 @@ def run_grade_job(thread_id: str) -> None:
         if settings.grade_even_lighting:
             from app.services.l3.grade.cdl import compose as _compose
 
-            level_inputs = []
+            group_idx_by_shot = [
+                next((gi for gi, idxs in enumerate(groups) if i in idxs), None)
+                for i in range(len(shots))
+            ]
+
+            level_inputs: List[ShotLevelInput] = []
             for i, s in enumerate(shots):
                 stats = shot_stats[s.key].stats or {}
                 subj = stats.get("subject_luma")
@@ -529,7 +577,7 @@ def run_grade_job(thread_id: str) -> None:
                 # Leveling's own window average re-diverges what they just
                 # aligned. Ungrouped shots keep the original local-smoothing
                 # behavior exactly (target_* stays None).
-                group_idx = next((gi for gi, idxs in enumerate(groups) if i in idxs), None)
+                group_idx = group_idx_by_shot[i]
                 ref = balance_references.get(group_idx) if group_idx is not None else None
                 if ref is not None and ws_stats:
                     bm_grade = _compose(balance_deltas.get(s.key, Grade()), match_deltas.get(s.key, Grade()), 1.0)
@@ -552,6 +600,33 @@ def run_grade_job(thread_id: str) -> None:
                         key=s.key, mid_gray=mid_gray, black_point=black, white_point=white,
                         subject_luma=subject_luma,
                     ))
+
+            # color_subject_exposure.plan.md Phase 2: a grouped shot's usable
+            # subject_luma should converge toward the GROUP's median SUBJECT
+            # luma (working space), not the group's whole-frame mid_gray
+            # reference (`target_mid_gray` above) -- a face's own brightness
+            # has no reason to equal the frame average. Computed inline here
+            # (not in reference.py) to keep the matching/balance math
+            # untouched, per this plan's own non-goals -- Balance/Match never
+            # see this value. <2 usable members in a group -> leave
+            # target_subject_luma unset (falls back to target_mid_gray).
+            if settings.grade_semantic and settings.grade_subject_exposure:
+                from statistics import median
+
+                from app.services.l3.grade.leveling import _usable_subject_luma
+
+                subject_by_group: Dict[int, List[float]] = {}
+                for i, gi in enumerate(group_idx_by_shot):
+                    if gi is None:
+                        continue
+                    usable = _usable_subject_luma(level_inputs[i].subject_luma, level_inputs[i].mid_gray)
+                    if usable is not None:
+                        subject_by_group.setdefault(gi, []).append(usable)
+                for i, gi in enumerate(group_idx_by_shot):
+                    members = subject_by_group.get(gi) if gi is not None else None
+                    if members and len(members) >= 2:
+                        level_inputs[i].target_subject_luma = median(members)
+
             leveling_deltas = solve_leveling(level_inputs)
 
         cube_cache: Dict[str, Optional[str]] = {}

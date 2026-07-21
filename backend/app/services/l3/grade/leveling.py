@@ -88,6 +88,15 @@ class ShotLevelInput:
     target_mid_gray: Optional[float] = None
     target_black_point: Optional[float] = None
     target_white_point: Optional[float] = None
+    # color_subject_exposure.plan.md Phase 2: a scene-group's median SUBJECT
+    # luma (working space), for a shot whose exposure value came from a
+    # usable subject_luma (see `_usable_subject_luma`). Without this, a
+    # grouped subject shot's subject_luma was leveled toward
+    # `target_mid_gray` -- the group's WHOLE-FRAME reference -- a mismatch
+    # (a face's own brightness has no reason to equal the frame average).
+    # `None` (default, and always for ungrouped/no-subject shots) keeps
+    # today's behavior: `target_mid_gray`, then the local smooth target.
+    target_subject_luma: Optional[float] = None
 
 
 def _smooth_target(values: List[float]) -> List[float]:
@@ -153,17 +162,24 @@ def _exposure_value(s: ShotLevelInput) -> float:
 def solve_exposure_leveling(ordered_shots: List[ShotLevelInput]) -> Dict[str, Grade]:
     """Step 2.1 (+ Step 3.1's subject-aware extension): nudge each shot's
     exposure toward a smooth target across the sequence, bounded. <2 shots
-    -> nothing to level against. A shot with `target_mid_gray` set (Phase
-    4b) uses that EXPLICIT target instead of the local smooth-target
-    average."""
+    -> nothing to level against. Target priority per shot: `target_subject_luma`
+    (color_subject_exposure.plan.md Phase 2 -- only when this shot's own
+    exposure value actually came from a USABLE subject_luma, never applied
+    to a whole-frame value) -> `target_mid_gray` (Phase 4b) -> the local
+    smooth-target average (today's behavior)."""
     if len(ordered_shots) < 2:
         return {}
     values = [_exposure_value(s) for s in ordered_shots]
     smooth_targets = _smooth_target(values)
-    targets = [
-        s.target_mid_gray if s.target_mid_gray is not None else t
-        for s, t in zip(ordered_shots, smooth_targets)
-    ]
+    targets = []
+    for s, t in zip(ordered_shots, smooth_targets):
+        has_usable_subject = _usable_subject_luma(s.subject_luma, s.mid_gray) is not None
+        if has_usable_subject and s.target_subject_luma is not None:
+            targets.append(s.target_subject_luma)
+        elif s.target_mid_gray is not None:
+            targets.append(s.target_mid_gray)
+        else:
+            targets.append(t)
     out: Dict[str, Grade] = {}
     for s, value, target in zip(ordered_shots, values, targets):
         gain = _capped_gain(value, target, EXPOSURE_CAP_STOPS)

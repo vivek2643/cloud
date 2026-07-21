@@ -27,7 +27,7 @@ from app.services.l3.grade import tone  # noqa: E402
 from app.services.l3.grade.cdl import Grade, apply_cdl, identity_grade_json  # noqa: E402
 from app.services.l3.grade.correct import solve_correct_grade  # noqa: E402
 from app.services.l3.grade.leveling import (  # noqa: E402
-    ShotLevelInput, solve_exposure_leveling, solve_leveling, solve_tonal_leveling,
+    SILHOUETTE_RATIO, ShotLevelInput, solve_exposure_leveling, solve_leveling, solve_tonal_leveling,
 )
 from app.services.l3.grade.lut_bake import bake_cube_text  # noqa: E402
 from app.services.l3.grade.match import ShotStats, group_neighbors, solve_sequence_match  # noqa: E402
@@ -1199,7 +1199,7 @@ def test_run_grade_job_groups_multi_file_reel_via_scene_join():
     rows = {}
     fake_settings = mock.Mock(
         grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
-        grade_shot_match_v2=True, grade_scene_join=True,
+        grade_shot_match_v2=True, grade_scene_join=True, grade_subject_exposure=False,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1239,7 +1239,7 @@ def test_run_grade_job_scene_join_does_not_over_group_unrelated_shots():
     rows = {}
     fake_settings = mock.Mock(
         grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
-        grade_shot_match_v2=True, grade_scene_join=True,
+        grade_shot_match_v2=True, grade_scene_join=True, grade_subject_exposure=False,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1280,7 +1280,7 @@ def test_run_grade_job_scene_join_fail_open_on_db_error():
     rows = {}
     fake_settings = mock.Mock(
         grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
-        grade_shot_match_v2=True, grade_scene_join=True,
+        grade_shot_match_v2=True, grade_scene_join=True, grade_subject_exposure=False,
     )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
@@ -1322,7 +1322,7 @@ def test_run_grade_job_scene_join_off_keeps_pre_plan_behavior():
     rows = {}
     fake_settings = mock.Mock(
         grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
-        grade_shot_match_v2=True, grade_scene_join=False,
+        grade_shot_match_v2=True, grade_scene_join=False, grade_subject_exposure=False,
     )
     join_spy = mock.Mock(side_effect=AssertionError("join must not be called when grade_scene_join=False"))
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
@@ -1342,6 +1342,283 @@ def test_run_grade_job_scene_join_off_keeps_pre_plan_behavior():
     non_identity = {k for k, gj in rows.items() if Grade.from_dict(gj["cdl"]) != Grade()}
     assert non_identity, rows
     print("ok  job: grade_scene_join=False never calls the DB join, RGB group_neighbors fallback unchanged")
+
+
+# --------------------------------------------------------------------------
+# color_subject_exposure.plan.md: subject_box join + Leveling subject
+# convergence (test 1 -- synthetic frame + degenerate box -- is already
+# covered by test_measure_subject_luma_reads_the_box_not_the_whole_frame /
+# test_measure_subject_luma_none_for_degenerate_box above; measure_span.py
+# is unchanged by this plan)
+# --------------------------------------------------------------------------
+
+def test_two_subjects_converge_after_leveling():
+    """Two shots, equal whole-frame mid_gray but subject_luma far apart
+    (0.25 vs 0.55, same group) must converge toward their working-space
+    median under solve_exposure_leveling, bounded by EXPOSURE_CAP_STOPS."""
+    from app.services.l3.grade.leveling import EXPOSURE_CAP_STOPS
+
+    target = (0.25 + 0.55) / 2
+    a = ShotLevelInput(key="a", mid_gray=0.4, black_point=0.02, white_point=0.9,
+                       subject_luma=0.25, target_subject_luma=target)
+    b = ShotLevelInput(key="b", mid_gray=0.4, black_point=0.02, white_point=0.9,
+                       subject_luma=0.55, target_subject_luma=target)
+    deltas = solve_exposure_leveling([a, b])
+    assert "a" in deltas and "b" in deltas, deltas
+
+    post_a = a.subject_luma * deltas["a"].slope[0]
+    post_b = b.subject_luma * deltas["b"].slope[0]
+    pre_spread = abs(b.subject_luma - a.subject_luma)
+    post_spread = abs(post_b - post_a)
+    assert post_spread < pre_spread, (pre_spread, post_spread)
+    cap = 2.0 ** EXPOSURE_CAP_STOPS
+    assert 1.0 / cap - 1e-6 <= deltas["a"].slope[0] <= cap + 1e-6
+    assert 1.0 / cap - 1e-6 <= deltas["b"].slope[0] <= cap + 1e-6
+    print(f"ok  leveling: two far-apart subjects converge (spread {pre_spread:.3f} -> {post_spread:.3f}, "
+         f"bounded by the {EXPOSURE_CAP_STOPS}-stop cap)")
+
+
+def test_no_subject_target_identical_to_today():
+    """A shot with no subject_luma/target_subject_luma at all behaves
+    exactly as before this plan (target_mid_gray, else the smooth target) --
+    and resolve_clip_grade with no subject_box produces the same grade_hash
+    whether or not grade_subject_exposure logic exists in the codebase
+    (since balance_delta/match_delta/leveling_delta are just None here)."""
+    plain = [ShotLevelInput(key=f"s{i}", mid_gray=mg, black_point=0.02, white_point=0.95)
+            for i, mg in enumerate([0.4, 0.55, 0.3, 0.5, 0.35])]
+    deltas_a = solve_leveling(plain)
+    deltas_b = solve_leveling(plain)   # deterministic -- re-running must match exactly
+    assert deltas_a == deltas_b
+
+    cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
+    g1 = resolve_clip_grade({}, color_stats=cs, pipeline="v1")
+    g2 = resolve_clip_grade({}, color_stats=cs, pipeline="v1")   # no subject_box either call
+    assert g1["grade_hash"] == g2["grade_hash"]
+    print("ok  leveling/resolver: no subject signal at all -> identical, deterministic output")
+
+
+def test_silhouette_subject_ignores_target_subject_luma_too():
+    """The SILHOUETTE_RATIO gate governs regardless of whether an explicit
+    target_subject_luma is set -- a silhouette shot must still fall back to
+    target_mid_gray/the smooth target, never leveled toward a subject
+    target computed from a signal the gate itself distrusts."""
+    silhouette = ShotLevelInput(
+        key="s0", mid_gray=0.5, black_point=0.02, white_point=0.95,
+        subject_luma=0.5 / (SILHOUETTE_RATIO * 2),   # well past the gate
+        target_subject_luma=0.5, target_mid_gray=0.5,
+    )
+    deltas = solve_exposure_leveling([silhouette, ShotLevelInput(
+        key="s1", mid_gray=0.5, black_point=0.02, white_point=0.95, target_mid_gray=0.5,
+    )])
+    # both shots are already AT their target_mid_gray (0.5) -- if the
+    # silhouette's subject_luma were (wrongly) used, it would need a large
+    # gain toward 0.5; since it isn't, neither shot needs a nudge.
+    assert "s0" not in deltas, deltas
+    print("ok  leveling: SILHOUETTE_RATIO gate overrides an explicit target_subject_luma too")
+
+
+def test_scene_meta_join_empty_result_has_no_subject_box():
+    """No covering run at all (the DB join fails open) -- lookup_shot_cut_meta
+    returns an empty dict, never raises; a caller's `.get(key)` is None for
+    every shot, so no subject_box reaches measure_span."""
+    with mock.patch("app.services.l3.cuts_v3_read.latest_run_for_files", return_value=None):
+        result = lookup_shot_cut_meta([("s0", "f0", 0, 1000), ("s1", "f1", 0, 1000)])
+    assert result == {}
+    assert result.get("s0") is None and result.get("s1") is None
+    print("ok  scene_meta: no covering run -> empty result, no subject_box, no crash")
+
+
+def test_scene_meta_invalid_subject_box_rejected():
+    """A malformed framing.subject_box (wrong length, non-finite, or
+    degenerate w/h) is rejected -- the shot gets subject_box=None rather
+    than a value that would crash _measure_subject_luma downstream."""
+    rows = [
+        {"file_id": "f0", "src_in_ms": 0, "src_out_ms": 1000, "label": "", "summary": "",
+         "on_camera": None, "speaker_person": None, "voice_ids": [], "take_group_id": None,
+         "sync_group_id": None, "framing": {"subject_box": [0.2, 0.3, 0.0, 0.5]}},   # w=0
+        {"file_id": "f0", "src_in_ms": 1000, "src_out_ms": 2000, "label": "", "summary": "",
+         "on_camera": None, "speaker_person": None, "voice_ids": [], "take_group_id": None,
+         "sync_group_id": None, "framing": {"subject_box": [0.2, 0.3, 0.5]}},         # wrong length
+        {"file_id": "f0", "src_in_ms": 2000, "src_out_ms": 3000, "label": "", "summary": "",
+         "on_camera": None, "speaker_person": None, "voice_ids": [], "take_group_id": None,
+         "sync_group_id": None, "framing": {"subject_box": [0.2, 0.3, 0.4, 0.5]}},    # valid
+    ]
+    with mock.patch("app.services.l3.cuts_v3_read.latest_run_for_files", return_value="run-1"), \
+         mock.patch("app.services.l3.cuts_v3_read.rows_for_run", return_value=rows):
+        result = lookup_shot_cut_meta([
+            ("bad-w", "f0", 0, 1000), ("bad-len", "f0", 1000, 2000), ("ok", "f0", 2000, 3000),
+        ])
+    assert result["bad-w"].subject_box is None, result["bad-w"]
+    assert result["bad-len"].subject_box is None, result["bad-len"]
+    assert result["ok"].subject_box == [0.2, 0.3, 0.4, 0.5], result["ok"]
+    print("ok  scene_meta: a malformed framing.subject_box is rejected, fail-open")
+
+
+def test_scene_meta_join_populates_hero_ts_ms():
+    """cut_records.hero_ts_ms (100% populated, source-time axis) is joined
+    alongside subject_box -- verified live that NO real timeline seg carries
+    its own hero_ts_ms, so without this the whole subject_luma chain would
+    stay inert regardless of a valid box."""
+    rows = [
+        {"file_id": "f0", "src_in_ms": 0, "src_out_ms": 2000, "label": "", "summary": "",
+         "on_camera": None, "speaker_person": None, "voice_ids": [], "take_group_id": None,
+         "sync_group_id": None, "framing": {"subject_box": [0.2, 0.3, 0.4, 0.5]}, "hero_ts_ms": 900},
+    ]
+    with mock.patch("app.services.l3.cuts_v3_read.latest_run_for_files", return_value="run-1"), \
+         mock.patch("app.services.l3.cuts_v3_read.rows_for_run", return_value=rows):
+        result = lookup_shot_cut_meta([("s0", "f0", 0, 2000)])
+    assert result["s0"].hero_ts_ms == 900, result["s0"]
+    print("ok  scene_meta: cut_records.hero_ts_ms is joined alongside subject_box")
+
+
+def test_run_grade_job_hero_ts_ms_fallback_only_when_box_resolves():
+    """job.py's hero_ts_ms fallback (joined from cut_records) must ONLY
+    apply when a subject_box is actually being resolved for that shot --
+    never for a shot with no box, so a document not using this feature
+    never has measure_span's SAMPLE POINTS shifted (hero_ts_ms reorders
+    timestamps[0] even without a box)."""
+    doc = {
+        "timeline": [
+            {"seg_id": "s0", "file_id": "f0", "in_ms": 0, "out_ms": 2000},
+            {"seg_id": "s1", "file_id": "f1", "in_ms": 0, "out_ms": 2000},
+        ],
+        "operations": [], "look": {},
+    }
+    joined = {
+        "s0": ShotCutMeta(subject_box=[0.3, 0.3, 0.4, 0.4], hero_ts_ms=900),
+        "s1": ShotCutMeta(subject_box=None, hero_ts_ms=900),   # no box -- fallback must NOT fire
+    }
+    seen = {}
+
+    def fake_measure_span(file_id, in_ms, out_ms, *, hero_ts_ms=None, subject_box=None):
+        seen[file_id] = hero_ts_ms
+        return _cs(mid_gray=0.4)
+
+    fake_settings = mock.Mock(
+        grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
+        grade_shot_match_v2=False, grade_scene_join=False, grade_subject_exposure=True,
+    )
+    with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
+         mock.patch("app.services.l3.grade.job._upsert_job_status"), \
+         mock.patch("app.services.l3.grade.job._upsert_grade_row"), \
+         mock.patch("app.services.l3.grade.job.fetch_color_stats", return_value={}), \
+         mock.patch("app.services.l3.grade.job.measure_span", side_effect=fake_measure_span), \
+         mock.patch("app.services.l3.grade.job.ensure_cube_file", return_value=None), \
+         mock.patch("app.services.l3.grade.job.get_settings", return_value=fake_settings), \
+         mock.patch("app.services.l3.grade.scene_meta.lookup_shot_cut_meta", return_value=joined), \
+         mock.patch("app.services.l3.store.latest_document", return_value=(doc, 1), create=True):
+        grade_job.run_grade_job("thread-hero-fallback")
+
+    assert seen["f0"] == 900, seen        # box resolved -> fallback fires
+    assert seen["f1"] is None, seen       # no box -> fallback must not fire, sampling unchanged
+    print("ok  job: the joined hero_ts_ms fallback only fires when a subject_box actually resolves")
+
+
+def test_run_grade_job_subject_exposure_converges_grouped_subjects():
+    """End-to-end (mocked): a joined subject_box reaches measure_span, and
+    two grouped shots' far-apart subject lumas converge toward each other
+    -- while grade_subject_exposure=False, the box never reaches
+    measure_span and behavior is the pre-existing whole-frame-only one."""
+    doc = {
+        "timeline": [
+            {"seg_id": "s0", "file_id": "f0", "in_ms": 0, "out_ms": 1000},
+            {"seg_id": "s1", "file_id": "f1", "in_ms": 0, "out_ms": 1000},
+        ],
+        "operations": [], "look": {},
+    }
+    joined = {
+        "s0": ShotCutMeta(sync_group_id="sync-X", subject_box=[0.3, 0.3, 0.4, 0.4]),
+        "s1": ShotCutMeta(sync_group_id="sync-X", subject_box=[0.3, 0.3, 0.4, 0.4]),
+    }
+
+    def run(subject_exposure_on):
+        boxes_seen = []
+
+        def fake_measure_span(file_id, in_ms, out_ms, *, hero_ts_ms=None, subject_box=None):
+            boxes_seen.append(subject_box)
+            return {"black_point": 0.02, "white_point": 0.9, "mid_gray": 0.5,
+                   "rgb_mean": [0.4, 0.4, 0.4], "rgb_std": [0.1, 0.1, 0.1],
+                   "subject_luma": 0.35 if file_id == "f0" else 0.62}
+
+        rows = {}
+        fake_settings = mock.Mock(
+            grade_pipeline="v1", grade_even_lighting=True, grade_semantic=True,
+            grade_shot_match_v2=True, grade_scene_join=True,
+            grade_subject_exposure=subject_exposure_on,
+        )
+        with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
+             mock.patch("app.services.l3.grade.job._upsert_job_status"), \
+             mock.patch("app.services.l3.grade.job._upsert_grade_row",
+                        side_effect=lambda tid, key, h, gj, cube: rows.__setitem__(key, gj)), \
+             mock.patch("app.services.l3.grade.job.fetch_color_stats", return_value={}), \
+             mock.patch("app.services.l3.grade.job.measure_span", side_effect=fake_measure_span), \
+             mock.patch("app.services.l3.grade.job.ensure_cube_file", return_value=None), \
+             mock.patch("app.services.l3.grade.job.get_settings", return_value=fake_settings), \
+             mock.patch("app.services.l3.grade.scene_meta.lookup_shot_cut_meta", return_value=joined), \
+             mock.patch("app.services.l3.store.latest_document", return_value=(doc, 1), create=True):
+            grade_job.run_grade_job("thread-subject-e2e")
+        return rows, boxes_seen
+
+    def roundtrip(dv, grade):
+        import numpy as np
+        lin = float(tone.to_working(np.array([dv], dtype=np.float32), tone.WORKING_SPACE_V1)[0])
+        rgb = np.full(3, lin, dtype=np.float32)
+        return float(tone.from_working(apply_cdl(rgb, grade), tone.WORKING_SPACE_V1)[0])
+
+    rows_on, boxes_on = run(True)
+    assert all(b is not None for b in boxes_on), boxes_on
+    post_a = roundtrip(0.35, Grade.from_dict(rows_on["s0"]["cdl"]))
+    post_b = roundtrip(0.62, Grade.from_dict(rows_on["s1"]["cdl"]))
+    assert abs(post_b - post_a) < abs(0.62 - 0.35), (post_a, post_b)
+
+    rows_off, boxes_off = run(False)
+    assert all(b is None for b in boxes_off), boxes_off
+    assert set(rows_off) == {"s0", "s1"}
+    print(f"ok  job: grouped subjects converge when grade_subject_exposure=True "
+         f"(0.35/0.62 -> {post_a:.3f}/{post_b:.3f}); off, no box ever reaches measure_span")
+
+
+def test_run_grade_job_subject_exposure_gated_on_grade_semantic_too():
+    """grade_subject_exposure=True but grade_semantic=False: the subject
+    signal is a semantic one, so it must stay off (no join call at all)."""
+    doc = {
+        "timeline": [{"seg_id": "s0", "file_id": "f0", "in_ms": 0, "out_ms": 1000}],
+        "operations": [], "look": {},
+    }
+
+    def fake_measure_span(file_id, in_ms, out_ms, *, hero_ts_ms=None, subject_box=None):
+        assert subject_box is None, subject_box
+        return _cs(mid_gray=0.4)
+
+    join_spy = mock.Mock(side_effect=AssertionError("join must not be called when grade_semantic=False"))
+    fake_settings = mock.Mock(
+        grade_pipeline="v1", grade_even_lighting=False, grade_semantic=False,
+        grade_shot_match_v2=False, grade_scene_join=False, grade_subject_exposure=True,
+    )
+    with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
+         mock.patch("app.services.l3.grade.job._upsert_job_status"), \
+         mock.patch("app.services.l3.grade.job._upsert_grade_row"), \
+         mock.patch("app.services.l3.grade.job.fetch_color_stats", return_value={}), \
+         mock.patch("app.services.l3.grade.job.measure_span", side_effect=fake_measure_span), \
+         mock.patch("app.services.l3.grade.job.ensure_cube_file", return_value=None), \
+         mock.patch("app.services.l3.grade.job.get_settings", return_value=fake_settings), \
+         mock.patch("app.services.l3.grade.scene_meta.lookup_shot_cut_meta", join_spy), \
+         mock.patch("app.services.l3.store.latest_document", return_value=(doc, 1), create=True):
+        grade_job.run_grade_job("thread-subject-no-semantic")
+    join_spy.assert_not_called()
+    print("ok  job: grade_subject_exposure is inert without grade_semantic, even alone")
+
+
+def test_legacy_unchanged_regardless_of_subject_exposure_flag():
+    """Legacy never calls run_grade_job (maybe_enqueue returns early), so
+    resolve_clip_grade(pipeline='legacy') can't see any subject signal --
+    verify explicitly rather than just by construction."""
+    cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
+    legacy = resolve_clip_grade({}, color_stats=cs)
+    legacy_explicit = resolve_clip_grade({}, color_stats=cs, pipeline="legacy")
+    assert legacy == legacy_explicit
+    assert legacy["working_space"] == "rec709"
+    print("ok  resolver: legacy output is unaffected by color_subject_exposure.plan.md")
 
 
 # --------------------------------------------------------------------------
@@ -1377,7 +1654,7 @@ def test_run_grade_job_applies_leveling_and_semantic_grouping_when_flagged():
 
     fake_settings = mock.Mock(
         grade_pipeline="v1", grade_even_lighting=True, grade_semantic=True,
-        grade_shot_match_v2=True, grade_scene_join=True,
+        grade_shot_match_v2=True, grade_scene_join=True, grade_subject_exposure=False,
     )
     joined_meta = {
         "s0": ShotCutMeta(speaker_person="P1", on_camera=True),
@@ -1475,6 +1752,16 @@ def main():
     test_run_grade_job_scene_join_does_not_over_group_unrelated_shots()
     test_run_grade_job_scene_join_fail_open_on_db_error()
     test_run_grade_job_scene_join_off_keeps_pre_plan_behavior()
+    test_two_subjects_converge_after_leveling()
+    test_no_subject_target_identical_to_today()
+    test_silhouette_subject_ignores_target_subject_luma_too()
+    test_scene_meta_join_empty_result_has_no_subject_box()
+    test_scene_meta_invalid_subject_box_rejected()
+    test_scene_meta_join_populates_hero_ts_ms()
+    test_run_grade_job_hero_ts_ms_fallback_only_when_box_resolves()
+    test_run_grade_job_subject_exposure_converges_grouped_subjects()
+    test_run_grade_job_subject_exposure_gated_on_grade_semantic_too()
+    test_legacy_unchanged_regardless_of_subject_exposure_flag()
     test_run_grade_job_applies_leveling_and_semantic_grouping_when_flagged()
     print("\nall grade tests passed")
 

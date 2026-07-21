@@ -167,6 +167,14 @@ class Settings(BaseSettings):
     # (empty metadata -> RGB-adjacency fallback only). v1-only.
     grade_scene_join: bool = True
 
+    # color_subject_exposure.plan.md: join each grade shot's covering
+    # cut_record's framing.subject_box, measure subject_luma on the hero
+    # frame, and make Leveling converge subjects (not whole-frame mid_gray)
+    # to a common per-group brightness. Off = today's behavior (subject_box
+    # never populated, Leveling always uses whole-frame mid_gray). Respected
+    # only when grade_semantic is also on (the subject signal is semantic).
+    grade_subject_exposure: bool = False
+
     # migration_runner.plan.md: the startup guard's sanctioned local-dev
     # bypass. "on" (default) means every process refuses to boot on schema
     # drift; "off" disables that check for THIS process only, loudly (a

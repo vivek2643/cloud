@@ -7,7 +7,7 @@ shot simply gets empty metadata and falls back to the RGB base)."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -20,10 +20,49 @@ class ShotCutMeta:
     voice_ids: List[str] = field(default_factory=list)
     take_group_id: Optional[str] = None
     sync_group_id: Optional[str] = None
+    # color_subject_exposure.plan.md Phase 1: the VLM's per-cut normalized
+    # (x,y,w,h) subject box (pass2.py::Framing.subject_box, 99.8% populated)
+    # -- the primary source for grade/measure_span.py's subject_luma signal.
+    subject_box: Optional[List[float]] = None
+    # The cut's own best-still anchor, SOURCE-time ms (same axis as
+    # in_ms/out_ms -- verified against the _overlap join below). 100%
+    # populated in cut_records, but NEVER present on a real timeline seg
+    # (verified live: 0/many real documents carry seg.hero_ts_ms) -- without
+    # this, measure_span never has a hero frame to measure subject_luma on,
+    # regardless of subject_box, so the whole chain stays inert. Only ever
+    # used as a fallback when the shot's own hero_ts_ms is absent (see
+    # job.py) -- never overrides a real one.
+    hero_ts_ms: Optional[int] = None
 
 
 def _overlap(a0: int, a1: int, b0: int, b1: int) -> int:
     return max(0, min(a1, b1) - max(a0, b0))
+
+
+def _valid_subject_box(raw: Any) -> Optional[List[float]]:
+    """Validate + clamp a `framing.subject_box` value into a safe normalized
+    [x,y,w,h]. Fail-open: anything malformed (wrong length, non-finite,
+    degenerate w/h) returns None rather than raising -- a shot with an
+    invalid box simply measures no subject_luma, same as one with none."""
+    import math
+
+    if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+        return None
+    try:
+        x, y, w, h = (float(v) for v in raw)
+    except (TypeError, ValueError):
+        return None
+    if any(math.isnan(v) or math.isinf(v) for v in (x, y, w, h)):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    x = max(0.0, min(1.0, x))
+    y = max(0.0, min(1.0, y))
+    w = max(0.0, min(1.0 - x, w))
+    h = max(0.0, min(1.0 - y, h))
+    if w <= 0 or h <= 0:
+        return None
+    return [x, y, w, h]
 
 
 def lookup_shot_cut_meta(
@@ -67,5 +106,7 @@ def lookup_shot_cut_meta(
             voice_ids=list(best.get("voice_ids") or []),
             take_group_id=best.get("take_group_id"),
             sync_group_id=best.get("sync_group_id"),
+            subject_box=_valid_subject_box((best.get("framing") or {}).get("subject_box")),
+            hero_ts_ms=best.get("hero_ts_ms"),
         )
     return out
