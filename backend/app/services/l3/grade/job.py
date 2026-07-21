@@ -62,7 +62,13 @@ logger = logging.getLogger(__name__)
 # metadata (was always empty on the raw timeline seg), plus an always-on RGB
 # base so grouping itself never degrades to all-singletons. Grouping feeds
 # Balance/Match directly, so this changes the grade math too.
-INPUT_HASH_SCHEMA_VERSION = 4
+# v5: resolver._clamp_composite_v1's negative-offset floor now also anchors
+# at a genuine shadow probe (COMPOSITE_SHADOW_PROBE), not just mid-gray --
+# fixes a real shadow crush (a shot needing only a modest negative offset
+# could crush a display ~0.15 shadow to pure black while mid-gray stayed
+# safely above the old floor; verified live on 7 of 53 real shots). The
+# grade math changed, so every cached grade must be recomputed.
+INPUT_HASH_SCHEMA_VERSION = 5
 
 # Same local-disk, content-addressed cube cache the preview cube endpoint and
 # the render compositor already use (grade/cache.py's documented "not shared

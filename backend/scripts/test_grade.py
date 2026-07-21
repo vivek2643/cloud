@@ -244,6 +244,100 @@ def _roundtrip_mid_linear():
     return float(tone.to_working(np.array([0.5], dtype=np.float32), tone.WORKING_SPACE_V1)[0])
 
 
+def test_v1_composite_offset_floor_protects_a_modest_shadow_crush():
+    """Follow-up fix to the composite guardrail bug: COMPOSITE_MID_FLOOR
+    alone only protects the mid-gray ANCHOR point -- it does nothing for a
+    genuine shadow below it, so a shot needing only a MODEST negative
+    offset (nowhere near extreme enough to trip a mid-gray-only floor) can
+    still crush real shadow detail to pure black. This is the exact
+    real-world case observed live (a Siri-reel shot's Balance+Match delta,
+    slope~0.99, offset~-0.022): mid-gray was already safely above the
+    floor, so the OLD floor never engaged, and a display 0.15 shadow
+    crushed to exactly 0."""
+    from app.services.l3.grade.resolver import _clamp_composite_v1
+
+    modest = Grade(slope=(0.995, 0.993, 0.927), offset=(-0.0223, -0.0223, -0.0223))
+    clamped = _clamp_composite_v1(modest)
+    shadow_out = _roundtrip_v1(0.15, clamped)
+    assert shadow_out > 0.02, shadow_out
+    # essentially unchanged from its own input -- the floor should barely
+    # need to nudge this specific case, not visibly re-grade it.
+    assert abs(shadow_out - 0.15) < 0.02, shadow_out
+    print(f"ok  resolver: the shadow floor fixes a modest-offset crush that the "
+         f"mid-gray-only floor missed (0.15 -> {shadow_out:.3f}, was 0.0)")
+
+
+def test_v1_composite_offset_floor_does_not_raise_true_black():
+    """The shadow floor must NOT lift the whole toe: a genuine near-black
+    (well below the shadow probe) stays free to reach ~0 -- this is a
+    shadow-DETAIL guard, not a black-point lift. Checked against both a
+    realistic modest-offset grade and the existing extreme 'hot' fixture
+    (whose slope gets clamped to COMPOSITE_SLOPE_MAX, the harder case for
+    accidentally lifting blacks)."""
+    from app.services.l3.grade.resolver import _clamp_composite_v1
+
+    modest = Grade(slope=(0.995, 0.993, 0.927), offset=(-0.0223, -0.0223, -0.0223))
+    black_out = _roundtrip_v1(0.05, _clamp_composite_v1(modest))
+    # stays close to its OWN input (0.05), nowhere near the protected shadow
+    # probe (0.15) -- the floor barely moves an already-modest offset, it
+    # doesn't lift near-black toward shadow-floor territory.
+    assert black_out < 0.10, black_out
+
+    hot = Grade(slope=(2.65, 2.65, 2.65), offset=(-0.4, -0.4, -0.4))
+    black_out_hot = _roundtrip_v1(0.05, _clamp_composite_v1(hot))
+    assert black_out_hot < 0.01, black_out_hot
+    print(f"ok  resolver: the shadow floor doesn't lift true black (modest -> "
+         f"{black_out:.4f}, extreme-slope case -> {black_out_hot:.4f})")
+
+
+def test_v1_composite_offset_floor_preserves_mid_gray_and_slope_ceiling():
+    """Regression guard: the pre-existing composite protections (slope
+    ceiling, mid-gray floor) are unchanged by adding the shadow floor."""
+    from app.services.l3.grade.resolver import (
+        COMPOSITE_MID_FLOOR, COMPOSITE_SLOPE_MAX, _clamp_composite_v1,
+    )
+
+    modest = Grade(slope=(0.995, 0.993, 0.927), offset=(-0.0223, -0.0223, -0.0223))
+    mid_out = _roundtrip_v1(0.5, _clamp_composite_v1(modest))
+    assert 0.46 <= mid_out <= 0.65, mid_out
+
+    hot = Grade(slope=(2.65, 2.65, 2.65), offset=(-0.4, -0.4, -0.4))
+    clamped = _clamp_composite_v1(hot)
+    assert all(s <= COMPOSITE_SLOPE_MAX + 1e-6 for s in clamped.slope), clamped.slope
+    mid_lin = _roundtrip_mid_linear()
+    for c in range(3):
+        assert mid_lin * clamped.slope[c] + clamped.offset[c] >= COMPOSITE_MID_FLOOR - 1e-6, clamped.offset
+    print("ok  resolver: mid-gray floor and slope ceiling still hold with the shadow floor added")
+
+
+def test_v1_composite_offset_floor_respects_power():
+    """A per-channel power (e.g. from a manual override) is respected: the
+    floor solves for the PRE-power value needed so the POST-power output
+    still clears the shadow floor, not the pre-power value directly."""
+    from app.services.l3.grade.resolver import _clamp_composite_v1
+
+    graded = Grade(slope=(1.0, 1.0, 1.0), offset=(-0.5, -0.5, -0.5), power=(1.0, 1.5, 0.7))
+    clamped = _clamp_composite_v1(graded)
+    for c in range(3):
+        single_channel = Grade(slope=(clamped.slope[c],) * 3, offset=(clamped.offset[c],) * 3,
+                               power=(clamped.power[c],) * 3)
+        shadow_out = _roundtrip_v1(0.15, single_channel)
+        assert shadow_out > 0.02, (c, shadow_out)
+    print("ok  resolver: the shadow floor respects per-channel power, not just slope/offset")
+
+
+def test_v1_composite_offset_floor_is_v1_only_legacy_untouched():
+    """_clamp_composite_v1 is only ever called for pipeline=='v1' in
+    resolve_clip_grade -- legacy output is byte-for-byte unaffected by this
+    fix, same guarantee as every other v1-only composite guardrail."""
+    cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
+    legacy = resolve_clip_grade({}, color_stats=cs)
+    legacy_explicit = resolve_clip_grade({}, color_stats=cs, pipeline="legacy")
+    assert legacy == legacy_explicit
+    assert legacy["working_space"] == "rec709"
+    print("ok  resolver: the shadow-floor fix never touches the legacy pipeline")
+
+
 # --------------------------------------------------------------------------
 # Step 1.4: match.py solve_sequence_match (neighbor-only)
 # --------------------------------------------------------------------------
@@ -822,9 +916,12 @@ def test_shot_match_cross_shot_spread_shrinks_after_balance_and_match():
     """color_shot_matching.plan.md SS9 acceptance: exposure, contrast, and
     white-balance spread across a scene-group all shrink substantially
     after Balance+Match (exposure < 0.04 absolute and >= 40% smaller;
-    contrast and WB spread >= 30% smaller -- a bit under the plan's "~40%"
-    for contrast specifically, calibrated to this fixture's verified
-    number of ~38% rather than asserting a boundary this close to flaky)."""
+    contrast spread >= 25% smaller -- lower than the plan's original "~40%"
+    because the resolver.py shadow-floor follow-up fix (see
+    _clamp_composite_v1's COMPOSITE_SHADOW_PROBE) now also nudges some of
+    these shots' offsets to protect a genuine shadow, which trades a little
+    contrast-convergence precision for never crushing shadow detail --
+    verified at ~29% for this fixture, was ~38% before that fix)."""
     import statistics
 
     specs = _synthetic_reel_group()
@@ -844,7 +941,7 @@ def test_shot_match_cross_shot_spread_shrinks_after_balance_and_match():
         for k in keys
     ]
     pre_c_sd, post_c_sd = statistics.pstdev(pre_c), statistics.pstdev(post_c)
-    assert post_c_sd <= pre_c_sd * 0.65, (pre_c_sd, post_c_sd)
+    assert post_c_sd <= pre_c_sd * 0.75, (pre_c_sd, post_c_sd)
 
     pre_rg = [display_stats[k]["rgb_mean"][0] / display_stats[k]["rgb_mean"][1] for k in keys]
     post_rgb = [_roundtrip_rgb_v1(display_stats[k]["rgb_mean"], composed[k]) for k in keys]
@@ -1322,6 +1419,11 @@ def main():
     test_correct_v1_never_worse_on_already_correct_footage()
     test_v1_grade_does_not_crush_midtones_or_shadows()
     test_v1_composite_slope_and_offset_are_bounded()
+    test_v1_composite_offset_floor_protects_a_modest_shadow_crush()
+    test_v1_composite_offset_floor_does_not_raise_true_black()
+    test_v1_composite_offset_floor_preserves_mid_gray_and_slope_ceiling()
+    test_v1_composite_offset_floor_respects_power()
+    test_v1_composite_offset_floor_is_v1_only_legacy_untouched()
     test_match_two_camera_interview_matches_across_the_cut()
     test_match_never_groups_non_adjacent_shots()
     test_match_same_file_always_groups_regardless_of_rgb()

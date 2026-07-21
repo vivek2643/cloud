@@ -82,18 +82,54 @@ COMPOSITE_SLOPE_MAX = 2.0
 # linearized midtone). Deliberately a low floor (well under a corrected mid's
 # ~0.146 linear target), so it's an outlier backstop, not a per-clip tuning.
 COMPOSITE_MID_FLOOR = 0.02
+# color_scene_grouping.plan.md follow-up: a shot needing only a MODEST
+# negative offset (nowhere near what the mid-gray floor above would ever
+# catch) can still crush real shadow detail to pure black -- a linear floor
+# anchored at ONE point (mid-gray) only guarantees THAT point stays safe; it
+# does nothing for any darker point below it. Verified live: 7 of 53 real
+# shots crushed a display ~0.15 shadow to exactly 0 while mid-gray stayed
+# comfortably above COMPOSITE_MID_FLOOR. A second floor anchored at this
+# shadow probe closes the gap -- see `_clamp_composite_v1`.
+COMPOSITE_SHADOW_PROBE = 0.15   # display-encoded
+
+
+def _floor_for_probe(probe_lin: float, slope: float, power: float, floor: float) -> float:
+    """The minimum offset (one channel) such that a WORKING-space probe
+    value, after THIS channel's slope + offset + power, is >= `floor`.
+    `power` is respected the same way `apply_cdl` applies it (post slope/
+    offset, and treated as 1.0 when <= 1e-6, mirroring its own degenerate-
+    power guard) -- solving `(probe*slope+offset)**power >= floor` for the
+    tightest `offset` gives `offset = floor**(1/power) - probe*slope`."""
+    safe_power = power if power > 1e-6 else 1.0
+    target = floor ** (1.0 / safe_power)
+    return target - probe_lin * slope
 
 
 def _clamp_composite_v1(grade: Grade) -> Grade:
     """Apply the composite slope ceiling + negative-offset floor to a fully
-    composed v1 CDL (see the module constants above for the reasoning)."""
+    composed v1 CDL (see the module constants above for the reasoning).
+
+    The offset floor is anchored at BOTH mid-gray and a genuine shadow probe
+    (`COMPOSITE_SHADOW_PROBE`). Because slope is always positive, protecting
+    a probe point automatically protects every BRIGHTER point too (so the
+    shadow floor alone would already imply the mid-gray one) -- both are
+    computed explicitly anyway so the mid-gray guarantee doesn't silently
+    depend on the shadow probe's exact value. Critically, this does NOT lift
+    the whole toe: a genuine near-black (well below the shadow probe, e.g.
+    display ~0.05) is UNAFFECTED by a floor anchored at a brighter point --
+    only points at or above the shadow probe are guaranteed non-crushed, so
+    true blacks stay free to reach ~0 (no milky/raised blacks)."""
     import numpy as np
 
     mid_lin = float(to_working(np.array([0.5], dtype=np.float32), WORKING_SPACE_V1)[0])
+    shadow_lin = float(to_working(np.array([COMPOSITE_SHADOW_PROBE], dtype=np.float32), WORKING_SPACE_V1)[0])
     slope = tuple(min(float(s), COMPOSITE_SLOPE_MAX) for s in grade.slope)
-    # offset floored per channel so mid_lin*slope + offset >= COMPOSITE_MID_FLOOR
     offset = tuple(
-        max(float(grade.offset[c]), COMPOSITE_MID_FLOOR - mid_lin * slope[c])
+        max(
+            float(grade.offset[c]),
+            _floor_for_probe(mid_lin, slope[c], grade.power[c], COMPOSITE_MID_FLOOR),
+            _floor_for_probe(shadow_lin, slope[c], grade.power[c], COMPOSITE_MID_FLOOR),
+        )
         for c in range(3)
     )
     return Grade(slope=slope, offset=offset, power=grade.power, sat=grade.sat)
