@@ -41,6 +41,7 @@ from app.services.l3.grade.look_engine import (  # noqa: E402
 from app.services.l3.grade.lut_bake import _identity_grid, _sample_lut_trilinear, bake_cube_text, parse_cube_text  # noqa: E402
 from app.services.l3.grade.match import ShotStats, group_neighbors, solve_sequence_match  # noqa: E402
 from app.services.l3.grade.measure_span import _measure_subject_lab, _measure_subject_luma  # noqa: E402
+from app.services.l3.grade.presets import list_presets  # noqa: E402
 from app.services.l3.grade.reference import GroupReference, compute_group_reference  # noqa: E402
 from app.services.l3.grade.resolver import resolve_clip_grade  # noqa: E402
 from app.services.l3.grade.scene_group import ShotSceneMeta, group_shots_semantically  # noqa: E402
@@ -2448,6 +2449,33 @@ def test_film_looks_carry_texture():
     print("ok  look_engine: every family=='film' look carries halation/grain; creator/ad looks carry no halation")
 
 
+# --------------------------------------------------------------------------
+# frontend_look_gallery.plan.md: gallery listing carries look_params (for
+# live thumbnails) + family; legacy CDL presets stay unchanged
+# --------------------------------------------------------------------------
+
+def test_list_engine_looks_has_params_and_family():
+    engine_listing = list_engine_looks()
+    assert len(engine_listing) == len(LOOKS)
+    for entry, look in zip(engine_listing, LOOKS):
+        assert entry["mode"] == "engine"
+        assert entry["family"] in {"creator", "film", "ad"}, entry
+        assert entry["look_id"] == look.look_id
+        assert "look_params" in entry, entry
+        # round-trips through LookSpec.from_dict without crashing and
+        # reproduces the exact spec it was built from
+        spec = LookSpec.from_dict(entry["look_params"])
+        assert spec == look.spec, (entry["look_id"], spec, look.spec)
+
+    preset_listing = list_presets()
+    assert len(preset_listing) > 0
+    for entry in preset_listing:
+        assert entry["mode"] == "preset"
+        assert "family" not in entry, entry          # regression: CDL presets stay unchanged
+        assert "look_params" not in entry, entry
+    print("ok  look_engine/presets: every engine entry carries look_params + family; CDL presets carry neither")
+
+
 def main():
     test_tone_legacy_is_exact_identity()
     test_tone_v1_black_stays_black()
@@ -2578,6 +2606,7 @@ def main():
     test_catalog_all_looks_valid()
     test_bake_parity_with_new_knobs()
     test_film_looks_carry_texture()
+    test_list_engine_looks_has_params_and_family()
     print("\nall grade tests passed")
 
 

@@ -1053,10 +1053,14 @@ export interface GradePresetSummary {
   label: string;
   description: string;
   /** color_look_library.plan.md: engine-look grouping tag ("creator" /
-   * "film" / "ad") -- absent on CDL presets. A frontend picker groups the
-   * gallery by this; not built yet (see that plan's "companion
-   * dependency" note), the field is just kept honest here. */
+   * "film" / "ad") -- absent on CDL presets. The gallery groups by this
+   * (frontend_look_gallery.plan.md). */
   family?: "creator" | "film" | "ad";
+  /** frontend_look_gallery.plan.md: this look's `LookSpec.to_dict()` --
+   * only present for `mode:"engine"`. Used to bake a live thumbnail cube
+   * (identity CDL + these params) via `gradeCubeUrl`'s existing
+   * `look_engine` query param, without a second per-look fetch. */
+  look_params?: Record<string, unknown>;
 }
 
 export function getGradePresets(token: string) {

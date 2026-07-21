@@ -31,6 +31,7 @@ import {
   type ResolvedVideoLayer,
 } from "@/lib/api";
 import { gradeCubeUrl, prefetchGradeCube } from "@/components/preview/grade-cube-client";
+import { LookCard } from "@/components/preview/look-card";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -164,6 +165,23 @@ function Dial({ value, onChange, label }: { value: number; onChange: (v: number)
       </span>
     </div>
   );
+}
+
+/** frontend_look_gallery.plan.md: groups the picker's engine looks under
+ * their `family` tag, in a fixed display order -- families with no looks
+ * are dropped rather than rendered empty. */
+const FAMILY_ORDER = ["creator", "film", "ad"] as const;
+const FAMILY_LABEL: Record<(typeof FAMILY_ORDER)[number], string> = {
+  creator: "Creator",
+  film: "Film",
+  ad: "Ad",
+};
+
+function groupByFamily(items: GradePresetSummary[]) {
+  return FAMILY_ORDER.map((fam) => ({
+    fam,
+    looks: items.filter((p) => (p.family ?? "creator") === fam),
+  })).filter((group) => group.looks.length > 0);
 }
 
 export function ColorGradeView() {
@@ -399,6 +417,16 @@ export function ColorGradeView() {
     }
   }
 
+  // frontend_look_gallery.plan.md: "None / Original" chip -- clears only the
+  // look-selection fields (same shape as selectLook above), preserving
+  // unrelated dial state like arc_intensity/vignette/reference_stats.
+  function selectNoneLook() {
+    applyLook(
+      { ...(look ?? {}), mode: undefined, look_id: null, preset_id: null, look_params: null, lut_ref: null },
+      true
+    );
+  }
+
   function setArcIntensity(v: number) {
     applyLook({ ...(look ?? {}), arc_intensity: v });
   }
@@ -540,32 +568,41 @@ export function ColorGradeView() {
         </div>
       )}
 
-      {/* Look picker gallery */}
-      <section>
+      {/* Look picker gallery -- frontend_look_gallery.plan.md: legacy CDL
+          presets and the engine_identity parity anchor are hidden from this
+          default picker (still reachable via selectLook/applyLook for any
+          document that already references one); engine looks group under
+          their `family` tag with live thumbnails. */}
+      <section className="space-y-4">
         <SectionLabel>Look</SectionLabel>
-        <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
-          {presets.map((p) => {
-            const active =
-              p.mode === "engine"
-                ? look?.mode === "engine" && look.look_id === p.look_id
-                : look?.mode === "preset" && look.preset_id === p.preset_id;
-            return (
-              <button
-                key={`${p.mode}:${p.mode === "engine" ? p.look_id : p.preset_id}`}
-                onClick={() => selectLook(p)}
-                title={p.description}
-                className="truncate rounded-lg border px-2 py-2 text-left text-[11px] font-medium transition-colors"
-                style={{
-                  borderColor: active ? "var(--accent)" : "var(--border)",
-                  background: active ? "var(--accent-soft)" : "transparent",
-                  color: active ? "var(--foreground)" : "var(--muted)",
-                }}
-              >
-                {p.label}
-              </button>
-            );
-          })}
-        </div>
+        <button
+          onClick={selectNoneLook}
+          className="rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors"
+          style={{
+            borderColor: !look?.mode ? "var(--accent)" : "var(--border)",
+            background: !look?.mode ? "var(--accent-soft)" : "transparent",
+            color: !look?.mode ? "var(--foreground)" : "var(--muted)",
+          }}
+        >
+          None / Original
+        </button>
+        {groupByFamily(presets.filter((p) => p.mode === "engine" && p.look_id !== "engine_identity")).map(
+          ({ fam, looks }) => (
+            <div key={fam} className="space-y-2">
+              <SectionLabel>{FAMILY_LABEL[fam]}</SectionLabel>
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                {looks.map((p) => (
+                  <LookCard
+                    key={p.look_id}
+                    look={p}
+                    active={look?.mode === "engine" && look.look_id === p.look_id}
+                    onSelect={() => selectLook(p)}
+                  />
+                ))}
+              </div>
+            </div>
+          )
+        )}
       </section>
 
       {/* Reference image / LUT drop */}

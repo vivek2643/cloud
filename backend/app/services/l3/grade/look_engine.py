@@ -550,15 +550,19 @@ def get_engine_look(look_id: str) -> Optional[EngineLook]:
     return _BY_ID.get(look_id)
 
 
-def list_engine_looks() -> List[Dict[str, str]]:
+def list_engine_looks() -> List[Dict[str, Any]]:
     """Gallery listing, same shape as `presets.list_presets` plus a `mode`
-    tag (both catalogs share one gallery endpoint -- see routers/grade.py)
-    and a `family` tag (color_look_library.plan.md's frontend-filtering
-    hook: "creator" / "film" / "ad")."""
+    tag (both catalogs share one gallery endpoint -- see routers/grade.py),
+    a `family` tag (color_look_library.plan.md's frontend-filtering hook:
+    "creator" / "film" / "ad"), and `look_params`
+    (frontend_look_gallery.plan.md: each look's `LookSpec.to_dict()`, so the
+    frontend can bake a live thumbnail cube -- identity CDL + this look's
+    params -- via the same `/api/grade/cube?look_engine=...` seam
+    `gradeCubeUrl` already encodes, without a second per-look fetch/lookup)."""
     return [
         {
             "look_id": look.look_id, "label": look.label, "description": look.description,
-            "mode": "engine", "family": look.family,
+            "mode": "engine", "family": look.family, "look_params": look.spec.to_dict(),
         }
         for look in LOOKS
     ]
