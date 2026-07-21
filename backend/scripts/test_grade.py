@@ -35,8 +35,8 @@ from app.services.l3.grade.leveling import (  # noqa: E402
     SILHOUETTE_RATIO, ShotLevelInput, solve_exposure_leveling, solve_leveling, solve_tonal_leveling,
 )
 from app.services.l3.grade.look_engine import (  # noqa: E402
-    LookSpec, _apply_hue_rotate, _apply_hue_sat, _apply_split_tone, _rgb_to_hsv,
-    build_look_grid, resolve_look_spec,
+    LOOKS, LookSpec, _apply_hue_rotate, _apply_hue_sat, _apply_split_tone, _rgb_to_hsv,
+    build_look_grid, get_engine_look, list_engine_looks, resolve_look_spec,
 )
 from app.services.l3.grade.lut_bake import _identity_grid, _sample_lut_trilinear, bake_cube_text, parse_cube_text  # noqa: E402
 from app.services.l3.grade.match import ShotStats, group_neighbors, solve_sequence_match  # noqa: E402
@@ -2025,13 +2025,11 @@ def test_compositor_grade_key_distinguishes_tone_contrast_from_identity():
 # color_response_engine.plan.md: parametric Look engine (mode == "engine")
 # --------------------------------------------------------------------------
 
-_PUNCHY_SPEC = LookSpec(
-    contrast=0.15,
-    shadow_tint=(-0.03, 0.01, 0.04),
-    highlight_tint=(0.04, 0.02, -0.03),
-    hue_sat=((30.0, 40.0, 1.25), (150.0, 50.0, 0.8)),
-    sat=1.08,
-)
+# color_look_library.plan.md dropped the engine_punchy/engine_film
+# validation-only catalog entries in favor of the real library -- resolved
+# from the real catalog (not hardcoded) so these tests never drift from
+# whatever punchy_vibrant/kodak_2383 actually tune to.
+_PUNCHY_SPEC = get_engine_look("punchy_vibrant").spec
 
 
 def test_look_identity_spec_is_identity_grid():
@@ -2153,7 +2151,7 @@ def test_look_engine_bake_parity():
 
 def test_resolver_engine_off_byte_identical():
     cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
-    seq = {"mode": "engine", "look_id": "engine_punchy"}
+    seq = {"mode": "engine", "look_id": "punchy_vibrant"}
     off = resolve_clip_grade({}, color_stats=cs, sequence_look=seq, pipeline="v1", look_engine_enabled=False)
     baseline = resolve_clip_grade({}, color_stats=cs, pipeline="v1")
     assert off["grade_hash"] == baseline["grade_hash"]
@@ -2163,7 +2161,7 @@ def test_resolver_engine_off_byte_identical():
 
 def test_resolver_engine_on_sets_look_engine_and_changes_hash():
     cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
-    seq = {"mode": "engine", "look_id": "engine_punchy"}
+    seq = {"mode": "engine", "look_id": "punchy_vibrant"}
     off = resolve_clip_grade({}, color_stats=cs, sequence_look=seq, pipeline="v1", look_engine_enabled=False)
     on = resolve_clip_grade({}, color_stats=cs, sequence_look=seq, pipeline="v1", look_engine_enabled=True)
     assert on.get("look_engine"), on.get("look_engine")
@@ -2203,13 +2201,13 @@ def test_compositor_grade_key_distinguishes_look_engine_from_identity():
 
 
 def test_resolve_look_spec_prefers_catalog_over_inline_params():
-    catalog = resolve_look_spec({"look_id": "engine_punchy"})
+    catalog = resolve_look_spec({"look_id": "punchy_vibrant"})
     assert catalog == _PUNCHY_SPEC
 
     inline = resolve_look_spec({"look_params": {"sat": 1.2}})
     assert inline is not None and abs(inline.sat - 1.2) < 1e-9
 
-    both = resolve_look_spec({"look_id": "engine_punchy", "look_params": {"sat": 1.2}})
+    both = resolve_look_spec({"look_id": "punchy_vibrant", "look_params": {"sat": 1.2}})
     assert both == _PUNCHY_SPEC   # a valid catalog look_id wins over inline params
 
     unknown = resolve_look_spec({"look_id": "not_a_real_look"})
@@ -2245,7 +2243,7 @@ def test_build_look_grid_ignores_texture():
 
 def test_resolver_film_texture_off_byte_identical():
     cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
-    seq = {"mode": "engine", "look_id": "engine_film"}
+    seq = {"mode": "engine", "look_id": "kodak_2383"}
     off = resolve_clip_grade({}, color_stats=cs, sequence_look=seq, pipeline="v1",
                              look_engine_enabled=True, film_texture_enabled=False)
     baseline_engine_only = resolve_clip_grade({}, color_stats=cs, sequence_look=seq, pipeline="v1",
@@ -2263,7 +2261,7 @@ def test_resolver_film_texture_off_byte_identical():
 
 def test_resolver_film_texture_on_populates_soft_local():
     cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
-    seq_film = {"mode": "engine", "look_id": "engine_film"}
+    seq_film = {"mode": "engine", "look_id": "kodak_2383"}
     on = resolve_clip_grade({}, color_stats=cs, sequence_look=seq_film, pipeline="v1",
                             look_engine_enabled=True, film_texture_enabled=True)
     off = resolve_clip_grade({}, color_stats=cs, sequence_look=seq_film, pipeline="v1",
@@ -2274,7 +2272,7 @@ def test_resolver_film_texture_on_populates_soft_local():
     # a look with color but zero texture (engine_punchy) -> texture-on flag
     # has nothing to route, soft_local stays None (triple-safe: flag, look,
     # AND look's own params must all be non-zero).
-    seq_punchy = {"mode": "engine", "look_id": "engine_punchy"}
+    seq_punchy = {"mode": "engine", "look_id": "punchy_vibrant"}
     punchy_on = resolve_clip_grade({}, color_stats=cs, sequence_look=seq_punchy, pipeline="v1",
                                    look_engine_enabled=True, film_texture_enabled=True)
     assert punchy_on.get("soft_local") is None
@@ -2353,6 +2351,101 @@ def test_transform_vf_texture_order_and_off_is_untouched():
                        halation_filter=halation, grain_filter=grain)
     assert on.index(vignette) < on.index("split=2") < on.index("noise=")
     print("ok  compositor: _transform_vf appends halation then grain after the vignette; off is untouched")
+
+
+# --------------------------------------------------------------------------
+# color_look_library.plan.md: black_lift + negative contrast + the real
+# 17-look catalog (16 authored + engine_identity)
+# --------------------------------------------------------------------------
+
+def test_black_lift_raises_floor_keeps_white():
+    import numpy as np
+
+    grid, size = build_look_grid(LookSpec(black_lift=0.08), size=17)
+    assert abs(float(grid.min()) - 0.08) < 1e-4, grid.min()
+    assert abs(float(grid.max()) - 1.0) < 1e-4, grid.max()
+    diag = np.array([grid[i, i, i] for i in range(size)])
+    luma = diag[:, 0] * 0.2126 + diag[:, 1] * 0.7152 + diag[:, 2] * 0.0722
+    assert bool(np.all(np.diff(luma) >= -1e-6)), luma
+    print("ok  look_engine: black_lift raises the floor to black_lift, keeps white at 1.0, stays monotonic")
+
+
+def test_negative_contrast_softens_monotonic():
+    import numpy as np
+
+    identity_grid, size = build_look_grid(LookSpec(), size=33)
+    soft_grid, _ = build_look_grid(LookSpec(contrast=-0.1), size=33)
+
+    def _diag_luma(grid):
+        diag = np.array([grid[i, i, i] for i in range(size)])
+        return diag[:, 0] * 0.2126 + diag[:, 1] * 0.7152 + diag[:, 2] * 0.0722
+
+    identity_luma = _diag_luma(identity_grid)
+    soft_luma = _diag_luma(soft_grid)
+    mid = size // 2
+    identity_slope = identity_luma[mid + 2] - identity_luma[mid - 2]
+    soft_slope = soft_luma[mid + 2] - soft_luma[mid - 2]
+    assert soft_slope < identity_slope, (soft_slope, identity_slope)   # softened midtone slope
+    assert bool(np.all(np.diff(soft_luma) >= -1e-6)), soft_luma        # still monotonic
+    assert abs(float(soft_luma[0])) < 1e-4 and abs(float(soft_luma[-1]) - 1.0) < 1e-4   # endpoints pinned
+    print("ok  look_engine: negative contrast softens the midtone slope, stays monotonic, endpoints pinned")
+
+
+def test_identity_still_exact_with_new_fields():
+    grid, size = build_look_grid(LookSpec(), size=17)
+    ident = _identity_grid(17)
+    assert bool((grid == ident).all()), float((grid - ident).max())
+    print("ok  look_engine: LookSpec() (black_lift=0, contrast=0 defaults) still builds the EXACT identity grid")
+
+
+def test_catalog_all_looks_valid():
+    import numpy as np
+
+    ids = [look.look_id for look in LOOKS]
+    assert len(ids) == len(set(ids)), f"duplicate look_id in LOOKS: {ids}"
+    assert len(LOOKS) >= 17, len(LOOKS)   # engine_identity + 6 creator + 6 film + 4 ad
+
+    for look in LOOKS:
+        grid, _ = build_look_grid(look.spec, size=17)
+        assert np.isfinite(grid).all(), f"{look.look_id}: non-finite grid"
+        assert grid.min() >= 0.0 and grid.max() <= 1.0, f"{look.look_id}: unclamped grid"
+
+    listing = list_engine_looks()
+    assert len(listing) == len(LOOKS)
+    for entry in listing:
+        assert entry["mode"] == "engine", entry
+        assert entry["family"] in {"creator", "film", "ad"}, entry
+    print(f"ok  look_engine: all {len(LOOKS)} catalog looks are finite/clamped, tagged, no duplicate ids")
+
+
+def test_bake_parity_with_new_knobs():
+    import numpy as np
+
+    spec = LookSpec(contrast=-0.1, black_lift=0.06, sat=0.9)
+    grid, size = build_look_grid(spec, size=33)
+    cube_text = bake_cube_text(Grade(), size=size, creative_lut_grid=(grid, size), working_space="rec709")
+    parsed_grid, parsed_size = parse_cube_text(cube_text)
+    assert parsed_size == size
+
+    probes = np.array([
+        [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [0.5, 0.5, 0.5],
+        [0.9, 0.4, 0.2], [0.05, 0.6, 0.95],
+    ], dtype=np.float32)
+    direct = _sample_lut_trilinear(grid, probes)
+    baked = _sample_lut_trilinear(parsed_grid, probes)
+    max_err = float(np.max(np.abs(direct - baked)))
+    assert max_err < 0.01, f"bake parity (black_lift + negative contrast) exceeded tolerance: {max_err}"
+    print(f"ok  look_engine: bake parity holds with black_lift + negative contrast (max err {max_err:.5f})")
+
+
+def test_film_looks_carry_texture():
+    for look in LOOKS:
+        has_texture = look.spec.halation > 0.0 or look.spec.grain > 0.0
+        if look.family == "film":
+            assert has_texture, f"{look.look_id} is family=film but carries no halation/grain"
+        elif look.family in ("creator", "ad") and look.look_id != "engine_identity":
+            assert look.spec.halation == 0.0, f"{look.look_id} ({look.family}) unexpectedly carries halation"
+    print("ok  look_engine: every family=='film' look carries halation/grain; creator/ad looks carry no halation")
 
 
 def main():
@@ -2479,6 +2572,12 @@ def main():
     test_grade_hash_changes_with_texture()
     test_grade_key_not_collapsed_with_texture()
     test_transform_vf_texture_order_and_off_is_untouched()
+    test_black_lift_raises_floor_keeps_white()
+    test_negative_contrast_softens_monotonic()
+    test_identity_still_exact_with_new_fields()
+    test_catalog_all_looks_valid()
+    test_bake_parity_with_new_knobs()
+    test_film_looks_carry_texture()
     print("\nall grade tests passed")
 
 

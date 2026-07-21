@@ -44,7 +44,11 @@ class LookSpec:
     express. Every field defaults to a NO-OP, so `LookSpec()` is an EXACT
     identity grid (parity anchor + what "no look selected" resolves to)."""
     # Extra per-look contrast on top of the global tone curve (reuses
-    # tone._contrast_pivot). 0.0 = none.
+    # tone._contrast_pivot). 0.0 = none; positive = more contrast; NEGATIVE
+    # = soften (color_look_library.plan.md -- "Bright & Airy"/"Vintage
+    # Faded" need a softer, not just flatter-by-omission, midtone slope).
+    # `g = 1.0 + contrast`, floored at 0.2 so a caller can't invert the
+    # curve; `_contrast_pivot` is monotonic for any g>0.
     contrast: float = 0.0
     # 3-zone split-tone (lift/gamma/gain color balance). Each is an RGB tint
     # added, luma-weighted into that zone; magnitudes are small (~+/-0.1).
@@ -65,6 +69,14 @@ class LookSpec:
     # descriptor by resolve_clip_grade instead, alongside the vignette.
     halation: float = 0.0   # 0 = off; ~0.15-0.4 tasteful. Glow strength.
     grain: float = 0.0      # 0 = off; ~0.02-0.08 tasteful. Noise amplitude.
+    # color_look_library.plan.md: faded/milky blacks -- raise the shadow
+    # floor without touching white. 0 = off; ~0.03-0.10 tasteful.
+    # `out = black_lift + (1-black_lift)*out` -> black lifts to
+    # `black_lift`, white stays exactly 1 (a classic film "fade"; reduces
+    # contrast in the toe specifically, distinct from -contrast's global
+    # softening). Applied LAST (after contrast) so the fade isn't
+    # re-crushed by the contrast op.
+    black_lift: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         """Canonical (lists, not tuples; every field present) so the same
@@ -80,6 +92,7 @@ class LookSpec:
             "sat": self.sat,
             "halation": self.halation,
             "grain": self.grain,
+            "black_lift": self.black_lift,
         }
 
     @staticmethod
@@ -121,6 +134,7 @@ class LookSpec:
             sat=float(d.get("sat") if d.get("sat") is not None else 1.0),
             halation=float(d.get("halation") or 0.0),
             grain=float(d.get("grain") or 0.0),
+            black_lift=float(d.get("black_lift") or 0.0),
         )
 
     def is_identity(self, eps: float = 1e-9) -> bool:
@@ -129,6 +143,7 @@ class LookSpec:
             and all(abs(v) < eps for v in self.shadow_tint)
             and all(abs(v) < eps for v in self.mid_tint)
             and all(abs(v) < eps for v in self.highlight_tint)
+            and abs(self.black_lift) < eps
             and not self.hue_rotate
             and not self.hue_sat
             and abs(self.sat - 1.0) < eps
@@ -263,13 +278,27 @@ def _apply_global_sat(rgb, spec: LookSpec):
     return luma + spec.sat * (rgb - luma)
 
 
+def _apply_black_lift(rgb, spec: LookSpec):
+    """`out = black_lift + (1-black_lift)*out` -- an affine remap: black
+    (0) lifts to `black_lift`, white (1) stays EXACTLY 1 (slope
+    `1-black_lift`, always positive for the intended `[0, ~0.1]` range, so
+    always monotonic). Applied last, after contrast, so the fade isn't
+    re-crushed by it (color_look_library.plan.md's "Bright & Airy"/
+    "Vintage Faded" need lifted/milky blacks, distinct from -contrast's
+    global softening)."""
+    if abs(spec.black_lift) < 1e-9:
+        return rgb
+    return spec.black_lift + (1.0 - spec.black_lift) * rgb
+
+
 def build_look_grid(spec: LookSpec, size: int = 33):
     """Evaluate the color-response ops over an identity grid and return
     `(grid, size)` -- the SAME shape `parse_cube_text` returns, so it drops
     straight into `bake_cube_text(creative_lut_grid=...)`. Pure/deterministic:
     the whole look is a function of `spec` alone. Fixed op order (split-tone
-    -> hue-rotate -> hue-sat -> global-sat -> contrast) -- documented, not
-    incidental; the validation looks and contact-sheet tuning assume it.
+    -> hue-rotate -> hue-sat -> global-sat -> contrast -> black_lift) --
+    documented, not incidental; the validation looks and contact-sheet
+    tuning assume it.
 
     Deliberately does NOT read `spec.halation`/`spec.grain`
     (halation_grain.plan.md) -- those are spatial/stochastic (neighbor +
@@ -288,7 +317,13 @@ def build_look_grid(spec: LookSpec, size: int = 33):
     out = _apply_hue_rotate(out, spec)
     out = _apply_hue_sat(out, spec)
     out = _apply_global_sat(out, spec)
-    if spec.contrast > 0.0:
+    if spec.contrast != 0.0:
+        # color_look_library.plan.md: NEGATIVE contrast (soften) is now
+        # allowed too -- g<1 gently lifts shadows/rolls off highlights
+        # instead of steepening the midtone slope. Floored at 0.2 so a
+        # caller can't invert the curve; _contrast_pivot is monotonic for
+        # any g>0 (verified: g=0.2..2.5 all stay monotonic/endpoint-pinned).
+        #
         # _contrast_pivot uses FRACTIONAL powers (x/p)**g -- on the RAW
         # base identity grid this is always safe (x in [0,1] exactly), but
         # split-tone/hue-sat can push a channel slightly outside [0,1]
@@ -297,16 +332,31 @@ def build_look_grid(spec: LookSpec, size: int = 33):
         # number. Clip immediately before this specific op -- the only one
         # in this chain that requires a bounded domain (HSV round-trips and
         # the additive tint are well-defined for any real RGB).
-        out = _contrast_pivot(np.clip(out, 0.0, 1.0), 1.0 + spec.contrast)
+        g = max(0.2, 1.0 + spec.contrast)
+        out = _contrast_pivot(np.clip(out, 0.0, 1.0), g)
+    out = _apply_black_lift(out, spec)
     return np.clip(out, 0.0, 1.0).astype(np.float32), size
 
 
 # --------------------------------------------------------------------------
-# Look catalog -- STRUCTURE ONLY (two entries to prove the engine end-to-end).
-# The full library (6 YouTube looks + 5-6 film grades + ad styles) is the
-# NEXT plan: seed film looks from published film-stock characteristic data,
-# hand-author the modern/creator ones, tune both via the contact sheet --
-# taste-validation needs real footage + iteration, not more engine plumbing.
+# Look catalog (color_look_library.plan.md): a real, YouTube-centric library
+# -- 6 creator looks (priority: most users), 6 film looks (the minority
+# family, carries halation+grain), 4 ad/commercial looks. `engine_identity`
+# stays as the parity anchor. The two engine-validation-only entries the
+# prior plan shipped (`engine_punchy`/`engine_film`) are subsumed by
+# `punchy_vibrant`/`kodak_2383` below and dropped -- this catalog is the
+# real product, not instrument validation anymore.
+#
+# "Fit to film-stock data" here means INFORMED AUTHORING, not spectral
+# simulation: `LookSpec` is a creative vocabulary (contrast, split-tone,
+# hue-rotate, hue-sat, sat, halation, grain, black_lift), not a physical
+# film model (density curves, dye couplers, spectral crosstalk). A "Kodak
+# 2383" entry means dialing our knobs to match that stock's PUBLISHED
+# color-science character (contrasty, teal-orange separation, warm
+# highlights, fine grain) -- never their .cube files (licensing), never a
+# numerical spectral fit. Values below are STARTING points tuned on real
+# footage via `scripts/_diag_look_contact_sheet.py` (see that script for
+# the actual contact-sheet renders this catalog was checked against).
 # --------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -315,41 +365,181 @@ class EngineLook:
     label: str
     description: str
     spec: LookSpec = field(default_factory=LookSpec)
+    # "creator" (YouTube/vlog, the priority family -- most users), "film"
+    # (carries halation+grain, needs grade_film_texture too), or "ad"
+    # (commercial/product). Purely a frontend-filtering hook -- "as many as
+    # we want for now, filter later," so tag, don't prune.
+    family: str = "creator"
 
 
 LOOKS: List[EngineLook] = [
     EngineLook(
         "engine_identity", "Engine Identity",
         "Exact identity -- the engine's parity anchor, no stylization.",
-        LookSpec(),
+        LookSpec(), family="creator",
+    ),
+
+    # ---- Creator family (priority -- most users) --------------------------
+    EngineLook(
+        "clean_natural", "Clean & Natural",
+        "Safe, true-to-life default -- a light contrast lift and a touch of "
+        "saturation on top of the fully-corrected image, nothing more.",
+        LookSpec(contrast=0.05, sat=1.03),
+        family="creator",
     ),
     EngineLook(
-        "engine_punchy", "Engine Punchy",
-        "Teal shadows, warm highlights, popped orange/skin + calmed green, "
-        "a touch of contrast and global saturation -- proves the per-hue "
-        "moves a CDL preset can't make.",
+        "bright_airy", "Bright & Airy",
+        "Lifted, soft, warm -- the vlog/lifestyle look: softened contrast, "
+        "milky-lifted blacks, a gentle warm cast top to bottom.",
         LookSpec(
-            contrast=0.15,
-            shadow_tint=(-0.03, 0.01, 0.04),
-            highlight_tint=(0.04, 0.02, -0.03),
-            hue_sat=((30.0, 40.0, 1.25), (150.0, 50.0, 0.8)),
-            sat=1.08,
+            contrast=-0.10, black_lift=0.05,
+            shadow_tint=(0.02, 0.015, 0.0), highlight_tint=(0.03, 0.02, -0.01),
+            sat=0.98,
         ),
+        family="creator",
     ),
     EngineLook(
-        "engine_film", "Engine Film",
-        "engine_punchy's color response plus halation glow + film grain "
-        "(halation_grain.plan.md) -- proves the spatial finishing pass "
-        "end to end, not a finished film-look library entry.",
+        "punchy_vibrant", "Punchy Vibrant",
+        "Saturated, contrasty pop for tech / gaming / product footage -- "
+        "popped orange/skin, calmed green, real per-hue moves a CDL preset "
+        "can't make.",
+        LookSpec(contrast=0.20, sat=1.15, hue_sat=((30.0, 40.0, 1.2), (150.0, 50.0, 0.9))),
+        family="creator",
+    ),
+    EngineLook(
+        "warm_cozy", "Warm Cozy",
+        "Gentle orange warmth for sit-down/talking-head content -- warm "
+        "shadows and highlights, a mild orange-band saturation lift.",
         LookSpec(
-            contrast=0.15,
-            shadow_tint=(-0.03, 0.01, 0.04),
-            highlight_tint=(0.04, 0.02, -0.03),
-            hue_sat=((30.0, 40.0, 1.25), (150.0, 50.0, 0.8)),
-            sat=1.08,
-            halation=0.25,
-            grain=0.04,
+            contrast=0.08, shadow_tint=(0.02, 0.005, -0.01), highlight_tint=(0.05, 0.02, -0.03),
+            hue_sat=((30.0, 45.0, 1.15),), sat=1.05,
         ),
+        family="creator",
+    ),
+    EngineLook(
+        "cool_clean", "Cool Clean",
+        "Slightly cool, crisp -- a reviewer/tech-desk look: cool shadow/"
+        "highlight tint, a firmer contrast lift, restrained saturation.",
+        LookSpec(
+            contrast=0.12, shadow_tint=(-0.02, 0.0, 0.03), highlight_tint=(-0.01, 0.0, 0.02),
+            sat=1.05,
+        ),
+        family="creator",
+    ),
+    EngineLook(
+        "moody_cinematic", "Moody Cinematic",
+        "Desaturated, teal shadows, a gentle crush -- an editorial/somber "
+        "mood for narrative or B-roll-heavy cuts.",
+        LookSpec(
+            contrast=0.18, shadow_tint=(-0.04, 0.0, 0.05), highlight_tint=(0.03, 0.015, -0.02),
+            hue_sat=((150.0, 50.0, 0.7),), sat=0.82,
+        ),
+        family="creator",
+    ),
+
+    # ---- Film family (informed by stock character; carries halation+grain,
+    # needs grade_film_texture on too -- their COLOR still applies under
+    # grade_look_engine alone, but the glow/grain texture stays off without
+    # the second flag; not a bug, see config.py's grade_film_texture note) --
+    EngineLook(
+        "kodak_2383", "Kodak 2383",
+        "Print-film character: contrasty, teal-orange separation, warm "
+        "highlights, fine grain. Informed by Kodak 2383's published "
+        "color-science description, not its .cube or a spectral fit. "
+        "Needs grade_film_texture for the halation/grain half.",
+        LookSpec(
+            contrast=0.22, shadow_tint=(-0.04, 0.0, 0.05), highlight_tint=(0.05, 0.02, -0.03),
+            hue_sat=((30.0, 40.0, 1.2), (150.0, 50.0, 0.85)), sat=1.05,
+            halation=0.25, grain=0.04,
+        ),
+        family="film",
+    ),
+    EngineLook(
+        "fuji_eterna", "Fuji Eterna",
+        "Soft, low-saturation, green-leaning -- Fuji Eterna's motion-picture "
+        "character (gentle contrast, desaturated, a cool-green midtone "
+        "lean). Needs grade_film_texture for the halation/grain half.",
+        LookSpec(contrast=0.04, mid_tint=(-0.01, 0.02, -0.01), sat=0.88, halation=0.15, grain=0.05),
+        family="film",
+    ),
+    EngineLook(
+        "vision3_250d", "Vision3 250D",
+        "Natural negative stock: gentle contrast, a slight warm lean, "
+        "faint lifted blacks. Needs grade_film_texture for the "
+        "halation/grain half.",
+        LookSpec(
+            contrast=0.08, black_lift=0.02, mid_tint=(0.02, 0.01, -0.01), sat=0.98,
+            halation=0.12, grain=0.05,
+        ),
+        family="film",
+    ),
+    EngineLook(
+        "portra_400", "Portra 400",
+        "Warm, skin-flattering portrait stock: soft, low-contrast, an "
+        "orange-band lift for warm skin. Needs grade_film_texture for the "
+        "halation/grain half.",
+        LookSpec(
+            contrast=0.0, black_lift=0.03, highlight_tint=(0.04, 0.02, -0.02),
+            hue_sat=((30.0, 45.0, 1.1),), sat=0.95, halation=0.10, grain=0.04,
+        ),
+        family="film",
+    ),
+    EngineLook(
+        "vintage_faded", "Vintage Faded",
+        "Lifted milky blacks, warm, desaturated -- an aged-print fade. "
+        "Needs grade_film_texture for the halation/grain half.",
+        LookSpec(
+            contrast=-0.05, black_lift=0.08, mid_tint=(0.03, 0.015, -0.02), sat=0.80,
+            halation=0.20, grain=0.06,
+        ),
+        family="film",
+    ),
+    EngineLook(
+        "bw_film", "B&W Film",
+        "Near-monochrome, contrasty, grainy -- a graphic black & white "
+        "film look (a creative near-desaturation, not a true single-channel "
+        "conversion). Needs grade_film_texture for the halation/grain half.",
+        LookSpec(contrast=0.20, sat=0.05, halation=0.10, grain=0.06),
+        family="film",
+    ),
+
+    # ---- Ad / commercial family --------------------------------------------
+    EngineLook(
+        "clean_commercial", "Clean Commercial",
+        "Crisp, neutral, punchy -- a no-grain commercial base for product/"
+        "corporate cuts.",
+        LookSpec(contrast=0.15, sat=1.08),
+        family="ad",
+    ),
+    EngineLook(
+        "high_key_beauty", "High-Key Beauty",
+        "Bright, airy, soft skin, warm -- a beauty/lifestyle high-key look: "
+        "softened contrast, lifted blacks, a warm highlight + orange-band lift.",
+        LookSpec(
+            contrast=-0.08, black_lift=0.05, highlight_tint=(0.03, 0.02, -0.01),
+            hue_sat=((30.0, 45.0, 1.1),), sat=1.0,
+        ),
+        family="ad",
+    ),
+    EngineLook(
+        "tech_sleek", "Tech Sleek",
+        "Cool, high-contrast, restrained saturation -- a product/tech-launch "
+        "look.",
+        LookSpec(
+            contrast=0.20, shadow_tint=(-0.03, 0.0, 0.04), highlight_tint=(-0.01, 0.0, 0.02),
+            sat=0.95,
+        ),
+        family="ad",
+    ),
+    EngineLook(
+        "food_vibrant", "Food Vibrant",
+        "Warm, saturated, appetizing -- pops orange/red and yellow for food "
+        "and product close-ups.",
+        LookSpec(
+            contrast=0.12, highlight_tint=(0.04, 0.02, -0.02),
+            hue_sat=((30.0, 45.0, 1.25), (60.0, 40.0, 1.15)), sat=1.18,
+        ),
+        family="ad",
     ),
 ]
 
@@ -362,9 +552,14 @@ def get_engine_look(look_id: str) -> Optional[EngineLook]:
 
 def list_engine_looks() -> List[Dict[str, str]]:
     """Gallery listing, same shape as `presets.list_presets` plus a `mode`
-    tag (both catalogs share one gallery endpoint -- see routers/grade.py)."""
+    tag (both catalogs share one gallery endpoint -- see routers/grade.py)
+    and a `family` tag (color_look_library.plan.md's frontend-filtering
+    hook: "creator" / "film" / "ad")."""
     return [
-        {"look_id": look.look_id, "label": look.label, "description": look.description, "mode": "engine"}
+        {
+            "look_id": look.look_id, "label": look.label, "description": look.description,
+            "mode": "engine", "family": look.family,
+        }
         for look in LOOKS
     ]
 

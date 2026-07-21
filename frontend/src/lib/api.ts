@@ -1052,6 +1052,11 @@ export interface GradePresetSummary {
   look_id?: string;
   label: string;
   description: string;
+  /** color_look_library.plan.md: engine-look grouping tag ("creator" /
+   * "film" / "ad") -- absent on CDL presets. A frontend picker groups the
+   * gallery by this; not built yet (see that plan's "companion
+   * dependency" note), the field is just kept honest here. */
+  family?: "creator" | "film" | "ad";
 }
 
 export function getGradePresets(token: string) {
