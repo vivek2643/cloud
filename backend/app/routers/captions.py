@@ -113,7 +113,7 @@ def get_suggestions(
     if doc is None:
         raise HTTPException(status_code=404, detail="No edit document yet")
 
-    resolved = resolve_document(doc)
+    resolved = resolve_document(doc, thread_id=thread_id)
     aspect = str(resolved.get("aspect") or "landscape")
     file_ids = list({
         v["source_file_id"] for v in (resolved.get("video_layers") or []) if v.get("kind") == "spine"

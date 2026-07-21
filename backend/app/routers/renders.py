@@ -82,7 +82,9 @@ def create_render(
     if not (document.get("timeline") or document.get("resolved")):
         raise HTTPException(status_code=409, detail="Edit document has no timeline to render")
 
-    resolved = resolve_document(document)
+    # thread_id is required so v1 reads the persisted grades (resolved_grades);
+    # without it the recompute would fall back to identity and export ungraded.
+    resolved = resolve_document(document, thread_id=thread_id)
     rhash = compositor.resolved_hash(resolved, body.preset)
 
     # Short-circuit to an identical successful render if one exists.

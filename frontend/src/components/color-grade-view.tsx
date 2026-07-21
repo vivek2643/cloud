@@ -27,9 +27,82 @@ import {
   type EditLook,
   type GradePresetSummary,
   type GradeStatus,
+  type ResolvedGrade,
+  type ResolvedVideoLayer,
 } from "@/lib/api";
+import { gradeCubeUrl, prefetchGradeCube } from "@/components/preview/grade-cube-client";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+// How often the grade-status poll re-checks while a job is (expected to be)
+// running, and how long we keep polling through a standalone `idle` right after
+// a save before giving up (the worker usually flips idle->grading well inside
+// this window).
+const POLL_INTERVAL_MS = 750;
+const IDLE_EXPECT_TIMEOUT_MS = 20_000;
+
+/** Mirrors the preview player's `isIdentityGrade` (use-program-player.ts): a
+ * grade the player would NOT paint (no LUT, no vignette, unit CDL) needs no
+ * cube warmed, so we skip it when deciding "preview is ready". */
+function isIdentityGrade(grade: ResolvedGrade | undefined): boolean {
+  if (!grade) return true;
+  if (grade.creative_lut_ref) return false;
+  if (grade.soft_local?.vignette && grade.soft_local.vignette.strength > 0) return false;
+  const cdl = grade.cdl as ResolvedGrade["cdl"] | undefined;
+  if (!cdl) return true;
+  const { slope, offset, power, sat } = cdl;
+  const eps = 1e-9;
+  return (
+    slope.every((v) => Math.abs(v - 1) < eps) &&
+    offset.every((v) => Math.abs(v) < eps) &&
+    power.every((v) => Math.abs(v - 1) < eps) &&
+    Math.abs(sat - 1) < eps
+  );
+}
+
+/** Distinct, paintable grades across the resolved video layers, deduped by the
+ * exact cube URL the player fetches -- so warming these is precisely what the
+ * preview needs before it can show the new grade. */
+function distinctPaintableGrades(layers: ResolvedVideoLayer[] | undefined): ResolvedGrade[] {
+  if (!layers) return [];
+  const byUrl = new Map<string, ResolvedGrade>();
+  for (const layer of layers) {
+    const g = layer.grade;
+    if (!g || isIdentityGrade(g)) continue;
+    const url = gradeCubeUrl(g);
+    if (!byUrl.has(url)) byUrl.set(url, g);
+  }
+  return [...byUrl.values()];
+}
+
+/** Continuous progress model for the grading bar. The bar only reaches 100%
+ * once the preview's LUT cubes are warmed (`ready`), never merely when the
+ * background job says "done". */
+type GradePhase =
+  | { kind: "idle" }
+  | { kind: "applying" }
+  | { kind: "grading"; done: number; total: number; progress: number }
+  | { kind: "warming" }
+  | { kind: "ready" };
+
+/** Map a phase to the bar's display percent + caption (null = hide the bar).
+ * KEY invariant: 100% is reserved for `ready` (cubes warmed). */
+function phaseDisplay(phase: GradePhase): { pct: number; caption: string } | null {
+  switch (phase.kind) {
+    case "idle":
+      return null;
+    case "applying":
+      return { pct: 8, caption: "Applying…" };
+    case "grading": {
+      const p = Math.max(0, Math.min(1, phase.progress));
+      return { pct: Math.round(10 + p * 70), caption: `Grading… ${phase.done}/${phase.total}` };
+    }
+    case "warming":
+      return { pct: 90, caption: "Finishing…" };
+    case "ready":
+      return { pct: 100, caption: "Ready" };
+  }
+}
 
 /** Mean + std per RGB channel from a decoded <img>, computed entirely
  * client-side (canvas readback) -- no server upload needed just to measure
@@ -112,51 +185,121 @@ export function ColorGradeView() {
   const lutInputRef = useRef<HTMLInputElement>(null);
 
   // --- Grading progress (color_grading_upgrade.plan.md Step 1.0 §6 / Phase 4) ---
-  // A DETERMINATE bar reflecting the real background v1 grade job, not a
-  // fake spinner (Phase 1 made grading a real job with real progress).
-  const [gradeStatus, setGradeStatus] = useState<GradeStatus | null>(null);
+  // A CONTINUOUS bar reflecting TRUE end-to-end readiness: the real background
+  // v1 grade job's progress, then a final "warming" phase that only hits 100%
+  // once the preview's LUT cubes are actually fetched, so the bar disappearing
+  // means the preview can genuinely show the new grade.
+  const [gradePhase, setGradePhase] = useState<GradePhase>({ kind: "idle" });
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Bumped whenever a NEW poll chain starts, so at most one chain is live: a
+  // superseded chain sees its captured gen != the current one and bails,
+  // preventing overlapping loops (and stale setState after unmount).
+  const pollGenRef = useRef(0);
+  // Absolute time (ms) after which a standalone `idle` stops being treated as
+  // "a job I'm waiting for" (worker never picked it up / no job was enqueued).
+  const idleDeadlineRef = useRef(0);
 
-  const pollGradeStatus = useCallback(async () => {
-    if (!threadId || !token) return;
-    let status: GradeStatus;
-    try {
-      status = await getGradeStatus(threadId, token);
-    } catch {
-      return; // transient network hiccup -- next trigger (or the retry below) will re-check
-    }
-    if (status.state === "grading") {
-      setGradeStatus(status);
-      pollTimerRef.current = setTimeout(() => void pollGradeStatus(), 750);
-      return;
-    }
-    if (status.state === "error") {
-      setError(status.error || "Grading failed.");
-      setGradeStatus(null);
-      return;
-    }
-    if (status.state === "done") {
-      // Refresh on done: re-fetch so the preview picks up the newly
-      // persisted grades, without touching the working timeline/undo stack.
-      try {
-        const thread = await getEditThread(threadId, token);
-        if (thread.document) wdCommitLook(thread.document_version ?? 0, thread.document);
-      } catch {
-        // Best-effort refresh; the next natural save/reload still picks it up.
+  // `expectJob`: true right after a look save -- we KNOW a job should appear, so
+  // keep polling through the brief `idle` gap (bounded by `idleDeadlineRef`)
+  // until it flips to grading/done/error. false for the panel-mount catch-up,
+  // where a standalone `idle` means "nothing running" and we stop immediately.
+  // `gen` is set only on recursive reschedules to keep them on the same chain.
+  const pollGradeStatus = useCallback(
+    async (expectJob = false, gen?: number): Promise<void> => {
+      if (!threadId || !token) return;
+      const myGen = gen ?? ++pollGenRef.current;
+      if (gen === undefined) {
+        // Fresh chain: drop any timer the previous chain scheduled and, when we
+        // expect a job, arm the idle deadline.
+        if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+        if (expectJob) idleDeadlineRef.current = Date.now() + IDLE_EXPECT_TIMEOUT_MS;
       }
-    }
-    setGradeStatus(null); // done or idle -- clear the bar
-  }, [threadId, token, wdCommitLook]);
+      if (myGen !== pollGenRef.current) return; // superseded before we even ran
+
+      const reschedule = () => {
+        pollTimerRef.current = setTimeout(
+          () => void pollGradeStatus(expectJob, myGen),
+          POLL_INTERVAL_MS
+        );
+      };
+
+      let status: GradeStatus;
+      try {
+        status = await getGradeStatus(threadId, token);
+      } catch {
+        // Transient network hiccup: retry within this chain while we still
+        // expect a job; otherwise let it drop (a later trigger re-checks).
+        if (expectJob && myGen === pollGenRef.current && Date.now() < idleDeadlineRef.current) {
+          reschedule();
+        }
+        return;
+      }
+      if (myGen !== pollGenRef.current) return; // superseded while awaiting
+
+      if (status.state === "grading") {
+        setGradePhase({ kind: "grading", done: status.done, total: status.total, progress: status.progress });
+        reschedule();
+        return;
+      }
+      if (status.state === "error") {
+        setError(status.error || "Grading failed.");
+        setGradePhase({ kind: "idle" });
+        return;
+      }
+      if (status.state === "done") {
+        // Job finished. Refetch so the preview picks up the newly persisted
+        // grades (without touching the working timeline/undo stack), then WARM
+        // each distinct grade's cube -- the bar only completes once the preview
+        // can actually paint the new look.
+        setGradePhase({ kind: "warming" });
+        try {
+          const thread = await getEditThread(threadId, token);
+          if (myGen !== pollGenRef.current) return;
+          if (thread.document) wdCommitLook(thread.document_version ?? 0, thread.document);
+          const grades = distinctPaintableGrades(thread.document?.resolved?.video_layers);
+          await Promise.all(grades.map((g) => prefetchGradeCube(g)));
+        } catch {
+          // Best-effort refresh/warm; the next natural save/reload still picks
+          // it up. Fall through to clear the bar either way.
+        }
+        if (myGen !== pollGenRef.current) return;
+        setGradePhase({ kind: "ready" });
+        pollTimerRef.current = setTimeout(() => {
+          if (myGen === pollGenRef.current) setGradePhase({ kind: "idle" });
+        }, 600);
+        return;
+      }
+      // status.state === "idle"
+      if (expectJob && Date.now() < idleDeadlineRef.current) {
+        // Job enqueued but the worker hasn't flipped it to `grading` yet -- keep
+        // the bar up ("Applying…") and keep polling.
+        setGradePhase((p) => (p.kind === "grading" || p.kind === "warming" ? p : { kind: "applying" }));
+        reschedule();
+        return;
+      }
+      // Not expecting a job (panel-mount catch-up), or the expect window
+      // elapsed with no transition -- nothing is running, so clear the bar.
+      setGradePhase({ kind: "idle" });
+    },
+    [threadId, token, wdCommitLook]
+  );
 
   // Catch a job already in flight (e.g. from a timeline edit made elsewhere)
   // when the panel opens/thread changes.
   useEffect(() => {
     void pollGradeStatus();
     return () => {
+      // Kill any live chain (and block its stale setState) on thread change /
+      // unmount, and clear the pending poll/clear timer. Mutating the ref in
+      // cleanup is intentional here (we want the value live at teardown time).
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      pollGenRef.current++;
       if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [threadId, token]);
+
+  const gradeDisplay = phaseDisplay(gradePhase);
 
   useEffect(() => {
     if (!token) return;
@@ -192,11 +335,13 @@ export function ColorGradeView() {
         token
       );
       wdCommitLook(res.version, res.document);
-      // A look change may have enqueued a v1 grade job (Step 1.0 §4) --
-      // check once now; pollGradeStatus keeps itself going while grading.
-      void pollGradeStatus();
+      // A look change may have enqueued a v1 grade job (Step 1.0 §4). Poll with
+      // expectJob=true so the bar rides through the brief idle->grading gap and
+      // only completes once the preview's cubes are warmed.
+      void pollGradeStatus(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not save the grade.");
+      setGradePhase({ kind: "idle" }); // save failed -- no job coming; drop the bar
     } finally {
       savingRef.current = false;
       setSaving(false);
@@ -209,6 +354,10 @@ export function ColorGradeView() {
     (next: EditLook | undefined, immediate = false) => {
       setLook(next); // instant local: the dial reflects input and never reverts
       pendingRef.current = next;
+      // Instant feedback: show the bar the moment the look changes (covers the
+      // debounce + save + idle gap before the job appears). Don't stomp a bar
+      // that's already mid-job/warming from a prior change.
+      setGradePhase((p) => (p.kind === "grading" || p.kind === "warming" ? p : { kind: "applying" }));
       if (flushTimer.current) clearTimeout(flushTimer.current);
       if (immediate) {
         void flushLook();
@@ -354,23 +503,23 @@ export function ColorGradeView() {
         </button>
       </div>
 
-      {gradeStatus?.state === "grading" && (
+      {gradeDisplay && (
         <div className="space-y-1">
           <div
             className="h-1 w-full overflow-hidden rounded-full"
             style={{ background: "var(--border)" }}
             role="progressbar"
-            aria-valuenow={Math.round(gradeStatus.progress * 100)}
+            aria-valuenow={gradeDisplay.pct}
             aria-valuemin={0}
             aria-valuemax={100}
           >
             <div
               className="h-full rounded-full transition-[width] duration-300"
-              style={{ width: `${Math.round(gradeStatus.progress * 100)}%`, background: "var(--accent)" }}
+              style={{ width: `${gradeDisplay.pct}%`, background: "var(--accent)" }}
             />
           </div>
           <p className="text-[11px]" style={{ color: "var(--muted)" }}>
-            Grading… {gradeStatus.done}/{gradeStatus.total}
+            {gradeDisplay.caption}
           </p>
         </div>
       )}

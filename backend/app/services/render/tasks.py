@@ -85,8 +85,21 @@ def resolve_document(document: Dict[str, Any], thread_id: Optional[str] = None) 
     `thread_id` (Step 1.0) is only needed for the recompute path under `v1`
     -- the persisted-snapshot fast path already baked the right grades in at
     save time."""
+    grade_pipeline = get_settings().grade_pipeline
     res = document.get("resolved")
-    if isinstance(res, dict) and (res.get("video_layers") or res.get("audio_layers")):
+    # Under `v1`, grades are produced ASYNCHRONOUSLY by run_grade_job and read
+    # from resolved_grades at resolve time -- so a persisted snapshot's baked
+    # grades go stale the instant a grade job re-runs (e.g. a look change).
+    # Never serve the snapshot's grades under v1: recompute from
+    # timeline+operations (cheap -- grade resolution is a DB lookup, NO frame
+    # measurement, which only happens inside the job) so a completed grade job
+    # actually surfaces in preview/render. `legacy` keeps the snapshot fast path
+    # (its grades ARE baked in at save time), so its bytes are unchanged.
+    can_recompute = bool(document.get("timeline") or document.get("operations"))
+    use_snapshot = isinstance(res, dict) and (res.get("video_layers") or res.get("audio_layers"))
+    if grade_pipeline == "v1" and can_recompute:
+        use_snapshot = False
+    if use_snapshot:
         # Snapshots predating the format field carry no aspect; backfill it from
         # the document so the render uses the declared delivery shape.
         res.setdefault("aspect", layers.aspect_of(document))
@@ -110,7 +123,6 @@ def resolve_document(document: Dict[str, Any], thread_id: Optional[str] = None) 
     # it too so `_apply_split_edits`'s clamp has real footage room to work
     # with (audio_sync.plan.md SS8).
     route_fids = {r["source_file_id"] for r in audio_routes.values()}
-    grade_pipeline = get_settings().grade_pipeline
     grade_lookup = _grade_lookup_for(thread_id, document) if grade_pipeline == "v1" else {}
     resolved = layers.resolve(
         document, _durations(list(set(fids) | route_fids)), color_stats, audio_routes,

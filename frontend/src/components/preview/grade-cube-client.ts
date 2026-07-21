@@ -44,6 +44,43 @@ export function gradeCubeUrl(grade: ResolvedGrade): string {
   return `${API_URL}/api/grade/cube?${params.toString()}`;
 }
 
+/** Shared fetch body for both `getGradeCube` (non-blocking) and
+ * `prefetchGradeCube` (awaitable). Deduped via `inFlight` and populating the
+ * SAME `cache` both read, so a cube fetched through either path is a cache hit
+ * for the other (and for the preview player). Returns the settled entry (or
+ * null on failure). */
+function fetchCube(url: string): Promise<CubeEntry | null> {
+  const hit = cache.get(url);
+  if (hit) return Promise.resolve(hit);
+  const existing = inFlight.get(url);
+  if (existing) return existing;
+  const token = useAuthStore.getState().session?.access_token;
+  const p = fetch(url, {
+    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+  })
+    .then((res) => (res.ok ? res.text() : null))
+    .then((text) => {
+      if (!text) return null;
+      const parsed = parseCubeText(text);
+      if (!parsed) return null;
+      cache.set(url, parsed);
+      cubeLoadListeners.forEach((cb) => {
+        try {
+          cb();
+        } catch {
+          /* a listener throwing must not break the fetch chain */
+        }
+      });
+      return parsed;
+    })
+    .catch(() => null)
+    .finally(() => {
+      inFlight.delete(url);
+    });
+  inFlight.set(url, p);
+  return p;
+}
+
 /** Non-blocking: returns a cached cube immediately if we have one, else
  * kicks off a fetch (deduped) and returns null for this call -- the caller
  * (the rAF draw loop) just tries again next frame once it resolves. */
@@ -52,31 +89,14 @@ export function getGradeCube(grade: ResolvedGrade | undefined): CubeEntry | null
   const url = gradeCubeUrl(grade);
   const hit = cache.get(url);
   if (hit) return hit;
-  if (!inFlight.has(url)) {
-    const token = useAuthStore.getState().session?.access_token;
-    const p = fetch(url, {
-      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-    })
-      .then((res) => (res.ok ? res.text() : null))
-      .then((text) => {
-        if (!text) return null;
-        const parsed = parseCubeText(text);
-        if (!parsed) return null;
-        cache.set(url, parsed);
-        cubeLoadListeners.forEach((cb) => {
-          try {
-            cb();
-          } catch {
-            /* a listener throwing must not break the fetch chain */
-          }
-        });
-        return parsed;
-      })
-      .catch(() => null)
-      .finally(() => {
-        inFlight.delete(url);
-      });
-    inFlight.set(url, p);
-  }
+  void fetchCube(url); // kick a deduped fetch; the next frame reads the cache
   return null;
+}
+
+/** Await a cube: resolves to the cached entry (or null on failure) once the
+ *  fetch settles. Populates the SAME cache getGradeCube reads, so awaiting this
+ *  warms the paused/next preview frame. Deduped via the shared inFlight map. */
+export function prefetchGradeCube(grade: ResolvedGrade | undefined): Promise<CubeEntry | null> {
+  if (!grade) return Promise.resolve(null);
+  return fetchCube(gradeCubeUrl(grade));
 }
