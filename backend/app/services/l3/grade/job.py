@@ -57,7 +57,12 @@ logger = logging.getLogger(__name__)
 # median-member group reference replacing the arbitrary anchor, stronger
 # Match strengths, a wider Leveling window. The grade math changed, so every
 # cached grade must be recomputed.
-INPUT_HASH_SCHEMA_VERSION = 3
+# v4 (color_scene_grouping.plan.md): semantic grouping now joins each shot to
+# its covering cut_record for real speaker/on_camera/label/summary/take/sync
+# metadata (was always empty on the raw timeline seg), plus an always-on RGB
+# base so grouping itself never degrades to all-singletons. Grouping feeds
+# Balance/Match directly, so this changes the grade math too.
+INPUT_HASH_SCHEMA_VERSION = 4
 
 # Same local-disk, content-addressed cube cache the preview cube endpoint and
 # the render compositor already use (grade/cache.py's documented "not shared
@@ -216,6 +221,7 @@ def compute_input_hash(document: Dict[str, Any]) -> str:
             "grade_even_lighting": settings.grade_even_lighting,
             "grade_semantic": settings.grade_semantic,
             "grade_shot_match_v2": settings.grade_shot_match_v2,
+            "grade_scene_join": settings.grade_scene_join,
         },
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
@@ -385,20 +391,43 @@ def run_grade_job(thread_id: str) -> None:
                 stats = color_stats.get(s.file_id)
             shot_stats[s.key] = ShotStats(key=s.key, file_id=s.file_id, stats=stats)
 
-        # Step 1.4 (+ Step 3.2): ONE sequence-match pass over the whole
-        # ordered timeline -- semantic grouping (when the shots carry the
-        # structural facts it needs) overrides the default RGB-adjacency
-        # grouping so matching aligns shots that are the same scene BY
-        # MEANING, not merely RGB-close.
+        # Step 1.4 (+ Step 3.2, + color_scene_grouping.plan.md): ONE
+        # sequence-match pass over the whole ordered timeline -- semantic
+        # grouping (when the shots carry the structural facts it needs)
+        # overrides the default RGB-adjacency grouping so matching aligns
+        # shots that are the same scene BY MEANING, not merely RGB-close.
+        # The raw timeline seg never carries speaker_person/on_camera/label/
+        # summary (they live on cut_records, one join away) -- when
+        # grade_scene_join is on, join each shot to its covering cut_record
+        # for the real values, plus its own span rgb_mean as scene_group's
+        # graceful RGB base (see scene_group.py's trust hierarchy). Off:
+        # scene_meta carries no metadata AND no rgb_mean, so
+        # group_shots_semantically returns all-singletons exactly as before
+        # this plan, and the existing RGB-adjacency fallback below engages.
         semantic_groups = None
         if settings.grade_semantic:
-            scene_meta = [
-                SceneMeta(key=s.key, file_id=s.file_id,
-                         speaker_person=s.item.get("speaker_person"),
-                         on_camera=s.item.get("on_camera"),
-                         label=str(s.item.get("label") or ""), summary=str(s.item.get("summary") or ""))
-                for s in shots
-            ]
+            cut_meta = {}
+            if settings.grade_scene_join:
+                from app.services.l3.grade.scene_meta import lookup_shot_cut_meta
+
+                cut_meta = lookup_shot_cut_meta(
+                    [(s.key, s.file_id, s.in_ms, s.out_ms) for s in shots]
+                )
+            scene_meta = []
+            for s in shots:
+                cm = cut_meta.get(s.key)
+                span_rgb = (shot_stats[s.key].stats or {}).get("rgb_mean") if settings.grade_scene_join else None
+                scene_meta.append(SceneMeta(
+                    key=s.key, file_id=s.file_id,
+                    speaker_person=(cm.speaker_person if cm else None),
+                    on_camera=(cm.on_camera if cm else None),
+                    label=(cm.label if cm else ""),
+                    summary=(cm.summary if cm else ""),
+                    voice_ids=(cm.voice_ids if cm else []),
+                    take_group_id=(cm.take_group_id if cm else None),
+                    sync_group_id=(cm.sync_group_id if cm else None),
+                    rgb_mean=list(span_rgb) if span_rgb else None,
+                ))
             semantic_groups = group_shots_semantically(scene_meta)
 
         ordered = [shot_stats[s.key] for s in shots]

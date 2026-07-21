@@ -160,6 +160,13 @@ class Settings(BaseSettings):
     # a revert.
     grade_shot_match_v2: bool = True
 
+    # color_scene_grouping.plan.md: join each grade shot's (file_id, span) to
+    # its covering cut_record so real scene metadata (speaker/on_camera/label/
+    # summary + take/sync/voice ids) drives grouping, with an RGB base so
+    # grouping never degrades to all-singletons. Off = today's behavior
+    # (empty metadata -> RGB-adjacency fallback only). v1-only.
+    grade_scene_join: bool = True
+
     # migration_runner.plan.md: the startup guard's sanctioned local-dev
     # bypass. "on" (default) means every process refuses to boot on schema
     # drift; "off" disables that check for THIS process only, loudly (a

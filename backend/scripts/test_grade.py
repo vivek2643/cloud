@@ -35,6 +35,7 @@ from app.services.l3.grade.measure_span import _measure_subject_luma  # noqa: E4
 from app.services.l3.grade.reference import GroupReference, compute_group_reference  # noqa: E402
 from app.services.l3.grade.resolver import resolve_clip_grade  # noqa: E402
 from app.services.l3.grade.scene_group import ShotSceneMeta, group_shots_semantically  # noqa: E402
+from app.services.l3.grade.scene_meta import ShotCutMeta, lookup_shot_cut_meta  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -493,6 +494,7 @@ def test_run_grade_job_end_to_end_mocked():
          mock.patch("app.services.l3.grade.job.fetch_color_stats", return_value={}), \
          mock.patch("app.services.l3.grade.job.measure_span", side_effect=fake_measure_span), \
          mock.patch("app.services.l3.grade.job.ensure_cube_file", return_value="/tmp/fake.cube"), \
+         mock.patch("app.services.l3.grade.scene_meta.lookup_shot_cut_meta", return_value={}), \
          mock.patch("app.services.l3.store.latest_document", return_value=(doc, 1), create=True):
         grade_job.run_grade_job("thread-1")
 
@@ -994,17 +996,273 @@ def test_run_grade_job_shot_match_v2_off_reproduces_pre_redesign_path():
 
 
 # --------------------------------------------------------------------------
+# color_scene_grouping.plan.md: real cut_records metadata + an always-on
+# RGB base folded into the semantic grouper itself
+# --------------------------------------------------------------------------
+
+def test_scene_grouping_rgb_base_prevents_all_singletons():
+    """Phase 2c: 8 shots, different file_id, no speaker/on_camera/take/sync
+    signals, but adjacent rgb_mean within SCENE_RGB_DIST_MAX -- the RGB base
+    must chain them into real groups. Without rgb_mean (today's pre-this-
+    plan behavior), the same shots are all-singletons."""
+    from app.services.l3.grade.scene_group import SCENE_RGB_DIST_MAX
+
+    meta_with_rgb = [
+        ShotSceneMeta(key=f"s{i}", file_id=f"f{i}", rgb_mean=[0.4 + 0.01 * i, 0.4, 0.4])
+        for i in range(8)
+    ]
+    groups = group_shots_semantically(meta_with_rgb)
+    assert any(len(g) >= 2 for g in groups), groups
+
+    meta_without_rgb = [ShotSceneMeta(key=f"s{i}", file_id=f"f{i}") for i in range(8)]
+    assert group_shots_semantically(meta_without_rgb) == [[i] for i in range(8)]
+    print(f"ok  scene_grouping: the RGB base (< {SCENE_RGB_DIST_MAX}) chains an "
+         f"otherwise all-singleton reel")
+
+
+def test_scene_grouping_sync_group_id_groups_across_files():
+    meta = [
+        ShotSceneMeta(key="s0", file_id="f1", sync_group_id="sync-A"),
+        ShotSceneMeta(key="s1", file_id="f2", sync_group_id="sync-A"),
+    ]
+    assert group_shots_semantically(meta) == [[0, 1]]
+    print("ok  scene_grouping: same sync_group_id groups across files (multicam outlook)")
+
+
+def test_scene_grouping_take_group_id_groups_across_files():
+    meta = [
+        ShotSceneMeta(key="s0", file_id="f1", take_group_id="take-A"),
+        ShotSceneMeta(key="s1", file_id="f2", take_group_id="take-A"),
+    ]
+    assert group_shots_semantically(meta) == [[0, 1]]
+    print("ok  scene_grouping: same take_group_id groups across files (retakes)")
+
+
+def test_scene_grouping_voice_ids_overlap_groups_across_files():
+    meta = [
+        ShotSceneMeta(key="s0", file_id="f1", voice_ids=["V1", "V2"]),
+        ShotSceneMeta(key="s1", file_id="f2", voice_ids=["V2", "V3"]),
+    ]
+    assert group_shots_semantically(meta) == [[0, 1]]
+    meta_no_overlap = [
+        ShotSceneMeta(key="s0", file_id="f1", voice_ids=["V1"]),
+        ShotSceneMeta(key="s1", file_id="f2", voice_ids=["V9"]),
+    ]
+    assert group_shots_semantically(meta_no_overlap) == [[0], [1]]
+    print("ok  scene_grouping: overlapping voice_ids groups across files, no overlap does not")
+
+
+def test_scene_meta_join_picks_max_overlap_cut_record():
+    """scene_meta.lookup_shot_cut_meta: among cut_records for the same file,
+    picks the one with the LARGEST time-overlap with the shot's span. A
+    shot with no overlapping cut_record is absent from the result (no
+    crash, no fabricated metadata)."""
+    rows = [
+        {"file_id": "f1", "src_in_ms": 0, "src_out_ms": 2000,
+         "label": "first cut", "summary": "", "on_camera": None,
+         "speaker_person": None, "voice_ids": [], "take_group_id": None, "sync_group_id": None},
+        {"file_id": "f1", "src_in_ms": 1800, "src_out_ms": 5000,
+         "label": "second cut", "summary": "", "on_camera": None,
+         "speaker_person": None, "voice_ids": [], "take_group_id": None, "sync_group_id": None},
+    ]
+    with mock.patch("app.services.l3.cuts_v3_read.latest_run_for_files", return_value="run-1"), \
+         mock.patch("app.services.l3.cuts_v3_read.rows_for_run", return_value=rows):
+        result = lookup_shot_cut_meta([
+            ("shot-a", "f1", 2200, 4800),   # overlaps 2nd cut [1800,5000] far more than 1st [0,2000]
+            ("shot-b", "f1", 9000, 9500),   # no overlap with either cut
+        ])
+    assert result["shot-a"].label == "second cut", result
+    assert "shot-b" not in result, result
+    print("ok  scene_meta: the (file_id, span) join picks the max-overlap cut_record")
+
+
+def test_run_grade_job_groups_multi_file_reel_via_scene_join():
+    """Acceptance: a 3-shot, 3-file doc where the mocked cut_records join
+    returns a shared sync_group_id for two of the three shots -- Balance/
+    Match must act on the grouped pair (non-identity deltas)."""
+    doc = {
+        "timeline": [
+            {"seg_id": "s0", "file_id": "f0", "in_ms": 0, "out_ms": 1000},
+            {"seg_id": "s1", "file_id": "f1", "in_ms": 0, "out_ms": 1000},
+            {"seg_id": "s2", "file_id": "f2", "in_ms": 0, "out_ms": 1000},
+        ],
+        "operations": [], "look": {},
+    }
+
+    def fake_measure_span(file_id, in_ms, out_ms, *, hero_ts_ms=None, subject_box=None):
+        return {"black_point": 0.02, "white_point": 0.9,
+               "mid_gray": {"f0": 0.30, "f1": 0.55, "f2": 0.32}[file_id],
+               "rgb_mean": [0.4, 0.4, 0.4], "rgb_std": [0.1, 0.1, 0.1]}
+
+    joined = {
+        "s0": ShotCutMeta(sync_group_id="sync-X"),
+        "s1": ShotCutMeta(sync_group_id="sync-X"),
+        # s2 has no covering cut_record -- absent from the join result
+    }
+    rows = {}
+    fake_settings = mock.Mock(
+        grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
+        grade_shot_match_v2=True, grade_scene_join=True,
+    )
+    with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
+         mock.patch("app.services.l3.grade.job._upsert_job_status"), \
+         mock.patch("app.services.l3.grade.job._upsert_grade_row",
+                    side_effect=lambda tid, key, h, gj, cube: rows.__setitem__(key, gj)), \
+         mock.patch("app.services.l3.grade.job.fetch_color_stats", return_value={}), \
+         mock.patch("app.services.l3.grade.job.measure_span", side_effect=fake_measure_span), \
+         mock.patch("app.services.l3.grade.job.ensure_cube_file", return_value=None), \
+         mock.patch("app.services.l3.grade.job.get_settings", return_value=fake_settings), \
+         mock.patch("app.services.l3.grade.scene_meta.lookup_shot_cut_meta", return_value=joined), \
+         mock.patch("app.services.l3.store.latest_document", return_value=(doc, 1), create=True):
+        grade_job.run_grade_job("thread-scene-join")
+
+    assert set(rows) == {"s0", "s1", "s2"}
+    non_identity = {k for k, gj in rows.items() if Grade.from_dict(gj["cdl"]) != Grade()}
+    assert {"s0", "s1"} & non_identity, rows
+    print("ok  job: run_grade_job groups a multi-file reel via the mocked cut_records join")
+
+
+def test_run_grade_job_scene_join_does_not_over_group_unrelated_shots():
+    """With the join returning empty (no covering cut_record for any shot)
+    and RGB genuinely far apart, grouping must NOT force a match --
+    verifies an empty join doesn't silently over-group."""
+    doc = {
+        "timeline": [
+            {"seg_id": "s0", "file_id": "f0", "in_ms": 0, "out_ms": 1000},
+            {"seg_id": "s1", "file_id": "f1", "in_ms": 0, "out_ms": 1000},
+        ],
+        "operations": [], "look": {},
+    }
+
+    def fake_measure_span(file_id, in_ms, out_ms, *, hero_ts_ms=None, subject_box=None):
+        return {"black_point": 0.02, "white_point": 0.9, "mid_gray": 0.3,
+               "rgb_mean": [0.9, 0.1, 0.1] if file_id == "f0" else [0.1, 0.9, 0.1],
+               "rgb_std": [0.1, 0.1, 0.1]}
+
+    rows = {}
+    fake_settings = mock.Mock(
+        grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
+        grade_shot_match_v2=True, grade_scene_join=True,
+    )
+    with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
+         mock.patch("app.services.l3.grade.job._upsert_job_status"), \
+         mock.patch("app.services.l3.grade.job._upsert_grade_row",
+                    side_effect=lambda tid, key, h, gj, cube: rows.__setitem__(key, gj)), \
+         mock.patch("app.services.l3.grade.job.fetch_color_stats", return_value={}), \
+         mock.patch("app.services.l3.grade.job.measure_span", side_effect=fake_measure_span), \
+         mock.patch("app.services.l3.grade.job.ensure_cube_file", return_value=None), \
+         mock.patch("app.services.l3.grade.job.get_settings", return_value=fake_settings), \
+         mock.patch("app.services.l3.grade.scene_meta.lookup_shot_cut_meta", return_value={}), \
+         mock.patch("app.services.l3.store.latest_document", return_value=(doc, 1), create=True):
+        grade_job.run_grade_job("thread-no-over-group")
+
+    assert set(rows) == {"s0", "s1"}
+    assert rows["s0"]["cdl"] == rows["s1"]["cdl"], rows   # no Match/Balance contribution for either
+    print("ok  job: an empty join + RGB-far shots does not over-group (no forced match)")
+
+
+def test_run_grade_job_scene_join_fail_open_on_db_error():
+    """Mirrors test_run_grade_job_records_error_never_crashes's spirit but
+    expects SUCCESS: the join must fail open (lookup_shot_cut_meta itself
+    never raises -- this guards run_grade_job in case a future change to
+    it does), and the RGB base still groups shots that are close in color
+    even with the join unavailable."""
+    doc = {
+        "timeline": [
+            {"seg_id": "s0", "file_id": "f0", "in_ms": 0, "out_ms": 1000},
+            {"seg_id": "s1", "file_id": "f1", "in_ms": 0, "out_ms": 1000},
+        ],
+        "operations": [], "look": {},
+    }
+
+    def fake_measure_span(file_id, in_ms, out_ms, *, hero_ts_ms=None, subject_box=None):
+        return {"black_point": 0.02, "white_point": 0.9,
+               "mid_gray": 0.3 if file_id == "f0" else 0.5,
+               "rgb_mean": [0.4, 0.4, 0.4], "rgb_std": [0.1, 0.1, 0.1]}   # close RGB, both shots
+
+    rows = {}
+    fake_settings = mock.Mock(
+        grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
+        grade_shot_match_v2=True, grade_scene_join=True,
+    )
+    with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
+         mock.patch("app.services.l3.grade.job._upsert_job_status"), \
+         mock.patch("app.services.l3.grade.job._upsert_grade_row",
+                    side_effect=lambda tid, key, h, gj, cube: rows.__setitem__(key, gj)), \
+         mock.patch("app.services.l3.grade.job.fetch_color_stats", return_value={}), \
+         mock.patch("app.services.l3.grade.job.measure_span", side_effect=fake_measure_span), \
+         mock.patch("app.services.l3.grade.job.ensure_cube_file", return_value=None), \
+         mock.patch("app.services.l3.grade.job.get_settings", return_value=fake_settings), \
+         mock.patch("app.services.l3.cuts_v3_read.latest_run_for_files", side_effect=RuntimeError("db down")), \
+         mock.patch("app.services.l3.store.latest_document", return_value=(doc, 1), create=True):
+        grade_job.run_grade_job("thread-fail-open")   # must not raise, must succeed
+
+    assert set(rows) == {"s0", "s1"}
+    non_identity = {k for k, gj in rows.items() if Grade.from_dict(gj["cdl"]) != Grade()}
+    assert non_identity, rows
+    print("ok  job: the cut_records join fails open on a DB error -- RGB base still groups, job still succeeds")
+
+
+def test_run_grade_job_scene_join_off_keeps_pre_plan_behavior():
+    """grade_scene_join=False: ShotSceneMeta gets empty metadata AND no
+    rgb_mean, so group_shots_semantically returns all-singletons and the
+    job falls back to RGB group_neighbors exactly as it did before this
+    plan -- and the DB join must never be called at all."""
+    doc = {
+        "timeline": [
+            {"seg_id": "s0", "file_id": "f0", "in_ms": 0, "out_ms": 1000},
+            {"seg_id": "s1", "file_id": "f1", "in_ms": 0, "out_ms": 1000},
+        ],
+        "operations": [], "look": {},
+    }
+
+    def fake_measure_span(file_id, in_ms, out_ms, *, hero_ts_ms=None, subject_box=None):
+        # close RGB -- the PRE-existing RGB group_neighbors fallback (not
+        # this plan's new semantic-grouper RGB base) can still chain these.
+        return {"black_point": 0.02, "white_point": 0.9, "mid_gray": 0.3,
+               "rgb_mean": [0.4, 0.4, 0.4], "rgb_std": [0.1, 0.1, 0.1]}
+
+    rows = {}
+    fake_settings = mock.Mock(
+        grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
+        grade_shot_match_v2=True, grade_scene_join=False,
+    )
+    join_spy = mock.Mock(side_effect=AssertionError("join must not be called when grade_scene_join=False"))
+    with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
+         mock.patch("app.services.l3.grade.job._upsert_job_status"), \
+         mock.patch("app.services.l3.grade.job._upsert_grade_row",
+                    side_effect=lambda tid, key, h, gj, cube: rows.__setitem__(key, gj)), \
+         mock.patch("app.services.l3.grade.job.fetch_color_stats", return_value={}), \
+         mock.patch("app.services.l3.grade.job.measure_span", side_effect=fake_measure_span), \
+         mock.patch("app.services.l3.grade.job.ensure_cube_file", return_value=None), \
+         mock.patch("app.services.l3.grade.job.get_settings", return_value=fake_settings), \
+         mock.patch("app.services.l3.grade.scene_meta.lookup_shot_cut_meta", join_spy), \
+         mock.patch("app.services.l3.store.latest_document", return_value=(doc, 1), create=True):
+        grade_job.run_grade_job("thread-join-off")
+
+    join_spy.assert_not_called()
+    assert set(rows) == {"s0", "s1"}
+    non_identity = {k for k, gj in rows.items() if Grade.from_dict(gj["cdl"]) != Grade()}
+    assert non_identity, rows
+    print("ok  job: grade_scene_join=False never calls the DB join, RGB group_neighbors fallback unchanged")
+
+
+# --------------------------------------------------------------------------
 # Phase 2/3: run_grade_job actually exercises leveling + semantic grouping
 # when their flags are on (mocked -- no DB/ffmpeg)
 # --------------------------------------------------------------------------
 
 def test_run_grade_job_applies_leveling_and_semantic_grouping_when_flagged():
+    """color_scene_grouping.plan.md: speaker_person/on_camera live on the
+    JOINED cut_record now, never on the raw timeline seg (that's the bug
+    this plan fixes) -- so grouping-by-speaker must be exercised by mocking
+    `scene_meta.lookup_shot_cut_meta`, not by setting fields on the seg
+    dict (those are read into compute_input_hash's payload only, never by
+    grouping)."""
     doc = {
         "timeline": [
-            {"seg_id": "s0", "file_id": "f1", "in_ms": 0, "out_ms": 2000,
-             "speaker_person": "P1", "on_camera": True},
-            {"seg_id": "s1", "file_id": "f2", "in_ms": 0, "out_ms": 2000,
-             "speaker_person": "P1", "on_camera": True},
+            {"seg_id": "s0", "file_id": "f1", "in_ms": 0, "out_ms": 2000},
+            {"seg_id": "s1", "file_id": "f2", "in_ms": 0, "out_ms": 2000},
         ],
         "operations": [], "look": {},
     }
@@ -1013,13 +1271,21 @@ def test_run_grade_job_applies_leveling_and_semantic_grouping_when_flagged():
     def fake_measure_span(file_id, in_ms, out_ms, *, hero_ts_ms=None, subject_box=None):
         # very different RGB (so RGB-based grouping would isolate them) but
         # jittery mid_gray (so leveling has something to do), same speaker
-        # (so semantic grouping should force a match despite the RGB gap).
+        # per the mocked cut_records join (so semantic grouping should
+        # force a match despite the RGB gap).
         return {"black_point": 0.02, "white_point": 0.9,
                "mid_gray": 0.3 if file_id == "f1" else 0.55,
                "rgb_mean": [0.9, 0.1, 0.1] if file_id == "f1" else [0.1, 0.9, 0.1],
                "rgb_std": [0.1, 0.1, 0.1]}
 
-    fake_settings = mock.Mock(grade_pipeline="v1", grade_even_lighting=True, grade_semantic=True)
+    fake_settings = mock.Mock(
+        grade_pipeline="v1", grade_even_lighting=True, grade_semantic=True,
+        grade_shot_match_v2=True, grade_scene_join=True,
+    )
+    joined_meta = {
+        "s0": ShotCutMeta(speaker_person="P1", on_camera=True),
+        "s1": ShotCutMeta(speaker_person="P1", on_camera=True),
+    }
 
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status", side_effect=lambda tid, **kw: call_log.append(("status", kw))), \
@@ -1029,6 +1295,7 @@ def test_run_grade_job_applies_leveling_and_semantic_grouping_when_flagged():
          mock.patch("app.services.l3.grade.job.measure_span", side_effect=fake_measure_span), \
          mock.patch("app.services.l3.grade.job.ensure_cube_file", return_value=None), \
          mock.patch("app.services.l3.grade.job.get_settings", return_value=fake_settings), \
+         mock.patch("app.services.l3.grade.scene_meta.lookup_shot_cut_meta", return_value=joined_meta), \
          mock.patch("app.services.l3.store.latest_document", return_value=(doc, 1), create=True):
         grade_job.run_grade_job("thread-flags")
 
@@ -1097,6 +1364,15 @@ def main():
     test_shot_match_references_none_reproduces_legacy_anchor_behavior()
     test_shot_match_references_override_matches_every_member_not_just_anchor()
     test_run_grade_job_shot_match_v2_off_reproduces_pre_redesign_path()
+    test_scene_grouping_rgb_base_prevents_all_singletons()
+    test_scene_grouping_sync_group_id_groups_across_files()
+    test_scene_grouping_take_group_id_groups_across_files()
+    test_scene_grouping_voice_ids_overlap_groups_across_files()
+    test_scene_meta_join_picks_max_overlap_cut_record()
+    test_run_grade_job_groups_multi_file_reel_via_scene_join()
+    test_run_grade_job_scene_join_does_not_over_group_unrelated_shots()
+    test_run_grade_job_scene_join_fail_open_on_db_error()
+    test_run_grade_job_scene_join_off_keeps_pre_plan_behavior()
     test_run_grade_job_applies_leveling_and_semantic_grouping_when_flagged()
     print("\nall grade tests passed")
 
