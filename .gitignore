@@ -22,6 +22,11 @@ build/
 # Runtime logs (analysis/edit/render output written at runtime)
 backend/logs/
 
+# color_qa_harness.plan.md: generated corpus stills/scoreboards/contact
+# sheets -- local artifacts by design (A.5/Part C: "commit the JSON to
+# _out/qa/baselines/<date>.json locally, not to git prod code").
+backend/scripts/_out/
+
 # IDE
 .vscode/
 .idea/
