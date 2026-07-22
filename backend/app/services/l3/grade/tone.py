@@ -12,9 +12,12 @@ not its tone curve -- that's one-directional by design):
 
   * `to_working(rgb_display, working_space)`: linearizes DISPLAY-encoded
     input into a scene-referred WORKING space. For `v1` this is a single,
-    well-documented transfer -- the inverse sRGB/Rec.709 EOTF. This is
-    deliberately the "slot": a fuller ACES input transform (IDT) can replace
-    it later without any caller change (see the plan's "Libraries deferred").
+    well-documented transfer -- the inverse sRGB/Rec.709 EOTF. This was
+    deliberately "the slot" for a fuller input transform (IDT); Part 2 of
+    color_phase1.plan.md fills it for LOG-tagged clips with `log_v1` (a
+    generic log/"flat" decode -- see `LOG_DECODE_GAMMA`), selected per-clip
+    by the resolver. `rec709_v1` itself is untouched (still exactly the
+    inverse sRGB EOTF) -- a per-vendor IDT is a later refinement.
   * `from_working(rgb_working, working_space)`: a FILMIC highlight shoulder
     (Reinhard-style, identity below `_SHOULDER_START` so shadows/midtones are
     literally untouched, asymptotic toward 1.0 above it so a bright/contrasty
@@ -39,6 +42,26 @@ predictable while still preventing a hard highlight clip -- the actual
 from __future__ import annotations
 
 WORKING_SPACE_V1 = "rec709_v1"
+WORKING_SPACE_LOG_V1 = "log_v1"
+
+# color_phase1.plan.md Part 2: a generic, single, well-behaved log/"flat"
+# decode curve for footage the `is_log_flat` heuristic flags. Log encoding
+# packs the SAME scene-linear value into a LOWER display code value than
+# sRGB does (a log profile's mid-gray sits ~0.32-0.42 in display-encoded
+# values -- S-Log2 ~0.32, S-Log3 ~0.41, LogC ~0.39, V-Log ~0.42 -- well
+# below sRGB's own ~0.461, trading midtone contrast for highlight
+# headroom), so decoding it needs a GENTLER curve than the sRGB EOTF, or
+# it under-shoots true scene-linear: a monotonic, endpoint-pinned
+# (0->0, 1->1) power curve, `linear = display ** LOG_DECODE_GAMMA`, with
+# GAMMA < sRGB's own effective ~2.4. GAMMA is derived numerically so a
+# representative log mid-gray code value decodes close to scene-linear
+# 0.18: 0.38 ** 1.8 ~= 0.175 (vs the sRGB EOTF's 0.38 -> ~0.119, which
+# would under-shoot). One curve across vendors, not per-profile -- a real
+# per-vendor IDT is a later refinement
+# (color_phase1.plan.md risk #5). Inherently bounded (x in [0,1] -> output
+# in [0,1]), so a false-positive `is_log_flat` misfire can't crush/blow a
+# shot, only over/under-lift it (risk #2).
+LOG_DECODE_GAMMA = 1.8
 
 _SRGB_A = 0.055
 _SRGB_LINEAR_THRESH = 0.0031308   # linear value where the sRGB OETF's two branches meet
@@ -57,11 +80,15 @@ TONE_PIVOT = 0.435
 
 
 def to_working(rgb_display, working_space: str):
-    """Display-encoded (gamma) RGB, 0..1 -> scene-referred linear RGB.
-    Identity unless `working_space == WORKING_SPACE_V1`."""
+    """Display-encoded RGB, 0..1 -> scene-referred linear RGB. Identity
+    unless `working_space` is `WORKING_SPACE_V1` (inverse sRGB/Rec.709 EOTF)
+    or `WORKING_SPACE_LOG_V1` (the generic log decode, `LOG_DECODE_GAMMA`)."""
     import numpy as np
 
     arr = np.asarray(rgb_display, dtype=np.float32)
+    if working_space == WORKING_SPACE_LOG_V1:
+        arr = np.clip(arr, 0.0, 1.0)
+        return np.power(arr, LOG_DECODE_GAMMA).astype(np.float32)
     if working_space != WORKING_SPACE_V1:
         return arr
     arr = np.clip(arr, 0.0, 1.0)
@@ -127,18 +154,21 @@ def _contrast_pivot(x, g, p: float = TONE_PIVOT):
 
 def from_working(rgb_working, working_space: str, *, contrast: float = 0.0):
     """Scene-referred linear RGB -> filmic-tone-mapped, display-encoded RGB.
-    Identity unless `working_space == WORKING_SPACE_V1`.
+    Identity unless `working_space` is `WORKING_SPACE_V1` or
+    `WORKING_SPACE_LOG_V1` -- both re-encode to display Rec.709 identically;
+    only `to_working`'s INPUT decode differs between them (color_phase1.
+    plan.md Part 2: "the output is always display Rec.709").
 
     `contrast` (color_tone_contrast.plan.md, v1-only): a filmic S-curve
     applied to the final display-encoded output, AFTER the highlight
     shoulder + sRGB OETF above. `contrast=0.0` (default) is exact identity
     (`g=1.0` in `_contrast_pivot`) -- reproduces today's bytes bit-for-bit.
     `contrast>0.0` maps to `g = 1.0 + contrast`. Never touched when
-    `working_space != WORKING_SPACE_V1` (legacy stays byte-for-byte)."""
+    `working_space` is neither of the above (legacy stays byte-for-byte)."""
     import numpy as np
 
     arr = np.asarray(rgb_working, dtype=np.float32)
-    if working_space != WORKING_SPACE_V1:
+    if working_space not in (WORKING_SPACE_V1, WORKING_SPACE_LOG_V1):
         return arr
     arr = np.clip(arr, 0.0, None)
     toned = np.clip(_tonemap_shoulder(arr), 0.0, 1.0)

@@ -95,7 +95,15 @@ logger = logging.getLogger(__name__)
 # the global tone_contrast S-curve permanently OFF (0.0) -- the "flags"
 # payload below is gone entirely, so this version bump alone is what forces
 # every project's stored grade to be recomputed against the new pipeline.
-INPUT_HASH_SCHEMA_VERSION = 11
+# v12 (color_phase1.plan.md Part 2): fills tone.to_working's long-reserved
+# IDT slot for LOG/flat footage -- resolver.resolve_clip_grade now selects
+# a new WORKING_SPACE_LOG_V1 per-clip (color_stats.is_log_flat), decoding
+# with a real log curve (tone.LOG_DECODE_GAMMA) instead of treating it as
+# display Rec.709, and correct.py's crude LOG_FLAT_PRE_LIFT is gated off
+# under that working space (the decode replaces it). Exactly inert on
+# already-Rec.709 footage (byte-identical grade_hash, verified live) -- only
+# is_log_flat clips' grade math actually changes.
+INPUT_HASH_SCHEMA_VERSION = 12
 
 # Same local-disk, content-addressed cube cache the preview cube endpoint and
 # the render compositor already use (grade/cache.py's documented "not shared

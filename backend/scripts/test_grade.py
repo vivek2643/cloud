@@ -103,6 +103,94 @@ def test_tone_v1_monotonic():
 
 
 # --------------------------------------------------------------------------
+# color_phase1.plan.md Part 2: WORKING_SPACE_LOG_V1 -- golden byte-identical
+# regression on rec709_v1 (the hard requirement) + the new log-decode curve
+# --------------------------------------------------------------------------
+
+def test_tone_v1_golden_byte_identical_after_log_v1_added():
+    """HARD REQUIREMENT (color_phase1.plan.md 2.2): adding the log_v1 branch
+    must not perturb rec709_v1 by even one bit. Recomputes the inverse sRGB
+    EOTF / filmic-shoulder+OETF formulas independently (not by calling
+    tone.py) against fixed probe values, so this test would catch a
+    regression even if someone edited the v1 branch itself, not just the
+    new log_v1 one."""
+    import numpy as np
+    probes = np.array([0.0, 0.04045, 0.18, 0.435, 0.8, 0.9, 1.0], dtype=np.float32)
+
+    lo = probes / 12.92
+    hi = np.power((probes + tone._SRGB_A) / (1.0 + tone._SRGB_A), 2.4)
+    expected_lin = np.where(probes <= tone._SRGB_DISPLAY_THRESH, lo, hi).astype(np.float32)
+    got_lin = tone.to_working(probes, tone.WORKING_SPACE_V1)
+    assert np.allclose(got_lin, expected_lin, atol=1e-7), (got_lin, expected_lin)
+
+    headroom = 1.0 - tone._SHOULDER_START
+    over = np.clip(expected_lin - tone._SHOULDER_START, 0.0, None)
+    toned = np.where(expected_lin <= tone._SHOULDER_START, expected_lin,
+                      tone._SHOULDER_START + headroom * over / (headroom + over))
+    toned = np.clip(toned, 0.0, 1.0)
+    lo2 = toned * 12.92
+    hi2 = (1.0 + tone._SRGB_A) * np.power(toned, 1.0 / 2.4) - tone._SRGB_A
+    expected_display = np.where(toned <= tone._SRGB_LINEAR_THRESH, lo2, hi2).astype(np.float32)
+    got_display = tone.from_working(got_lin, tone.WORKING_SPACE_V1)
+    assert np.allclose(got_display, expected_display, atol=1e-7), (got_display, expected_display)
+    print("ok  tone: rec709_v1 is byte-identical to its independently-recomputed formula")
+
+
+def test_tone_log_v1_endpoints_pinned_and_bounded():
+    import numpy as np
+    x = np.array([0.0, 0.38, 1.0], dtype=np.float32)
+    lin = tone.to_working(x, tone.WORKING_SPACE_LOG_V1)
+    assert abs(float(lin[0])) < 1e-6, lin
+    assert abs(float(lin[-1]) - 1.0) < 1e-6, lin
+    assert bool(np.all(lin >= 0.0)) and bool(np.all(lin <= 1.0))
+    print("ok  tone: log_v1 decode is endpoint-pinned (0->0, 1->1) and stays in [0,1]")
+
+
+def test_tone_log_v1_midgray_decodes_near_true_scene_linear():
+    """The whole point of the decode: a log profile packs the SAME
+    scene-linear mid-gray (0.18) into a LOWER display code value (~0.32-0.42)
+    than sRGB would (~0.461) -- log footage looks flatter/darker un-decoded,
+    preserving highlight headroom. So decoding that code value must produce
+    a HIGHER linear result than naively running it through the sRGB EOTF
+    would (which under-shoots to ~0.12): the log curve is deliberately
+    gentler (GAMMA=1.8 < sRGB's ~2.4) to correct for that compression."""
+    import numpy as np
+    x = np.array([0.38], dtype=np.float32)
+    log_decoded = float(tone.to_working(x, tone.WORKING_SPACE_LOG_V1)[0])
+    srgb_decoded = float(tone.to_working(x, tone.WORKING_SPACE_V1)[0])
+    assert log_decoded > srgb_decoded, (log_decoded, srgb_decoded)
+    assert abs(log_decoded - 0.18) < 0.05, log_decoded
+    print(f"ok  tone: log_v1 mid-gray (0.38) decodes to {log_decoded:.3f}, near scene-linear 0.18")
+
+
+def test_tone_log_v1_monotonic():
+    import numpy as np
+    sweep = np.linspace(0, 1, 200).astype(np.float32)
+    lin = tone.to_working(sweep, tone.WORKING_SPACE_LOG_V1)
+    assert bool(np.all(np.diff(lin) >= -1e-6))
+    print("ok  tone: log_v1 decode curve is monotonically non-decreasing")
+
+
+def test_tone_log_v1_from_working_matches_v1_reencode():
+    """from_working must treat log_v1 identically to v1 -- same tonemap +
+    re-encode to display Rec.709, only the INPUT decode differs."""
+    import numpy as np
+    lin = np.array([0.0, 0.18, 0.5, 0.9], dtype=np.float32)
+    out_log = tone.from_working(lin, tone.WORKING_SPACE_LOG_V1)
+    out_v1 = tone.from_working(lin, tone.WORKING_SPACE_V1)
+    assert np.array_equal(out_log, out_v1), (out_log, out_v1)
+    print("ok  tone: log_v1 from_working is identical to v1's (same re-encode, decode differs)")
+
+
+def test_tone_log_v1_black_stays_black():
+    import numpy as np
+    lin = tone.to_working(np.array([0.0], dtype=np.float32), tone.WORKING_SPACE_LOG_V1)
+    out = tone.from_working(lin, tone.WORKING_SPACE_LOG_V1)
+    assert abs(float(out[0])) < 1e-5, out
+    print("ok  tone: log_v1 black point stays exactly black")
+
+
+# --------------------------------------------------------------------------
 # Step 1.1: lut_bake.py -- direct-compute vs baked-cube parity, legacy parity
 # --------------------------------------------------------------------------
 
@@ -198,6 +286,52 @@ def test_correct_v1_never_worse_on_already_correct_footage():
     g = solve_correct_grade(cs, pipeline="v1")
     assert abs(g.slope[0] - 1.0) < 0.05, g.slope
     print("ok  correct: v1 barely moves already-correctly-exposed footage")
+
+
+# --------------------------------------------------------------------------
+# color_phase1.plan.md Part 2: LOG_FLAT_PRE_LIFT gated off under the real
+# log decode (WORKING_SPACE_LOG_V1), kept as a fallback otherwise
+# --------------------------------------------------------------------------
+
+def test_correct_pre_lift_applies_by_default_for_is_log_flat():
+    """Unchanged fallback behavior: no explicit working_space -> the
+    pipeline-derived WORKING_SPACE_V1 is used, so the crude pre-lift still
+    fires for an is_log_flat clip (pre-Part-2 behavior, byte-identical)."""
+    # Modest stretch (not already pinned to LEVELS_SLOPE_MAX) so the pre-
+    # lift's extra multiplier is actually visible in the result -- an
+    # aggressive black/white gap saturates the ceiling either way and the
+    # re-anchoring clamp erases the difference, which would be a false pass.
+    cs = _cs(black_point=0.15, white_point=0.70, mid_gray=0.40, is_log_flat=True)
+    with_lift = solve_correct_grade(cs, pipeline="v1")
+    without_flag = solve_correct_grade({**cs, "is_log_flat": False}, pipeline="v1")
+    assert with_lift.slope != without_flag.slope or with_lift.offset != without_flag.offset
+    print("ok  correct: is_log_flat still applies the crude pre-lift when no explicit working_space is given")
+
+
+def test_correct_pre_lift_gated_off_under_log_working_space():
+    """The real fix: once WORKING_SPACE_LOG_V1 is explicitly selected (as
+    resolver.py now does for an is_log_flat clip), the crude 1.06x pre-lift
+    must NOT also fire -- the log decode already compensates; double-
+    applying would over-lift. Compare the SAME color_stats solved under v1
+    (pre-lift fires) vs explicitly under log_v1 (pre-lift gated off) -- they
+    must differ, proving the gate actually took effect."""
+    cs = _cs(black_point=0.15, white_point=0.70, mid_gray=0.40, is_log_flat=True)
+    g_v1 = solve_correct_grade(cs, pipeline="v1", working_space=tone.WORKING_SPACE_V1)
+    g_log = solve_correct_grade(cs, pipeline="v1", working_space=tone.WORKING_SPACE_LOG_V1)
+    assert g_v1.slope != g_log.slope or g_v1.offset != g_log.offset, (g_v1, g_log)
+    print("ok  correct: LOG_FLAT_PRE_LIFT is gated off when working_space is explicitly log_v1")
+
+
+def test_correct_pre_lift_gate_is_a_no_op_for_non_log_footage():
+    """The gate only touches the is_log_flat branch -- non-log footage
+    solved under either working_space value (hypothetically) would still
+    differ only because of the differing decode, never because of the
+    pre-lift (which never fires without is_log_flat)."""
+    cs = _cs(black_point=0.05, white_point=0.85, mid_gray=0.42, is_log_flat=False)
+    g_default = solve_correct_grade(cs, pipeline="v1")
+    g_explicit_v1 = solve_correct_grade(cs, pipeline="v1", working_space=tone.WORKING_SPACE_V1)
+    assert g_default == g_explicit_v1, (g_default, g_explicit_v1)
+    print("ok  correct: explicitly passing WORKING_SPACE_V1 reproduces the pipeline-derived default exactly")
 
 
 def _roundtrip_v1(display_value, grade):
@@ -404,6 +538,80 @@ def test_resolver_explicit_working_space_overrides_pipeline_default():
     g = resolve_clip_grade({"working_space": "custom_space"}, color_stats=None)
     assert g["working_space"] == "custom_space", g["working_space"]
     print("ok  resolver: an item's explicit working_space wins over the default")
+
+
+# --------------------------------------------------------------------------
+# color_phase1.plan.md Part 2: per-clip log working-space selection
+# --------------------------------------------------------------------------
+
+def test_resolver_is_log_flat_selects_log_working_space():
+    g = resolve_clip_grade({}, color_stats=_cs(is_log_flat=True))
+    assert g["working_space"] == tone.WORKING_SPACE_LOG_V1, g["working_space"]
+    print("ok  resolver: is_log_flat color_stats selects WORKING_SPACE_LOG_V1")
+
+
+def test_resolver_non_log_stays_on_v1_working_space():
+    g = resolve_clip_grade({}, color_stats=_cs(is_log_flat=False))
+    assert g["working_space"] == tone.WORKING_SPACE_V1, g["working_space"]
+    print("ok  resolver: is_log_flat=False (or absent) stays on WORKING_SPACE_V1")
+
+
+def test_resolver_no_color_stats_stays_on_v1_working_space():
+    """color_stats=None must not crash the `.get("is_log_flat")` read."""
+    g = resolve_clip_grade({}, color_stats=None)
+    assert g["working_space"] == tone.WORKING_SPACE_V1, g["working_space"]
+    print("ok  resolver: color_stats=None is treated as non-log, no crash")
+
+
+def test_resolver_explicit_working_space_wins_over_is_log_flat():
+    g = resolve_clip_grade({"working_space": "custom_space"}, color_stats=_cs(is_log_flat=True))
+    assert g["working_space"] == "custom_space", g["working_space"]
+    print("ok  resolver: an item's explicit working_space still wins even when is_log_flat is set")
+
+
+def test_resolver_log_clip_produces_a_finite_bounded_cdl():
+    """The log decode + composite clamp must still produce a sane CDL --
+    not NaN/inf/wildly out of range -- for a representative log/flat
+    color_stats row (low native contrast, mid_gray reading dim)."""
+    cs = _cs(black_point=0.05, white_point=0.55, mid_gray=0.25, is_log_flat=True)
+    g_dict = resolve_clip_grade({}, color_stats=cs)
+    cdl = Grade.from_dict(g_dict["cdl"])
+    for s in cdl.slope:
+        assert math.isfinite(s) and 0.0 < s < 5.0, cdl.slope
+    for o in cdl.offset:
+        assert math.isfinite(o), cdl.offset
+    print("ok  resolver: a log-flat clip resolves to a finite, bounded CDL")
+
+
+def test_resolver_non_log_golden_grade_hash_unchanged_by_part2():
+    """HARD REQUIREMENT (color_phase1.plan.md 2.2): adding per-clip log
+    working-space selection must be byte-identical for a non-log clip -- the
+    golden hash below was captured by running this exact resolve BEFORE
+    Part 2's tone.py/correct.py/resolver.py changes (git stash + rerun), not
+    guessed. If this ever changes, something in the non-log path moved."""
+    g = resolve_clip_grade({}, color_stats=_cs())
+    assert g["working_space"] == tone.WORKING_SPACE_V1, g["working_space"]
+    assert g["grade_hash"] == "362cad69961b690a70e6280c1f21507e", g["grade_hash"]
+    assert g["cdl"] == {
+        "slope": [0.8333333333333334, 0.8333333333333334, 0.8333333333333334],
+        "offset": [0.003661125103632607, 0.003661125103632607, 0.003661125103632607],
+        "power": [1.0, 1.0, 1.0], "sat": 1.0,
+    }, g["cdl"]
+    print("ok  resolver: non-log clip's grade_hash is byte-identical to pre-Part-2")
+
+
+def test_resolver_log_flat_grade_hash_differs_from_treating_it_as_v1():
+    """The whole point of Part 2: a log-tagged clip must actually get a
+    DIFFERENT (distinct cache key / distinct baked cube) grade than the
+    same measurement would under WORKING_SPACE_V1 -- otherwise the log
+    decode isn't actually being applied."""
+    cs_log = _cs(black_point=0.05, white_point=0.55, mid_gray=0.25, is_log_flat=True)
+    cs_plain = _cs(black_point=0.05, white_point=0.55, mid_gray=0.25, is_log_flat=False)
+    g_log = resolve_clip_grade({}, color_stats=cs_log)
+    g_plain = resolve_clip_grade({}, color_stats=cs_plain)
+    assert g_log["working_space"] != g_plain["working_space"]
+    assert g_log["grade_hash"] != g_plain["grade_hash"]
+    print("ok  resolver: a log-flat clip's grade_hash differs from the same clip graded as v1")
 
 
 def test_resolver_reference_transfer_v1_does_not_crash_or_blow_up():
@@ -2225,12 +2433,21 @@ def main():
     test_tone_v1_never_exceeds_one()
     test_tone_v1_midgray_barely_moves_shadows_untouched()
     test_tone_v1_monotonic()
+    test_tone_v1_golden_byte_identical_after_log_v1_added()
+    test_tone_log_v1_endpoints_pinned_and_bounded()
+    test_tone_log_v1_midgray_decodes_near_true_scene_linear()
+    test_tone_log_v1_monotonic()
+    test_tone_log_v1_from_working_matches_v1_reencode()
+    test_tone_log_v1_black_stays_black()
     test_lut_bake_legacy_unaffected_by_working_space_param()
     test_lut_bake_v1_parity_direct_vs_baked_cube()
     test_lut_bake_v1_differs_from_legacy_for_same_grade()
     test_correct_legacy_untouched_by_pipeline_param()
     test_correct_v1_nudges_mid_gray_toward_target_bounded()
     test_correct_v1_never_worse_on_already_correct_footage()
+    test_correct_pre_lift_applies_by_default_for_is_log_flat()
+    test_correct_pre_lift_gated_off_under_log_working_space()
+    test_correct_pre_lift_gate_is_a_no_op_for_non_log_footage()
     test_v1_grade_does_not_crush_midtones_or_shadows()
     test_v1_composite_slope_and_offset_are_bounded()
     test_v1_composite_offset_floor_protects_a_modest_shadow_crush()
@@ -2242,6 +2459,13 @@ def main():
     test_match_same_file_always_groups_regardless_of_rgb()
     test_resolver_v1_sets_v1_working_space()
     test_resolver_explicit_working_space_overrides_pipeline_default()
+    test_resolver_is_log_flat_selects_log_working_space()
+    test_resolver_non_log_stays_on_v1_working_space()
+    test_resolver_no_color_stats_stays_on_v1_working_space()
+    test_resolver_explicit_working_space_wins_over_is_log_flat()
+    test_resolver_log_clip_produces_a_finite_bounded_cdl()
+    test_resolver_non_log_golden_grade_hash_unchanged_by_part2()
+    test_resolver_log_flat_grade_hash_differs_from_treating_it_as_v1()
     test_resolver_reference_transfer_v1_does_not_crash_or_blow_up()
     test_resolver_subject_box_seam_carries_through_no_visual_change_by_default()
     test_one_grade_per_shot_no_intra_shot_variance()

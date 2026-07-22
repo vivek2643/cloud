@@ -46,8 +46,18 @@ CLIP_HIGH_8BIT = 253 / 255.0     # color_stats.CLIP_HIGH_8BIT
 
 CRUSHED_BLACK_PASS, CRUSHED_BLACK_WARN = 0.02, 0.05
 CLIPPED_HIGHLIGHT_PASS, CLIPPED_HIGHLIGHT_WARN = 0.02, 0.05
+# color_phase1.plan.md Part 1b: exposure is content-aware, not one rigid
+# target. EXPOSURE_BAND_PASS is a "typical" reference window (inside it ->
+# PASS); a deliberately dark (night/moody) or bright (high-key) shot that
+# lands outside it is only ever WARNed, never FAILed, as long as it's still
+# within EXPOSURE_GROSS_FAIL -- FAIL is reserved for a genuinely broken
+# whole-frame exposure (a mean/median luma that gross, e.g. ~0.06, reads as
+# almost entirely crushed regardless of creative intent; ~0.92 as almost
+# entirely blown). This is the Tier A "gross end" signal;
+# crushed_black_fraction/clipped_highlight_fraction stay the precise
+# structural ones.
 EXPOSURE_BAND_PASS = (0.30, 0.60)
-EXPOSURE_BAND_WARN = (0.22, 0.72)
+EXPOSURE_GROSS_FAIL = (0.06, 0.92)
 
 NEUTRAL_CHROMA_MASK_MAX = 6.0     # |ab| below this -> "near neutral" pixel
 NEUTRAL_MASK_MIN_FRACTION = 0.01  # below this coverage, deviation is N/A
@@ -62,6 +72,19 @@ GROUP_SUBJECT_LUMA_STD_PASS, GROUP_SUBJECT_LUMA_STD_WARN = 0.03, 0.06
 SATURATION_PASS = (12.0, 40.0)
 SATURATION_WARN = (8.0, 55.0)
 CHROMA_INCREASE_FAIL_RATIO = 2.0
+# color_phase1.plan.md Part 1a: a look declaring an intended global
+# saturation factor below this is read as INTENTIONAL desaturation/mono
+# (e.g. bw_film at sat=0.05, moody_teal at 0.82 is NOT below this -- only
+# genuinely near-mono looks are exempt) -- the "under-saturated" FAIL
+# direction is waived for it (the over-saturation backstop still applies).
+LOOK_MONO_SAT_THRESHOLD = 0.35
+# The graded/raw chroma ratio, normalized by the look's intended factor
+# (1.0 for no-look/correction-only), judged against these multiplicative
+# windows instead of an absolute chroma band -- so a deliberately warm/
+# vivid OR deliberately restrained look is judged against what IT intends,
+# not one fixed number for every shot.
+SATURATION_RATIO_PASS = (0.6, 1.6)
+SATURATION_RATIO_WARN = (0.4, 2.0)
 
 BANDING_PASS, BANDING_WARN = 0.15, 0.30
 
@@ -164,6 +187,17 @@ def crop_box(rgb01: np.ndarray, box: Optional[Sequence[float]]) -> Optional[np.n
 # 1. Exposure
 # --------------------------------------------------------------------------
 
+def _exposure_band_verdict(value: float) -> Verdict:
+    """PASS inside the "typical" window; WARN for anything else that's
+    still a plausible creative exposure; FAIL only at the gross extremes
+    (Tier A -- a genuinely broken whole-frame exposure)."""
+    if EXPOSURE_GROSS_FAIL[0] <= value <= EXPOSURE_GROSS_FAIL[1]:
+        if EXPOSURE_BAND_PASS[0] <= value <= EXPOSURE_BAND_PASS[1]:
+            return "pass"
+        return "warn"
+    return "fail"
+
+
 def exposure_metrics(graded01: np.ndarray, raw01: Optional[np.ndarray] = None) -> Dict[str, MetricResult]:
     l = luma01(graded01)
     crushed = float(np.mean(l <= CLIP_LOW_8BIT))
@@ -172,16 +206,22 @@ def exposure_metrics(graded01: np.ndarray, raw01: Optional[np.ndarray] = None) -
 
     crushed_extra: Dict[str, Any] = {}
     clipped_extra: Dict[str, Any] = {}
+    exposure_extra: Dict[str, Any] = {"mean": mean_l, "median": median_l, "target": TARGET_MID_GRAY}
     if raw01 is not None:
         raw_l = luma01(raw01)
         raw_crushed = float(np.mean(raw_l <= CLIP_LOW_8BIT))
         raw_clipped = float(np.mean(raw_l >= CLIP_HIGH_8BIT))
         crushed_extra = {"raw": raw_crushed, "delta": crushed - raw_crushed}
         clipped_extra = {"raw": raw_clipped, "delta": clipped - raw_clipped}
+        raw_mean, raw_median = float(raw_l.mean()), float(np.median(raw_l))
+        exposure_extra.update({
+            "raw_mean": raw_mean, "raw_median": raw_median,
+            "delta_mean": mean_l - raw_mean, "delta_median": median_l - raw_median,
+        })
 
     exposure_verdict = worst_verdict([
-        _band_range(mean_l, EXPOSURE_BAND_PASS, EXPOSURE_BAND_WARN),
-        _band_range(median_l, EXPOSURE_BAND_PASS, EXPOSURE_BAND_WARN),
+        _exposure_band_verdict(mean_l),
+        _exposure_band_verdict(median_l),
     ])
 
     return {
@@ -193,10 +233,7 @@ def exposure_metrics(graded01: np.ndarray, raw01: Optional[np.ndarray] = None) -
             "clipped_highlight_fraction", clipped,
             _band_upper(clipped, CLIPPED_HIGHLIGHT_PASS, CLIPPED_HIGHLIGHT_WARN), clipped_extra,
         ),
-        "exposure_band": MetricResult(
-            "exposure_band", median_l, exposure_verdict,
-            {"mean": mean_l, "median": median_l, "target": TARGET_MID_GRAY},
-        ),
+        "exposure_band": MetricResult("exposure_band", median_l, exposure_verdict, exposure_extra),
     }
 
 
@@ -368,23 +405,104 @@ def group_subject_exposure_metrics(
 # 4. Over-processing
 # --------------------------------------------------------------------------
 
-def saturation_band(graded01: np.ndarray, raw01: Optional[np.ndarray] = None) -> MetricResult:
+def look_saturation_intent(look_engine: Optional[dict]) -> Optional[float]:
+    """color_phase1.plan.md Part 1a: the active look's OWN intended global
+    saturation factor, read straight from its `LookSpec` (no hand-maintained
+    "these looks are mono" list -- any future look is handled automatically).
+    `LookSpec.sat` is the base global multiplier; `hue_sat` bands nudge it by
+    their (width/360) share of the hue wheel as a coarse frame-coverage
+    weight (we don't have a hue histogram to weight by actual pixel
+    coverage, so this is a principled estimate, not a guess -- a band
+    covering more of the wheel plausibly touches more of a typical frame).
+    `None` when there's no active look (the "correction only, no creative
+    desat" case) -- callers should treat that as an intent of `1.0`."""
+    if not look_engine:
+        return None
+    try:
+        sat = float(look_engine.get("sat", 1.0))
+    except (TypeError, ValueError):
+        sat = 1.0
+    hue_sat = look_engine.get("hue_sat") or []
+    weighted_sum = 0.0
+    weight_total = 0.0
+    for band in hue_sat:
+        if not band or len(band) != 3:
+            continue
+        try:
+            _center, width, mult = (float(v) for v in band)
+        except (TypeError, ValueError):
+            continue
+        w = max(0.0, min(360.0, width)) / 360.0
+        weighted_sum += w * mult
+        weight_total += w
+    if weight_total <= 0.0:
+        return sat
+    hue_sat_factor = weighted_sum / weight_total
+    # Damp the hue-band contribution by how much of the wheel it actually
+    # covers (weight_total capped at 1.0) -- a narrow band nudges a whole-
+    # frame chroma average only a little, a wide one more.
+    return sat * (1.0 + (hue_sat_factor - 1.0) * min(1.0, weight_total))
+
+
+def saturation_band(
+    graded01: np.ndarray, raw01: Optional[np.ndarray] = None, *, look_intent: Optional[float] = None,
+) -> MetricResult:
+    """Judged RELATIVE TO RAW (the graded/raw chroma ratio, normalized by
+    the look's own intended factor) rather than one fixed absolute band --
+    the primary signal for "did this grade over/under-saturate," matching
+    every other metric's raw-vs-graded discipline. The absolute band stays
+    as a coarse backstop, and a look intending near-mono (`look_intent <
+    LOOK_MONO_SAT_THRESHOLD`) exempts the UNDER-saturated direction entirely
+    (it's working as designed) while still guarding against an
+    over-saturated "B&W" look, which would be a real bug."""
     lab = to_lab(graded01)
     a, b = lab[..., 1], lab[..., 2]
     chroma_mean = float(np.sqrt(a * a + b * b).mean())
-    verdict = _band_range(chroma_mean, SATURATION_PASS, SATURATION_WARN)
     extra: Dict[str, Any] = {}
+    if look_intent is not None:
+        extra["look_intent"] = look_intent
+    is_mono_look = look_intent is not None and look_intent < LOOK_MONO_SAT_THRESHOLD
+
+    raw_chroma: Optional[float] = None
     if raw01 is not None:
         raw_lab = to_lab(raw01)
         ra, rb = raw_lab[..., 1], raw_lab[..., 2]
         raw_chroma = float(np.sqrt(ra * ra + rb * rb).mean())
         extra["raw_chroma_mean"] = raw_chroma
-        if raw_chroma > 1e-6:
-            ratio = chroma_mean / raw_chroma
-            extra["chroma_increase_ratio"] = ratio
-            if ratio > CHROMA_INCREASE_FAIL_RATIO:
-                verdict = "fail"
-    return MetricResult("saturation_band", chroma_mean, verdict, extra)
+
+    ratio: Optional[float] = None
+    if raw_chroma is not None and raw_chroma > 1e-6:
+        ratio = chroma_mean / raw_chroma
+        extra["chroma_increase_ratio"] = ratio
+        if ratio > CHROMA_INCREASE_FAIL_RATIO:
+            # Over-saturation backstop -- applies even under a mono look
+            # (an over-saturated "B&W" look is still a real bug).
+            return MetricResult("saturation_band", chroma_mean, "fail", extra)
+
+    if is_mono_look:
+        return MetricResult("saturation_band", chroma_mean, "na", extra)
+
+    if ratio is None:
+        # No raw baseline (or a ~zero-chroma raw source, nothing to ratio
+        # against) -- fall back to the absolute band.
+        verdict = _band_range(chroma_mean, SATURATION_PASS, SATURATION_WARN)
+        return MetricResult("saturation_band", chroma_mean, verdict, extra)
+
+    expected = look_intent if look_intent is not None else 1.0
+    normalized = ratio / expected if expected > 1e-6 else ratio
+    extra["normalized_ratio"] = normalized
+    ratio_verdict = _band_range(normalized, SATURATION_RATIO_PASS, SATURATION_RATIO_WARN)
+    # Absolute backstop -- OVER-saturated extreme only. Naturally-muted
+    # content (an indoor talking-head, mostly skin/neutral walls) can
+    # legitimately have low whole-frame chroma even when correctly graded;
+    # the ratio above already catches a grade that makes it WORSE, so the
+    # absolute UNDER-saturated band must NOT independently fail here (this
+    # is exactly the "podcast trial 3 / natural preset" false failure the
+    # plan's first-run findings called out). A garish, absolutely
+    # oversaturated result is still worth flagging even if the ratio looks
+    # sane (raw was already oversaturated too).
+    absolute_over_verdict = _band_upper(chroma_mean, SATURATION_PASS[1], SATURATION_WARN[1])
+    return MetricResult("saturation_band", chroma_mean, worst_verdict([ratio_verdict, absolute_over_verdict]), extra)
 
 
 def banding_score(graded01: np.ndarray) -> MetricResult:

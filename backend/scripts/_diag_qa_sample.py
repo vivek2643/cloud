@@ -206,6 +206,12 @@ def sample_thread(entry: Dict[str, Any], frames_per_shot: int) -> List[Dict[str,
             has_grade = grade_json is not None
             cube_path = ensure_cube_file(grade_json, CUBE_DIR) if has_grade else None
             look_engine = (grade_json or {}).get("look_engine")
+            # color_phase1.plan.md Part 2: the shot's ACTUAL working_space
+            # (rec709_v1 or, for a log-tagged clip, log_v1) -- _diag_qa_score.
+            # py's look-fidelity bake must use the SAME space the real grade
+            # composed in, or the comparison baseline is measuring the wrong
+            # decode entirely.
+            working_space = (grade_json or {}).get("working_space")
 
             frame_records = []
             for ts_ms in ts_list:
@@ -237,6 +243,7 @@ def sample_thread(entry: Dict[str, Any], frames_per_shot: int) -> List[Dict[str,
                 "subject_box": subject_box,
                 "has_grade": has_grade,
                 "look_engine": look_engine,
+                "working_space": working_space,
                 "is_log_flat": bool(stats.get("is_log_flat")),
                 "chroma_mean": stats.get("chroma_mean"),
                 "frames": frame_records,

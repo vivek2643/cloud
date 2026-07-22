@@ -44,7 +44,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from app.services.l3.grade.cdl import Grade
 from app.services.l3.grade.colorspace import is_neutral, lab_to_srgb
-from app.services.l3.grade.tone import WORKING_SPACE_V1, to_working_scalar
+from app.services.l3.grade.tone import WORKING_SPACE_LOG_V1, WORKING_SPACE_V1, to_working_scalar
 
 TARGET_BLACK = 0.02
 TARGET_WHITE = 0.97
@@ -99,16 +99,17 @@ def _compose(s1: float, o1: float, s2: float, o2: float) -> Tuple[float, float]:
 
 def _project(value: float, working_space: str) -> float:
     """Project a DISPLAY scalar into the space the CDL is actually applied.
-    v1 bakes the CDL BETWEEN `to_working` (display->linear) and `from_working`
-    (lut_bake.py), so a levels solve targeting display anchors must be solved
-    on the LINEARIZED points to round-trip correctly (otherwise a
-    display-space negative offset gets subtracted from a linearized midtone and
-    crushes it -- the "everything too dark" bug). Legacy solves in display
-    space exactly as before -- identity here (no float32 round-trip, so
-    byte-for-byte unchanged)."""
-    if working_space != WORKING_SPACE_V1:
+    v1 (and log_v1, color_phase1.plan.md Part 2) bakes the CDL BETWEEN
+    `to_working` (display->linear) and `from_working` (lut_bake.py), so a
+    levels solve targeting display anchors must be solved on the LINEARIZED
+    points to round-trip correctly (otherwise a display-space negative
+    offset gets subtracted from a linearized midtone and crushes it -- the
+    "everything too dark" bug). Legacy solves in display space exactly as
+    before -- identity here (no float32 round-trip, so byte-for-byte
+    unchanged)."""
+    if working_space not in (WORKING_SPACE_V1, WORKING_SPACE_LOG_V1):
         return value
-    return to_working_scalar(value, None, WORKING_SPACE_V1)
+    return to_working_scalar(value, None, working_space)
 
 
 def _skin_multiplier(skin_lab: Optional[Any]) -> Optional[Tuple[float, float, float]]:
@@ -247,6 +248,7 @@ def solve_correct_grade(
     white_reference_rgb: Optional[Tuple[float, float, float]] = None,
     pipeline: str = "legacy",
     skin_vibrance: bool = False,
+    working_space: Optional[str] = None,
 ) -> Grade:
     """Deterministic correction from ONE file's `color_stats` row (see
     `grade.measure.fetch_color_stats`), optionally refined by a verified
@@ -257,6 +259,14 @@ def solve_correct_grade(
     `pipeline=="v1"` (color_grading_upgrade.plan.md Step 1.3) additionally
     targets a mid-gray placement via `_solve_levels_v1`; `legacy` is the
     untouched black/white-only stretch.
+
+    `working_space` (color_phase1.plan.md Part 2): overrides the
+    pipeline-derived default (`WORKING_SPACE_V1` for `pipeline=="v1"`, else
+    `"rec709"`) -- the resolver passes `WORKING_SPACE_LOG_V1` for a clip its
+    `is_log_flat` heuristic flags, so the levels/WB solve runs in the SAME
+    space `to_working`/`from_working` will actually apply the CDL in at bake
+    time. `None` (every existing caller) reproduces today's pipeline-derived
+    space exactly -- byte-identical.
 
     `skin_vibrance` (color_skin_vibrance.plan.md, v1-only): also folds a
     skin-anchored tint vote into the WB solve (`subject_lab` -- the
@@ -272,14 +282,24 @@ def solve_correct_grade(
     clip_highlight = float(color_stats.get("clip_highlight_pct") or 0.0)
     black = float(color_stats.get("black_point") if color_stats.get("black_point") is not None else 0.0)
 
-    working_space = WORKING_SPACE_V1 if pipeline == "v1" else "rec709"
+    if working_space is None:
+        working_space = WORKING_SPACE_V1 if pipeline == "v1" else "rec709"
     skin_active = skin_vibrance and pipeline == "v1"
     skin_lab = (color_stats.get("subject_lab") or color_stats.get("skin_lab")) if skin_active else None
     wb_r, wb_g, wb_b = _solve_wb(color_stats, white_reference_rgb, skin_lab=skin_lab)
     levels_fn = _solve_levels_v1 if pipeline == "v1" else _solve_levels
     luma_slope, luma_offset = levels_fn(color_stats, clip_shadow, clip_highlight, working_space=working_space)
 
-    if color_stats.get("is_log_flat") and clip_shadow <= MAX_CLIP_PCT_FOR_STRETCH:
+    # The crude pre-lift is a stand-in for a real log decode -- once
+    # WORKING_SPACE_LOG_V1 actually decodes this clip (tone.to_working),
+    # applying BOTH would double-compensate. Gate it off there; it stays
+    # live as a fallback for any is_log_flat clip that (for whatever
+    # reason) isn't routed to the log working space.
+    if (
+        color_stats.get("is_log_flat")
+        and clip_shadow <= MAX_CLIP_PCT_FOR_STRETCH
+        and working_space != WORKING_SPACE_LOG_V1
+    ):
         # Pivot-preserving around REC709's standard mid-gray target so the
         # extra lift doesn't drag overall brightness with it. Under v1 the
         # levels op above is in working (linear) space, so the pivot must be

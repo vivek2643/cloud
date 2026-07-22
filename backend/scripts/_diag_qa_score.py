@@ -45,12 +45,42 @@ from app.services.l3.grade.cdl import Grade  # noqa: E402
 from app.services.l3.grade.look_engine import LookSpec, build_look_grid  # noqa: E402
 from app.services.l3.grade.lut_bake import _sample_lut_trilinear, bake_cube_text, parse_cube_text  # noqa: E402
 from qa import metrics as m  # noqa: E402
+from qa.content_source import content_type_for  # noqa: E402
 
 OUT_ROOT = os.path.join(HERE, "_out", "qa")
 SAMPLES_PATH = os.path.join(OUT_ROOT, "samples.json")
 SCOREBOARD_PATH = os.path.join(OUT_ROOT, "scoreboard.json")
 
 _SEVERITY = {"pass": 0, "warn": 1, "fail": 2, "na": 0}
+
+# color_phase1.plan.md "The tiered parity bar": the single source of truth
+# mapping each per-shot/per-group metric to its tier. Metrics absent from
+# this map (e.g. banding_score, which is WARN-only and never a hard fail)
+# are reported but don't count toward any tier's pass/fail bar.
+TIER_A_METRICS = {"crushed_black_fraction", "clipped_highlight_fraction", "neutral_axis_deviation", "exposure_band"}
+TIER_B_METRICS = {
+    "saturation_band", "skin_perp_residual", "look_fidelity_cosine", "banding_score",
+    "intra_group_luma_std", "intra_group_chroma_std", "intra_group_subject_luma_std",
+}
+# Same three group metrics judge TWO different questions: Tier B bands their
+# own std VALUE (quality), Tier C checks their raw-comparison `improved` /
+# `convergence_delta` field (did the grade make the scene worse than raw).
+TIER_C_METRICS = {"intra_group_luma_std", "intra_group_chroma_std", "intra_group_subject_luma_std"}
+TIER_A_REQUIRED_PASS_PCT = 100.0
+TIER_B_REQUIRED_PASS_PCT = 95.0
+TIER_C_REQUIRED_PASS_PCT = 100.0
+
+_TIER_MAP: Dict[str, List[str]] = defaultdict(list)
+for _name in TIER_A_METRICS:
+    _TIER_MAP[_name].append("A")
+for _name in TIER_B_METRICS:
+    _TIER_MAP[_name].append("B")
+for _name in TIER_C_METRICS:
+    _TIER_MAP[_name].append("C")
+
+# Photographic quality metrics that are meaningless on synthetic (slide-deck
+# / screen-recording) content -- color_phase1.plan.md Part 1c.
+_SYNTHETIC_NA_METRICS = {"saturation_band", "skin_perp_residual", "exposure_band"}
 
 
 def _load_rgb01(path: str) -> np.ndarray:
@@ -70,13 +100,17 @@ def _hero_frame(shot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return frames[0] if frames else None
 
 
-def _look_only_still(look_engine: dict, raw01: np.ndarray) -> Optional[np.ndarray]:
+def _look_only_still(look_engine: dict, raw01: np.ndarray, working_space: str = "rec709_v1") -> Optional[np.ndarray]:
     """The look's OWN color transform on this shot's raw still -- identity
-    CDL + the look's grid, exactly `_diag_look_thumbs.thumb_cube_output`."""
+    CDL + the look's grid, exactly `_diag_look_thumbs.thumb_cube_output`,
+    EXCEPT for `working_space`: this must match the shot's ACTUAL resolved
+    working_space (color_phase1.plan.md Part 2 -- a log-tagged clip's real
+    grade decodes through `log_v1`; comparing it against a `rec709_v1`-baked
+    "look only" reference would measure the wrong decode, not the look)."""
     try:
         spec = LookSpec.from_dict(look_engine)
         grid = build_look_grid(spec)
-        cube_text = bake_cube_text(Grade(), working_space="rec709_v1", creative_lut_grid=grid, tone_contrast=0.0)
+        cube_text = bake_cube_text(Grade(), working_space=working_space, creative_lut_grid=grid, tone_contrast=0.0)
         lut_grid, _size = parse_cube_text(cube_text)
         return np.clip(_sample_lut_trilinear(lut_grid, raw01), 0.0, 1.0)
     except Exception as e:
@@ -97,17 +131,29 @@ def score_shot(shot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         print(f"    !! {shot['shot_key']}: failed to load frames: {e}")
         return None
 
+    look_intent = m.look_saturation_intent(shot.get("look_engine"))
+
     results: Dict[str, m.MetricResult] = {}
     results.update(m.exposure_metrics(graded01, raw01=raw01))
     results["neutral_axis_deviation"] = m.neutral_axis_deviation(graded01)
     results["skin_perp_residual"] = m.skin_perp_residual(graded01, shot.get("subject_box"))
-    results["saturation_band"] = m.saturation_band(graded01, raw01=raw01)
+    results["saturation_band"] = m.saturation_band(graded01, raw01=raw01, look_intent=look_intent)
     results["banding_score"] = m.banding_score(graded01)
 
     if shot.get("look_engine"):
-        look_only01 = _look_only_still(shot["look_engine"], raw01)
+        look_only01 = _look_only_still(shot["look_engine"], raw01, shot.get("working_space") or "rec709_v1")
         if look_only01 is not None:
             results["look_fidelity_cosine"] = m.look_fidelity_metric(graded01, raw01, look_only01)
+
+    content_type = content_type_for(shot["project_id"], shot["project_label"])
+    if content_type == "synthetic":
+        # color_phase1.plan.md Part 1c: photographic quality metrics are
+        # meaningless on slide-deck/screen-recording content -- na them out
+        # of Tier scoring while keeping structural metrics (crushed/clipped/
+        # neutral-axis) reported for information.
+        for name in _SYNTHETIC_NA_METRICS:
+            if name in results:
+                results[name] = dataclasses.replace(results[name], verdict="na")
 
     summary_graded = m.summarize_shot(graded01, subject_box=shot.get("subject_box"))
     summary_raw = m.summarize_shot(raw01, subject_box=shot.get("subject_box"))
@@ -117,7 +163,7 @@ def score_shot(shot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "project_id": shot["project_id"], "project_label": shot["project_label"],
         "thread_id": shot["thread_id"], "shot_key": shot["shot_key"],
         "group_id": shot.get("group_id"), "has_grade": shot.get("has_grade"),
-        "is_log_flat": shot.get("is_log_flat"), "verdict": shot_verdict,
+        "is_log_flat": shot.get("is_log_flat"), "content_type": content_type, "verdict": shot_verdict,
         "metrics": {k: v.to_dict() for k, v in results.items()},
         "summary_graded": summary_graded, "summary_raw": summary_raw,
     }
@@ -197,6 +243,122 @@ def _project_rollup(shot_scores: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def _iter_metric_instances(shot_scores: List[Dict[str, Any]], group_scores: List[Dict[str, Any]]):
+    for shot in shot_scores:
+        for name, md in shot["metrics"].items():
+            yield name, md
+    for grp in group_scores:
+        for name, md in grp["metrics"].items():
+            yield name, md
+
+
+def _annotate_tiers(shot_scores: List[Dict[str, Any]], group_scores: List[Dict[str, Any]]) -> None:
+    """color_phase1.plan.md tiered-bar implementation note: "add the tier to
+    each metric's record." A list since the three group-consistency metrics
+    are judged by both Tier B (their own std value) and Tier C (their raw-
+    comparison improved/convergence_delta field)."""
+    for name, md in _iter_metric_instances(shot_scores, group_scores):
+        md["tiers"] = list(_TIER_MAP.get(name, []))
+
+
+def _tier_a_fail_exempt(name: str, md: Dict[str, Any]) -> bool:
+    """A Tier-A structural fail only counts when the GRADE caused/worsened
+    it. `crushed_black_fraction`/`clipped_highlight_fraction` carry a raw
+    baseline `delta` (graded_fraction - raw_fraction); a shot whose raw was
+    already crushed/clipped and whose grade did not worsen it (delta <= 0)
+    is a source defect, out of Tier-A's grade-introduced scope."""
+    if name not in ("crushed_black_fraction", "clipped_highlight_fraction"):
+        return False
+    delta = md.get("delta")
+    return delta is not None and delta <= 0
+
+
+def _tier_a_rollup(shot_scores: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Zero tolerance is on FAIL only -- a WARN (e.g. exposure_band's
+    "outside typical but not gross" case) never counts against Tier A; that
+    is the entire point of 1b's gross-vs-typical split."""
+    scored = fails = exempted = 0
+    for name, md in _iter_metric_instances(shot_scores, []):
+        if name not in TIER_A_METRICS or md["verdict"] == "na":
+            continue
+        scored += 1
+        if md["verdict"] == "fail":
+            if _tier_a_fail_exempt(name, md):
+                exempted += 1
+            else:
+                fails += 1
+    pass_pct = round(100.0 * (scored - fails) / scored, 1) if scored else 100.0
+    return {
+        "scored": scored, "fails": fails, "exempted_source_defects": exempted,
+        "pass_pct": pass_pct, "required_pass_pct": TIER_A_REQUIRED_PASS_PCT, "met": fails == 0,
+    }
+
+
+def _tier_b_rollup(shot_scores: List[Dict[str, Any]], group_scores: List[Dict[str, Any]]) -> Dict[str, Any]:
+    counts = {"pass": 0, "warn": 0, "fail": 0}
+    for name, md in _iter_metric_instances(shot_scores, group_scores):
+        if name not in TIER_B_METRICS or md["verdict"] == "na":
+            continue
+        verdict = md["verdict"]
+        if name == "banding_score" and verdict == "fail":
+            # plan: "WARN-only; never a hard fail -- contact sheet is the judge"
+            verdict = "warn"
+        counts[verdict] += 1
+    scored = sum(counts.values())
+    pass_pct = round(100.0 * counts["pass"] / scored, 1) if scored else 100.0
+    return {
+        "scored": scored, **counts,
+        "pass_pct": pass_pct, "required_pass_pct": TIER_B_REQUIRED_PASS_PCT,
+        "met": pass_pct >= TIER_B_REQUIRED_PASS_PCT,
+    }
+
+
+def _group_clears_tier_c(metrics: Dict[str, Any]) -> Optional[bool]:
+    """None when no Tier-C-applicable metric is present on this group
+    (e.g. no raw comparison could be computed) -- excluded from the
+    denominator rather than counted either way.
+
+    Tier C's own stated bar is "never make a scene worse than ungraded"
+    (a non-strict <=), NOT "must strictly improve." A group whose RAW
+    members were already perfectly consistent (raw_std == graded_std == 0,
+    e.g. two near-identical frames) has nothing left to improve and must
+    still clear the bar -- so this compares `value <= raw` directly rather
+    than trusting `extra["improved"]`, which is metrics.py's own STRICT `<`
+    and would wrongly fail an already-perfect tie."""
+    applicable = False
+    ok = True
+    for name in ("intra_group_luma_std", "intra_group_chroma_std"):
+        md = metrics.get(name)
+        if md is None or md["verdict"] == "na" or "raw" not in md:
+            continue
+        applicable = True
+        if md["value"] > md["raw"]:
+            ok = False
+    md = metrics.get("intra_group_subject_luma_std")
+    if md is not None and md["verdict"] != "na" and "convergence_delta" in md:
+        applicable = True
+        if md["convergence_delta"] < 0:
+            ok = False
+    return ok if applicable else None
+
+
+def _tier_c_rollup(group_scores: List[Dict[str, Any]]) -> Dict[str, Any]:
+    considered = passing = 0
+    for grp in group_scores:
+        clears = _group_clears_tier_c(grp["metrics"])
+        if clears is None:
+            continue
+        considered += 1
+        if clears:
+            passing += 1
+    pass_pct = round(100.0 * passing / considered, 1) if considered else 100.0
+    return {
+        "scored_groups": considered, "passing_groups": passing,
+        "pass_pct": pass_pct, "required_pass_pct": TIER_C_REQUIRED_PASS_PCT,
+        "met": considered == 0 or passing == considered,
+    }
+
+
 def main() -> None:
     if not os.path.exists(SAMPLES_PATH):
         raise SystemExit(f"no samples manifest at {SAMPLES_PATH} -- run _diag_qa_sample.py first")
@@ -214,6 +376,13 @@ def main() -> None:
     group_scores = score_groups(shot_scores)
     ranked = _rank_failure_classes(shot_scores, group_scores)
     projects = _project_rollup(shot_scores)
+
+    _annotate_tiers(shot_scores, group_scores)
+    tiers = {
+        "tier_a": _tier_a_rollup(shot_scores),
+        "tier_b": _tier_b_rollup(shot_scores, group_scores),
+        "tier_c": _tier_c_rollup(group_scores),
+    }
 
     # ShotSummary (a dataclass) was needed as-is for score_groups' grouping
     # math above; make the per-shot records JSON-safe before they go in the
@@ -237,6 +406,7 @@ def main() -> None:
         "group_count": len(group_scores),
         "overall": overall,
         "overall_pass_pct": round(100.0 * overall["pass"] / n, 1) if n else 0.0,
+        "tiers": tiers,
         "failure_classes_ranked": ranked,
         "log_flat_shot_count": len(log_flat_shots),
         "rec709_shot_count": len(rec709_shots),
@@ -253,6 +423,17 @@ def main() -> None:
     print(f"\n==== SCOREBOARD ({n} shots, {len(group_scores)} scored groups) ====")
     print(f"overall: pass={overall['pass']} warn={overall['warn']} fail={overall['fail']} na={overall['na']} "
          f"({scoreboard['overall_pass_pct']}% pass)")
+
+    print("\n==== TIERED PARITY BAR ====")
+    ta, tb, tc = tiers["tier_a"], tiers["tier_b"], tiers["tier_c"]
+    print(f"Tier A structural  (need {ta['required_pass_pct']}%): {ta['pass_pct']}% "
+         f"[{'MET' if ta['met'] else 'NOT MET'}]  scored={ta['scored']} fails={ta['fails']} "
+         f"exempted_source_defects={ta['exempted_source_defects']}")
+    print(f"Tier B quality     (need {tb['required_pass_pct']}%): {tb['pass_pct']}% "
+         f"[{'MET' if tb['met'] else 'NOT MET'}]  scored={tb['scored']} pass={tb['pass']} "
+         f"warn={tb['warn']} fail={tb['fail']}")
+    print(f"Tier C vs-raw      (need {tc['required_pass_pct']}%): {tc['pass_pct']}% "
+         f"[{'MET' if tc['met'] else 'NOT MET'}]  groups={tc['scored_groups']} passing={tc['passing_groups']}")
 
     print(f"\n{'metric':32} {'pass':>5} {'warn':>5} {'fail':>5} {'na':>5} {'mean_sev':>9} {'rank':>6}")
     for r in ranked:

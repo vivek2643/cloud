@@ -69,6 +69,44 @@ def test_exposure_band_reports_raw_delta_direction():
     print("ok  exposure: crushed_black_fraction reports a positive RAW->GRADED delta when the grade crushes more")
 
 
+def test_exposure_band_deliberately_dark_shot_warns_not_fails():
+    """color_phase1.plan.md Part 1b: a night/moody shot outside the
+    'typical' window but nowhere near gross mis-exposure must WARN, never
+    FAIL -- the exact false-failure the plan's first-run findings called
+    out (EXPOSURE_BAND_PASS = (0.30, 0.60) alone used to hard-fail this)."""
+    r = m.exposure_metrics(_solid((0.15, 0.15, 0.15)))
+    assert r["exposure_band"].verdict == "warn", r["exposure_band"]
+    print("ok  exposure: a deliberately dark (but not gross) shot WARNs, never FAILs")
+
+
+def test_exposure_band_deliberately_bright_shot_warns_not_fails():
+    r = m.exposure_metrics(_solid((0.85, 0.85, 0.85)))
+    assert r["exposure_band"].verdict == "warn", r["exposure_band"]
+    print("ok  exposure: a deliberately bright (but not gross) shot WARNs, never FAILs")
+
+
+def test_exposure_band_gross_dark_still_fails():
+    r = m.exposure_metrics(_solid((0.02, 0.02, 0.02)))
+    assert r["exposure_band"].verdict == "fail", r["exposure_band"]
+    print("ok  exposure: a genuinely gross-crushed whole frame (mean < EXPOSURE_GROSS_FAIL) still FAILs")
+
+
+def test_exposure_band_gross_bright_still_fails():
+    r = m.exposure_metrics(_solid((0.98, 0.98, 0.98)))
+    assert r["exposure_band"].verdict == "fail", r["exposure_band"]
+    print("ok  exposure: a genuinely gross-blown whole frame still FAILs")
+
+
+def test_exposure_band_reports_raw_reference_and_deltas():
+    raw = _solid((0.20, 0.20, 0.20))
+    graded = _solid((0.42, 0.42, 0.42))
+    r = m.exposure_metrics(graded, raw01=raw)
+    extra = r["exposure_band"].extra
+    assert abs(extra["raw_mean"] - 0.20) < 1e-6, extra
+    assert abs(extra["delta_mean"] - 0.22) < 1e-6, extra
+    print("ok  exposure: exposure_band carries raw_mean/raw_median/delta_mean when a raw baseline is given")
+
+
 # --------------------------------------------------------------------------
 # 2. White balance / color cast
 # --------------------------------------------------------------------------
@@ -183,6 +221,75 @@ def test_saturation_band_chroma_increase_ratio_fail():
     print("ok  over-processing: chroma_increase_ratio > 2.0 forces a FAIL even if the band alone wouldn't")
 
 
+def test_look_saturation_intent_none_without_look():
+    assert m.look_saturation_intent(None) is None
+    assert m.look_saturation_intent({}) is None   # falsy, same as no look at all
+    assert m.look_saturation_intent({"sat": 1.0}) == 1.0   # an explicit identity spec
+    print("ok  look_saturation_intent: None with no look (incl. an empty/falsy dict)")
+
+
+def test_look_saturation_intent_reads_global_sat():
+    assert m.look_saturation_intent({"sat": 0.05}) == 0.05
+    assert m.look_saturation_intent({"sat": 1.25}) == 1.25
+    print("ok  look_saturation_intent: reads LookSpec.sat directly when no hue_sat bands")
+
+
+def test_look_saturation_intent_weights_hue_sat_by_band_width():
+    # a full-wheel (360deg) band at mult=0.5 fully dominates the base sat.
+    full_band = {"sat": 1.0, "hue_sat": [[30.0, 360.0, 0.5]]}
+    assert abs(m.look_saturation_intent(full_band) - 0.5) < 1e-9
+    # a narrow (36deg = 10% of the wheel) band only nudges it a little.
+    narrow_band = {"sat": 1.0, "hue_sat": [[30.0, 36.0, 0.5]]}
+    intent = m.look_saturation_intent(narrow_band)
+    assert 0.5 < intent < 1.0, intent
+    print("ok  look_saturation_intent: a hue_sat band's pull scales with its wheel coverage")
+
+
+def test_saturation_band_mono_look_exempts_low_chroma():
+    raw = _solid((0.5, 0.3, 0.25))
+    graded = _solid((0.4, 0.4, 0.4))   # near-mono result -- exactly what a bw look intends
+    r = m.saturation_band(graded, raw01=raw, look_intent=0.05)   # bw_film-like
+    assert r.verdict == "na", r
+    print("ok  saturation_band: a mono look (intent < LOOK_MONO_SAT_THRESHOLD) exempts a low-chroma result")
+
+
+def test_saturation_band_mono_look_still_fails_oversaturation():
+    raw = _solid((0.5, 0.3, 0.25))
+    graded = _solid((0.95, 0.05, 0.05))   # wildly oversaturated -- NOT what a bw look intends
+    r = m.saturation_band(graded, raw01=raw, look_intent=0.05)
+    assert r.verdict == "fail", r
+    print("ok  saturation_band: a mono look does NOT exempt an over-saturated result (still a real bug)")
+
+
+def test_saturation_band_ratio_fails_under_a_mild_look_too():
+    raw = _solid((0.45, 0.40, 0.35))
+    graded = _solid((0.95, 0.05, 0.05))
+    r = m.saturation_band(graded, raw01=raw, look_intent=1.05)   # a mild, near-neutral look
+    assert r.extra["chroma_increase_ratio"] > m.CHROMA_INCREASE_FAIL_RATIO
+    assert r.verdict == "fail"
+    print("ok  saturation_band: the >2.0 ratio backstop still fires under a mild (non-mono) look")
+
+
+def test_saturation_band_no_look_reproduces_absolute_band_without_raw():
+    r = m.saturation_band(_solid((0.5, 0.5, 0.5)))   # no raw01 at all
+    assert r.verdict == "fail", r   # falls back to the absolute band, same as before
+    print("ok  saturation_band: look_intent=None with no raw baseline reproduces the absolute-band behavior")
+
+
+def test_saturation_band_naturally_muted_correction_only_passes():
+    """The exact 'podcast trial 3 / natural preset' false failure the plan's
+    first-run findings called out: naturally low-chroma content (mostly
+    skin/neutral wood paneling), correctly graded (ratio ~1, no creative
+    desaturation), must PASS even though its ABSOLUTE chroma sits below the
+    old fixed SATURATION_WARN floor."""
+    raw = _solid((0.55, 0.5, 0.48))
+    graded = _solid((0.56, 0.5, 0.47))
+    r = m.saturation_band(graded, raw01=raw, look_intent=None)
+    assert r.value < m.SATURATION_WARN[0], r.value   # absolute chroma IS below the old floor
+    assert r.verdict == "pass", r   # but the ratio-based judgment correctly passes it
+    print("ok  saturation_band: naturally-muted, correctly-graded content passes despite low absolute chroma")
+
+
 def test_banding_score_flat_frame_is_pass():
     r = m.banding_score(_solid((0.4, 0.4, 0.4)))
     assert r.verdict == "pass" and r.value == 0.0
@@ -263,6 +370,11 @@ def main():
     test_clipped_highlight_all_white_is_fail()
     test_exposure_band_pass_at_target_mid_gray()
     test_exposure_band_reports_raw_delta_direction()
+    test_exposure_band_deliberately_dark_shot_warns_not_fails()
+    test_exposure_band_deliberately_bright_shot_warns_not_fails()
+    test_exposure_band_gross_dark_still_fails()
+    test_exposure_band_gross_bright_still_fails()
+    test_exposure_band_reports_raw_reference_and_deltas()
     test_neutral_axis_deviation_zero_on_pure_gray()
     test_neutral_axis_deviation_na_when_no_neutral_pixels()
     test_skin_perp_residual_na_outside_lightness_gate()
@@ -277,6 +389,14 @@ def main():
     test_group_subject_exposure_convergence_delta()
     test_saturation_band_fail_on_dead_flat()
     test_saturation_band_chroma_increase_ratio_fail()
+    test_look_saturation_intent_none_without_look()
+    test_look_saturation_intent_reads_global_sat()
+    test_look_saturation_intent_weights_hue_sat_by_band_width()
+    test_saturation_band_mono_look_exempts_low_chroma()
+    test_saturation_band_mono_look_still_fails_oversaturation()
+    test_saturation_band_ratio_fails_under_a_mild_look_too()
+    test_saturation_band_no_look_reproduces_absolute_band_without_raw()
+    test_saturation_band_naturally_muted_correction_only_passes()
     test_banding_score_flat_frame_is_pass()
     test_banding_score_sparse_levels_is_worse_than_full_ramp()
     test_look_fidelity_identical_shift_is_cosine_one()

@@ -59,7 +59,7 @@ from app.services.l3.grade.look_engine import LookSpec, resolve_look_spec
 from app.services.l3.grade.presets import get_preset
 from app.services.l3.grade.reference_transfer import solve_reference_transfer
 from app.services.l3.grade.softlocal import solve_vignette
-from app.services.l3.grade.tone import WORKING_SPACE_V1, from_working, to_working
+from app.services.l3.grade.tone import WORKING_SPACE_LOG_V1, WORKING_SPACE_V1, from_working, to_working
 
 # --------------------------------------------------------------------------
 # Composite guardrails (color_grading_upgrade.plan.md -- v1 only).
@@ -103,9 +103,9 @@ def _floor_for_probe(probe_lin: float, slope: float, power: float, floor: float)
     return target - probe_lin * slope
 
 
-def _clamp_composite_v1(grade: Grade) -> Grade:
+def _clamp_composite_v1(grade: Grade, working_space: str = WORKING_SPACE_V1) -> Grade:
     """Apply the composite slope ceiling + negative-offset floor to a fully
-    composed v1 CDL (see the module constants above for the reasoning).
+    composed CDL (see the module constants above for the reasoning).
 
     The offset floor is anchored at BOTH mid-gray and a genuine shadow probe
     (`COMPOSITE_SHADOW_PROBE`). Because slope is always positive, protecting
@@ -116,11 +116,17 @@ def _clamp_composite_v1(grade: Grade) -> Grade:
     the whole toe: a genuine near-black (well below the shadow probe, e.g.
     display ~0.05) is UNAFFECTED by a floor anchored at a brighter point --
     only points at or above the shadow probe are guaranteed non-crushed, so
-    true blacks stay free to reach ~0 (no milky/raised blacks)."""
+    true blacks stay free to reach ~0 (no milky/raised blacks).
+
+    `working_space` (color_phase1.plan.md Part 2): the probes must be
+    projected through whichever space THIS clip's CDL actually composes in
+    -- a log clip's `working_space` decodes the same display probes to
+    different linear values than `rec709_v1` would. Defaults to
+    `WORKING_SPACE_V1`, so every existing caller is unchanged."""
     import numpy as np
 
-    mid_lin = float(to_working(np.array([0.5], dtype=np.float32), WORKING_SPACE_V1)[0])
-    shadow_lin = float(to_working(np.array([COMPOSITE_SHADOW_PROBE], dtype=np.float32), WORKING_SPACE_V1)[0])
+    mid_lin = float(to_working(np.array([0.5], dtype=np.float32), working_space)[0])
+    shadow_lin = float(to_working(np.array([COMPOSITE_SHADOW_PROBE], dtype=np.float32), working_space)[0])
     slope = tuple(min(float(s), COMPOSITE_SLOPE_MAX) for s in grade.slope)
     offset = tuple(
         max(
@@ -134,7 +140,7 @@ def _clamp_composite_v1(grade: Grade) -> Grade:
 
 
 def _corrected_source_stats(
-    color_stats: Optional[Dict[str, Any]], stack: Grade
+    color_stats: Optional[Dict[str, Any]], stack: Grade, working_space: str = WORKING_SPACE_V1,
 ) -> Optional[Dict[str, Any]]:
     """Project a file's measured `rgb_mean`/`rgb_std` through the correct+match
     `stack` so the Look layer solves against the image AS CORRECTED, not the raw
@@ -147,26 +153,27 @@ def _corrected_source_stats(
     exact for that stack, not an approximation.
 
     (color_grading_upgrade.plan.md Step 1.5): the CDL the stack composes into
-    runs INSIDE the v1 working-space wrapper at bake time (Step 1.1), so the
-    mean projection is done there too -- linearize, apply slope/offset,
-    re-encode -- keeping the corrected stats in the SAME space the reference
-    image's own stats were measured in (display-encoded, `reference_transfer.
-    compute_image_stats`), so the two sides of the transfer stay comparable.
-    `std` stays a plain slope scale (the working-space encode/decode is
-    nonlinear, so std doesn't project through it exactly -- an accepted
-    approximation)."""
+    runs INSIDE the working-space wrapper at bake time (Step 1.1; color_
+    phase1.plan.md Part 2 for `working_space`), so the mean projection is
+    done there too -- decode, apply slope/offset, re-encode -- keeping the
+    corrected stats in the SAME space the reference image's own stats were
+    measured in (display-encoded, `reference_transfer.compute_image_stats`),
+    so the two sides of the transfer stay comparable. `std` stays a plain
+    slope scale (the working-space encode/decode is nonlinear, so std
+    doesn't project through it exactly -- an accepted approximation).
+    Defaults to `WORKING_SPACE_V1`, so every existing caller is unchanged."""
     if not color_stats:
         return None
     mean = color_stats.get("rgb_mean") or [0.5, 0.5, 0.5]
     std = color_stats.get("rgb_std") or [0.2, 0.2, 0.2]
     import numpy as np
 
-    working_mean = to_working(np.array(mean, dtype=np.float32), WORKING_SPACE_V1)
+    working_mean = to_working(np.array(mean, dtype=np.float32), working_space)
     corr_working = np.clip(
         working_mean * np.array(stack.slope, dtype=np.float32)
         + np.array(stack.offset, dtype=np.float32), 0.0, 1.0,
     )
-    corr_mean = from_working(corr_working, WORKING_SPACE_V1).tolist()
+    corr_mean = from_working(corr_working, working_space).tolist()
     corr_std = [max(0.0, std[c] * stack.slope[c]) for c in range(3)]
     return {**color_stats, "rgb_mean": corr_mean, "rgb_std": corr_std}
 
@@ -250,10 +257,23 @@ def resolve_clip_grade(
     below), and halation_grain.plan.md's halation/grain always route into
     `soft_local` whenever that look declares them -- both are permanent,
     look-scoped capabilities now, not caller-gated.
+
+    `working_space` (color_phase1.plan.md Part 2): an explicit
+    `item["working_space"]` always wins (unchanged); otherwise this clip's
+    `color_stats["is_log_flat"]` (L1's heuristic -- untagged transfer
+    functions are the norm, see tone.py's `LOG_DECODE_GAMMA` docstring)
+    selects `WORKING_SPACE_LOG_V1` so Correct/Balance/Match/Leveling/Look
+    all solve and compose in properly-decoded scene-linear instead of
+    treating log/flat footage as if it were already display Rec.709; a
+    non-log clip is untouched (`WORKING_SPACE_V1`, byte-identical to
+    before this working-space selection existed).
     """
+    is_log = bool((color_stats or {}).get("is_log_flat"))
+    working_space = item.get("working_space") or (WORKING_SPACE_LOG_V1 if is_log else WORKING_SPACE_V1)
+
     stack = solve_correct_grade(
         color_stats, already_graded=already_graded, pipeline="v1",
-        skin_vibrance=True,
+        skin_vibrance=True, working_space=working_space,
     )
     if balance_delta is not None:
         stack = compose(stack, balance_delta, 1.0)
@@ -264,7 +284,7 @@ def resolve_clip_grade(
     # The Look layer sits on top of correct+match+leveling, so it must be solved
     # against the ALREADY-CORRECTED image (see _corrected_source_stats). Passing
     # the raw color_stats here is what made a reference drop double-stretch exposure.
-    corrected_stats = _corrected_source_stats(color_stats, stack)
+    corrected_stats = _corrected_source_stats(color_stats, stack, working_space)
     stack = compose(stack, _solve_look(sequence_look, corrected_stats), 1.0)
     arc_intensity = (sequence_look or {}).get("arc_intensity")
     stack = compose(stack, solve_arc_grade(item.get("arc_intent"), arc_intensity), 1.0)
@@ -275,12 +295,11 @@ def resolve_clip_grade(
     # Bound the FINAL composed CDL so the multiplicatively-stacked layers
     # (correct+match+leveling+lift+override) can't over-contrast or crush
     # shadows regardless of how they combine (Fixes 2 & 3).
-    resolved = _clamp_composite_v1(resolved)
+    resolved = _clamp_composite_v1(resolved, working_space)
 
     creative_lut_ref = (sequence_look or {}).get("lut_ref") if sequence_look else None
     if sequence_look and sequence_look.get("mode") != "lut":
         creative_lut_ref = None
-    working_space = item.get("working_space") or WORKING_SPACE_V1
 
     # color_response_engine.plan.md: mode=="engine" bakes a LookSpec into the
     # creative LUT grid instead of an uploaded .cube -- the two are mutually
