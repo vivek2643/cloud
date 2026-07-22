@@ -366,9 +366,10 @@ class EngineLook:
     description: str
     spec: LookSpec = field(default_factory=LookSpec)
     # "creator" (YouTube/vlog, the priority family -- most users), "film"
-    # (carries halation+grain, needs grade_film_texture too), or "ad"
-    # (commercial/product). Purely a frontend-filtering hook -- "as many as
-    # we want for now, filter later," so tag, don't prune.
+    # (carries halation+grain, always applied when the look declares them --
+    # grade_pipeline_standardize.plan.md), or "ad" (commercial/product).
+    # Purely a frontend-filtering hook -- "as many as we want for now,
+    # filter later," so tag, don't prune.
     family: str = "creator"
 
 
@@ -438,15 +439,14 @@ LOOKS: List[EngineLook] = [
     ),
 
     # ---- Film family (informed by stock character; carries halation+grain,
-    # needs grade_film_texture on too -- their COLOR still applies under
-    # grade_look_engine alone, but the glow/grain texture stays off without
-    # the second flag; not a bug, see config.py's grade_film_texture note) --
+    # always applied whenever the look declares them -- look-scoped, no
+    # flag; see resolver.py's film-texture routing) --
     EngineLook(
         "kodak_2383", "Kodak 2383",
         "Print-film character: contrasty, teal-orange separation, warm "
-        "highlights, fine grain. Informed by Kodak 2383's published "
-        "color-science description, not its .cube or a spectral fit. "
-        "Needs grade_film_texture for the halation/grain half.",
+        "highlights, fine grain, gentle halation glow. Informed by Kodak "
+        "2383's published color-science description, not its .cube or a "
+        "spectral fit.",
         LookSpec(
             contrast=0.22, shadow_tint=(-0.04, 0.0, 0.05), highlight_tint=(0.05, 0.02, -0.03),
             hue_sat=((30.0, 40.0, 1.2), (150.0, 50.0, 0.85)), sat=1.05,
@@ -458,15 +458,14 @@ LOOKS: List[EngineLook] = [
         "fuji_eterna", "Fuji Eterna",
         "Soft, low-saturation, green-leaning -- Fuji Eterna's motion-picture "
         "character (gentle contrast, desaturated, a cool-green midtone "
-        "lean). Needs grade_film_texture for the halation/grain half.",
+        "lean, soft grain and halation).",
         LookSpec(contrast=0.04, mid_tint=(-0.01, 0.02, -0.01), sat=0.88, halation=0.15, grain=0.05),
         family="film",
     ),
     EngineLook(
         "vision3_250d", "Vision3 250D",
         "Natural negative stock: gentle contrast, a slight warm lean, "
-        "faint lifted blacks. Needs grade_film_texture for the "
-        "halation/grain half.",
+        "faint lifted blacks, fine grain and halation.",
         LookSpec(
             contrast=0.08, black_lift=0.02, mid_tint=(0.02, 0.01, -0.01), sat=0.98,
             halation=0.12, grain=0.05,
@@ -476,8 +475,7 @@ LOOKS: List[EngineLook] = [
     EngineLook(
         "portra_400", "Portra 400",
         "Warm, skin-flattering portrait stock: soft, low-contrast, an "
-        "orange-band lift for warm skin. Needs grade_film_texture for the "
-        "halation/grain half.",
+        "orange-band lift for warm skin, fine grain and a soft halation glow.",
         LookSpec(
             contrast=0.0, black_lift=0.03, highlight_tint=(0.04, 0.02, -0.02),
             hue_sat=((30.0, 45.0, 1.1),), sat=0.95, halation=0.10, grain=0.04,
@@ -486,8 +484,8 @@ LOOKS: List[EngineLook] = [
     ),
     EngineLook(
         "vintage_faded", "Vintage Faded",
-        "Lifted milky blacks, warm, desaturated -- an aged-print fade. "
-        "Needs grade_film_texture for the halation/grain half.",
+        "Lifted milky blacks, warm, desaturated -- an aged-print fade with "
+        "visible grain and halation.",
         LookSpec(
             contrast=-0.05, black_lift=0.08, mid_tint=(0.03, 0.015, -0.02), sat=0.80,
             halation=0.20, grain=0.06,
@@ -498,7 +496,7 @@ LOOKS: List[EngineLook] = [
         "bw_film", "B&W Film",
         "Near-monochrome, contrasty, grainy -- a graphic black & white "
         "film look (a creative near-desaturation, not a true single-channel "
-        "conversion). Needs grade_film_texture for the halation/grain half.",
+        "conversion) with visible grain and halation.",
         LookSpec(contrast=0.20, sat=0.05, halation=0.10, grain=0.06),
         family="film",
     ),

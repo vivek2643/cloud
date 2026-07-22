@@ -18,15 +18,14 @@ every later build step plugs into:
     step that Match alone (a placement + cast nudge, not a full exposure
     convergence) never fully closed. Same "computed once per document,
     passed in as a delta" pattern as match/leveling.
-  - SS6 (match) is wired: a pre-computed per-file delta (see
-    `grade.match.solve_match_deltas`, computed ONCE per document resolve in
-    `layers.resolve` since grade-groups are a whole-document clustering, not
-    a per-clip decision) composes next.
-  - Leveling (color_grading_upgrade.plan.md Phase 2, gated on `settings.
-    grade_even_lighting`) composes next: a pre-computed per-shot bounded
-    exposure/tonal-placement nudge toward the sequence's smooth target (see
-    `grade.leveling.solve_leveling`), same "computed once per document,
-    passed in as a delta" pattern as match.
+  - SS6 (match) is wired: a pre-computed per-shot delta (see
+    `grade.match.solve_sequence_match`, computed ONCE per document by
+    `grade.job.run_grade_job` since grade-groups are a whole-document
+    clustering, not a per-clip decision) composes next.
+  - Leveling (color_grading_upgrade.plan.md Phase 2) composes next: a
+    pre-computed per-shot bounded exposure/tonal-placement nudge toward the
+    sequence's smooth target (see `grade.leveling.solve_leveling`), same
+    "computed once per document, passed in as a delta" pattern as match.
   - SS7 (look) is wired: `sequence_look.mode` selects ONE of the three input
     modes (SS7) -- a preset recipe, a reference-image transfer (needs
     pre-computed `reference_stats`, see `reference_transfer.py`), or a
@@ -61,8 +60,6 @@ from app.services.l3.grade.presets import get_preset
 from app.services.l3.grade.reference_transfer import solve_reference_transfer
 from app.services.l3.grade.softlocal import solve_vignette
 from app.services.l3.grade.tone import WORKING_SPACE_V1, from_working, to_working
-
-DEFAULT_WORKING_SPACE = "rec709"
 
 # --------------------------------------------------------------------------
 # Composite guardrails (color_grading_upgrade.plan.md -- v1 only).
@@ -137,7 +134,7 @@ def _clamp_composite_v1(grade: Grade) -> Grade:
 
 
 def _corrected_source_stats(
-    color_stats: Optional[Dict[str, Any]], stack: Grade, *, pipeline: str = "legacy"
+    color_stats: Optional[Dict[str, Any]], stack: Grade
 ) -> Optional[Dict[str, Any]]:
     """Project a file's measured `rgb_mean`/`rgb_std` through the correct+match
     `stack` so the Look layer solves against the image AS CORRECTED, not the raw
@@ -149,31 +146,27 @@ def _corrected_source_stats(
     construction), so mean' = clamp(mean*slope+offset) and std' = std*slope is
     exact for that stack, not an approximation.
 
-    `pipeline=="v1"` (color_grading_upgrade.plan.md Step 1.5): the CDL the
-    stack composes into runs INSIDE the working-space wrapper at bake time
-    (Step 1.1), so the mean projection is done there too -- linearize,
-    apply slope/offset, re-encode -- keeping the corrected stats in the SAME
-    space the reference image's own stats were measured in (display-encoded,
-    `reference_transfer.compute_image_stats`), so the two sides of the
-    transfer stay comparable. `std` stays a plain slope scale either way
-    (the working-space encode/decode is nonlinear, so std doesn't project
-    through it exactly -- an approximation already accepted for the legacy
-    path too, not a new one)."""
+    (color_grading_upgrade.plan.md Step 1.5): the CDL the stack composes into
+    runs INSIDE the v1 working-space wrapper at bake time (Step 1.1), so the
+    mean projection is done there too -- linearize, apply slope/offset,
+    re-encode -- keeping the corrected stats in the SAME space the reference
+    image's own stats were measured in (display-encoded, `reference_transfer.
+    compute_image_stats`), so the two sides of the transfer stay comparable.
+    `std` stays a plain slope scale (the working-space encode/decode is
+    nonlinear, so std doesn't project through it exactly -- an accepted
+    approximation)."""
     if not color_stats:
         return None
     mean = color_stats.get("rgb_mean") or [0.5, 0.5, 0.5]
     std = color_stats.get("rgb_std") or [0.2, 0.2, 0.2]
-    if pipeline == "v1":
-        import numpy as np
+    import numpy as np
 
-        working_mean = to_working(np.array(mean, dtype=np.float32), WORKING_SPACE_V1)
-        corr_working = np.clip(
-            working_mean * np.array(stack.slope, dtype=np.float32)
-            + np.array(stack.offset, dtype=np.float32), 0.0, 1.0,
-        )
-        corr_mean = from_working(corr_working, WORKING_SPACE_V1).tolist()
-    else:
-        corr_mean = [min(1.0, max(0.0, mean[c] * stack.slope[c] + stack.offset[c])) for c in range(3)]
+    working_mean = to_working(np.array(mean, dtype=np.float32), WORKING_SPACE_V1)
+    corr_working = np.clip(
+        working_mean * np.array(stack.slope, dtype=np.float32)
+        + np.array(stack.offset, dtype=np.float32), 0.0, 1.0,
+    )
+    corr_mean = from_working(corr_working, WORKING_SPACE_V1).tolist()
     corr_std = [max(0.0, std[c] * stack.slope[c]) for c in range(3)]
     return {**color_stats, "rgb_mean": corr_mean, "rgb_std": corr_std}
 
@@ -212,13 +205,14 @@ def resolve_clip_grade(
     match_delta: Optional[Grade] = None,
     balance_delta: Optional[Grade] = None,
     leveling_delta: Optional[Grade] = None,
-    pipeline: str = "legacy",
-    skin_vibrance: bool = False,
     tone_contrast: float = 0.0,
-    look_engine_enabled: bool = False,
-    film_texture_enabled: bool = False,
 ) -> Dict[str, Any]:
-    """Resolve ONE clip's (spine segment or op) final grade descriptor.
+    """Resolve ONE clip's (spine segment or op) final grade descriptor. The
+    v1 pipeline (color_grading_upgrade.plan.md; standardized on as the sole
+    pipeline by grade_pipeline_standardize.plan.md): percentile-based
+    correct layer, the `rec709_v1` working space (baked into the CDL's tone
+    response at bake time), composite CDL guardrails, and the Look layer's
+    corrected-source stats projected through that same working space.
 
     `item` is the raw `EditSegment`/`EditOperation` dict; `item.get("grade")`
     is the per-clip explicit override (SS2.4) -- a delta nudge composed onto
@@ -230,44 +224,36 @@ def resolve_clip_grade(
     callers that have it available should pass it through. `match_delta` is
     this clip's SS6 grade-groups delta (this file's nudge toward its group's
     anchor), already resolved once for the whole document by the caller.
-    `balance_delta` (color_shot_matching.plan.md Phase 2b, v1-only): this
-    shot's exposure/white-balance/contrast nudge toward its scene-group's
-    robust median reference (`grade.balance.solve_balance`), already
-    resolved once for the whole document -- composed BETWEEN Correct and
-    Match so the two stages converge on the same target instead of fighting.
-    `pipeline` (color_grading_upgrade.plan.md Step 1.1/1.3/1.5): "legacy"
-    (default) is today's exact stack -- callers that never pass it get
-    byte-identical output. "v1" selects the percentile-based correct layer,
-    the `rec709_v1` working space (baked into the CDL's tone response at
-    bake time), and projects the Look layer's corrected-source stats through
-    that same working space. `leveling_delta` (Phase 2, gated by the caller
-    on `settings.grade_even_lighting`) is this shot's bounded exposure/
+    `balance_delta` (color_shot_matching.plan.md Phase 2b): this shot's
+    exposure/white-balance/contrast nudge toward its scene-group's robust
+    median reference (`grade.balance.solve_balance`), already resolved once
+    for the whole document -- composed BETWEEN Correct and Match so the two
+    stages converge on the same target instead of fighting.
+    `leveling_delta` (Phase 2) is this shot's bounded exposure/
     tonal-placement nudge toward the sequence's smooth target (`grade.
     leveling.solve_leveling`), already resolved once for the whole document
     -- composed between Match and Look, same pattern as `match_delta`, so
     the Look layer still solves against the fully-corrected-so-far image.
-    `skin_vibrance` (color_skin_vibrance.plan.md, v1-only): threaded straight
-    through to `solve_correct_grade` -- gates the skin-anchored WB tint vote
-    and the chroma-based saturation floor. Off (default) -> Correct layer
-    unchanged.
-    `tone_contrast` (color_tone_contrast.plan.md, v1-only): a filmic S-curve
-    strength baked into `from_working` at bake time -- carried through the
-    descriptor and the `grade_hash` payload (NOT applied to the CDL itself)
-    so the cube rebakes when it changes. `0.0` (default) -> byte-identical.
-    `look_engine_enabled` (color_response_engine.plan.md): gates the new
-    `mode == "engine"` Look mode -- a `LookSpec` baked into the creative LUT
-    grid (mutually exclusive with an uploaded `.cube`; see below). Off
-    (default) -> `look_engine` never set, byte-identical to before this plan.
-    `film_texture_enabled` (halation_grain.plan.md): gates routing an active
-    engine look's `halation`/`grain` params into `soft_local`, alongside the
-    vignette -- both are spatial/stochastic, so they apply as an additional
-    pass, never baked into the CDL/LUT. Off (default), or no engine look, or
-    a look with zero texture -> `soft_local` byte-identical to before this
-    plan.
+    Skin-anchored WB tint correction + the chroma-based saturation floor
+    (color_skin_vibrance.plan.md) are always applied via `solve_correct_grade`.
+    `tone_contrast` (color_tone_contrast.plan.md): a filmic S-curve strength
+    baked into `from_working` at bake time -- carried through the descriptor
+    and the `grade_hash` payload (NOT applied to the CDL itself) so the cube
+    rebakes when it changes. Hardwired to `0.0` by every caller
+    (grade_pipeline_standardize.plan.md: the global S-curve regressed
+    "too dark" looks by double-applying contrast on top of engine looks) --
+    the parameter and plumbing stay so a future caller can pass a non-zero
+    value; `0.0` is an exact identity.
+    An active engine look (`sequence_look["mode"] == "engine"`,
+    color_response_engine.plan.md) always bakes its `LookSpec` into the
+    creative LUT grid (mutually exclusive with an uploaded `.cube`; see
+    below), and halation_grain.plan.md's halation/grain always route into
+    `soft_local` whenever that look declares them -- both are permanent,
+    look-scoped capabilities now, not caller-gated.
     """
     stack = solve_correct_grade(
-        color_stats, already_graded=already_graded, pipeline=pipeline,
-        skin_vibrance=skin_vibrance,
+        color_stats, already_graded=already_graded, pipeline="v1",
+        skin_vibrance=True,
     )
     if balance_delta is not None:
         stack = compose(stack, balance_delta, 1.0)
@@ -278,7 +264,7 @@ def resolve_clip_grade(
     # The Look layer sits on top of correct+match+leveling, so it must be solved
     # against the ALREADY-CORRECTED image (see _corrected_source_stats). Passing
     # the raw color_stats here is what made a reference drop double-stretch exposure.
-    corrected_stats = _corrected_source_stats(color_stats, stack, pipeline=pipeline)
+    corrected_stats = _corrected_source_stats(color_stats, stack)
     stack = compose(stack, _solve_look(sequence_look, corrected_stats), 1.0)
     arc_intensity = (sequence_look or {}).get("arc_intensity")
     stack = compose(stack, solve_arc_grade(item.get("arc_intent"), arc_intensity), 1.0)
@@ -286,27 +272,24 @@ def resolve_clip_grade(
     override = Grade.from_dict(item.get("grade")) if item.get("grade") else None
     resolved = compose(stack, override, 1.0) if override is not None else stack
 
-    # v1 only: bound the FINAL composed CDL so the multiplicatively-stacked
-    # layers (correct+match+leveling+lift+override) can't over-contrast or
-    # crush shadows regardless of how they combine (Fixes 2 & 3).
-    if pipeline == "v1":
-        resolved = _clamp_composite_v1(resolved)
+    # Bound the FINAL composed CDL so the multiplicatively-stacked layers
+    # (correct+match+leveling+lift+override) can't over-contrast or crush
+    # shadows regardless of how they combine (Fixes 2 & 3).
+    resolved = _clamp_composite_v1(resolved)
 
     creative_lut_ref = (sequence_look or {}).get("lut_ref") if sequence_look else None
     if sequence_look and sequence_look.get("mode") != "lut":
         creative_lut_ref = None
-    default_ws = WORKING_SPACE_V1 if pipeline == "v1" else DEFAULT_WORKING_SPACE
-    working_space = item.get("working_space") or default_ws
+    working_space = item.get("working_space") or WORKING_SPACE_V1
 
     # color_response_engine.plan.md: mode=="engine" bakes a LookSpec into the
     # creative LUT grid instead of an uploaded .cube -- the two are mutually
     # exclusive (both fill the same `creative_lut_grid` slot at bake time),
     # so an engine look wins over any stale `lut_ref` on the same look dict.
     # `spec.is_identity()` (empty spec, unknown look_id/params) skips the
-    # grid entirely -- byte-identical to no look, same never-worse discipline
-    # as every other new-field-off-by-default plan in this stack.
+    # grid entirely -- byte-identical to no look.
     look_engine = None
-    if look_engine_enabled and sequence_look and sequence_look.get("mode") == "engine":
+    if sequence_look and sequence_look.get("mode") == "engine":
         spec = resolve_look_spec(sequence_look)
         if spec is not None and not spec.is_identity():
             look_engine = spec.to_dict()
@@ -327,14 +310,13 @@ def resolve_clip_grade(
     # halation_grain.plan.md: spatial finishing (halation glow + film grain),
     # declared by the SAME engine look already resolved above -- reuse
     # `look_engine` (the dict, or None) rather than re-resolving the spec.
-    # Requires BOTH `film_texture_enabled` and an active engine look
-    # (`look_engine` is only ever non-None when `look_engine_enabled` was
-    # already true), so this rides `grade_look_engine` too, per the plan's
-    # own "requires grade_look_engine" framing, without a second explicit
-    # flag check here.
+    # Look-scoped, not a global toggle (grade_pipeline_standardize.plan.md):
+    # fires purely on the active look declaring nonzero halation/grain, so
+    # film-family looks automatically get their texture and non-film looks
+    # never do.
     halation = None
     grain = None
-    if film_texture_enabled and look_engine:
+    if look_engine:
         texture_spec = LookSpec.from_dict(look_engine)
         if texture_spec.halation > 0.0:
             halation = {"strength": min(1.0, texture_spec.halation)}

@@ -1,15 +1,15 @@
 """
-The `v1` grade pipeline as a background job (color_grading_upgrade.plan.md
-Step 1.0 -- the foundational seam every later Phase-1 layer plugs into).
+The grade pipeline as a background job (color_grading_upgrade.plan.md
+Step 1.0 -- the foundational seam every later Phase-1 layer plugs into;
+standardized on as the SOLE pipeline by grade_pipeline_standardize.plan.md).
 
-Why a job at all: the full `v1` stack (per-shot SPAN measurement, one
+Why a job at all: the full stack (per-shot SPAN measurement, one
 sequence-match pass, resolve, pre-bake) is too heavy to run inline on every
 document resolve for a long timeline. So it runs ONCE per meaningful change,
 as a Procrastinate task (`run_grade_job`), and PERSISTS the result
 (`resolved_grades`) + live progress (`grade_jobs`) -- `layers.resolve` then
-just READS under `grade_pipeline=="v1"` instead of computing (see
-`fetch_latest_grades`, and `layers.py::resolve`'s `grade_lookup` param).
-`legacy` never touches this file at all.
+just READS (see `fetch_latest_grades`, and `layers.py::resolve`'s
+`grade_lookup` param), never computes inline.
 
 The read path never blocks on the job: `fetch_latest_grades` returns the
 FRESHEST persisted row per shot regardless of `input_hash`, so a shot whose
@@ -88,7 +88,14 @@ logger = logging.getLogger(__name__)
 # params now route into soft_local (gated on grade_film_texture, requires
 # grade_look_engine too), changing the render -vf chain / preview pass
 # whenever both flags are on and the look carries texture.
-INPUT_HASH_SCHEMA_VERSION = 10
+# v11 (grade_pipeline_standardize.plan.md): collapsed every dev flag this
+# history tracked (grade_pipeline/even_lighting/semantic/shot_match_v2/
+# scene_join/subject_exposure/skin_vibrance/look_engine) to permanently-on
+# behavior, made film_texture purely look-scoped (no flag), and hardwired
+# the global tone_contrast S-curve permanently OFF (0.0) -- the "flags"
+# payload below is gone entirely, so this version bump alone is what forces
+# every project's stored grade to be recomputed against the new pipeline.
+INPUT_HASH_SCHEMA_VERSION = 11
 
 # Same local-disk, content-addressed cube cache the preview cube endpoint and
 # the render compositor already use (grade/cache.py's documented "not shared
@@ -220,14 +227,15 @@ def compute_input_hash(document: Dict[str, Any]) -> str:
     """Stable hash over everything that can change what `run_grade_job` would
     produce: EVERY shot's identity + SPAN + per-clip overrides (an ORDERED
     list, not a set -- position matters, since `solve_sequence_match` groups
-    by adjacency), the sequence-level look, and the active grade flags.
-    Trimming a cut moves ITS OWN span stats AND can change which neighbors
-    its matching window sees, so span (not just `look`) MUST be part of this
-    payload -- a look-only hash would silently serve a stale match/measure
-    after a trim. Two documents that would resolve to byte-identical v1
-    grades hash the same; anything else changes it, which is exactly what
-    `maybe_enqueue` diffs against to decide whether to re-run the job."""
-    settings = get_settings()
+    by adjacency) and the sequence-level look. Trimming a cut moves ITS OWN
+    span stats AND can change which neighbors its matching window sees, so
+    span (not just `look`) MUST be part of this payload -- a look-only hash
+    would silently serve a stale match/measure after a trim. Two documents
+    that would resolve to byte-identical grades hash the same; anything else
+    changes it, which is exactly what `maybe_enqueue` diffs against to decide
+    whether to re-run the job. (No "flags" payload -- the pipeline has no
+    more dev flags; `INPUT_HASH_SCHEMA_VERSION` alone forces a re-grade when
+    the grade MATH changes.)"""
     shots = ordered_shots(document)
     payload = {
         "v": INPUT_HASH_SCHEMA_VERSION,
@@ -242,19 +250,6 @@ def compute_input_hash(document: Dict[str, Any]) -> str:
             for s in shots
         ],
         "look": document.get("look") or {},
-        "flags": {
-            "grade_pipeline": settings.grade_pipeline,
-            "grade_even_lighting": settings.grade_even_lighting,
-            "grade_semantic": settings.grade_semantic,
-            "grade_shot_match_v2": settings.grade_shot_match_v2,
-            "grade_scene_join": settings.grade_scene_join,
-            "grade_subject_exposure": settings.grade_subject_exposure,
-            "grade_skin_vibrance": settings.grade_skin_vibrance,
-            "grade_tone_contrast": settings.grade_tone_contrast,
-            "grade_tone_contrast_strength": settings.grade_tone_contrast_strength,
-            "grade_look_engine": settings.grade_look_engine,
-            "grade_film_texture": settings.grade_film_texture,
-        },
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
@@ -348,10 +343,8 @@ def _upsert_grade_row(thread_id: str, shot_key: str, input_hash: str,
 def maybe_enqueue(thread_id: str, document: Dict[str, Any]) -> None:
     """Enqueue `run_grade_job` iff the CURRENT `input_hash` differs from
     whatever this thread last ran/is running (idempotent -- Step 1.0 §4).
-    A no-op entirely under `legacy` (the job is v1-only) or with no
-    gradeable shots yet."""
-    settings = get_settings()
-    if settings.grade_pipeline != "v1" or not (document.get("timeline") or document.get("operations")):
+    A no-op with no gradeable shots yet."""
+    if not (document.get("timeline") or document.get("operations")):
         return
     h = compute_input_hash(document)
     existing = get_job_state(thread_id)
@@ -404,7 +397,6 @@ def run_grade_job(thread_id: str) -> None:
     shots = ordered_shots(document)
     _upsert_job_status(thread_id, state="grading", total=len(shots), done=0, input_hash=h)
     try:
-        settings = get_settings()
         file_ids = list({s.file_id for s in shots})
         color_stats = fetch_color_stats(file_ids)
         sequence_look = document.get("look")
@@ -412,28 +404,17 @@ def run_grade_job(thread_id: str) -> None:
         # color_subject_exposure.plan.md: the cut_records join (scene_meta's
         # metadata + subject_box) must resolve BEFORE the measure loop below
         # -- measure_span needs the subject box up front to measure
-        # subject_luma on the hero frame, whereas previously the join only
-        # ran AFTER measurement (scene grouping never needed anything from
-        # measure_span). One join, reused by both consumers: grade_scene_join
-        # gates whether the METADATA (label/summary/speaker/etc, used for
-        # grouping below) is attached; grade_subject_exposure gates whether
-        # the SUBJECT BOX (used for measurement) is attached. Either flag
-        # alone triggers the join; each flag independently controls only its
-        # own downstream usage, so toggling one never changes the other's
-        # behavior (verified: flip only grade_subject_exposure and grouping
-        # output is byte-identical; flip only grade_scene_join and no box
-        # ever reaches measure_span).
-        cut_meta = {}
-        if settings.grade_semantic and (settings.grade_scene_join or settings.grade_subject_exposure):
-            from app.services.l3.grade.scene_meta import lookup_shot_cut_meta
+        # subject_luma on the hero frame. One join feeds two downstream
+        # consumers: the METADATA (label/summary/speaker/etc, used for
+        # grouping below) and the SUBJECT BOX (used for measurement).
+        from app.services.l3.grade.scene_meta import lookup_shot_cut_meta
 
-            cut_meta = lookup_shot_cut_meta(
-                [(s.key, s.file_id, s.in_ms, s.out_ms) for s in shots]
-            )
-        subject_boxes: Dict[str, List[float]] = (
-            {k: m.subject_box for k, m in cut_meta.items() if m.subject_box}
-            if settings.grade_semantic and settings.grade_subject_exposure else {}
+        cut_meta = lookup_shot_cut_meta(
+            [(s.key, s.file_id, s.in_ms, s.out_ms) for s in shots]
         )
+        subject_boxes: Dict[str, List[float]] = {
+            k: m.subject_box for k, m in cut_meta.items() if m.subject_box
+        }
 
         # Step 1.2 (+ Step 3.1, + color_subject_exposure.plan.md): measure
         # the span actually used; never-worse fallback to whole-file
@@ -472,182 +453,158 @@ def run_grade_job(thread_id: str) -> None:
         # overrides the default RGB-adjacency grouping so matching aligns
         # shots that are the same scene BY MEANING, not merely RGB-close.
         # The raw timeline seg never carries speaker_person/on_camera/label/
-        # summary (they live on cut_records, one join away) -- when
-        # grade_scene_join is on, use the (already-joined, see above) real
-        # values, plus its own span rgb_mean as scene_group's graceful RGB
-        # base (see scene_group.py's trust hierarchy). Off: scene_meta
-        # carries no metadata AND no rgb_mean, so group_shots_semantically
-        # returns all-singletons exactly as before this plan, and the
-        # existing RGB-adjacency fallback below engages -- regardless of
-        # whether the join above ran for grade_subject_exposure's sake.
-        semantic_groups = None
-        if settings.grade_semantic:
-            scene_meta = []
-            for s in shots:
-                cm = cut_meta.get(s.key) if settings.grade_scene_join else None
-                span_rgb = (shot_stats[s.key].stats or {}).get("rgb_mean") if settings.grade_scene_join else None
-                scene_meta.append(SceneMeta(
-                    key=s.key, file_id=s.file_id,
-                    speaker_person=(cm.speaker_person if cm else None),
-                    on_camera=(cm.on_camera if cm else None),
-                    label=(cm.label if cm else ""),
-                    summary=(cm.summary if cm else ""),
-                    voice_ids=(cm.voice_ids if cm else []),
-                    take_group_id=(cm.take_group_id if cm else None),
-                    sync_group_id=(cm.sync_group_id if cm else None),
-                    rgb_mean=list(span_rgb) if span_rgb else None,
-                ))
-            semantic_groups = group_shots_semantically(scene_meta)
+        # summary (they live on cut_records, one join away) -- use the
+        # (already-joined, see above) real values, plus its own span
+        # rgb_mean as scene_group's graceful RGB base (see scene_group.py's
+        # trust hierarchy): a shot with no covering cut_record simply has no
+        # metadata, so group_shots_semantically falls back to the RGB base
+        # for it rather than forcing an all-singleton result.
+        scene_meta = []
+        for s in shots:
+            cm = cut_meta.get(s.key)
+            span_rgb = (shot_stats[s.key].stats or {}).get("rgb_mean")
+            scene_meta.append(SceneMeta(
+                key=s.key, file_id=s.file_id,
+                speaker_person=(cm.speaker_person if cm else None),
+                on_camera=(cm.on_camera if cm else None),
+                label=(cm.label if cm else ""),
+                summary=(cm.summary if cm else ""),
+                voice_ids=(cm.voice_ids if cm else []),
+                take_group_id=(cm.take_group_id if cm else None),
+                sync_group_id=(cm.sync_group_id if cm else None),
+                rgb_mean=list(span_rgb) if span_rgb else None,
+            ))
+        semantic_groups = group_shots_semantically(scene_meta)
 
         ordered = [shot_stats[s.key] for s in shots]
-        # Safe defaults for the kill-switch (grade_shot_match_v2=False) path
-        # below, so the Leveling block (which runs regardless of the flag)
-        # can branch on `groups`/`balance_references` without a NameError.
-        groups: List[List[int]] = []
-        ws_stats: List[Dict[str, Any]] = []
+        # color_shot_matching.plan.md Phase 1: an all-singleton semantic
+        # result means the signals were absent/unhelpful for THIS document
+        # (the common real-data case: speaker_person/on_camera/label/summary
+        # all unset) -- degrade to the RGB fallback instead of silently
+        # letting Match do nothing (SS2 "primary cause": singleton groups are
+        # skipped, and a non-None `groups` bypasses group_neighbors
+        # entirely).
+        if not _has_real_groups(semantic_groups):
+            semantic_groups = None
+        groups = semantic_groups if semantic_groups is not None else group_neighbors(ordered)
+
+        # Phase 2a: Balance's robust reference, solved on WORKING-space
+        # stats (Balance's math has to live in the space the CDL is
+        # applied).
         balance_references: Dict[int, GroupReference] = {}
-        if settings.grade_shot_match_v2:
-            # color_shot_matching.plan.md Phase 1: an all-singleton semantic
-            # result means the signals were absent/unhelpful for THIS
-            # document (the common real-data case: speaker_person/on_camera/
-            # label/summary all unset) -- degrade to the RGB fallback
-            # instead of silently letting Match do nothing (SS2 "primary
-            # cause": singleton groups are skipped, and a non-None `groups`
-            # bypasses group_neighbors entirely).
-            if not _has_real_groups(semantic_groups):
-                semantic_groups = None
-            groups = semantic_groups if semantic_groups is not None else group_neighbors(ordered)
+        display_stats = [o.stats or {} for o in ordered]
+        ws_stats = [_ws_stats(o.stats) for o in ordered]
+        for gi, idxs in enumerate(groups):
+            b_ref = compute_group_reference([ws_stats[i] for i in idxs])
+            if b_ref is not None:
+                balance_references[gi] = b_ref
 
-            # Phase 2a: Balance's robust reference, solved on WORKING-space
-            # stats (Balance's math has to live in the space the CDL is
-            # applied).
-            display_stats = [o.stats or {} for o in ordered]
-            ws_stats = [_ws_stats(o.stats) for o in ordered]
-            for gi, idxs in enumerate(groups):
-                b_ref = compute_group_reference([ws_stats[i] for i in idxs])
-                if b_ref is not None:
-                    balance_references[gi] = b_ref
+        balance_deltas: Dict[str, Grade] = solve_balance(
+            ws_stats, groups, balance_references, [s.key for s in shots],
+        )
 
-            balance_deltas: Dict[str, Grade] = solve_balance(
-                ws_stats, groups, balance_references, [s.key for s in shots],
-            )
+        # Phase 2c: Match solves against the AS-BALANCED image, not the
+        # raw span stats -- same "corrected source" discipline
+        # resolver.py's _corrected_source_stats already uses for the
+        # Look layer. Composing two independently-solved "toward the
+        # same reference" deltas on the RAW stats does not converge, it
+        # overshoots (see _corrected_display_stats's docstring for the
+        # verified numbers) -- this is what makes Balance and Match
+        # actually reinforce instead of fight.
+        balanced_display_stats = [
+            display_stats[i] if o.key not in balance_deltas
+            else _corrected_display_stats(ws_stats[i], balance_deltas[o.key])
+            for i, o in enumerate(ordered)
+        ]
+        match_references: Dict[int, GroupReference] = {}
+        for gi, idxs in enumerate(groups):
+            m_ref = compute_group_reference([balanced_display_stats[i] for i in idxs])
+            if m_ref is not None:
+                match_references[gi] = m_ref
+        balanced_shots = [
+            ShotStats(key=o.key, file_id=o.file_id, stats=balanced_display_stats[i])
+            for i, o in enumerate(ordered)
+        ]
+        match_deltas: Dict[str, Grade] = solve_sequence_match(
+            balanced_shots, groups=groups, working_space=WORKING_SPACE_V1,
+            references=match_references,
+        )
 
-            # Phase 2c: Match solves against the AS-BALANCED image, not the
-            # raw span stats -- same "corrected source" discipline
-            # resolver.py's _corrected_source_stats already uses for the
-            # Look layer. Composing two independently-solved "toward the
-            # same reference" deltas on the RAW stats does not converge, it
-            # overshoots (see _corrected_display_stats's docstring for the
-            # verified numbers) -- this is what makes Balance and Match
-            # actually reinforce instead of fight.
-            balanced_display_stats = [
-                display_stats[i] if o.key not in balance_deltas
-                else _corrected_display_stats(ws_stats[i], balance_deltas[o.key])
-                for i, o in enumerate(ordered)
-            ]
-            match_references: Dict[int, GroupReference] = {}
-            for gi, idxs in enumerate(groups):
-                m_ref = compute_group_reference([balanced_display_stats[i] for i in idxs])
-                if m_ref is not None:
-                    match_references[gi] = m_ref
-            balanced_shots = [
-                ShotStats(key=o.key, file_id=o.file_id, stats=balanced_display_stats[i])
-                for i, o in enumerate(ordered)
-            ]
-            match_deltas: Dict[str, Grade] = solve_sequence_match(
-                balanced_shots, groups=groups, working_space=WORKING_SPACE_V1,
-                references=match_references,
-            )
-        else:
-            # Kill switch (color_shot_matching.plan.md SS6): the exact
-            # pre-redesign v1 path -- semantic-or-nothing grouping (no RGB
-            # fallback), no Balance, no robust reference (single-anchor
-            # matching at the old, weaker strengths is NOT reproduced here
-            # since those constants changed in place -- see match.py's
-            # comment on why that's an accepted, documented tradeoff of the
-            # "flag-gates only the structural additions" rollback shape).
-            balance_deltas = {}
-            match_deltas = solve_sequence_match(
-                ordered, groups=semantic_groups, working_space=WORKING_SPACE_V1,
-            )
-
-        # Phase 2: ONE leveling pass (exposure + tonal placement), gated on
-        # grade_even_lighting -- working-space-projected scalars, same
-        # projection Step 1.5's _corrected_source_stats already uses.
+        # Phase 2: ONE leveling pass (exposure + tonal placement) --
+        # working-space-projected scalars, same projection Step 1.5's
+        # _corrected_source_stats already uses.
         leveling_deltas: Dict[str, Grade] = {}
-        if settings.grade_even_lighting:
-            from app.services.l3.grade.cdl import compose as _compose
+        from app.services.l3.grade.cdl import compose as _compose
 
-            group_idx_by_shot = [
-                next((gi for gi, idxs in enumerate(groups) if i in idxs), None)
-                for i in range(len(shots))
-            ]
+        group_idx_by_shot = [
+            next((gi for gi, idxs in enumerate(groups) if i in idxs), None)
+            for i in range(len(shots))
+        ]
 
-            level_inputs: List[ShotLevelInput] = []
-            for i, s in enumerate(shots):
-                stats = shot_stats[s.key].stats or {}
-                subj = stats.get("subject_luma")
-                subject_luma = _to_working_scalar(subj, None) if subj is not None else None
+        level_inputs: List[ShotLevelInput] = []
+        for i, s in enumerate(shots):
+            stats = shot_stats[s.key].stats or {}
+            subj = stats.get("subject_luma")
+            subject_luma = _to_working_scalar(subj, None) if subj is not None else None
 
-                # Phase 4b: for a shot that's a member of a real (2+) Balance
-                # /Match group, level its CURRENT value from the AS-CORRECTED
-                # (post Balance+Match) stats, toward an EXPLICIT target (the
-                # SAME group reference Balance/Match already converged on)
-                # instead of the local smooth-target average -- otherwise
-                # Leveling's own window average re-diverges what they just
-                # aligned. Ungrouped shots keep the original local-smoothing
-                # behavior exactly (target_* stays None).
-                group_idx = group_idx_by_shot[i]
-                ref = balance_references.get(group_idx) if group_idx is not None else None
-                if ref is not None and ws_stats:
-                    bm_grade = _compose(balance_deltas.get(s.key, Grade()), match_deltas.get(s.key, Grade()), 1.0)
-                    mid_gray = _apply_working_scalar(ws_stats[i].get("mid_gray"), bm_grade, 1)
-                    if mid_gray is None:
-                        mid_gray = 0.5   # same uncorrected fallback constant as the no-group path
-                    black = _apply_working_scalar(ws_stats[i]["black_point"], bm_grade, 1)
-                    white = _apply_working_scalar(ws_stats[i]["white_point"], bm_grade, 1)
-                    level_inputs.append(ShotLevelInput(
-                        key=s.key, mid_gray=mid_gray, black_point=black, white_point=white,
-                        subject_luma=subject_luma,
-                        target_mid_gray=ref.mid_gray, target_black_point=ref.black_point,
-                        target_white_point=ref.white_point,
-                    ))
-                else:
-                    mid_gray = _to_working_scalar(stats.get("mid_gray"), 0.5)
-                    black = _to_working_scalar(stats.get("black_point"), 0.0)
-                    white = _to_working_scalar(stats.get("white_point"), 1.0)
-                    level_inputs.append(ShotLevelInput(
-                        key=s.key, mid_gray=mid_gray, black_point=black, white_point=white,
-                        subject_luma=subject_luma,
-                    ))
+            # Phase 4b: for a shot that's a member of a real (2+) Balance
+            # /Match group, level its CURRENT value from the AS-CORRECTED
+            # (post Balance+Match) stats, toward an EXPLICIT target (the
+            # SAME group reference Balance/Match already converged on)
+            # instead of the local smooth-target average -- otherwise
+            # Leveling's own window average re-diverges what they just
+            # aligned. Ungrouped shots keep the original local-smoothing
+            # behavior exactly (target_* stays None).
+            group_idx = group_idx_by_shot[i]
+            ref = balance_references.get(group_idx) if group_idx is not None else None
+            if ref is not None and ws_stats:
+                bm_grade = _compose(balance_deltas.get(s.key, Grade()), match_deltas.get(s.key, Grade()), 1.0)
+                mid_gray = _apply_working_scalar(ws_stats[i].get("mid_gray"), bm_grade, 1)
+                if mid_gray is None:
+                    mid_gray = 0.5   # same uncorrected fallback constant as the no-group path
+                black = _apply_working_scalar(ws_stats[i]["black_point"], bm_grade, 1)
+                white = _apply_working_scalar(ws_stats[i]["white_point"], bm_grade, 1)
+                level_inputs.append(ShotLevelInput(
+                    key=s.key, mid_gray=mid_gray, black_point=black, white_point=white,
+                    subject_luma=subject_luma,
+                    target_mid_gray=ref.mid_gray, target_black_point=ref.black_point,
+                    target_white_point=ref.white_point,
+                ))
+            else:
+                mid_gray = _to_working_scalar(stats.get("mid_gray"), 0.5)
+                black = _to_working_scalar(stats.get("black_point"), 0.0)
+                white = _to_working_scalar(stats.get("white_point"), 1.0)
+                level_inputs.append(ShotLevelInput(
+                    key=s.key, mid_gray=mid_gray, black_point=black, white_point=white,
+                    subject_luma=subject_luma,
+                ))
 
-            # color_subject_exposure.plan.md Phase 2: a grouped shot's usable
-            # subject_luma should converge toward the GROUP's median SUBJECT
-            # luma (working space), not the group's whole-frame mid_gray
-            # reference (`target_mid_gray` above) -- a face's own brightness
-            # has no reason to equal the frame average. Computed inline here
-            # (not in reference.py) to keep the matching/balance math
-            # untouched, per this plan's own non-goals -- Balance/Match never
-            # see this value. <2 usable members in a group -> leave
-            # target_subject_luma unset (falls back to target_mid_gray).
-            if settings.grade_semantic and settings.grade_subject_exposure:
-                from statistics import median
+        # color_subject_exposure.plan.md Phase 2: a grouped shot's usable
+        # subject_luma should converge toward the GROUP's median SUBJECT
+        # luma (working space), not the group's whole-frame mid_gray
+        # reference (`target_mid_gray` above) -- a face's own brightness
+        # has no reason to equal the frame average. Computed inline here
+        # (not in reference.py) to keep the matching/balance math
+        # untouched, per this plan's own non-goals -- Balance/Match never
+        # see this value. <2 usable members in a group -> leave
+        # target_subject_luma unset (falls back to target_mid_gray).
+        from statistics import median
 
-                from app.services.l3.grade.leveling import _usable_subject_luma
+        from app.services.l3.grade.leveling import _usable_subject_luma
 
-                subject_by_group: Dict[int, List[float]] = {}
-                for i, gi in enumerate(group_idx_by_shot):
-                    if gi is None:
-                        continue
-                    usable = _usable_subject_luma(level_inputs[i].subject_luma, level_inputs[i].mid_gray)
-                    if usable is not None:
-                        subject_by_group.setdefault(gi, []).append(usable)
-                for i, gi in enumerate(group_idx_by_shot):
-                    members = subject_by_group.get(gi) if gi is not None else None
-                    if members and len(members) >= 2:
-                        level_inputs[i].target_subject_luma = median(members)
+        subject_by_group: Dict[int, List[float]] = {}
+        for i, gi in enumerate(group_idx_by_shot):
+            if gi is None:
+                continue
+            usable = _usable_subject_luma(level_inputs[i].subject_luma, level_inputs[i].mid_gray)
+            if usable is not None:
+                subject_by_group.setdefault(gi, []).append(usable)
+        for i, gi in enumerate(group_idx_by_shot):
+            members = subject_by_group.get(gi) if gi is not None else None
+            if members and len(members) >= 2:
+                level_inputs[i].target_subject_luma = median(members)
 
-            leveling_deltas = solve_leveling(level_inputs)
+        leveling_deltas = solve_leveling(level_inputs)
 
         cube_cache: Dict[str, Optional[str]] = {}
         done = 0
@@ -657,13 +614,7 @@ def run_grade_job(thread_id: str) -> None:
                 s.item, color_stats=stats, sequence_look=sequence_look,
                 balance_delta=balance_deltas.get(s.key),
                 match_delta=match_deltas.get(s.key), leveling_delta=leveling_deltas.get(s.key),
-                pipeline="v1", skin_vibrance=settings.grade_skin_vibrance,
-                tone_contrast=(
-                    settings.grade_tone_contrast_strength
-                    if settings.grade_tone_contrast and settings.grade_pipeline == "v1" else 0.0
-                ),
-                look_engine_enabled=settings.grade_look_engine,
-                film_texture_enabled=settings.grade_film_texture,
+                tone_contrast=0.0,
             )
             gh = grade_json.get("grade_hash")
             if gh not in cube_cache:

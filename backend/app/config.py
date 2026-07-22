@@ -137,69 +137,6 @@ class Settings(BaseSettings):
     # Same cut_record contract both ways -- flip freely per ingest run.
     cuts_segmenter: str = "v3"
 
-    # color_grading_upgrade.plan.md: "legacy" is today's exact inline-resolve
-    # stack (byte-identical output, no background job). "v1" moves grading to
-    # a background job (grade/job.py::run_grade_job) that measures each shot's
-    # OWN span, matches neighbors, and pre-bakes cubes -- layers.resolve then
-    # READS the persisted result instead of computing it. Flip only once
-    # Phase 1's parity tests are green.
-    grade_pipeline: str = "v1"
-    # Phase 2: bounded across-shot exposure/tonal-placement leveling (a smooth
-    # target curve, capped correction). On for frontend validation across all
-    # projects (revert to False to disable).
-    grade_even_lighting: bool = True
-    # Phase 3: subject-aware leveling + semantic scene grouping for matching +
-    # narrative-driven arc. On for frontend validation (revert to False).
-    grade_semantic: bool = True
-
-    # color_shot_matching.plan.md: the two-stage group->balance->match
-    # redesign (graceful RGB grouping fallback + a robust median-member
-    # reference both Balance and Match converge on). Off falls back to the
-    # pre-redesign v1 matching (semantic-or-nothing grouping, no balance,
-    # weaker match strengths) -- a single kill switch for rollback without
-    # a revert.
-    grade_shot_match_v2: bool = True
-
-    # color_scene_grouping.plan.md: join each grade shot's (file_id, span) to
-    # its covering cut_record so real scene metadata (speaker/on_camera/label/
-    # summary + take/sync/voice ids) drives grouping, with an RGB base so
-    # grouping never degrades to all-singletons. Off = today's behavior
-    # (empty metadata -> RGB-adjacency fallback only). v1-only.
-    grade_scene_join: bool = True
-
-    # color_subject_exposure.plan.md: join each grade shot's covering
-    # cut_record's framing.subject_box, measure subject_luma on the hero
-    # frame, and make Leveling converge subjects (not whole-frame mid_gray)
-    # to a common per-group brightness. Off = today's behavior (subject_box
-    # never populated, Leveling always uses whole-frame mid_gray). Respected
-    # only when grade_semantic is also on (the subject signal is semantic).
-    grade_subject_exposure: bool = False
-
-    # color_skin_vibrance.plan.md: skin-anchored tint correction (fairness-safe:
-    # removes only the off-locus green/magenta cast on skin, never targets a
-    # skin tone) + a bounded global saturation floor for flat/desaturated
-    # footage. v1-only; the subject_lab (face-region) skin refinement additionally
-    # requires grade_semantic (it rides the grade_subject_exposure box). Off =
-    # today's WB (gray-world/white-patch) and sat=1.0 exactly.
-    grade_skin_vibrance: bool = False
-
-    # color_tone_contrast.plan.md: adds a filmic contrast S-curve to the v1 tone
-    # map (tone.from_working), baked into the cube so preview == export. Off =
-    # today's shoulder-only tone map (byte-identical). v1-only.
-    grade_tone_contrast: bool = False
-    grade_tone_contrast_strength: float = 0.9   # g = 1 + strength; tune per contact sheet
-
-    # color_response_engine.plan.md: parametric Look engine (mode=="engine") that
-    # bakes a LookSpec into the creative LUT grid. Off = engine looks ignored
-    # (byte-identical; existing preset/reference/lut/no-look paths never change).
-    grade_look_engine: bool = False
-
-    # halation_grain.plan.md: look-scoped spatial film texture (halation
-    # glow + film grain), applied as a soft_local pass on both sides (approximate
-    # parity, like the vignette). Off = no halation/grain keys in soft_local
-    # (byte-identical). Rides engine looks; requires grade_look_engine too.
-    grade_film_texture: bool = False
-
     # migration_runner.plan.md: the startup guard's sanctioned local-dev
     # bypass. "on" (default) means every process refuses to boot on schema
     # drift; "off" disables that check for THIS process only, loudly (a

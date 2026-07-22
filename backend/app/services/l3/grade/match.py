@@ -1,21 +1,10 @@
 """
-Match layer (color_grading.plan.md SS6, Fork D "grade-groups"): deterministic
-clustering of SOURCE FILES by measured color similarity, so footage from the
-same scene/lighting setup grades consistently instead of each file drifting
-independently. Anchor = highest quality in the group; other members get a
-CONSERVATIVE delta nudging their measured color toward the anchor's, never a
-full match (a full match would erase real differences between genuinely
-different shots that just happen to cluster).
-
-Deliberately file-level, not cut-level: `color_stats` (the only numeric,
-non-free-text similarity signal available) is measured per FILE (SS2.2), and
-a continuous single-camera shoot already wants consistent grading across all
-its cuts by construction. This also sidesteps needing a scene-continuity
-signal whose exact shape/reliability this pass hasn't verified -- clustering
-on a signal we fully control and understand beats guessing at one we don't.
-`total_quality` (per-cut, from `cut_records`) is optional and only used to
-break ties in anchor selection when available; clustering itself never needs
-it.
+Match layer (color_grading.plan.md SS6): a NEIGHBOR-based match over each
+shot's own SPAN stats (grade.measure_span) -- two shots only ever match when
+they're ADJACENT in program order (or share a file_id) AND their span-level
+color is close, never a global "these two files happen to look similar"
+cluster (which could drag together two unrelated scenes that just happen to
+share a palette).
 """
 from __future__ import annotations
 
@@ -25,9 +14,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from app.services.l3.grade.cdl import Grade, compose
 from app.services.l3.grade.reference import GroupReference
 from app.services.l3.grade.tone import WORKING_SPACE_V1, to_working_scalar
-
-RGB_DIST_MAX = 0.12       # mean-RGB Euclidean distance (0..1 scale) to group two files
-MATCH_STRENGTH = 0.4      # conservative: nudge 40% of the way toward the anchor, never all the way
 
 
 def _rgb_dist(a: List[float], b: List[float]) -> float:
@@ -39,89 +25,15 @@ def _proj(value: Optional[float], working_space: str) -> Optional[float]:
     Under v1 the composed CDL runs between `to_working` and `from_working`
     (lut_bake.py), so a levels/cast delta solved on raw display span stats
     would be applied to LINEARIZED values and mis-anchor (the same
-    display-vs-linear mismatch that crushed the correct layer). Legacy is
-    identity (no float32 round-trip -> byte-for-byte unchanged). `None` passes
+    display-vs-linear mismatch that crushed the correct layer). `None` passes
     through so the mid-gray nudge's optional-input handling is preserved."""
     if value is None or working_space != WORKING_SPACE_V1:
         return value
     return to_working_scalar(value, None, WORKING_SPACE_V1)
 
 
-def cluster_grade_groups(
-    color_stats_by_file: Dict[str, Dict[str, Any]],
-) -> List[List[str]]:
-    """Greedy single-link clustering of file_ids by `rgb_mean` distance.
-    Deterministic given a stable iteration order (sorted file_ids)."""
-    ids = sorted(f for f, cs in color_stats_by_file.items() if cs and cs.get("rgb_mean"))
-    groups: List[List[str]] = []
-    assigned: Dict[str, int] = {}
-    for fid in ids:
-        rgb = color_stats_by_file[fid]["rgb_mean"]
-        best_group: Optional[int] = None
-        best_dist = RGB_DIST_MAX
-        for gi, members in enumerate(groups):
-            # Compare against the group's centroid (mean of members so far).
-            centroid = [
-                sum(color_stats_by_file[m]["rgb_mean"][c] for m in members) / len(members)
-                for c in range(3)
-            ]
-            d = _rgb_dist(rgb, centroid)
-            if d < best_dist:
-                best_dist = d
-                best_group = gi
-        if best_group is None:
-            groups.append([fid])
-            assigned[fid] = len(groups) - 1
-        else:
-            groups[best_group].append(fid)
-            assigned[fid] = best_group
-    return groups
-
-
-def _quality_for(file_id: str, total_quality_by_file: Dict[str, float]) -> float:
-    return total_quality_by_file.get(file_id, 0.0)
-
-
-def solve_match_deltas(
-    color_stats_by_file: Dict[str, Dict[str, Any]],
-    total_quality_by_file: Optional[Dict[str, float]] = None,
-) -> Dict[str, Grade]:
-    """file_id -> a conservative CDL delta nudging that file's measured color
-    toward its group's anchor (the highest-quality file in a group with 2+
-    members; ties broken by file_id for determinism). The anchor itself
-    always gets identity -- it's what the rest of the group matches TO."""
-    total_quality_by_file = total_quality_by_file or {}
-    groups = cluster_grade_groups(color_stats_by_file)
-    out: Dict[str, Grade] = {}
-
-    for members in groups:
-        if len(members) < 2:
-            continue
-        anchor = max(members, key=lambda f: (_quality_for(f, total_quality_by_file), f))
-        anchor_rgb = color_stats_by_file[anchor]["rgb_mean"]
-        for fid in members:
-            if fid == anchor:
-                continue
-            member_rgb = color_stats_by_file[fid]["rgb_mean"]
-            eps = 1e-6
-            # Per-channel multiplier that would fully match anchor's mean,
-            # damped by MATCH_STRENGTH so it's a nudge, not a replacement.
-            full_slope = [anchor_rgb[c] / max(eps, member_rgb[c]) for c in range(3)]
-            slope = tuple(1.0 + (s - 1.0) * MATCH_STRENGTH for s in full_slope)
-            out[fid] = Grade(slope=slope, offset=(0.0, 0.0, 0.0), power=(1.0, 1.0, 1.0), sat=1.0)
-    return out
-
-
 # --------------------------------------------------------------------------
 # color_grading_upgrade.plan.md Step 1.4: TIMELINE-AWARE sequence matching.
-#
-# Replaces the whole-document, whole-file clustering above (kept for
-# `legacy`) with a NEIGHBOR-based match over each shot's own SPAN stats
-# (grade.measure_span, Step 1.2): two shots only ever match when they're
-# ADJACENT in program order (or share a file_id) AND their span-level color
-# is close -- never a global "these two files happen to look similar"
-# cluster, which is exactly the failure mode this step fixes (it could drag
-# together two unrelated scenes that just happen to share a palette).
 # --------------------------------------------------------------------------
 
 # Same distance family as RGB_DIST_MAX, applied to per-SPAN (not whole-file)
@@ -212,11 +124,14 @@ def solve_sequence_match(
     working_space: str = "rec709", references: Optional[Dict[int, GroupReference]] = None,
 ) -> Dict[str, Grade]:
     """shot_key -> a conservative CDL delta nudging that shot's SPAN-measured
-    color toward its neighbor-group's anchor (the highest-quality span in a
-    run of 2+ adjacent/same-file shots; ties broken by `key`). The anchor
-    itself gets no delta. Percentile-based (black/white/mid-gray placement)
-    PLUS a damped per-channel cast nudge, composed -- see module docstring
-    for why grouping is neighbor-only, not global clustering.
+    color toward its group's robust reference. EVERY member gets a delta (no
+    distinguished "anchor" member is exempt). Percentile-based (black/white/
+    mid-gray placement) PLUS a damped per-channel cast nudge, composed -- see
+    module docstring for why grouping is neighbor-only, not global
+    clustering. A group with no entry in `references` (color_shot_matching.
+    plan.md Phase 3 -- `run_grade_job` builds one per group via
+    `grade.reference.compute_group_reference`) is skipped: nothing to match
+    its members toward.
 
     `groups` (color_grading_upgrade.plan.md Step 3.2, optional): a
     pre-computed grouping (`grade.scene_group.group_shots_semantically`) to
@@ -229,42 +144,28 @@ def solve_sequence_match(
     time. GROUPING stays in display space (a perceptual "same scene?" gate,
     unchanged by this arg), but the slope/offset/cast DELTAS are solved on
     working-space-projected span stats so they anchor correctly through the
-    v1 bake wrapper (see `_proj`). Legacy default solves in display space.
+    v1 bake wrapper (see `_proj`).
 
-    `references` (color_shot_matching.plan.md Phase 3, optional): group-index
-    -> a robust `GroupReference` (DISPLAY-space, same as `_proj` expects --
-    see job.py's comment on building two references per group to avoid
-    double-projection) to match EVERY member toward, replacing the
-    single-shot `max(quality, key)` anchor -- and replacing "the anchor is
-    exempt" with "every member gets a delta," since there's no longer a
-    distinguished member. `None` (default) reproduces today's anchor-based
-    behavior exactly, byte-for-byte -- only `run_grade_job` (v1, when
-    `settings.grade_shot_match_v2`) passes `references`."""
+    `references`: group-index -> a robust `GroupReference` (DISPLAY-space,
+    same as `_proj` expects -- see job.py's comment on building two
+    references per group to avoid double-projection) to match EVERY member
+    toward. `run_grade_job` always builds and passes one per real (2+
+    member) group."""
     out: Dict[str, Grade] = {}
+    references = references or {}
     for gi, idxs in enumerate(groups if groups is not None else group_neighbors(ordered_shots)):
         if len(idxs) < 2:
             continue
+        ref = references.get(gi)
+        if ref is None:
+            continue
         members = [ordered_shots[i] for i in idxs]
-        ref = (references or {}).get(gi)
-        if ref is not None:
-            a_black = _proj(float(ref.black_point), working_space)
-            a_white = _proj(float(ref.white_point), working_space)
-            a_mid = _proj(float(ref.mid_gray), working_space)
-            a_rgb = [_proj(float(c), working_space) for c in ref.rgb_mean]
-            anchor_key = None   # no member is "the anchor" -- every member matches the reference
-        else:
-            anchor = max(members, key=lambda s: (s.quality, s.key))
-            a = anchor.stats or {}
-            a_black = _proj(float(a.get("black_point") if a.get("black_point") is not None else 0.0), working_space)
-            a_white = _proj(float(a.get("white_point") if a.get("white_point") is not None else 1.0), working_space)
-            a_mid = a.get("mid_gray")
-            a_mid = _proj(float(a_mid), working_space) if a_mid is not None else None
-            a_rgb = [_proj(float(c), working_space) for c in (a.get("rgb_mean") or [0.5, 0.5, 0.5])]
-            anchor_key = anchor.key
+        a_black = _proj(float(ref.black_point), working_space)
+        a_white = _proj(float(ref.white_point), working_space)
+        a_mid = _proj(float(ref.mid_gray), working_space)
+        a_rgb = [_proj(float(c), working_space) for c in ref.rgb_mean]
 
         for s in members:
-            if anchor_key is not None and s.key == anchor_key:
-                continue
             m = s.stats or {}
             m_black = _proj(float(m.get("black_point") if m.get("black_point") is not None else 0.0), working_space)
             m_white = _proj(float(m.get("white_point") if m.get("white_point") is not None else 1.0), working_space)

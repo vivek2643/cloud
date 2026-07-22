@@ -26,7 +26,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from app.auth import get_current_user_id
-from app.config import get_settings
 from app.services.l3 import auto_edit
 from app.services.l3 import store
 from app.services.l3.grade.cdl import Grade
@@ -160,18 +159,18 @@ def _owned_thread(thread_id: str, user_id: str) -> dict:
 def get_thread(thread_id: str, user_id: str = Depends(get_current_user_id)):
     thread = _owned_thread(thread_id, user_id)
     document, version = store.latest_document(thread_id)
-    # Under v1, grades are async (run_grade_job) and read from resolved_grades.
-    # The stored `resolved` is a snapshot from the last save -- if a grade job
-    # has since finished (e.g. the look change that triggered this refetch), the
-    # snapshot's grades are stale. Re-resolve so the client's refetch-on-done
-    # actually reflects the job's output (resolve_document recomputes grades from
-    # the freshest persisted rows under v1; a no-op under legacy).
-    if document and get_settings().grade_pipeline == "v1":
+    # Grades are async (run_grade_job) and read from resolved_grades. The
+    # stored `resolved` is a snapshot from the last save -- if a grade job
+    # has since finished (e.g. the look change that triggered this refetch),
+    # the snapshot's grades are stale. Re-resolve so the client's
+    # refetch-on-done actually reflects the job's output (resolve_document
+    # recomputes grades from the freshest persisted rows).
+    if document:
         try:
             from app.services.render.tasks import resolve_document
             document = {**document, "resolved": resolve_document(document, thread_id=thread_id)}
         except Exception:
-            logger.exception("get_thread: v1 grade re-resolve failed for %s (serving stored)", thread_id)
+            logger.exception("get_thread: grade re-resolve failed for %s (serving stored)", thread_id)
     return {
         **thread,
         "document": document,

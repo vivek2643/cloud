@@ -95,76 +95,89 @@ function loadImage(src: string): Promise<HTMLImageElement> {
 }
 
 /** Lazily builds the ONE shared context/program/textures, loading the
- * reference still once. Returns null (never throws) on any failure -- no
+ * reference still once. Resolves null (never throws) on any failure -- no
  * WebGL2, shader compile error, or image load error -- so callers fail
- * open into the flat-swatch fallback. */
+ * open into the flat-swatch fallback.
+ *
+ * grade_pipeline_standardize.plan.md Part B: a `null` outcome is NEVER
+ * cached on `rendererPromise` -- only a successful `Renderer` is. If the
+ * FIRST call ever fails (e.g. the reference still hadn't landed yet behind
+ * a stale dev-server 404, or a transient WebGL context hiccup), earlier code
+ * cached that `null` on the shared promise for the rest of the page session,
+ * so every card fell into the flat-swatch fallback forever, even once the
+ * underlying cause was gone -- a hard reload was the only fix. Clearing the
+ * promise on failure lets the NEXT call retry from scratch instead. */
 async function getRenderer(): Promise<Renderer | null> {
   if (!rendererPromise) {
-    rendererPromise = (async () => {
-      const canvas = document.createElement("canvas");
-      canvas.width = THUMB_W;
-      canvas.height = THUMB_H;
-      const gl = canvas.getContext("webgl2", { premultipliedAlpha: false, antialias: false });
-      if (!gl) return null;
-
-      const vs = compileShader(gl, gl.VERTEX_SHADER, VERTEX_SRC);
-      const fs = compileShader(gl, gl.FRAGMENT_SHADER, FRAGMENT_SRC);
-      if (!vs || !fs) return null;
-      const program = gl.createProgram();
-      if (!program) return null;
-      gl.attachShader(program, vs);
-      gl.attachShader(program, fs);
-      gl.linkProgram(program);
-      gl.deleteShader(vs);
-      gl.deleteShader(fs);
-      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return null;
-
-      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-
-      const quad = gl.createBuffer();
-      gl.bindBuffer(gl.ARRAY_BUFFER, quad);
-      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, -1, 1, 1, -1, 1]), gl.STATIC_DRAW);
-      const aPos = gl.getAttribLocation(program, "aPos");
-      gl.enableVertexAttribArray(aPos);
-      gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
-
-      let image: HTMLImageElement;
-      try {
-        image = await loadImage(REF_IMAGE_SRC);
-      } catch {
-        return null;
-      }
-
-      const imageTex = gl.createTexture();
-      if (!imageTex) return null;
-      gl.bindTexture(gl.TEXTURE_2D, imageTex);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      // Screen-space v=0 at top matches this image's natural (un-flipped)
-      // orientation -- no video-style flip needed for a still <img>.
-      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, image);
-
-      const lutTex = gl.createTexture();
-      if (!lutTex) return null;
-      gl.bindTexture(gl.TEXTURE_3D, lutTex);
-      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
-
-      return {
-        gl, canvas, program,
-        uImage: gl.getUniformLocation(program, "uImage"),
-        uLut: gl.getUniformLocation(program, "uLut"),
-        imageTex, lutTex,
-      };
-    })();
+    rendererPromise = buildRenderer();
   }
-  return rendererPromise;
+  const renderer = await rendererPromise;
+  if (!renderer) rendererPromise = null;
+  return renderer;
+}
+
+async function buildRenderer(): Promise<Renderer | null> {
+  const canvas = document.createElement("canvas");
+  canvas.width = THUMB_W;
+  canvas.height = THUMB_H;
+  const gl = canvas.getContext("webgl2", { premultipliedAlpha: false, antialias: false });
+  if (!gl) return null;
+
+  const vs = compileShader(gl, gl.VERTEX_SHADER, VERTEX_SRC);
+  const fs = compileShader(gl, gl.FRAGMENT_SHADER, FRAGMENT_SRC);
+  if (!vs || !fs) return null;
+  const program = gl.createProgram();
+  if (!program) return null;
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+  gl.linkProgram(program);
+  gl.deleteShader(vs);
+  gl.deleteShader(fs);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return null;
+
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+
+  const quad = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, -1, 1, 1, -1, 1]), gl.STATIC_DRAW);
+  const aPos = gl.getAttribLocation(program, "aPos");
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+  let image: HTMLImageElement;
+  try {
+    image = await loadImage(REF_IMAGE_SRC);
+  } catch {
+    return null;
+  }
+
+  const imageTex = gl.createTexture();
+  if (!imageTex) return null;
+  gl.bindTexture(gl.TEXTURE_2D, imageTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  // Screen-space v=0 at top matches this image's natural (un-flipped)
+  // orientation -- no video-style flip needed for a still <img>.
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, image);
+
+  const lutTex = gl.createTexture();
+  if (!lutTex) return null;
+  gl.bindTexture(gl.TEXTURE_3D, lutTex);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+
+  return {
+    gl, canvas, program,
+    uImage: gl.getUniformLocation(program, "uImage"),
+    uLut: gl.getUniformLocation(program, "uLut"),
+    imageTex, lutTex,
+  };
 }
 
 function synthGrade(lookParams: Record<string, unknown>): ResolvedGrade {

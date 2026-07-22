@@ -62,9 +62,9 @@ def _resolve_captions(document: Dict[str, Any], resolved: Dict[str, Any]) -> Lis
 
 
 def _grade_lookup_for(thread_id: Optional[str], document: Dict[str, Any]) -> Dict[str, dict]:
-    """color_grading_upgrade.plan.md Step 1.0: under `grade_pipeline=="v1"`,
-    pre-fetch every gradeable shot's freshest persisted grade so
-    `layers.resolve` can just read (never compute). Empty (and therefore a
+    """color_grading_upgrade.plan.md Step 1.0: pre-fetch every gradeable
+    shot's freshest persisted grade so `layers.resolve` can just read (never
+    compute). Empty (and therefore a
     plain identity fallback inside `layers.resolve`) when there's no
     thread_id to key off of, or the lookup itself fails -- never blocks a
     render/resolve on the grade store being reachable."""
@@ -82,23 +82,19 @@ def _grade_lookup_for(thread_id: Optional[str], document: Dict[str, Any]) -> Dic
 def resolve_document(document: Dict[str, Any], thread_id: Optional[str] = None) -> Dict[str, Any]:
     """The resolved layer set for a document. Prefer the snapshot the agent
     persisted; otherwise recompute deterministically from spine + operations.
-    `thread_id` (Step 1.0) is only needed for the recompute path under `v1`
-    -- the persisted-snapshot fast path already baked the right grades in at
+    `thread_id` (Step 1.0) is needed for the recompute path's grade lookup --
+    the persisted-snapshot fast path already baked the right grades in at
     save time."""
-    grade_pipeline = get_settings().grade_pipeline
     res = document.get("resolved")
-    # Under `v1`, grades are produced ASYNCHRONOUSLY by run_grade_job and read
-    # from resolved_grades at resolve time -- so a persisted snapshot's baked
+    # Grades are produced ASYNCHRONOUSLY by run_grade_job and read from
+    # resolved_grades at resolve time -- so a persisted snapshot's baked
     # grades go stale the instant a grade job re-runs (e.g. a look change).
-    # Never serve the snapshot's grades under v1: recompute from
-    # timeline+operations (cheap -- grade resolution is a DB lookup, NO frame
-    # measurement, which only happens inside the job) so a completed grade job
-    # actually surfaces in preview/render. `legacy` keeps the snapshot fast path
-    # (its grades ARE baked in at save time), so its bytes are unchanged.
+    # Never serve the snapshot's grades: recompute from timeline+operations
+    # (cheap -- grade resolution is a DB lookup, NO frame measurement, which
+    # only happens inside the job) so a completed grade job actually surfaces
+    # in preview/render.
     can_recompute = bool(document.get("timeline") or document.get("operations"))
-    use_snapshot = isinstance(res, dict) and (res.get("video_layers") or res.get("audio_layers"))
-    if grade_pipeline == "v1" and can_recompute:
-        use_snapshot = False
+    use_snapshot = isinstance(res, dict) and (res.get("video_layers") or res.get("audio_layers")) and not can_recompute
     if use_snapshot:
         # Snapshots predating the format field carry no aspect; backfill it from
         # the document so the render uses the declared delivery shape.
@@ -110,23 +106,17 @@ def resolve_document(document: Dict[str, Any], thread_id: Optional[str] = None) 
             res["captions"] = _resolve_captions(document, res)
         return res
     timeline = document.get("timeline") or []
-    fids = list({s["file_id"] for s in timeline})
-    color_stats: Dict[str, dict] = {}
-    try:
-        from app.services.l3.grade.measure import fetch_color_stats
-        color_stats = fetch_color_stats(fids)
-    except Exception:
-        logger.exception("resolve_document: color_stats lookup failed (continuing)")
     audio_routes = _resolve_audio_routes(timeline)
+    fids = list({s["file_id"] for s in timeline})
     # A synced group's authoritative source may be a file that's never itself
     # a spine angle (e.g. a dedicated external mic) -- durations must cover
     # it too so `_apply_split_edits`'s clamp has real footage room to work
     # with (audio_sync.plan.md SS8).
     route_fids = {r["source_file_id"] for r in audio_routes.values()}
-    grade_lookup = _grade_lookup_for(thread_id, document) if grade_pipeline == "v1" else {}
+    grade_lookup = _grade_lookup_for(thread_id, document)
     resolved = layers.resolve(
-        document, _durations(list(set(fids) | route_fids)), color_stats, audio_routes,
-        grade_pipeline=grade_pipeline, grade_lookup=grade_lookup,
+        document, _durations(list(set(fids) | route_fids)), audio_routes=audio_routes,
+        grade_lookup=grade_lookup,
     ).to_dict()
     resolved["captions"] = _resolve_captions(document, resolved)
     return resolved

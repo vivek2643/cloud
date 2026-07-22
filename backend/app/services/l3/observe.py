@@ -226,13 +226,11 @@ def resolve_doc(document: dict, ctx: EditContext) -> dict:
         framing.annotate_document(document)
     except Exception:
         logger.exception("observe: framing annotation failed (continuing)")
-    # color_grading_upgrade.plan.md Step 1.0: under `v1`, read every shot's
-    # freshest persisted grade instead of computing inline (graceful fallback
-    # to identity for a shot the background job hasn't produced yet).
-    from app.config import get_settings
-    grade_pipeline = get_settings().grade_pipeline
+    # color_grading_upgrade.plan.md Step 1.0: read every shot's freshest
+    # persisted grade instead of computing inline (graceful fallback to
+    # identity for a shot the background job hasn't produced yet).
     grade_lookup: Dict[str, dict] = {}
-    if grade_pipeline == "v1" and ctx.thread_id:
+    if ctx.thread_id:
         try:
             from app.services.l3.grade.job import fetch_latest_grades, ordered_shots
             shot_keys = [s.key for s in ordered_shots(document)]
@@ -240,8 +238,7 @@ def resolve_doc(document: dict, ctx: EditContext) -> dict:
         except Exception:
             logger.exception("resolve_doc: grade lookup failed for thread %s (continuing)", ctx.thread_id)
     document["resolved"] = layers.resolve(
-        document, ctx.durations, ctx.color_stats,
-        grade_pipeline=grade_pipeline, grade_lookup=grade_lookup,
+        document, ctx.durations, ctx.color_stats, grade_lookup=grade_lookup,
     ).to_dict()
     return document
 

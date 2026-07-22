@@ -1,9 +1,8 @@
 """
 Leveling layer (color_grading_upgrade.plan.md Phase 2, bounded photometric
 leveling -- Step 2.1/2.2; Step 3.1 extends it to subject-aware exposure).
-Composed as a new stage BETWEEN Match and Look in `resolver.py`, gated
-entirely on `settings.grade_even_lighting`; runs INSIDE `run_grade_job`
-(Step 1.0), never inline.
+Composed as a new stage BETWEEN Match and Look in `resolver.py`; runs
+INSIDE `run_grade_job` (Step 1.0), never inline.
 
 Two generic-safe ideas, both a SMOOTH-TARGET + BOUNDED-GAIN pattern:
   * `solve_exposure_leveling` (2.1): nudge each shot's exposure (subject

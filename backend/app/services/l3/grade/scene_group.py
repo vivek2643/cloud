@@ -7,8 +7,9 @@ RGB drifted for an incidental reason (a bright object entering frame, a
 light flicker).
 
 Feeds `grade.match.solve_sequence_match`'s optional `groups` param, taking
-over from its default RGB-based `group_neighbors` when semantic signals are
-available (`settings.grade_semantic`).
+over from its default RGB-based `group_neighbors` -- `grade.job.
+run_grade_job` always computes this grouping and falls back to
+`group_neighbors` only when the semantic result is all-singletons.
 
 Signals used, most-to-least trusted (color_scene_grouping.plan.md extended
 this beyond the original 3 -- see that plan's DB-verified population rates:

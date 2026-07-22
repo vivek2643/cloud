@@ -223,7 +223,7 @@ def test_v1_grade_does_not_crush_midtones_or_shadows():
     solve crushed the 0.15 shadow to 0.0 and the fix lands it near ~0.15.)
     Thresholds are loose/generic on purpose."""
     cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
-    g_dict = resolve_clip_grade({}, color_stats=cs, pipeline="v1")
+    g_dict = resolve_clip_grade({}, color_stats=cs)
     cdl = Grade.from_dict(g_dict["cdl"])
 
     mid_out = _roundtrip_v1(0.5, cdl)
@@ -338,18 +338,6 @@ def test_v1_composite_offset_floor_respects_power():
     print("ok  resolver: the shadow floor respects per-channel power, not just slope/offset")
 
 
-def test_v1_composite_offset_floor_is_v1_only_legacy_untouched():
-    """_clamp_composite_v1 is only ever called for pipeline=='v1' in
-    resolve_clip_grade -- legacy output is byte-for-byte unaffected by this
-    fix, same guarantee as every other v1-only composite guardrail."""
-    cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
-    legacy = resolve_clip_grade({}, color_stats=cs)
-    legacy_explicit = resolve_clip_grade({}, color_stats=cs, pipeline="legacy")
-    assert legacy == legacy_explicit
-    assert legacy["working_space"] == "rec709"
-    print("ok  resolver: the shadow-floor fix never touches the legacy pipeline")
-
-
 # --------------------------------------------------------------------------
 # Step 1.4: match.py solve_sequence_match (neighbor-only)
 # --------------------------------------------------------------------------
@@ -365,9 +353,11 @@ def test_match_two_camera_interview_matches_across_the_cut():
     ]
     groups = group_neighbors(shots)
     assert groups == [[0, 1]], groups
-    deltas = solve_sequence_match(shots)
-    assert "s1" not in deltas   # s1 is the anchor (higher quality)
-    assert "s0" in deltas and deltas["s0"].slope != (1.0, 1.0, 1.0)
+    ref = compute_group_reference([s.stats for s in shots])
+    deltas = solve_sequence_match(shots, references={0: ref})
+    # grade_pipeline_standardize.plan.md: no member is exempt as "the
+    # anchor" -- every member converges toward the group's reference.
+    assert "s0" in deltas and "s1" in deltas, deltas
     print("ok  match: a two-camera interview matches across the cut")
 
 
@@ -394,8 +384,9 @@ def test_match_same_file_always_groups_regardless_of_rgb():
                                                  "mid_gray": 0.5, "rgb_mean": [0.1, 0.9, 0.1]}, quality=0.1),
     ]
     assert group_neighbors(shots) == [[0, 1]]
-    deltas = solve_sequence_match(shots)
-    assert "b" in deltas   # 'a' (higher quality) is anchor; 'b' gets nudged despite being far in RGB
+    ref = compute_group_reference([s.stats for s in shots])
+    deltas = solve_sequence_match(shots, references={0: ref})
+    assert "a" in deltas and "b" in deltas   # both converge, despite being far apart in RGB
     print("ok  match: adjacent same-file shots always group, regardless of RGB distance")
 
 
@@ -403,34 +394,28 @@ def test_match_same_file_always_groups_regardless_of_rgb():
 # Step 1.5/1.1/1.3/1.7: resolver.py pipeline plumbing
 # --------------------------------------------------------------------------
 
-def test_resolver_legacy_default_working_space_unchanged():
-    g = resolve_clip_grade({}, color_stats=None)
-    assert g["working_space"] == "rec709", g["working_space"]
-    print("ok  resolver: legacy default working_space is unchanged ('rec709')")
-
-
 def test_resolver_v1_sets_v1_working_space():
-    g = resolve_clip_grade({}, color_stats=None, pipeline="v1")
+    g = resolve_clip_grade({}, color_stats=None)
     assert g["working_space"] == tone.WORKING_SPACE_V1, g["working_space"]
-    print("ok  resolver: pipeline='v1' selects the v1 working space")
+    print("ok  resolver: default working_space is the v1 working space")
 
 
 def test_resolver_explicit_working_space_overrides_pipeline_default():
-    g = resolve_clip_grade({"working_space": "custom_space"}, color_stats=None, pipeline="v1")
+    g = resolve_clip_grade({"working_space": "custom_space"}, color_stats=None)
     assert g["working_space"] == "custom_space", g["working_space"]
-    print("ok  resolver: an item's explicit working_space wins over the pipeline default")
+    print("ok  resolver: an item's explicit working_space wins over the default")
 
 
 def test_resolver_reference_transfer_v1_does_not_crash_or_blow_up():
-    """Step 1.5: dropping a reference under v1 still composes without
-    double-stretching into an extreme grade."""
+    """Step 1.5: dropping a reference still composes without double-
+    stretching into an extreme grade."""
     color_stats = _cs(rgb_mean=[0.3, 0.3, 0.3], rgb_std=[0.15, 0.15, 0.15])
     sequence_look = {
         "mode": "reference",
         "reference_stats": {"rgb_mean": [0.6, 0.5, 0.4], "rgb_std": [0.2, 0.2, 0.2]},
         "match_strength": 0.6,
     }
-    g_dict = resolve_clip_grade({}, color_stats=color_stats, sequence_look=sequence_look, pipeline="v1")
+    g_dict = resolve_clip_grade({}, color_stats=color_stats, sequence_look=sequence_look)
     cdl = Grade.from_dict(g_dict["cdl"])
     for s in cdl.slope:
         assert 0.3 < s < 3.0, cdl.slope   # bounded, not blown out
@@ -474,32 +459,32 @@ def test_one_grade_per_shot_no_intra_shot_variance():
 
 
 # --------------------------------------------------------------------------
-# Step 1.0: layers.py's v1 read-path (grade_lookup)
+# Step 1.0: layers.py's read-path (grade_lookup)
 # --------------------------------------------------------------------------
 
 def _doc_one_seg():
     return {"timeline": [{"seg_id": "s0", "file_id": "f1", "in_ms": 0, "out_ms": 2000}], "operations": []}
 
 
-def test_layers_legacy_default_is_byte_identical_to_before():
-    """Calling resolve() with NO grade_pipeline/grade_lookup args (every
-    existing caller) must produce the exact same grade resolve_clip_grade
-    would inline -- the core 'legacy reproduces today's bytes' contract."""
+def test_layers_no_grade_lookup_falls_back_to_identity():
+    """Calling resolve() with NO grade_lookup arg (every caller that hasn't
+    fetched one) must render identity -- layers.resolve never computes a
+    grade inline; grading happens exclusively in run_grade_job."""
     doc = _doc_one_seg()
     cs = {"f1": _cs(rgb_mean=[0.4, 0.5, 0.6])}
     resolved = layers.resolve(doc, {}, cs)
-    expected = resolve_clip_grade(doc["timeline"][0], color_stats=cs["f1"], sequence_look=None, match_delta=None)
-    assert resolved.video_layers[0].grade == expected
-    print("ok  layers: default resolve() call is byte-identical to inline resolve_clip_grade")
+    cdl = Grade.from_dict(resolved.video_layers[0].grade["cdl"])
+    assert cdl == Grade(), cdl
+    print("ok  layers: no grade_lookup -> identity (never computes inline)")
 
 
 def test_layers_v1_reads_grade_lookup_hit():
     doc = _doc_one_seg()
     fake_grade = identity_grade_json(tone.WORKING_SPACE_V1)
     fake_grade["cdl"] = Grade(slope=(1.3, 1.0, 1.0)).to_dict()   # a distinctive, obviously-not-computed value
-    resolved = layers.resolve(doc, {}, {}, grade_pipeline="v1", grade_lookup={"s0": fake_grade})
+    resolved = layers.resolve(doc, {}, {}, grade_lookup={"s0": fake_grade})
     assert resolved.video_layers[0].grade == fake_grade
-    print("ok  layers: v1 reads the pre-fetched grade_lookup hit verbatim (never recomputes)")
+    print("ok  layers: reads the pre-fetched grade_lookup hit verbatim (never recomputes)")
 
 
 def test_layers_v1_falls_back_to_identity_on_miss():
@@ -508,10 +493,40 @@ def test_layers_v1_falls_back_to_identity_on_miss():
     computation -- preview stays responsive while the job catches up."""
     doc = _doc_one_seg()
     cs = {"f1": _cs(rgb_mean=[0.9, 0.1, 0.1])}   # would normally correct heavily
-    resolved = layers.resolve(doc, {}, cs, grade_pipeline="v1", grade_lookup={})
+    resolved = layers.resolve(doc, {}, cs, grade_lookup={})
     cdl = Grade.from_dict(resolved.video_layers[0].grade["cdl"])
-    assert cdl == Grade(), cdl   # identity -- color_stats is NOT used to compute anything under v1
-    print("ok  layers: v1 falls back to identity (never computes inline) when grade_lookup misses")
+    assert cdl == Grade(), cdl   # identity -- color_stats is NOT used to compute anything
+    print("ok  layers: falls back to identity (never computes inline) when grade_lookup misses")
+
+
+def test_layers_split_screen_region_preserves_spine_grade():
+    """Regression (found live while verifying grade_pipeline_standardize.plan.md
+    against a real split-screen thread): a layout_region with a "spine" cell
+    slices the spine's video layers via _slice_video (layers.py::
+    _dest_spine_window/_apply_layout_regions) to stamp the split-screen dest
+    rect -- _slice_video was dropping `.grade` entirely (defaulted to `{}`,
+    the dataclass field default), so every split-screen document silently
+    rendered its spine ungraded. The sliced layer(s) must carry the SAME
+    grade the un-sliced layer had."""
+    doc = {
+        "timeline": [{"seg_id": "s0", "file_id": "f1", "in_ms": 0, "out_ms": 4000}],
+        "operations": [{
+            "type": "place_video", "op_id": "op0", "source_file_id": "f2",
+            "src_in_ms": 0, "src_out_ms": 4000, "from_ms": 0, "to_ms": 4000,
+        }],
+        "layout_regions": [{
+            "region_id": "lr0", "template": "split_h", "from_ms": 0, "to_ms": 4000,
+            "cells": {"left": {"layer": "spine"}, "right": {"layer": "op0"}},
+        }],
+    }
+    fake_grade = identity_grade_json(tone.WORKING_SPACE_V1)
+    fake_grade["cdl"] = Grade(slope=(1.3, 1.0, 1.0)).to_dict()
+    resolved = layers.resolve(doc, {}, {}, grade_lookup={"s0": fake_grade, "op0": fake_grade})
+    spine_layers = [v for v in resolved.video_layers if v.kind == "spine"]
+    assert spine_layers, "the region must actually slice at least one spine layer"
+    for v in spine_layers:
+        assert v.grade == fake_grade, (v.layer_id, v.grade)
+    print("ok  layers: a split-screen layout_region's sliced spine layers keep their grade")
 
 
 # --------------------------------------------------------------------------
@@ -816,7 +831,8 @@ def test_scene_group_overrides_rgb_grouping_in_solve_sequence_match():
                         "rgb_mean": [0.1, 0.9, 0.1]}, quality=0.8),
     ]
     assert solve_sequence_match(shots) == {}, "RGB-only grouping should NOT match these"
-    forced = solve_sequence_match(shots, groups=[[0, 1]])
+    ref = compute_group_reference([s.stats for s in shots])
+    forced = solve_sequence_match(shots, groups=[[0, 1]], references={0: ref})
     assert "s0" in forced, "semantic groups must override the default RGB grouping"
     print("ok  scene_group: semantic groups align a same-setup pair RGB alone would miss")
 
@@ -1018,31 +1034,11 @@ def test_balance_lifts_capped_dull_shot_and_survives_composite_slope_clamp():
          f"slope clamp (0.20 -> {mid_after:.3f})")
 
 
-def test_shot_match_references_none_reproduces_legacy_anchor_behavior():
-    """references=None (the default, and the ONLY path legacy/pre-redesign
-    callers ever exercise) must reproduce today's single-anchor behavior
-    byte-for-byte -- guards the default-path/rollback guarantee."""
-    shots = [
-        ShotStats(key="s0", file_id="camA",
-                  stats={"black_point": 0.02, "white_point": 0.9, "mid_gray": 0.35,
-                        "rgb_mean": [0.5, 0.48, 0.46]}, quality=0.5),
-        ShotStats(key="s1", file_id="camB",
-                  stats={"black_point": 0.05, "white_point": 0.8, "mid_gray": 0.3,
-                        "rgb_mean": [0.46, 0.47, 0.5]}, quality=0.8),
-    ]
-    without_references = solve_sequence_match(shots)
-    without_references_explicit_none = solve_sequence_match(shots, references=None)
-    assert without_references == without_references_explicit_none
-    # s1 (higher quality) is the anchor -- exempt, matching Step 1.4's existing test.
-    assert "s1" not in without_references and "s0" in without_references
-    print("ok  shot_match: references=None reproduces the anchor-based legacy behavior exactly")
-
-
 def test_shot_match_references_override_matches_every_member_not_just_anchor():
     """An explicit `references` override matches EVERY member toward the
-    reference (no member is exempt as "the anchor") -- the opposite of the
-    references=None path, where exactly one member (the anchor) is
-    exempt."""
+    reference -- no member is exempt as "the anchor" (grade_pipeline_
+    standardize.plan.md: the only path since the anchor fallback was
+    removed)."""
     shots = [
         ShotStats(key="s0", file_id="camA",
                   stats={"black_point": 0.02, "white_point": 0.9, "mid_gray": 0.35,
@@ -1055,57 +1051,9 @@ def test_shot_match_references_override_matches_every_member_not_just_anchor():
     forced = solve_sequence_match(shots, references={0: ref})
     assert "s0" in forced and "s1" in forced, forced   # no member exempt
 
-    default = solve_sequence_match(shots)
-    assert len(default) == 1   # exactly one member (the anchor) exempt, today's behavior
+    no_references = solve_sequence_match(shots)
+    assert no_references == {}   # no reference for the group -> skipped, not an anchor fallback
     print("ok  shot_match: an explicit reference matches every member, none exempt as 'the anchor'")
-
-
-def test_run_grade_job_shot_match_v2_off_reproduces_pre_redesign_path():
-    """The kill switch (grade_shot_match_v2=False): run_grade_job must not
-    crash and must skip Balance entirely, falling back to the exact
-    pre-redesign v1 matching call (semantic-or-nothing grouping, no RGB
-    fallback, no references)."""
-    doc = {
-        "timeline": [
-            {"seg_id": "s0", "file_id": "f0", "in_ms": 0, "out_ms": 1000},
-            {"seg_id": "s1", "file_id": "f1", "in_ms": 0, "out_ms": 1000},
-        ],
-        "operations": [], "look": {},
-    }
-
-    def fake_measure_span(file_id, in_ms, out_ms, *, hero_ts_ms=None, subject_box=None):
-        return _cs(rgb_mean=[0.9, 0.1, 0.1] if file_id == "f0" else [0.1, 0.9, 0.1], mid_gray=0.3)
-
-    rows = {}
-    fake_settings = mock.Mock(
-        grade_pipeline="v1", grade_even_lighting=False, grade_semantic=False, grade_shot_match_v2=False,
-        grade_skin_vibrance=False,
-        grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
-        grade_look_engine=False,
-        grade_film_texture=False,
-    )
-    with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
-         mock.patch("app.services.l3.grade.job._upsert_job_status"), \
-         mock.patch("app.services.l3.grade.job._upsert_grade_row",
-                    side_effect=lambda tid, key, h, gj, cube: rows.__setitem__(key, gj)), \
-         mock.patch("app.services.l3.grade.job.fetch_color_stats", return_value={}), \
-         mock.patch("app.services.l3.grade.job.measure_span", side_effect=fake_measure_span), \
-         mock.patch("app.services.l3.grade.job.ensure_cube_file", return_value=None), \
-         mock.patch("app.services.l3.grade.job.get_settings", return_value=fake_settings), \
-         mock.patch("app.services.l3.store.latest_document", return_value=(doc, 1), create=True):
-        grade_job.run_grade_job("thread-kill-switch")   # must not raise
-
-    assert set(rows) == {"s0", "s1"}
-    # two different files, RGB-far apart, no semantic metadata -> the
-    # pre-redesign path's default RGB grouping (group_neighbors, inside
-    # solve_sequence_match) does NOT chain them -> no Match/Balance
-    # contribution for either shot. Both have identical measured stats
-    # (same black/white/mid_gray, only rgb_mean differs, and WB is neutral
-    # gray-world here) so Correct alone produces the SAME grade for both --
-    # any difference between them would mean grouping fired when it must not.
-    assert rows["s0"]["cdl"] == rows["s1"]["cdl"], (rows["s0"]["cdl"], rows["s1"]["cdl"])
-    assert Grade.from_dict(rows["s0"]["cdl"]) != Grade()   # Correct itself is NOT identity here
-    print("ok  job: grade_shot_match_v2=False reproduces the pre-redesign no-fallback matching path")
 
 
 # --------------------------------------------------------------------------
@@ -1213,14 +1161,6 @@ def test_run_grade_job_groups_multi_file_reel_via_scene_join():
         # s2 has no covering cut_record -- absent from the join result
     }
     rows = {}
-    fake_settings = mock.Mock(
-        grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
-        grade_shot_match_v2=True, grade_scene_join=True, grade_subject_exposure=False,
-        grade_skin_vibrance=False,
-        grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
-        grade_look_engine=False,
-        grade_film_texture=False,
-    )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
          mock.patch("app.services.l3.grade.job._upsert_grade_row",
@@ -1228,7 +1168,6 @@ def test_run_grade_job_groups_multi_file_reel_via_scene_join():
          mock.patch("app.services.l3.grade.job.fetch_color_stats", return_value={}), \
          mock.patch("app.services.l3.grade.job.measure_span", side_effect=fake_measure_span), \
          mock.patch("app.services.l3.grade.job.ensure_cube_file", return_value=None), \
-         mock.patch("app.services.l3.grade.job.get_settings", return_value=fake_settings), \
          mock.patch("app.services.l3.grade.scene_meta.lookup_shot_cut_meta", return_value=joined), \
          mock.patch("app.services.l3.store.latest_document", return_value=(doc, 1), create=True):
         grade_job.run_grade_job("thread-scene-join")
@@ -1257,14 +1196,6 @@ def test_run_grade_job_scene_join_does_not_over_group_unrelated_shots():
                "rgb_std": [0.1, 0.1, 0.1]}
 
     rows = {}
-    fake_settings = mock.Mock(
-        grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
-        grade_shot_match_v2=True, grade_scene_join=True, grade_subject_exposure=False,
-        grade_skin_vibrance=False,
-        grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
-        grade_look_engine=False,
-        grade_film_texture=False,
-    )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
          mock.patch("app.services.l3.grade.job._upsert_grade_row",
@@ -1272,7 +1203,6 @@ def test_run_grade_job_scene_join_does_not_over_group_unrelated_shots():
          mock.patch("app.services.l3.grade.job.fetch_color_stats", return_value={}), \
          mock.patch("app.services.l3.grade.job.measure_span", side_effect=fake_measure_span), \
          mock.patch("app.services.l3.grade.job.ensure_cube_file", return_value=None), \
-         mock.patch("app.services.l3.grade.job.get_settings", return_value=fake_settings), \
          mock.patch("app.services.l3.grade.scene_meta.lookup_shot_cut_meta", return_value={}), \
          mock.patch("app.services.l3.store.latest_document", return_value=(doc, 1), create=True):
         grade_job.run_grade_job("thread-no-over-group")
@@ -1302,14 +1232,6 @@ def test_run_grade_job_scene_join_fail_open_on_db_error():
                "rgb_mean": [0.4, 0.4, 0.4], "rgb_std": [0.1, 0.1, 0.1]}   # close RGB, both shots
 
     rows = {}
-    fake_settings = mock.Mock(
-        grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
-        grade_shot_match_v2=True, grade_scene_join=True, grade_subject_exposure=False,
-        grade_skin_vibrance=False,
-        grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
-        grade_look_engine=False,
-        grade_film_texture=False,
-    )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
          mock.patch("app.services.l3.grade.job._upsert_grade_row",
@@ -1317,7 +1239,6 @@ def test_run_grade_job_scene_join_fail_open_on_db_error():
          mock.patch("app.services.l3.grade.job.fetch_color_stats", return_value={}), \
          mock.patch("app.services.l3.grade.job.measure_span", side_effect=fake_measure_span), \
          mock.patch("app.services.l3.grade.job.ensure_cube_file", return_value=None), \
-         mock.patch("app.services.l3.grade.job.get_settings", return_value=fake_settings), \
          mock.patch("app.services.l3.cuts_v3_read.latest_run_for_files", side_effect=RuntimeError("db down")), \
          mock.patch("app.services.l3.store.latest_document", return_value=(doc, 1), create=True):
         grade_job.run_grade_job("thread-fail-open")   # must not raise, must succeed
@@ -1326,54 +1247,6 @@ def test_run_grade_job_scene_join_fail_open_on_db_error():
     non_identity = {k for k, gj in rows.items() if Grade.from_dict(gj["cdl"]) != Grade()}
     assert non_identity, rows
     print("ok  job: the cut_records join fails open on a DB error -- RGB base still groups, job still succeeds")
-
-
-def test_run_grade_job_scene_join_off_keeps_pre_plan_behavior():
-    """grade_scene_join=False: ShotSceneMeta gets empty metadata AND no
-    rgb_mean, so group_shots_semantically returns all-singletons and the
-    job falls back to RGB group_neighbors exactly as it did before this
-    plan -- and the DB join must never be called at all."""
-    doc = {
-        "timeline": [
-            {"seg_id": "s0", "file_id": "f0", "in_ms": 0, "out_ms": 1000},
-            {"seg_id": "s1", "file_id": "f1", "in_ms": 0, "out_ms": 1000},
-        ],
-        "operations": [], "look": {},
-    }
-
-    def fake_measure_span(file_id, in_ms, out_ms, *, hero_ts_ms=None, subject_box=None):
-        # close RGB -- the PRE-existing RGB group_neighbors fallback (not
-        # this plan's new semantic-grouper RGB base) can still chain these.
-        return {"black_point": 0.02, "white_point": 0.9, "mid_gray": 0.3,
-               "rgb_mean": [0.4, 0.4, 0.4], "rgb_std": [0.1, 0.1, 0.1]}
-
-    rows = {}
-    fake_settings = mock.Mock(
-        grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
-        grade_shot_match_v2=True, grade_scene_join=False, grade_subject_exposure=False,
-        grade_skin_vibrance=False,
-        grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
-        grade_look_engine=False,
-        grade_film_texture=False,
-    )
-    join_spy = mock.Mock(side_effect=AssertionError("join must not be called when grade_scene_join=False"))
-    with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
-         mock.patch("app.services.l3.grade.job._upsert_job_status"), \
-         mock.patch("app.services.l3.grade.job._upsert_grade_row",
-                    side_effect=lambda tid, key, h, gj, cube: rows.__setitem__(key, gj)), \
-         mock.patch("app.services.l3.grade.job.fetch_color_stats", return_value={}), \
-         mock.patch("app.services.l3.grade.job.measure_span", side_effect=fake_measure_span), \
-         mock.patch("app.services.l3.grade.job.ensure_cube_file", return_value=None), \
-         mock.patch("app.services.l3.grade.job.get_settings", return_value=fake_settings), \
-         mock.patch("app.services.l3.grade.scene_meta.lookup_shot_cut_meta", join_spy), \
-         mock.patch("app.services.l3.store.latest_document", return_value=(doc, 1), create=True):
-        grade_job.run_grade_job("thread-join-off")
-
-    join_spy.assert_not_called()
-    assert set(rows) == {"s0", "s1"}
-    non_identity = {k for k, gj in rows.items() if Grade.from_dict(gj["cdl"]) != Grade()}
-    assert non_identity, rows
-    print("ok  job: grade_scene_join=False never calls the DB join, RGB group_neighbors fallback unchanged")
 
 
 # --------------------------------------------------------------------------
@@ -1423,8 +1296,8 @@ def test_no_subject_target_identical_to_today():
     assert deltas_a == deltas_b
 
     cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
-    g1 = resolve_clip_grade({}, color_stats=cs, pipeline="v1")
-    g2 = resolve_clip_grade({}, color_stats=cs, pipeline="v1")   # no subject_box either call
+    g1 = resolve_clip_grade({}, color_stats=cs)
+    g2 = resolve_clip_grade({}, color_stats=cs)   # no subject_box either call
     assert g1["grade_hash"] == g2["grade_hash"]
     print("ok  leveling/resolver: no subject signal at all -> identical, deterministic output")
 
@@ -1526,21 +1399,12 @@ def test_run_grade_job_hero_ts_ms_fallback_only_when_box_resolves():
         seen[file_id] = hero_ts_ms
         return _cs(mid_gray=0.4)
 
-    fake_settings = mock.Mock(
-        grade_pipeline="v1", grade_even_lighting=False, grade_semantic=True,
-        grade_shot_match_v2=False, grade_scene_join=False, grade_subject_exposure=True,
-        grade_skin_vibrance=False,
-        grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
-        grade_look_engine=False,
-        grade_film_texture=False,
-    )
     with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
          mock.patch("app.services.l3.grade.job._upsert_job_status"), \
          mock.patch("app.services.l3.grade.job._upsert_grade_row"), \
          mock.patch("app.services.l3.grade.job.fetch_color_stats", return_value={}), \
          mock.patch("app.services.l3.grade.job.measure_span", side_effect=fake_measure_span), \
          mock.patch("app.services.l3.grade.job.ensure_cube_file", return_value=None), \
-         mock.patch("app.services.l3.grade.job.get_settings", return_value=fake_settings), \
          mock.patch("app.services.l3.grade.scene_meta.lookup_shot_cut_meta", return_value=joined), \
          mock.patch("app.services.l3.store.latest_document", return_value=(doc, 1), create=True):
         grade_job.run_grade_job("thread-hero-fallback")
@@ -1552,9 +1416,7 @@ def test_run_grade_job_hero_ts_ms_fallback_only_when_box_resolves():
 
 def test_run_grade_job_subject_exposure_converges_grouped_subjects():
     """End-to-end (mocked): a joined subject_box reaches measure_span, and
-    two grouped shots' far-apart subject lumas converge toward each other
-    -- while grade_subject_exposure=False, the box never reaches
-    measure_span and behavior is the pre-existing whole-frame-only one."""
+    two grouped shots' far-apart subject lumas converge toward each other."""
     doc = {
         "timeline": [
             {"seg_id": "s0", "file_id": "f0", "in_ms": 0, "out_ms": 1000},
@@ -1566,38 +1428,25 @@ def test_run_grade_job_subject_exposure_converges_grouped_subjects():
         "s0": ShotCutMeta(sync_group_id="sync-X", subject_box=[0.3, 0.3, 0.4, 0.4]),
         "s1": ShotCutMeta(sync_group_id="sync-X", subject_box=[0.3, 0.3, 0.4, 0.4]),
     }
+    boxes_seen = []
 
-    def run(subject_exposure_on):
-        boxes_seen = []
+    def fake_measure_span(file_id, in_ms, out_ms, *, hero_ts_ms=None, subject_box=None):
+        boxes_seen.append(subject_box)
+        return {"black_point": 0.02, "white_point": 0.9, "mid_gray": 0.5,
+               "rgb_mean": [0.4, 0.4, 0.4], "rgb_std": [0.1, 0.1, 0.1],
+               "subject_luma": 0.35 if file_id == "f0" else 0.62}
 
-        def fake_measure_span(file_id, in_ms, out_ms, *, hero_ts_ms=None, subject_box=None):
-            boxes_seen.append(subject_box)
-            return {"black_point": 0.02, "white_point": 0.9, "mid_gray": 0.5,
-                   "rgb_mean": [0.4, 0.4, 0.4], "rgb_std": [0.1, 0.1, 0.1],
-                   "subject_luma": 0.35 if file_id == "f0" else 0.62}
-
-        rows = {}
-        fake_settings = mock.Mock(
-            grade_pipeline="v1", grade_even_lighting=True, grade_semantic=True,
-            grade_shot_match_v2=True, grade_scene_join=True,
-            grade_skin_vibrance=False,
-            grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
-            grade_look_engine=False,
-            grade_film_texture=False,
-            grade_subject_exposure=subject_exposure_on,
-        )
-        with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
-             mock.patch("app.services.l3.grade.job._upsert_job_status"), \
-             mock.patch("app.services.l3.grade.job._upsert_grade_row",
-                        side_effect=lambda tid, key, h, gj, cube: rows.__setitem__(key, gj)), \
-             mock.patch("app.services.l3.grade.job.fetch_color_stats", return_value={}), \
-             mock.patch("app.services.l3.grade.job.measure_span", side_effect=fake_measure_span), \
-             mock.patch("app.services.l3.grade.job.ensure_cube_file", return_value=None), \
-             mock.patch("app.services.l3.grade.job.get_settings", return_value=fake_settings), \
-             mock.patch("app.services.l3.grade.scene_meta.lookup_shot_cut_meta", return_value=joined), \
-             mock.patch("app.services.l3.store.latest_document", return_value=(doc, 1), create=True):
-            grade_job.run_grade_job("thread-subject-e2e")
-        return rows, boxes_seen
+    rows = {}
+    with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
+         mock.patch("app.services.l3.grade.job._upsert_job_status"), \
+         mock.patch("app.services.l3.grade.job._upsert_grade_row",
+                    side_effect=lambda tid, key, h, gj, cube: rows.__setitem__(key, gj)), \
+         mock.patch("app.services.l3.grade.job.fetch_color_stats", return_value={}), \
+         mock.patch("app.services.l3.grade.job.measure_span", side_effect=fake_measure_span), \
+         mock.patch("app.services.l3.grade.job.ensure_cube_file", return_value=None), \
+         mock.patch("app.services.l3.grade.scene_meta.lookup_shot_cut_meta", return_value=joined), \
+         mock.patch("app.services.l3.store.latest_document", return_value=(doc, 1), create=True):
+        grade_job.run_grade_job("thread-subject-e2e")
 
     def roundtrip(dv, grade):
         import numpy as np
@@ -1605,69 +1454,15 @@ def test_run_grade_job_subject_exposure_converges_grouped_subjects():
         rgb = np.full(3, lin, dtype=np.float32)
         return float(tone.from_working(apply_cdl(rgb, grade), tone.WORKING_SPACE_V1)[0])
 
-    rows_on, boxes_on = run(True)
-    assert all(b is not None for b in boxes_on), boxes_on
-    post_a = roundtrip(0.35, Grade.from_dict(rows_on["s0"]["cdl"]))
-    post_b = roundtrip(0.62, Grade.from_dict(rows_on["s1"]["cdl"]))
+    assert all(b is not None for b in boxes_seen), boxes_seen
+    post_a = roundtrip(0.35, Grade.from_dict(rows["s0"]["cdl"]))
+    post_b = roundtrip(0.62, Grade.from_dict(rows["s1"]["cdl"]))
     assert abs(post_b - post_a) < abs(0.62 - 0.35), (post_a, post_b)
-
-    rows_off, boxes_off = run(False)
-    assert all(b is None for b in boxes_off), boxes_off
-    assert set(rows_off) == {"s0", "s1"}
-    print(f"ok  job: grouped subjects converge when grade_subject_exposure=True "
-         f"(0.35/0.62 -> {post_a:.3f}/{post_b:.3f}); off, no box ever reaches measure_span")
-
-
-def test_run_grade_job_subject_exposure_gated_on_grade_semantic_too():
-    """grade_subject_exposure=True but grade_semantic=False: the subject
-    signal is a semantic one, so it must stay off (no join call at all)."""
-    doc = {
-        "timeline": [{"seg_id": "s0", "file_id": "f0", "in_ms": 0, "out_ms": 1000}],
-        "operations": [], "look": {},
-    }
-
-    def fake_measure_span(file_id, in_ms, out_ms, *, hero_ts_ms=None, subject_box=None):
-        assert subject_box is None, subject_box
-        return _cs(mid_gray=0.4)
-
-    join_spy = mock.Mock(side_effect=AssertionError("join must not be called when grade_semantic=False"))
-    fake_settings = mock.Mock(
-        grade_pipeline="v1", grade_even_lighting=False, grade_semantic=False,
-        grade_shot_match_v2=False, grade_scene_join=False, grade_subject_exposure=True,
-        grade_skin_vibrance=False,
-        grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
-        grade_look_engine=False,
-        grade_film_texture=False,
-    )
-    with mock.patch("app.services.l3.grade.job.get_job_state", return_value=None), \
-         mock.patch("app.services.l3.grade.job._upsert_job_status"), \
-         mock.patch("app.services.l3.grade.job._upsert_grade_row"), \
-         mock.patch("app.services.l3.grade.job.fetch_color_stats", return_value={}), \
-         mock.patch("app.services.l3.grade.job.measure_span", side_effect=fake_measure_span), \
-         mock.patch("app.services.l3.grade.job.ensure_cube_file", return_value=None), \
-         mock.patch("app.services.l3.grade.job.get_settings", return_value=fake_settings), \
-         mock.patch("app.services.l3.grade.scene_meta.lookup_shot_cut_meta", join_spy), \
-         mock.patch("app.services.l3.store.latest_document", return_value=(doc, 1), create=True):
-        grade_job.run_grade_job("thread-subject-no-semantic")
-    join_spy.assert_not_called()
-    print("ok  job: grade_subject_exposure is inert without grade_semantic, even alone")
-
-
-def test_legacy_unchanged_regardless_of_subject_exposure_flag():
-    """Legacy never calls run_grade_job (maybe_enqueue returns early), so
-    resolve_clip_grade(pipeline='legacy') can't see any subject signal --
-    verify explicitly rather than just by construction."""
-    cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
-    legacy = resolve_clip_grade({}, color_stats=cs)
-    legacy_explicit = resolve_clip_grade({}, color_stats=cs, pipeline="legacy")
-    assert legacy == legacy_explicit
-    assert legacy["working_space"] == "rec709"
-    print("ok  resolver: legacy output is unaffected by color_subject_exposure.plan.md")
+    print(f"ok  job: grouped subjects converge (0.35/0.62 -> {post_a:.3f}/{post_b:.3f})")
 
 
 # --------------------------------------------------------------------------
-# Phase 2/3: run_grade_job actually exercises leveling + semantic grouping
-# when their flags are on (mocked -- no DB/ffmpeg)
+# Phase 2/3: run_grade_job exercises leveling + semantic grouping
 # --------------------------------------------------------------------------
 
 def test_run_grade_job_applies_leveling_and_semantic_grouping_when_flagged():
@@ -1696,14 +1491,6 @@ def test_run_grade_job_applies_leveling_and_semantic_grouping_when_flagged():
                "rgb_mean": [0.9, 0.1, 0.1] if file_id == "f1" else [0.1, 0.9, 0.1],
                "rgb_std": [0.1, 0.1, 0.1]}
 
-    fake_settings = mock.Mock(
-        grade_pipeline="v1", grade_even_lighting=True, grade_semantic=True,
-        grade_shot_match_v2=True, grade_scene_join=True, grade_subject_exposure=False,
-        grade_skin_vibrance=False,
-        grade_tone_contrast=False, grade_tone_contrast_strength=0.0,
-        grade_look_engine=False,
-        grade_film_texture=False,
-    )
     joined_meta = {
         "s0": ShotCutMeta(speaker_person="P1", on_camera=True),
         "s1": ShotCutMeta(speaker_person="P1", on_camera=True),
@@ -1716,7 +1503,6 @@ def test_run_grade_job_applies_leveling_and_semantic_grouping_when_flagged():
          mock.patch("app.services.l3.grade.job.fetch_color_stats", return_value={}), \
          mock.patch("app.services.l3.grade.job.measure_span", side_effect=fake_measure_span), \
          mock.patch("app.services.l3.grade.job.ensure_cube_file", return_value=None), \
-         mock.patch("app.services.l3.grade.job.get_settings", return_value=fake_settings), \
          mock.patch("app.services.l3.grade.scene_meta.lookup_shot_cut_meta", return_value=joined_meta), \
          mock.patch("app.services.l3.store.latest_document", return_value=(doc, 1), create=True):
         grade_job.run_grade_job("thread-flags")
@@ -1727,7 +1513,7 @@ def test_run_grade_job_applies_leveling_and_semantic_grouping_when_flagged():
     # without crashing and produced a real, non-identity result somewhere).
     non_identity = [k for k, gj in rows.items() if Grade.from_dict(gj["cdl"]) != Grade()]
     assert non_identity, rows
-    print("ok  job: run_grade_job runs leveling + semantic grouping when both flags are on")
+    print("ok  job: run_grade_job runs leveling + semantic grouping")
 
 
 # --------------------------------------------------------------------------
@@ -1841,20 +1627,6 @@ def test_lab_to_srgb_round_trips():
         for a, b in zip(rgb, back):
             assert abs(a - b) < 1e-4, (rgb, back)
     print("ok  colorspace: lab_to_srgb(srgb_to_lab(rgb)) round-trips within tolerance")
-
-
-def test_correct_flag_off_byte_identical():
-    cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38,
-             skin_lab=_push_perp(_on_locus(60.0, 20.0), 12.0), chroma_mean=8.0)
-    default_call = resolve_clip_grade({}, color_stats=cs, pipeline="v1")
-    explicit_off = resolve_clip_grade({}, color_stats=cs, pipeline="v1", skin_vibrance=False)
-    assert default_call == explicit_off
-    # Rich skin/chroma data present but the flag is off -> identical to a
-    # color_stats row that never had those fields at all (new fields inert).
-    cs_no_new_fields = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
-    without_new_fields = resolve_clip_grade({}, color_stats=cs_no_new_fields, pipeline="v1")
-    assert default_call["grade_hash"] == without_new_fields["grade_hash"]
-    print("ok  correct/resolver: skin_vibrance=False is byte-identical regardless of skin/chroma data present")
 
 
 def test_white_reference_still_wins_over_skin():
@@ -1989,8 +1761,8 @@ def test_bake_parity_with_contrast():
 
 def test_resolver_flag_off_byte_identical():
     cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
-    default_call = resolve_clip_grade({}, color_stats=cs, pipeline="v1")
-    explicit_zero = resolve_clip_grade({}, color_stats=cs, pipeline="v1", tone_contrast=0.0)
+    default_call = resolve_clip_grade({}, color_stats=cs)
+    explicit_zero = resolve_clip_grade({}, color_stats=cs, tone_contrast=0.0)
     assert default_call == explicit_zero
     assert default_call["grade_hash"] == explicit_zero["grade_hash"]
     print("ok  resolver: tone_contrast=0.0 (default) is byte-identical, same grade_hash")
@@ -2150,35 +1922,23 @@ def test_look_engine_bake_parity():
     print(f"ok  look_engine: baked-cube trilinear sample matches the direct grid (max err {max_err:.5f})")
 
 
-def test_resolver_engine_off_byte_identical():
+def test_resolver_engine_sets_look_engine_and_changes_hash():
     cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
-    seq = {"mode": "engine", "look_id": "punchy_vibrant"}
-    off = resolve_clip_grade({}, color_stats=cs, sequence_look=seq, pipeline="v1", look_engine_enabled=False)
-    baseline = resolve_clip_grade({}, color_stats=cs, pipeline="v1")
-    assert off["grade_hash"] == baseline["grade_hash"]
-    assert off.get("look_engine") is None
-    print("ok  resolver: mode='engine' with the flag off is byte-identical to no look at all")
+    baseline = resolve_clip_grade({}, color_stats=cs)
 
-
-def test_resolver_engine_on_sets_look_engine_and_changes_hash():
-    cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
     seq = {"mode": "engine", "look_id": "punchy_vibrant"}
-    off = resolve_clip_grade({}, color_stats=cs, sequence_look=seq, pipeline="v1", look_engine_enabled=False)
-    on = resolve_clip_grade({}, color_stats=cs, sequence_look=seq, pipeline="v1", look_engine_enabled=True)
+    on = resolve_clip_grade({}, color_stats=cs, sequence_look=seq)
     assert on.get("look_engine"), on.get("look_engine")
-    assert on["grade_hash"] != off["grade_hash"]
+    assert on["grade_hash"] != baseline["grade_hash"]
     assert on.get("creative_lut_ref") is None   # engine + uploaded LUT are mutually exclusive
 
-    # the identity catalog entry stays inert even with the flag on -- an
-    # empty spec skips the grid entirely (byte-identical to no look).
+    # the identity catalog entry stays inert -- an empty spec skips the grid
+    # entirely (byte-identical to no look at all).
     seq_identity = {"mode": "engine", "look_id": "engine_identity"}
-    identity_on = resolve_clip_grade(
-        {}, color_stats=cs, sequence_look=seq_identity, pipeline="v1", look_engine_enabled=True,
-    )
-    baseline = resolve_clip_grade({}, color_stats=cs, pipeline="v1")
+    identity_on = resolve_clip_grade({}, color_stats=cs, sequence_look=seq_identity)
     assert identity_on.get("look_engine") is None
     assert identity_on["grade_hash"] == baseline["grade_hash"]
-    print("ok  resolver: mode='engine' with the flag on sets look_engine + rehashes; the identity look stays inert")
+    print("ok  resolver: mode='engine' sets look_engine + rehashes; the identity look stays inert")
 
 
 def test_grade_hash_look_engine_in_payload():
@@ -2242,42 +2002,25 @@ def test_build_look_grid_ignores_texture():
     print("ok  look_engine: build_look_grid ignores halation/grain -- texture never bakes into the color grid")
 
 
-def test_resolver_film_texture_off_byte_identical():
+def test_resolver_film_texture_populates_soft_local_when_look_declares_it():
+    """grade_pipeline_standardize.plan.md: film texture is look-scoped, not
+    a global toggle -- it fires purely on the active look declaring nonzero
+    halation/grain."""
     cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
-    seq = {"mode": "engine", "look_id": "kodak_2383"}
-    off = resolve_clip_grade({}, color_stats=cs, sequence_look=seq, pipeline="v1",
-                             look_engine_enabled=True, film_texture_enabled=False)
-    baseline_engine_only = resolve_clip_grade({}, color_stats=cs, sequence_look=seq, pipeline="v1",
-                                              look_engine_enabled=True, film_texture_enabled=True)
-    no_look = resolve_clip_grade({}, color_stats=cs, pipeline="v1")
-    assert off.get("soft_local") is None
-    assert off["grade_hash"] != baseline_engine_only["grade_hash"]   # texture ON does change the hash
-    # flag off is otherwise identical to a plain no-look v1 resolve on the
-    # non-soft-local fields (the color engine itself is independently gated
-    # by look_engine_enabled, already covered by the response-engine plan's
-    # own tests -- this test's job is just "texture off touches nothing").
-    assert off["cdl"] == no_look["cdl"]
-    print("ok  resolver: film_texture_enabled=False never populates soft_local, regardless of the look")
+    no_look = resolve_clip_grade({}, color_stats=cs)
+    assert no_look.get("soft_local") is None
 
-
-def test_resolver_film_texture_on_populates_soft_local():
-    cs = _cs(black_point=0.06, white_point=0.85, mid_gray=0.38)
     seq_film = {"mode": "engine", "look_id": "kodak_2383"}
-    on = resolve_clip_grade({}, color_stats=cs, sequence_look=seq_film, pipeline="v1",
-                            look_engine_enabled=True, film_texture_enabled=True)
-    off = resolve_clip_grade({}, color_stats=cs, sequence_look=seq_film, pipeline="v1",
-                             look_engine_enabled=True, film_texture_enabled=False)
+    on = resolve_clip_grade({}, color_stats=cs, sequence_look=seq_film)
     assert on["soft_local"] == {"halation": {"strength": 0.25}, "grain": {"strength": 0.04}}
-    assert on["grade_hash"] != off["grade_hash"]
+    assert on["grade_hash"] != no_look["grade_hash"]
 
-    # a look with color but zero texture (engine_punchy) -> texture-on flag
-    # has nothing to route, soft_local stays None (triple-safe: flag, look,
-    # AND look's own params must all be non-zero).
+    # a look with color but zero texture (punchy_vibrant) -> soft_local
+    # stays None (the look's own params, not a flag, gate this).
     seq_punchy = {"mode": "engine", "look_id": "punchy_vibrant"}
-    punchy_on = resolve_clip_grade({}, color_stats=cs, sequence_look=seq_punchy, pipeline="v1",
-                                   look_engine_enabled=True, film_texture_enabled=True)
+    punchy_on = resolve_clip_grade({}, color_stats=cs, sequence_look=seq_punchy)
     assert punchy_on.get("soft_local") is None
-    print("ok  resolver: film_texture_enabled=True + a texture look populates soft_local.halation/.grain")
+    print("ok  resolver: soft_local.halation/.grain populate exactly when the active look declares them")
 
 
 def test_grain_ffmpeg_filter():
@@ -2494,19 +2237,18 @@ def main():
     test_v1_composite_offset_floor_does_not_raise_true_black()
     test_v1_composite_offset_floor_preserves_mid_gray_and_slope_ceiling()
     test_v1_composite_offset_floor_respects_power()
-    test_v1_composite_offset_floor_is_v1_only_legacy_untouched()
     test_match_two_camera_interview_matches_across_the_cut()
     test_match_never_groups_non_adjacent_shots()
     test_match_same_file_always_groups_regardless_of_rgb()
-    test_resolver_legacy_default_working_space_unchanged()
     test_resolver_v1_sets_v1_working_space()
     test_resolver_explicit_working_space_overrides_pipeline_default()
     test_resolver_reference_transfer_v1_does_not_crash_or_blow_up()
     test_resolver_subject_box_seam_carries_through_no_visual_change_by_default()
     test_one_grade_per_shot_no_intra_shot_variance()
-    test_layers_legacy_default_is_byte_identical_to_before()
+    test_layers_no_grade_lookup_falls_back_to_identity()
     test_layers_v1_reads_grade_lookup_hit()
     test_layers_v1_falls_back_to_identity_on_miss()
+    test_layers_split_screen_region_preserves_spine_grade()
     test_input_hash_stable_for_identical_documents()
     test_input_hash_changes_when_a_span_trims()
     test_input_hash_changes_when_look_changes()
@@ -2534,9 +2276,7 @@ def main():
     test_shot_match_cross_shot_spread_shrinks_after_balance_and_match()
     test_shot_match_no_shadow_crush_after_balance_and_match()
     test_balance_lifts_capped_dull_shot_and_survives_composite_slope_clamp()
-    test_shot_match_references_none_reproduces_legacy_anchor_behavior()
     test_shot_match_references_override_matches_every_member_not_just_anchor()
-    test_run_grade_job_shot_match_v2_off_reproduces_pre_redesign_path()
     test_scene_grouping_rgb_base_prevents_all_singletons()
     test_scene_grouping_sync_group_id_groups_across_files()
     test_scene_grouping_take_group_id_groups_across_files()
@@ -2545,7 +2285,6 @@ def main():
     test_run_grade_job_groups_multi_file_reel_via_scene_join()
     test_run_grade_job_scene_join_does_not_over_group_unrelated_shots()
     test_run_grade_job_scene_join_fail_open_on_db_error()
-    test_run_grade_job_scene_join_off_keeps_pre_plan_behavior()
     test_two_subjects_converge_after_leveling()
     test_no_subject_target_identical_to_today()
     test_silhouette_subject_ignores_target_subject_luma_too()
@@ -2554,8 +2293,6 @@ def main():
     test_scene_meta_join_populates_hero_ts_ms()
     test_run_grade_job_hero_ts_ms_fallback_only_when_box_resolves()
     test_run_grade_job_subject_exposure_converges_grouped_subjects()
-    test_run_grade_job_subject_exposure_gated_on_grade_semantic_too()
-    test_legacy_unchanged_regardless_of_subject_exposure_flag()
     test_run_grade_job_applies_leveling_and_semantic_grouping_when_flagged()
     test_vibrance_boosts_low_chroma_bounded()
     test_vibrance_no_desaturation_on_vivid_footage()
@@ -2566,7 +2303,6 @@ def main():
     test_skin_tint_skips_non_skin()
     test_skin_prefers_subject_lab_over_center_proxy()
     test_lab_to_srgb_round_trips()
-    test_correct_flag_off_byte_identical()
     test_white_reference_still_wins_over_skin()
     test_measure_subject_lab_reads_the_box_not_the_whole_frame()
     test_measure_subject_lab_none_for_degenerate_box()
@@ -2586,15 +2322,13 @@ def main():
     test_look_hue_rotate_only_targets_band()
     test_look_hue_sat_only_targets_band()
     test_look_engine_bake_parity()
-    test_resolver_engine_off_byte_identical()
-    test_resolver_engine_on_sets_look_engine_and_changes_hash()
+    test_resolver_engine_sets_look_engine_and_changes_hash()
     test_grade_hash_look_engine_in_payload()
     test_compositor_grade_key_distinguishes_look_engine_from_identity()
     test_resolve_look_spec_prefers_catalog_over_inline_params()
     test_lookspec_texture_roundtrip()
     test_build_look_grid_ignores_texture()
-    test_resolver_film_texture_off_byte_identical()
-    test_resolver_film_texture_on_populates_soft_local()
+    test_resolver_film_texture_populates_soft_local_when_look_declares_it()
     test_grain_ffmpeg_filter()
     test_halation_subgraph_shape()
     test_grade_hash_changes_with_texture()
