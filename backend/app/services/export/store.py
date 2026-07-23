@@ -4,13 +4,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-import psycopg
 
-from app.config import get_settings
-
-
-def _pg() -> psycopg.Connection:
-    return psycopg.connect(get_settings().database_url, autocommit=True)
+def _pg():
+    from app.services import db
+    return db.connection()
 
 
 _COLS = (

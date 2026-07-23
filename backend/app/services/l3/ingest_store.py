@@ -14,9 +14,8 @@ from app.services.l3.post import CutRecord
 
 
 def _pg_conn():
-    import psycopg
-    from app.config import get_settings
-    return psycopg.connect(get_settings().database_url, autocommit=True)
+    from app.services import db
+    return db.connection()
 
 
 def create_ingest_run(project_id: str, pass1_model: str, pass2_model: str) -> str:

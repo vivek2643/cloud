@@ -7,14 +7,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-import psycopg
-from psycopg.rows import dict_row
-
-from app.config import get_settings
-
 
 def _pg_conn():
-    return psycopg.connect(get_settings().database_url, autocommit=True, row_factory=dict_row)
+    from app.services import db
+    return db.connection_dict_row()
 
 
 def create_sync_group(

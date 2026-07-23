@@ -75,12 +75,6 @@ _SPEECH_TRIM_MAX = 1.0
 _SUBJECT_BY_CHANNEL = {"said": "person", "done": "person", "shown": "object"}
 
 
-def _pg_conn():
-    import psycopg
-    from app.config import get_settings
-    return psycopg.connect(get_settings().database_url, autocommit=True)
-
-
 # --------------------------------------------------------------------------
 # Cache signature (Phase 2): ingest_run_id + a content hash of the file's rows
 # --------------------------------------------------------------------------

@@ -487,9 +487,8 @@ def resolve_speech_span_ms(
 # --------------------------------------------------------------------------
 
 def _pg_conn():
-    import psycopg
-    from app.config import get_settings
-    return psycopg.connect(get_settings().database_url, autocommit=True)
+    from app.services import db
+    return db.connection()
 
 
 def _load_words(file_id: str) -> List[dict]:

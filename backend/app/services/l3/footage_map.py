@@ -33,7 +33,6 @@ import logging
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.config import get_settings
 from app.services.l3 import cutrecord_map
 from app.services.l3.energy import default_energy_for
 
@@ -394,8 +393,8 @@ def build_clip_tree(
 # --------------------------------------------------------------------------
 
 def _pg_conn():
-    import psycopg
-    return psycopg.connect(get_settings().database_url, autocommit=True)
+    from app.services import db
+    return db.connection()
 
 
 def _ensure_table(conn) -> None:

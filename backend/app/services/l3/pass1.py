@@ -1185,9 +1185,8 @@ def run_pass1(
 
 
 def _pg_conn():
-    import psycopg
-    from app.config import get_settings
-    return psycopg.connect(get_settings().database_url, autocommit=True)
+    from app.services import db
+    return db.connection()
 
 
 def load_project_file_rows(project_id: str) -> List[Tuple[str, str, int, Lattice]]:

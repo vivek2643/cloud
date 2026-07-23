@@ -9,9 +9,6 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-import psycopg
-
-from app.config import get_settings
 from app.services.jobs import app
 from app.services.l3 import layers
 from app.services.render import compositor, store
@@ -19,8 +16,9 @@ from app.services.render import compositor, store
 logger = logging.getLogger(__name__)
 
 
-def _pg() -> psycopg.Connection:
-    return psycopg.connect(get_settings().database_url, autocommit=True)
+def _pg():
+    from app.services import db
+    return db.connection()
 
 
 def file_ids_in(resolved: Dict[str, Any]) -> List[str]:

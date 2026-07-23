@@ -52,9 +52,9 @@ STAGES_COLOR = STAGES_V2 + ("color_stats",)
 AUDIO_STAGES = ("audio_proxy", "audio_features", "transcript", "diarization")
 
 
-def _pg_conn() -> psycopg.Connection:
-    settings = get_settings()
-    return psycopg.connect(settings.database_url, autocommit=True)
+def _pg_conn():
+    from app.services import db
+    return db.connection()
 
 
 # --- Per-stage job tracking ----------------------------------------------

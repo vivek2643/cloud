@@ -14,10 +14,30 @@ class Settings(BaseSettings):
     r2_secret_access_key: str
     r2_bucket_name: str = "aerodrive"
 
-    # Direct Postgres connection string for procrastinate + pgvector queries
-    # (the supabase-py REST client can't run raw SQL or HNSW search).
-    # Example: postgresql://postgres:<pw>@db.<ref>.supabase.co:5432/postgres
+    # Session/direct Postgres connection string -- Procrastinate (LISTEN/
+    # NOTIFY) and the migration runner's advisory lock (session-scoped,
+    # needs one pinned backend connection) MUST stay on this route, never
+    # the transaction pooler below. Supabase's Supavisor session pooler
+    # (port 5432) or a direct DB connection both work here.
     database_url: str = ""
+
+    # scale_architecture.plan.md Pillar 1: the TRANSACTION pooler URL
+    # (Supavisor, port 6543) business-query connections borrow from via
+    # app/services/db.py's process-global pool. Falls back to `database_url`
+    # when unset (dev / a deployment with no separate pooler configured) --
+    # every business query already ran fine over a single URL before this
+    # pillar, so an unset pool URL is a no-op, not a startup failure.
+    database_pool_url: str = ""
+    # Per-WORKER-PROCESS cap on the business-query pool (app/services/db.py).
+    # Deliberately NOT named DB_POOL_MAX -- that env var already exists
+    # (jobs.py) for Procrastinate's own, separate connector pool, which
+    # stays on the session/direct route; reusing the name would silently
+    # couple two unrelated pools. Budget: total (this x worker process
+    # count) should stay under ~40-80% of the compute tier's direct-
+    # connection cap when running WITHOUT a pooler in front, or well under
+    # the pooler's own configured client-slot budget when one is (see the
+    # plan's Supabase Pro connection-facts table).
+    db_pool_max_size: int = 8
 
     cors_origins: List[str] = ["http://localhost:3000"]
 
@@ -62,38 +82,14 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-opus-4-8"
 
-    # --- L3: prompt-driven auto-editor (OpenAI) --------------------------
-    # A simple, deterministic 3-call pipeline (Director -> Editor -> Coverage)
-    # that turns a one-line brief into a full Edit Document: guess the energy,
-    # build the hero-cuts feed at that energy, select + order the cuts, then
-    # lay light coverage. Provider/model overridable.
-    enable_autoedit: bool = True
-    # The editing brain (converse + arranger) runs on the strongest available
-    # model -- this is creative selection + ordering, not cheap classification.
-    # Provider-neutral: flip to "openai"/"gemini" + a model id to swap backbones.
+    # --- L3 editing brain (converse + tools) model backbone --------------
+    # The agentic chat editor (converse.respond -> tools.run_edit_loop) runs on
+    # the strongest available model -- creative selection + ordering, not cheap
+    # classification. Provider-neutral: flip to "openai"/"gemini" + a model id
+    # to swap backbones.
     autoedit_provider: str = "anthropic"
     autoedit_model: str = "claude-opus-4-8"
     autoedit_max_output_tokens: int = 16384
-    # Deep reasoning for the editorial calls (taste, story, ordering).
-    autoedit_effort: str = "high"
-    # A pure clip ASSEMBLER: pick the right clips and order them, nothing else.
-    # Leave False to skip the coverage pass (no V2 cutaway ops); flip True to let
-    # it lay B-roll / reaction cutaways as V2 over the V1 spine.
-    autoedit_coverage: bool = False
-
-    # --- L3 arranger: the cut-picking reasoning brain --------------------
-    # Resident mode (default) holds the whole footage map in one context and
-    # runs a draft -> self-critique cycle. When the map text exceeds this many
-    # chars it is PAGED instead: a compact index + on-demand inspect tools, so
-    # we degrade gracefully instead of blindly truncating.
-    arranger_resident_char_budget: int = 180_000
-    # Reasoning passes in resident mode (2 = draft, then critique + revise).
-    arranger_passes: int = 2
-    # Effort for the draft pass; the final (critique) pass uses autoedit_effort.
-    arranger_draft_effort: str = "medium"
-    # Paged mode: effort per turn and a hard cap on tool/reason turns.
-    arranger_paged_effort: str = "medium"
-    arranger_max_turns: int = 12
 
     # --- Cuts v3: LLM-grouped ingest (app.services.llm.client) -----------
     # Two structured Sonnet-class calls per project ingest (text-only pass 1,

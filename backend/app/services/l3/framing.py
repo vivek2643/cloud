@@ -47,11 +47,9 @@ def _feel_ease(feel: Optional[str]) -> str:
 # --------------------------------------------------------------------------
 
 def _pg_conn():
-    import psycopg
+    from app.services import db
 
-    from app.config import get_settings
-
-    return psycopg.connect(get_settings().database_url, autocommit=True)
+    return db.connection()
 
 
 def _load_motion_centroids(file_id: str) -> List[dict]:

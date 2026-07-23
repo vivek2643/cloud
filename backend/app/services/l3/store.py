@@ -13,16 +13,12 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-import psycopg
-
-from app.config import get_settings
-
 logger = logging.getLogger(__name__)
 
 
-def _pg_conn() -> psycopg.Connection:
-    settings = get_settings()
-    return psycopg.connect(settings.database_url, autocommit=True)
+def _pg_conn():
+    from app.services import db
+    return db.connection()
 
 
 # --- Threads ---------------------------------------------------------------

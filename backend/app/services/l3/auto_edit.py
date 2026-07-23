@@ -20,10 +20,6 @@ from __future__ import annotations
 import logging
 from typing import Dict, List, Optional
 
-import psycopg
-
-from app.config import get_settings
-
 logger = logging.getLogger(__name__)
 
 
@@ -31,8 +27,9 @@ logger = logging.getLogger(__name__)
 # Loading per-clip context (used by footage_map)
 # --------------------------------------------------------------------------
 
-def _pg_conn() -> psycopg.Connection:
-    return psycopg.connect(get_settings().database_url, autocommit=True)
+def _pg_conn():
+    from app.services import db
+    return db.connection()
 
 
 def _clip_cards(file_ids: List[str]) -> Dict[str, dict]:

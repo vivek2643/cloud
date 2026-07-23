@@ -146,9 +146,8 @@ def build_context(file_ids: List[str], run_id: Optional[str] = None,
 
 
 def _pg_conn():
-    import psycopg
-    from app.config import get_settings
-    return psycopg.connect(get_settings().database_url, autocommit=True)
+    from app.services import db
+    return db.connection()
 
 
 def _fetch_audio_features(file_ids: List[str]) -> Dict[str, dict]:

@@ -46,6 +46,9 @@ insightface==0.7.3
 onnxruntime==1.19.2
 # Direct psycopg for raw queries we need outside the Supabase REST client
 psycopg[binary]==3.2.4
+# scale_architecture.plan.md Pillar 1: the process-global business-query
+# connection pool (app/services/db.py) over Supabase's transaction pooler.
+psycopg-pool==3.2.8
 numpy<2.0
 
 # --- LLM backbones ---

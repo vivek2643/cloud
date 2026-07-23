@@ -20,9 +20,6 @@ import os
 import tempfile
 from typing import Any, Dict, List, Optional
 
-import psycopg
-
-from app.config import get_settings
 from app.services.l1 import color_stats as color_stats_mod
 from app.services.processing import _download_from_r2
 
@@ -36,8 +33,9 @@ SCHEMA_VERSION = 2
 SPAN_MAX_FRAMES = 4
 
 
-def _pg() -> psycopg.Connection:
-    return psycopg.connect(get_settings().database_url, autocommit=True)
+def _pg():
+    from app.services import db
+    return db.connection()
 
 
 def _cached(file_id: str, in_ms: int, out_ms: int) -> Optional[Dict[str, Any]]:

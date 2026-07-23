@@ -14,9 +14,8 @@ from typing import List
 
 
 def _pg_conn():
-    import psycopg
-    from app.config import get_settings
-    return psycopg.connect(get_settings().database_url, autocommit=True)
+    from app.services import db
+    return db.connection()
 
 
 def find_or_create_project(user_id: str, file_ids: List[str]) -> str:

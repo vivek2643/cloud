@@ -19,8 +19,6 @@ from __future__ import annotations
 import json
 from typing import List, Optional, Tuple
 
-from app.config import get_settings
-
 # Merge consecutive same-speaker words into one turn unless the silence between
 # them exceeds this (likely a real handover or pause).
 DEFAULT_TURN_GAP_MS = 800
@@ -32,9 +30,9 @@ Turn = Tuple[int, int, str]
 
 
 def _pg_conn():
-    import psycopg
+    from app.services import db
 
-    return psycopg.connect(get_settings().database_url, autocommit=True)
+    return db.connection()
 
 
 def merge_words_to_turns(

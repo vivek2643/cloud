@@ -16,9 +16,6 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Sequence
 
-import psycopg
-
-from app.config import get_settings
 from app.services.l3.captions import colour as colour_mod
 from app.services.l3.captions import placement as placement_mod
 from app.services.l3.captions import styles as styles_mod
@@ -31,8 +28,9 @@ logger = logging.getLogger(__name__)
 # Fetch (impure) -- batch, once per document resolve.
 # --------------------------------------------------------------------------
 
-def _pg() -> psycopg.Connection:
-    return psycopg.connect(get_settings().database_url, autocommit=True)
+def _pg():
+    from app.services import db
+    return db.connection()
 
 
 def fetch_transcripts(file_ids: Sequence[str]) -> Dict[str, Dict[str, Any]]:

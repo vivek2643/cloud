@@ -27,8 +27,6 @@ import tempfile
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-import psycopg
-
 from app.config import get_settings
 from app.services.jobs import app as jobs_app
 from app.services.l3.grade.balance import solve_balance
@@ -111,8 +109,9 @@ INPUT_HASH_SCHEMA_VERSION = 12
 _CUBE_CACHE_DIR = os.path.join(tempfile.gettempdir(), "edso_grade_cubes")
 
 
-def _pg() -> psycopg.Connection:
-    return psycopg.connect(get_settings().database_url, autocommit=True)
+def _pg():
+    from app.services import db
+    return db.connection()
 
 
 def _to_working_scalar(value: Optional[float], default: Optional[float]) -> float:

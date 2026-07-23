@@ -35,9 +35,8 @@ router = APIRouter(prefix="/api/sync", tags=["sync"])
 
 
 def _pg_conn():
-    import psycopg
-    from app.config import get_settings
-    return psycopg.connect(get_settings().database_url, autocommit=True)
+    from app.services import db
+    return db.connection()
 
 
 def _owned_files(file_ids: List[str], user_id: str) -> List[dict]:

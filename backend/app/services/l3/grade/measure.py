@@ -11,10 +11,6 @@ from __future__ import annotations
 
 from typing import Dict, List
 
-import psycopg
-
-from app.config import get_settings
-
 _COLS = (
     "file_id", "black_point", "white_point", "mid_gray", "rgb_mean",
     "rgb_median", "rgb_std", "lab_ab_cast", "wb_gray_world", "wb_white_patch",
@@ -27,8 +23,9 @@ _COLS = (
 # this key, so widening the SELECT is inert for every other caller.
 
 
-def _pg() -> psycopg.Connection:
-    return psycopg.connect(get_settings().database_url, autocommit=True)
+def _pg():
+    from app.services import db
+    return db.connection()
 
 
 def fetch_color_stats(file_ids: List[str]) -> Dict[str, dict]:

@@ -12,11 +12,6 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-import psycopg
-from psycopg.rows import dict_row
-
-from app.config import get_settings
-
 logger = logging.getLogger(__name__)
 
 
@@ -43,7 +38,6 @@ def list_l1_analyses(user_id: str, limit: int = 200) -> List[Dict[str, Any]]:
     Sourced entirely from Postgres so it works no matter which machine
     (local or a remote GPU worker) actually ran the analysis.
     """
-    settings = get_settings()
     sql = """
         select
             f.id            as file_id,
@@ -73,9 +67,11 @@ def list_l1_analyses(user_id: str, limit: int = 200) -> List[Dict[str, Any]]:
         order by f.created_at desc
         limit %s
     """
+    from app.services import db
+
     stages = list(_L1_STAGES)
     out: List[Dict[str, Any]] = []
-    with psycopg.connect(settings.database_url, autocommit=True, row_factory=dict_row) as conn:
+    with db.connection_dict_row() as conn:
         cur = conn.execute(sql, (stages, stages, user_id, stages, limit))
         for r in cur.fetchall():
             secs = r["l1_seconds"]
@@ -95,7 +91,8 @@ def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
 
     Schema is stable: callers (frontend, log viewer) can rely on these keys.
     """
-    settings = get_settings()
+    from app.services import db
+
     out: Dict[str, Any] = {
         "file_id": file_id,
         "file": None,
@@ -105,7 +102,7 @@ def build_l1_snapshot(file_id: str) -> Dict[str, Any]:
         "summary": {},
     }
 
-    with psycopg.connect(settings.database_url, autocommit=True, row_factory=dict_row) as conn:
+    with db.connection_dict_row() as conn:
         # File row (only the fields we care about)
         cur = conn.execute(
             """
