@@ -23,6 +23,7 @@ from procrastinate import RetryStrategy
 
 from app.config import get_settings
 from app.services import audit_log
+from app.services import correlation
 from app.services.jobs import app
 from app.services.l1 import active_speaker as asd_mod
 from app.services.l1 import audio_features as af_mod
@@ -117,6 +118,19 @@ def _file_type(file_id: str) -> Optional[str]:
         with _pg_conn() as conn:
             row = conn.execute(
                 "select file_type from files where id = %s", (file_id,)
+            ).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def _user_id_for_file(file_id: str) -> Optional[str]:
+    """Pillar 7: for correlation-scope logging only -- best-effort, never
+    raises (an unknown owner just logs as "-")."""
+    try:
+        with _pg_conn() as conn:
+            row = conn.execute(
+                "select user_id::text from files where id = %s", (file_id,)
             ).fetchone()
         return row[0] if row else None
     except Exception:
@@ -808,7 +822,10 @@ def _run_deep_stages_parallel(
         tracks.append((_track_audio, (file_id, wav_path, duration_s)))
 
     with ThreadPoolExecutor(max_workers=len(tracks)) as ex:
-        futs = [ex.submit(fn, *args) for fn, args in tracks]
+        # correlation.run_with_scope: plain ex.submit wouldn't propagate this
+        # file's correlation.scope() into these worker threads, and their log
+        # lines would show "-" for file_id/user_id.
+        futs = [correlation.run_with_scope(ex, fn, *args) for fn, args in tracks]
         wait(futs)
     for f in futs:
         exc = f.exception()
@@ -1093,6 +1110,14 @@ def l1_orchestrate(file_id: str, r2_key: str) -> None:
     Branches by file_type: audio uploads run the video-free music path.
     Idempotent: each stage checks processing_jobs first.
     """
+    # scale_architecture.plan.md Pillar 7: every log line for this file's L1
+    # run carries file_id/user_id from here on (correlation.scope, not
+    # threaded through every logger.info call by hand).
+    with correlation.scope(file_id=file_id, user_id=_user_id_for_file(file_id)):
+        _l1_orchestrate(file_id, r2_key)
+
+
+def _l1_orchestrate(file_id: str, r2_key: str) -> None:
     settings = get_settings()
 
     if not _file_exists(file_id):

@@ -33,12 +33,16 @@ class FakeStore:
         self.deleted_for = None
         self.inserted = None
         self.hero_keys = {}
+        self.timings = None
 
     def create_ingest_run(self, project_id, pass1_model, pass2_model):
         return "run-1"
 
     def set_status(self, ingest_run_id, status, error=None):
         self.status_history.append((status, error))
+
+    def set_timings(self, ingest_run_id, timings_ms):
+        self.timings = timings_ms
 
     def record_pass1_result(self, ingest_run_id, pass1_output, usage, project_summary):
         self.pass1_recorded = (pass1_output, usage, project_summary)

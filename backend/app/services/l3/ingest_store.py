@@ -83,6 +83,17 @@ def get_identity_map(ingest_run_id: str) -> Optional[Dict[str, Any]]:
     return row[0] if isinstance(row[0], dict) else json.loads(row[0])
 
 
+def set_timings(ingest_run_id: str, timings_ms: Dict[str, float]) -> None:
+    """Persist this run's per-stage wall-clock breakdown (scale_architecture.
+    plan.md Pillar 7). Written once at the end of a run, success or failure,
+    so a slow/failed run is still diagnosable from the DB alone."""
+    with _pg_conn() as conn:
+        conn.execute(
+            "update ingest_runs set timings_ms = %s where id = %s",
+            (json.dumps(timings_ms), ingest_run_id),
+        )
+
+
 def accumulate_pass2_usage(ingest_run_id: str, usage: Dict[str, int]) -> None:
     with _pg_conn() as conn:
         conn.execute(

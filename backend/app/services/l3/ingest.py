@@ -40,11 +40,13 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import get_settings
+from app.services import correlation
 from app.services.jobs import app
 from app.services.l1 import active_speaker
 from app.services.l1.snapshot import build_l1_snapshot
@@ -66,6 +68,19 @@ from app.services.l3.pass2_params import MAX_PARALLEL_PASS2_BATCHES, STILL_WIDTH
 from app.services.processing import _download_from_r2, _upload_to_r2
 
 logger = logging.getLogger(__name__)
+
+
+def _user_id_for_project(project_id: str) -> Optional[str]:
+    """Pillar 7: for correlation-scope logging only -- best-effort, never
+    raises (an unknown owner just logs as "-")."""
+    try:
+        with pass1._pg_conn() as conn:
+            row = conn.execute(
+                "select user_id::text from projects where id = %s", (project_id,)
+            ).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
 
 
 def _onsets_for_files(file_ids: List[str]) -> Dict[str, List[int]]:
@@ -181,6 +196,21 @@ def run_ingest(project_id: str) -> str:
     looking like a success (the plan's "no fallback" rule)."""
     settings = get_settings()
     ingest_run_id = store.create_ingest_run(project_id, settings.ingest_pass1_model, settings.ingest_pass2_model)
+    # scale_architecture.plan.md Pillar 7: every log line for this run
+    # carries project_id/ingest_run_id/user_id from here on (correlation.
+    # scope), not threaded through every logger.info call by hand.
+    with correlation.scope(project_id=project_id, ingest_run_id=ingest_run_id,
+                            user_id=_user_id_for_project(project_id)):
+        return _run_ingest(project_id, settings, ingest_run_id)
+
+
+def _run_ingest(project_id: str, settings, ingest_run_id: str) -> str:
+    # scale_architecture.plan.md Pillar 7: per-stage wall-clock breakdown,
+    # persisted on the run row + logged as a one-line scoreboard, win or
+    # fail. `t_stage` is a rolling checkpoint reset at each stage boundary.
+    t_start = time.monotonic()
+    t_stage = t_start
+    timings_ms: Dict[str, float] = {}
     try:
         file_rows = pass1.load_project_file_rows(project_id)
         if not file_rows:
@@ -284,10 +314,16 @@ def run_ingest(project_id: str) -> str:
         voice_of = identity_voices.assign_voices(embeddings_by_file, groups, all_speakers_by_file)
         turns_by_file = {fid: lat.turns for fid, lat in lattices.items()}
 
+        timings_ms["pass1"] = (time.monotonic() - t_stage) * 1000
+        t_stage = time.monotonic()
+
         store.set_status(ingest_run_id, "images")
         planned_frames = ip.build_image_plan(pass1_output, lattices, motion_by_file, scene_by_file,
                                              silences_by_file, v4_meta_by_ref=v4_meta_by_ref or None)
         images_b64 = fr.extract_for_planned_frames(planned_frames, proxy_keys)
+
+        timings_ms["extract"] = (time.monotonic() - t_stage) * 1000
+        t_stage = time.monotonic()
 
         # Still reported as "pass2" -- the DB status column's check
         # constraint only knows the original stage name, and adding a new
@@ -313,8 +349,21 @@ def run_ingest(project_id: str) -> str:
         # contract) -- never a correctness requirement.
         cache_ctx = nullcontext()
         pass2_cache_name = None
+        # Pillar 7: wall clock per batch, not just the stage total -- batches
+        # run concurrently, so "pass2=Xs" alone hides whether that's one slow
+        # batch or a genuinely long stage. `batch_timings_ms.append` is a
+        # plain list append from multiple threads, safe under the GIL.
+        batch_timings_ms: List[float] = []
+
+        def _timed_pass2_batch(rows, out, frames, imgs):
+            t0 = time.monotonic()
+            try:
+                return pass2.run_pass2_batch(rows, out, frames, imgs)
+            finally:
+                batch_timings_ms.append((time.monotonic() - t0) * 1000)
+
         submit_batch = lambda pool, rows, frames: pool.submit(  # noqa: E731
-            pass2.run_pass2_batch, rows, pass1_output, frames, images_b64)
+            _timed_pass2_batch, rows, pass1_output, frames, images_b64)
 
         if settings.ingest_pass2_provider == "gemini":
             from app.services.llm import ingest_gemini as ig
@@ -323,7 +372,7 @@ def run_ingest(project_id: str) -> str:
             if pass2_cache_name:
                 cache_ctx = ig.pass2_cache_scope(pass2_cache_name)
                 submit_batch = lambda pool, rows, frames: ig.submit_with_cache_context(  # noqa: E731
-                    pool, pass2.run_pass2_batch, rows, pass1_output, frames, images_b64)
+                    pool, _timed_pass2_batch, rows, pass1_output, frames, images_b64)
 
         try:
             # Batches only share a read-only cached prefix -- no reason to
@@ -346,6 +395,10 @@ def run_ingest(project_id: str) -> str:
             if pass2_cache_name:
                 from app.services.llm import ingest_gemini as ig
                 ig.delete_pass2_cache(pass2_cache_name)
+
+        timings_ms["pass2"] = (time.monotonic() - t_stage) * 1000
+        timings_ms["pass2_max_batch"] = max(batch_timings_ms) if batch_timings_ms else 0.0
+        t_stage = time.monotonic()
 
         pass2_output = pass2.Pass2Output(cuts=all_cuts)
         pass2_output = pass2.apply_junk_suspects(pass2_output, pass1_output, lattices)
@@ -386,6 +439,9 @@ def run_ingest(project_id: str) -> str:
         if identity_map.get("persons"):
             store.set_identity_map(ingest_run_id, identity_map)
 
+        timings_ms["identity"] = (time.monotonic() - t_stage) * 1000
+        t_stage = time.monotonic()
+
         store.set_status(ingest_run_id, "post")
         records = post.assemble_cut_records(pass2_output, lattices, motion_by_file, silences_by_file,
                                             junk_suspects=pass1_output.junk_suspects,
@@ -399,9 +455,27 @@ def run_ingest(project_id: str) -> str:
         record_ids = store.insert_cut_records(ingest_run_id, records)
         _extract_and_upload_heroes(records, record_ids, proxy_keys)
 
+        timings_ms["post"] = (time.monotonic() - t_stage) * 1000
+        timings_ms["total"] = (time.monotonic() - t_start) * 1000
+        store.set_timings(ingest_run_id, timings_ms)
+        logger.info(
+            "ingest run %s scoreboard: pass1=%.1fs extract=%.1fs pass2=%.1fs(max batch=%.1fs) "
+            "identity=%.1fs post=%.1fs total=%.1fs",
+            ingest_run_id,
+            timings_ms.get("pass1", 0.0) / 1000, timings_ms.get("extract", 0.0) / 1000,
+            timings_ms.get("pass2", 0.0) / 1000, timings_ms.get("pass2_max_batch", 0.0) / 1000,
+            timings_ms.get("identity", 0.0) / 1000, timings_ms.get("post", 0.0) / 1000,
+            timings_ms.get("total", 0.0) / 1000,
+        )
+
         store.set_status(ingest_run_id, "ready")
     except Exception as e:
         logger.exception("ingest run %s failed", ingest_run_id)
+        timings_ms["total"] = (time.monotonic() - t_start) * 1000
+        try:
+            store.set_timings(ingest_run_id, timings_ms)
+        except Exception:
+            logger.warning("ingest run %s: failed to persist partial timings", ingest_run_id, exc_info=True)
         store.set_status(ingest_run_id, "failed", error=str(e))
         raise
     return ingest_run_id

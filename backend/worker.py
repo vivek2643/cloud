@@ -21,12 +21,21 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+from app.services.correlation import CorrelationFilter  # noqa: E402
 from app.services.jobs import app, register_tasks  # noqa: E402
 
+# scale_architecture.plan.md Pillar 7: every log line gets
+# user/project/file/run correlation fields ("-" when unset). The filter must
+# be on the HANDLER, not a logger, to see records propagated up from every
+# module's own `logging.getLogger(__name__)`.
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    format="%(asctime)s %(levelname)s %(name)s "
+           "[user=%(user_id)s project=%(project_id)s file=%(file_id)s run=%(ingest_run_id)s] "
+           "%(message)s",
 )
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(CorrelationFilter())
 logger = logging.getLogger("worker")
 
 
