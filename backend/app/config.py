@@ -135,6 +135,19 @@ class Settings(BaseSettings):
     # Only affects the gemini pass-2 path.
     ingest_pass2_thinking: str = "low"
 
+    # scale_architecture.plan.md Pillar 4: PROACTIVE limiter on in-flight LLM
+    # calls, per provider -- separate from llm/client.py's existing REACTIVE
+    # retry (backoff on a 429/5xx after it happens). Without this, bumping
+    # MAX_PARALLEL_PASS2_BATCHES just turns a slow run into a retry storm: a
+    # single run_ingest already fires up to MAX_PARALLEL_PASS2_BATCHES calls
+    # at once, and run_many() can run up to 4 projects concurrently, each
+    # with its own batch pool -- so today's real worst case is already
+    # 4x MAX_PARALLEL_PASS2_BATCHES in flight process-wide. Pass 1 and an
+    # anthropic-provider pass 2 share the anthropic slot; a gemini-provider
+    # pass 2 uses the gemini slot (see llm/client.py's complete()).
+    ingest_llm_max_inflight_anthropic: int = 8
+    ingest_llm_max_inflight_gemini: int = 8
+
     # migration_runner.plan.md: the startup guard's sanctioned local-dev
     # bypass. "on" (default) means every process refuses to boot on schema
     # drift; "off" disables that check for THIS process only, loudly (a

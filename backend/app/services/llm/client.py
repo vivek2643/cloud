@@ -39,6 +39,7 @@ import anthropic
 from pydantic import BaseModel, ValidationError
 
 from app.config import get_settings
+from app.services import limits
 from app.services.llm.anthropic_client import _block_to_anthropic, _sdk_client
 from app.services.llm.base import Block
 
@@ -304,6 +305,31 @@ def complete(
     schema-valid parsed object, return an error string to reject it, or
     None to accept -- a violation is folded into the exact same
     one-re-ask-then-fail-loud path as a schema violation."""
+    # scale_architecture.plan.md Pillar 4: a PROACTIVE limiter (bounds
+    # concurrency before the call goes out), separate from the REACTIVE
+    # retry inside _with_transient_retry below. Held for the whole call
+    # including its one re-ask -- that's still one logical in-flight
+    # completion. Provider routing mirrors the branch just below: pass 1 and
+    # an anthropic-provider pass 2 share the anthropic slot.
+    provider = "gemini" if (stage == "pass2" and get_settings().ingest_pass2_provider == "gemini") else "anthropic"
+    with limits.llm_slot(provider):
+        return _complete_impl(
+            stage, system, blocks, schema,
+            extra_blocks=extra_blocks, cache=cache, max_tokens=max_tokens, extra_check=extra_check,
+        )
+
+
+def _complete_impl(
+    stage: str,
+    system: str,
+    blocks: List[Block],
+    schema: Type[SchemaT],
+    *,
+    extra_blocks: Optional[List[Block]] = None,
+    cache: bool = True,
+    max_tokens: int = 8192,
+    extra_check: Optional[Callable[[SchemaT], Optional[str]]] = None,
+) -> Completion:
     # gemini_pass2.plan.md: Pass 2 only, gated, off by default. Every other
     # stage (pass1, and pass2 itself when the flag is "anthropic") never
     # imports ingest_gemini at all -- this branch is the ENTIRE surface area

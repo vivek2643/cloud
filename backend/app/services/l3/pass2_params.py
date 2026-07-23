@@ -22,7 +22,9 @@ MAX_CUTS_PER_PASS2_BATCH = 7
 
 # Batches only share a read-only cached prompt prefix, so running them
 # concurrently instead of back-to-back is a pure wall-clock win (see
-# pass2.build_pass2_batches / ingest.py). The merged call is heavier than
-# either old half alone, so this keeps the more conservative of the two
-# prior parallelism levels (pass2a's shards ran 4-wide, pass2b's batches 6).
-MAX_PARALLEL_PASS2_BATCHES = 4
+# pass2.build_pass2_batches / ingest.py). scale_architecture.plan.md Pillar 4:
+# raised from 4 now that llm/client.complete() has a proactive per-provider
+# in-flight limiter (Settings.ingest_llm_max_inflight_{anthropic,gemini}) --
+# without that limiter this many concurrent batches was just a bigger retry
+# storm against the provider's own rate limit, not a real wall-clock win.
+MAX_PARALLEL_PASS2_BATCHES = 8

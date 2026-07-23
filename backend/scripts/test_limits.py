@@ -27,6 +27,7 @@ def _reset():
     rebuild rather than reusing whatever an earlier test sized."""
     limits._ffmpeg_sem = None
     limits._r2_sem = None
+    limits._llm_sems = {}
 
 
 def test_ffmpeg_slot_bounds_concurrency_to_the_configured_limit():
@@ -116,6 +117,42 @@ def test_slot_releases_on_exception():
         assert acquired == [True], "slot did not release after an exception"
     finally:
         settings.ffmpeg_concurrency = orig
+        _reset()
+
+
+def test_llm_slot_bounds_concurrency_per_provider_independently():
+    _reset()
+    settings = get_settings()
+    orig_a, orig_g = settings.ingest_llm_max_inflight_anthropic, settings.ingest_llm_max_inflight_gemini
+    settings.ingest_llm_max_inflight_anthropic = 1
+    settings.ingest_llm_max_inflight_gemini = 2
+    try:
+        counts = {"anthropic": 0, "gemini": 0}
+        peaks = {"anthropic": 0, "gemini": 0}
+        lock = threading.Lock()
+
+        def worker(provider):
+            with limits.llm_slot(provider):
+                with lock:
+                    counts[provider] += 1
+                    peaks[provider] = max(peaks[provider], counts[provider])
+                time.sleep(0.05)
+                with lock:
+                    counts[provider] -= 1
+
+        threads = (
+            [threading.Thread(target=worker, args=("anthropic",)) for _ in range(4)]
+            + [threading.Thread(target=worker, args=("gemini",)) for _ in range(4)]
+        )
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert peaks["anthropic"] == 1, f"expected anthropic peak 1, got {peaks['anthropic']}"
+        assert peaks["gemini"] == 2, f"expected gemini peak 2, got {peaks['gemini']}"
+    finally:
+        settings.ingest_llm_max_inflight_anthropic = orig_a
+        settings.ingest_llm_max_inflight_gemini = orig_g
         _reset()
 
 
