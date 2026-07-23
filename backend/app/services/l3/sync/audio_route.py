@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from app.services.l3 import cuts_v3_read
+from app.services.l3 import cuts_read
 from app.services.l3.sync import store as sync_store
 
 
@@ -44,11 +44,11 @@ def resolve_audio_routes(timeline: List[dict]) -> Dict[str, Dict[str, Any]]:
     file_ids = list({str(s["file_id"]) for s in timeline if s.get("file_id")})
     if not file_ids:
         return {}
-    run_id = cuts_v3_read.latest_run_for_files(file_ids)
+    run_id = cuts_read.latest_run_for_files(file_ids)
     if run_id is None:
         return {}
     rows_by_file: Dict[str, List[Dict[str, Any]]] = {}
-    for row in cuts_v3_read.rows_for_run(run_id, file_ids):
+    for row in cuts_read.rows_for_run(run_id, file_ids):
         rows_by_file.setdefault(row["file_id"], []).append(row)
 
     routes: Dict[str, Dict[str, Any]] = {}

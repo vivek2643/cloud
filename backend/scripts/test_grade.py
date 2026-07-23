@@ -1334,8 +1334,8 @@ def test_scene_meta_join_picks_max_overlap_cut_record():
          "label": "second cut", "summary": "", "on_camera": None,
          "speaker_person": None, "voice_ids": [], "take_group_id": None, "sync_group_id": None},
     ]
-    with mock.patch("app.services.l3.cuts_v3_read.latest_run_for_files", return_value="run-1"), \
-         mock.patch("app.services.l3.cuts_v3_read.rows_for_run", return_value=rows):
+    with mock.patch("app.services.l3.cuts_read.latest_run_for_files", return_value="run-1"), \
+         mock.patch("app.services.l3.cuts_read.rows_for_run", return_value=rows):
         result = lookup_shot_cut_meta([
             ("shot-a", "f1", 2200, 4800),   # overlaps 2nd cut [1800,5000] far more than 1st [0,2000]
             ("shot-b", "f1", 9000, 9500),   # no overlap with either cut
@@ -1447,7 +1447,7 @@ def test_run_grade_job_scene_join_fail_open_on_db_error():
          mock.patch("app.services.l3.grade.job.fetch_color_stats", return_value={}), \
          mock.patch("app.services.l3.grade.job.measure_span", side_effect=fake_measure_span), \
          mock.patch("app.services.l3.grade.job.ensure_cube_file", return_value=None), \
-         mock.patch("app.services.l3.cuts_v3_read.latest_run_for_files", side_effect=RuntimeError("db down")), \
+         mock.patch("app.services.l3.cuts_read.latest_run_for_files", side_effect=RuntimeError("db down")), \
          mock.patch("app.services.l3.store.latest_document", return_value=(doc, 1), create=True):
         grade_job.run_grade_job("thread-fail-open")   # must not raise, must succeed
 
@@ -1534,7 +1534,7 @@ def test_scene_meta_join_empty_result_has_no_subject_box():
     """No covering run at all (the DB join fails open) -- lookup_shot_cut_meta
     returns an empty dict, never raises; a caller's `.get(key)` is None for
     every shot, so no subject_box reaches measure_span."""
-    with mock.patch("app.services.l3.cuts_v3_read.latest_run_for_files", return_value=None):
+    with mock.patch("app.services.l3.cuts_read.latest_run_for_files", return_value=None):
         result = lookup_shot_cut_meta([("s0", "f0", 0, 1000), ("s1", "f1", 0, 1000)])
     assert result == {}
     assert result.get("s0") is None and result.get("s1") is None
@@ -1556,8 +1556,8 @@ def test_scene_meta_invalid_subject_box_rejected():
          "on_camera": None, "speaker_person": None, "voice_ids": [], "take_group_id": None,
          "sync_group_id": None, "framing": {"subject_box": [0.2, 0.3, 0.4, 0.5]}},    # valid
     ]
-    with mock.patch("app.services.l3.cuts_v3_read.latest_run_for_files", return_value="run-1"), \
-         mock.patch("app.services.l3.cuts_v3_read.rows_for_run", return_value=rows):
+    with mock.patch("app.services.l3.cuts_read.latest_run_for_files", return_value="run-1"), \
+         mock.patch("app.services.l3.cuts_read.rows_for_run", return_value=rows):
         result = lookup_shot_cut_meta([
             ("bad-w", "f0", 0, 1000), ("bad-len", "f0", 1000, 2000), ("ok", "f0", 2000, 3000),
         ])
@@ -1577,8 +1577,8 @@ def test_scene_meta_join_populates_hero_ts_ms():
          "on_camera": None, "speaker_person": None, "voice_ids": [], "take_group_id": None,
          "sync_group_id": None, "framing": {"subject_box": [0.2, 0.3, 0.4, 0.5]}, "hero_ts_ms": 900},
     ]
-    with mock.patch("app.services.l3.cuts_v3_read.latest_run_for_files", return_value="run-1"), \
-         mock.patch("app.services.l3.cuts_v3_read.rows_for_run", return_value=rows):
+    with mock.patch("app.services.l3.cuts_read.latest_run_for_files", return_value="run-1"), \
+         mock.patch("app.services.l3.cuts_read.rows_for_run", return_value=rows):
         result = lookup_shot_cut_meta([("s0", "f0", 0, 2000)])
     assert result["s0"].hero_ts_ms == 900, result["s0"]
     print("ok  scene_meta: cut_records.hero_ts_ms is joined alongside subject_box")

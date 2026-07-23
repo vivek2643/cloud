@@ -312,7 +312,7 @@ export interface IngestRun {
   updated_at: string | null;
 }
 
-export interface CutsV3Response {
+export interface CutsResponse {
   project_id: string;
   name: string;
   ingest_run: IngestRun | null;
@@ -334,10 +334,10 @@ export function kickIngest(projectId: string, token: string) {
   });
 }
 
-export function getCutsV3(projectId: string, token: string) {
+export function getCuts(projectId: string, token: string) {
   // no-store: this is read after a re-ingest, so a cached body would show
   // stale cuts (the exact "nothing changed" trap). Always hit the server.
-  return request<CutsV3Response>(`/api/projects/${projectId}/cuts-v3`, {
+  return request<CutsResponse>(`/api/projects/${projectId}/cuts`, {
     token,
     cache: "no-store",
   });

@@ -474,13 +474,13 @@ def test_split_screen_snap_cap_keeps_edge_and_suggests():
     fused seam field."""
     import json as _json_mod
 
-    from app.services.l3 import cuts_v3_read, tools
+    from app.services.l3 import cuts_read, tools
 
     struct = _map()
     ctx = _ctx(struct)
     ctx.run_id = "run-1"
-    orig = cuts_v3_read.rows_for_run
-    cuts_v3_read.rows_for_run = lambda run_id, file_ids: [
+    orig = cuts_read.rows_for_run
+    cuts_read.rows_for_run = lambda run_id, file_ids: [
         {"src_in_ms": 0, "src_out_ms": 1300},      # boundary at 1300ms -- 700ms
         #                                             from the raw in (beyond the 400 cap)
         {"src_in_ms": 3100, "src_out_ms": 8000},   # boundary at 3100ms -- 100ms from raw out
@@ -493,7 +493,7 @@ def test_split_screen_snap_cap_keeps_edge_and_suggests():
              "template": "pip", "from_ms": 0, "to_ms": 2000},
             ctx, doc)
     finally:
-        cuts_v3_read.rows_for_run = orig
+        cuts_read.rows_for_run = orig
     assert changed
     op = new["operations"][-1]
     assert op["src_in_ms"] == 2000, op          # kept: boundary was 700ms away (> cap)
@@ -526,13 +526,13 @@ def test_split_screen_snaps_to_seam_via_dispatch():
     and reports the deltas."""
     import json as _json_mod
 
-    from app.services.l3 import cuts_v3_read, tools
+    from app.services.l3 import cuts_read, tools
 
     struct = _map()
     ctx = _ctx(struct)
     ctx.run_id = "run-1"
-    orig = cuts_v3_read.rows_for_run
-    cuts_v3_read.rows_for_run = lambda run_id, file_ids: [
+    orig = cuts_read.rows_for_run
+    cuts_read.rows_for_run = lambda run_id, file_ids: [
         {"src_in_ms": 0, "src_out_ms": 1200},      # boundary at 1200ms
         {"src_in_ms": 3200, "src_out_ms": 8000},   # boundary at 3200ms
     ]
@@ -545,7 +545,7 @@ def test_split_screen_snaps_to_seam_via_dispatch():
              "template": "pip", "from_ms": 0, "to_ms": 2500},
             ctx, doc)
     finally:
-        cuts_v3_read.rows_for_run = orig
+        cuts_read.rows_for_run = orig
     assert changed and len(new["operations"]) == n0 + 1, new["operations"]
     op = new["operations"][-1]
     assert (op["src_in_ms"], op["src_out_ms"]) == (1200, 3200), op   # snapped, not 1000/3000

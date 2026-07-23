@@ -123,34 +123,34 @@ def test_kick_ingest_503s_when_enqueue_fails():
     print("ok  test_kick_ingest_503s_when_enqueue_fails")
 
 
-def test_get_cuts_v3_returns_result():
+def test_get_cuts_returns_result():
     fake_result = {"project_id": "proj-123", "name": "x", "ingest_run": None, "cuts": []}
     p = _Patcher()
-    p.set(projects.read, "load_cuts_v3", lambda project_id, user_id: fake_result)
+    p.set(projects.read, "load_cuts", lambda project_id, user_id: fake_result)
     _as_user("user-1")
     try:
         client = TestClient(fastapi_app)
-        resp = client.get("/api/projects/proj-123/cuts-v3")
+        resp = client.get("/api/projects/proj-123/cuts")
     finally:
         p.restore()
         _clear_overrides()
     assert resp.status_code == 200, resp.text
     assert resp.json() == fake_result
-    print("ok  test_get_cuts_v3_returns_result")
+    print("ok  test_get_cuts_returns_result")
 
 
-def test_get_cuts_v3_404s_when_not_found():
+def test_get_cuts_404s_when_not_found():
     p = _Patcher()
-    p.set(projects.read, "load_cuts_v3", lambda project_id, user_id: None)
+    p.set(projects.read, "load_cuts", lambda project_id, user_id: None)
     _as_user("user-1")
     try:
         client = TestClient(fastapi_app)
-        resp = client.get("/api/projects/missing/cuts-v3")
+        resp = client.get("/api/projects/missing/cuts")
     finally:
         p.restore()
         _clear_overrides()
     assert resp.status_code == 404, resp.text
-    print("ok  test_get_cuts_v3_404s_when_not_found")
+    print("ok  test_get_cuts_404s_when_not_found")
 
 
 def main():
@@ -159,8 +159,8 @@ def main():
     test_kick_ingest_enqueues_and_returns_queued()
     test_kick_ingest_404s_on_unowned_project()
     test_kick_ingest_503s_when_enqueue_fails()
-    test_get_cuts_v3_returns_result()
-    test_get_cuts_v3_404s_when_not_found()
+    test_get_cuts_returns_result()
+    test_get_cuts_404s_when_not_found()
     print("\nall projects-router tests passed")
 
 

@@ -100,12 +100,12 @@ def signatures_for(file_ids: List[str], run_id: Optional[str] = None) -> Dict[st
     out: Dict[str, Optional[str]] = {fid: None for fid in file_ids}
     if not file_ids:
         return out
-    from app.services.l3 import cuts_v3_read
-    run_id = run_id or cuts_v3_read.latest_run_for_files(file_ids)
+    from app.services.l3 import cuts_read
+    run_id = run_id or cuts_read.latest_run_for_files(file_ids)
     if run_id is None:
         return out
     counts: Dict[str, int] = {}
-    for row in cuts_v3_read.rows_for_run(run_id, file_ids):
+    for row in cuts_read.rows_for_run(run_id, file_ids):
         counts[row["file_id"]] = counts.get(row["file_id"], 0) + 1
     for fid, n in counts.items():
         payload = json.dumps({"run": run_id, "n": n, "v": CUTRECORD_MAP_VERSION}, sort_keys=True)
@@ -585,11 +585,11 @@ def cut_dicts_for_files(file_ids: List[str], run_id: Optional[str] = None) -> Di
     fabrication."""
     if not file_ids:
         return {}
-    from app.services.l3 import cuts_v3_read
-    run_id = run_id or cuts_v3_read.latest_run_for_files(file_ids)
+    from app.services.l3 import cuts_read
+    run_id = run_id or cuts_read.latest_run_for_files(file_ids)
     if run_id is None:
         return {}
     out: Dict[str, List[Dict[str, Any]]] = {}
-    for row in cuts_v3_read.rows_for_run(run_id, file_ids):
+    for row in cuts_read.rows_for_run(run_id, file_ids):
         out.setdefault(row["file_id"], []).append(_to_cut_dict(row))
     return out

@@ -1,6 +1,6 @@
 """
 Persistence for `sync_groups`/`sync_group_members` (audio_sync.plan.md SS6).
-Plain psycopg CRUD, same shape as `cuts_v3_read.py` -- no ORM in this
+Plain psycopg CRUD, same shape as `cuts_read.py` -- no ORM in this
 codebase (see that module's own note on the point).
 """
 from __future__ import annotations

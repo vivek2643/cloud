@@ -6,10 +6,10 @@ import { useDriveStore } from "@/stores/drive-store";
 import {
   createProject,
   kickIngest,
-  getCutsV3,
+  getCuts,
   getFilePlaybackUrl,
   type CutRecord,
-  type CutsV3Response,
+  type CutsResponse,
   type FileRecord,
   type IngestStatus,
   type SalienceEvent,
@@ -392,7 +392,7 @@ function cropForAspect(cut: CutRecord, aspect: Aspect): [number, number, number,
   return cut.framing?.crop_16x9;
 }
 
-export function CutsV3View() {
+export function CutsView() {
   const token = useAuthStore((s) => s.session?.access_token);
   const files = useDriveStore((s) => s.files);
   const [aspect, setAspect] = useState<Aspect>("landscape");
@@ -412,7 +412,7 @@ export function CutsV3View() {
   // middle stop ("Balanced").
   const [energy, setEnergy] = useState(0.5);
   const [projectId, setProjectId] = useState<string | null>(null);
-  const [data, setData] = useState<CutsV3Response | null>(null);
+  const [data, setData] = useState<CutsResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [kicking, setKicking] = useState(false);
   const [pollGen, setPollGen] = useState(0);
@@ -454,7 +454,7 @@ export function CutsV3View() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token, candidateKey]);
 
-  // Fetch cuts-v3 + poll while the ingest run is in a non-terminal state.
+  // Fetch cuts + poll while the ingest run is in a non-terminal state.
   useEffect(() => {
     if (!token || !projectId) {
       setData(null);
@@ -465,7 +465,7 @@ export function CutsV3View() {
 
     async function tick() {
       try {
-        const r = await getCutsV3(projectId!, token!);
+        const r = await getCuts(projectId!, token!);
         if (cancelled) return;
         setData(r);
         setLoading(false);
@@ -739,7 +739,7 @@ export function CutsV3View() {
       {!loading && candidateIds.length === 0 && (
         <EmptyState
           title="No footage yet"
-          body="Upload video. Once analyzed, you can run the cuts-v3 ingest here."
+          body="Upload video. Once analyzed, you can run the cuts ingest here."
         />
       )}
 
@@ -803,7 +803,7 @@ export function CutsV3View() {
                         {c.junk ? (
                           <JunkStrip cut={c} width={CARD_W[aspect]} />
                         ) : (
-                          <CutCardV3
+                          <CutCard
                             file={filesById[c.file_id]!}
                             cut={c}
                             energy={energy}
@@ -841,7 +841,7 @@ function IngestBanner({
   hasProject,
   onKick,
 }: {
-  run: CutsV3Response["ingest_run"];
+  run: CutsResponse["ingest_run"];
   loading: boolean;
   kicking: boolean;
   hasProject: boolean;
@@ -857,7 +857,7 @@ function IngestBanner({
       >
         <div className="flex items-center gap-2 text-sm">
           <Sparkles size={15} style={{ color: "var(--accent)" }} />
-          <span>Not yet ingested for cuts-v3.</span>
+          <span>Not yet ingested for cuts.</span>
         </div>
         <KickButton kicking={kicking} onClick={onKick} label="Run ingest" />
       </div>
@@ -1184,7 +1184,7 @@ function JunkStrip({ cut, width }: { cut: CutRecord; width: number }) {
   );
 }
 
-function CutCardV3({
+function CutCard({
   file,
   cut,
   energy,

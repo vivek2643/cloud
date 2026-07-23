@@ -99,8 +99,8 @@ def build_context(file_ids: List[str], run_id: Optional[str] = None,
     eff_run = run_id
     if eff_run is None and file_ids:
         try:
-            from app.services.l3 import cuts_v3_read
-            eff_run = cuts_v3_read.latest_run_for_files(file_ids)
+            from app.services.l3 import cuts_read
+            eff_run = cuts_read.latest_run_for_files(file_ids)
         except Exception:
             logger.exception("observe: run resolve failed (continuing live)")
     fmap = footage_map.assemble_map(file_ids, run_id=eff_run) if file_ids else {}
@@ -285,8 +285,8 @@ def _seams_for_file(ctx: EditContext, file_id: str) -> List[int]:
     if ctx.run_id is None:
         return []
     try:
-        from app.services.l3 import cuts_v3_read
-        rows = cuts_v3_read.rows_for_run(ctx.run_id, [file_id])
+        from app.services.l3 import cuts_read
+        rows = cuts_read.rows_for_run(ctx.run_id, [file_id])
     except Exception:
         logger.exception("observe: seam points lookup failed for %s", file_id)
         return []

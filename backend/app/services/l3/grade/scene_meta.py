@@ -77,12 +77,12 @@ def lookup_shot_cut_meta(
     if not file_ids:
         return out
     try:
-        from app.services.l3 import cuts_v3_read
+        from app.services.l3 import cuts_read
 
-        run_id = cuts_v3_read.latest_run_for_files(file_ids)
+        run_id = cuts_read.latest_run_for_files(file_ids)
         if run_id is None:
             return out
-        rows = cuts_v3_read.rows_for_run(run_id, file_ids)
+        rows = cuts_read.rows_for_run(run_id, file_ids)
     except Exception:
         return out   # fail-open: grouping falls back to the RGB base
 

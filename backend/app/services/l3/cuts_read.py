@@ -1,7 +1,7 @@
 """
-Cuts v3 read path: ``GET /api/projects/{id}/cuts-v3``. Pure DB read, zero
-model calls -- the latest ``ingest_run`` for a project plus every
-``cut_record`` it produced. See cuts_v3.plan.md section 7.
+Cuts read path: ``GET /api/projects/{id}/cuts``. Pure DB read, zero model
+calls -- the latest ``ingest_run`` for a project plus every ``cut_record``
+it produced. See cuts_v3.plan.md section 7.
 
 Also the resolver + shared row fetch the agentic editor's footage map
 (``cutrecord_map.py``) uses to read the SAME ``cut_records`` a thread's files
@@ -57,7 +57,7 @@ def latest_run_for_files(file_ids: List[str]) -> Optional[str]:
 def rows_for_run(run_id: str, file_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """Every ``cut_record`` row for one ingest run, optionally scoped to a set
     of files. The reusable row fetch behind both the UI read path
-    (``load_cuts_v3``) and the brain's projection (``cutrecord_map``)."""
+    (``load_cuts``) and the brain's projection (``cutrecord_map``)."""
     query = (
         "select id::text, file_id::text, src_in_ms, src_out_ms, kind, word_span, atom_ids,\n"
         "       label, summary, on_camera, take_group_id::text, take_role, channel,\n"
@@ -78,7 +78,7 @@ def rows_for_run(run_id: str, file_ids: Optional[List[str]] = None) -> List[Dict
     return [dict(r) for r in rows]
 
 
-def load_cuts_v3(project_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+def load_cuts(project_id: str, user_id: str) -> Optional[Dict[str, Any]]:
     """None when the project doesn't exist or isn't owned by ``user_id``."""
     with _pg_conn() as conn:
         proj = conn.execute(

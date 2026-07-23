@@ -75,12 +75,12 @@ def fetch_cut_records(file_ids: Sequence[str]) -> Dict[str, List[Dict[str, Any]]
     ids = list({f for f in file_ids if f})
     if not ids:
         return {}
-    from app.services.l3 import cuts_v3_read
-    run_id = cuts_v3_read.latest_run_for_files(ids)
+    from app.services.l3 import cuts_read
+    run_id = cuts_read.latest_run_for_files(ids)
     if run_id is None:
         return {}
     out: Dict[str, List[Dict[str, Any]]] = {}
-    for row in cuts_v3_read.rows_for_run(run_id, ids):
+    for row in cuts_read.rows_for_run(run_id, ids):
         out.setdefault(row["file_id"], []).append(row)
     return out
 

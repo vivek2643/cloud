@@ -75,8 +75,8 @@ def start_thread(user_id: str, file_ids: List[str], brief: str) -> str:
 
     ingest_run_id: Optional[str] = None
     try:
-        from app.services.l3 import cuts_v3_read
-        ingest_run_id = cuts_v3_read.latest_run_for_files(file_ids)
+        from app.services.l3 import cuts_read
+        ingest_run_id = cuts_read.latest_run_for_files(file_ids)
     except Exception:
         logger.exception("start_thread: run pin resolve failed (continuing unpinned)")
 

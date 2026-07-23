@@ -440,7 +440,7 @@ def test_pinned_run_id_is_honored_without_live_resolve():
     """When a thread pins a run (migration 028), the projection reads THAT run
     and never falls back to `latest_run_for_files` -- so a re-ingest mid-thread
     can't swap the beat universe under an active edit."""
-    from app.services.l3 import cuts_v3_read
+    from app.services.l3 import cuts_read
     calls = {"latest": 0, "rows_run": None}
 
     def fake_latest(_fids):
@@ -451,8 +451,8 @@ def test_pinned_run_id_is_honored_without_live_resolve():
         calls["rows_run"] = run_id
         return [_row(id="c", file_id="ffffffff-1111")]
 
-    orig_latest, orig_rows = cuts_v3_read.latest_run_for_files, cuts_v3_read.rows_for_run
-    cuts_v3_read.latest_run_for_files, cuts_v3_read.rows_for_run = fake_latest, fake_rows
+    orig_latest, orig_rows = cuts_read.latest_run_for_files, cuts_read.rows_for_run
+    cuts_read.latest_run_for_files, cuts_read.rows_for_run = fake_latest, fake_rows
     try:
         cm.cut_dicts_for_files(["ffffffff-1111"], run_id="PINNED-RUN")
         assert calls["rows_run"] == "PINNED-RUN", calls
@@ -460,14 +460,14 @@ def test_pinned_run_id_is_honored_without_live_resolve():
         cm.signatures_for(["ffffffff-1111"], run_id="PINNED-RUN")
         assert calls["rows_run"] == "PINNED-RUN" and calls["latest"] == 0, calls
     finally:
-        cuts_v3_read.latest_run_for_files, cuts_v3_read.rows_for_run = orig_latest, orig_rows
+        cuts_read.latest_run_for_files, cuts_read.rows_for_run = orig_latest, orig_rows
     print("ok  test_pinned_run_id_is_honored_without_live_resolve")
 
 
 def test_unpinned_falls_back_to_latest_run():
     """No pin (older threads / pre-028) => resolve the latest covering run live,
     exactly today's behavior."""
-    from app.services.l3 import cuts_v3_read
+    from app.services.l3 import cuts_read
     calls = {"latest": 0, "rows_run": None}
 
     def fake_latest(_fids):
@@ -478,13 +478,13 @@ def test_unpinned_falls_back_to_latest_run():
         calls["rows_run"] = run_id
         return [_row(id="c", file_id="ffffffff-1111")]
 
-    orig_latest, orig_rows = cuts_v3_read.latest_run_for_files, cuts_v3_read.rows_for_run
-    cuts_v3_read.latest_run_for_files, cuts_v3_read.rows_for_run = fake_latest, fake_rows
+    orig_latest, orig_rows = cuts_read.latest_run_for_files, cuts_read.rows_for_run
+    cuts_read.latest_run_for_files, cuts_read.rows_for_run = fake_latest, fake_rows
     try:
         cm.cut_dicts_for_files(["ffffffff-1111"])
         assert calls["latest"] == 1 and calls["rows_run"] == "LATEST-RUN", calls
     finally:
-        cuts_v3_read.latest_run_for_files, cuts_v3_read.rows_for_run = orig_latest, orig_rows
+        cuts_read.latest_run_for_files, cuts_read.rows_for_run = orig_latest, orig_rows
     print("ok  test_unpinned_falls_back_to_latest_run")
 
 

@@ -43,7 +43,7 @@ if BACKEND not in sys.path:
 import psycopg  # noqa: E402
 
 from app.config import get_settings  # noqa: E402
-from app.services.l3 import cuts_v3_read, ingest, ingest_store as store  # noqa: E402
+from app.services.l3 import cuts_read, ingest, ingest_store as store  # noqa: E402
 
 # Approx USD per MILLION tokens (input / output / cache-read). Only used for
 # the printed cost estimate -- raw token counts (in ingest_runs) are the
@@ -85,7 +85,7 @@ def _delete_run(run_id: str) -> None:
     """Tear down a throwaway run: its cut_records first (FK), then the
     ingest_runs row itself -- deleting the row (not just its cuts) is what
     lets the project's real latest run become "latest" again by
-    created_at ordering (see cuts_v3_read.load_cuts_v3's own query)."""
+    created_at ordering (see cuts_read.load_cuts's own query)."""
     store.delete_cut_records_for_run(run_id)
     with _pg_conn() as conn:
         conn.execute("delete from ingest_runs where id = %s", (run_id,))
@@ -179,7 +179,7 @@ def run_ab_for_project(
             elapsed = time.time() - t0
 
             usage = _run_usage(run_id) if run_id else {}
-            records = cuts_v3_read.rows_for_run(run_id) if (run_id and status == "ok") else []
+            records = cuts_read.rows_for_run(run_id) if (run_id and status == "ok") else []
             metrics = _metrics(records)
             cost = _cost_usd(usage, provider) if usage else 0.0
             results[provider] = {

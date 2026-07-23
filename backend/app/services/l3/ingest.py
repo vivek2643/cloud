@@ -407,13 +407,23 @@ def run_ingest(project_id: str) -> str:
     return ingest_run_id
 
 
+@app.task(name="l3_cuts_ingest", queue="ingest", retry=False)
+def l3_cuts_ingest(project_id: str) -> None:
+    run_ingest(project_id)
+
+
 @app.task(name="l3_cuts_v3_ingest", queue="ingest", retry=False)
 def l3_cuts_v3_ingest(project_id: str) -> None:
+    """cuts_v4_only.plan.md Phase 3 (risk R1): temporary alias for
+    ``l3_cuts_ingest`` under the pre-rename task name, so any job still
+    enqueued under the old name from before this deploy keeps running.
+    ``defer_ingest`` below only ever enqueues the new name -- remove this
+    once the ``ingest`` queue has drained past this release."""
     run_ingest(project_id)
 
 
 def defer_ingest(project_id: str) -> None:
-    """Enqueue a cuts-v3 ingest run on the network-bound ``ingest`` procrastinate
+    """Enqueue a cuts ingest run on the network-bound ``ingest`` procrastinate
     queue (its own worker, decoupled from GPU ingest). Not auto-retried: each
     attempt is a real, costed API call, and a failure here is almost always a
     schema/prompt problem worth looking at, not a transient one."""
@@ -422,11 +432,11 @@ def defer_ingest(project_id: str) -> None:
     enqueue_app = App(connector=PsycopgConnector(
         conninfo=get_settings().database_url, min_size=1, max_size=2))
     with enqueue_app.open():
-        enqueue_app.configure_task("l3_cuts_v3_ingest", queue="ingest").defer(project_id=project_id)
+        enqueue_app.configure_task("l3_cuts_ingest", queue="ingest").defer(project_id=project_id)
 
 
 def run_many(project_ids: List[str], max_workers: int = 4) -> Dict[str, Any]:
-    """Run cuts-v3 ingest for several projects concurrently. Different
+    """Run cuts ingest for several projects concurrently. Different
     projects share no state -- separate API calls, separate DB rows,
     separate R2 keys -- so this is a pure wall-clock win with none of the
     prompt-cache tradeoff that parallelizing shards WITHIN one project would

@@ -1068,8 +1068,8 @@ def _cast_table_for(file_ids: List[str], run_id: Optional[str]) -> str:
     cluster, or no covering run at all. Fail-open: any lookup error
     degrades to '', never breaks the map."""
     try:
-        from app.services.l3 import cuts_v3_read, ingest_store
-        resolved_run_id = run_id or cuts_v3_read.latest_run_for_files(file_ids)
+        from app.services.l3 import cuts_read, ingest_store
+        resolved_run_id = run_id or cuts_read.latest_run_for_files(file_ids)
         if resolved_run_id is None:
             return ""
         identity_map = ingest_store.get_identity_map(resolved_run_id)
