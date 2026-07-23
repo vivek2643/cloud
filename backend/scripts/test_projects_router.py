@@ -88,6 +88,30 @@ def test_kick_ingest_enqueues_and_returns_queued():
     print("ok  test_kick_ingest_enqueues_and_returns_queued")
 
 
+def test_kick_ingest_treats_already_enqueued_as_a_noop():
+    """scale_architecture.plan.md Pillar 5: defer_ingest's queueing_lock
+    raises AlreadyEnqueued when a run for this project is already pending --
+    a double-click, not a failure."""
+    from procrastinate.exceptions import AlreadyEnqueued
+
+    def already(project_id):
+        raise AlreadyEnqueued("already queued")
+
+    p = _Patcher()
+    p.set(projects, "_owned_project", lambda project_id, user_id: None)
+    p.set(projects, "defer_ingest", already)
+    _as_user("user-1")
+    try:
+        client = TestClient(fastapi_app)
+        resp = client.post("/api/projects/proj-123/ingest")
+    finally:
+        p.restore()
+        _clear_overrides()
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"project_id": "proj-123", "status": "queued"}
+    print("ok  test_kick_ingest_treats_already_enqueued_as_a_noop")
+
+
 def test_kick_ingest_404s_on_unowned_project():
     def not_found(project_id, user_id):
         raise HTTPException(status_code=404, detail="project not found")
@@ -157,6 +181,7 @@ def main():
     test_create_project_returns_project_id()
     test_create_project_rejects_empty_file_ids()
     test_kick_ingest_enqueues_and_returns_queued()
+    test_kick_ingest_treats_already_enqueued_as_a_noop()
     test_kick_ingest_404s_on_unowned_project()
     test_kick_ingest_503s_when_enqueue_fails()
     test_get_cuts_returns_result()

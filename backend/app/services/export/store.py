@@ -1,5 +1,6 @@
-"""Export row persistence (the `exports` table, migration 047). Mirrors
-`render/store.py`'s shape (same lifecycle: queued -> running -> done/failed)."""
+"""Export row persistence (the `exports` table, migration 047 + 049). Mirrors
+`render/store.py`'s shape (same lifecycle: queued -> running -> done/failed,
+same resolved_hash dedup)."""
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
@@ -12,21 +13,23 @@ def _pg():
 
 _COLS = (
     "id::text, thread_id::text, document_version, kind, quality, include_media, "
-    "status, output_r2_key, error, created_at, updated_at"
+    "resolved_hash, status, output_r2_key, error, created_at, updated_at"
 )
 
 
 def create_export(
-    thread_id: str, document_version: int, kind: str, quality: str, include_media: bool
+    thread_id: str, document_version: int, kind: str, quality: str, include_media: bool,
+    resolved_hash: Optional[str] = None,
 ) -> Dict[str, Any]:
     with _pg() as conn:
         row = conn.execute(
             f"""
-            insert into exports (thread_id, document_version, kind, quality, include_media, status)
-            values (%s, %s, %s, %s, %s, 'queued')
+            insert into exports (thread_id, document_version, kind, quality, include_media,
+                                 resolved_hash, status)
+            values (%s, %s, %s, %s, %s, %s, 'queued')
             returning {_COLS}
             """,
-            (thread_id, document_version, kind, quality, include_media),
+            (thread_id, document_version, kind, quality, include_media, resolved_hash),
         ).fetchone()
     return _row(row)
 
@@ -35,6 +38,25 @@ def get_export(export_id: str) -> Optional[Dict[str, Any]]:
     with _pg() as conn:
         row = conn.execute(
             f"select {_COLS} from exports where id = %s", (export_id,)
+        ).fetchone()
+    return _row(row) if row else None
+
+
+def find_done(
+    thread_id: str, document_version: int, kind: str, quality: str, resolved_hash: str
+) -> Optional[Dict[str, Any]]:
+    """An existing successful export of the identical timeline+kind+quality+
+    include_media (folded into resolved_hash), if any."""
+    with _pg() as conn:
+        row = conn.execute(
+            f"""
+            select {_COLS} from exports
+             where thread_id = %s and document_version = %s and kind = %s
+               and quality = %s and resolved_hash = %s
+               and status = 'done' and output_r2_key is not null
+             order by created_at desc limit 1
+            """,
+            (thread_id, document_version, kind, quality, resolved_hash),
         ).fetchone()
     return _row(row) if row else None
 
@@ -78,9 +100,10 @@ def _row(row: tuple) -> Dict[str, Any]:
         "kind": row[3],
         "quality": row[4],
         "include_media": row[5],
-        "status": row[6],
-        "output_r2_key": row[7],
-        "error": row[8],
-        "created_at": row[9].isoformat() if row[9] else None,
-        "updated_at": row[10].isoformat() if row[10] else None,
+        "resolved_hash": row[6],
+        "status": row[7],
+        "output_r2_key": row[8],
+        "error": row[9],
+        "created_at": row[10].isoformat() if row[10] else None,
+        "updated_at": row[11].isoformat() if row[11] else None,
     }

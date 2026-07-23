@@ -50,9 +50,16 @@ def create_project(body: CreateProjectBody, user_id: str = Depends(get_current_u
 def kick_ingest(project_id: str, user_id: str = Depends(get_current_user_id)):
     """Enqueue (or re-enqueue) the cuts ingest for this project. Returns
     immediately; poll GET /{project_id}/cuts for status."""
+    from procrastinate.exceptions import AlreadyEnqueued
+
     _owned_project(project_id, user_id)
     try:
         defer_ingest(project_id)
+    except AlreadyEnqueued:
+        # scale_architecture.plan.md Pillar 5: defer_ingest's queueing_lock
+        # already caught this -- a run for this project is already pending.
+        # A double-click/retry, not a failure: same response either way.
+        pass
     except Exception:
         logger.exception("could not enqueue ingest for project %s", project_id)
         raise HTTPException(status_code=503, detail="could not enqueue ingest")

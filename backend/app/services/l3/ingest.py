@@ -500,13 +500,29 @@ def defer_ingest(project_id: str) -> None:
     """Enqueue a cuts ingest run on the network-bound ``ingest`` procrastinate
     queue (its own worker, decoupled from GPU ingest). Not auto-retried: each
     attempt is a real, costed API call, and a failure here is almost always a
-    schema/prompt problem worth looking at, not a transient one."""
+    schema/prompt problem worth looking at, not a transient one.
+
+    scale_architecture.plan.md Pillar 5: nothing previously stopped two
+    concurrent runs for the same project (no lock at this call site, and
+    ``run_ingest`` always inserts a fresh ``ingest_runs`` row and redoes all
+    work from scratch -- ``ingest_runs.status`` tracks progress, it doesn't
+    gate resume the way L1's ``processing_jobs`` does). ``lock`` keeps two
+    runs for the SAME project from ever being ``doing`` simultaneously -- a
+    worker-side fetch constraint that holds even with >1 worker/concurrency
+    on the ``ingest`` queue, unlike ``queueing_lock`` alone (which only
+    dedups the ``todo`` state). ``queueing_lock`` additionally collapses a
+    double-click into one pending job instead of stacking up redundant,
+    real-money LLM runs -- ``Task.defer`` raises ``AlreadyEnqueued`` when one
+    is already waiting; the caller treats that as a no-op, not a failure."""
     from procrastinate import App, PsycopgConnector
 
     enqueue_app = App(connector=PsycopgConnector(
         conninfo=get_settings().database_url, min_size=1, max_size=2))
     with enqueue_app.open():
-        enqueue_app.configure_task("l3_cuts_ingest", queue="ingest").defer(project_id=project_id)
+        enqueue_app.configure_task(
+            "l3_cuts_ingest", queue="ingest",
+            lock=f"ingest:{project_id}", queueing_lock=f"ingest:{project_id}",
+        ).defer(project_id=project_id)
 
 
 def run_many(project_ids: List[str], max_workers: int = 4) -> Dict[str, Any]:

@@ -88,14 +88,24 @@ def _analysis_proxy_keys(file_id: str) -> tuple[str, str]:
 def _enqueue_task(task_name: str, file_id: str, r2_key: str) -> bool:
     """Defer a GPU-queue ingest task via a short-lived, per-call procrastinate
     connector (see the long note on the original _enqueue_l1 for why a per-call
-    connector avoids the concurrent-complete race). Best-effort."""
+    connector avoids the concurrent-complete race). Best-effort.
+
+    scale_architecture.plan.md Pillar 5: `lock` keyed on the file (not the
+    task name -- l1_orchestrate/l1_editing_proxy are mutually exclusive
+    alternatives for the SAME file, never both) makes jobs.py's own claimed
+    invariant ("never run two L1 pipelines for the same file concurrently")
+    actually true -- a retried /complete call or a duplicate multipart
+    finalize can't start a second GPU pipeline run while one is still
+    `doing`; it just waits behind the lock instead."""
     try:
         from procrastinate import App, PsycopgConnector
 
         enqueue_app = App(connector=PsycopgConnector(
             conninfo=get_settings().database_url, min_size=1, max_size=2))
         with enqueue_app.open():
-            enqueue_app.configure_task(task_name, queue="gpu").defer(file_id=file_id, r2_key=r2_key)
+            enqueue_app.configure_task(
+                task_name, queue="gpu", lock=f"l1:{file_id}",
+            ).defer(file_id=file_id, r2_key=r2_key)
         return True
     except Exception:
         logger.exception("Could not enqueue %s for %s; file is still uploaded.", task_name, file_id)

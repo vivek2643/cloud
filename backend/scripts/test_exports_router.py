@@ -21,6 +21,8 @@ from fastapi.testclient import TestClient  # noqa: E402
 from app.auth import get_current_user_id  # noqa: E402
 from app.main import app as fastapi_app  # noqa: E402
 from app.routers import exports  # noqa: E402
+from app.services.render import compositor as render_compositor  # noqa: E402
+from app.services.render import tasks as render_tasks  # noqa: E402
 
 
 class _Patcher:
@@ -48,13 +50,24 @@ _THREAD = {"id": "thread-1", "user_id": "user-1"}
 _DOCUMENT = {"timeline": [{"seg_id": "s0", "file_id": "f1"}], "operations": []}
 
 
+def _patch_dedup_noop(p: "_Patcher") -> None:
+    """Pillar 5: create_export now resolves the document + hashes it to
+    check for an existing done export before enqueuing. Patch that path to a
+    no-op (never finds a match) so tests unrelated to dedup itself don't
+    need a real resolve/hash."""
+    p.set(render_tasks, "resolve_document", lambda document, thread_id=None: {})
+    p.set(render_compositor, "resolved_hash", lambda resolved, preset: "hash-noop")
+    p.set(exports.export_store, "find_done", lambda tid, v, kind, quality, rhash: None)
+
+
 def test_create_export_enqueues_and_returns_queued_row():
     p = _Patcher()
     p.set(exports.l3_store, "get_thread", lambda thread_id: dict(_THREAD, id=thread_id))
     p.set(exports.l3_store, "latest_document", lambda thread_id: (_DOCUMENT, 3))
-    p.set(exports.export_store, "create_export", lambda tid, v, kind, quality, media: {
+    _patch_dedup_noop(p)
+    p.set(exports.export_store, "create_export", lambda tid, v, kind, quality, media, rhash: {
         "id": "exp-1", "thread_id": tid, "document_version": v, "kind": kind,
-        "quality": quality, "include_media": media, "status": "queued",
+        "quality": quality, "include_media": media, "resolved_hash": rhash, "status": "queued",
         "output_r2_key": None, "error": None, "created_at": None, "updated_at": None,
     })
     calls = []
@@ -75,6 +88,39 @@ def test_create_export_enqueues_and_returns_queued_row():
     assert body["kind"] == "mp4" and body["quality"] == "1080"
     assert calls == ["exp-1"]
     print("ok  test_create_export_enqueues_and_returns_queued_row")
+
+
+def test_create_export_short_circuits_to_existing_done_export():
+    p = _Patcher()
+    p.set(exports.l3_store, "get_thread", lambda thread_id: dict(_THREAD, id=thread_id))
+    p.set(exports.l3_store, "latest_document", lambda thread_id: (_DOCUMENT, 3))
+    p.set(render_tasks, "resolve_document", lambda document, thread_id=None: {})
+    p.set(render_compositor, "resolved_hash", lambda resolved, preset: "hash-match")
+    done_row = {
+        "id": "exp-done", "thread_id": "thread-1", "document_version": 3, "kind": "mp4",
+        "quality": "1080", "include_media": False, "resolved_hash": "hash-match", "status": "done",
+        "output_r2_key": "exports/existing.mp4", "error": None, "created_at": None, "updated_at": None,
+    }
+    p.set(exports.export_store, "find_done", lambda tid, v, kind, quality, rhash: done_row)
+    create_calls = []
+    p.set(exports.export_store, "create_export", lambda *a, **kw: create_calls.append((a, kw)) or {})
+    enqueue_calls = []
+    p.set(exports, "_enqueue", lambda export_id: enqueue_calls.append(export_id) or True)
+    _as_user("user-1")
+    try:
+        client = TestClient(fastapi_app)
+        resp = client.post(
+            "/api/edit/threads/thread-1/export",
+            json={"kind": "mp4", "quality": "1080", "include_media": False},
+        )
+    finally:
+        p.restore()
+        _clear_overrides()
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["id"] == "exp-done"
+    assert create_calls == [], "should not create a new row when an identical done export exists"
+    assert enqueue_calls == [], "should not enqueue when short-circuiting to an existing export"
+    print("ok  test_create_export_short_circuits_to_existing_done_export")
 
 
 def test_create_export_rejects_unknown_kind():
@@ -156,9 +202,10 @@ def test_create_export_marks_failed_when_enqueue_fails():
     p = _Patcher()
     p.set(exports.l3_store, "get_thread", lambda thread_id: dict(_THREAD, id=thread_id))
     p.set(exports.l3_store, "latest_document", lambda thread_id: (_DOCUMENT, 3))
-    p.set(exports.export_store, "create_export", lambda tid, v, kind, quality, media: {
+    _patch_dedup_noop(p)
+    p.set(exports.export_store, "create_export", lambda tid, v, kind, quality, media, rhash: {
         "id": "exp-2", "thread_id": tid, "document_version": v, "kind": kind,
-        "quality": quality, "include_media": media, "status": "queued",
+        "quality": quality, "include_media": media, "resolved_hash": rhash, "status": "queued",
         "output_r2_key": None, "error": None, "created_at": None, "updated_at": None,
     })
     updates = []
@@ -268,6 +315,7 @@ def test_list_exports_returns_all_for_thread():
 
 def main():
     test_create_export_enqueues_and_returns_queued_row()
+    test_create_export_short_circuits_to_existing_done_export()
     test_create_export_rejects_unknown_kind()
     test_create_export_rejects_unknown_quality()
     test_create_export_404s_on_unowned_thread()

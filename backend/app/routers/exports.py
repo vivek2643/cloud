@@ -97,7 +97,22 @@ def create_export(
     if not (document.get("timeline") or document.get("resolved")):
         raise HTTPException(status_code=409, detail="Edit document has no timeline to export")
 
-    row = export_store.create_export(thread_id, version, body.kind, body.quality, body.include_media)
+    # scale_architecture.plan.md Pillar 5: dedup, mirroring routers/renders.py
+    # (export_options.plan.md shipped without it -- resolved_hash folds in
+    # kind/quality/include_media too, since unlike a render those genuinely
+    # change the output for the SAME timeline). build_export resolves the
+    # document itself either way, so this isn't new request-path cost beyond
+    # what render's create_render already accepts.
+    from app.services.render.tasks import resolve_document
+    resolved = resolve_document(document, thread_id=thread_id)
+    rhash = compositor.resolved_hash(resolved, f"{body.kind}:{body.quality}:{int(body.include_media)}")
+
+    existing = export_store.find_done(thread_id, version, body.kind, body.quality, rhash)
+    if existing:
+        return _to_response(existing)
+
+    row = export_store.create_export(
+        thread_id, version, body.kind, body.quality, body.include_media, rhash)
     if not _enqueue(row["id"]):
         export_store.update_status(row["id"], status="failed", error="Worker unavailable.")
         row = export_store.get_export(row["id"]) or row

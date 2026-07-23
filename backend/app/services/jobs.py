@@ -4,8 +4,13 @@ procrastinate app: Postgres-backed durable job queue.
 Why procrastinate over FastAPI BackgroundTasks:
   - Survives API process restarts.
   - Retries with exponential backoff.
-  - Single-writer locking per task name so we never run two L1 pipelines
-    for the same file concurrently.
+  - Job-level `lock`/`queueing_lock` support so a call site CAN enforce
+    single-writer semantics for a given key (e.g. upload.py's `_enqueue_task`
+    locks on file_id so we never run two L1 pipelines for the same file
+    concurrently, ingest.py's `defer_ingest` locks on project_id the same
+    way for L3) -- see scale_architecture.plan.md Pillar 5. Procrastinate
+    itself has no such guarantee by default; it's opt-in per `configure_task`
+    call, not automatic just from using the library.
 
 Setup (one-time):
   - Add DATABASE_URL to .env (direct Supabase Postgres URL).
