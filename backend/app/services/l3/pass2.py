@@ -412,7 +412,7 @@ def to_pass2_cuts(
     return out
 
 
-def apply_junk_suspects(pass2: Pass2Output, pass1: Pass1Output) -> Pass2Output:
+def apply_junk_suspects(pass2: Pass2Output, pass1: Pass1Output, lattices: Dict[str, Lattice]) -> Pass2Output:
     """Deterministically carry pass 1's semantic junk calls onto the final
     cuts. A cut fully contained in a pass-1 junk_suspect span (a leading
     camera cue that the coverage-fill surfaced as its own recovered cut, dead
@@ -420,14 +420,31 @@ def apply_junk_suspects(pass2: Pass2Output, pass1: Pass1Output) -> Pass2Output:
     from a single still. Junk is binary and RECOVERABLE (hidden into the
     Discarded tray, never deleted), so nothing is lost. Conservative: only
     EXACT containment, never a partial overlap (which might clip real
-    content)."""
+    content).
+
+    cuts_v4_only.plan.md: video-junk matching is ms-span overlap, not
+    atom_ids -- a V4 video cut carries no atom_ids to intersect against (the
+    old `atom_ids <= suspect.atom_ids` test was already permanently
+    vacuous). A junk suspect's own `atom_ids` (still emitted by pass 1 --
+    atoms remain the non-speech scaffolding) are resolved to their ms span
+    via `lattices`, the same edge-resolution `post._junk_suspect_spans`
+    uses; a video cut's span comes straight from its own
+    `pass1.video_tentative_groups` entry (the segmenter's own ground truth),
+    looked up by source_ref the same way `_video_group_is_v4` does."""
     speech_susp: Dict[str, List[Tuple[int, int, str]]] = {}
-    video_susp: Dict[str, List[Tuple[set, str]]] = {}
+    video_susp: Dict[str, List[Tuple[int, int, str]]] = {}
     for js in pass1.junk_suspects:
         if js.word_span is not None:
             speech_susp.setdefault(js.file_id, []).append((js.word_span[0], js.word_span[1], js.reason))
         elif js.atom_ids:
-            video_susp.setdefault(js.file_id, []).append((set(js.atom_ids), js.reason))
+            lattice = lattices.get(js.file_id)
+            if lattice is None:
+                continue
+            atoms_by_id = {a.atom_id: a for a in lattice.atoms}
+            members = [atoms_by_id[i] for i in js.atom_ids if i in atoms_by_id]
+            if members:
+                span = (min(a.start_ms for a in members), max(a.end_ms for a in members))
+                video_susp.setdefault(js.file_id, []).append((span[0], span[1], js.reason))
 
     n = 0
     for c in pass2.cuts:
@@ -437,9 +454,13 @@ def apply_junk_suspects(pass2: Pass2Output, pass1: Pass1Output) -> Pass2Output:
         if c.kind == "speech" and c.word_span is not None:
             a, b = c.word_span
             hit = next((r for (sa, sb, r) in speech_susp.get(c.file_id, []) if sa <= a and b <= sb), None)
-        elif c.kind == "video" and c.atom_ids:
-            ids = set(c.atom_ids)
-            hit = next((r for (sids, r) in video_susp.get(c.file_id, []) if ids <= sids), None)
+        elif c.kind == "video":
+            gi = _ref_index(c.source_ref, "video_group[")
+            if gi is not None and gi < len(pass1.video_tentative_groups):
+                vg = pass1.video_tentative_groups[gi]
+                if vg.src_in_ms is not None and vg.src_out_ms is not None:
+                    cs, ce = vg.src_in_ms, vg.src_out_ms
+                    hit = next((r for (ss, se, r) in video_susp.get(c.file_id, []) if ss <= cs and ce <= se), None)
         if hit is not None:
             c.junk = True
             c.junk_reason = c.junk_reason or hit
@@ -641,14 +662,13 @@ _SYSTEM = _SYSTEM_PREFIX + _V3_VIDEO_CLAUSE + _SYSTEM_SUFFIX
 
 
 def system_prompt(cuts_segmenter: str = "v3") -> str:
-    """The per-call system prompt (v4_cuts_as_primitive.plan.md section 3.2):
-    ``_SYSTEM`` (byte-identical) on V3; on V4 the video-handling paragraph
-    swaps to the "already a finished cut, never split" version. Everything
-    else -- speech grouping, framing, look, junk, shape, people -- is
-    unchanged either way."""
-    if cuts_segmenter == "v4":
-        return _SYSTEM_PREFIX + _V4_VIDEO_CLAUSE + _SYSTEM_SUFFIX
-    return _SYSTEM
+    """The per-call system prompt. cuts_v4_only.plan.md Phase 1: V4 is the
+    only cuts path now, so this always returns the V4 video-handling clause
+    ("already a finished cut, never split"); `cuts_segmenter` is inert here
+    for one commit (kept for signature compatibility, deleted in Phase 2
+    along with `_V3_VIDEO_CLAUSE`/`_SYSTEM`). Everything else -- speech
+    grouping, framing, look, junk, shape, people -- is unchanged."""
+    return _SYSTEM_PREFIX + _V4_VIDEO_CLAUSE + _SYSTEM_SUFFIX
 
 # gemini_pass2.plan.md Phase 3: appended to _SYSTEM ONLY when
 # ingest_pass2_provider=="gemini" -- never mutates the base prompt (that

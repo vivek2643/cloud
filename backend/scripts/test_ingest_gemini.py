@@ -572,7 +572,7 @@ def test_run_pass2_batch_anthropic_provider_system_prompt_unchanged():
     finally:
         settings.ingest_pass2_provider = orig_provider
 
-    assert captured["system"] == pass2._SYSTEM
+    assert captured["system"] == pass2.system_prompt()  # no _GEMINI_REINFORCE leaks onto the Anthropic path
     print("ok  test_run_pass2_batch_anthropic_provider_system_prompt_unchanged")
 
 
@@ -601,7 +601,7 @@ def test_run_pass2_batch_gemini_provider_appends_reinforcement():
     finally:
         settings.ingest_pass2_provider = orig
 
-    assert captured["system"] == pass2._SYSTEM + pass2._GEMINI_REINFORCE
+    assert captured["system"] == pass2.system_prompt() + pass2._GEMINI_REINFORCE
     assert captured["system"] == pass2.gemini_system_prompt()
     print("ok  test_run_pass2_batch_gemini_provider_appends_reinforcement")
 

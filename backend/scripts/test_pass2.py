@@ -76,7 +76,7 @@ def test_apply_junk_suspects_hides_a_contained_speech_cut():
                        label="the real line", summary="content"),
     ])
     p1 = Pass1Output(junk_suspects=[JunkSuspect(file_id="f1", word_span=(0, 1), reason="camera cue")])
-    out = pass2.apply_junk_suspects(p2, p1)
+    out = pass2.apply_junk_suspects(p2, p1, {})
     assert out.cuts[0].junk is True, out.cuts[0]
     assert out.cuts[0].junk_reason == "camera cue"
     assert out.cuts[1].junk is False, out.cuts[1]   # real content untouched
@@ -92,9 +92,56 @@ def test_apply_junk_suspects_ignores_partial_overlap():
                        label="mixed", summary="cue then content"),
     ])
     p1 = Pass1Output(junk_suspects=[JunkSuspect(file_id="f1", word_span=(0, 1), reason="camera cue")])
-    out = pass2.apply_junk_suspects(p2, p1)
+    out = pass2.apply_junk_suspects(p2, p1, {})
     assert out.cuts[0].junk is False, out.cuts[0]
     print("ok  test_apply_junk_suspects_ignores_partial_overlap")
+
+
+def _lattice_with_junk_atom():
+    from app.services.l3.lattice import Atom, Lattice
+    atoms = [Atom(atom_id=0, file_id="f1", start_ms=0, end_ms=500, state_in="x", state_out="y",
+                 action_energy=0.1, coherence=0.9)]
+    return Lattice(file_id="f1", duration_ms=10000, words=[], turns=[], hints=[], atoms=atoms)
+
+
+def test_apply_junk_suspects_hides_a_contained_v4_video_cut():
+    # cuts_v4_only.plan.md FIX: a V4 video cut carries no atom_ids, so
+    # video-junk matching must go by ms-span overlap against the cut's own
+    # pass1.video_tentative_groups span, not atom_ids.
+    p2 = pass2.Pass2Output(cuts=[
+        pass2.Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1",
+                       label="cue", summary="camera cue"),
+        pass2.Pass2Cut(source_ref="video_group[1]", kind="video", file_id="f1",
+                       label="real", summary="real content"),
+    ])
+    p1 = Pass1Output(
+        video_tentative_groups=[
+            VideoTentativeGroup(file_id="f1", atom_ids=[], src_in_ms=0, src_out_ms=400),
+            VideoTentativeGroup(file_id="f1", atom_ids=[], src_in_ms=1000, src_out_ms=3000),
+        ],
+        junk_suspects=[JunkSuspect(file_id="f1", atom_ids=[0], reason="camera cue")],
+    )
+    out = pass2.apply_junk_suspects(p2, p1, {"f1": _lattice_with_junk_atom()})
+    assert out.cuts[0].junk is True, out.cuts[0]
+    assert out.cuts[0].junk_reason == "camera cue"
+    assert out.cuts[1].junk is False, out.cuts[1]   # real content, outside the suspect span
+    print("ok  test_apply_junk_suspects_hides_a_contained_v4_video_cut")
+
+
+def test_apply_junk_suspects_v4_video_cut_ignores_partial_overlap():
+    p2 = pass2.Pass2Output(cuts=[
+        pass2.Pass2Cut(source_ref="video_group[0]", kind="video", file_id="f1",
+                       label="mixed", summary="cue then content"),
+    ])
+    p1 = Pass1Output(
+        video_tentative_groups=[
+            VideoTentativeGroup(file_id="f1", atom_ids=[], src_in_ms=0, src_out_ms=2000),
+        ],
+        junk_suspects=[JunkSuspect(file_id="f1", atom_ids=[0], reason="camera cue")],
+    )
+    out = pass2.apply_junk_suspects(p2, p1, {"f1": _lattice_with_junk_atom()})
+    assert out.cuts[0].junk is False, out.cuts[0]
+    print("ok  test_apply_junk_suspects_v4_video_cut_ignores_partial_overlap")
 
 
 # --------------------------------------------------------------------------
@@ -392,20 +439,17 @@ def test_v4_n_groups_in_yields_n_labeled_cuts_out_no_split():
     print("ok  test_v4_n_groups_in_yields_n_labeled_cuts_out_no_split")
 
 
-def test_v4_system_prompt_drops_the_split_clause():
-    v3 = pass2.system_prompt("v3")
-    v4 = pass2.system_prompt("v4")
-    assert "MAY be split back" in v3
-    assert "MAY be split back" not in v4
-    assert "never split or merge" in v4
-    assert v3 != v4
-    print("ok  test_v4_system_prompt_drops_the_split_clause")
-
-
-def test_v3_system_prompt_is_byte_identical_to_the_default():
-    assert pass2.system_prompt() == pass2._SYSTEM
-    assert pass2.system_prompt("v3") == pass2._SYSTEM
-    print("ok  test_v3_system_prompt_is_byte_identical_to_the_default")
+def test_system_prompt_always_uses_v4_clause_regardless_of_param():
+    # cuts_v4_only.plan.md Phase 1: V4 is the only cuts path now -- the
+    # `cuts_segmenter` param is inert (kept for one commit, removed in
+    # Phase 2 along with `_V3_VIDEO_CLAUSE`/`_SYSTEM`).
+    default = pass2.system_prompt()
+    explicit_v3 = pass2.system_prompt("v3")
+    explicit_v4 = pass2.system_prompt("v4")
+    assert default == explicit_v3 == explicit_v4
+    assert "never split or merge" in default
+    assert "MAY be split back" not in default
+    print("ok  test_system_prompt_always_uses_v4_clause_regardless_of_param")
 
 
 def test_valid_cuts_round_trip():
@@ -867,6 +911,8 @@ def main():
     test_pass2cut_constructs_with_all_fields()
     test_apply_junk_suspects_hides_a_contained_speech_cut()
     test_apply_junk_suspects_ignores_partial_overlap()
+    test_apply_junk_suspects_hides_a_contained_v4_video_cut()
+    test_apply_junk_suspects_v4_video_cut_ignores_partial_overlap()
     test_apply_take_groups_outlook_path_matches_old_apply_outlook_roles()
     test_apply_take_groups_non_outlook_group_gets_take_role()
     test_apply_take_groups_then_enforce_take_winner_crowns_the_best()
@@ -885,8 +931,7 @@ def main():
     test_v4_video_cut_passes_locators_resolved_with_no_atom_ids()
     test_v4_video_group_never_needs_atom_partition_check()
     test_v4_n_groups_in_yields_n_labeled_cuts_out_no_split()
-    test_v4_system_prompt_drops_the_split_clause()
-    test_v3_system_prompt_is_byte_identical_to_the_default()
+    test_system_prompt_always_uses_v4_clause_regardless_of_param()
     test_valid_cuts_round_trip()
     test_pass2_batch_output_rejects_an_unexpected_wrapper_key()
     test_cutjudgment_defaults_are_safe()

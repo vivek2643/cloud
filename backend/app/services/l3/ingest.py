@@ -227,46 +227,44 @@ def run_ingest(project_id: str) -> str:
         # footage_map/observe's alt-PIC angle switching.
         pass1_output = pass1.group_outlooks(pass1_output, groups)
 
-        # cuts_v4_segmentation.plan.md: replace pass 1's own LLM video groups
-        # with the deterministic, signal-driven segmenter's cuts. Speech +
-        # junk stay pass 1's (untouched above); v4_meta_by_ref carries each
-        # V4 cut's real span + salience + density to image_plan/identity/post
-        # below (empty on the V3 path -- every one of those params is a no-op
-        # when empty, byte-identical to today).
+        # cuts_v4_only.plan.md: the deterministic, signal-driven segmenter is
+        # the ONLY video-cut path now -- pass 1 no longer emits its own video
+        # groups at all (see pass1.py, the model prompt only asks for
+        # speech). v4_meta_by_ref carries each cut's real span + salience +
+        # density to image_plan/identity/post below.
         v4_meta_by_ref: Dict[str, Dict[str, Any]] = {}
-        if settings.cuts_segmenter == "v4":
-            speech_spans_by_file: Dict[str, List[Tuple[int, int]]] = {}
-            for sc in pass1_output.speech_cuts:
-                lat = lattices.get(sc.file_id)
-                if lat is None or not lat.words:
-                    continue
-                s, e = resolve_speech_span_ms(lat.words, lat.atoms, tuple(sc.word_span),
-                                              silences_by_file.get(sc.file_id, []))
-                if e > s:
-                    speech_spans_by_file.setdefault(sc.file_id, []).append((s, e))
+        speech_spans_by_file: Dict[str, List[Tuple[int, int]]] = {}
+        for sc in pass1_output.speech_cuts:
+            lat = lattices.get(sc.file_id)
+            if lat is None or not lat.words:
+                continue
+            s, e = resolve_speech_span_ms(lat.words, lat.atoms, tuple(sc.word_span),
+                                          silences_by_file.get(sc.file_id, []))
+            if e > s:
+                speech_spans_by_file.setdefault(sc.file_id, []).append((s, e))
 
-            video_tentative_groups: List[pass1.VideoTentativeGroup] = []
-            for fid in file_ids:
-                lat = lattices[fid]
-                for vc in v4seg.segment_video(
-                    file_id=fid, duration_ms=lat.duration_ms,
-                    speech_spans=sorted(speech_spans_by_file.get(fid, [])),
-                    motion=motion_by_file.get(fid) or {}, audio=audio_by_file.get(fid) or {},
-                    scene=scene_by_file.get(fid) or {},
-                ):
-                    gi = len(video_tentative_groups)
-                    # v4_cuts_as_primitive.plan.md section 3.1: the V4 cut IS
-                    # the primitive -- no atoms, its own span carried directly
-                    # on the group (never re-derived from atom membership).
-                    video_tentative_groups.append(pass1.VideoTentativeGroup(
-                        file_id=fid, atom_ids=[], src_in_ms=vc.src_in_ms, src_out_ms=vc.src_out_ms))
-                    v4_meta_by_ref[f"video_group[{gi}]"] = {
-                        "src_in_ms": vc.src_in_ms, "src_out_ms": vc.src_out_ms,
-                        "salience": dict(vc.salience), "density": vc.density,
-                    }
-            logger.info("ingest: v4 segmenter produced %d video cut(s) across %d file(s)",
-                       len(video_tentative_groups), len(file_ids))
-            pass1_output = pass1_output.model_copy(update={"video_tentative_groups": video_tentative_groups})
+        video_tentative_groups: List[pass1.VideoTentativeGroup] = []
+        for fid in file_ids:
+            lat = lattices[fid]
+            for vc in v4seg.segment_video(
+                file_id=fid, duration_ms=lat.duration_ms,
+                speech_spans=sorted(speech_spans_by_file.get(fid, [])),
+                motion=motion_by_file.get(fid) or {}, audio=audio_by_file.get(fid) or {},
+                scene=scene_by_file.get(fid) or {},
+            ):
+                gi = len(video_tentative_groups)
+                # v4_cuts_as_primitive.plan.md section 3.1: the V4 cut IS
+                # the primitive -- no atoms, its own span carried directly
+                # on the group (never re-derived from atom membership).
+                video_tentative_groups.append(pass1.VideoTentativeGroup(
+                    file_id=fid, atom_ids=[], src_in_ms=vc.src_in_ms, src_out_ms=vc.src_out_ms))
+                v4_meta_by_ref[f"video_group[{gi}]"] = {
+                    "src_in_ms": vc.src_in_ms, "src_out_ms": vc.src_out_ms,
+                    "salience": dict(vc.salience), "density": vc.density,
+                }
+        logger.info("ingest: v4 segmenter produced %d video cut(s) across %d file(s)",
+                   len(video_tentative_groups), len(file_ids))
+        pass1_output = pass1_output.model_copy(update={"video_tentative_groups": video_tentative_groups})
 
         store.record_pass1_result(ingest_run_id, pass1_output.model_dump(), pass1_completion.usage,
                                   pass1_output.project_summary)
@@ -350,7 +348,7 @@ def run_ingest(project_id: str) -> str:
                 ig.delete_pass2_cache(pass2_cache_name)
 
         pass2_output = pass2.Pass2Output(cuts=all_cuts)
-        pass2_output = pass2.apply_junk_suspects(pass2_output, pass1_output)
+        pass2_output = pass2.apply_junk_suspects(pass2_output, pass1_output, lattices)
         # take_group_id/take_role are entirely code-owned now (pass2_merge.
         # plan.md D1/D2): the model never resolves takes, so this is the
         # ONLY place they're ever set -- both declared-outlook members
@@ -372,9 +370,10 @@ def run_ingest(project_id: str) -> str:
         # (face tracks at L1, cuts by pass 2).
         face_tracks_by_file = _face_tracks_for_files(file_ids)
         track_to_person, persons = identity_faces.cluster(face_tracks_by_file)
-        # cuts_v4_segmentation.plan.md: a V4 video cut's real span is the
-        # segmenter's own, not the atom-membership bounding box -- see
-        # identity/faces._cut_span_ms. Empty on the V3 path (no-op).
+        # cuts_v4_only.plan.md: a video cut's real span is the segmenter's
+        # own -- see identity/faces._cut_span_ms. `or None` below just means
+        # "this project happened to have zero video cuts" (all speech), not
+        # a fallback path.
         v4_span_override = {ref: (meta["src_in_ms"], meta["src_out_ms"])
                             for ref, meta in v4_meta_by_ref.items()}
         visible_persons = identity_faces.visible_persons_by_cut(
