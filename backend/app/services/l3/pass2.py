@@ -430,7 +430,7 @@ def apply_junk_suspects(pass2: Pass2Output, pass1: Pass1Output, lattices: Dict[s
     via `lattices`, the same edge-resolution `post._junk_suspect_spans`
     uses; a video cut's span comes straight from its own
     `pass1.video_tentative_groups` entry (the segmenter's own ground truth),
-    looked up by source_ref the same way `_video_group_is_v4` does."""
+    looked up by source_ref via `_ref_index`."""
     speech_susp: Dict[str, List[Tuple[int, int, str]]] = {}
     video_susp: Dict[str, List[Tuple[int, int, str]]] = {}
     for js in pass1.junk_suspects:
@@ -541,23 +541,10 @@ _SYSTEM_PREFIX = (
     "one cut (see the one-record-per-ref rule below).\n\n"
 )
 
-# cuts_v4_segmentation.plan.md / v4_cuts_as_primitive.plan.md section 3.2:
-# the ONLY part of the prompt that differs between a V3 and a V4 ingest run --
-# whether a video cut's boundary is still the model's to adjust (V3, atom-
-# grounded) or already finished by the segmenter before any pixel was seen
-# (V4, never re-cut). Everything else (speech grouping, framing, look, junk,
-# shape, people) is identical either way.
-_V3_VIDEO_CLAUSE = (
-    "For every in-scope speech_cut and every in-scope video_tentative_group, "
-    "emit ONE final cut record (a tentative video group MAY be split back "
-    "into multiple cuts along its existing atom_ids if the pixels show it "
-    "isn't one moment -- never invent a boundary inside an atom).\n\n"
-    "Do NOT echo word_span (it is derived from your source_ref by code). "
-    "Do NOT echo atom_ids either, EXCEPT when you split a video group into "
-    "several cuts -- then each piece must list the atom_ids it owns, the "
-    "pieces together must use every atom_id of the group exactly once, "
-    "never zero times and never twice.\n\n"
-)
+# cuts_v4_only.plan.md: video cuts are always V4-shaped now -- a
+# video_tentative_group's boundary is already finished by the segmenter
+# before any pixel was seen, so the model's job on it is only to label it,
+# never to adjust or split its span.
 _V4_VIDEO_CLAUSE = (
     "For every in-scope speech_cut, emit ONE final cut record. Each "
     "in-scope video_tentative_group is ALREADY a finished cut -- its "
@@ -655,22 +642,14 @@ _SYSTEM_SUFFIX = (
     "video_group[i], VERBATIM. Never invent a new ref."
 )
 
-# The V3 (default) system prompt -- byte-identical to the prompt this module
-# has always sent. Kept as a plain module-level constant (rather than only a
-# function call) since callers/tests reference it directly.
-_SYSTEM = _SYSTEM_PREFIX + _V3_VIDEO_CLAUSE + _SYSTEM_SUFFIX
-
-
-def system_prompt(cuts_segmenter: str = "v3") -> str:
-    """The per-call system prompt. cuts_v4_only.plan.md Phase 1: V4 is the
-    only cuts path now, so this always returns the V4 video-handling clause
-    ("already a finished cut, never split"); `cuts_segmenter` is inert here
-    for one commit (kept for signature compatibility, deleted in Phase 2
-    along with `_V3_VIDEO_CLAUSE`/`_SYSTEM`). Everything else -- speech
-    grouping, framing, look, junk, shape, people -- is unchanged."""
+def system_prompt() -> str:
+    """The per-call system prompt. cuts_v4_only.plan.md: V4 is the only cuts
+    path, so this always returns the V4 video-handling clause ("already a
+    finished cut, never split"). Everything else -- speech grouping,
+    framing, look, junk, shape, people -- is unchanged."""
     return _SYSTEM_PREFIX + _V4_VIDEO_CLAUSE + _SYSTEM_SUFFIX
 
-# gemini_pass2.plan.md Phase 3: appended to _SYSTEM ONLY when
+# gemini_pass2.plan.md Phase 3: appended to the base system prompt ONLY when
 # ingest_pass2_provider=="gemini" -- never mutates the base prompt (that
 # would perturb the proven Claude path). The Anthropic path relies on
 # FORCED tool-use (tool_choice pinned to the one schema tool) to guarantee a
@@ -697,15 +676,15 @@ _GEMINI_REINFORCE = (
 )
 
 
-def gemini_system_prompt(cuts_segmenter: str = "v3") -> str:
+def gemini_system_prompt() -> str:
     """The exact system string a Gemini-provider batch call sends
-    (``system_prompt(cuts_segmenter)`` + the reinforcement suffix). P4
-    (gemini_pass2.plan.md): ``ingest.py`` bakes this into the per-run
-    ``CachedContent`` so caching doesn't silently drop the reinforcement --
-    a cached call's per-call config never re-sends ``system_instruction``
-    (see ``ingest_gemini._build_config``), so whatever was baked in at cache
+    (``system_prompt()`` + the reinforcement suffix). P4 (gemini_pass2.plan.md):
+    ``ingest.py`` bakes this into the per-run ``CachedContent`` so caching
+    doesn't silently drop the reinforcement -- a cached call's per-call
+    config never re-sends ``system_instruction`` (see
+    ``ingest_gemini._build_config``), so whatever was baked in at cache
     creation is the ONLY system prompt those calls ever get."""
-    return system_prompt(cuts_segmenter) + _GEMINI_REINFORCE
+    return system_prompt() + _GEMINI_REINFORCE
 
 
 def build_pass2_batch_blocks(
@@ -773,41 +752,19 @@ def _ref_index(ref: str, prefix: str) -> Optional[int]:
     return None
 
 
-def _video_group_is_v4(pass1: Pass1Output, ref: str) -> bool:
-    """v4_cuts_as_primitive.plan.md section 3.2: True when ``ref`` names a
-    V4-shaped group (its own span, no atoms -- see pass1.VideoTentativeGroup).
-    The single structural signal every atom-contract validator gates on, so
-    a V3 group (span fields None) is checked exactly as before and a V4
-    group (span already ground truth, never split) skips them entirely."""
-    gi = _ref_index(ref, "video_group[")
-    if gi is None or gi >= len(pass1.video_tentative_groups):
-        return False
-    vg = pass1.video_tentative_groups[gi]
-    return vg.src_in_ms is not None and vg.src_out_ms is not None
-
-
 def backfill_locators(output: Pass2BatchOutput, pass1: Pass1Output) -> Pass2BatchOutput:
-    """Deterministically fill/normalize every cut's word_span/atom_ids from
-    pass 1 by source_ref. The model was originally required to echo these
-    verbatim; observed against the real API, that echo was the single
-    biggest output-complexity failure (66 cuts -> 41 validation errors,
-    twice). They carry zero judgment -- pass 1's grouping is final -- so
-    code owns them now:
+    """Deterministically fill/normalize every cut's word_span from pass 1 by
+    source_ref. The model was originally required to echo these verbatim;
+    observed against the real API, that echo was the single biggest
+    output-complexity failure (66 cuts -> 41 validation errors, twice). They
+    carry zero judgment -- pass 1's grouping is final -- so code owns them
+    now:
 
-      * speech cut  -> word_span := pass1.speech_cuts[i].word_span, always.
-      * V4 video cut (own span, no atoms) -> nothing to backfill; atom_ids
-        stays None (there ARE none) and the cut's real span rides separately
-        on v4_meta_by_ref, keyed by this same ref (see post.py/ingest.py).
-      * V3 video cut, ref emitted by exactly ONE cut -> atom_ids := the whole
-        group's atom_ids (no split, nothing to decide).
-      * V3 video cut, ref emitted by SEVERAL cuts (a split) -> each piece
-        keeps its own atom_ids (that IS judgment); _split_groups_partition_
-        atoms validates the pieces partition the group exactly."""
-    video_ref_counts: Dict[str, int] = {}
-    for cut in output.cuts:
-        if cut.kind == "video":
-            video_ref_counts[cut.source_ref] = video_ref_counts.get(cut.source_ref, 0) + 1
-
+      * speech cut -> word_span := pass1.speech_cuts[i].word_span, always.
+      * video cut (own span, no atoms) -> nothing to backfill; atom_ids
+        stays None (there ARE none -- cuts_v4_only.plan.md) and the cut's
+        real span rides separately on v4_meta_by_ref, keyed by this same
+        ref (see post.py/ingest.py)."""
     new_cuts: List[CutJudgment] = []
     for cut in output.cuts:
         update: Dict[str, Any] = {}
@@ -815,57 +772,19 @@ def backfill_locators(output: Pass2BatchOutput, pass1: Pass1Output) -> Pass2Batc
             i = _ref_index(cut.source_ref, "speech_cut[")
             if i is not None and i < len(pass1.speech_cuts):
                 update["word_span"] = tuple(pass1.speech_cuts[i].word_span)
-        elif (cut.kind == "video" and not _video_group_is_v4(pass1, cut.source_ref)
-              and video_ref_counts.get(cut.source_ref) == 1):
-            gi = _ref_index(cut.source_ref, "video_group[")
-            if gi is not None and gi < len(pass1.video_tentative_groups):
-                update["atom_ids"] = list(pass1.video_tentative_groups[gi].atom_ids)
         new_cuts.append(cut.model_copy(update=update) if update else cut)
     return Pass2BatchOutput(cuts=new_cuts)
 
 
 def _locators_resolved(output: Pass2BatchOutput, pass1: Pass1Output) -> Optional[str]:
-    """After backfill, every cut must have its locator: a speech cut missing
-    word_span means its ref didn't resolve; a V3 video cut missing atom_ids
-    means it's one piece of a SPLIT group that didn't say which atoms it
-    owns (the one locator that IS the model's judgment). A V4 video cut
-    carries no atom_ids by design -- its span lives on v4_meta_by_ref -- so
-    it's exempt from this check entirely."""
+    """After backfill, every speech cut must have its locator: word_span
+    missing means its ref didn't resolve. A video cut carries no atom_ids by
+    design -- its span lives on v4_meta_by_ref -- so there's nothing to
+    check for it."""
     for cut in output.cuts:
         if cut.kind == "speech" and cut.word_span is None:
             return (f"{cut.source_ref!r} resolved to no word_span -- its ref must name an "
                     f"existing pass-1 speech_cut")
-        if (cut.kind == "video" and not cut.atom_ids
-                and not _video_group_is_v4(pass1, cut.source_ref)):
-            return (f"{cut.source_ref!r} has no atom_ids -- when you split a video group "
-                    f"into several cuts, every piece must list the atom_ids it owns")
-    return None
-
-
-def _split_groups_partition_atoms(output: Pass2BatchOutput, pass1: Pass1Output) -> Optional[str]:
-    """When a video group is split into several cuts, the pieces' atom_ids
-    must partition the group's atoms exactly -- no atom lost, none invented.
-    (The no-duplicates half is _no_duplicate_atoms; this checks the union.)
-    N/A for a V4 group: it carries no atoms and the prompt forbids splitting
-    it at all, so there's no partition to check."""
-    by_ref: Dict[str, List[CutJudgment]] = {}
-    for cut in output.cuts:
-        if cut.kind == "video" and not _video_group_is_v4(pass1, cut.source_ref):
-            by_ref.setdefault(cut.source_ref, []).append(cut)
-    for ref, cuts in by_ref.items():
-        if len(cuts) < 2:
-            continue
-        gi = _ref_index(ref, "video_group[")
-        if gi is None or gi >= len(pass1.video_tentative_groups):
-            continue
-        expected = set(pass1.video_tentative_groups[gi].atom_ids)
-        got = {a for c in cuts for a in (c.atom_ids or [])}
-        if got != expected:
-            missing = sorted(expected - got)
-            extra = sorted(got - expected)
-            return (f"the cuts splitting {ref!r} don't partition its atoms exactly -- "
-                    f"missing atom_ids {missing}, unexpected {extra}; every atom of the "
-                    f"group must land in exactly one piece")
     return None
 
 
@@ -890,24 +809,6 @@ def _source_refs_exist(output: Pass2BatchOutput, pass1: Pass1Output) -> Optional
                     f"reference EXACTLY one of speech_cut[0..{max(n_speech - 1, 0)}] or "
                     f"video_group[0..{max(n_video - 1, 0)}], verbatim; never invent a new "
                     f"ref")
-    return None
-
-
-def _no_duplicate_atoms(output: Pass2BatchOutput) -> Optional[str]:
-    """Every atom_id must end up in exactly one output cut. Observed against
-    the real API: the model occasionally double-counts an atom when
-    splitting a tentative video group into multiple final cuts."""
-    seen: Dict[Tuple[str, int], str] = {}
-    for cut in output.cuts:
-        if cut.kind != "video" or not cut.atom_ids:
-            continue
-        for atom_id in cut.atom_ids:
-            key = (cut.file_id, atom_id)
-            if key in seen:
-                return (f"atom_id {atom_id} of file {cut.file_id} appears in both "
-                       f"{seen[key]!r} and {cut.source_ref!r} -- split a group's atom_ids "
-                       f"between the pieces, never duplicate one across them")
-            seen[key] = cut.source_ref
     return None
 
 
@@ -950,32 +851,31 @@ def _no_overlapping_word_spans(output: Pass2BatchOutput) -> Optional[str]:
 
 
 def _resolve_cut_span_ms(cut: CutJudgment, lattices: Dict[str, Lattice]) -> Optional[Tuple[int, int]]:
-    """Best-effort (s, e) in ms for one cut, same resolution post.py uses --
-    word/atom edges, clamped so a speech cut's silence cushion can never
-    reach into a neighboring atom's span (see resolve_speech_span_ms).
+    """Best-effort (s, e) in ms for a speech cut, same resolution post.py
+    uses -- word/atom edges, clamped so a speech cut's silence cushion can
+    never reach into a neighboring atom's span (see resolve_speech_span_ms).
     Silence data is skipped here (empty list) since the clamp alone is what
     prevents the overlap this check exists to catch; a few ms of precision
-    beyond that doesn't matter for a GROSS-overlap check like this one."""
+    beyond that doesn't matter for a GROSS-overlap check like this one.
+
+    cuts_v4_only.plan.md: a video cut's real span lives on v4_meta_by_ref,
+    not here -- this always returns None for kind=="video" (out of scope
+    for this plan to wire up; _no_cross_kind_ms_overlap below is a no-op for
+    the video side of the check as a result, matching the already-current
+    V4 runtime behavior, not a new regression)."""
     lattice = lattices.get(cut.file_id)
     if lattice is None:
         return None
     if cut.kind == "speech" and cut.word_span:
         return resolve_speech_span_ms(lattice.words, lattice.atoms, cut.word_span, [])
-    if cut.kind == "video" and cut.atom_ids:
-        atoms_by_id = {a.atom_id: a for a in lattice.atoms}
-        members = [atoms_by_id[i] for i in cut.atom_ids if i in atoms_by_id]
-        if not members:
-            return None
-        return min(a.start_ms for a in members), max(a.end_ms for a in members)
     return None
 
 
 def _no_cross_kind_ms_overlap(output: Pass2BatchOutput, lattices: Dict[str, Lattice]) -> Optional[str]:
     """A speech cut and a video cut in the same file resolving to
-    overlapping ms spans -- neither _no_duplicate_atoms (video-only, by
-    atom id) nor _no_overlapping_word_spans (speech-only, by word index)
-    catches this, since it's the CROSS-kind case. Observed against the real
-    API surfacing only as an opaque ms-overlap failure in
+    overlapping ms spans; _no_overlapping_word_spans only checks
+    speech-vs-speech, so this catches the CROSS-kind case. Observed against
+    the real API surfacing only as an opaque ms-overlap failure in
     post.assemble_cut_records; resolving spans here catches it earlier,
     with a message that names both cuts."""
     by_file: Dict[str, List[Tuple[int, int, str]]] = {}
@@ -1043,8 +943,6 @@ def _pass2_semantic_checks(output: Pass2BatchOutput, pass1: Pass1Output,
     return (_source_refs_exist(output, pass1)
            or _kind_matches_source_ref(output)
            or _locators_resolved(output, pass1)
-           or _split_groups_partition_atoms(output, pass1)
-           or _no_duplicate_atoms(output)
            or _no_overlapping_word_spans(output)
            or _no_cross_kind_ms_overlap(output, lattices))
 
@@ -1068,8 +966,8 @@ def run_pass2_batch(
     batch has no resolvable images.
 
     gemini_pass2.plan.md: when ``ingest_pass2_provider=="gemini"``, the
-    reinforcement suffix is appended to the system prompt (never mutates
-    ``_SYSTEM`` itself, so the proven Claude path is untouched) and, if a
+    reinforcement suffix is appended to the system prompt (never mutates the
+    base prompt itself, so the proven Claude path is untouched) and, if a
     per-run Gemini ``CachedContent`` is active (P4), the STABLE
     ``build_pass1_blocks`` prefix is left out of this call entirely -- it's
     already baked into that cache; re-sending it here would erase the cost
@@ -1077,7 +975,7 @@ def run_pass2_batch(
     (which differs batch to batch) is ever sent fresh."""
     batch_refs = {f.ref for f in batch_frames}
     settings = get_settings()
-    system = system_prompt(settings.cuts_segmenter)
+    system = system_prompt()
     stable_blocks = build_pass1_blocks(file_rows)
     if settings.ingest_pass2_provider == "gemini":
         system = system + _GEMINI_REINFORCE

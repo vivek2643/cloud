@@ -253,12 +253,14 @@ def test_cutjudgment_has_no_take_fields():
 
 
 def test_locators_are_optional_at_parse_time_and_backfilled():
-    # word_span/atom_ids are deliberately NOT required by the schema -- the
-    # model no longer echoes them (that echo was the single biggest
-    # output-complexity failure); backfill_locators derives them from pass 1.
+    # word_span is deliberately NOT required by the schema -- the model no
+    # longer echoes it (that echo was the single biggest output-complexity
+    # failure); backfill_locators derives it from pass 1. A video cut carries
+    # no atom_ids at all (cuts_v4_only.plan.md) -- its real span lives on
+    # v4_meta_by_ref, not this schema.
     p1 = Pass1Output(
         speech_cuts=[SpeechCut(file_id="f1", word_span=(3, 9), label="s")],
-        video_tentative_groups=[VideoTentativeGroup(file_id="f1", atom_ids=[4, 5, 6])],
+        video_tentative_groups=[VideoTentativeGroup(file_id="f1", src_in_ms=0, src_out_ms=1000)],
     )
     out = pass2.Pass2BatchOutput(cuts=[
         pass2.CutJudgment(source_ref="speech_cut[0]", kind="speech", file_id="f1",
@@ -268,7 +270,7 @@ def test_locators_are_optional_at_parse_time_and_backfilled():
     ])
     filled = pass2.backfill_locators(out, p1)
     assert filled.cuts[0].word_span == (3, 9), filled.cuts[0]
-    assert filled.cuts[1].atom_ids == [4, 5, 6], filled.cuts[1]
+    assert filled.cuts[1].atom_ids is None, filled.cuts[1]
     assert pass2._locators_resolved(filled, p1) is None
     print("ok  test_locators_are_optional_at_parse_time_and_backfilled")
 
@@ -337,44 +339,6 @@ def test_shape_round_trips_through_to_pass2_cuts():
     print("ok  test_shape_round_trips_through_to_pass2_cuts")
 
 
-def test_backfill_leaves_split_video_groups_to_the_model():
-    # A video group split into two cuts: backfill must NOT overwrite the
-    # pieces' own atom_ids (that split IS the model's judgment); the
-    # partition check validates them instead.
-    p1 = Pass1Output(
-        video_tentative_groups=[VideoTentativeGroup(file_id="f1", atom_ids=[0, 1, 2])],
-    )
-    good = pass2.Pass2BatchOutput(cuts=[
-        pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
-                          atom_ids=[0], label="a", summary="a"),
-        pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
-                          atom_ids=[1, 2], label="b", summary="b"),
-    ])
-    filled = pass2.backfill_locators(good, p1)
-    assert filled.cuts[0].atom_ids == [0] and filled.cuts[1].atom_ids == [1, 2]
-    assert pass2._split_groups_partition_atoms(filled, p1) is None
-
-    lost_atom = pass2.Pass2BatchOutput(cuts=[
-        pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
-                          atom_ids=[0], label="a", summary="a"),
-        pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
-                          atom_ids=[2], label="b", summary="b"),
-    ])
-    err = pass2._split_groups_partition_atoms(lost_atom, p1)
-    assert err is not None and "[1]" in err, err
-
-    missing_ids = pass2.Pass2BatchOutput(cuts=[
-        pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
-                          atom_ids=[0, 1, 2], label="a", summary="a"),
-        pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
-                          label="b", summary="b"),   # split piece with no atom_ids
-    ])
-    filled2 = pass2.backfill_locators(missing_ids, p1)
-    err2 = pass2._locators_resolved(filled2, p1)
-    assert err2 is not None and "atom_ids" in err2, err2
-    print("ok  test_backfill_leaves_split_video_groups_to_the_model")
-
-
 # --------------------------------------------------------------------------
 # V4 (v4_cuts_as_primitive.plan.md): a video group with its own span and no
 # atoms is a FINISHED cut -- pass 2 never splits it, backfill never touches
@@ -406,21 +370,6 @@ def test_v4_video_cut_passes_locators_resolved_with_no_atom_ids():
     print("ok  test_v4_video_cut_passes_locators_resolved_with_no_atom_ids")
 
 
-def test_v4_video_group_never_needs_atom_partition_check():
-    p1 = Pass1Output(video_tentative_groups=[_v4_group((1000, 2000))])
-    # Even if the model DID (against instructions) emit two cuts for one V4
-    # ref, the atom-partition check must not fire -- there's no atom
-    # contract to violate on V4.
-    out = pass2.Pass2BatchOutput(cuts=[
-        pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
-                          label="a", summary="a"),
-        pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
-                          label="b", summary="b"),
-    ])
-    assert pass2._split_groups_partition_atoms(out, p1) is None
-    print("ok  test_v4_video_group_never_needs_atom_partition_check")
-
-
 def test_v4_n_groups_in_yields_n_labeled_cuts_out_no_split():
     p1 = Pass1Output(video_tentative_groups=[
         _v4_group((0, 1000)), _v4_group((2000, 3000)), _v4_group((4000, 4500)),
@@ -434,22 +383,16 @@ def test_v4_n_groups_in_yields_n_labeled_cuts_out_no_split():
     assert len(filled.cuts) == 3
     assert all(c.atom_ids is None for c in filled.cuts), filled.cuts
     assert pass2._locators_resolved(filled, p1) is None
-    assert pass2._split_groups_partition_atoms(filled, p1) is None
-    assert pass2._no_duplicate_atoms(filled) is None
     print("ok  test_v4_n_groups_in_yields_n_labeled_cuts_out_no_split")
 
 
-def test_system_prompt_always_uses_v4_clause_regardless_of_param():
-    # cuts_v4_only.plan.md Phase 1: V4 is the only cuts path now -- the
-    # `cuts_segmenter` param is inert (kept for one commit, removed in
-    # Phase 2 along with `_V3_VIDEO_CLAUSE`/`_SYSTEM`).
-    default = pass2.system_prompt()
-    explicit_v3 = pass2.system_prompt("v3")
-    explicit_v4 = pass2.system_prompt("v4")
-    assert default == explicit_v3 == explicit_v4
-    assert "never split or merge" in default
-    assert "MAY be split back" not in default
-    print("ok  test_system_prompt_always_uses_v4_clause_regardless_of_param")
+def test_system_prompt_always_uses_the_v4_clause():
+    # cuts_v4_only.plan.md Phase 2: V4 is the only cuts path now -- there is
+    # no cuts_segmenter param and no V3 clause left to compare against.
+    prompt = pass2.system_prompt()
+    assert "never split or merge" in prompt
+    assert "MAY be split back" not in prompt
+    print("ok  test_system_prompt_always_uses_the_v4_clause")
 
 
 def test_valid_cuts_round_trip():
@@ -485,29 +428,6 @@ def test_cutjudgment_defaults_are_safe():
     assert j.readability_ms == 0
     assert j.people == []
     print("ok  test_cutjudgment_defaults_are_safe")
-
-
-def test_no_duplicate_atoms_passes_when_every_atom_is_used_once():
-    out = pass2.Pass2BatchOutput(cuts=[
-        pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
-                          atom_ids=[0, 1], label="a", summary="a"),
-        pass2.CutJudgment(source_ref="video_group[1]", kind="video", file_id="f1",
-                          atom_ids=[2, 3], label="b", summary="b"),
-    ])
-    assert pass2._no_duplicate_atoms(out) is None
-    print("ok  test_no_duplicate_atoms_passes_when_every_atom_is_used_once")
-
-
-def test_no_duplicate_atoms_catches_an_atom_split_across_two_cuts():
-    out = pass2.Pass2BatchOutput(cuts=[
-        pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
-                          atom_ids=[0, 1, 2], label="a", summary="a"),
-        pass2.CutJudgment(source_ref="video_group[0b]", kind="video", file_id="f1",
-                          atom_ids=[2, 3], label="b", summary="b"),   # atom 2 double-counted
-    ])
-    err = pass2._no_duplicate_atoms(out)
-    assert err is not None and "atom_id 2" in err, err
-    print("ok  test_no_duplicate_atoms_catches_an_atom_split_across_two_cuts")
 
 
 def test_kind_is_derived_from_source_ref_not_the_models_field():
@@ -555,13 +475,15 @@ def test_pass2_semantic_checks_combines_all_checks():
     p1 = _pass1_with()
     # (kind/ref mismatch is no longer a semantic error -- kind is derived from
     # the ref at parse time; see test_kind_is_derived_from_source_ref_*.)
-    dup_atoms = pass2.Pass2BatchOutput(cuts=[
-        pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
-                          atom_ids=[0], label="a", summary="a"),
-        pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
-                          atom_ids=[0], label="b", summary="b"),
+    # Two cuts for the SAME speech_cut ref backfill to the identical word_span
+    # -- an overlap _no_overlapping_word_spans must catch.
+    dup_ref = pass2.Pass2BatchOutput(cuts=[
+        pass2.CutJudgment(source_ref="speech_cut[0]", kind="speech", file_id="f1",
+                          label="a", summary="a"),
+        pass2.CutJudgment(source_ref="speech_cut[0]", kind="speech", file_id="f1",
+                          label="b", summary="b"),
     ])
-    assert pass2._pass2_semantic_checks(dup_atoms, p1, {}, {"video_group[0]"}) is not None
+    assert pass2._pass2_semantic_checks(dup_ref, p1, {}, {"speech_cut[0]"}) is not None
 
     clean = pass2.Pass2BatchOutput(cuts=[
         pass2.CutJudgment(source_ref="speech_cut[0]", kind="speech", file_id="f1",
@@ -622,17 +544,35 @@ def _lattice_for_cross_kind_test():
     return Lattice(file_id="f1", duration_ms=1000, words=words, turns=[], hints=[], atoms=atoms)
 
 
-def test_no_cross_kind_ms_overlap_catches_a_speech_and_video_cut_overlapping():
+def test_no_cross_kind_ms_overlap_catches_two_overlapping_speech_cuts():
+    lattices = {"f1": _lattice_for_cross_kind_test()}
+    out = pass2.Pass2BatchOutput(cuts=[
+        pass2.CutJudgment(source_ref="speech_cut[0]", kind="speech", file_id="f1",
+                          word_span=(0, 1), label="a", summary="a"),   # words[0:1] -> ms [0, 500)
+        pass2.CutJudgment(source_ref="speech_cut[1]", kind="speech", file_id="f1",
+                          word_span=(1, 2), label="b", summary="b"),   # words[1:2] -> ms [300, 800)
+    ])
+    err = pass2._no_cross_kind_ms_overlap(out, lattices)
+    assert err is not None and "speech_cut[0]" in err and "speech_cut[1]" in err, err
+    print("ok  test_no_cross_kind_ms_overlap_catches_two_overlapping_speech_cuts")
+
+
+def test_no_cross_kind_ms_overlap_is_speech_only_now():
+    # cuts_v4_only.plan.md: _resolve_cut_span_ms no longer resolves a video
+    # cut's span (that lives on v4_meta_by_ref, not the atom lattice), so
+    # this check can only ever catch a speech-vs-speech overlap now -- a
+    # video cut simply never participates. Flagged, out-of-scope gap, not a
+    # regression: wiring v4_meta_by_ref through this semantic-check pathway
+    # is explicitly out of scope for this plan.
     lattices = {"f1": _lattice_for_cross_kind_test()}
     out = pass2.Pass2BatchOutput(cuts=[
         pass2.CutJudgment(source_ref="speech_cut[1]", kind="speech", file_id="f1",
-                          word_span=(1, 2), label="a", summary="a"),   # words[1:2] -> ms [300, 800)
+                          word_span=(1, 2), label="a", summary="a"),
         pass2.CutJudgment(source_ref="video_group[0]", kind="video", file_id="f1",
-                          atom_ids=[0], label="b", summary="b"),        # atom 0 -> ms [400, 1000)
+                          label="b", summary="b"),
     ])
-    err = pass2._no_cross_kind_ms_overlap(out, lattices)
-    assert err is not None and "speech_cut[1]" in err and "video_group[0]" in err, err
-    print("ok  test_no_cross_kind_ms_overlap_catches_a_speech_and_video_cut_overlapping")
+    assert pass2._no_cross_kind_ms_overlap(out, lattices) is None
+    print("ok  test_no_cross_kind_ms_overlap_is_speech_only_now")
 
 
 # --------------------------------------------------------------------------
@@ -926,23 +866,20 @@ def main():
     test_shape_accepts_every_listed_value()
     test_shape_normalizes_off_list_or_missing_to_center()
     test_shape_round_trips_through_to_pass2_cuts()
-    test_backfill_leaves_split_video_groups_to_the_model()
     test_v4_video_group_is_never_backfilled_with_atom_ids()
     test_v4_video_cut_passes_locators_resolved_with_no_atom_ids()
-    test_v4_video_group_never_needs_atom_partition_check()
     test_v4_n_groups_in_yields_n_labeled_cuts_out_no_split()
-    test_system_prompt_always_uses_v4_clause_regardless_of_param()
+    test_system_prompt_always_uses_the_v4_clause()
     test_valid_cuts_round_trip()
     test_pass2_batch_output_rejects_an_unexpected_wrapper_key()
     test_cutjudgment_defaults_are_safe()
-    test_no_duplicate_atoms_passes_when_every_atom_is_used_once()
-    test_no_duplicate_atoms_catches_an_atom_split_across_two_cuts()
     test_kind_is_derived_from_source_ref_not_the_models_field()
     test_no_overlapping_word_spans_catches_a_duplicate_span()
     test_pass2_semantic_checks_combines_all_checks()
     test_drop_out_of_batch_cuts_filters_strays_and_fixes_file_id()
     test_source_refs_exist_rejects_an_invented_ref()
-    test_no_cross_kind_ms_overlap_catches_a_speech_and_video_cut_overlapping()
+    test_no_cross_kind_ms_overlap_catches_two_overlapping_speech_cuts()
+    test_no_cross_kind_ms_overlap_is_speech_only_now()
     test_to_pass2_cuts_converts_every_field()
     test_to_pass2_cuts_empty_is_a_noop()
     test_to_pass2_cuts_caps_people_per_cut_keeping_the_first_most_prominent()

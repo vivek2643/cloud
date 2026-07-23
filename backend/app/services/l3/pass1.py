@@ -2,11 +2,13 @@
 Cuts v3, Pass 1: text-only ingest over ALL clips in a project at once.
 
 One call decides MEANING for the whole project (plan North Star #2): the
-final speech grouping, cross-clip take candidates, tentative video groupings,
-junk suspects, and a project + per-clip summary. Boundaries stay code-derived
--- the model emits WORD INDICES (speech) and ATOM IDS (video), never a
-millisecond; ``lattice.snap_word_edge`` / the atom table resolve those to
-precise ms afterward (North Star #1).
+final speech grouping, cross-clip take candidates, junk suspects, and a
+project + per-clip summary. Video cuts are NOT the model's job (cuts_v4_only.
+plan.md: the deterministic segmenter in v4_segment.py owns all video
+grouping, built entirely in code). Speech boundaries stay code-derived from
+the model's own judgment -- it emits WORD INDICES (speech) and, for a junk
+span on non-speech footage, ATOM IDS; ``lattice.snap_word_edge`` / the atom
+table resolve those to precise ms afterward (North Star #1).
 
 Pure-ish core: ``run_pass1(file_rows)`` takes already-loaded ``Lattice``
 objects and makes exactly one ``llm.client.complete`` call (mockable, see
@@ -62,14 +64,13 @@ class TakeCandidate(BaseModel):
 
 class VideoTentativeGroup(BaseModel):
     file_id: str
-    # V3 (grounded-atom groups, LLM-emitted): the atoms this group covers.
-    # V4 (v4_cuts_as_primitive.plan.md section 3.1): always [] -- the group
-    # instead carries its own span directly below (ingest builds these in
-    # code, never from the model, so the default only matters for V3's own
-    # schema validation never seeing this field omitted).
+    # cuts_v4_only.plan.md: the model never emits these -- ingest.py builds
+    # one per V4 segmenter cut, entirely in code (see v4_segment.segment_video).
+    # atom_ids is always [] now (kept on the schema only for cut_records rows
+    # already persisted from the retired V3 algorithm, read via the legacy
+    # ladder path -- see cutrecord_map.py); src_in_ms/src_out_ms are the
+    # segmenter's own span, ground truth for the cut.
     atom_ids: List[int] = Field(default_factory=list)
-    # V4 only: the segmenter's own span (ground truth) for this cut. None on
-    # V3 (span comes from atom membership instead -- see post.py).
     src_in_ms: Optional[int] = None
     src_out_ms: Optional[int] = None
 
@@ -146,8 +147,6 @@ _SYSTEM = (
     "alone.\n"
     "  - take_candidates: near-identical retakes of the same line (within or across "
     "clips); each member is one whole speech_cut.\n"
-    "  - video_tentative_groups: visual moments worth keeping, each a group of "
-    "atom_ids that belong together as one continuous shot or action.\n"
     "  - junk_suspects: spans that are NOT part of the delivered piece. Be "
     "aggressive about the one closed class you alone can catch from meaning: spoken "
     "PRODUCTION CUES and counts aimed at the crew, not the audience (e.g. go / "
@@ -161,7 +160,8 @@ _SYSTEM = (
     "ONLY categories, indices, ids and text: word ranges, atom ids, group ids, "
     "labels, reasons. NEVER emit a score, confidence, threshold, or any number you "
     "invented -- every measurement and every millisecond comes from code. Emit WORD "
-    "INDICES (speech) and ATOM IDS (video), never timestamps."
+    "INDICES for a speech_cut or a speech junk_suspect, and ATOM IDS for a junk_suspect "
+    "on non-speech (video) footage, never timestamps."
 )
 
 
@@ -245,41 +245,6 @@ def _no_overlapping_speech_cuts(output: Pass1Output) -> str | None:
                 return (f"speech_cut[{i0}] words[{a0}-{b0}] and speech_cut[{i1}] "
                         f"words[{a1}-{b1}] overlap in {file_id} -- speech cuts must "
                         f"partition non-overlapping word ranges")
-    return None
-
-
-def _no_speech_cut_swallows_atoms(output: Pass1Output, lattices: Dict[str, Lattice]) -> str | None:
-    """A speech cut whose word range contains an atom that is ALSO a member of
-    some video_tentative_group would make two final cuts (this speech beat and
-    that video cut) claim the same instant -- a real overlap. So the check is
-    against GROUPED atoms only. An atom the beat legitimately ABSORBED across a
-    weldable seam (``_seam_split``) belongs to no group and produces no video
-    cut, so it may sit inside the beat's span -- that is the whole point of the
-    speech-to-speech bridge (cuts_v3_speech_bridge.plan.md). This is
-    ``enforce_lattice_partition``'s post-condition (asserted there), kept
-    separate so tests can probe it directly; ``post._validate_no_overlap`` is
-    the final ms-level guard."""
-    grouped: Dict[str, set] = {}
-    for vg in output.video_tentative_groups:
-        grouped.setdefault(vg.file_id, set()).update(vg.atom_ids)
-    for i, sc in enumerate(output.speech_cuts):
-        lattice = lattices.get(sc.file_id)
-        if lattice is None or not lattice.words:
-            continue
-        a, b = sc.word_span
-        if not (0 <= a <= b < len(lattice.words)):
-            return (f"speech_cut[{i}] word_span [{a}-{b}] is out of range for "
-                    f"{sc.file_id} ({len(lattice.words)} words)")
-        span_s = int(lattice.words[a].get("start_ms", 0))
-        span_e = int(lattice.words[b].get("end_ms", 0))
-        gset = grouped.get(sc.file_id, set())
-        for atom in lattice.atoms:
-            if atom.atom_id in gset and atom.start_ms >= span_s and atom.end_ms <= span_e:
-                return (f"speech_cut[{i}] \"{sc.label}\" words[{a}-{b}] swallows GROUPED "
-                        f"video atom {atom.atom_id} [{atom.start_ms}-{atom.end_ms}]ms in "
-                        f"{sc.file_id} -- that atom would also become a video cut; split "
-                        f"the beat, or the seam should have absorbed the atom out of its "
-                        f"group")
     return None
 
 
@@ -806,24 +771,6 @@ def _take_content_cluster(
     return [members[i] for i in sorted(best)] if len(best) >= 2 else []
 
 
-def _contiguous_atom_runs(lattice: Lattice, atom_ids: List[int]) -> List[List[int]]:
-    """``atom_ids`` split into time-contiguous runs (next.start_ms ==
-    cur.end_ms). Unknown ids are dropped. A video group must be one
-    continuous stretch of timeline: observed against the real API, pass 1
-    grouped atoms from BOTH SIDES of a speech span into one group, whose
-    resolved (min..max) span then bracketed the speech -- an unfixable
-    cross-kind overlap downstream."""
-    by_id = {a.atom_id: a for a in lattice.atoms}
-    members = [by_id[i] for i in sorted(set(atom_ids)) if i in by_id]
-    runs: List[List[int]] = []
-    for a in members:
-        if runs and by_id[runs[-1][-1]].end_ms == a.start_ms:
-            runs[-1].append(a.atom_id)
-        else:
-            runs.append([a.atom_id])
-    return runs
-
-
 # --------------------------------------------------------------------------
 # Outlook grouping. An OUTLOOK group's members are alternate cameras of the
 # SAME moment (the user declared them). The offset alignment already knows --
@@ -1011,15 +958,15 @@ def enforce_lattice_partition(
          contains most of its words -- so member == whole cut always holds
          downstream (pass 2a source_refs, image_plan joins). Groups left
          with fewer than two distinct members are dropped.
-      4. Split any video_tentative_group at time discontinuities (see
-         ``_contiguous_atom_runs``) -- a group must be one continuous
-         stretch, never a bridge across speech.
-      5. COVERAGE FILL (video): every atom the model left out of all groups
-         (and not absorbed into a beat in step 1) is re-added, contiguous
-         ungrouped atoms folded into one group.
 
-    Post-condition asserted: no speech cut swallows a GROUPED atom (an absorbed
-    one legitimately plays inside its beat)."""
+    cuts_v4_only.plan.md: video cuts are no longer grouped here at all -- the
+    model never emits video_tentative_groups (always ``[]``), and the
+    deterministic segmenter (v4_segment.py, driven off ingest.py) builds them
+    straight from the RAW non-speech gaps left by the speech_cuts this
+    function produces. An atom a beat absorbed across a weldable seam is, by
+    that same construction, already inside the beat's own span and so is
+    never part of a "gap" the segmenter sees -- no separate video-side
+    exclusion step is needed."""
     # Atoms a pass-1 junk suspect flags -- a flagged break inside a gap makes
     # its seam hard (seam.classify_seam), so a beat never bridges across a cue.
     junk_atom_ids: Dict[str, set] = {}
@@ -1040,9 +987,6 @@ def enforce_lattice_partition(
         for m in tc.members:
             claimed_words.setdefault(m.file_id, set()).update(range(m.word_span[0], m.word_span[1] + 1))
 
-    # Atoms a beat ABSORBED across a weldable seam: they leave the video pool
-    # (below) and play inside the spoken beat instead of becoming a video cut.
-    absorbed_atoms: Dict[str, set] = {}
     new_cuts: List[SpeechCut] = []
     synced_ids = outlook_file_ids or set()
     group_of = outlook_group_of or {}
@@ -1055,7 +999,6 @@ def enforce_lattice_partition(
                                        junk_atom_ids.get(sc.file_id, set()),
                                        synced=sc.file_id in synced_ids)
         if absorbed:
-            absorbed_atoms.setdefault(sc.file_id, set()).update(absorbed)
             logger.info("pass1 enforce: beat %r words[%d-%d] absorbed %d atom(s) across "
                         "weldable seam(s)", sc.label, sc.word_span[0], sc.word_span[1], len(absorbed))
         if len(pieces) == 1:
@@ -1142,7 +1085,6 @@ def enforce_lattice_partition(
                                                       junk_atom_ids.get(file_id, set()),
                                                       synced=file_id in synced_ids)
             if merged_absorbed:
-                absorbed_atoms.setdefault(file_id, set()).update(merged_absorbed)
                 logger.info("pass1 enforce: merged same-beat neighbours in %s, absorbing "
                             "%d atom(s)", file_id, len(merged_absorbed))
             # Fold any zero-audible-duration cut into its neighbour so no speech
@@ -1155,13 +1097,11 @@ def enforce_lattice_partition(
             # angles by BYTE-IDENTICAL word spans, an invariant this file's
             # own local seam/junk pattern could break if run per-angle.
             if file_id not in synced_ids:
-                file_cuts, runt_absorbed = _absorb_runt_speech_cuts(
+                file_cuts, _runt_absorbed = _absorb_runt_speech_cuts(
                     file_cuts, lattice, junk_atom_ids.get(file_id, set()),
                     claimed_words.get(file_id, set()), junk_word_spans.get(file_id, []),
                     synced=False,
                 )
-                if runt_absorbed:
-                    absorbed_atoms.setdefault(file_id, set()).update(runt_absorbed)
         merged_cuts.extend(file_cuts)
     new_cuts = merged_cuts
 
@@ -1206,63 +1146,6 @@ def enforce_lattice_partition(
             logger.info("pass1 enforce: dropping take group %r (%d member(s) remain "
                         "after same-line guard; was %d)", tc.group_id, len(kept), len(members))
 
-    new_groups: List[VideoTentativeGroup] = []
-    for vg in output.video_tentative_groups:
-        lattice = lattices.get(vg.file_id)
-        if lattice is None:
-            new_groups.append(vg)
-            continue
-        # Contiguity split only (structural: a group must be one time-continuous
-        # run, else its resolved span brackets a speech beat -- an unfixable
-        # cross-kind overlap). NOT action isolation: grouping/merging is the
-        # model's job now (signal-judge), so a swing and its follow-through can
-        # ride in one group if the model says so.
-        # Drop any atom a speech beat absorbed across a weldable seam -- it now
-        # plays inside that beat, so it must not ALSO become a video cut.
-        absorbed_here = absorbed_atoms.get(vg.file_id, set())
-        kept_ids = [i for i in vg.atom_ids if i not in absorbed_here]
-        if not kept_ids:
-            continue
-        runs = _contiguous_atom_runs(lattice, kept_ids)
-        if len(runs) == 1 and runs[0] == kept_ids:
-            new_groups.append(VideoTentativeGroup(file_id=vg.file_id, atom_ids=kept_ids))
-        else:
-            logger.info("pass1 enforce: splitting video group atoms=%s into %d "
-                        "contiguous run(s)", kept_ids, len(runs))
-            for run in runs:
-                new_groups.append(VideoTentativeGroup(file_id=vg.file_id, atom_ids=run))
-
-    # Coverage fill (video): every atom must land in some group. Grouping is
-    # the model's call, but an atom it left out of every group is not lost --
-    # it's re-added, with contiguous ungrouped atoms folded into one recovered
-    # group (coverage without confetti). Junk stays the model's recoverable
-    # label; nothing vanishes for merely being ungrouped.
-    grouped_ids: Dict[str, set] = {}
-    for vg in new_groups:
-        grouped_ids.setdefault(vg.file_id, set()).update(vg.atom_ids)
-    for file_id, lattice in lattices.items():
-        # Grouped OR absorbed atoms are already spoken for; only genuinely
-        # ungrouped, un-absorbed atoms need a recovered group.
-        have = grouped_ids.get(file_id, set()) | absorbed_atoms.get(file_id, set())
-        ungrouped = sorted((a for a in lattice.atoms if a.atom_id not in have),
-                           key=lambda a: a.start_ms)
-        if not ungrouped:
-            continue
-        run: List[Any] = []
-        for a in ungrouped:
-            if run and run[-1].end_ms == a.start_ms:
-                run.append(a)
-            else:
-                if run:
-                    new_groups.append(VideoTentativeGroup(
-                        file_id=file_id, atom_ids=[x.atom_id for x in run]))
-                run = [a]
-        if run:
-            new_groups.append(VideoTentativeGroup(
-                file_id=file_id, atom_ids=[x.atom_id for x in run]))
-        logger.info("pass1 enforce: recovered %d ungrouped atom(s) in %s",
-                    len(ungrouped), file_id)
-
     # Deterministic per-beat voice (voice_first_identity.plan.md): "who is
     # talking this beat" was never the model's job to guess -- word-level
     # diarization already knows exactly who spoke each word. Stamp
@@ -1275,12 +1158,7 @@ def enforce_lattice_partition(
         for sc in new_cuts
     ]
 
-    enforced = output.model_copy(update={"speech_cuts": new_cuts, "take_candidates": new_takes,
-                                         "video_tentative_groups": new_groups})
-    leftover = _no_speech_cut_swallows_atoms(enforced, lattices)
-    if leftover:
-        raise ValueError(f"enforce_lattice_partition post-condition failed: {leftover}")
-    return enforced
+    return output.model_copy(update={"speech_cuts": new_cuts, "take_candidates": new_takes})
 
 
 # --------------------------------------------------------------------------
@@ -1393,8 +1271,7 @@ def render_pass1_output(pass1: Pass1Output, keep_refs: set | None = None) -> str
         if not keep_video(gi):
             continue
         kept_files.add(vg.file_id)
-        atoms = ",".join(str(a) for a in vg.atom_ids)
-        lines.append(f"  video_group[{gi}]: file={vg.file_id} atoms=[{atoms}]")
+        lines.append(f"  video_group[{gi}]: file={vg.file_id} span=[{vg.src_in_ms}-{vg.src_out_ms}]ms")
 
     lines.append("JUNK SUSPECTS:")
     for js in pass1.junk_suspects:

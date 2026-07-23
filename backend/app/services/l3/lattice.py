@@ -26,9 +26,11 @@ model:
     turns, not against the whole timeline (unchanged rule -- never cut under
     speech).
 
-Atoms are deliberately fine (over-segmenting bias is safe -- pass 1/2 merge
-them back into ``video_tentative_groups`` / final cuts; under-splitting, which
-would hide a real boundary forever, is the only fatal error).
+Atoms are deliberately fine (over-segmenting bias is safe -- the deterministic
+V4 segmenter (``v4_segment.py``) trims raw non-speech spans down to final video
+cuts, and pass 1 merges atoms back into speech cuts across a weldable seam;
+under-splitting, which would hide a real boundary forever, is the only fatal
+error).
 
 Pure core: ``build_atoms(...)`` / ``speech_hints(...)`` / the pure
 ``_snap_word_edge`` take already-loaded artifacts and do no DB call, so they

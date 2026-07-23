@@ -74,31 +74,21 @@ def test_composition_drift_extra_added_inside_span_only():
     print("ok  test_composition_drift_extra_added_inside_span_only")
 
 
-def test_video_group_anchor_yields_one_frame_per_anchor():
-    atoms = [_atom(0, 0, 1000, anchors=[200, 600]), _atom(1, 1000, 2000, anchors=[1500])]
-    lat = _lattice_with_atoms("f1", 0, atoms)
-    pass1 = Pass1Output(video_tentative_groups=[VideoTentativeGroup(file_id="f1", atom_ids=[0, 1])])
-    frames = ip.build_image_plan(pass1, {"f1": lat}, {}, {}, {})
-    anchor_frames = sorted(f.ts_ms for f in frames if f.reason == ip.REASON_VIDEO_GROUP_ANCHOR)
-    assert anchor_frames == [200, 600, 1500], frames
-    assert all(f.ref == "video_group[0]" for f in frames)
-    print("ok  test_video_group_anchor_yields_one_frame_per_anchor")
-
-
 def test_every_pass1_unit_gets_a_frame_even_over_budget():
     """One frame per unit is MANDATORY -- the budget can never starve a unit
     of its only frame (a cut pass 2 never saw pixels for can't be judged;
     observed as a real 'no images resolved' pass-2b failure)."""
-    atoms = [_atom(i, i * 1000, (i + 1) * 1000) for i in range(6)]
-    lat = _lattice_with_atoms("f1", 5, atoms)
+    lat = _lattice_with_atoms("f1", 5, [])
     pass1 = Pass1Output(
         speech_cuts=[SpeechCut(file_id="f1", word_span=(0, 4), label="x")],
-        video_tentative_groups=[VideoTentativeGroup(file_id="f1", atom_ids=[i]) for i in range(6)],
+        video_tentative_groups=[VideoTentativeGroup(file_id="f1") for _ in range(6)],
     )
+    v4_meta = {f"video_group[{gi}]": {"src_in_ms": gi * 1000, "src_out_ms": (gi + 1) * 1000}
+              for gi in range(6)}
     orig_budget = ip.FRAME_BUDGET_PER_CLIP
     ip.FRAME_BUDGET_PER_CLIP = 2   # far fewer than the 7 units
     try:
-        frames = ip.build_image_plan(pass1, {"f1": lat}, {}, {}, {})
+        frames = ip.build_image_plan(pass1, {"f1": lat}, {}, {}, {}, v4_meta_by_ref=v4_meta)
     finally:
         ip.FRAME_BUDGET_PER_CLIP = orig_budget
     refs = {f.ref for f in frames}
@@ -109,9 +99,9 @@ def test_every_pass1_unit_gets_a_frame_even_over_budget():
 
 
 def test_video_group_unanchored_uses_calm_and_sharp_fallback():
-    atoms = [_atom(0, 0, 1000, anchors=[])]
-    lat = _lattice_with_atoms("f1", 0, atoms)
-    pass1 = Pass1Output(video_tentative_groups=[VideoTentativeGroup(file_id="f1", atom_ids=[0])])
+    lat = _lattice_with_atoms("f1", 0, [])
+    pass1 = Pass1Output(video_tentative_groups=[VideoTentativeGroup(file_id="f1")])
+    v4_meta = {"video_group[0]": {"src_in_ms": 0, "src_out_ms": 1000}}
     hop = 100
     n = 10
     action = [0.8] * n
@@ -119,20 +109,19 @@ def test_video_group_unanchored_uses_calm_and_sharp_fallback():
     action[4] = 0.05
     blur[4] = 0.05  # a clearly calmest+sharpest sample at i=4 -> ts=400
     motion = {"f1": {"hop_ms": hop, "action_energy": action, "blur": blur}}
-    frames = ip.build_image_plan(pass1, {"f1": lat}, motion, {}, {})
+    frames = ip.build_image_plan(pass1, {"f1": lat}, motion, {}, {}, v4_meta_by_ref=v4_meta)
     assert len(frames) == 1, frames
     assert frames[0].reason == ip.REASON_VIDEO_GROUP_CALM
     assert frames[0].ts_ms == 400, frames[0]
     print("ok  test_video_group_unanchored_uses_calm_and_sharp_fallback")
 
 
-def test_video_group_with_no_resolvable_atoms_is_skipped():
-    atoms = [_atom(0, 0, 1000)]
-    lat = _lattice_with_atoms("f1", 0, atoms)
-    pass1 = Pass1Output(video_tentative_groups=[VideoTentativeGroup(file_id="f1", atom_ids=[99])])
+def test_video_group_with_no_v4_meta_is_skipped():
+    lat = _lattice_with_atoms("f1", 0, [])
+    pass1 = Pass1Output(video_tentative_groups=[VideoTentativeGroup(file_id="f1")])
     frames = ip.build_image_plan(pass1, {"f1": lat}, {}, {}, {})
     assert frames == [], frames
-    print("ok  test_video_group_with_no_resolvable_atoms_is_skipped")
+    print("ok  test_video_group_with_no_v4_meta_is_skipped")
 
 
 def test_take_member_always_kept_even_at_tiny_budget():
@@ -158,34 +147,33 @@ def test_take_member_always_kept_even_at_tiny_budget():
     print("ok  test_take_member_always_kept_even_at_tiny_budget")
 
 
-def test_budget_truncation_second_moment_outranks_extra_anchors_and_drift():
-    # A group with 3 anchors + a drift point inside the speech cut, no
-    # motion data (hop_ms=0 -> every non-trivial span clears the runt guard,
-    # see _is_runt_span). perception_upgrade.plan.md's new tier order is
-    # mandatory > second_moment > extra_anchors > drift: with only 1 slot of
-    # budget beyond the 3 mandatory frames, it goes to a 2nd-moment
-    # candidate (take's "late"), not the next anchor or the drift point.
-    atoms = [_atom(0, 3000, 6000, anchors=[3500, 4200, 5100])]
-    lat = _lattice_with_atoms("f1", 5, atoms)
+def test_budget_truncation_second_moment_outranks_drift():
+    # A video group + a drift point inside the speech cut, no motion data
+    # (hop_ms=0 -> every non-trivial span clears the runt guard, see
+    # _is_runt_span). Tier order is mandatory > second_moment > drift: with
+    # only 1 slot of budget beyond the 3 mandatory frames, it goes to a
+    # 2nd-moment candidate (take's "late"), not the drift point.
+    lat = _lattice_with_atoms("f1", 5, [])
     pass1 = Pass1Output(
         take_candidates=[TakeCandidate(group_id="tg1", members=[TakeMember(file_id="f1", word_span=(0, 1))])],
         speech_cuts=[SpeechCut(file_id="f1", word_span=(0, 4), label="x")],
-        video_tentative_groups=[VideoTentativeGroup(file_id="f1", atom_ids=[0])],
+        video_tentative_groups=[VideoTentativeGroup(file_id="f1")],
     )
+    v4_meta = {"video_group[0]": {"src_in_ms": 3000, "src_out_ms": 6000}}
     scene = {"f1": {"composition_points": [{"ts_ms": 700}]}}
     orig_budget = ip.FRAME_BUDGET_PER_CLIP
     ip.FRAME_BUDGET_PER_CLIP = 4   # 3 mandatory + room for exactly 1 extra
     try:
-        frames = ip.build_image_plan(pass1, {"f1": lat}, {}, scene, {})
+        frames = ip.build_image_plan(pass1, {"f1": lat}, {}, scene, {}, v4_meta_by_ref=v4_meta)
     finally:
         ip.FRAME_BUDGET_PER_CLIP = orig_budget
     assert len(frames) == 4, frames
     reasons = sorted(f.reason for f in frames)
-    # 1 take (x2, early+late) + 1 speech (mandatory only) + 1st video anchor
-    # (mandatory only) -- the extra anchors and the drift point both lost
-    # out to the take's 2nd-moment frame.
+    # 1 take (x2, early+late) + 1 speech (mandatory only) + 1 video
+    # (mandatory only) -- the drift point lost out to the take's 2nd-moment
+    # frame.
     assert reasons == [ip.REASON_SPEECH_CUT, ip.REASON_TAKE_MEMBER,
-                       ip.REASON_TAKE_MEMBER, ip.REASON_VIDEO_GROUP_ANCHOR], frames
+                       ip.REASON_TAKE_MEMBER, ip.REASON_VIDEO_GROUP_CALM], frames
     takes = [f for f in frames if f.reason == ip.REASON_TAKE_MEMBER]
     assert {f.phase for f in takes} == {"early", "late"}, takes
     # speech/video kept only their mandatory frame -- and since their would-be
@@ -193,35 +181,33 @@ def test_budget_truncation_second_moment_outranks_extra_anchors_and_drift():
     # (never a dangling "early" with no "late" to pair with).
     non_take = [f for f in frames if f.reason != ip.REASON_TAKE_MEMBER]
     assert all(f.phase == "only" for f in non_take), non_take
-    print("ok  test_budget_truncation_second_moment_outranks_extra_anchors_and_drift")
+    print("ok  test_budget_truncation_second_moment_outranks_drift")
 
 
-def test_budget_truncation_extra_anchors_outrank_drift_once_second_moment_is_covered():
+def test_budget_truncation_drift_wins_once_second_moment_is_covered():
     # Same fixture, but with enough budget to satisfy every mandatory AND
-    # 2nd-moment candidate -- confirms the ORIGINAL ordering (extra anchors
-    # before drift) still holds beneath the new second_moment tier.
-    atoms = [_atom(0, 3000, 6000, anchors=[3500, 4200, 5100])]
-    lat = _lattice_with_atoms("f1", 5, atoms)
+    # 2nd-moment candidate -- confirms drift (the lowest tier) still gets
+    # the leftover slot once nothing higher-priority is competing for it.
+    lat = _lattice_with_atoms("f1", 5, [])
     pass1 = Pass1Output(
         take_candidates=[TakeCandidate(group_id="tg1", members=[TakeMember(file_id="f1", word_span=(0, 1))])],
         speech_cuts=[SpeechCut(file_id="f1", word_span=(0, 4), label="x")],
-        video_tentative_groups=[VideoTentativeGroup(file_id="f1", atom_ids=[0])],
+        video_tentative_groups=[VideoTentativeGroup(file_id="f1")],
     )
+    v4_meta = {"video_group[0]": {"src_in_ms": 3000, "src_out_ms": 6000}}
     scene = {"f1": {"composition_points": [{"ts_ms": 700}]}}
     orig_budget = ip.FRAME_BUDGET_PER_CLIP
     # 3 mandatory + 3 second-moment (take/speech/video each get a "late") + 1.
     ip.FRAME_BUDGET_PER_CLIP = 7
     try:
-        frames = ip.build_image_plan(pass1, {"f1": lat}, {}, scene, {})
+        frames = ip.build_image_plan(pass1, {"f1": lat}, {}, scene, {}, v4_meta_by_ref=v4_meta)
     finally:
         ip.FRAME_BUDGET_PER_CLIP = orig_budget
-    anchor_ts = sorted(f.ts_ms for f in frames if f.reason == ip.REASON_VIDEO_GROUP_ANCHOR)
-    # first anchor (mandatory, early) + last anchor (2nd moment, late) +
-    # the one leftover middle anchor (the extra that wins the final slot
-    # over the drift point).
-    assert anchor_ts == [3500, 4200, 5100], anchor_ts
-    assert not any(f.reason == ip.REASON_COMPOSITION_DRIFT for f in frames), frames
-    print("ok  test_budget_truncation_extra_anchors_outrank_drift_once_second_moment_is_covered")
+    assert len(frames) == 7, frames
+    video_frames = [f for f in frames if f.ref == "video_group[0]"]
+    assert {f.phase for f in video_frames} == {"early", "late"}, video_frames
+    assert any(f.reason == ip.REASON_COMPOSITION_DRIFT for f in frames), frames
+    print("ok  test_budget_truncation_drift_wins_once_second_moment_is_covered")
 
 
 def test_long_speech_cut_gets_early_and_late_frames():
@@ -262,19 +248,6 @@ def test_runt_speech_cut_stays_single_frame():
     assert frames[0].phase == "only", frames[0]
     print("ok  test_runt_speech_cut_stays_single_frame")
 
-
-def test_anchored_video_group_gets_first_and_last_anchor_when_far_apart():
-    atoms = [_atom(0, 0, 10000, anchors=[100, 5000, 9800])]
-    lat = _lattice_with_atoms("f1", 0, atoms)
-    pass1 = Pass1Output(video_tentative_groups=[VideoTentativeGroup(file_id="f1", atom_ids=[0])])
-    frames = ip.build_image_plan(pass1, {"f1": lat}, {}, {}, {})
-    assert len(frames) == 3, frames   # first (early) + last (late) + leftover middle anchor extra
-    early = next(f for f in frames if f.phase == "early")
-    late = next(f for f in frames if f.phase == "late")
-    assert early.ts_ms == 100 and late.ts_ms == 9800, (early, late)
-    leftover = [f for f in frames if f.phase == "only"]
-    assert len(leftover) == 1 and leftover[0].ts_ms == 5000, leftover
-    print("ok  test_anchored_video_group_gets_first_and_last_anchor_when_far_apart")
 
 
 def test_v4_point_salience_straddles_the_peak():
@@ -387,16 +360,14 @@ def test_planned_frame_to_dict():
 def main():
     test_speech_cut_frame_uses_sharpest_ms_in_span()
     test_composition_drift_extra_added_inside_span_only()
-    test_video_group_anchor_yields_one_frame_per_anchor()
     test_every_pass1_unit_gets_a_frame_even_over_budget()
     test_video_group_unanchored_uses_calm_and_sharp_fallback()
-    test_video_group_with_no_resolvable_atoms_is_skipped()
+    test_video_group_with_no_v4_meta_is_skipped()
     test_take_member_always_kept_even_at_tiny_budget()
-    test_budget_truncation_second_moment_outranks_extra_anchors_and_drift()
-    test_budget_truncation_extra_anchors_outrank_drift_once_second_moment_is_covered()
+    test_budget_truncation_second_moment_outranks_drift()
+    test_budget_truncation_drift_wins_once_second_moment_is_covered()
     test_long_speech_cut_gets_early_and_late_frames()
     test_runt_speech_cut_stays_single_frame()
-    test_anchored_video_group_gets_first_and_last_anchor_when_far_apart()
     test_v4_point_salience_straddles_the_peak()
     test_v4_multi_event_cluster_yields_at_most_two_frames()
     test_v4_multi_event_cluster_with_point_primary_keeps_the_straddle()

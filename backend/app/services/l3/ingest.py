@@ -319,7 +319,7 @@ def run_ingest(project_id: str) -> str:
         if settings.ingest_pass2_provider == "gemini":
             from app.services.llm import ingest_gemini as ig
             pass2_cache_name = ig.create_pass2_cache(
-                pass2.gemini_system_prompt(settings.cuts_segmenter), pass1.build_pass1_blocks(file_rows))
+                pass2.gemini_system_prompt(), pass1.build_pass1_blocks(file_rows))
             if pass2_cache_name:
                 cache_ctx = ig.pass2_cache_scope(pass2_cache_name)
                 submit_batch = lambda pool, rows, frames: ig.submit_with_cache_context(  # noqa: E731

@@ -13,7 +13,7 @@ whole tiers and the run died in pass 2 with "no images resolved". The
 budget only ever trims EXTRAS beyond that floor, priority order when over
 budget (drop the lowest tier first):
 
-    2nd (early/late) moment  >  extra anchor frames (beyond a group's first)  >  composition-drift extras
+    2nd (early/late) moment  >  composition-drift extras
 
 perception_upgrade.plan.md Part B: a unit whose span is long enough (by that
 CLIP's OWN unit-length distribution, never a hardcoded ms) gets a SECOND
@@ -37,18 +37,17 @@ FRAME_BUDGET_PER_CLIP = 40
 
 REASON_TAKE_MEMBER = "take_member"
 REASON_SPEECH_CUT = "speech_cut"
-REASON_VIDEO_GROUP_ANCHOR = "video_group_anchor"
 REASON_VIDEO_GROUP_CALM = "video_group_calm"
 REASON_COMPOSITION_DRIFT = "composition_drift"
-# cuts_v4_segmentation.plan.md section 7: for a V4 video cut with a "point"
+# cuts_v4_only.plan.md section 7: for a V4 video cut with a "point"
 # salience, the two frames straddle the peak (one shortly before, one shortly
 # after) instead of the generic early/late halves -- so pass 2 can actually
 # tell before/after/both apart, since it never sees a timestamp.
 REASON_SHAPE_STRADDLE = "shape_straddle"
 _STRADDLE_OFFSET_MS = 400
 # The 2nd (early/late pairing) frame for a unit that clears the runt guard --
-# its own extras tier, ranked above extra_anchors/drift but below the 1st
-# (mandatory, never-dropped) frame per unit (module docstring).
+# its own extras tier, ranked above drift but below the 1st (mandatory,
+# never-dropped) frame per unit (module docstring).
 REASON_SECOND_MOMENT = "second_moment"
 
 
@@ -76,20 +75,6 @@ def _word_span_ms(lattices: Dict[str, Lattice], silences_by_file: Dict[str, List
     lattice = lattices[file_id]
     silences = silences_by_file.get(file_id, [])
     return resolve_speech_span_ms(lattice.words, lattice.atoms, word_span, silences)
-
-
-def _atom_group_span(lattices: Dict[str, Lattice], file_id: str,
-                      atom_ids: List[int]) -> Tuple[int, int, List[int]]:
-    """(start_ms, end_ms, sorted anchor_ms union) over the given atom ids.
-    (0, 0, []) when none of the ids resolve (stale/malformed model output)."""
-    atoms_by_id = {a.atom_id: a for a in lattices[file_id].atoms}
-    members = [atoms_by_id[i] for i in atom_ids if i in atoms_by_id]
-    if not members:
-        return 0, 0, []
-    s = min(a.start_ms for a in members)
-    e = max(a.end_ms for a in members)
-    anchors = sorted({t for a in members for t in a.anchor_ms})
-    return s, e, anchors
 
 
 def _calm_and_sharp_ms(motion: Dict[str, Any], s: int, e: int, default_ms: int) -> int:
@@ -162,10 +147,12 @@ def build_image_plan(
     """Turn pass 1's output into a concrete, budgeted list of frames to pull
     and hand to pass 2. Deterministic: same inputs always produce the same
     plan. Files absent from ``lattices`` are silently skipped (not yet
-    ingest-ready). ``v4_meta_by_ref`` (cuts_v4_segmentation.plan.md): {ref:
-    {"salience": {...}, ...}} for a V4 ingest's video cuts -- a "point"
-    salience straddles its peak instead of the generic early/late split (see
-    REASON_SHAPE_STRADDLE). None/empty -> identical to today (V3)."""
+    ingest-ready). ``v4_meta_by_ref`` (cuts_v4_only.plan.md): {ref: {"src_in_ms":
+    ..., "src_out_ms": ..., "salience": {...}, ...}} for every video cut --
+    ingest.py builds one entry per video_tentative_group, so this is the ONLY
+    source of a video unit's span (the segmenter's own ground truth); a
+    "point" salience straddles its peak instead of the generic early/late
+    split (see REASON_SHAPE_STRADDLE)."""
     # --- Pass 0: resolve every mandatory unit's (file_id, s, e, ...) up
     # front -- needed BEFORE deciding 1-vs-2 frames, since the runt guard
     # compares a unit's span against its OWN clip's median unit span.
@@ -184,44 +171,36 @@ def build_image_plan(
         s, e = _word_span_ms(lattices, silences_by_file, sc.file_id, sc.word_span)
         speech_units.append((sc.file_id, s, e, f"speech_cut[{i}]"))
 
-    video_units: List[Tuple[str, int, int, List[int], str]] = []
+    video_units: List[Tuple[str, int, int, str]] = []
     for gi, vg in enumerate(pass1.video_tentative_groups):
         if vg.file_id not in lattices:
             continue
         ref0 = f"video_group[{gi}]"
         v4_meta = (v4_meta_by_ref or {}).get(ref0)
-        if v4_meta is not None:
-            # The segmenter's own tight span, NOT the bounding box of the
-            # (coarser, informational-only) atoms it happens to overlap --
-            # using the atom span here would let mandatory/extra frames land
-            # outside what the V4 cut actually plays. No atom-derived
-            # anchors either: a "point" salience gets its own straddle
-            # frames below; "span"/"none" fall through to the calm+sharp
-            # instant within the segmenter's real bounds.
-            s, e, anchors = int(v4_meta["src_in_ms"]), int(v4_meta["src_out_ms"]), []
-        else:
-            s, e, anchors = _atom_group_span(lattices, vg.file_id, vg.atom_ids)
+        if v4_meta is None:
+            continue
+        # The segmenter's own span, ground truth for a video cut.
+        s, e = int(v4_meta["src_in_ms"]), int(v4_meta["src_out_ms"])
         if e <= s:
             continue
-        video_units.append((vg.file_id, s, e, anchors, f"video_group[{gi}]"))
+        video_units.append((vg.file_id, s, e, f"video_group[{gi}]"))
 
     spans_by_file: Dict[str, List[int]] = {}
     for fid, s, e, _ref in take_units:
         spans_by_file.setdefault(fid, []).append(e - s)
     for fid, s, e, _ref in speech_units:
         spans_by_file.setdefault(fid, []).append(e - s)
-    for fid, s, e, _anchors, _ref in video_units:
+    for fid, s, e, _ref in video_units:
         spans_by_file.setdefault(fid, []).append(e - s)
     median_by_file: Dict[str, float] = {
         fid: statistics.median(spans) for fid, spans in spans_by_file.items()
     }
 
-    # (mandatory frames, 2nd-moment extras, extra-anchor frames, drift
-    # frames) per clip. Mandatory = one frame per pass-1 unit, NEVER dropped
-    # (see module docstring); the budget only trims the three extras tiers.
+    # (mandatory frames, 2nd-moment extras, drift frames) per clip.
+    # Mandatory = one frame per pass-1 unit, NEVER dropped (see module
+    # docstring); the budget only trims the two extras tiers.
     mandatory_by_file: Dict[str, List[PlannedFrame]] = {}
     second_moment_by_file: Dict[str, List[PlannedFrame]] = {}
-    extra_anchors_by_file: Dict[str, List[PlannedFrame]] = {}
     drift_by_file: Dict[str, List[PlannedFrame]] = {}
 
     def _two_frame_ok(file_id: str, s: int, e: int, hop_ms: int) -> bool:
@@ -271,15 +250,13 @@ def build_image_plan(
                 drift_by_file.setdefault(file_id, []).append(
                     PlannedFrame(file_id, pts, REASON_COMPOSITION_DRIFT, ref, "only"))
 
-    # Video tentative groups: first frame mandatory (first anchor, else the
-    # calm+sharp instant); anchors beyond the first/last stay budgeted
-    # extras. A 2nd moment is the LAST anchor (if far enough from the
-    # first) or the calm+sharp instant over the LATE half otherwise.
-    for file_id, s, e, anchors, ref in video_units:
+    # Video tentative groups: first frame mandatory -- the peak straddle for
+    # a "point" salience cut, else the calm+sharp instant (2nd moment over
+    # the late half when the span clears the runt guard).
+    for file_id, s, e, ref in video_units:
         motion = motion_by_file.get(file_id, {})
         hop_ms = int(motion.get("hop_ms") or 0)
         mid = s + (e - s) // 2
-        quarter = max(1, (e - s) // 4)
 
         v4_sal = ((v4_meta_by_ref or {}).get(ref) or {}).get("salience") or {}
         if v4_sal.get("kind") == "point":
@@ -296,55 +273,26 @@ def build_image_plan(
                     PlannedFrame(file_id, peak_ms, REASON_SHAPE_STRADDLE, ref, "only"))
             continue
 
-        if anchors:
-            early_ts = anchors[0]
-            two_frame = _two_frame_ok(file_id, s, e, hop_ms)
-            late_ts: Optional[int] = None
-            leftover_anchors = anchors[1:]
-            if two_frame:
-                if len(anchors) > 1 and not _too_close(anchors[0], anchors[-1], hop_ms):
-                    late_ts = anchors[-1]
-                    leftover_anchors = anchors[1:-1]
-                else:
-                    late_ts = _calm_and_sharp_ms(motion, mid, e, e - quarter)
-                    leftover_anchors = anchors[1:]
-                if _too_close(early_ts, late_ts, hop_ms):
-                    late_ts = None
-                    leftover_anchors = anchors[1:]
-            if late_ts is not None:
+        if _two_frame_ok(file_id, s, e, hop_ms):
+            blur = motion.get("blur") or []
+            early, late = _early_late_ms(blur, hop_ms, s, e)
+            if not _too_close(early, late, hop_ms):
                 mandatory_by_file.setdefault(file_id, []).append(
-                    PlannedFrame(file_id, early_ts, REASON_VIDEO_GROUP_ANCHOR, ref, "early"))
+                    PlannedFrame(file_id, early, REASON_VIDEO_GROUP_CALM, ref, "early"))
                 second_moment_by_file.setdefault(file_id, []).append(
-                    PlannedFrame(file_id, late_ts, REASON_VIDEO_GROUP_ANCHOR, ref, "late"))
-            else:
-                mandatory_by_file.setdefault(file_id, []).append(
-                    PlannedFrame(file_id, early_ts, REASON_VIDEO_GROUP_ANCHOR, ref, "only"))
-            for a_ts in leftover_anchors:
-                extra_anchors_by_file.setdefault(file_id, []).append(
-                    PlannedFrame(file_id, a_ts, REASON_VIDEO_GROUP_ANCHOR, ref, "only"))
-        else:
-            if _two_frame_ok(file_id, s, e, hop_ms):
-                blur = motion.get("blur") or []
-                early, late = _early_late_ms(blur, hop_ms, s, e)
-                if not _too_close(early, late, hop_ms):
-                    mandatory_by_file.setdefault(file_id, []).append(
-                        PlannedFrame(file_id, early, REASON_VIDEO_GROUP_CALM, ref, "early"))
-                    second_moment_by_file.setdefault(file_id, []).append(
-                        PlannedFrame(file_id, late, REASON_VIDEO_GROUP_CALM, ref, "late"))
-                    continue
-            ts = _calm_and_sharp_ms(motion, s, e, (s + e) // 2)
-            mandatory_by_file.setdefault(file_id, []).append(
-                PlannedFrame(file_id, ts, REASON_VIDEO_GROUP_CALM, ref, "only"))
+                    PlannedFrame(file_id, late, REASON_VIDEO_GROUP_CALM, ref, "late"))
+                continue
+        ts = _calm_and_sharp_ms(motion, s, e, (s + e) // 2)
+        mandatory_by_file.setdefault(file_id, []).append(
+            PlannedFrame(file_id, ts, REASON_VIDEO_GROUP_CALM, ref, "only"))
 
     out: List[PlannedFrame] = []
-    all_files = (set(mandatory_by_file) | set(second_moment_by_file)
-                | set(extra_anchors_by_file) | set(drift_by_file))
+    all_files = set(mandatory_by_file) | set(second_moment_by_file) | set(drift_by_file)
     for file_id in all_files:
         mandatory = mandatory_by_file.get(file_id, [])
         out.extend(mandatory)
         budget = max(0, FRAME_BUDGET_PER_CLIP - len(mandatory))
         for tier in (second_moment_by_file.get(file_id, []),
-                    extra_anchors_by_file.get(file_id, []),
                     drift_by_file.get(file_id, [])):
             take = tier[:budget]
             out.extend(take)

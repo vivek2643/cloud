@@ -725,12 +725,12 @@ def _clip_continuity(
     prev_contiguous) so the two always agree. ``idxs`` must already be sorted
     by src_in_ms. Returns ``{resolved_idx: continuity_dict}``.
 
-    ``v4_meta_by_ref`` (v4_cuts_as_primitive.plan.md section 5): when BOTH
-    cuts of a pair are V4 video cuts (their source_ref is a key in this dict),
-    the seam test keys off the cuts' own boundaries instead of atoms -- see
-    ``_has_scene_or_transition_v4``. Any pair involving a speech cut (or a V3
-    video cut) keeps reading the atom lattice exactly as before -- speech
-    boundaries are unaffected by V4. None/empty -> always the V3 atom path."""
+    ``v4_meta_by_ref`` (cuts_v4_only.plan.md): when BOTH cuts of a pair are
+    video cuts (their source_ref is a key in this dict -- every video cut,
+    always), the seam test keys off the cuts' own boundaries instead of atoms
+    -- see ``_has_scene_or_transition_v4``. Any pair involving a speech cut
+    keeps reading the atom lattice exactly as before, since speech boundaries
+    are unaffected by the video segmenter."""
     v4_meta_by_ref = v4_meta_by_ref or {}
     n = len(idxs)
     conts = [{
@@ -741,8 +741,8 @@ def _clip_continuity(
     for pos in range(n - 1):
         cur_cut, cs, ce, _ = resolved[idxs[pos]]
         nxt_cut, ns, ne, _ = resolved[idxs[pos + 1]]
-        both_v4 = cur_cut.source_ref in v4_meta_by_ref and nxt_cut.source_ref in v4_meta_by_ref
-        has_break = (_has_scene_or_transition_v4(motion, ce, ns, synced=synced) if both_v4
+        both_video = cur_cut.source_ref in v4_meta_by_ref and nxt_cut.source_ref in v4_meta_by_ref
+        has_break = (_has_scene_or_transition_v4(motion, ce, ns, synced=synced) if both_video
                     else _has_scene_or_transition(lattice.atoms, ce, ns, synced=synced))
         verdict = classify_seam(Seam(
             same_clip=True,
@@ -805,21 +805,21 @@ def assemble_cut_records(
     ...}}}}``) -- fed straight through to ``sync.av_couple.authoritative_for``
     /``refine_offset`` to bake each cut's coupled ``(audio_file_id,
     audio_offset_ms)``. None/empty -> every cut couples to its own file at
-    offset 0 (today's behavior). ``v4_meta_by_ref`` (cuts_v4_segmentation.
-    plan.md): {source_ref: {"src_in_ms", "src_out_ms", "salience", "density"}}
-    for a V4 ingest's video cuts -- when present for a cut, its span and
-    salience come straight from the segmenter (v4_segment.VideoCut) instead
-    of atom membership / post._salience, and its pace envelope's min_ms is
-    density-scaled instead of anchor-derived. None/empty -> every video cut
-    resolves exactly as today (V3). Raises ``ValueError`` (stage ``post``,
-    per the plan's "no fallback" rule) on any invariant violation -- the
-    caller marks the ingest run ``failed`` for re-run."""
+    offset 0 (today's behavior). ``v4_meta_by_ref`` (cuts_v4_only.plan.md):
+    {source_ref: {"src_in_ms", "src_out_ms", "salience", "density"}} for
+    every video cut -- ingest.py's V4 segmenter builds one entry per
+    video_tentative_group, so this is the ONLY source of a video cut's span
+    and salience (v4_segment.VideoCut), and its pace envelope's min_ms is
+    density-scaled instead of anchor-derived. Raises ``ValueError`` (stage
+    ``post``, per the plan's "no fallback" rule) on any invariant violation --
+    the caller marks the ingest run ``failed`` for re-run."""
     junk_by_file: Dict[str, List[JunkSuspect]] = {}
     for js in (junk_suspects or []):
         junk_by_file.setdefault(js.file_id, []).append(js)
 
     audio_by_file = audio_by_file or {}
     sync_info_by_file = sync_info_by_file or {}
+    v4_meta_by_ref = v4_meta_by_ref or {}
     # Clip-relative normalisers for the quality scores: each signal is ranked
     # against its OWN clip's spread, so there are no absolute dB/pixel constants.
     rms_lohi = {fid: _series_lohi((a or {}).get("rms_db") or []) for fid, a in audio_by_file.items()}
@@ -835,21 +835,17 @@ def assemble_cut_records(
         if cut.kind == "speech":
             silences = silences_by_file.get(cut.file_id, [])
             s, e = resolve_speech_span_ms(lattice.words, lattice.atoms, cut.word_span, silences)
-        elif v4_meta_by_ref and cut.source_ref in v4_meta_by_ref:
-            # cuts_v4_segmentation.plan.md: the segmenter's own tight span --
-            # NOT the bounding box of the (coarser, informational-only) atoms
-            # it happens to overlap. See v4_segment.segment_video's docstring
-            # for why atom_ids can't drive this resolution for a V4 cut.
+        elif cut.source_ref in v4_meta_by_ref:
+            # cuts_v4_only.plan.md: the segmenter's own tight span -- NOT the
+            # bounding box of atoms it happens to overlap. See
+            # v4_segment.segment_video's docstring for why atom_ids can't
+            # drive this resolution for a video cut.
             meta = v4_meta_by_ref[cut.source_ref]
             s, e = int(meta["src_in_ms"]), int(meta["src_out_ms"])
         else:
-            atoms_by_id = {a.atom_id: a for a in lattice.atoms}
-            members = [atoms_by_id[i] for i in (cut.atom_ids or []) if i in atoms_by_id]
-            if not members:
-                raise ValueError(f"assemble_cut_records: no resolvable atoms for {cut.source_ref} "
-                                 f"in {cut.file_id}")
-            s = min(a.start_ms for a in members)
-            e = max(a.end_ms for a in members)
+            raise ValueError(f"assemble_cut_records: video cut {cut.source_ref} in "
+                             f"{cut.file_id} has no v4_meta_by_ref entry -- every video cut "
+                             f"must resolve through the V4 segmenter")
 
         motion = motion_by_file.get(cut.file_id, {})
         anchors = _anchors_in(motion, s, e)
@@ -921,18 +917,21 @@ def assemble_cut_records(
         total_quality = compute_total_quality(cut.kind, speech_quality, visual_score)
 
         if v4_meta is not None:
-            # cuts_v4_segmentation.plan.md section 4: the segmenter already
-            # computed the novelty curve and the anchor kind -- emit its
-            # salience directly rather than recomputing an absolute-level
-            # peak in post._salience. `shape` (pass 2's coarse semantic
-            # prior, arbitrated by construction -- see cutrecord_map._video_
-            # rung's branch order: `kind` is always code-owned and decides
-            # point/span/none; `shape` only ever picks the ladder's
-            # before/after asymmetry, defaulting safely to symmetric
-            # otherwise) rides alongside it.
+            # cuts_v4_only.plan.md: every video cut is a segmenter cut, and
+            # the segmenter already computed the novelty curve and the anchor
+            # kind -- emit its salience directly rather than recomputing an
+            # absolute-level peak in post._salience. `shape` (pass 2's coarse
+            # semantic prior, arbitrated by construction -- see
+            # cutrecord_map._video_rung's branch order: `kind` is always
+            # code-owned and decides point/span/none; `shape` only ever picks
+            # the ladder's before/after asymmetry, defaulting safely to
+            # symmetric otherwise) rides alongside it.
             salience = dict(v4_meta.get("salience") or {})
             salience["shape"] = cut.shape
         else:
+            # A speech cut -- salience here has nothing to do with the video
+            # segmenter; it's the same clip-relative energy/loudness/anchor
+            # curve every speech cut has always used.
             ae_lo, ae_hi = ae_lohi.get(cut.file_id, (None, None))
             rms_lo, rms_hi = rms_lohi.get(cut.file_id, (None, None))
             salience = _salience(

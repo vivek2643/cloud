@@ -128,27 +128,20 @@ def cluster(
 def _cut_span_ms(cut: Any, lattice: Any,
                   span_override: Optional[Dict[str, Tuple[int, int]]] = None) -> Optional[Tuple[int, int]]:
     """Best-effort (s, e) ms for one Pass2Cut-shaped object (duck-typed --
-    file_id/kind/word_span/atom_ids -- this module stays decoupled from the
-    pass2 schema, same pattern the rest of identity/ already uses).
+    file_id/kind/word_span -- this module stays decoupled from the pass2
+    schema, same pattern the rest of identity/ already uses).
 
-    ``span_override`` (cuts_v4_segmentation.plan.md): {source_ref: (s, e)} for
-    a V4 video cut, whose real span is the segmenter's own tight span, NOT the
-    bounding box of the (coarser, informational-only) atoms it happens to
-    overlap -- see v4_segment.segment_video's module docstring. None/absent
-    for every cut falls through to the atom-membership resolution below,
-    identical to today's behavior (the V3 path, and any cut with no override)."""
+    ``span_override`` (cuts_v4_only.plan.md): {source_ref: (s, e)} for every
+    video cut, whose real span is the segmenter's own tight span -- see
+    v4_segment.segment_video's module docstring. A speech cut resolves from
+    its word_span instead. A video cut with no entry in ``span_override``
+    (only possible for a caller that didn't build one) resolves to None."""
     if span_override and cut.source_ref in span_override:
         return span_override[cut.source_ref]
     if lattice is None:
         return None
     if cut.kind == "speech" and cut.word_span:
         return resolve_speech_span_ms(lattice.words, lattice.atoms, tuple(cut.word_span), [])
-    if cut.kind == "video" and cut.atom_ids:
-        atoms_by_id = {a.atom_id: a for a in lattice.atoms}
-        members = [atoms_by_id[i] for i in cut.atom_ids if i in atoms_by_id]
-        if not members:
-            return None
-        return min(a.start_ms for a in members), max(a.end_ms for a in members)
     return None
 
 
@@ -166,9 +159,8 @@ def visible_persons_by_cut(
     by mean face-box area, most prominent first) so a crowd shot stays a
     readable signal rather than an exhaustive roster.
 
-    ``span_override``: see ``_cut_span_ms`` -- {source_ref: (s, e)} for a V4
-    ingest's video cuts, whose real span is the segmenter's own, not the
-    atom-membership bounding box. None/empty for a V3 run (today's behavior)."""
+    ``span_override``: see ``_cut_span_ms`` -- {source_ref: (s, e)} for every
+    video cut, whose real span is the segmenter's own."""
     out: Dict[Tuple[str, str], List[str]] = {}
     cuts_by_file: Dict[str, List[Any]] = {}
     for cut in cuts:
