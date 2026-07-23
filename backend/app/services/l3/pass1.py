@@ -1,5 +1,5 @@
 """
-Cuts v3, Pass 1: text-only ingest over ALL clips in a project at once.
+Cuts, Pass 1: text-only ingest over ALL clips in a project at once.
 
 One call decides MEANING for the whole project (plan North Star #2): the
 final speech grouping, cross-clip take candidates, junk suspects, and a

@@ -1,5 +1,5 @@
 """
-Cuts v3: the deterministic IMAGE PLAN. No model call -- this falls straight
+Cuts: the deterministic IMAGE PLAN. No model call -- this falls straight
 out of pass 1's output plus signals L1 already computed (blur, action energy,
 composition drift). Decides exactly which frames pass 2 needs to see, and
 what each one is FOR, so pass 2 never has to guess what a numbered image

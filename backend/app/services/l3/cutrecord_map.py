@@ -1,16 +1,16 @@
 """
-Cuts v3 (``cut_records``) -> clip-tree projection for the agentic editor.
+Cuts (``cut_records``) -> clip-tree projection for the agentic editor.
 
 ``footage_map.build_clip_tree`` expects one cut dict per beat, each owning a
 broad..sharp zoom LADDER (the shape the retired hero-cut substrate used to
-hand it -- see cuts_v3_to_brain.plan.md and cleanup.plan.md B2). Cuts v3's
+hand it -- see cuts_v3_to_brain.plan.md and cleanup.plan.md B2). Cuts's
 ``cut_records`` are the current source of truth (what the Cuts tab reads),
 but they carry no ladder -- just one span (``src_in_ms``/``src_out_ms``), a
 ``hero_ts_ms`` anchor, and a ``pace`` envelope (``min_ms``/``natural_ms``/
 ``max_ms``/``levels``/``remove_spans``). This module is the bridge: it maps
 each ``cut_record`` row to the exact cut-dict shape ``build_clip_tree``
 consumes, synthesizing the ladder deterministically in code -- mirroring the
-frontend energy dial's own math (``cuts-v3-view.tsx``'s ``tightenedSpan``/
+frontend energy dial's own math (``cuts-view.tsx``'s ``tightenedSpan``/
 ``chosenRemoveSpans``) -- so the brain's tightening matches what the editor
 shows. No LLM numbers involved anywhere in this module; code owns every
 derived value.
@@ -59,7 +59,7 @@ _BAND_ENERGIES = (0.1, 0.3, 0.5, 0.7, 0.9)
 _FOLLOW_THROUGH_FLOOR_MS = 300
 _LEAD_FLOOR_MS = 300
 
-# Mirrors cuts-v3-view.tsx SPEECH_TRIM_MAX: even at max energy, only shave this
+# Mirrors cuts-view.tsx SPEECH_TRIM_MAX: even at max energy, only shave this
 # fraction of a speech cut's removable dead-air/filler budget. Kept identical
 # to the frontend dial so the ladder's sharpest rung matches what the editor's
 # dial shows at energy 1. edso_pacing_audit_timing.plan.md SS7: raised from
@@ -311,7 +311,7 @@ def _video_rung(row: Dict[str, Any], energy: float, level: str, score: float) ->
     """One video rung, clamped to ``pace.min_ms`` -- energy 0 = full grounded
     span, energy 1 = the tightest safe inset, evaluated at this rung's
     band-center energy. V3 (no ``salience.kind``) keeps the original
-    hero_ts_ms-centered symmetric shrink exactly (cuts-v3-view.tsx's
+    hero_ts_ms-centered symmetric shrink exactly (cuts-view.tsx's
     ``tightenedSpan``); a V4 cut (``salience.kind`` present) collapses toward
     the salience anchor instead, asymmetrically per shape -- see
     cuts_v4_segmentation.plan.md section 6. `shape` only ever picks the
@@ -358,7 +358,7 @@ def _video_rung(row: Dict[str, Any], energy: float, level: str, score: float) ->
 
 
 def _chosen_remove_spans(spans: List[Tuple[int, int]], energy: float) -> List[Tuple[int, int]]:
-    """Mirrors cuts-v3-view.tsx's ``chosenRemoveSpans``: the longest removable
+    """Mirrors cuts-view.tsx's ``chosenRemoveSpans``: the longest removable
     dead-air/filler spans first, up to ``energy * _SPEECH_TRIM_MAX`` of the
     total removable budget."""
     if not spans or energy <= 0:
@@ -377,7 +377,7 @@ def _chosen_remove_spans(spans: List[Tuple[int, int]], energy: float) -> List[Tu
 
 
 def _kept_segments(in_ms: int, out_ms: int, removed: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-    """Mirrors cuts-v3-view.tsx's ``keptSegments``: subtract the removed spans
+    """Mirrors cuts-view.tsx's ``keptSegments``: subtract the removed spans
     from [in_ms, out_ms] -> the ordered kept segments. Never empty."""
     rs = sorted((max(a, in_ms), min(b, out_ms)) for a, b in removed)
     rs = [(a, b) for a, b in rs if b > a]
@@ -473,7 +473,7 @@ def _audio_mute_for(channel: str, row: Dict[str, Any]) -> Tuple[Optional[str], b
     """The video default-mute rule: a video (done/shown) cut whose pace envelope
     says its source sound ISN'T worth keeping (``natural_sound`` false) is muted
     by default -- matching the old substrate's "b-roll shouldn't drag in stray
-    audio" policy, using cuts v3's own worth-keeping judgment as the signal
+    audio" policy, using the cut's own worth-keeping judgment as the signal
     instead of a raw speech/silence re-analysis. Said cuts leave audio/mute at
     their hero-cut default (unset/False) -- their audio IS the point."""
     if channel == "said":

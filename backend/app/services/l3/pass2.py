@@ -1,5 +1,5 @@
 """
-Cuts v3, Pass 2: ONE per-cut vision call -- identity (label/summary/channel/
+Cuts, Pass 2: ONE per-cut vision call -- identity (label/summary/channel/
 natural_sound/junk) + full visual judgment (framing/look/captions/taste/
 people), merged into a single ``CutJudgment`` the model emits per cut
 (pass2_merge.plan.md). Batches are pure size-based chunking (no co-location

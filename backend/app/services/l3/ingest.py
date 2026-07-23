@@ -1,5 +1,5 @@
 """
-Cuts v3 orchestrator: pass1 -> image_plan -> frame extraction -> pass2
+Cuts orchestrator: pass1 -> image_plan -> frame extraction -> pass2
 (identity + full visual judgment in one call per batch, batches run
 concurrently) -> post -> persist + hero frames. One call per project;
 re-runnable (each call is a fresh ``ingest_run`` row -- nothing is patched
@@ -175,7 +175,7 @@ def _extract_and_upload_heroes(records: List[post.CutRecord], record_ids: List[s
 
 
 def run_ingest(project_id: str) -> str:
-    """Run the full cuts-v3 ingest for one project. Returns the new
+    """Run the full cuts ingest for one project. Returns the new
     ingest_run id. On any failure the run is marked ``failed`` with the
     reason and the exception re-raised -- no partial result is ever left
     looking like a success (the plan's "no fallback" rule)."""

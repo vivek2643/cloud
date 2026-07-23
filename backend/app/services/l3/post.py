@@ -1,5 +1,5 @@
 """
-Cuts v3 post-compute: deterministic assembly of the final ``cut_records``
+Cuts post-compute: deterministic assembly of the final ``cut_records``
 from pass 2's judged output. No model call here, and no fallback -- the
 remaining invariants (zero overlap, boundary-on-edge) are enforced in code; a
 violation fails the ingest run loudly for re-run rather than being silently

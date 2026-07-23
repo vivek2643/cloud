@@ -1,5 +1,5 @@
 """
-Cuts v3: DB persistence for ``ingest_runs`` + ``cut_records`` (migration
+Cuts: DB persistence for ``ingest_runs`` + ``cut_records`` (migration
 024_cuts_v3.sql). Plain psycopg, autocommit -- the orchestrator (``ingest.py``)
 calls these at each stage transition so a crash mid-run leaves an
 inspectable, re-runnable row instead of losing all progress silently.

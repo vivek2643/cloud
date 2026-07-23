@@ -1,6 +1,6 @@
 """
-Per-genre default for the cuts-v3 energy dial (the client-side view-math
-tightness axis -- see cuts-v3-view.tsx). The rest of this module (the cuts-v2
+Per-genre default for the cuts energy dial (the client-side view-math
+tightness axis -- see cuts-view.tsx). The rest of this module (the cuts-v2
 five-band EnergyParams mapping) was retired in cleanup.plan.md B3.
 """
 from __future__ import annotations

@@ -7,7 +7,7 @@
 #   - GPU_WORKERS processes pull the "gpu" queue (L1 ingest), each pinned
 #     round-robin to a physical GPU via CUDA_VISIBLE_DEVICES so they don't all
 #     pile onto GPU 0.
-#   - One ingest worker pulls the "ingest" queue (Cuts v3 ingest -- Anthropic
+#   - One ingest worker pulls the "ingest" queue (Cuts ingest -- Anthropic
 #     image/text calls). It's a network/API call, not GPU compute, so it runs
 #     at high concurrency in a single process and never competes for VRAM with
 #     the L1 ingest workers.
@@ -18,7 +18,7 @@
 #   CPU_WORKERS         default = 2
 #   NUM_GPUS            override GPU count (else auto-detected via nvidia-smi)
 #   WORKER_CONCURRENCY  per-process concurrency (default 1; safe for VRAM)
-#   INGEST_CONCURRENCY  concurrent Cuts v3 ingest calls (default 6)
+#   INGEST_CONCURRENCY  concurrent Cuts ingest calls (default 6)
 #
 # Usage:
 #   cd backend && ./run_workers.sh
@@ -69,7 +69,7 @@ for ((i = 0; i < GPU_WORKERS; i++)); do
   sleep 2
 done
 
-# --- Ingest worker: Cuts v3 ingest (network-bound Anthropic calls, no GPU) --
+# --- Ingest worker: Cuts ingest (network-bound Anthropic calls, no GPU) --
 # One process serves the "ingest" queue with internal concurrency so many
 # projects' image/text calls overlap. Decoupled from the "gpu" queue so it
 # never contends for VRAM with L1 ingest.
