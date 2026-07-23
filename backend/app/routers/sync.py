@@ -24,6 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from app.auth import get_current_user_id
+from app.services import limits
 from app.services.l3.projects import find_or_create_project
 from app.services.l3.sync import store as sync_store
 from app.services.l3.sync.authoritative import GroupMember, pick_authoritative
@@ -56,10 +57,11 @@ def _owned_files(file_ids: List[str], user_id: str) -> List[dict]:
 
 def _demux_wav(raw_path: str, out_path: str) -> None:
     import subprocess
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", raw_path, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", out_path],
-        check=True, capture_output=True, timeout=300,
-    )
+    with limits.ffmpeg_slot():
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", raw_path, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", out_path],
+            check=True, capture_output=True, timeout=300,
+        )
 
 
 def _fetch_audio_features(file_ids: List[str]) -> dict:

@@ -36,6 +36,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Dict, List
 
+from app.services import limits
 from app.services.l1.cut_grid_common import clamp01, local_maxima
 from app.services.l1.scene_cuts_params import (
     COMPOSITION_DRIFT_FLOOR,
@@ -82,20 +83,24 @@ def _decode_bgr_frames(video_path: str, w: int, h: int, fps: int):
         "-vf", f"scale={w}:{h},fps={fps}",
         "-pix_fmt", "bgr24", "-f", "rawvideo", "-",
     ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    frame_bytes = w * h * 3
-    try:
-        while True:
-            buf = proc.stdout.read(frame_bytes)
-            if len(buf) < frame_bytes:
-                break
-            yield np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3)
-    finally:
+    # Held for the whole decode (not just the spawn) -- this is a live
+    # subprocess streaming frames for as long as the caller keeps pulling,
+    # exactly the resource FFMPEG_CONCURRENCY is meant to bound.
+    with limits.ffmpeg_slot():
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        frame_bytes = w * h * 3
         try:
-            proc.stdout.close()
-        except Exception:
-            pass
-        proc.wait()
+            while True:
+                buf = proc.stdout.read(frame_bytes)
+                if len(buf) < frame_bytes:
+                    break
+                yield np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3)
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            proc.wait()
 
 
 def _hs_hist(frame_bgr):

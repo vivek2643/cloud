@@ -44,6 +44,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from app.services import limits
+
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
@@ -402,10 +404,11 @@ def _dense_motion_energy(
 # ---------------------------------------------------------------------------
 
 def _demux_wav(video_path: str, out_path: str) -> None:
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", video_path, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", out_path],
-        check=True, capture_output=True, timeout=FFMPEG_TIMEOUT_S,
-    )
+    with limits.ffmpeg_slot():
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", video_path, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", out_path],
+            check=True, capture_output=True, timeout=FFMPEG_TIMEOUT_S,
+        )
 
 
 def _audio_rms_envelope(wav_path: str, hop_ms: int) -> List[float]:

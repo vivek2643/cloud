@@ -44,6 +44,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from app.services import limits
 from app.services.l1.cut_grid_common import (
     clamp01,
     hit_cost_curve,
@@ -138,20 +139,24 @@ def _decode_gray_frames(video_path: str, w: int, h: int, fps: int):
         "-vf", f"scale={w}:{h},fps={fps},format=gray",
         "-f", "rawvideo", "-",
     ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    frame_bytes = w * h
-    try:
-        while True:
-            buf = proc.stdout.read(frame_bytes)
-            if len(buf) < frame_bytes:
-                break
-            yield np.frombuffer(buf, dtype=np.uint8).reshape(h, w)
-    finally:
+    # Held for the whole decode (not just the spawn) -- a live subprocess
+    # streaming frames for as long as the caller keeps pulling, exactly the
+    # resource FFMPEG_CONCURRENCY is meant to bound.
+    with limits.ffmpeg_slot():
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        frame_bytes = w * h
         try:
-            proc.stdout.close()
-        except Exception:
-            pass
-        proc.wait()
+            while True:
+                buf = proc.stdout.read(frame_bytes)
+                if len(buf) < frame_bytes:
+                    break
+                yield np.frombuffer(buf, dtype=np.uint8).reshape(h, w)
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            proc.wait()
 
 
 def _fit_camera_model(src, dst, ransac_px: float):

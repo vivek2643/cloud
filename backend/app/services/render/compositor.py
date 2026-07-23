@@ -31,6 +31,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from app.services import limits
 from app.services.l3.captions.ass_export import captions_to_ass
 from app.services.l3.grade.cache import ensure_cube_file
 from app.services.l3.grade.cdl import is_identity, Grade
@@ -629,7 +630,8 @@ def _concat_segments(segments: List[str], dst: str, cfg: Dict[str, Any]) -> None
     try:
         cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
                "-c", "copy", "-movflags", "+faststart", dst]
-        proc = subprocess.run(cmd, capture_output=True)
+        with limits.ffmpeg_slot():
+            proc = subprocess.run(cmd, capture_output=True)
         if proc.returncode != 0 or not _ok(dst):
             logger.warning("concat copy failed; re-encoding merge.")
             cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
@@ -799,7 +801,8 @@ def _ok(path: str) -> bool:
 
 
 def _run_ffmpeg(cmd: List[str], out_path: str, what: str) -> None:
-    proc = subprocess.run(cmd, capture_output=True)
+    with limits.ffmpeg_slot():
+        proc = subprocess.run(cmd, capture_output=True)
     if proc.returncode != 0 or not _ok(out_path):
         try:
             if os.path.exists(out_path):

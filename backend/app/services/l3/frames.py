@@ -14,6 +14,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Iterable, List, Tuple
 
+from app.services import limits
 from app.services.l3.image_plan import PlannedFrame
 from app.services.processing import _download_from_r2
 
@@ -33,17 +34,18 @@ def _run_ffmpeg_still(video_path: str, ts_s: float, out_path: str, width: int) -
     Swallows the CalledProcessError (returns False) so the caller can retry an
     earlier seek; other failures (timeout, missing ffmpeg) still raise."""
     try:
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-ss", str(max(0.0, ts_s)),
-                "-i", video_path,
-                "-vframes", "1",
-                "-vf", f"scale={width}:-2,format=yuv420p",
-                "-q:v", "3",
-                out_path,
-            ],
-            check=True, capture_output=True, timeout=FFMPEG_TIMEOUT_S,
-        )
+        with limits.ffmpeg_slot():
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-ss", str(max(0.0, ts_s)),
+                    "-i", video_path,
+                    "-vframes", "1",
+                    "-vf", f"scale={width}:-2,format=yuv420p",
+                    "-q:v", "3",
+                    out_path,
+                ],
+                check=True, capture_output=True, timeout=FFMPEG_TIMEOUT_S,
+            )
     except subprocess.CalledProcessError:
         return False
     return os.path.exists(out_path) and os.path.getsize(out_path) > 0

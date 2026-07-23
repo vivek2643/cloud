@@ -39,6 +39,16 @@ class Settings(BaseSettings):
     # plan's Supabase Pro connection-facts table).
     db_pool_max_size: int = 8
 
+    # scale_architecture.plan.md Pillar 3: process-global bounded pools
+    # (app/services/limits.py). Every ffmpeg/ffprobe subprocess spawn and
+    # every R2 GET/PUT acquires one of these before running -- per-run caps
+    # (e.g. MAX_PARALLEL_PASS2_BATCHES, L1's 3 parallel tracks) only bound a
+    # SINGLE run/file; these are the process-wide backstop across however
+    # many runs/files are concurrently in flight. Raise as CPU/bandwidth
+    # headroom allows -- pure config knobs, no code change to scale.
+    ffmpeg_concurrency: int = 4
+    r2_concurrency: int = 16
+
     cors_origins: List[str] = ["http://localhost:3000"]
 
     # Dev mode: when set (non-empty), the backend bypasses JWT validation and

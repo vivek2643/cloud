@@ -46,6 +46,8 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+from app.services import limits
+
 logger = logging.getLogger(__name__)
 
 # Bump when the measurement logic/shape changes so cached rows recompute even
@@ -133,7 +135,8 @@ def _decode_rgb_frame_at(video_path: str, ts_s: float, w: int, h: int):
         "-frames:v", "1", "-vf", f"scale={w}:{h}",
         "-pix_fmt", "rgb24", "-f", "rawvideo", "-",
     ]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    with limits.ffmpeg_slot():
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     frame_bytes = w * h * 3
     buf = proc.stdout
     if len(buf) < frame_bytes:

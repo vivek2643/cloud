@@ -17,6 +17,8 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+from app.services import limits
+
 logger = logging.getLogger(__name__)
 
 
@@ -47,7 +49,8 @@ def _ffmpeg_loudnorm_pass1(wav_path: str) -> tuple[float, float]:
         "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
         "-f", "null", "-",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    with limits.ffmpeg_slot():
+        result = subprocess.run(cmd, capture_output=True, text=True)
     stderr = result.stderr
     match = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", stderr, re.DOTALL)
     if not match:

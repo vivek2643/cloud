@@ -24,6 +24,7 @@ from procrastinate import RetryStrategy
 from app.config import get_settings
 from app.services import audit_log
 from app.services import correlation
+from app.services import limits
 from app.services.jobs import app
 from app.services.l1 import active_speaker as asd_mod
 from app.services.l1 import audio_features as af_mod
@@ -205,7 +206,8 @@ FFMPEG_TIMEOUT_S = 2 * 60 * 60
 
 def _run_ffmpeg(cmd: list) -> tuple[bool, bytes]:
     try:
-        subprocess.run(cmd, check=True, capture_output=True, timeout=FFMPEG_TIMEOUT_S)
+        with limits.ffmpeg_slot():
+            subprocess.run(cmd, check=True, capture_output=True, timeout=FFMPEG_TIMEOUT_S)
         return True, b""
     except subprocess.TimeoutExpired:
         return False, b"ffmpeg timed out"
@@ -317,17 +319,18 @@ def _stage1_proxy(file_id: str, raw_path: str, tmpdir: str) -> tuple[float, int,
     # Thumbnail straight off the proxy: it's already normalized (8-bit, SDR,
     # rotation baked), so mjpeg never trips over exotic source pixel formats.
     thumb_time = max(duration * 0.25, 1.0)
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-ss", str(thumb_time),
-            "-i", proxy_path,
-            "-vframes", "1",
-            "-vf", "scale=640:-2,format=yuv420p",
-            "-q:v", "3",
-            thumb_path,
-        ],
-        check=True, capture_output=True, timeout=FFMPEG_TIMEOUT_S,
-    )
+    with limits.ffmpeg_slot():
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-ss", str(thumb_time),
+                "-i", proxy_path,
+                "-vframes", "1",
+                "-vf", "scale=640:-2,format=yuv420p",
+                "-q:v", "3",
+                thumb_path,
+            ],
+            check=True, capture_output=True, timeout=FFMPEG_TIMEOUT_S,
+        )
     thumb_key = f"thumbnails/{file_id}/thumb.jpg"
     _upload_to_r2(thumb_path, thumb_key, "image/jpeg")
 
@@ -346,15 +349,16 @@ def _stage1_proxy(file_id: str, raw_path: str, tmpdir: str) -> tuple[float, int,
 # --- WAV demux for stages 2 & 5 ------------------------------------------
 
 def _demux_wav(raw_path: str, out_path: str) -> None:
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-i", raw_path,
-            "-ac", "1", "-ar", "16000",
-            "-c:a", "pcm_s16le",
-            out_path,
-        ],
-        check=True, capture_output=True, timeout=FFMPEG_TIMEOUT_S,
-    )
+    with limits.ffmpeg_slot():
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", raw_path,
+                "-ac", "1", "-ar", "16000",
+                "-c:a", "pcm_s16le",
+                out_path,
+            ],
+            check=True, capture_output=True, timeout=FFMPEG_TIMEOUT_S,
+        )
 
 
 # --- Audio-only (music) stages -------------------------------------------
