@@ -1,17 +1,18 @@
 """
-Resolved captions -> ASS/libass subtitle text (captions.plan.md SS12): the
-SAME `resolved.captions` track the DOM/canvas preview overlay animates, fed
-through `_lut3d_arg`-style local-path escaping and burned by the ffmpeg
-compositor's `ass` filter. Parity is enforced by CONSTRUCTION, not by
-testing each effect twice: SS16 resolved #2 restricts v1 to exactly the four
-animation presets that have a faithful ASS expression (fade / pop / karaoke
-/ slide) -- `styles.ANIMATION_PRESETS` is already limited to these, so
-`_event_tags` below never has to approximate a fifth.
+Resolved captions -> ASS/libass subtitle text (caption_style_mvp.plan.md #4):
+the SAME `resolved.captions` track the DOM/canvas preview overlay animates,
+fed through the ffmpeg compositor's `ass` filter. Parity with
+`frontend/src/lib/resolve-captions.ts` is enforced by construction, not by
+testing each effect twice -- the four MVP animation presets (Active Reader /
+Pop-Bounce / Smooth Fade Up / Sequential Reveal) and every timing constant
+below are mirrored EXACTLY there; a change to one of the `_*_MS`/`_*_PX`/
+`_*_SCALE` constants below needs the matching constant updated in that file
+or preview and export visibly diverge.
 
 Text is pre-wrapped into lines by `timing.py` (max_chars_per_line/max_lines,
-already computed against the STYLE's own budget) -- this module renders
-those lines verbatim (`\\N` hard breaks) rather than re-wrapping, so preview
-and export never disagree about where a line breaks.
+already computed against the style's own size-derived budget) -- this module
+renders those lines verbatim (`\\N` hard breaks) rather than re-wrapping, so
+preview and export never disagree about where a line breaks.
 """
 from __future__ import annotations
 
@@ -22,7 +23,24 @@ from typing import Any, Dict, List, Tuple
 # the resolved box actually sits on the canvas.
 _AN_TOP, _AN_MID, _AN_BOTTOM = 8, 5, 2
 
-_KARAOKE_SECONDARY_DIM = 0.45  # "not yet sung" text: fill dimmed toward the outline colour
+# caption_style_mvp.plan.md #3: one fixed restrained outline width, one fixed
+# subtle shadow depth (ASS units) -- zero when the style's toggle is off.
+_OUTLINE_WIDTH = 2
+_SHADOW_DEPTH = 1
+
+# caption_style_mvp.plan.md #4: every entry transition completes within
+# 200ms. Constants below are each individually <=200ms (or split into two
+# phases that together are <=200ms) -- see the docstring above re: preview
+# parity.
+_ACTIVE_READER_ENTRY_MS = 120          # whole-caption entry fade (block appears)
+_ACTIVE_READER_DIM = 0.55              # "not currently spoken" brightness factor
+_POP_START_SCALE = 80                  # %, pre-ramp baseline
+_POP_PEAK_SCALE = 105                  # %, peak (never exceeds this)
+_POP_SETTLE_SCALE = 100                # %, rest state
+_POP_RAMP_MS = 90                      # each of the two ramp phases (90+90=180ms total)
+_FADE_UP_RISE_PX = 12                  # reference pixels, within the 10-15px ask
+_FADE_UP_DUR_MS = 180
+_SEQUENTIAL_WORD_FADE_MS = 120         # per-word appear fade
 
 
 def _ms_to_ass_time(ms: int) -> str:
@@ -60,15 +78,15 @@ def _style_key(style: Dict[str, Any]) -> Tuple:
     font = style["font"]
     colour = style["colour"]
     return (
-        font["family"], font["weight"], font.get("tracking", 0.0),
-        colour["fill"], colour["emphasis_fill"], colour["outline"], colour["shadow"], colour.get("box"),
+        font["family"], font["weight"], colour["fill"], colour["outline"], colour["shadow"],
+        colour["outline_enabled"], colour["shadow_enabled"], style.get("size_pct"),
     )
 
 
 def _build_styles_block(events: List[Dict[str, Any]], canvas_h: int) -> Tuple[str, Dict[Tuple, str]]:
-    """One ASS `Style:` line per distinct (font, colours) combo actually used
-    (normally exactly one -- a document has one active caption style -- but
-    never assumed, so a future per-event style override stays correct)."""
+    """One ASS `Style:` line per distinct (font, colours, size) combo
+    actually used (normally exactly one -- a document has one active caption
+    style -- but never assumed)."""
     seen: Dict[Tuple, str] = {}
     lines = [
         "[V4+ Styles]",
@@ -76,7 +94,6 @@ def _build_styles_block(events: List[Dict[str, Any]], canvas_h: int) -> Tuple[st
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding",
     ]
-    font_size = max(18, round(canvas_h * 0.045))
     for ev in events:
         style = ev["style"]
         key = _style_key(style)
@@ -85,17 +102,18 @@ def _build_styles_block(events: List[Dict[str, Any]], canvas_h: int) -> Tuple[st
         name = f"Style{len(seen)}"
         seen[key] = name
         font, colour = style["font"], style["colour"]
+        size_pct = style.get("size_pct") or 0.045
+        font_size = max(18, round(canvas_h * size_pct))
         primary = _hex_to_ass_bgr(colour["fill"])
-        secondary = _hex_to_ass_bgr(_dim_hex(colour["fill"], _KARAOKE_SECONDARY_DIM))
+        secondary = _hex_to_ass_bgr(_dim_hex(colour["fill"], _ACTIVE_READER_DIM))
         outline_c = _hex_to_ass_bgr(colour["outline"])
-        back_c = _hex_to_ass_bgr(colour["box"] or colour["shadow"], alpha=(0 if colour["box"] else 100))
-        border_style = 3 if colour.get("box") else 1  # 3 = opaque box, 1 = outline+shadow
-        outline_w = 3 if style["colour"].get("strong_outline") else 2
-        spacing = round(float(font.get("tracking", 0.0)) * font_size)
+        back_c = _hex_to_ass_bgr(colour["shadow"], alpha=(100 if colour["shadow_enabled"] else 255))
+        outline_w = _OUTLINE_WIDTH if colour["outline_enabled"] else 0
+        shadow_d = _SHADOW_DEPTH if colour["shadow_enabled"] else 0
         lines.append(
             f"Style: {name},{font['family']},{font_size},{primary},{secondary},{outline_c},{back_c},"
-            f"{-1 if font['weight'] >= 600 else 0},0,0,0,100,100,{spacing},0,{border_style},"
-            f"{outline_w},2,5,20,20,20,1"
+            f"{-1 if font['weight'] >= 600 else 0},0,0,0,100,100,0,0,1,"
+            f"{outline_w},{shadow_d},5,20,20,20,1"
         )
     return "\n".join(lines), seen
 
@@ -115,59 +133,56 @@ def _anchor_for_box(box: List[float], canvas_w: int, canvas_h: int) -> Tuple[int
     return _AN_MID, cx, round((y + h / 2.0) * canvas_h)
 
 
-def _event_tags(ev: Dict[str, Any], an: int, px: int, py: int) -> str:
-    """Event-level override tags (position + whole-line animation). Per-word
-    tags (karaoke `\\kf`, pop `\\t`) are built separately in `_line_text`."""
-    anim = ev["anim"]
-    preset = anim.get("preset", "fade")
-    tags = [f"\\an{an}", f"\\pos({px},{py})"]
-    if preset == "fade":
-        fad_ms = max(80, round(180 * (0.4 + float(anim.get("intensity", 0.5)))))
-        tags.append(f"\\fad({fad_ms},{fad_ms})")
-    elif preset == "slide":
-        rise = round(40 + 60 * float(anim.get("intensity", 0.5)))
-        dur = 220
-        y_from = py + rise if an != _AN_TOP else py - rise
-        tags = [f"\\an{an}", f"\\move({px},{y_from},{px},{py},0,{dur})", f"\\fad({dur},80)"]
-    return "{" + "".join(tags) + "}"
+def _event_tags(ev: Dict[str, Any], an: int, px: int, py: int) -> Tuple[str, int, int]:
+    """Event-level override tags (position + whole-line entry animation).
+    Returns (tag_string, px, py) since `fade_up`'s `\\move` needs a distinct
+    FROM point while everything else keeps the same (px, py)."""
+    preset = ev.get("anim") or "fade_up"
+    if preset == "fade_up":
+        y_from = py + _FADE_UP_RISE_PX if an != _AN_TOP else py - _FADE_UP_RISE_PX
+        tags = [f"\\an{an}", f"\\move({px},{y_from},{px},{py},0,{_FADE_UP_DUR_MS})", f"\\fad({_FADE_UP_DUR_MS},80)"]
+        return "{" + "".join(tags) + "}", px, py
+    if preset == "active_reader":
+        tags = [f"\\an{an}", f"\\pos({px},{py})", f"\\fad({_ACTIVE_READER_ENTRY_MS},80)"]
+        return "{" + "".join(tags) + "}", px, py
+    # "pop" and "sequential_reveal" both animate per-word (see _line_text);
+    # the event container itself just needs a quick, unobtrusive entry.
+    tags = [f"\\an{an}", f"\\pos({px},{py})", f"\\fad({_SEQUENTIAL_WORD_FADE_MS},80)"]
+    return "{" + "".join(tags) + "}", px, py
 
 
-def _line_text(
-    line: Dict[str, Any], ev_start_ms: int, style_colour: Dict[str, Any],
-    anim: Dict[str, Any], karaoke_cursor: List[int],
-) -> str:
-    """One line's text with per-word animation tags. `karaoke_cursor` is a
-    single-element mutable [prev_word_t_out_ms] threaded across ALL lines of
-    the event: ASS karaoke (\\k/\\kf) is cumulative over the whole Dialogue
-    line (\\N breaks included), so each word gets a leading empty \\k<gap>
-    syllable equal to the real pause since the previous word. Without it the
-    fill runs ahead of the actual speech -- and ahead of the DOM preview,
-    which fills each word over its absolute [t_in,t_out] (resolve-captions.ts
-    wordKaraokeFrac)."""
-    preset = anim.get("preset", "fade")
-    intensity = float(anim.get("intensity", 0.5))
+def _line_text(line: Dict[str, Any], ev_start_ms: int, style_colour: Dict[str, Any], preset: str) -> str:
+    """One line's text with per-word animation tags for the presets that
+    animate per-word (`active_reader`, `pop`, `sequential_reveal`);
+    `fade_up` animates the whole event only, so its words render plain."""
     parts: List[str] = []
     for w in line["words"]:
         text = _escape_ass_text(w["text"])
-        if preset == "karaoke":
-            gap_cs = max(0, round((int(w["t_in_ms"]) - karaoke_cursor[0]) / 10))
-            dur_cs = max(1, round((w["t_out_ms"] - w["t_in_ms"]) / 10))
-            lead = f"\\k{gap_cs}" if gap_cs > 0 else ""  # empty (text-less) hold syllable
-            parts.append(f"{{{lead}\\kf{dur_cs}}}{text} ")
-            karaoke_cursor[0] = int(w["t_out_ms"])
-        elif preset == "pop" and w.get("emphasized"):
-            scale = round(100 + 35 * intensity)
-            emph_colour = _hex_to_ass_bgr(style_colour["emphasis_fill"])
-            fill_colour = _hex_to_ass_bgr(style_colour["fill"])
-            t_ms = max(1, w["t_in_ms"] - ev_start_ms)
-            pop_dur = min(220, max(80, w["t_out_ms"] - w["t_in_ms"]))
-            # Ramp scale+colour up to the emphasis peak, then ramp BOTH back
-            # (colour included, \\c{fill}) so the word doesn't stay tinted for
-            # the rest of the event -- matches resolve-captions.ts wordPopStyle,
-            # which reverts to the fill colour once the pop window closes.
+        t0 = max(0, w["t_in_ms"] - ev_start_ms)
+        t1 = max(t0, w["t_out_ms"] - ev_start_ms)
+
+        if preset == "active_reader":
+            fill_c = _hex_to_ass_bgr(style_colour["fill"])
+            dim_c = _hex_to_ass_bgr(_dim_hex(style_colour["fill"], _ACTIVE_READER_DIM))
+            swap_ms = min(100, max(10, t1 - t0)) if t1 > t0 else 10
             parts.append(
-                f"{{\\t({t_ms},{t_ms + pop_dur},\\fscx{scale}\\fscy{scale}\\c{emph_colour})}}"
-                f"{text}{{\\t({t_ms + pop_dur},{t_ms + pop_dur + pop_dur},\\fscx100\\fscy100\\c{fill_colour})}} "
+                f"{{\\c{dim_c}}}{{\\t({t0},{t0 + swap_ms},\\c{fill_c})}}"
+                f"{text}{{\\t({t1},{t1 + swap_ms},\\c{dim_c})}} "
+            )
+        elif preset == "pop" and w.get("emphasized"):
+            fill_c = _hex_to_ass_bgr(style_colour["fill"])
+            ramp1_end = t0 + _POP_RAMP_MS
+            ramp2_end = ramp1_end + _POP_RAMP_MS
+            parts.append(
+                f"{{\\fscx{_POP_START_SCALE}\\fscy{_POP_START_SCALE}}}"
+                f"{{\\t({t0},{ramp1_end},\\fscx{_POP_PEAK_SCALE}\\fscy{_POP_PEAK_SCALE})}}"
+                f"{text}"
+                f"{{\\t({ramp1_end},{ramp2_end},\\fscx{_POP_SETTLE_SCALE}\\fscy{_POP_SETTLE_SCALE}\\c{fill_c})}} "
+            )
+        elif preset == "sequential_reveal":
+            fade_end = t0 + _SEQUENTIAL_WORD_FADE_MS
+            parts.append(
+                f"{{\\alpha&HFF&}}{{\\t({t0},{fade_end},\\alpha&H00&)}}{text} "
             )
         else:
             parts.append(f"{text} ")
@@ -179,16 +194,14 @@ def _build_events_block(events: List[Dict[str, Any]], style_names: Dict[Tuple, s
     for ev in events:
         style = ev["style"]
         style_name = style_names[_style_key(style)]
+        preset = ev.get("anim") or "fade_up"
         an, px, py = _anchor_for_box(ev["box"], canvas_w, canvas_h)
-        tags = _event_tags(ev, an, px, py)
-        # Karaoke timing is cumulative over the whole Dialogue line, so the
-        # cursor must span all of this event's lines (not reset per line).
-        karaoke_cursor = [int(ev["prog_start_ms"])]
+        tag_str, px, py = _event_tags(ev, an, px, py)
         line_texts = [
-            _line_text(line, ev["prog_start_ms"], style["colour"], ev["anim"], karaoke_cursor)
+            _line_text(line, ev["prog_start_ms"], style["colour"], preset)
             for line in ev["lines"]
         ]
-        text = tags + "\\N".join(line_texts)
+        text = tag_str + "\\N".join(line_texts)
         start, end = _ms_to_ass_time(ev["prog_start_ms"]), _ms_to_ass_time(ev["prog_end_ms"])
         lines.append(f"Dialogue: 0,{start},{end},{style_name},,0,0,0,,{text}")
     return "\n".join(lines)
@@ -212,9 +225,10 @@ def captions_to_ass(events: List[Dict[str, Any]], *, canvas_w: int, canvas_h: in
         # No events -> still emit a minimal default style so the doc parses.
         styles_block, style_names = _build_styles_block(
             [{"style": {
-                "font": {"family": "Arial", "weight": 400, "tracking": 0.0},
-                "colour": {"fill": "#ffffff", "emphasis_fill": "#ffffff", "outline": "#000000",
-                           "shadow": "#000000", "box": None, "strong_outline": False},
+                "font": {"family": "Arial", "weight": 400},
+                "colour": {"fill": "#ffffff", "outline": "#000000", "shadow": "#000000",
+                           "outline_enabled": False, "shadow_enabled": False},
+                "size_pct": 0.045,
             }}],
             canvas_h,
         )

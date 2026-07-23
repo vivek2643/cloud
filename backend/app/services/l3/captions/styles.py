@@ -1,120 +1,123 @@
 """
-Caption style bundles (captions.plan.md SS3/SS5): the `CaptionStyle` schema
-plus the curated catalogs (fonts/animations/placements/colours) it's built
-from. Pure data -- no I/O, no signals -- everything downstream (resolver,
-suggest, ass_export) composes these dicts.
+Caption style bundles (caption_style_mvp.plan.md): the `CaptionStyle` schema
+plus the curated catalogs (fonts/colours/positions/animations/cases/sizes) it's
+built from. Pure data -- no I/O, no signals -- everything downstream
+(resolver, suggest, ass_export) composes these dicts.
 
-v1 animation vocabulary is DELIBERATELY restricted (SS16 resolved #2) to the
-four effects that render *identically* in the DOM/canvas preview and in
-ASS/libass: fade, pop (scale/colour emphasis), karaoke (word-fill), slide.
-Typewriter / word-bounce / highlight-box (SS5's fuller list) need true
-per-frame kinetic typography for a faithful ASS parity -- deferred to phase 2
-(SS15) rather than shipped as a lookalike approximation that would quietly
-diverge between preview and export.
+MVP catalog is DELIBERATELY four values per category, no exceptions -- every
+knob that used to be a continuous dial (animation intensity, letter tracking,
+outline width, shadow parameters, line-wrap limits, beat sync, an open colour
+picker) is now either gone or a fixed internal constant. This is a full
+replacement of the prior "Suggested + Standards, 5+7 tiles, 5 colour sources,
+4 animation presets with tunable intensity" system with a much smaller
+Standard + 4 AI-picks catalog. `CaptionStyle.from_dict` still parses the OLD
+(pre-MVP) shape so previously saved documents keep rendering -- see
+`_from_legacy_dict` -- but nothing new is ever written in that shape again.
 
-Font set: 6 curated families, all SIL Open Font License (so they can be
-self-hosted + embedded in an ffmpeg burn freely -- SS16 "lock ~6 SIL OFL
-fonts"). Only FAMILY METADATA lives here; no binaries are bundled by this
-change (see `frontend/public/fonts/` -- the existing Telegraf entry is the
-same "path exists, files dropped in later" precedent, `globals.css` already
-falls back to the system stack when a font file is absent). Both the CSS
-`@font-face` the frontend registers and the `fontfile`/`fontsdir` ffmpeg burn
-need real files before a family renders as anything but its system fallback;
-until then every family still degrades to a legible system font, never a
-blank/broken caption.
+Font set: 4 curated families, all SIL Open Font License, self-hosted under
+`frontend/public/fonts/` (WOFF2, preview) and
+`backend/app/services/render/caption_fonts/` (TTF/OTF, the ffmpeg/libass
+burn) -- see those directories' NOTICE files for exact source/license per
+family.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 # --------------------------------------------------------------------------
-# Fonts (SS5) -- family, weight, a plausible system fallback stack, and the
-# self-hosted file stem this family will resolve to once real font binaries
-# land under frontend/public/fonts/ + a backend fonts dir (SS12/SS13).
+# Fonts -- family, weight, a plausible system fallback stack. Family names
+# here must match frontend globals.css's `@font-face` declarations AND the
+# self-hosted binaries' embedded name exactly, or preview/export diverge.
 # --------------------------------------------------------------------------
 
 FONTS: Dict[str, Dict[str, Any]] = {
+    "montserrat": {
+        "family": "Montserrat", "weight": 800, "archetype": "modern_workhorse",
+        "fallback_stack": "'Montserrat', Arial, sans-serif", "license": "OFL",
+    },
     "anton": {
-        "family": "Anton", "weight": 400, "archetype": "condensed_impact",
-        "fallback_stack": "'Anton', Impact, 'Arial Narrow Bold', sans-serif",
-        "license": "OFL",
+        "family": "Anton", "weight": 400, "archetype": "punchy_creator",
+        "fallback_stack": "'Anton', Impact, 'Arial Narrow Bold', sans-serif", "license": "OFL",
     },
-    "poppins_extrabold": {
-        "family": "Poppins", "weight": 800, "archetype": "bold_geometric",
-        "fallback_stack": "'Poppins', 'Montserrat', Arial, sans-serif",
-        "license": "OFL",
+    "jost": {
+        "family": "Jost", "weight": 800, "archetype": "futura_geometric",
+        "fallback_stack": "'Jost', Futura, 'Century Gothic', sans-serif", "license": "OFL",
     },
-    "inter_tight": {
-        "family": "Inter Tight", "weight": 600, "archetype": "neutral_workhorse",
-        "fallback_stack": "'Inter Tight', Inter, -apple-system, sans-serif",
-        "license": "OFL",
-    },
-    "nunito": {
-        "family": "Nunito", "weight": 700, "archetype": "rounded_friendly",
-        "fallback_stack": "'Nunito', 'Trebuchet MS', 'Segoe UI', sans-serif",
-        "license": "OFL",
-    },
-    "fraunces": {
-        "family": "Fraunces", "weight": 600, "archetype": "editorial",
-        "fallback_stack": "'Fraunces', Georgia, 'Times New Roman', serif",
-        "license": "OFL",
-    },
-    "permanent_marker": {
-        "family": "Permanent Marker", "weight": 400, "archetype": "marker_handwritten",
-        "fallback_stack": "'Permanent Marker', 'Bradley Hand', cursive",
-        "license": "OFL",
+    "inter": {
+        "family": "Inter", "weight": 600, "archetype": "neutral_standard",
+        "fallback_stack": "'Inter', -apple-system, 'Segoe UI', sans-serif", "license": "OFL",
     },
 }
+DEFAULT_FONT_ID = "inter"
 
 # --------------------------------------------------------------------------
-# Animations (SS5, restricted to the v1 parity-safe set -- SS16 #2)
+# Colours -- 4 fixed swatches, no dynamic/grade-matched/palette source. Each
+# swatch declares its own OWN outline/shadow ink: white/yellow/cyan (light
+# text) get a dark outline+shadow when enabled; charcoal (dark text) gets a
+# light one -- so legibility never depends on a runtime footage sample.
 # --------------------------------------------------------------------------
 
-ANIMATION_PRESETS = ("fade", "pop", "karaoke", "slide")
-EMPHASIS_MODES = ("semantic", "loudness", "none")
+_DARK_INK = "#000000"
+_LIGHT_INK = "#FFFFFF"
 
-
-@dataclass
-class AnimationSpec:
-    preset: str = "fade"           # one of ANIMATION_PRESETS
-    intensity: float = 0.6         # 0..1, scales overshoot/emphasis amplitude
-    beat_sync: bool = False
-    emphasis: str = "loudness"     # one of EMPHASIS_MODES
-
-
-# --------------------------------------------------------------------------
-# Placement (SS5/SS9)
-# --------------------------------------------------------------------------
-
-PLACEMENT_ANCHORS = ("lower_third", "center", "top", "dynamic", "speaker")
-
-
-@dataclass
-class PlacementSpec:
-    anchor: str = "dynamic"
-    safe_area: bool = True
-    # Minimum time (ms) a placement is held before it's allowed to move again
-    # (SS9 hysteresis) -- computed per weld-run by placement.py, this is just
-    # the style's stated preference for how "sticky" placement should feel.
-    stability_ms: int = 1200
-
+COLOURS: Dict[str, Dict[str, str]] = {
+    "white": {"label": "White", "hex": "#FFFFFF", "ink": _DARK_INK},
+    "yellow": {"label": "Vibrant Yellow", "hex": "#FFEB3B", "ink": _DARK_INK},
+    "cyan": {"label": "Cyan", "hex": "#00E5FF", "ink": _DARK_INK},
+    "charcoal": {"label": "Charcoal", "hex": "#1A1A1A", "ink": _LIGHT_INK},
+}
+DEFAULT_COLOUR_ID = "white"
 
 # --------------------------------------------------------------------------
-# Colour (SS5/SS11)
+# Outline / shadow -- booleans only; width/opacity are fixed constants owned
+# by ass_export.py (ASS units) and caption-overlay.tsx (CSS px), not exposed
+# here as tunables.
 # --------------------------------------------------------------------------
 
-COLOUR_SOURCES = ("white", "black_box", "match_grade", "palette_accent", "high_contrast")
+# --------------------------------------------------------------------------
+# Position -- 4 fixed vertical placements, no dynamic/speaker/per-cut
+# caption_zones routing for MVP styles (placement.py falls back to
+# lower_third when analysis is unavailable).
+# --------------------------------------------------------------------------
 
+POSITIONS = ("lower_third", "center", "top", "bottom_dynamic")
+DEFAULT_POSITION = "lower_third"
 
-@dataclass
-class ColourSpec:
-    source: str = "white"
-    fill: str = "#ffffff"
-    emphasis_fill: str = "#ffffff"
-    outline: str = "#000000"
-    shadow: str = "#000000"
-    box: Optional[str] = None      # box fill colour, only used by black_box
+# --------------------------------------------------------------------------
+# Animation -- 4 fixed presets, no per-style intensity/beat_sync/emphasis
+# dial. Internal timing constants live in ass_export.py (export) and
+# resolve-captions.ts (preview), kept in lockstep by convention + tests.
+# --------------------------------------------------------------------------
+
+ANIMATIONS = ("active_reader", "pop", "fade_up", "sequential_reveal")
+DEFAULT_ANIMATION = "fade_up"
+
+# --------------------------------------------------------------------------
+# Case -- 4 values. "sentence" capitalizes the first word of each caption
+# event and lowercases the rest (a caption event is the closest available
+# unit to "a sentence" -- there's no punctuation-based sentence splitter in
+# the transcript word stream).
+# --------------------------------------------------------------------------
+
+CASES = ("original", "sentence", "upper", "lower")
+DEFAULT_CASE = "original"
+
+# --------------------------------------------------------------------------
+# Size -- 4 values, mapped to a fixed frame-height percentage used
+# identically by preview (caption-overlay.tsx) and export (ass_export.py).
+# --------------------------------------------------------------------------
+
+SIZES = ("small", "regular", "large", "xl")
+DEFAULT_SIZE = "regular"
+SIZE_FRAME_PCT: Dict[str, float] = {"small": 0.036, "regular": 0.045, "large": 0.055, "xl": 0.065}
+# Max characters/line is NOT a user-facing control, but it must shrink as
+# text gets bigger or a large/XL caption overflows its safe box -- purely a
+# function of `size`, same rationale `LEVELS_SLOPE_MAX`-style caps elsewhere
+# in this codebase use (a derived safety bound, not a dial).
+MAX_CHARS_PER_LINE: Dict[str, int] = {"small": 42, "regular": 34, "large": 28, "xl": 22}
+MAX_LINES = 2
 
 
 # --------------------------------------------------------------------------
@@ -125,233 +128,228 @@ class ColourSpec:
 class CaptionStyle:
     style_id: str
     label: str
-    tier: str = "standard"         # "suggested" | "standard"
-    font_id: str = "inter_tight"
-    case: str = "as-is"            # "as-is" | "upper"
-    tracking: float = 0.0          # letter-spacing, em
-    max_lines: int = 2
-    max_chars_per_line: int = 32
-    animation: AnimationSpec = field(default_factory=AnimationSpec)
-    placement: PlacementSpec = field(default_factory=PlacementSpec)
-    colour: ColourSpec = field(default_factory=ColourSpec)
+    tier: str = "standard"          # "suggested" | "standard"
+    font_id: str = DEFAULT_FONT_ID
+    colour_id: str = DEFAULT_COLOUR_ID
+    outline_enabled: bool = False
+    shadow_enabled: bool = False
+    position: str = DEFAULT_POSITION
+    animation: str = DEFAULT_ANIMATION
+    case: str = DEFAULT_CASE
+    size: str = DEFAULT_SIZE
     rationale: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        font = FONTS.get(self.font_id, FONTS["inter_tight"])
+        font = FONTS.get(self.font_id, FONTS[DEFAULT_FONT_ID])
+        colour = COLOURS.get(self.colour_id, COLOURS[DEFAULT_COLOUR_ID])
         return {
             "style_id": self.style_id,
             "label": self.label,
             "tier": self.tier,
             "font": {
-                "font_id": self.font_id,
-                "family": font["family"], "weight": font["weight"],
+                "font_id": self.font_id, "family": font["family"], "weight": font["weight"],
                 "fallback_stack": font["fallback_stack"],
-                "case": self.case, "tracking": self.tracking,
-                "max_lines": self.max_lines, "max_chars_per_line": self.max_chars_per_line,
-            },
-            "animation": {
-                "preset": self.animation.preset, "intensity": self.animation.intensity,
-                "beat_sync": self.animation.beat_sync, "emphasis": self.animation.emphasis,
-            },
-            "placement": {
-                "anchor": self.placement.anchor, "safe_area": self.placement.safe_area,
-                "stability_ms": self.placement.stability_ms,
             },
             "colour": {
-                "source": self.colour.source, "fill": self.colour.fill,
-                "emphasis_fill": self.colour.emphasis_fill, "outline": self.colour.outline,
-                "shadow": self.colour.shadow, "box": self.colour.box,
+                "colour_id": self.colour_id, "fill": colour["hex"],
+                "outline_enabled": self.outline_enabled, "shadow_enabled": self.shadow_enabled,
+                "outline": colour["ink"], "shadow": colour["ink"],
             },
+            "position": self.position,
+            "animation": self.animation,
+            "case": self.case,
+            "size": self.size,
+            "size_pct": SIZE_FRAME_PCT.get(self.size, SIZE_FRAME_PCT[DEFAULT_SIZE]),
+            "max_lines": MAX_LINES,
+            "max_chars_per_line": MAX_CHARS_PER_LINE.get(self.size, MAX_CHARS_PER_LINE[DEFAULT_SIZE]),
             "rationale": self.rationale,
         }
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "CaptionStyle":
-        """Reconstruct from a `to_dict()`-shaped snapshot (SS3 "resolved
-        style properties inlined too" -- a document's persisted
-        `captions.base_style` is exactly this shape, so a Suggested pick
-        stays resolvable even after its ephemeral suggest.py cache entry is
-        gone / regenerated differently)."""
-        font = d.get("font") or {}
-        anim = d.get("animation") or {}
-        place = d.get("placement") or {}
-        colour = d.get("colour") or {}
+        """Reconstruct from a `to_dict()`-shaped snapshot. Detects and
+        normalizes the OLD (pre-MVP) shape -- nested `font.font_id`/
+        `animation.preset`/`placement.anchor`/`colour.source` -- so a
+        document saved before this rewrite still resolves to a valid, close
+        MVP-catalog style instead of crashing or silently going blank. Never
+        rewrites the stored snapshot; this is a read-time normalization
+        only (the plan's "preserve old saved documents")."""
+        if _looks_legacy(d):
+            return _from_legacy_dict(d)
+        font_id = d.get("font", {}).get("font_id") if isinstance(d.get("font"), dict) else None
+        colour_block = d.get("colour") if isinstance(d.get("colour"), dict) else {}
         return cls(
             style_id=d.get("style_id") or "custom",
             label=d.get("label") or "Custom",
             tier=d.get("tier") or "standard",
-            font_id=font.get("font_id") or "inter_tight",
-            case=font.get("case") or "as-is",
-            tracking=float(font.get("tracking") or 0.0),
-            max_lines=int(font.get("max_lines") or 2),
-            max_chars_per_line=int(font.get("max_chars_per_line") or 32),
-            animation=AnimationSpec(
-                preset=anim.get("preset") or "fade",
-                intensity=float(anim.get("intensity") if anim.get("intensity") is not None else 0.6),
-                beat_sync=bool(anim.get("beat_sync") or False),
-                emphasis=anim.get("emphasis") or "loudness",
-            ),
-            placement=PlacementSpec(
-                anchor=place.get("anchor") or "dynamic",
-                safe_area=bool(place.get("safe_area") if place.get("safe_area") is not None else True),
-                stability_ms=int(place.get("stability_ms") or 1200),
-            ),
-            colour=ColourSpec(
-                source=colour.get("source") or "white",
-                fill=colour.get("fill") or "#ffffff",
-                emphasis_fill=colour.get("emphasis_fill") or "#ffffff",
-                outline=colour.get("outline") or "#000000",
-                shadow=colour.get("shadow") or "#000000",
-                box=colour.get("box"),
-            ),
+            font_id=font_id if font_id in FONTS else DEFAULT_FONT_ID,
+            colour_id=colour_block.get("colour_id") if colour_block.get("colour_id") in COLOURS else DEFAULT_COLOUR_ID,
+            outline_enabled=bool(colour_block.get("outline_enabled", False)),
+            shadow_enabled=bool(colour_block.get("shadow_enabled", False)),
+            position=d.get("position") if d.get("position") in POSITIONS else DEFAULT_POSITION,
+            animation=d.get("animation") if d.get("animation") in ANIMATIONS else DEFAULT_ANIMATION,
+            case=d.get("case") if d.get("case") in CASES else DEFAULT_CASE,
+            size=d.get("size") if d.get("size") in SIZES else DEFAULT_SIZE,
             rationale=d.get("rationale"),
         )
 
 
 def apply_overrides(style: CaptionStyle, overrides: Optional[Dict[str, Any]]) -> CaptionStyle:
-    """A shallow, field-level patch (SS7 "Standards" refine-from-suggestion):
-    overrides never compose/accumulate like a grade delta -- each field is
-    either the base style's value or the override's, nothing in between."""
+    """A shallow, field-level patch: overrides never compose/accumulate like
+    a grade delta -- each field is either the base style's value or the
+    override's, nothing in between. Only the MVP-public fields are
+    patchable (font/colour/position/animation/case/size/outline/shadow)."""
     if not overrides:
         return style
     import copy
     s = copy.deepcopy(style)
-    if "font_id" in overrides and overrides["font_id"] in FONTS:
+    if overrides.get("font_id") in FONTS:
         s.font_id = overrides["font_id"]
-    if "case" in overrides and overrides["case"] in ("as-is", "upper"):
+    if overrides.get("colour_id") in COLOURS:
+        s.colour_id = overrides["colour_id"]
+    if "outline_enabled" in overrides:
+        s.outline_enabled = bool(overrides["outline_enabled"])
+    if "shadow_enabled" in overrides:
+        s.shadow_enabled = bool(overrides["shadow_enabled"])
+    if overrides.get("position") in POSITIONS:
+        s.position = overrides["position"]
+    if overrides.get("animation") in ANIMATIONS:
+        s.animation = overrides["animation"]
+    if overrides.get("case") in CASES:
         s.case = overrides["case"]
-    if "tracking" in overrides:
-        try:
-            s.tracking = float(overrides["tracking"])
-        except (TypeError, ValueError):
-            pass
-    if "max_lines" in overrides:
-        try:
-            s.max_lines = max(1, min(3, int(overrides["max_lines"])))
-        except (TypeError, ValueError):
-            pass
-    if "max_chars_per_line" in overrides:
-        try:
-            s.max_chars_per_line = max(10, min(60, int(overrides["max_chars_per_line"])))
-        except (TypeError, ValueError):
-            pass
-    anim = overrides.get("animation") or {}
-    if anim.get("preset") in ANIMATION_PRESETS:
-        s.animation.preset = anim["preset"]
-    if "intensity" in anim:
-        try:
-            s.animation.intensity = max(0.0, min(1.0, float(anim["intensity"])))
-        except (TypeError, ValueError):
-            pass
-    if "beat_sync" in anim:
-        s.animation.beat_sync = bool(anim["beat_sync"])
-    if anim.get("emphasis") in EMPHASIS_MODES:
-        s.animation.emphasis = anim["emphasis"]
-    place = overrides.get("placement") or {}
-    if place.get("anchor") in PLACEMENT_ANCHORS:
-        s.placement.anchor = place["anchor"]
-    if "safe_area" in place:
-        s.placement.safe_area = bool(place["safe_area"])
-    colour = overrides.get("colour") or {}
-    if colour.get("source") in COLOUR_SOURCES:
-        s.colour.source = colour["source"]
+    if overrides.get("size") in SIZES:
+        s.size = overrides["size"]
     return s
 
 
 # --------------------------------------------------------------------------
-# Standards catalog (SS7): the universal, hand-authored building blocks.
+# Legacy (pre-MVP) snapshot normalization
 # --------------------------------------------------------------------------
 
-def _standard(style_id: str, label: str, **kw: Any) -> CaptionStyle:
-    anim = kw.pop("animation", {})
-    place = kw.pop("placement", {})
-    colour = kw.pop("colour", {})
+_LEGACY_FONT_MAP = {
+    "inter_tight": "inter", "poppins_extrabold": "montserrat", "anton": "anton",
+    "nunito": "inter", "fraunces": "inter", "permanent_marker": "inter",
+}
+_LEGACY_ANIMATION_MAP = {"fade": "fade_up", "karaoke": "active_reader", "slide": "fade_up", "pop": "pop"}
+_LEGACY_POSITION_MAP = {
+    "lower_third": "lower_third", "center": "center", "top": "top",
+    "dynamic": "lower_third", "speaker": "lower_third",
+}
+_LEGACY_CASE_MAP = {"as-is": "original", "upper": "upper"}
+
+
+def _looks_legacy(d: Dict[str, Any]) -> bool:
+    """The MVP shape's `colour` is a dict with `colour_id`; the legacy
+    shape's `colour` is a dict with `source`. `position`/`animation` are
+    flat strings in the MVP shape, nested dicts (`placement.anchor`,
+    `animation.preset`) in the legacy one -- any of these is enough to tell
+    them apart."""
+    colour = d.get("colour")
+    if isinstance(colour, dict) and "source" in colour:
+        return True
+    if isinstance(d.get("animation"), dict):
+        return True
+    if isinstance(d.get("placement"), dict):
+        return True
+    return False
+
+
+def _nearest_colour_id(hexcolor: Optional[str]) -> str:
+    """Nearest of the 4 fixed swatches by RGB Euclidean distance -- the
+    plan's "dynamic colour source -> nearest fixed palette colour" mapping."""
+    if not hexcolor:
+        return DEFAULT_COLOUR_ID
+    h = hexcolor.lstrip("#")
+    if len(h) != 6:
+        return DEFAULT_COLOUR_ID
+    try:
+        r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return DEFAULT_COLOUR_ID
+    best_id, best_dist = DEFAULT_COLOUR_ID, float("inf")
+    for cid, spec in COLOURS.items():
+        ch = spec["hex"].lstrip("#")
+        cr, cg, cb = (int(ch[i:i + 2], 16) for i in (0, 2, 4))
+        dist = (r - cr) ** 2 + (g - cg) ** 2 + (b - cb) ** 2
+        if dist < best_dist:
+            best_id, best_dist = cid, dist
+    return best_id
+
+
+def _from_legacy_dict(d: Dict[str, Any]) -> CaptionStyle:
+    font_block = d.get("font") if isinstance(d.get("font"), dict) else {}
+    anim_block = d.get("animation") if isinstance(d.get("animation"), dict) else {}
+    place_block = d.get("placement") if isinstance(d.get("placement"), dict) else {}
+    colour_block = d.get("colour") if isinstance(d.get("colour"), dict) else {}
+
+    legacy_font_id = font_block.get("font_id")
+    legacy_case = font_block.get("case") or d.get("case")
+    legacy_preset = anim_block.get("preset")
+    legacy_anchor = place_block.get("anchor")
+    legacy_fill = colour_block.get("fill")
+
+    # The legacy system always rendered outline + shadow (no toggle existed)
+    # -- preserve that look for old documents rather than silently stripping
+    # it, which would visually change every saved caption at once.
     return CaptionStyle(
-        style_id=style_id, label=label, tier="standard",
-        animation=AnimationSpec(**anim), placement=PlacementSpec(**place),
-        colour=ColourSpec(**colour), **kw,
+        style_id=d.get("style_id") or "custom",
+        label=d.get("label") or "Custom",
+        tier=d.get("tier") or "standard",
+        font_id=_LEGACY_FONT_MAP.get(legacy_font_id, DEFAULT_FONT_ID),
+        colour_id=_nearest_colour_id(legacy_fill),
+        outline_enabled=True,
+        shadow_enabled=True,
+        position=_LEGACY_POSITION_MAP.get(legacy_anchor, DEFAULT_POSITION),
+        animation=_LEGACY_ANIMATION_MAP.get(legacy_preset, DEFAULT_ANIMATION),
+        case=_LEGACY_CASE_MAP.get(legacy_case, DEFAULT_CASE),
+        size=DEFAULT_SIZE,
+        rationale=d.get("rationale"),
     )
 
 
-# Accent palette for coloured emphasis / active words (SS11). Kept small and
-# vivid -- these read well on almost any footage and clear the contrast floor
-# once colour.py's legibility check runs.
-ACCENT_YELLOW = "#ffd60a"
-ACCENT_GREEN = "#16e06a"
-ACCENT_PINK = "#ff2d78"
+# --------------------------------------------------------------------------
+# The permanent Standard (never regenerated -- see caption_style_mvp.plan.md
+# "Permanent Standard"). Reset restores exactly these values.
+# --------------------------------------------------------------------------
 
-STANDARDS: List[CaptionStyle] = [
-    # 1. THE default: a plain, dependable lower-third caption sitting DOWN out
-    # of the way. Clean white, heavy outline, gentle fade, no colour gimmick --
-    # the one you'd reach for most of the time (first tile in the gallery).
-    _standard(
-        "std_standard", "Standard", font_id="inter_tight", max_chars_per_line=34,
-        animation={"preset": "fade", "intensity": 0.35, "emphasis": "none"},
-        placement={"anchor": "lower_third"},
-        colour={"source": "white", "fill": "#ffffff", "emphasis_fill": "#ffffff",
-                "outline": "#000000", "shadow": "#000000"},
-    ),
-    # 2. Bold Yellow (Hormozi-style): condensed caps, key word pops to yellow.
-    _standard(
-        "std_bold_yellow", "Bold Yellow", font_id="anton", case="upper", tracking=0.02,
-        max_chars_per_line=22,
-        animation={"preset": "pop", "intensity": 0.85, "beat_sync": True, "emphasis": "loudness"},
-        placement={"anchor": "lower_third"},
-        colour={"source": "white", "fill": "#ffffff", "emphasis_fill": ACCENT_YELLOW,
-                "outline": "#000000", "shadow": "#000000"},
-    ),
-    # 3. Word Pop (CapCut/Submagic-style): each word fills to green as spoken.
-    _standard(
-        "std_word_pop", "Word Pop", font_id="poppins_extrabold", max_chars_per_line=26,
-        animation={"preset": "karaoke", "intensity": 0.6, "emphasis": "loudness"},
-        placement={"anchor": "lower_third"},
-        colour={"source": "white", "fill": ACCENT_GREEN, "emphasis_fill": ACCENT_GREEN,
-                "outline": "#000000", "shadow": "#000000"},
-    ),
-    # 4. Black Bar: white text on a solid black box -- always legible, podcast-safe.
-    _standard(
-        "std_black_bar", "Black Bar", font_id="inter_tight", max_chars_per_line=30,
-        animation={"preset": "fade", "intensity": 0.3, "emphasis": "none"},
-        placement={"anchor": "lower_third"},
-        colour={"source": "black_box", "fill": "#ffffff", "emphasis_fill": "#ffffff",
-                "outline": "#000000", "shadow": "#000000", "box": "#000000"},
-    ),
-    # 5. Accent: emphasis colour pulled from the footage's own palette.
-    _standard(
-        "std_accent", "Accent", font_id="poppins_extrabold", max_chars_per_line=26,
-        animation={"preset": "pop", "intensity": 0.7, "beat_sync": True, "emphasis": "loudness"},
-        placement={"anchor": "dynamic"},
-        colour={"source": "palette_accent", "fill": "#ffffff", "emphasis_fill": ACCENT_YELLOW,
-                "outline": "#000000", "shadow": "#000000"},
-    ),
-    # 6. Editorial: premium serif, tied to the clip's grade, quiet semantic fill.
-    _standard(
-        "std_editorial", "Editorial", font_id="fraunces", max_chars_per_line=36,
-        animation={"preset": "karaoke", "intensity": 0.4, "emphasis": "semantic"},
-        placement={"anchor": "center"},
-        colour={"source": "match_grade", "fill": "#ffffff", "emphasis_fill": "#ffffff",
-                "outline": "#000000", "shadow": "#000000"},
-    ),
-    # 7. Marker: handwritten, slides up from the top -- playful B-roll captioning.
-    _standard(
-        "std_marker", "Marker", font_id="permanent_marker", max_chars_per_line=22,
-        animation={"preset": "slide", "intensity": 0.5, "emphasis": "none"},
-        placement={"anchor": "top"},
-        colour={"source": "white", "fill": "#ffffff", "emphasis_fill": ACCENT_PINK,
-                "outline": "#000000", "shadow": "#000000"},
-    ),
-]
-
-_STANDARDS_BY_ID: Dict[str, CaptionStyle] = {s.style_id: s for s in STANDARDS}
+STANDARD = CaptionStyle(
+    style_id="std_standard", label="Standard", tier="standard",
+    font_id="inter", colour_id="white",
+    outline_enabled=False, shadow_enabled=True,
+    position="lower_third", animation="fade_up",
+    case="original", size="regular",
+)
 
 
-def get_standard(style_id: str) -> Optional[CaptionStyle]:
-    return _STANDARDS_BY_ID.get(style_id)
+def get_standard(style_id: Optional[str] = None) -> Optional[CaptionStyle]:
+    """`style_id` is accepted (not required) for backward call-site
+    compatibility -- there is exactly one Standard now, so any id (or None)
+    resolves to it. A caller passing a stale Standards-catalog id from
+    before this rewrite (e.g. "std_bold_yellow") still gets a valid style
+    rather than None."""
+    return STANDARD
 
 
 def list_standards() -> List[Dict[str, Any]]:
-    return [s.to_dict() for s in STANDARDS]
+    return [STANDARD.to_dict()]
 
 
 def list_fonts() -> List[Dict[str, Any]]:
     return [{"font_id": k, **v} for k, v in FONTS.items()]
+
+
+def list_colours() -> List[Dict[str, Any]]:
+    return [{"colour_id": k, **v} for k, v in COLOURS.items()]
+
+
+_IDENTIFIER_RE = re.compile(r"[^a-z0-9]+")
+
+
+def slugify_style_id(prefix: str, *parts: str) -> str:
+    """A stable, readable style_id for a generated suggestion, e.g.
+    `slugify_style_id("sugg", "montserrat", "yellow", "pop")` ->
+    `"sugg_montserrat_yellow_pop"`. Used by suggest.py so a given
+    combination always gets the same id across regenerations (only the
+    SET of 4 offered ids changes, not what a fixed id means)."""
+    bits = [_IDENTIFIER_RE.sub("_", p.lower()).strip("_") for p in parts if p]
+    return "_".join([prefix, *bits]) if bits else prefix

@@ -4,14 +4,17 @@ Caption font licenses
 The caption font binaries in ../caption_fonts/ are third-party fonts,
 redistributed here under their respective licenses (full text in this folder).
 
-  caption-anton.ttf              Anton              SIL Open Font License 1.1  (OFL-anton.txt)
-  caption-poppins_extrabold.ttf  Poppins ExtraBold  SIL Open Font License 1.1  (OFL-poppins_extrabold.txt)
-  caption-inter_tight.ttf        Inter Tight        SIL Open Font License 1.1  (OFL-inter_tight.txt)
-  caption-nunito.ttf             Nunito             SIL Open Font License 1.1  (OFL-nunito.txt)
-  caption-fraunces.ttf           Fraunces           SIL Open Font License 1.1  (OFL-fraunces.txt)
-  caption-permanent_marker.ttf   Permanent Marker   Apache License 2.0         (LICENSE-permanent_marker.txt)
+  caption-montserrat.ttf  Montserrat ExtraBold  SIL Open Font License 1.1  (OFL-montserrat.txt)
+  caption-anton.ttf       Anton                 SIL Open Font License 1.1  (OFL-anton.txt)
+  caption-jost.ttf        Jost ExtraBold        SIL Open Font License 1.1  (OFL-jost.txt)
+  caption-inter.ttf       Inter SemiBold        SIL Open Font License 1.1  (OFL-inter.txt)
 
-The same six families are also self-hosted for the web preview as .woff2 in
+The same four families are also self-hosted for the web preview as .woff2 in
 frontend/public/fonts/ (caption-*.woff2), registered via @font-face in
 frontend/src/app/globals.css, so the DOM preview and the ffmpeg/libass burn use
 the same typefaces.
+
+Montserrat/Jost/Inter are instantiated as static single-weight TTFs from each
+family's upstream variable font (fontTools.varLib.instancer), so libass sees
+one unambiguous weight per family rather than resolving a default instance
+from a variable font.

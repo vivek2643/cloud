@@ -82,9 +82,21 @@ def _to_program(word: Dict[str, Any], src_in_ms: int, prog_start_ms: int) -> Tup
     return t_in, t_out
 
 
-def _display_text(text: str, case: str) -> str:
+def _display_text(text: str, case: str, *, is_first_in_event: bool = False) -> str:
+    """caption_style_mvp.plan.md #1's 4-value case catalog. "sentence"
+    capitalizes the first word of the EVENT (the closest available unit to
+    "a sentence" -- there's no punctuation-based sentence splitter over the
+    transcript word stream) and lowercases every other word; "original"
+    passes the transcript's own casing through untouched."""
     t = text.strip()
-    return t.upper() if case == "upper" else t
+    if case == "upper":
+        return t.upper()
+    if case == "lower":
+        return t.lower()
+    if case == "sentence":
+        t = t.lower()
+        return t[:1].upper() + t[1:] if is_first_in_event else t
+    return t  # "original"
 
 
 def _rms_at(rms_db: Optional[List[float]], hop_ms: int, ms: int) -> float:
@@ -225,6 +237,7 @@ def build_events(
         emph_word = run[emph_idx] if emph_idx is not None else None
 
         lines_out = []
+        is_first_word = True
         for line in lines_words:
             words_out = []
             for w in line:
@@ -232,10 +245,11 @@ def build_events(
                 if beat_sync and is_musical and onsets_ms and w is emph_word:
                     t_in = _snap_to_beat(t_in, onsets_ms)
                 words_out.append({
-                    "text": _display_text(w.get("text", ""), case),
+                    "text": _display_text(w.get("text", ""), case, is_first_in_event=is_first_word),
                     "t_in_ms": t_in, "t_out_ms": t_out,
                     "emphasized": w is emph_word,
                 })
+                is_first_word = False
             lines_out.append({"words": words_out})
 
         events.append({

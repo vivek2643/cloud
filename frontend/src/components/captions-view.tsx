@@ -1,27 +1,46 @@
 "use client";
 
 /**
- * Captions panel (captions.plan.md): a two-tier gallery -- "Suggested"
- * (5 bundles generated for THIS edit, SS6) over "Standards" (the universal
- * catalog, SS7) -- not a 30-knob inspector. Every tile rides the SAME
- * shared representative frame + real sample words (SS1.5/SS1.6), frozen at
- * each style's animation "peak pose" (SS1.5) rather than live-animating.
- * Selecting any tile pre-fills the Refine section below it (SS1.7).
+ * Captions panel (caption_style_mvp.plan.md): ONE five-card gallery --
+ * Standard (permanent, hand-authored, always first) + 4 AI Picks generated
+ * for this edit -- not a 30-knob inspector, not the old two-tier Suggested/
+ * Standards split. Every tile rides the SAME shared representative frame +
+ * real sample words, frozen at each style's animation "peak pose" rather
+ * than live-animating (there's no playhead on a gallery tile). Selecting
+ * any tile pre-fills the customization panel below it.
  *
  * Persistence mirrors `color-grade-view.tsx`'s applyLook/flushLook exactly
- * (debounced, serialized, saves against the LIVE head version) -- see that
- * file's comment for why a save-per-tick was the wrong call there; the same
- * reasoning applies to a dragged/typed override here.
+ * (debounced, serialized, saves against the LIVE head version).
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Loader2, Shuffle, VolumeX } from "lucide-react";
+import { Loader2, RotateCcw, Shuffle, VolumeX } from "lucide-react";
 import { useEditDocStore } from "@/stores/edit-doc-store";
 import { useAuthStore } from "@/stores/auth-store";
 import {
   getCaptionCatalog, getCaptionSuggestions, saveEditDocument,
-  type CaptionCatalog, type CaptionStyle, type CaptionWord,
-  type EditCaptions,
+  type CaptionAnimation, type CaptionCase, type CaptionCatalog, type CaptionPosition,
+  type CaptionSize, type CaptionStyle, type CaptionWord, type EditCaptions,
 } from "@/lib/api";
+
+const ANIMATION_LABELS: Record<CaptionAnimation, string> = {
+  active_reader: "Active Reader", pop: "Pop/Bounce", fade_up: "Smooth Fade Up", sequential_reveal: "Sequential Reveal",
+};
+const POSITION_LABELS: Record<CaptionPosition, string> = {
+  lower_third: "Lower Third", center: "Dead Center", top: "Upper Third", bottom_dynamic: "Bottom Dynamic",
+};
+const CASE_LABELS: Record<CaptionCase, string> = {
+  original: "Original", sentence: "Sentence", upper: "UPPERCASE", lower: "lowercase",
+};
+const SIZE_LABELS: Record<CaptionSize, string> = {
+  small: "Small", regular: "Regular", large: "Large", xl: "Extra Large",
+};
+// Mirrors backend/app/services/l3/captions/placement.py's
+// POSITION_VERTICAL_CENTER / _BAND_H -- so a tile's peak-pose box sits
+// where the real caption will actually land, not an ad-hoc guess.
+const POSITION_VERTICAL_CENTER: Record<CaptionPosition, number> = {
+  lower_third: 0.81, center: 0.50, top: 0.135, bottom_dynamic: 0.715,
+};
+const POSITION_BAND_H = 0.22;
 
 function SectionLabel({ children }: { children: React.ReactNode }) {
   return (
@@ -31,93 +50,73 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
-function motionLabel(style: CaptionStyle): string {
-  const names: Record<string, string> = { fade: "Subtle-fade", pop: "Pop", karaoke: "Karaoke", slide: "Slide-up" };
-  const base = names[style.animation.preset] ?? style.animation.preset;
-  return style.animation.beat_sync ? `${base} · Beat-synced` : base;
+function outlineShadow(outline: string, shadow: string, outlineEnabled: boolean, shadowEnabled: boolean): string {
+  const layers: string[] = [];
+  if (outlineEnabled) {
+    const w = 1;
+    layers.push(
+      `-${w}px -${w}px 0 ${outline}`, `${w}px -${w}px 0 ${outline}`,
+      `-${w}px ${w}px 0 ${outline}`, `${w}px ${w}px 0 ${outline}`,
+    );
+  }
+  if (shadowEnabled) layers.push(`2px 2px 3px ${shadow}`);
+  return layers.join(", ");
 }
 
-function dimHex(hex: string, factor: number): string {
-  const h = hex.replace("#", "");
-  if (h.length !== 6) return hex;
-  const r = Math.round(parseInt(h.slice(0, 2), 16) * factor);
-  const g = Math.round(parseInt(h.slice(2, 4), 16) * factor);
-  const b = Math.round(parseInt(h.slice(4, 6), 16) * factor);
-  const toHex = (v: number) => v.toString(16).padStart(2, "0");
-  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+function positionBoxStyle(position: CaptionPosition): React.CSSProperties {
+  const center = POSITION_VERTICAL_CENTER[position] ?? POSITION_VERTICAL_CENTER.lower_third;
+  const top = Math.max(0, (center - POSITION_BAND_H / 2) * 100);
+  return { left: "5%", width: "90%", top: `${top}%`, height: `${POSITION_BAND_H * 100}%` };
 }
 
-function outlineShadow(outline: string, shadow: string, strong: boolean): string {
-  const w = strong ? 2 : 1;
-  return [
-    `-${w}px -${w}px 0 ${outline}`, `${w}px -${w}px 0 ${outline}`,
-    `-${w}px ${w}px 0 ${outline}`, `${w}px ${w}px 0 ${outline}`,
-    `2px 2px 3px ${shadow}`,
-  ].join(", ");
-}
-
-/** Frozen "peak pose" (SS1.5): karaoke half-filled at the middle word, pop's
- * emphasized word at full scale, fade/slide just shown settled -- a static
+/** Frozen "peak pose": Active Reader shows its middle word highlighted,
+ * Pop/Bounce shows the emphasised word at its peak scale, Smooth Fade Up /
+ * Sequential Reveal show the settled/fully-revealed state -- a static
  * approximation of `resolve-captions.ts`'s live interpolation at its most
- * legible instant, not a real progMs sample (there's no playhead on a tile). */
+ * legible instant, not a real progMs sample. */
 function PeakPoseCaption({ style, words }: { style: CaptionStyle; words: CaptionWord[] }) {
   const { colour, animation, font } = style;
-  const shadow = outlineShadow(colour.outline, colour.shadow, !!colour.strong_outline);
-  const peakIdx = Math.floor(words.length / 2);
+  const shadow = outlineShadow(colour.outline, colour.shadow, colour.outline_enabled, colour.shadow_enabled);
   const emphIdx = words.findIndex((w) => w.emphasized);
+  const peakIdx = emphIdx >= 0 ? emphIdx : Math.floor(words.length / 2);
   return (
     <div
       className="pointer-events-none text-center leading-tight"
-      style={{
-        fontFamily: font.fallback_stack, fontWeight: font.weight,
-        letterSpacing: `${font.tracking}em`, fontSize: "13px",
-        background: colour.box || undefined,
-        padding: colour.box ? "0.15em 0.4em" : undefined,
-        borderRadius: colour.box ? 4 : undefined,
-      }}
+      style={{ fontFamily: font.fallback_stack, fontWeight: font.weight, fontSize: "13px" }}
     >
       {words.map((w, i) => {
-        if (animation.preset === "karaoke") {
-          const frac = i < peakIdx ? 1 : i === peakIdx ? 0.5 : 0;
-          const secondary = dimHex(colour.fill, 0.45);
+        if (animation === "active_reader") {
+          const isCurrent = i === peakIdx;
+          return (
+            <span key={i} style={{ color: colour.fill, textShadow: shadow, filter: isCurrent ? undefined : "brightness(0.55)" }}>
+              {w.text}&nbsp;
+            </span>
+          );
+        }
+        if (animation === "pop") {
+          const isPeak = i === peakIdx;
           return (
             <span
               key={i}
-              style={{
-                backgroundImage: `linear-gradient(90deg, ${colour.fill} ${frac * 100}%, ${secondary} ${frac * 100}%)`,
-                WebkitBackgroundClip: "text", backgroundClip: "text", color: "transparent",
-                textShadow: shadow,
-              }}
+              style={{ color: colour.fill, textShadow: shadow, display: "inline-block", transform: isPeak ? "scale(1.05)" : undefined }}
             >
               {w.text}&nbsp;
             </span>
           );
         }
-        const isPeakEmphasis = animation.preset === "pop" && i === (emphIdx >= 0 ? emphIdx : peakIdx);
-        return (
-          <span
-            key={i}
-            style={{
-              color: isPeakEmphasis ? colour.emphasis_fill : colour.fill,
-              textShadow: shadow,
-              display: "inline-block",
-              transform: isPeakEmphasis ? "scale(1.3)" : undefined,
-            }}
-          >
-            {w.text}&nbsp;
-          </span>
-        );
+        return <span key={i} style={{ color: colour.fill, textShadow: shadow }}>{w.text}&nbsp;</span>;
       })}
     </div>
   );
 }
 
 function Tile({
-  style, words, selected, onClick,
+  style, words, selected, badge, onClick,
 }: {
   style: CaptionStyle;
   words: CaptionWord[];
   selected: boolean;
+  badge?: string;
   onClick: () => void;
 }) {
   return (
@@ -131,24 +130,23 @@ function Tile({
           doesn't depend on a representative frame existing). */}
       <div className="relative aspect-video w-full overflow-hidden" style={{ background: "#000000" }}>
         {words.length > 0 && (
-          <div
-            className="absolute flex items-center justify-center"
-            style={
-              style.placement.anchor === "top"
-                ? { left: "5%", top: "4%", width: "90%", height: "28%" }
-                : style.placement.anchor === "center"
-                ? { left: "5%", top: "38%", width: "90%", height: "28%" }
-                : { left: "5%", bottom: "6%", width: "90%", height: "28%" }
-            }
-          >
+          <div className="absolute flex items-center justify-center" style={positionBoxStyle(style.position)}>
             <PeakPoseCaption style={style} words={words} />
           </div>
+        )}
+        {badge && (
+          <span
+            className="absolute left-1.5 top-1.5 rounded px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide"
+            style={{ background: "var(--accent-soft)", color: "var(--foreground)" }}
+          >
+            {badge}
+          </span>
         )}
       </div>
       <div className="space-y-0.5 px-2 py-1.5">
         <div className="flex items-center justify-between gap-1">
           <span className="truncate text-[11px] font-medium">{style.label}</span>
-          <span className="shrink-0 text-[9px]" style={{ color: "var(--muted)" }}>{motionLabel(style)}</span>
+          <span className="shrink-0 text-[9px]" style={{ color: "var(--muted)" }}>{ANIMATION_LABELS[style.animation]}</span>
         </div>
         {style.rationale && (
           <p className="truncate text-[10px]" style={{ color: "var(--muted)" }} title={style.rationale}>
@@ -168,6 +166,7 @@ export function CaptionsView() {
   const token = useAuthStore((s) => s.session?.access_token);
 
   const [catalog, setCatalog] = useState<CaptionCatalog | null>(null);
+  const [standard, setStandard] = useState<CaptionStyle | null>(null);
   const [suggestions, setSuggestions] = useState<CaptionStyle[]>([]);
   const [sampleWords, setSampleWords] = useState<CaptionWord[]>([]);
   const [reshuffleSeed, setReshuffleSeed] = useState(0);
@@ -187,6 +186,9 @@ export function CaptionsView() {
     getCaptionSuggestions(threadId, token, { reshuffleSeed })
       .then((res) => {
         if (cancelled) return;
+        setStandard(res.standard);
+        // Regeneration only ever replaces the 4 AI picks + shared frame/words
+        // (never the applied style -- that lives in `captions`, untouched here).
         setSuggestions(res.suggestions);
         setSampleWords(res.sample_words);
       })
@@ -255,25 +257,34 @@ export function CaptionsView() {
     applyCaptions(captions ? { ...captions, enabled: false } : { enabled: false }, true);
   }
 
-  function applyOverride(patch: Record<string, unknown>, immediate = false) {
+  function resetToSelected() {
+    if (!captions?.base_style) return;
+    applyCaptions({ ...captions, overrides: null }, true);
+  }
+
+  function applyOverride(
+    patch: Partial<{
+      font_id: string; colour_id: string; outline_enabled: boolean; shadow_enabled: boolean;
+      position: CaptionPosition; animation: CaptionAnimation; case: CaptionCase; size: CaptionSize;
+    }>,
+    immediate = false
+  ) {
     if (!captions?.base_style) return;
     applyCaptions({ ...captions, overrides: { ...(captions.overrides ?? {}), ...patch } }, immediate);
   }
 
   const selectedStyleId = captions?.enabled ? captions.style_id : null;
-  const effectiveFontId =
-    (captions?.overrides as { font_id?: string } | undefined)?.font_id ?? captions?.base_style?.font.font_id;
-  const effectiveCase =
-    (captions?.overrides as { case?: string } | undefined)?.case ?? captions?.base_style?.font.case ?? "as-is";
-  const effectiveAnim =
-    (captions?.overrides as { animation?: { preset?: string } } | undefined)?.animation?.preset
-    ?? captions?.base_style?.animation.preset;
-  const effectiveAnchor =
-    (captions?.overrides as { placement?: { anchor?: string } } | undefined)?.placement?.anchor
-    ?? captions?.base_style?.placement.anchor;
-  const effectiveColourSource =
-    (captions?.overrides as { colour?: { source?: string } } | undefined)?.colour?.source
-    ?? captions?.base_style?.colour.source;
+  const base = captions?.base_style;
+  const ov = captions?.overrides;
+  const effectiveFontId = ov?.font_id ?? base?.font.font_id;
+  const effectiveColourId = ov?.colour_id ?? base?.colour.colour_id;
+  const effectiveOutlineEnabled = ov?.outline_enabled ?? base?.colour.outline_enabled ?? false;
+  const effectiveShadowEnabled = ov?.shadow_enabled ?? base?.colour.shadow_enabled ?? false;
+  const effectivePosition = ov?.position ?? base?.position;
+  const effectiveAnimation = ov?.animation ?? base?.animation;
+  const effectiveCase = ov?.case ?? base?.case ?? "original";
+  const effectiveSize = ov?.size ?? base?.size ?? "regular";
+  const hasOverrides = !!ov && Object.keys(ov).length > 0;
 
   if (!threadId) {
     return (
@@ -285,6 +296,11 @@ export function CaptionsView() {
       </div>
     );
   }
+
+  const galleryTiles: { style: CaptionStyle; badge?: string }[] = [
+    ...(standard ? [{ style: standard, badge: "Standard" }] : []),
+    ...suggestions.map((s) => ({ style: s })),
+  ];
 
   return (
     <div className="mx-auto max-w-3xl space-y-6 p-4">
@@ -304,122 +320,146 @@ export function CaptionsView() {
 
       <section>
         <div className="mb-2 flex items-center justify-between">
-          <SectionLabel>Suggested for this edit</SectionLabel>
+          <SectionLabel>Standard + AI Picks</SectionLabel>
           <button
             onClick={() => setReshuffleSeed((s) => s + 1)}
             disabled={loadingSuggestions}
-            title="Reshuffle (keeps Auto)"
+            title="Regenerate the 4 AI picks (Standard and your applied style never change)"
             className="flex items-center gap-1 rounded p-1 text-[10px] transition-colors hover:bg-[var(--accent-soft)] disabled:opacity-40"
             style={{ color: "var(--muted)" }}
           >
-            <Shuffle size={11} /> Reshuffle
+            <Shuffle size={11} /> Regenerate
           </button>
         </div>
-        {loadingSuggestions ? (
+        {loadingSuggestions && galleryTiles.length === 0 ? (
           <div className="flex items-center gap-1.5 py-6 text-[11px]" style={{ color: "var(--muted)" }}>
             <Loader2 size={12} className="animate-spin" /> Generating suggestions…
           </div>
         ) : (
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-            {suggestions.map((s) => (
+            {galleryTiles.map(({ style, badge }) => (
               <Tile
-                key={s.style_id}
-                style={s}
+                key={style.style_id}
+                style={style}
                 words={sampleWords}
-                selected={selectedStyleId === s.style_id}
-                onClick={() => selectStyle(s)}
+                badge={badge}
+                selected={selectedStyleId === style.style_id}
+                onClick={() => selectStyle(style)}
               />
             ))}
           </div>
         )}
       </section>
 
-      {catalog && (
+      {base && catalog && (
         <section>
-          <SectionLabel>Standards</SectionLabel>
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-            {catalog.standards.map((s) => (
-              <Tile
-                key={s.style_id}
-                style={s}
-                words={sampleWords}
-                selected={selectedStyleId === s.style_id}
-                onClick={() => selectStyle(s)}
+          <div className="mb-2 flex items-center justify-between">
+            <SectionLabel>Customize</SectionLabel>
+            <button
+              onClick={resetToSelected}
+              disabled={!hasOverrides}
+              title="Reset to the selected card's original values"
+              className="flex items-center gap-1 rounded p-1 text-[10px] transition-colors hover:bg-[var(--accent-soft)] disabled:opacity-40"
+              style={{ color: "var(--muted)" }}
+            >
+              <RotateCcw size={11} /> Reset
+            </button>
+          </div>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+            <div>
+              <SectionLabel>Font</SectionLabel>
+              <select
+                value={effectiveFontId}
+                onChange={(e) => applyOverride({ font_id: e.target.value }, true)}
+                className="w-full rounded-lg border bg-transparent px-2 py-1.5 text-[11px] outline-none"
+                style={{ borderColor: "var(--border)" }}
+              >
+                {catalog.fonts.map((f) => (
+                  <option key={f.font_id} value={f.font_id}>{f.family}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <SectionLabel>Colour</SectionLabel>
+              <select
+                value={effectiveColourId}
+                onChange={(e) => applyOverride({ colour_id: e.target.value }, true)}
+                className="w-full rounded-lg border bg-transparent px-2 py-1.5 text-[11px] outline-none"
+                style={{ borderColor: "var(--border)" }}
+              >
+                {catalog.colours.map((c) => (
+                  <option key={c.colour_id} value={c.colour_id}>{c.label}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <SectionLabel>Position</SectionLabel>
+              <select
+                value={effectivePosition}
+                onChange={(e) => applyOverride({ position: e.target.value as CaptionPosition }, true)}
+                className="w-full rounded-lg border bg-transparent px-2 py-1.5 text-[11px] outline-none"
+                style={{ borderColor: "var(--border)" }}
+              >
+                {(Object.keys(POSITION_LABELS) as CaptionPosition[]).map((p) => (
+                  <option key={p} value={p}>{POSITION_LABELS[p]}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <SectionLabel>Animation</SectionLabel>
+              <select
+                value={effectiveAnimation}
+                onChange={(e) => applyOverride({ animation: e.target.value as CaptionAnimation }, true)}
+                className="w-full rounded-lg border bg-transparent px-2 py-1.5 text-[11px] outline-none"
+                style={{ borderColor: "var(--border)" }}
+              >
+                {(Object.keys(ANIMATION_LABELS) as CaptionAnimation[]).map((a) => (
+                  <option key={a} value={a}>{ANIMATION_LABELS[a]}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <SectionLabel>Case</SectionLabel>
+              <select
+                value={effectiveCase}
+                onChange={(e) => applyOverride({ case: e.target.value as CaptionCase }, true)}
+                className="w-full rounded-lg border bg-transparent px-2 py-1.5 text-[11px] outline-none"
+                style={{ borderColor: "var(--border)" }}
+              >
+                {(Object.keys(CASE_LABELS) as CaptionCase[]).map((c) => (
+                  <option key={c} value={c}>{CASE_LABELS[c]}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <SectionLabel>Size</SectionLabel>
+              <select
+                value={effectiveSize}
+                onChange={(e) => applyOverride({ size: e.target.value as CaptionSize }, true)}
+                className="w-full rounded-lg border bg-transparent px-2 py-1.5 text-[11px] outline-none"
+                style={{ borderColor: "var(--border)" }}
+              >
+                {(Object.keys(SIZE_LABELS) as CaptionSize[]).map((s) => (
+                  <option key={s} value={s}>{SIZE_LABELS[s]}</option>
+                ))}
+              </select>
+            </div>
+            <label className="flex items-center gap-1.5 text-[11px]">
+              <input
+                type="checkbox"
+                checked={effectiveOutlineEnabled}
+                onChange={(e) => applyOverride({ outline_enabled: e.target.checked }, true)}
               />
-            ))}
-          </div>
-        </section>
-      )}
-
-      {captions?.base_style && catalog && (
-        <section className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-          <div>
-            <SectionLabel>Font</SectionLabel>
-            <select
-              value={effectiveFontId}
-              onChange={(e) => applyOverride({ font_id: e.target.value }, true)}
-              className="w-full rounded-lg border bg-transparent px-2 py-1.5 text-[11px] outline-none"
-              style={{ borderColor: "var(--border)" }}
-            >
-              {catalog.fonts.map((f) => (
-                <option key={f.font_id} value={f.font_id}>{f.family}</option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <SectionLabel>Case</SectionLabel>
-            <select
-              value={effectiveCase}
-              onChange={(e) => applyOverride({ case: e.target.value }, true)}
-              className="w-full rounded-lg border bg-transparent px-2 py-1.5 text-[11px] outline-none"
-              style={{ borderColor: "var(--border)" }}
-            >
-              <option value="as-is">As-is</option>
-              <option value="upper">UPPERCASE</option>
-            </select>
-          </div>
-          <div>
-            <SectionLabel>Animation</SectionLabel>
-            <select
-              value={effectiveAnim}
-              onChange={(e) => applyOverride({ animation: { preset: e.target.value } }, true)}
-              className="w-full rounded-lg border bg-transparent px-2 py-1.5 text-[11px] outline-none"
-              style={{ borderColor: "var(--border)" }}
-            >
-              <option value="fade">Subtle-fade</option>
-              <option value="pop">Pop</option>
-              <option value="karaoke">Karaoke</option>
-              <option value="slide">Slide-up</option>
-            </select>
-          </div>
-          <div>
-            <SectionLabel>Placement</SectionLabel>
-            <select
-              value={effectiveAnchor}
-              onChange={(e) => applyOverride({ placement: { anchor: e.target.value } }, true)}
-              className="w-full rounded-lg border bg-transparent px-2 py-1.5 text-[11px] outline-none"
-              style={{ borderColor: "var(--border)" }}
-            >
-              <option value="dynamic">Dynamic (safe-zone)</option>
-              <option value="lower_third">Lower-third</option>
-              <option value="center">Centered</option>
-              <option value="top">Top</option>
-            </select>
-          </div>
-          <div>
-            <SectionLabel>Colour</SectionLabel>
-            <select
-              value={effectiveColourSource}
-              onChange={(e) => applyOverride({ colour: { source: e.target.value } }, true)}
-              className="w-full rounded-lg border bg-transparent px-2 py-1.5 text-[11px] outline-none"
-              style={{ borderColor: "var(--border)" }}
-            >
-              <option value="white">White + soft shadow</option>
-              <option value="black_box">Black-box</option>
-              <option value="match_grade">Match grade</option>
-              <option value="palette_accent">Accent from palette</option>
-              <option value="high_contrast">High-contrast pop</option>
-            </select>
+              Outline
+            </label>
+            <label className="flex items-center gap-1.5 text-[11px]">
+              <input
+                type="checkbox"
+                checked={effectiveShadowEnabled}
+                onChange={(e) => applyOverride({ shadow_enabled: e.target.checked }, true)}
+              />
+              Shadow
+            </label>
           </div>
         </section>
       )}

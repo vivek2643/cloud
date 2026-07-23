@@ -804,70 +804,77 @@ export interface ResolvedAudioLayer {
   op_id?: string | null;
 }
 
-// --- Captions (captions.plan.md SS3/SS5) -----------------------------------
+// --- Captions (caption_style_mvp.plan.md) -----------------------------------
+// Five reliable choices: Standard (permanent, hand-authored) + 4 AI Picks.
+// Every category below is a closed 4-value catalog (2 for outline/shadow) --
+// no intensity/tracking/outline-width/shadow-parameter/line-limit/beat-sync/
+// arbitrary-colour dials in the public MVP. `CaptionFontId`/`CaptionColourId`
+// stay plain `string` (not a union) because the catalog is DATA fetched from
+// `/api/captions/catalog`, not a compile-time-fixed set on the frontend --
+// matches how `CaptionAnimation`/`CaptionPosition`/`CaptionCase`/`CaptionSize`
+// below are still unions (those four ARE fixed, catalog-independent enums).
 
-export type CaptionAnimationPreset = "fade" | "pop" | "karaoke" | "slide";
-export type CaptionEmphasisMode = "semantic" | "loudness" | "none";
-export type CaptionPlacementAnchor = "lower_third" | "center" | "top" | "dynamic" | "speaker";
-export type CaptionColourSource = "white" | "black_box" | "match_grade" | "palette_accent" | "high_contrast";
+export type CaptionPosition = "lower_third" | "center" | "top" | "bottom_dynamic";
+export type CaptionAnimation = "active_reader" | "pop" | "fade_up" | "sequential_reveal";
+export type CaptionCase = "original" | "sentence" | "upper" | "lower";
+export type CaptionSize = "small" | "regular" | "large" | "xl";
 
 export interface CaptionFont {
   font_id: string;
   family: string;
   weight: number;
   fallback_stack: string;
-  case: "as-is" | "upper";
-  tracking: number;
-  max_lines: number;
-  max_chars_per_line: number;
-}
-
-export interface CaptionAnimation {
-  preset: CaptionAnimationPreset;
-  intensity: number;
-  beat_sync: boolean;
-  emphasis: CaptionEmphasisMode;
-}
-
-export interface CaptionPlacement {
-  anchor: CaptionPlacementAnchor;
-  safe_area: boolean;
-  stability_ms: number;
 }
 
 export interface CaptionColour {
-  source: CaptionColourSource;
+  colour_id: string;
   fill: string;
-  emphasis_fill: string;
+  outline_enabled: boolean;
+  shadow_enabled: boolean;
   outline: string;
   shadow: string;
-  box?: string | null;
-  /** Set once a style has been contrast-resolved against real footage
-   * (resolved.captions / the suggestions endpoint's tiles) -- absent on the
-   * raw, footage-independent Standards catalog entries. */
-  strong_outline?: boolean;
 }
 
-/** A caption style bundle -- the thing one gallery tile represents (SS3). */
+/** A caption style bundle -- the thing one gallery card represents. */
 export interface CaptionStyle {
   style_id: string;
   label: string;
   tier: "suggested" | "standard";
   font: CaptionFont;
-  animation: CaptionAnimation;
-  placement: CaptionPlacement;
   colour: CaptionColour;
+  position: CaptionPosition;
+  animation: CaptionAnimation;
+  case: CaptionCase;
+  size: CaptionSize;
+  size_pct: number;
+  max_lines: number;
+  max_chars_per_line: number;
   rationale?: string | null;
 }
 
-/** Persisted selection on the document (SS3), mirrors `look`'s shape. */
+/** The only fields a user can actually customize post-selection (product
+ * contract's "expose only" list) -- a typed replacement for the old
+ * `Record<string, unknown>` escape hatch. Every field optional: an override
+ * patches ONE field of the base style at a time, never composes. */
+export interface CaptionOverrides {
+  font_id?: string;
+  colour_id?: string;
+  outline_enabled?: boolean;
+  shadow_enabled?: boolean;
+  position?: CaptionPosition;
+  animation?: CaptionAnimation;
+  case?: CaptionCase;
+  size?: CaptionSize;
+}
+
+/** Persisted selection on the document, mirrors `look`'s shape. */
 export interface EditCaptions {
   style_id?: string | null;
   enabled: boolean;
-  /** A full style snapshot at selection time, so a Suggested pick stays
+  /** A full style snapshot at selection time, so an AI Pick stays
    * resolvable even after the ephemeral suggestion cache regenerates. */
   base_style?: CaptionStyle | null;
-  overrides?: Record<string, unknown> | null;
+  overrides?: CaptionOverrides | null;
 }
 
 export interface CaptionWord {
@@ -882,7 +889,7 @@ export interface CaptionLine {
 }
 
 /** One resolved caption "card" -- `resolved.captions[]`, the ONE track both
- * the preview overlay and the ASS export read (SS3/SS4). */
+ * the preview overlay and the ASS export read. */
 export interface ResolvedCaptionEvent {
   prog_start_ms: number;
   prog_end_ms: number;
@@ -1083,7 +1090,7 @@ export function getGradeStatus(threadId: string, token: string) {
   return request<GradeStatus>(`/api/edit/threads/${threadId}/grade-status`, { token });
 }
 
-// --- Captions (captions.plan.md SS13) ---
+// --- Captions (caption_style_mvp.plan.md) ---
 
 export interface CaptionFontSummary {
   font_id: string;
@@ -1094,8 +1101,20 @@ export interface CaptionFontSummary {
   license: string;
 }
 
+export interface CaptionColourSummary {
+  colour_id: string;
+  label: string;
+  hex: string;
+  ink: string;
+}
+
+/** `standards` is always exactly one entry (the permanent Standard) --
+ * kept as an array (not a single object) so the shape matches the
+ * suggestions endpoint's `standard` field trivially if a caller wants to
+ * treat them uniformly. */
 export interface CaptionCatalog {
   fonts: CaptionFontSummary[];
+  colours: CaptionColourSummary[];
   standards: CaptionStyle[];
 }
 
@@ -1110,7 +1129,9 @@ export interface CaptionRepresentativeFrame {
   subject_box: [number, number, number, number] | null;
 }
 
+/** The gallery is always Standard + exactly 4 AI Picks. */
 export interface CaptionSuggestionsResponse {
+  standard: CaptionStyle;
   suggestions: CaptionStyle[];
   representative_frame: CaptionRepresentativeFrame | null;
   sample_words: CaptionWord[];

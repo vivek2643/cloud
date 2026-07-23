@@ -18,10 +18,17 @@
   font-display: swap;
 }
 
-/* Caption fonts (SIL OFL, except Permanent Marker = Apache-2.0) — self-hosted
-   so the DOM preview matches the ffmpeg/libass burn (which reads the same
+/* Caption fonts (caption_style_mvp.plan.md — all SIL OFL) — self-hosted so
+   the DOM preview matches the ffmpeg/libass burn (which reads the same
    families from backend/app/services/render/caption_fonts/). Family names
    here must match styles.py's FONTS[*].family exactly. */
+@font-face {
+  font-family: "Montserrat";
+  src: url("/fonts/caption-montserrat.woff2") format("woff2");
+  font-weight: 800;
+  font-style: normal;
+  font-display: swap;
+}
 @font-face {
   font-family: "Anton";
   src: url("/fonts/caption-anton.woff2") format("woff2");
@@ -30,37 +37,16 @@
   font-display: swap;
 }
 @font-face {
-  font-family: "Poppins";
-  src: url("/fonts/caption-poppins_extrabold.woff2") format("woff2");
+  font-family: "Jost";
+  src: url("/fonts/caption-jost.woff2") format("woff2");
   font-weight: 800;
   font-style: normal;
   font-display: swap;
 }
 @font-face {
-  font-family: "Inter Tight";
-  src: url("/fonts/caption-inter_tight.woff2") format("woff2");
+  font-family: "Inter";
+  src: url("/fonts/caption-inter.woff2") format("woff2");
   font-weight: 600;
-  font-style: normal;
-  font-display: swap;
-}
-@font-face {
-  font-family: "Nunito";
-  src: url("/fonts/caption-nunito.woff2") format("woff2");
-  font-weight: 700;
-  font-style: normal;
-  font-display: swap;
-}
-@font-face {
-  font-family: "Fraunces";
-  src: url("/fonts/caption-fraunces.woff2") format("woff2");
-  font-weight: 600;
-  font-style: normal;
-  font-display: swap;
-}
-@font-face {
-  font-family: "Permanent Marker";
-  src: url("/fonts/caption-permanent_marker.woff2") format("woff2");
-  font-weight: 400;
   font-style: normal;
   font-display: swap;
 }

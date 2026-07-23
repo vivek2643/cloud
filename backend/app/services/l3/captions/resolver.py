@@ -178,25 +178,29 @@ def resolve_captions(
     transcripts_by_file: Optional[Dict[str, Dict[str, Any]]] = None,
     audio_features_by_file: Optional[Dict[str, Dict[str, Any]]] = None,
     cut_records_by_file: Optional[Dict[str, List[Dict[str, Any]]]] = None,
-    color_stats_by_file: Optional[Dict[str, Dict[str, Any]]] = None,
     aspect: str = "landscape",
 ) -> List[Dict[str, Any]]:
     """Pure: every signal is already-fetched. `resolved_timeline` is a
     `layers.ResolvedTimeline.to_dict()`-shaped dict (or the equivalent
     already baked onto `document["resolved"]`) -- captions ride on the SAME
     spine spans grading/compositing already agreed on, so a retime/trim
-    that moves `resolved.video_layers` moves captions with it for free (SS10
-    "retime-aware": no separate retime math needed here)."""
+    that moves `resolved.video_layers` moves captions with it for free
+    (retime-aware: no separate retime math needed here).
+
+    Colour is fully deterministic now (caption_style_mvp.plan.md #3) --
+    no `color_stats`/`grade` signal is needed to resolve it, unlike the
+    pre-MVP `match_grade`/`palette_accent`/`high_contrast` sources."""
     if style is None:
         return []
     transcripts_by_file = transcripts_by_file or {}
     audio_features_by_file = audio_features_by_file or {}
     cut_records_by_file = cut_records_by_file or {}
-    color_stats_by_file = color_stats_by_file or {}
     style_dict = style.to_dict()
     colour_spec = style_dict["colour"]
-    font = style_dict["font"]
-    placement_spec = style_dict["placement"]
+    resolved_colour = colour_mod.resolve_colour(
+        colour_spec["colour_id"],
+        outline_enabled=colour_spec["outline_enabled"], shadow_enabled=colour_spec["shadow_enabled"],
+    )
 
     spine_layers = [
         v for v in (resolved_timeline.get("video_layers") or []) if v.get("kind") == "spine"
@@ -212,7 +216,7 @@ def resolve_captions(
             rows = cut_records_by_file.get(layer["source_file_id"], [])
             run_rows.extend(_covering_rows(rows, int(layer["src_in_ms"]), int(layer["src_out_ms"])))
         placement_result = placement_mod.resolve_placement(
-            run_rows, anchor=placement_spec["anchor"], aspect=aspect, safe_area=placement_spec["safe_area"],
+            run_rows, position=style_dict["position"], aspect=aspect, safe_area=True,
         )
         box = placement_result["box"]
 
@@ -248,15 +252,16 @@ def resolve_captions(
                 words,
                 src_in_ms=int(layer["src_in_ms"]), prog_start_ms=int(layer["prog_start_ms"]),
                 layer_prog_end_ms=int(layer["prog_end_ms"]),
-                max_chars_per_line=font["max_chars_per_line"], max_lines=font["max_lines"],
-                case=font["case"], emphasis_mode=style_dict["animation"]["emphasis"],
-                beat_sync=style_dict["animation"]["beat_sync"],
+                max_chars_per_line=style_dict["max_chars_per_line"], max_lines=style_dict["max_lines"],
+                case=style_dict["case"],
+                # Emphasis/beat-sync are internal-only now (caption_style_mvp.
+                # plan.md: "do not expose ... beat sync"): "loudness" still
+                # decides which word Pop/Bounce bounces; beat_sync is always
+                # off (removed from the MVP suggestion path entirely).
+                emphasis_mode="loudness", beat_sync=False,
                 rms_db=af.get("rms_db"), rms_hop_ms=int(af.get("prosody_hop_ms") or 0),
                 onsets_ms=af.get("onsets_ms"), is_musical=bool(af.get("is_musical")),
                 next_event_start_ms=next_start,
-            )
-            resolved_colour = colour_mod.resolve_colour(
-                colour_spec, color_stats=color_stats_by_file.get(file_id), grade=layer.get("grade"),
             )
             for ev in evs:
                 events.append({
@@ -264,7 +269,7 @@ def resolve_captions(
                     "box": box,
                     "style_ref": style_dict["style_id"],
                     "style": {**style_dict, "colour": {**colour_spec, **resolved_colour}},
-                    "anim": dict(style_dict["animation"]),
+                    "anim": style_dict["animation"],
                 })
     events.sort(key=lambda e: e["prog_start_ms"])
     return events
@@ -289,12 +294,11 @@ def resolve_captions_for_document(
         transcripts = fetch_transcripts(file_ids)
         audio_features = fetch_audio_features(file_ids)
         cut_records = fetch_cut_records(file_ids)
-        color_stats = fetch_color_stats_for_captions(file_ids)
     except Exception:
         logger.exception("resolve_captions_for_document: signal fetch failed (continuing without captions)")
         return []
     return resolve_captions(
         resolved_timeline, style=style,
         transcripts_by_file=transcripts, audio_features_by_file=audio_features,
-        cut_records_by_file=cut_records, color_stats_by_file=color_stats, aspect=aspect,
+        cut_records_by_file=cut_records, aspect=aspect,
     )
