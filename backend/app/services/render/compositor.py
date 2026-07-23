@@ -64,6 +64,35 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "video_codec": "libx264", "video_preset": "medium", "video_crf": 20,
         "audio_codec": "aac", "audio_bitrate": "192k", "use_proxy": False,
     },
+    # export_options.plan.md Phase 1: the export dialog's own quality vocabulary.
+    # "1080"/"720" are the SAME tiers as "export"/"preview" above -- kept as
+    # separate keys (not a rename) so the pre-existing per-thread RenderBar's
+    # "preview"/"export" preset ids keep working unchanged, while the export
+    # dialog gets the plan's own 2160/1080/720/source naming.
+    "2160": {
+        "long_edge": 3840, "fps": 30,
+        "video_codec": "libx264", "video_preset": "medium", "video_crf": 18,
+        "audio_codec": "aac", "audio_bitrate": "192k", "use_proxy": False,
+    },
+    "1080": {
+        "long_edge": 1920, "fps": 30,
+        "video_codec": "libx264", "video_preset": "medium", "video_crf": 20,
+        "audio_codec": "aac", "audio_bitrate": "192k", "use_proxy": False,
+    },
+    "720": {
+        "long_edge": 1280, "fps": 30,
+        "video_codec": "libx264", "video_preset": "veryfast", "video_crf": 24,
+        "audio_codec": "aac", "audio_bitrate": "128k", "use_proxy": True,
+    },
+    # long_edge=None is a MARKER, not a real size: "source" passes through the
+    # timeline's own native resolution (the largest source file dimension in
+    # use), resolved per-render by `_source_long_edge` since it depends on
+    # which files are actually in THIS timeline -- see `render_resolved`.
+    "source": {
+        "long_edge": None, "fps": 30,
+        "video_codec": "libx264", "video_preset": "medium", "video_crf": 18,
+        "audio_codec": "aac", "audio_bitrate": "192k", "use_proxy": False,
+    },
 }
 
 # Delivery aspect -> (w_ratio, h_ratio). The long edge maps to the larger ratio
@@ -89,11 +118,35 @@ def canvas_dims(long_edge: int, aspect: str) -> Tuple[int, int]:
     return _even(long_edge * rw / rh), _even(long_edge)  # portrait: height is long
 
 
-def _cfg_for(preset: str, aspect: str) -> Dict[str, Any]:
-    """Concrete render config: the preset's quality tier sized to `aspect`."""
+def _cfg_for(preset: str, aspect: str, source_long_edge: Optional[int] = None) -> Dict[str, Any]:
+    """Concrete render config: the preset's quality tier sized to `aspect`.
+    `source_long_edge`: the resolved size for the "source" preset's None
+    marker (see `_source_long_edge`); falls back to the "export" tier's fixed
+    long edge when no source file in this timeline carries known dimensions,
+    rather than failing the render."""
     base = PRESETS[preset]
-    w, h = canvas_dims(int(base["long_edge"]), aspect)
+    long_edge = base["long_edge"]
+    if long_edge is None:
+        long_edge = source_long_edge or PRESETS["export"]["long_edge"]
+    w, h = canvas_dims(int(long_edge), aspect)
     return {**base, "width": w, "height": h}
+
+
+def _source_long_edge(video: List[dict], file_lookup: "Dict[str, FileEntry]") -> Optional[int]:
+    """The largest known native pixel dimension among this timeline's own
+    source files -- the "source" preset's passthrough target. None when no
+    source file in `file_lookup` carries width/height (e.g. pre-migration
+    rows), so the caller falls back to a fixed tier instead of guessing."""
+    best = 0
+    for fid in {v.get("source_file_id") for v in video}:
+        entry = file_lookup.get(fid)
+        if entry is None:
+            continue
+        for d in (entry.width, entry.height):
+            if d and d > best:
+                best = d
+    return best or None
+
 
 ProgressCb = Optional[Callable[[int, str], None]]
 
@@ -104,6 +157,11 @@ class FileEntry:
     r2_key: str
     r2_proxy_key: Optional[str]
     has_video: bool = True
+    # export_options.plan.md Phase 1: the source file's own pixel dimensions,
+    # when known -- only consumed by the "source" preset (see
+    # `_source_long_edge`); every other preset ignores these.
+    width: Optional[int] = None
+    height: Optional[int] = None
 
 
 # --------------------------------------------------------------------------
@@ -126,11 +184,11 @@ def render_resolved(
     if preset not in PRESETS:
         raise ValueError(f"Unknown preset {preset!r}; known: {list(PRESETS)}")
     aspect = str(resolved.get("aspect") or "landscape")
-    cfg = _cfg_for(preset, aspect)
-    os.makedirs(CACHE_ROOT, exist_ok=True)
-
     video = sorted(resolved.get("video_layers") or [], key=lambda v: (v["prog_start_ms"], v["z"]))
     audio = sorted(resolved.get("audio_layers") or [], key=lambda a: a["prog_start_ms"])
+    source_long_edge = _source_long_edge(video, file_lookup) if PRESETS[preset]["long_edge"] is None else None
+    cfg = _cfg_for(preset, aspect, source_long_edge)
+    os.makedirs(CACHE_ROOT, exist_ok=True)
     total_ms = int(resolved.get("duration_ms") or 0)
     if not video and not audio:
         raise ValueError("Nothing to render: resolved timeline is empty.")

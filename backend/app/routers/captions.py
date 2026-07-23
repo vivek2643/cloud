@@ -126,9 +126,9 @@ def get_suggestions(
     user_id: str = Depends(get_current_user_id),
 ) -> dict:
     _owned_thread(thread_id, user_id)
-    from app.services.render.tasks import _load_document_version, resolve_document
+    from app.services.render.tasks import load_document_version, resolve_document
 
-    doc = _load_document_version(thread_id, version) if version is not None else None
+    doc = load_document_version(thread_id, version) if version is not None else None
     if doc is None:
         doc, _v = store.latest_document(thread_id)
     if doc is None:

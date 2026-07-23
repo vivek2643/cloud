@@ -11,7 +11,8 @@
 #     image/text calls). It's a network/API call, not GPU compute, so it runs
 #     at high concurrency in a single process and never competes for VRAM with
 #     the L1 ingest workers.
-#   - CPU_WORKERS processes pull the "cpu" queue (ffmpeg renders); no GPU.
+#   - CPU_WORKERS processes pull the "cpu"/"l3"/"render"/"export" queues
+#     (ffmpeg renders + exports, L3 auto-editor); no GPU.
 #
 # Env:
 #   GPU_WORKERS         default = number of detected GPUs (min 1)
@@ -77,13 +78,16 @@ echo "  ingest-worker -> queue=ingest concurrency=$INGEST_CONCURRENCY"
 CUDA_VISIBLE_DEVICES="" WORKER_QUEUES="ingest" WORKER_CONCURRENCY="$INGEST_CONCURRENCY" python worker.py &
 pids+=($!)
 
-# --- CPU workers: L3 auto-editor (network-bound OpenAI calls) -------------
-# Renders were removed, so the old "cpu" render queue is dead; these processes
-# now serve the L3 auto-editor's "l3" queue (kept "cpu" too for forward-compat).
-# Running L3 here keeps the network-bound editor calls off the GPU ingest workers.
+# --- CPU workers: L3 auto-editor + render/export (ffmpeg, no GPU) ---------
+# export_options.plan.md Phase 0: "render" (render_edit) and "export"
+# (build_export) are both ffmpeg/CPU-bound, so they fold into this same pool
+# rather than a dedicated worker -- before this, render_edit/build_export jobs
+# were enqueued but never picked up by any worker (queue="render"/"export" was
+# never in WORKER_QUEUES anywhere). Running L3 here keeps the network-bound
+# editor calls off the GPU ingest workers.
 for ((j = 0; j < CPU_WORKERS; j++)); do
-  echo "  cpu-worker $j -> queue=cpu,l3"
-  CUDA_VISIBLE_DEVICES="" WORKER_QUEUES="cpu,l3" python worker.py &
+  echo "  cpu-worker $j -> queue=cpu,l3,render,export"
+  CUDA_VISIBLE_DEVICES="" WORKER_QUEUES="cpu,l3,render,export" python worker.py &
   pids+=($!)
 done
 

@@ -23,7 +23,7 @@ def _pg() -> psycopg.Connection:
     return psycopg.connect(get_settings().database_url, autocommit=True)
 
 
-def _file_ids_in(resolved: Dict[str, Any]) -> List[str]:
+def file_ids_in(resolved: Dict[str, Any]) -> List[str]:
     ids = set()
     for v in resolved.get("video_layers") or []:
         ids.add(v["source_file_id"])
@@ -122,23 +122,25 @@ def resolve_document(document: Dict[str, Any], thread_id: Optional[str] = None) 
     return resolved
 
 
-def _file_lookup(file_ids: List[str]) -> Dict[str, compositor.FileEntry]:
+def file_lookup(file_ids: List[str]) -> Dict[str, compositor.FileEntry]:
     if not file_ids:
         return {}
     with _pg() as conn:
         rows = conn.execute(
-            "select id::text, r2_key, r2_proxy_key, file_type from files where id = any(%s::uuid[])",
+            "select id::text, r2_key, r2_proxy_key, file_type, width, height "
+            "from files where id = any(%s::uuid[])",
             (file_ids,),
         ).fetchall()
     return {
         r[0]: compositor.FileEntry(
-            file_id=r[0], r2_key=r[1], r2_proxy_key=r[2], has_video=(r[3] == "video")
+            file_id=r[0], r2_key=r[1], r2_proxy_key=r[2], has_video=(r[3] == "video"),
+            width=r[4], height=r[5],
         )
         for r in rows
     }
 
 
-def _load_document_version(thread_id: str, version: int) -> Optional[Dict[str, Any]]:
+def load_document_version(thread_id: str, version: int) -> Optional[Dict[str, Any]]:
     import json
     with _pg() as conn:
         row = conn.execute(
@@ -158,12 +160,12 @@ def render_edit(render_id: str) -> None:
         return
     store.update_status(render_id, status="running", progress_pct=1)
     try:
-        document = _load_document_version(row["thread_id"], row["document_version"])
+        document = load_document_version(row["thread_id"], row["document_version"])
         if document is None:
             raise RuntimeError(f"document v{row['document_version']} not found")
         resolved = resolve_document(document, thread_id=row["thread_id"])
-        file_ids = _file_ids_in(resolved)
-        lookup = _file_lookup(file_ids)
+        file_ids = file_ids_in(resolved)
+        lookup = file_lookup(file_ids)
         missing = [f for f in file_ids if f not in lookup]
         if missing:
             raise RuntimeError(f"source file(s) missing for render: {missing}")

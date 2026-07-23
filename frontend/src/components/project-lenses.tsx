@@ -4,6 +4,7 @@ import { DriveContent } from "@/components/drive-content";
 import { CutsView } from "@/components/cuts-view";
 import { ColorGradeView } from "@/components/color-grade-view";
 import { CaptionsView } from "@/components/captions-view";
+import { ExportView } from "@/components/export-view";
 import { useDriveStore } from "@/stores/drive-store";
 
 /**
@@ -11,8 +12,9 @@ import { useDriveStore } from "@/stores/drive-store";
  * every video in the project; "Cuts" surfaces the deterministic V4 ingest
  * pipeline (cuts_v4_only.plan.md) -- the sole Cuts surface now that the older
  * views have been retired. "Colour grading" is color_grading.plan.md's Grade
- * panel. "Captions" is captions.plan.md's two-tier gallery. Remaining stages
- * are placeholders for now.
+ * panel. "Captions" is captions.plan.md's two-tier gallery. "Export" is
+ * export_options.plan.md's deliverable picker (finished video / rough cut /
+ * subtitles). Remaining stages are placeholders for now.
  */
 export function ProjectLenses() {
   const projectStage = useDriveStore((s) => s.projectStage);
@@ -21,6 +23,7 @@ export function ProjectLenses() {
   if (projectStage === "cuts") return <CutsView />;
   if (projectStage === "color") return <ColorGradeView />;
   if (projectStage === "captions") return <CaptionsView />;
+  if (projectStage === "export") return <ExportView />;
   return <ComingSoon label="Coming soon" />;
 }
 

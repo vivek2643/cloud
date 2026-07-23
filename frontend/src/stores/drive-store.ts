@@ -4,7 +4,7 @@ import type { Folder, FileRecord } from "@/lib/api";
 export type ViewMode = "grid" | "list";
 
 // The project workspace stages shown in the left sidebar.
-export type ProjectStage = "media" | "cuts" | "color" | "captions";
+export type ProjectStage = "media" | "cuts" | "color" | "captions" | "export";
 
 interface UploadItem {
   id: string;

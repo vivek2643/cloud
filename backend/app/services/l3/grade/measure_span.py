@@ -69,7 +69,7 @@ def _store_cache(file_id: str, in_ms: int, out_ms: int, stats: Dict[str, Any]) -
 
 def _fetch_proxy_path(file_id: str, tmp_dir: str) -> Optional[str]:
     """Download this file's proxy (or original) to a local temp path -- the
-    same `r2_proxy_key`-preferred lookup `render/tasks.py::_file_lookup`
+    same `r2_proxy_key`-preferred lookup `render/tasks.py::file_lookup`
     uses, since L1's own ingest-time proxy download is long gone by the time
     this runs (well after ingest, inside the grade job)."""
     with _pg() as conn:

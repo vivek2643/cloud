@@ -1282,3 +1282,52 @@ export function listRenders(threadId: string, token: string) {
     { token }
   );
 }
+
+// --- Export (export_options.plan.md) ---
+
+export type ExportKind = "mp4" | "rough_cut" | "srt";
+export type ExportQuality = "2160" | "1080" | "720" | "source";
+export type ExportStatus = "queued" | "running" | "done" | "failed";
+
+export interface ExportJob {
+  id: string;
+  thread_id: string;
+  document_version: number;
+  kind: ExportKind | string;
+  quality: ExportQuality | string;
+  include_media: boolean;
+  status: ExportStatus;
+  output_r2_key?: string | null;
+  output_url?: string | null;
+  error?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export function createExport(
+  threadId: string,
+  options: { kind: ExportKind; quality?: ExportQuality; includeMedia?: boolean; version?: number },
+  token: string
+) {
+  return request<ExportJob>(`/api/edit/threads/${threadId}/export`, {
+    method: "POST",
+    body: JSON.stringify({
+      kind: options.kind,
+      quality: options.quality ?? "1080",
+      include_media: options.includeMedia ?? false,
+      version: options.version,
+    }),
+    token,
+  });
+}
+
+export function getExport(exportId: string, token: string) {
+  return request<ExportJob>(`/api/exports/${exportId}`, { token });
+}
+
+export function listExports(threadId: string, token: string) {
+  return request<{ exports: ExportJob[] }>(
+    `/api/edit/threads/${threadId}/exports`,
+    { token }
+  );
+}
