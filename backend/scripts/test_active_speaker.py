@@ -262,6 +262,7 @@ class _FakeCapture:
         self._fps = fps
         self._frame_shape = frame_shape
         self._pos_ms = 0.0
+        self._grab_idx = -1  # sequential grab()/retrieve() cursor
 
     def isOpened(self):
         return True
@@ -281,6 +282,19 @@ class _FakeCapture:
         if self._pos_ms > duration_ms:
             return False, None
         return True, np.zeros(self._frame_shape, dtype=np.uint8)
+
+    # _sample_frames walks the clip sequentially via grab()/retrieve() (a
+    # decode optimization over per-sample CAP_PROP_POS_MSEC seeking) -- mirror
+    # that exact boundary: grab() advances a cursor and reports whether a frame
+    # remains, retrieve() decodes the currently-grabbed frame.
+    def grab(self):
+        self._grab_idx += 1
+        return self._grab_idx < self._n_frames
+
+    def retrieve(self):
+        if 0 <= self._grab_idx < self._n_frames:
+            return True, np.zeros(self._frame_shape, dtype=np.uint8)
+        return False, None
 
     def release(self):
         pass
