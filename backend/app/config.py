@@ -1,5 +1,4 @@
 from __future__ import annotations
-from typing import List
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 from functools import lru_cache
@@ -58,7 +57,13 @@ class Settings(BaseSettings):
     # on their entire library at once.
     max_inflight_ingest_runs_per_user: int = 5
 
-    cors_origins: List[str] = ["http://localhost:3000"]
+    # Comma-separated allowed browser origins for CORS (the deployed frontend,
+    # e.g. "https://app.vercel.app,https://www.myapp.com"). Kept a plain str --
+    # NOT List[str] -- because pydantic-settings JSON-decodes list-typed env
+    # vars, so a normal comma-separated CORS_ORIGINS value would raise at
+    # startup. Split into a list at the consumer (app/main.py). The dev-origin
+    # regex there still covers localhost/LAN, so local dev is unaffected.
+    cors_origins: str = "http://localhost:3000"
 
     # Dev mode: when set (non-empty), the backend bypasses JWT validation and
     # treats every request as this user. Set to "" to re-enable real auth.

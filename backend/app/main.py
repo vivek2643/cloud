@@ -51,7 +51,9 @@ DEV_ORIGIN_REGEX = (
 # importable even if settings can't load (e.g. a unit test with no env).
 try:
     from app.config import get_settings
-    PROD_ORIGINS = get_settings().cors_origins
+    # cors_origins is a comma-separated str (see config.py for why it isn't a
+    # list-typed setting); split + strip into the list CORSMiddleware wants.
+    PROD_ORIGINS = [o.strip() for o in get_settings().cors_origins.split(",") if o.strip()]
 except Exception:  # noqa: BLE001 - never block app import on config
     PROD_ORIGINS = ["http://localhost:3000"]
 
