@@ -69,8 +69,11 @@ services:
         value: runpod
       - key: WORKER_QUEUES
         value: gpu
+      # Max concurrent in-flight RunPod jobs this box babysits. Keep this <= the
+      # RunPod endpoint's "max workers" (account quota is 10 for a new account;
+      # request an increase, then raise both together). 1:1 = no RunPod-side queue.
       - key: WORKER_CONCURRENCY
-        value: "16"       # max concurrent in-flight RunPod jobs this box babysits
+        value: "10"
       - key: RUNPOD_API_KEY
         sync: false
       - key: RUNPOD_ENDPOINT_ID
