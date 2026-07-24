@@ -19,7 +19,18 @@
 #   CPU_WORKERS         default = 2
 #   NUM_GPUS            override GPU count (else auto-detected via nvidia-smi)
 #   WORKER_CONCURRENCY  per-process concurrency (default 1; safe for VRAM)
-#   INGEST_CONCURRENCY  concurrent Cuts ingest calls (default 6)
+#   INGEST_CONCURRENCY  concurrent Cuts ingest calls (default 8; see below)
+#
+# scale_architecture.plan.md Pillar 4/8: INGEST_CONCURRENCY's default moved
+# 6->8 -- safe now that llm/client.complete() has a proactive per-provider
+# in-flight limiter (INGEST_LLM_MAX_INFLIGHT_{ANTHROPIC,GEMINI}), which bounds
+# real concurrent LLM calls regardless of how many projects this process is
+# juggling. CPU_WORKERS and gpu WORKER_CONCURRENCY stay at their current
+# defaults: the plan's own proposed bumps for those ("soak CPU-L1", "+CPU
+# split") depend on the L1 CPU/GPU queue split in pipeline_parallelism.
+# plan.md, which hasn't shipped -- raising them now wouldn't soak anything,
+# just add idle workers pulling from queues nothing routes CPU-only L1 work
+# to yet.
 #
 # Usage:
 #   cd backend && ./run_workers.sh
@@ -41,7 +52,7 @@ fi
 
 GPU_WORKERS="${GPU_WORKERS:-$NUM_GPUS}"
 CPU_WORKERS="${CPU_WORKERS:-2}"
-INGEST_CONCURRENCY="${INGEST_CONCURRENCY:-6}"
+INGEST_CONCURRENCY="${INGEST_CONCURRENCY:-8}"
 export WORKER_CONCURRENCY="${WORKER_CONCURRENCY:-1}"
 
 echo "Fleet: NUM_GPUS=$NUM_GPUS GPU_WORKERS=$GPU_WORKERS CPU_WORKERS=$CPU_WORKERS concurrency=$WORKER_CONCURRENCY ingest_concurrency=$INGEST_CONCURRENCY"
