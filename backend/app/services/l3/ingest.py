@@ -65,7 +65,7 @@ from app.services.l3.lattice import Lattice, resolve_speech_span_ms
 from app.services.l3.sync import store as sync_store
 from app.services.l3.sync.lattice_merge import apply_outlook_groups, outlook_groups
 from app.services.l3.pass2_params import MAX_PARALLEL_PASS2_BATCHES, STILL_WIDTH_PX
-from app.services.processing import _download_from_r2, _upload_to_r2
+from app.services.processing import _upload_to_r2
 
 logger = logging.getLogger(__name__)
 
@@ -168,19 +168,20 @@ def _face_tracks_for_files(file_ids: List[str]) -> Dict[str, List[active_speaker
 
 
 def _extract_and_upload_heroes(records: List[post.CutRecord], record_ids: List[str],
-                               proxy_keys: Dict[str, str]) -> None:
+                               proxy_cache: fr.ProxyCache) -> None:
     by_file: Dict[str, List[Tuple[str, post.CutRecord]]] = {}
     for rid, rec in zip(record_ids, records):
         by_file.setdefault(rec.file_id, []).append((rid, rec))
 
     for file_id, items in by_file.items():
-        proxy_key = proxy_keys.get(file_id)
-        if not proxy_key:
+        # Reuse the proxy already downloaded for pass-2 planning stills (same
+        # run) instead of a second R2 GET; a file with no proxy key returns
+        # None -- same silent skip as before.
+        proxy_path = proxy_cache.local_path(file_id)
+        if proxy_path is None:
             logger.warning("ingest: no proxy for %s -- skipping %d hero frame(s)", file_id, len(items))
             continue
         with tempfile.TemporaryDirectory() as tmp:
-            proxy_path = os.path.join(tmp, "proxy.mp4")
-            _download_from_r2(proxy_key, proxy_path)
             for rid, rec in items:
                 still_path = os.path.join(tmp, f"{rid}.jpg")
                 fr.extract_still(proxy_path, rec.hero_ts_ms, still_path, width=STILL_WIDTH_PX)
@@ -211,6 +212,13 @@ def _run_ingest(project_id: str, settings, ingest_run_id: str) -> str:
     t_start = time.monotonic()
     t_stage = t_start
     timings_ms: Dict[str, float] = {}
+    # Run-scoped proxy download cache (I/O dedupe only): each clip's 1080p
+    # proxy is needed twice per run -- pass-2 planning stills and hero frames
+    # -- separated by the pass-2 LLM calls. This temp dir + ProxyCache lets
+    # the second phase reuse the first phase's already-downloaded proxy
+    # instead of a second R2 GET. Created just before planning extraction
+    # below; cleaned up in the finally on both success and failure.
+    proxy_tmp: Optional[tempfile.TemporaryDirectory] = None
     try:
         file_rows = pass1.load_project_file_rows(project_id)
         if not file_rows:
@@ -320,7 +328,9 @@ def _run_ingest(project_id: str, settings, ingest_run_id: str) -> str:
         store.set_status(ingest_run_id, "images")
         planned_frames = ip.build_image_plan(pass1_output, lattices, motion_by_file, scene_by_file,
                                              silences_by_file, v4_meta_by_ref=v4_meta_by_ref or None)
-        images_b64 = fr.extract_for_planned_frames(planned_frames, proxy_keys)
+        proxy_tmp = tempfile.TemporaryDirectory()
+        proxy_cache = fr.ProxyCache(proxy_tmp.name, proxy_keys)
+        images_b64 = fr.extract_for_planned_frames(planned_frames, proxy_keys, cache=proxy_cache)
 
         timings_ms["extract"] = (time.monotonic() - t_stage) * 1000
         t_stage = time.monotonic()
@@ -453,7 +463,7 @@ def _run_ingest(project_id: str, settings, ingest_run_id: str) -> str:
 
         store.delete_cut_records_for_run(ingest_run_id)
         record_ids = store.insert_cut_records(ingest_run_id, records)
-        _extract_and_upload_heroes(records, record_ids, proxy_keys)
+        _extract_and_upload_heroes(records, record_ids, proxy_cache)
 
         timings_ms["post"] = (time.monotonic() - t_stage) * 1000
         timings_ms["total"] = (time.monotonic() - t_start) * 1000
@@ -478,6 +488,10 @@ def _run_ingest(project_id: str, settings, ingest_run_id: str) -> str:
             logger.warning("ingest run %s: failed to persist partial timings", ingest_run_id, exc_info=True)
         store.set_status(ingest_run_id, "failed", error=str(e))
         raise
+    finally:
+        # Drop the run-scoped proxy cache dir on both success and failure.
+        if proxy_tmp is not None:
+            proxy_tmp.cleanup()
     return ingest_run_id
 
 
