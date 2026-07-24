@@ -1032,6 +1032,13 @@ def l1_editing_proxy(file_id: str, r2_key: str) -> None:
     proxies without blocking on the multi-GB raw. Idempotent via the shared
     'proxy' stage, so it's a harmless no-op when the raw-fallback path already
     generated it."""
+    # deployment.plan.md: on the Render dispatcher (GPU_EXECUTION=runpod) this
+    # forwards the compute to RunPod and returns; on the RunPod handler / local
+    # (GPU_EXECUTION=local) it falls through and runs the real transcode below.
+    if get_settings().gpu_execution == "runpod":
+        from app.services import runpod_bridge
+        runpod_bridge.run_remote("l1_editing_proxy", file_id=file_id, r2_key=r2_key)
+        return
     if not _file_exists(file_id):
         logger.info("File %s gone; skipping editing proxy.", file_id)
         return
@@ -1074,6 +1081,12 @@ def l1_active_speaker(file_id: str) -> None:
     is guaranteed to exist by the time this runs. Best-effort throughout --
     a failure here degrades identity to id-less PIC/SND for this file,
     never fails the file's own L1/ingest."""
+    # deployment.plan.md: forward to RunPod on the dispatcher; run locally on
+    # the RunPod handler / single-box.
+    if get_settings().gpu_execution == "runpod":
+        from app.services import runpod_bridge
+        runpod_bridge.run_remote("l1_active_speaker", file_id=file_id)
+        return
     if not _file_exists(file_id):
         logger.info("File %s gone; skipping active-speaker pass.", file_id)
         return
@@ -1114,6 +1127,13 @@ def l1_orchestrate(file_id: str, r2_key: str) -> None:
     Branches by file_type: audio uploads run the video-free music path.
     Idempotent: each stage checks processing_jobs first.
     """
+    # deployment.plan.md: forward to RunPod on the dispatcher; run locally on
+    # the RunPod handler / single-box. Returns before correlation.scope so the
+    # dispatcher stays a thin network-bound forwarder.
+    if get_settings().gpu_execution == "runpod":
+        from app.services import runpod_bridge
+        runpod_bridge.run_remote("l1_orchestrate", file_id=file_id, r2_key=r2_key)
+        return
     # scale_architecture.plan.md Pillar 7: every log line for this file's L1
     # run carries file_id/user_id from here on (correlation.scope, not
     # threaded through every logger.info call by hand).

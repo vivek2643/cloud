@@ -45,8 +45,19 @@ DEV_ORIGIN_REGEX = (
     r"^http://(localhost|127\.0\.0\.1|192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}):\d+$"
 )
 
+# Production origins (the deployed frontend, e.g. the Vercel domain) come from
+# CORS_ORIGINS (settings.cors_origins). The dev regex above still matches
+# localhost/LAN, so local dev is unchanged. Defensive default keeps the app
+# importable even if settings can't load (e.g. a unit test with no env).
+try:
+    from app.config import get_settings
+    PROD_ORIGINS = get_settings().cors_origins
+except Exception:  # noqa: BLE001 - never block app import on config
+    PROD_ORIGINS = ["http://localhost:3000"]
+
 app.add_middleware(
     CORSMiddleware,
+    allow_origins=PROD_ORIGINS,
     allow_origin_regex=DEV_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],

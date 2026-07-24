@@ -44,5 +44,9 @@ RUN python -c "from insightface.app import FaceAnalysis; a = FaceAnalysis(name='
 
 COPY backend/ /app/backend/
 
-# Stateless worker; no EXPOSE needed. Provide env at runtime (see docs).
-CMD ["python", "worker.py"]
+# Default entrypoint is the RunPod Serverless handler (deployment.plan.md
+# Phase 1): this image is the GPU L1 tier on RunPod. Other consumers override
+# the command explicitly -- e.g. Render's edso-workers runs `bash run_workers.sh`
+# via render.yaml, and local single-box runs `python worker.py`. Stateless; no
+# EXPOSE needed. Provide env at runtime (GPU_EXECUTION=local here).
+CMD ["python", "handler.py"]

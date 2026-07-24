@@ -78,8 +78,13 @@ async def main() -> None:
     queues = [q.strip() for q in queues_env.split(",") if q.strip()] or None
 
     # Only the ingest workers run Whisper; L2 (Gemini) and L3 (Claude) workers
-    # are network-bound, so skip the model warmup/load for them.
-    if queues is None or "gpu" in queues:
+    # are network-bound, so skip the model warmup/load for them. The Render
+    # `edso-gpu-dispatcher` also pulls the "gpu" queue but never runs models
+    # itself (GPU_EXECUTION=runpod forwards compute to RunPod), so it skips the
+    # warmup too -- otherwise it would pointlessly download ~3-4GB of weights.
+    from app.config import get_settings
+    is_dispatcher = get_settings().gpu_execution == "runpod"
+    if (queues is None or "gpu" in queues) and not is_dispatcher:
         _warmup()
 
     logger.info(

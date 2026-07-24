@@ -165,6 +165,26 @@ class Settings(BaseSettings):
     # instead of quietly commenting out the check itself.
     migration_guard: str = "on"
 
+    # --- deployment.plan.md: RunPod serverless GPU execution -------------
+    # Where the `gpu`-queue L1 tasks (l1_orchestrate / l1_editing_proxy /
+    # l1_active_speaker) physically run their model compute. "local" (default)
+    # = run it in THIS process, byte-identical to single-box/dev. "runpod" =
+    # the task body forwards to a RunPod Serverless endpoint via
+    # app/services/runpod_bridge.py. The Render `edso-gpu-dispatcher` sets
+    # "runpod"; the RunPod handler container itself runs with "local" so it
+    # does the real compute (and its follow-up enqueues bounce back through
+    # the dispatcher, not into an infinite forward loop). Nothing about the
+    # compute changes -- same functions, same inputs, same outputs; only the
+    # machine differs.
+    gpu_execution: str = "local"
+    # RunPod Serverless endpoint the dispatcher forwards to (only read when
+    # gpu_execution == "runpod"). Empty everywhere else.
+    runpod_api_key: str = ""
+    runpod_endpoint_id: str = ""
+    # Upper bound (seconds) the dispatcher polls one GPU job before giving up
+    # so Procrastinate can retry -- sized for a long clip's full L1 pass.
+    runpod_timeout_seconds: int = 900
+
     @property
     def r2_endpoint(self) -> str:
         return f"https://{self.r2_account_id}.r2.cloudflarestorage.com"
