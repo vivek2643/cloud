@@ -28,12 +28,46 @@ logger = logging.getLogger("runpod_handler")
 
 
 def _warmup() -> dict:
-    """Force Whisper weights to load now so the first real job isn't slow.
-    Used by the upload pre-warm ping (deployment.plan.md Phase 3)."""
+    """Preload the L1 model stack now so the first real job isn't slow.
+    Used by the upload pre-warm ping (deployment.plan.md Phase 3).
+
+    Whisper loads first (the critical path). Each additional preload --
+    pyannote diarization and insightface/ASD -- is BEST-EFFORT: wrapped in
+    its own try/except so a warmup failure (e.g. missing HF_TOKEN, unlicensed
+    gated model, backend not installed) can never crash the worker or fail the
+    warmup response. The lazy loaders already fail open (return None on error),
+    but we guard here too so an unexpected raise still can't sink warmup."""
+    warmed = []
+
     from app.services.l1.transcript import _WhisperEngine
 
     _WhisperEngine.get()
-    return {"ok": True, "warmed": True}
+    warmed.append("whisper")
+
+    # pyannote diarization pipeline -- see app/services/l1/diarization.py.
+    try:
+        from app.services.l1.diarization import _get_pyannote_pipeline
+
+        if _get_pyannote_pipeline() is not None:
+            warmed.append("diarization")
+        else:
+            logger.warning("warmup: pyannote diarization pipeline unavailable; skipping.")
+    except Exception:
+        logger.warning("warmup: diarization preload failed; continuing.", exc_info=True)
+
+    # insightface FaceAnalysis (active-speaker detection) -- see
+    # app/services/l1/active_speaker.py. No-arg cached accessor, no video needed.
+    try:
+        from app.services.l1.active_speaker import _get_face_app
+
+        if _get_face_app() is not None:
+            warmed.append("insightface")
+        else:
+            logger.warning("warmup: insightface FaceAnalysis unavailable; skipping.")
+    except Exception:
+        logger.warning("warmup: insightface preload failed; continuing.", exc_info=True)
+
+    return {"ok": True, "warmed": True, "components": warmed}
 
 
 def _task_func(task: str):
