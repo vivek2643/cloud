@@ -35,6 +35,12 @@ services:
       # Set to your Vercel domain(s), comma-separated, in the dashboard.
       - key: CORS_ORIGINS
         sync: false
+      # The API fires the RunPod upload pre-warm (warm() on /presign), so it
+      # needs the RunPod creds too -- same values as edso-gpu-dispatcher.
+      - key: RUNPOD_API_KEY
+        sync: false
+      - key: RUNPOD_ENDPOINT_ID
+        sync: false
 
   - type: worker
     name: edso-workers

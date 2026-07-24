@@ -139,13 +139,15 @@ def test_run_remote_raises_on_ok_false():
         _restore(mp)
 
 
-def test_warm_noop_when_local():
+def test_warm_noop_when_runpod_unconfigured():
     mp = []
     try:
-        # gpu_execution=local -> warm() must not touch httpx at all.
-        _patch(mp, rb, "get_settings", lambda: FakeSettings(gpu_execution="local"))
+        # No endpoint configured -> warm() must not touch httpx at all (local dev).
+        # Note: gpu_execution is irrelevant here -- pre-warm gates on creds so it
+        # still fires on the API service, which runs GPU_EXECUTION=local.
+        _patch(mp, rb, "get_settings", lambda: FakeSettings(gpu_execution="local", endpoint=""))
         def _boom(*a, **k):
-            raise AssertionError("warm() must not call httpx when local")
+            raise AssertionError("warm() must not call httpx when RunPod is unconfigured")
         _patch(mp, rb, "httpx", type("X", (), {"Client": staticmethod(_boom)}))
         rb.warm()  # no raise, no httpx use
     finally:
@@ -193,7 +195,7 @@ TESTS = [
     test_run_remote_completes_ok,
     test_run_remote_raises_on_failed,
     test_run_remote_raises_on_ok_false,
-    test_warm_noop_when_local,
+    test_warm_noop_when_runpod_unconfigured,
     test_guard_forwards_when_runpod,
     test_guard_runs_local_when_local,
 ]

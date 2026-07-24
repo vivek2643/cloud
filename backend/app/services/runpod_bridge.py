@@ -97,12 +97,13 @@ def warm() -> None:
     """Fire a best-effort async warmup ping so a RunPod worker + model weights
     are hot by the time real L1 jobs arrive (upload pre-warm, Phase 3). Returns
     immediately: the HTTP call runs on a daemon thread so it can never block or
-    fault the request that triggered it. No-ops when GPU_EXECUTION != runpod."""
+    fault the request that triggered it.
+
+    Gated on RunPod being CONFIGURED (endpoint + key), NOT on gpu_execution: the
+    API service runs GPU_EXECUTION=local for its own task execution but is
+    exactly where the pre-warm must fire on upload. When RunPod creds are unset
+    (local dev), this no-ops."""
     settings = get_settings()
-    if (
-        settings.gpu_execution != "runpod"
-        or not settings.runpod_endpoint_id
-        or not settings.runpod_api_key
-    ):
+    if not settings.runpod_endpoint_id or not settings.runpod_api_key:
         return
     threading.Thread(target=_warm_call, name="runpod-warm", daemon=True).start()

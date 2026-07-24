@@ -94,8 +94,10 @@ same account as your `HF_TOKEN`. Without this, diarization fails on RunPod.
 4. **Service-specific vars** (Render will prompt for the `sync: false` ones):
    - `edso-gpu-dispatcher`: `RUNPOD_API_KEY` = your key, `RUNPOD_ENDPOINT_ID` =
      the endpoint id from step 1.
-   - `edso-api`: `CORS_ORIGINS` — leave blank for now (you'll set the Vercel
-     domain in step 3). You can put a placeholder like `http://localhost:3000`.
+   - `edso-api`: `CORS_ORIGINS` — leave as `http://localhost:3000` for now (you'll
+     set the Vercel domain in step 3). Also set `RUNPOD_API_KEY` +
+     `RUNPOD_ENDPOINT_ID` here (same values as the dispatcher): the API fires the
+     upload pre-warm to RunPod, so it needs the creds too.
 5. Click **Apply / Create**. Render builds the image once and starts all three.
    - Watch `edso-workers` logs → you should see "Applying pending migrations…"
      then "Worker ready".
