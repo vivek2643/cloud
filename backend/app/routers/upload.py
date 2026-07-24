@@ -42,11 +42,23 @@ def _detect_file_type(content_type: str) -> str:
     return "other"
 
 
+def _maybe_prewarm(content_type: str) -> None:
+    """deployment.plan.md Phase 3: the instant a VIDEO upload starts, fire a
+    best-effort RunPod warmup so the GPU worker + model weights are hot by the
+    time L1 is enqueued (which only happens later, once the client analysis
+    proxies land). No-op unless GPU_EXECUTION=runpod; runs on a daemon thread,
+    so it never blocks or faults the upload."""
+    if _detect_file_type(content_type) == "video":
+        from app.services import runpod_bridge
+        runpod_bridge.warm()
+
+
 @router.post("/presign", response_model=PresignResponse)
 def presign_upload(
     body: PresignRequest,
     user_id: str = Depends(get_current_user_id),
 ):
+    _maybe_prewarm(body.content_type)
     sb = get_supabase()
 
     if body.folder_id:
@@ -173,6 +185,7 @@ def multipart_create(
     body: MultipartCreateRequest,
     user_id: str = Depends(get_current_user_id),
 ):
+    _maybe_prewarm(body.content_type)
     sb = get_supabase()
 
     if body.folder_id:

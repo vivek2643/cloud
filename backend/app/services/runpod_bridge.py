@@ -18,6 +18,7 @@ never raises.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any
 
@@ -82,16 +83,7 @@ def run_remote(task: str, **kwargs: Any) -> None:
             time.sleep(_POLL_INTERVAL_S)
 
 
-def warm() -> None:
-    """Best-effort async warmup ping so a RunPod worker + model weights are hot
-    by the time real L1 jobs arrive (upload pre-warm). Never raises."""
-    settings = get_settings()
-    if (
-        settings.gpu_execution != "runpod"
-        or not settings.runpod_endpoint_id
-        or not settings.runpod_api_key
-    ):
-        return
+def _warm_call() -> None:
     try:
         payload = {"input": {"task": "warmup"}}
         with httpx.Client(timeout=15) as client:
@@ -99,3 +91,18 @@ def warm() -> None:
         logger.info("runpod: warm ping sent")
     except Exception:  # noqa: BLE001 - pre-warm is best-effort, never fatal
         logger.warning("runpod warm ping failed (non-fatal)", exc_info=True)
+
+
+def warm() -> None:
+    """Fire a best-effort async warmup ping so a RunPod worker + model weights
+    are hot by the time real L1 jobs arrive (upload pre-warm, Phase 3). Returns
+    immediately: the HTTP call runs on a daemon thread so it can never block or
+    fault the request that triggered it. No-ops when GPU_EXECUTION != runpod."""
+    settings = get_settings()
+    if (
+        settings.gpu_execution != "runpod"
+        or not settings.runpod_endpoint_id
+        or not settings.runpod_api_key
+    ):
+        return
+    threading.Thread(target=_warm_call, name="runpod-warm", daemon=True).start()

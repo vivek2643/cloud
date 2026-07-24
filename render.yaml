@@ -1,0 +1,101 @@
+# Render Blueprint (deployment.plan.md Phase 4).
+#
+# Three services, one repo, auto-deploy on push to `main`:
+#   - edso-api            : FastAPI HTTP (public; the frontend calls this)
+#   - edso-workers        : Procrastinate CPU workers (ingest LLM calls, L3
+#                           brain, ffmpeg renders/exports). GPU_EXECUTION=local,
+#                           GPU_WORKERS=0 -> never runs L1/GPU work.
+#   - edso-gpu-dispatcher : pulls the `gpu` queue and forwards each L1 job to
+#                           RunPod Serverless (GPU_EXECUTION=runpod). Thin +
+#                           network-bound, so high WORKER_CONCURRENCY.
+#
+# The GPU model compute itself is NOT here -- it runs on RunPod from
+# backend/Dockerfile.worker + backend/handler.py. Set secrets in the Render
+# dashboard (the `sync: false` vars + the `edso-shared` group); never commit them.
+
+services:
+  - type: web
+    name: edso-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile.api
+    dockerContext: .
+    plan: starter
+    branch: main
+    autoDeploy: true
+    healthCheckPath: /health
+    # Apply pending migrations once, before the API goes live, so it doesn't
+    # crash-loop on the schema-drift guard while a worker races to apply them.
+    # Advisory-locked (see migration_runner.plan.md), so concurrent appliers
+    # from other services are harmless.
+    preDeployCommand: python scripts/migrate.py apply
+    envVars:
+      - fromGroup: edso-shared
+      - key: GPU_EXECUTION
+        value: local
+      # Set to your Vercel domain(s), comma-separated, in the dashboard.
+      - key: CORS_ORIGINS
+        sync: false
+
+  - type: worker
+    name: edso-workers
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile.api
+    dockerContext: .
+    dockerCommand: bash run_workers.sh
+    plan: standard        # ffmpeg renders/exports want the extra CPU/RAM
+    branch: main
+    autoDeploy: true
+    envVars:
+      - fromGroup: edso-shared
+      - key: GPU_EXECUTION
+        value: local
+      - key: GPU_WORKERS
+        value: "0"        # this box has no GPU; L1 goes to RunPod
+      - key: WORKER_QUEUES
+        value: ingest,cpu,l3,render,export
+
+  - type: worker
+    name: edso-gpu-dispatcher
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile.api
+    dockerContext: .
+    dockerCommand: python worker.py
+    plan: starter         # only waits on RunPod; no CPU/VRAM work
+    branch: main
+    autoDeploy: true
+    envVars:
+      - fromGroup: edso-shared
+      - key: GPU_EXECUTION
+        value: runpod
+      - key: WORKER_QUEUES
+        value: gpu
+      - key: WORKER_CONCURRENCY
+        value: "16"       # max concurrent in-flight RunPod jobs this box babysits
+      - key: RUNPOD_API_KEY
+        sync: false
+      - key: RUNPOD_ENDPOINT_ID
+        sync: false
+
+envVarGroups:
+  - name: edso-shared
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_POOL_URL
+        sync: false
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET_NAME
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false

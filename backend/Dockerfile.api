@@ -1,0 +1,40 @@
+# CPU image for the always-on tier (deployment.plan.md Phase 5):
+#   - edso-api            (uvicorn app.main:app)
+#   - edso-workers        (run_workers.sh; CPU queues: ingest,cpu,l3,render,export)
+#   - edso-gpu-dispatcher (worker.py; queue=gpu, GPU_EXECUTION=runpod -> forwards)
+#
+# All three import the same app package, so they share one image; the start
+# command is set per-service in render.yaml. No CUDA/GPU here: the actual model
+# compute runs on RunPod (see Dockerfile.worker + handler.py). The router import
+# chain pulls torch/opencv/insightface, so those wheels + their system libs are
+# installed even though this tier never runs a model -- imports must succeed.
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+# ffmpeg: render/export/proxy transcodes on the worker service.
+# libgl1 + libglib2.0-0: opencv-python-headless import.
+# libsndfile1: soundfile/torchaudio import chain.
+# git + build-essential: VCS/C-extension pip deps (e.g. webrtcvad).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        libgl1 \
+        libglib2.0-0 \
+        libsndfile1 \
+        git \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app/backend
+
+# torch resolves to the CPU wheel here (no CUDA base), which is the intent for
+# this tier. Layer above COPY so code changes don't re-run the heavy install.
+COPY backend/requirements.txt ./requirements.txt
+RUN pip install -r requirements.txt
+
+COPY backend/ /app/backend/
+
+# Default is the API; workers/dispatcher override via render.yaml dockerCommand.
+# Render injects $PORT for web services.
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
