@@ -49,6 +49,15 @@ class Settings(BaseSettings):
     ffmpeg_concurrency: int = 4
     r2_concurrency: int = 16
 
+    # scale_architecture.plan.md Pillar 6: hard per-user cap on concurrent L3
+    # ingest runs (a real, costed API call the user directly triggers, worth
+    # rate-limiting outright -- unlike L1, which is upload-triggered and only
+    # gets a priority penalty, not a hard cap; see app/services/fairness.py).
+    # Sized for the plan's target burst (5 users x 10 videos): one user
+    # shouldn't be able to occupy the whole ingest queue by kicking off ingest
+    # on their entire library at once.
+    max_inflight_ingest_runs_per_user: int = 5
+
     cors_origins: List[str] = ["http://localhost:3000"]
 
     # Dev mode: when set (non-empty), the backend bypasses JWT validation and

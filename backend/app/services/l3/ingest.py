@@ -496,7 +496,7 @@ def l3_cuts_v3_ingest(project_id: str) -> None:
     run_ingest(project_id)
 
 
-def defer_ingest(project_id: str) -> None:
+def defer_ingest(project_id: str, user_id: str) -> None:
     """Enqueue a cuts ingest run on the network-bound ``ingest`` procrastinate
     queue (its own worker, decoupled from GPU ingest). Not auto-retried: each
     attempt is a real, costed API call, and a failure here is almost always a
@@ -513,14 +513,25 @@ def defer_ingest(project_id: str) -> None:
     dedups the ``todo`` state). ``queueing_lock`` additionally collapses a
     double-click into one pending job instead of stacking up redundant,
     real-money LLM runs -- ``Task.defer`` raises ``AlreadyEnqueued`` when one
-    is already waiting; the caller treats that as a no-op, not a failure."""
+    is already waiting; the caller treats that as a no-op, not a failure.
+
+    Pillar 6: ``fairness.check_ingest_capacity`` raises ``CapacityExceeded``
+    (the caller's to turn into a 429) if this user already has
+    ``max_inflight_ingest_runs_per_user`` runs going, and otherwise returns
+    the priority to defer at -- lower the more of THIS user's own runs are
+    already in flight, so one user kicking off ingest on their whole library
+    doesn't bury a quieter user's single request behind all of it."""
     from procrastinate import App, PsycopgConnector
+
+    from app.services import fairness
+
+    priority = fairness.check_ingest_capacity(user_id)
 
     enqueue_app = App(connector=PsycopgConnector(
         conninfo=get_settings().database_url, min_size=1, max_size=2))
     with enqueue_app.open():
         enqueue_app.configure_task(
-            "l3_cuts_ingest", queue="ingest",
+            "l3_cuts_ingest", queue="ingest", priority=priority,
             lock=f"ingest:{project_id}", queueing_lock=f"ingest:{project_id}",
         ).defer(project_id=project_id)
 

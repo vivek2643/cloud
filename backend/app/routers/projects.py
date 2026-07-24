@@ -52,14 +52,21 @@ def kick_ingest(project_id: str, user_id: str = Depends(get_current_user_id)):
     immediately; poll GET /{project_id}/cuts for status."""
     from procrastinate.exceptions import AlreadyEnqueued
 
+    from app.services.fairness import CapacityExceeded
+
     _owned_project(project_id, user_id)
     try:
-        defer_ingest(project_id)
+        defer_ingest(project_id, user_id)
     except AlreadyEnqueued:
         # scale_architecture.plan.md Pillar 5: defer_ingest's queueing_lock
         # already caught this -- a run for this project is already pending.
         # A double-click/retry, not a failure: same response either way.
         pass
+    except CapacityExceeded as e:
+        # Pillar 6: a real, user-visible limit, not a transient/server
+        # failure -- 429 so the client can distinguish "try again shortly"
+        # from "something is actually broken" (503, below).
+        raise HTTPException(status_code=429, detail=str(e))
     except Exception:
         logger.exception("could not enqueue ingest for project %s", project_id)
         raise HTTPException(status_code=503, detail="could not enqueue ingest")

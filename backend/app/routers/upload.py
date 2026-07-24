@@ -85,7 +85,7 @@ def _analysis_proxy_keys(file_id: str) -> tuple[str, str]:
     )
 
 
-def _enqueue_task(task_name: str, file_id: str, r2_key: str) -> bool:
+def _enqueue_task(task_name: str, file_id: str, r2_key: str, user_id: str) -> bool:
     """Defer a GPU-queue ingest task via a short-lived, per-call procrastinate
     connector (see the long note on the original _enqueue_l1 for why a per-call
     connector avoids the concurrent-complete race). Best-effort.
@@ -96,15 +96,24 @@ def _enqueue_task(task_name: str, file_id: str, r2_key: str) -> bool:
     invariant ("never run two L1 pipelines for the same file concurrently")
     actually true -- a retried /complete call or a duplicate multipart
     finalize can't start a second GPU pipeline run while one is still
-    `doing`; it just waits behind the lock instead."""
+    `doing`; it just waits behind the lock instead.
+
+    Pillar 6: priority (not a hard cap -- upload already succeeded, the file
+    needs SOME L1 run eventually) is lower the more of this user's OWN files
+    are already mid-L1, so one user's bulk upload doesn't bury a quieter
+    user's single file behind the whole batch on a contended gpu queue."""
     try:
         from procrastinate import App, PsycopgConnector
+
+        from app.services import fairness
+
+        priority = fairness.priority_for_l1(user_id)
 
         enqueue_app = App(connector=PsycopgConnector(
             conninfo=get_settings().database_url, min_size=1, max_size=2))
         with enqueue_app.open():
             enqueue_app.configure_task(
-                task_name, queue="gpu", lock=f"l1:{file_id}",
+                task_name, queue="gpu", lock=f"l1:{file_id}", priority=priority,
             ).defer(file_id=file_id, r2_key=r2_key)
         return True
     except Exception:
@@ -112,7 +121,7 @@ def _enqueue_task(task_name: str, file_id: str, r2_key: str) -> bool:
         return False
 
 
-def _enqueue_l1(file_id: str, r2_key: str) -> bool:
+def _enqueue_l1(file_id: str, r2_key: str, user_id: str) -> bool:
     """
     Defer the L1 orchestrator onto procrastinate. Returns True on success.
 
@@ -129,7 +138,7 @@ def _enqueue_l1(file_id: str, r2_key: str) -> bool:
     upload itself succeeds and the file stays pending until a worker is up.
     """
     # queue="gpu": GPU fleet runs ingest; CPU render workers ignore it.
-    return _enqueue_task("l1_orchestrate", file_id, r2_key)
+    return _enqueue_task("l1_orchestrate", file_id, r2_key, user_id)
 
 
 def _finalize_upload(sb, file_record: dict) -> dict:
@@ -151,9 +160,9 @@ def _finalize_upload(sb, file_record: dict) -> dict:
     )
     if analyzable:
         if file_record.get("r2_proxy_a_key"):
-            _enqueue_task("l1_editing_proxy", file_record["id"], file_record["r2_key"])
+            _enqueue_task("l1_editing_proxy", file_record["id"], file_record["r2_key"], file_record["user_id"])
         else:
-            _enqueue_l1(file_record["id"], file_record["r2_key"])
+            _enqueue_l1(file_record["id"], file_record["r2_key"], file_record["user_id"])
     return result.data[0]
 
 

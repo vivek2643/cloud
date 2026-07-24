@@ -74,7 +74,7 @@ def test_kick_ingest_enqueues_and_returns_queued():
     calls = []
     p = _Patcher()
     p.set(projects, "_owned_project", lambda project_id, user_id: None)
-    p.set(projects, "defer_ingest", lambda project_id: calls.append(project_id))
+    p.set(projects, "defer_ingest", lambda project_id, user_id: calls.append((project_id, user_id)))
     _as_user("user-1")
     try:
         client = TestClient(fastapi_app)
@@ -84,7 +84,7 @@ def test_kick_ingest_enqueues_and_returns_queued():
         _clear_overrides()
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"project_id": "proj-123", "status": "queued"}
-    assert calls == ["proj-123"]
+    assert calls == [("proj-123", "user-1")]
     print("ok  test_kick_ingest_enqueues_and_returns_queued")
 
 
@@ -94,7 +94,7 @@ def test_kick_ingest_treats_already_enqueued_as_a_noop():
     a double-click, not a failure."""
     from procrastinate.exceptions import AlreadyEnqueued
 
-    def already(project_id):
+    def already(project_id, user_id):
         raise AlreadyEnqueued("already queued")
 
     p = _Patcher()
@@ -110,6 +110,29 @@ def test_kick_ingest_treats_already_enqueued_as_a_noop():
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"project_id": "proj-123", "status": "queued"}
     print("ok  test_kick_ingest_treats_already_enqueued_as_a_noop")
+
+
+def test_kick_ingest_429s_when_over_capacity():
+    """scale_architecture.plan.md Pillar 6: defer_ingest raises
+    CapacityExceeded when this user already has max_inflight_ingest_runs_
+    per_user runs going -- a real, user-visible limit (429), not a 503."""
+    from app.services.fairness import CapacityExceeded
+
+    def over_capacity(project_id, user_id):
+        raise CapacityExceeded(user_id, in_flight=5, max_inflight=5)
+
+    p = _Patcher()
+    p.set(projects, "_owned_project", lambda project_id, user_id: None)
+    p.set(projects, "defer_ingest", over_capacity)
+    _as_user("user-1")
+    try:
+        client = TestClient(fastapi_app)
+        resp = client.post("/api/projects/proj-123/ingest")
+    finally:
+        p.restore()
+        _clear_overrides()
+    assert resp.status_code == 429, resp.text
+    print("ok  test_kick_ingest_429s_when_over_capacity")
 
 
 def test_kick_ingest_404s_on_unowned_project():
@@ -130,7 +153,7 @@ def test_kick_ingest_404s_on_unowned_project():
 
 
 def test_kick_ingest_503s_when_enqueue_fails():
-    def boom(project_id):
+    def boom(project_id, user_id):
         raise RuntimeError("queue unavailable")
 
     p = _Patcher()
@@ -182,6 +205,7 @@ def main():
     test_create_project_rejects_empty_file_ids()
     test_kick_ingest_enqueues_and_returns_queued()
     test_kick_ingest_treats_already_enqueued_as_a_noop()
+    test_kick_ingest_429s_when_over_capacity()
     test_kick_ingest_404s_on_unowned_project()
     test_kick_ingest_503s_when_enqueue_fails()
     test_get_cuts_returns_result()
