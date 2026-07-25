@@ -40,7 +40,7 @@ import threading
 from typing import Iterator
 
 import psycopg
-from psycopg.rows import dict_row
+from psycopg.rows import dict_row, tuple_row
 from psycopg_pool import ConnectionPool
 
 from app.config import get_settings
@@ -91,10 +91,21 @@ def connection() -> "contextlib.AbstractContextManager[psycopg.Connection]":
 def connection_dict_row() -> Iterator[psycopg.Connection]:
     """Same as `connection()`, but rows come back as dicts (psycopg's
     `dict_row` factory) -- for the handful of modules that already relied
-    on that (`l3/cuts_read.py`, `l3/sync/store.py`, `l1/snapshot.py`)."""
+    on that (`l3/cuts_read.py`, `l3/sync/store.py`, `l1/snapshot.py`).
+
+    CRITICAL: restore `row_factory` to the default (`tuple_row`) on exit.
+    The connection is POOLED -- `connection()` hands the same physical socket
+    to the next borrower without recreating it, so leaving `row_factory` as
+    `dict_row` poisons the pool: a later `connection()` caller (which expects
+    tuple rows and does `row[0]`) then gets a dict and blows up with
+    `KeyError: 0`. This bit l1_active_speaker on a warm RunPod worker right
+    after l1_orchestrate's build_l1_snapshot borrowed a dict-row connection."""
     with connection() as conn:
         conn.row_factory = dict_row
-        yield conn
+        try:
+            yield conn
+        finally:
+            conn.row_factory = tuple_row
 
 
 def close() -> None:
