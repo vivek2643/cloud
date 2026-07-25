@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     # Sized for the plan's target burst (5 users x 10 videos): one user
     # shouldn't be able to occupy the whole ingest queue by kicking off ingest
     # on their entire library at once.
-    max_inflight_ingest_runs_per_user: int = 5
+    max_inflight_ingest_runs_per_user: int = 10
 
     # Comma-separated allowed browser origins for CORS (the deployed frontend,
     # e.g. "https://app.vercel.app,https://www.myapp.com"). Kept a plain str --
