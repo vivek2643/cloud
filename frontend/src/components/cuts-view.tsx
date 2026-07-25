@@ -24,7 +24,6 @@ import {
   Volume2,
   VolumeX,
   Layers,
-  Loader2,
   Eye,
   EyeOff,
 } from "lucide-react";
@@ -420,6 +419,19 @@ export function CutsView() {
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [order, setOrder] = useState<string[]>([]);
   const urlCache = useRef<Record<string, Promise<string | null>>>({});
+  // Cuts generation is fully automatic -- there are no manual ingest controls.
+  // These refs keep polling from spamming kicks: `autoKicked` is the set of
+  // projects we've auto-started (once each, ever), `autoRetried` allows exactly
+  // ONE automatic retry per view mount on failure, `retriedRunId` is the run id
+  // we last kicked over (null = auto-start over "never ingested"), and
+  // `pendingRun` means a kick just fired and we're polling for its run to
+  // surface. `candidateCount` mirrors the ready-candidate count for use inside
+  // the poll closure without widening its deps.
+  const autoKickedRef = useRef<Set<string>>(new Set());
+  const autoRetriedRef = useRef(false);
+  const retriedRunIdRef = useRef<string | null>(null);
+  const pendingRunRef = useRef(false);
+  const candidateCountRef = useRef(0);
 
   const candidates = useMemo(
     () => files.filter((f) => f.file_type === "video" && f.l1_status === "ready"),
@@ -432,6 +444,7 @@ export function CutsView() {
   }, [files]);
   const candidateIds = useMemo(() => candidates.map((f) => f.id), [candidates]);
   const candidateKey = candidateIds.join(",");
+  candidateCountRef.current = candidateIds.length;
 
   // Find-or-create the backend project for this exact file set.
   useEffect(() => {
@@ -463,14 +476,58 @@ export function CutsView() {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
 
+    async function autoKick(retriedRunId: string | null) {
+      pendingRunRef.current = true;
+      retriedRunIdRef.current = retriedRunId;
+      setKicking(true);
+      try {
+        await kickIngest(projectId!, token!);
+      } catch {
+        // Best-effort: a failed kick just leaves us polling; the run row (or its
+        // absence) drives the surfaced state. No manual retry button exists.
+      } finally {
+        if (!cancelled) setKicking(false);
+      }
+    }
+
     async function tick() {
       try {
         const r = await getCuts(projectId!, token!);
         if (cancelled) return;
         setData(r);
         setLoading(false);
-        const status = r.ingest_run?.status;
-        if (status && status !== "ready" && status !== "failed") {
+        const run = r.ingest_run;
+        const status = run?.status;
+
+        // A freshly-kicked run has surfaced (its id differs from the one we
+        // kicked over, or it moved off "failed") -> stop waiting on it.
+        if (pendingRunRef.current) {
+          const cur = run?.id ?? null;
+          if (cur !== retriedRunIdRef.current || (status && status !== "failed")) {
+            pendingRunRef.current = false;
+          }
+        }
+
+        // Auto-start: never ingested + we have ready candidates -> kick ONCE
+        // per project, then keep polling for the run to appear.
+        if (!run && candidateCountRef.current > 0 && !autoKickedRef.current.has(projectId!)) {
+          autoKickedRef.current.add(projectId!);
+          await autoKick(null);
+          if (!cancelled) timer = setTimeout(tick, 1500);
+          return;
+        }
+
+        // Auto-retry ONCE per view mount on failure -- no manual retry button.
+        if (status === "failed" && !autoRetriedRef.current) {
+          autoRetriedRef.current = true;
+          await autoKick(run!.id);
+          if (!cancelled) timer = setTimeout(tick, 1500);
+          return;
+        }
+
+        // Keep polling while the run is non-terminal, or while we're waiting
+        // for a just-kicked run to show up.
+        if ((status && status !== "ready" && status !== "failed") || pendingRunRef.current) {
           timer = setTimeout(tick, 3000);
         }
       } catch {
@@ -502,17 +559,6 @@ export function CutsView() {
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, []);
-
-  const handleKickIngest = useCallback(async () => {
-    if (!token || !projectId) return;
-    setKicking(true);
-    try {
-      await kickIngest(projectId, token);
-    } finally {
-      setKicking(false);
-      setPollGen((g) => g + 1);
-    }
-  }, [token, projectId]);
 
   const getUrl = useCallback(
     (fileId: string): Promise<string | null> => {
@@ -659,6 +705,18 @@ export function CutsView() {
   const run = data?.ingest_run ?? null;
   const isProcessing = !!run && run.status !== "ready" && run.status !== "failed";
 
+  // Fully-automatic generation status (no manual controls). A failed run shows
+  // "retrying" while an auto-retry is in flight (kicking, or waiting for the new
+  // run to surface) and a buttonless error only once that retry is exhausted.
+  let genMode: "generating" | "retrying" | "error" | null = null;
+  if (projectId) {
+    if (run?.status === "failed") {
+      genMode = kicking || pendingRunRef.current ? "retrying" : "error";
+    } else if (isProcessing || kicking || pendingRunRef.current) {
+      genMode = "generating";
+    }
+  }
+
   return (
     <div>
       <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
@@ -701,17 +759,6 @@ export function CutsView() {
           />
         </div>
         <div className="flex items-center gap-2.5">
-          {run?.status === "ready" && (
-            <button
-              onClick={handleKickIngest}
-              disabled={kicking}
-              className="rounded-lg border px-3 py-2 text-xs font-medium transition-colors hover:bg-[var(--sidebar)] disabled:opacity-50"
-              style={{ borderColor: "rgba(255,255,255,0.4)", color: "var(--foreground)" }}
-              title="Re-run the cuts ingest for this project"
-            >
-              {kicking ? "Re-running…" : "Re-run ingest"}
-            </button>
-          )}
           <EditButton />
         </div>
       </div>
@@ -722,13 +769,7 @@ export function CutsView() {
         <EnergyBar value={energy} onChange={setEnergy} />
       </div>
 
-      <IngestBanner
-        run={run}
-        loading={loading}
-        kicking={kicking}
-        hasProject={!!projectId}
-        onKick={handleKickIngest}
-      />
+      <GenerationStatus mode={genMode} run={run} />
 
       {loading && !data && (
         <p className="py-12 text-center text-sm" style={{ color: "var(--muted)" }}>
@@ -739,7 +780,7 @@ export function CutsView() {
       {!loading && candidateIds.length === 0 && (
         <EmptyState
           title="No footage yet"
-          body="Upload video. Once analyzed, you can run the cuts ingest here."
+          body="Upload video. Cuts are generated automatically once your videos finish analyzing."
         />
       )}
 
@@ -834,77 +875,80 @@ export function CutsView() {
   );
 }
 
-function IngestBanner({
+// Cuts generation is fully automatic: there are no "Run ingest" / "Retry"
+// buttons. This surfaces the automatic run's progress instead --
+//  - "generating": an indeterminate bar (no granular % from the backend) with
+//    the current stage label + running cost.
+//  - "retrying": the same bar after a failed run auto-retried once.
+//  - "error": a quiet, buttonless message once that single retry is exhausted.
+function GenerationStatus({
+  mode,
   run,
-  loading,
-  kicking,
-  hasProject,
-  onKick,
 }: {
+  mode: "generating" | "retrying" | "error" | null;
   run: CutsResponse["ingest_run"];
-  loading: boolean;
-  kicking: boolean;
-  hasProject: boolean;
-  onKick: () => void;
 }) {
-  if (!hasProject) return null;
+  if (!mode) return null;
 
-  if (!loading && !run) {
+  if (mode === "error") {
     return (
       <div
-        className="mb-6 flex items-center justify-between gap-3 rounded-xl border px-4 py-3"
+        className="mb-6 rounded-xl border px-4 py-3 text-sm"
         style={{ borderColor: "var(--border)", background: "var(--sidebar)" }}
       >
-        <div className="flex items-center gap-2 text-sm">
-          <Sparkles size={15} style={{ color: "var(--accent)" }} />
-          <span>Not yet ingested for cuts.</span>
-        </div>
-        <KickButton kicking={kicking} onClick={onKick} label="Run ingest" />
-      </div>
-    );
-  }
-
-  if (!run) return null;
-
-  if (run.status === "failed") {
-    return (
-      <div
-        className="mb-6 flex items-center justify-between gap-3 rounded-xl border px-4 py-3"
-        style={{ borderColor: "#b91c1c", background: "rgba(185,28,28,0.08)" }}
-      >
-        <div className="text-sm">
-          <span className="font-semibold" style={{ color: "#f87171" }}>
-            Ingest failed
+        <span className="font-medium" style={{ color: "var(--foreground)" }}>
+          Cut generation failed
+        </span>
+        {run?.error && (
+          <span className="ml-2" style={{ color: "var(--muted)" }}>
+            {run.error}
           </span>
-          {run.error && (
-            <span className="ml-2" style={{ color: "var(--muted)" }}>
-              {run.error}
-            </span>
-          )}
-        </div>
-        <KickButton kicking={kicking} onClick={onKick} label="Retry" />
-      </div>
-    );
-  }
-
-  if (run.status !== "ready") {
-    return (
-      <div
-        className="mb-6 flex items-center gap-3 rounded-xl border px-4 py-3 text-sm"
-        style={{ borderColor: "var(--border)", background: "var(--sidebar)" }}
-      >
-        <Loader2 size={15} className="animate-spin" style={{ color: "var(--accent)" }} />
-        <span>{STATUS_LABEL[run.status]}</span>
-        {run.cost_usd != null && (
-          <span style={{ color: "var(--muted)" }}>· ${run.cost_usd.toFixed(2)} so far</span>
         )}
       </div>
     );
   }
 
-  // Ready: no banner. The project summary is intentionally not shown; re-run
-  // lives in the top toolbar.
-  return null;
+  const headline = mode === "retrying" ? "Cut generation failed — retrying…" : "Generating cuts…";
+  const stage = run && run.status !== "ready" && run.status !== "failed" ? STATUS_LABEL[run.status] : "Starting…";
+  const cost =
+    run?.cost_usd != null && run.cost_usd > 0 ? ` · $${run.cost_usd.toFixed(2)} so far` : "";
+
+  return (
+    <div
+      className="mb-6 rounded-xl border px-4 py-3.5"
+      style={{ borderColor: "var(--border)", background: "var(--sidebar)" }}
+    >
+      <div className="flex items-baseline justify-between gap-3">
+        <span className="text-sm font-medium" style={{ color: "var(--foreground)" }}>
+          {headline}
+        </span>
+        <span className="shrink-0 text-xs" style={{ color: "var(--muted)" }}>
+          {stage}
+          {cost}
+        </span>
+      </div>
+      <IndeterminateBar />
+    </div>
+  );
+}
+
+// A slim indeterminate progress track: a short accent segment sweeps across a
+// grey track. Used when there's no granular percentage to report.
+function IndeterminateBar() {
+  return (
+    <div
+      className="relative mt-3 h-1 w-full overflow-hidden rounded-full"
+      style={{ background: "var(--border)" }}
+    >
+      <div
+        className="absolute top-0 h-full w-2/5 rounded-full"
+        style={{
+          background: "var(--accent)",
+          animation: "indeterminate-sweep 1.15s cubic-bezier(0.4, 0, 0.2, 1) infinite",
+        }}
+      />
+    </div>
+  );
 }
 
 // Snaps to 5 stops (Broad..Sharp); reads the continuous value as tightening
@@ -982,20 +1026,6 @@ function EnergyBar({ value, onChange }: { value: number; onChange: (v: number) =
         {energyLabel(value)}
       </span>
     </div>
-  );
-}
-
-function KickButton({ kicking, onClick, label }: { kicking: boolean; onClick: () => void; label: string }) {
-  return (
-    <button
-      onClick={onClick}
-      disabled={kicking}
-      className="flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-xs font-semibold transition-colors disabled:opacity-60"
-      style={{ background: "var(--accent)", color: "var(--background)" }}
-    >
-      {kicking && <Loader2 size={12} className="animate-spin" />}
-      {kicking ? "Starting…" : label}
-    </button>
   );
 }
 

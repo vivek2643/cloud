@@ -92,6 +92,13 @@
   --clip-audio-4: #3a3a3a;
 }
 
+/* Indeterminate progress track: a short accent segment sweeps across a grey
+   track. Used where there's no granular percentage (e.g. cuts generation). */
+@keyframes indeterminate-sweep {
+  0% { left: -40%; }
+  100% { left: 100%; }
+}
+
 body {
   background: var(--background);
   color: var(--foreground);
