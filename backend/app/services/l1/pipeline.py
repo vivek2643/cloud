@@ -153,6 +153,97 @@ def _file_exists(file_id: str) -> bool:
         return True
 
 
+# Terminal l1_status values -- a file that reached any of these is "done" for
+# the purpose of deciding whether a folder's whole upload batch has finished.
+# Anything else ('pending'/'uploading'/'running'/NULL) still owes work.
+_L1_TERMINAL = ("ready", "skipped", "failed")
+
+
+def _maybe_autostart_cuts(file_id: str) -> None:
+    """Auto-kick the L3 cuts ingest once a folder's whole L1 upload batch is
+    done, so users don't have to click "Run ingest" manually.
+
+    Scope = every VIDEO file sharing this file's (user_id, folder_id)
+    (folder_id NULL = drive root) -- the SAME candidate set the cuts view
+    builds from all ``l1_status == 'ready'`` videos in the folder. We only
+    kick when EVERY video in that scope has reached a terminal l1_status and
+    at least one is 'ready'. A one-shot guard (any pre-existing ``ingest_runs``
+    row for the project) keeps a later file's completion from re-kicking a
+    project that already ran; late-additions are handled separately.
+
+    Fully BEST-EFFORT / self-guarding: the entire body is wrapped so it can
+    NEVER raise -- an autostart hiccup must not fail (or force a retry of) the
+    L1 job that just succeeded. defer_ingest's own lock/queueing_lock already
+    dedupes concurrent/double kicks; AlreadyEnqueued and CapacityExceeded are
+    treated as no-ops.
+    """
+    try:
+        from procrastinate.exceptions import AlreadyEnqueued
+
+        from app.services.fairness import CapacityExceeded
+        from app.services.l3.ingest import defer_ingest
+        from app.services.l3.projects import find_or_create_project
+
+        with _pg_conn() as conn:
+            row = conn.execute(
+                "select user_id::text, folder_id::text from files where id = %s",
+                (file_id,),
+            ).fetchone()
+            if not row:
+                return
+            user_id, folder_id = row[0], row[1]
+
+            # folder_id NULL (drive root) must group with other root files --
+            # `= NULL` never matches, so branch on None explicitly.
+            if folder_id is None:
+                rows = conn.execute(
+                    "select id::text, l1_status from files "
+                    "where user_id = %s and folder_id is null and file_type = 'video'",
+                    (user_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "select id::text, l1_status from files "
+                    "where user_id = %s and folder_id = %s and file_type = 'video'",
+                    (user_id, folder_id),
+                ).fetchall()
+
+        if not rows:
+            return
+
+        ready_video_ids: List[str] = []
+        for vid, status in rows:
+            if status not in _L1_TERMINAL:
+                return  # batch not finished -- a sibling video still owes work
+            if status == "ready":
+                ready_video_ids.append(vid)
+        if not ready_video_ids:
+            return
+
+        project_id = find_or_create_project(user_id, ready_video_ids)
+
+        # One-shot guard: if this exact project already ran (or is running) an
+        # ingest, don't auto re-kick on a later completion in the same scope.
+        with _pg_conn() as conn:
+            existing = conn.execute(
+                "select 1 from ingest_runs where project_id = %s limit 1",
+                (project_id,),
+            ).fetchone()
+        if existing is not None:
+            return
+
+        try:
+            defer_ingest(project_id, user_id)
+        except (AlreadyEnqueued, CapacityExceeded):
+            return
+        logger.info(
+            "auto-started cuts ingest for project %s (%d videos)",
+            project_id, len(ready_video_ids),
+        )
+    except Exception:
+        logger.warning("auto-start cuts check failed for %s", file_id, exc_info=True)
+
+
 # --- Stage 1: proxy + thumb (refactor of existing process_video) ---------
 
 def _gpu_available() -> bool:
@@ -868,6 +959,7 @@ def _orchestrate_audio(file_id: str, r2_key: str, settings) -> None:
                         duration_s, settings.max_l1_duration_seconds,
                     )
                     _set_l1_status(file_id, "skipped")
+                    _maybe_autostart_cuts(file_id)
                     return
 
                 _demux_wav(raw_path, wav_path)
@@ -890,6 +982,7 @@ def _orchestrate_audio(file_id: str, r2_key: str, settings) -> None:
                     _run_stage(conn, file_id, "diarization", _stage6_diarization, file_id, wav_path, conn)
 
         _set_l1_status(file_id, "ready")
+        _maybe_autostart_cuts(file_id)
         logger.info("L1(audio) complete for %s", file_id)
         try:
             snapshot = build_l1_snapshot(file_id)
@@ -1174,6 +1267,7 @@ def _l1_orchestrate(file_id: str, r2_key: str) -> None:
                     duration_s, settings.max_l1_duration_seconds,
                 )
                 _set_l1_status(file_id, "skipped")
+                _maybe_autostart_cuts(file_id)
                 return
 
             # Deep stages run as three concurrent tracks (speech / audio / video),
@@ -1183,6 +1277,7 @@ def _l1_orchestrate(file_id: str, r2_key: str) -> None:
             )
 
         _set_l1_status(file_id, "ready")
+        _maybe_autostart_cuts(file_id)
         logger.info("L1 complete for %s", file_id)
         try:
             snapshot = build_l1_snapshot(file_id)
