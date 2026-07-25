@@ -6,7 +6,7 @@ import { useDriveStore } from "@/stores/drive-store";
 import { useAuthStore } from "@/stores/auth-store";
 import { FileIcon } from "./file-icon";
 import { formatBytes, formatDuration } from "@/lib/utils";
-import { getFilePlaybackUrl, deleteFile, getFolderCovers, getFiles } from "@/lib/api";
+import { getFilePlaybackUrl, deleteFile, deleteFolder, getFolderCovers, getFiles } from "@/lib/api";
 import {
   MoreHorizontal,
   Loader2,
@@ -17,6 +17,7 @@ import {
   CheckCircle2,
   Circle,
   ExternalLink,
+  FolderOpen,
   Trash2,
 } from "lucide-react";
 import type { Folder, FileRecord } from "@/lib/api";
@@ -37,6 +38,7 @@ export function DriveContent({ onFileContextMenu, onFolderContextMenu }: DriveCo
     searchQuery,
     currentFolderId,
     toggleSelected,
+    removeFolder,
     removeFile,
     setFiles,
   } = useDriveStore();
@@ -63,13 +65,20 @@ export function DriveContent({ onFileContextMenu, onFolderContextMenu }: DriveCo
   }, [anyProcessing, currentFolderId, session?.access_token, setFiles]);
 
   const [fileMenu, setFileMenu] = useState<{ file: FileRecord; x: number; y: number } | null>(null);
+  const [folderMenu, setFolderMenu] = useState<{ folder: Folder; x: number; y: number } | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deletingFolderId, setDeletingFolderId] = useState<string | null>(null);
 
   // Either a right-click or the row's "⋯" button opens our menu. If the parent
   // passed its own handler we honour it too (none currently do).
   function handleFileMenu(file: FileRecord, e: React.MouseEvent) {
     onFileContextMenu?.(file, e);
     setFileMenu({ file, x: e.clientX, y: e.clientY });
+  }
+
+  function handleFolderMenu(folder: Folder, e: React.MouseEvent) {
+    onFolderContextMenu?.(folder, e);
+    setFolderMenu({ folder, x: e.clientX, y: e.clientY });
   }
 
   async function handleDelete(file: FileRecord) {
@@ -87,6 +96,24 @@ export function DriveContent({ onFileContextMenu, onFolderContextMenu }: DriveCo
       window.alert(`Could not delete the video: ${(err as Error).message}`);
     } finally {
       setDeletingId(null);
+    }
+  }
+
+  async function handleFolderDelete(folder: Folder) {
+    setFolderMenu(null);
+    if (!session?.access_token) return;
+    const ok = window.confirm(
+      `Delete "${folder.name}" and all of its videos and analysis?\n\nThis can't be undone.`,
+    );
+    if (!ok) return;
+    setDeletingFolderId(folder.id);
+    try {
+      await deleteFolder(folder.id, session.access_token);
+      removeFolder(folder.id);
+    } catch (err) {
+      window.alert(`Could not delete the project: ${(err as Error).message}`);
+    } finally {
+      setDeletingFolderId(null);
     }
   }
 
@@ -131,11 +158,12 @@ export function DriveContent({ onFileContextMenu, onFolderContextMenu }: DriveCo
           files={visibleFiles}
           selectedIds={selectedIds}
           deletingId={deletingId}
+          deletingFolderId={deletingFolderId}
           onToggleSelect={toggleSelected}
           onNavigate={(id) => router.push(`/drive/folder/${id}`)}
           onOpenFile={(id) => router.push(`/file/${id}`)}
           onFileContextMenu={handleFileMenu}
-          onFolderContextMenu={onFolderContextMenu}
+          onFolderContextMenu={handleFolderMenu}
         />
       ) : (
         <GridView
@@ -143,11 +171,12 @@ export function DriveContent({ onFileContextMenu, onFolderContextMenu }: DriveCo
           files={visibleFiles}
           selectedIds={selectedIds}
           deletingId={deletingId}
+          deletingFolderId={deletingFolderId}
           onToggleSelect={toggleSelected}
           onNavigate={(id) => router.push(`/drive/folder/${id}`)}
           onOpenFile={(id) => router.push(`/file/${id}`)}
           onFileContextMenu={handleFileMenu}
-          onFolderContextMenu={onFolderContextMenu}
+          onFolderContextMenu={handleFolderMenu}
         />
       )}
 
@@ -163,6 +192,21 @@ export function DriveContent({ onFileContextMenu, onFolderContextMenu }: DriveCo
             router.push(`/file/${id}`);
           }}
           onDelete={() => handleDelete(fileMenu.file)}
+        />
+      )}
+
+      {folderMenu && (
+        <FolderMenu
+          folder={folderMenu.folder}
+          x={folderMenu.x}
+          y={folderMenu.y}
+          onClose={() => setFolderMenu(null)}
+          onOpen={() => {
+            const id = folderMenu.folder.id;
+            setFolderMenu(null);
+            router.push(`/drive/folder/${id}`);
+          }}
+          onDelete={() => handleFolderDelete(folderMenu.folder)}
         />
       )}
     </div>
@@ -221,6 +265,55 @@ function FileMenu({
   );
 }
 
+function FolderMenu({
+  folder,
+  x,
+  y,
+  onClose,
+  onOpen,
+  onDelete,
+}: {
+  folder: Folder;
+  x: number;
+  y: number;
+  onClose: () => void;
+  onOpen: () => void;
+  onDelete: () => void;
+}) {
+  const MENU_W = 180;
+  const MENU_H = 92;
+  const left = Math.min(x, (typeof window !== "undefined" ? window.innerWidth : x) - MENU_W - 8);
+  const top = Math.min(y, (typeof window !== "undefined" ? window.innerHeight : y) - MENU_H - 8);
+  return (
+    <>
+      <div className="fixed inset-0 z-40" onClick={onClose} onContextMenu={(e) => { e.preventDefault(); onClose(); }} />
+      <div
+        className="fixed z-50 overflow-hidden rounded-lg border py-1 shadow-xl"
+        style={{ left, top, minWidth: MENU_W, background: "var(--background)", borderColor: "var(--border)" }}
+      >
+        <div className="truncate px-3 pb-1 pt-0.5 text-[11px]" style={{ color: "var(--muted)" }}>
+          {folder.name}
+        </div>
+        <button
+          onClick={onOpen}
+          className="flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm transition-colors hover:bg-[var(--accent-soft)]"
+        >
+          <FolderOpen size={15} style={{ color: "var(--muted)" }} />
+          Open
+        </button>
+        <button
+          onClick={onDelete}
+          className="flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm transition-colors hover:bg-[var(--accent-soft)]"
+          style={{ color: "#ef4444" }}
+        >
+          <Trash2 size={15} />
+          Delete
+        </button>
+      </div>
+    </>
+  );
+}
+
 // --- Project (folder) card: stacked-perspective thumbnail + name below ---
 
 function ClipPanel({
@@ -250,10 +343,12 @@ function ClipPanel({
 
 function ProjectCard({
   folder,
+  deleting = false,
   onOpen,
   onContextMenu,
 }: {
   folder: Folder;
+  deleting?: boolean;
   onOpen: () => void;
   onContextMenu: (e: React.MouseEvent) => void;
 }) {
@@ -290,6 +385,23 @@ function ProjectCard({
         className="relative aspect-[4/3] w-full overflow-hidden rounded-xl border transition-colors group-hover:border-[var(--accent)]"
         style={{ borderColor: "var(--border)", background: "var(--sidebar)" }}
       >
+        {/* Hover "⋯" menu (top-right) — opens Open / Delete. */}
+        <button
+          onClick={(e) => { e.stopPropagation(); onContextMenu(e); }}
+          className="absolute right-1.5 top-1.5 z-20 flex items-center justify-center rounded-md p-1 text-white opacity-0 transition-opacity hover:bg-black/40 group-hover:opacity-100"
+          style={{ background: "rgba(0,0,0,0.55)" }}
+          title="More"
+        >
+          <MoreHorizontal size={15} />
+        </button>
+
+        {deleting && (
+          <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-2 bg-black/60">
+            <Loader2 size={20} className="animate-spin text-white" />
+            <span className="text-xs text-white/80">Deleting…</span>
+          </div>
+        )}
+
         <div className="absolute inset-0 flex items-center justify-center" style={{ perspective: "520px" }}>
           <ClipPanel
             src={left}
@@ -336,6 +448,7 @@ function GridView({
   files,
   selectedIds,
   deletingId,
+  deletingFolderId,
   compact = false,
   onToggleSelect,
   onNavigate,
@@ -347,6 +460,7 @@ function GridView({
   files: FileRecord[];
   selectedIds: Set<string>;
   deletingId?: string | null;
+  deletingFolderId?: string | null;
   compact?: boolean;
   onToggleSelect: (id: string) => void;
   onNavigate: (id: string) => void;
@@ -368,6 +482,7 @@ function GridView({
               <ProjectCard
                 key={folder.id}
                 folder={folder}
+                deleting={deletingFolderId === folder.id}
                 onOpen={() => onNavigate(folder.id)}
                 onContextMenu={(e) => { e.preventDefault(); onFolderContextMenu?.(folder, e); }}
               />
@@ -662,6 +777,7 @@ function ListView({
   files,
   selectedIds,
   deletingId,
+  deletingFolderId,
   onToggleSelect,
   onNavigate,
   onOpenFile,
@@ -672,6 +788,7 @@ function ListView({
   files: FileRecord[];
   selectedIds: Set<string>;
   deletingId?: string | null;
+  deletingFolderId?: string | null;
   onToggleSelect: (id: string) => void;
   onNavigate: (id: string) => void;
   onOpenFile: (id: string) => void;
@@ -691,26 +808,44 @@ function ListView({
           </tr>
         </thead>
         <tbody>
-          {folders.map((folder) => (
-            <tr
-              key={folder.id}
-              onDoubleClick={() => onNavigate(folder.id)}
-              onContextMenu={(e) => { e.preventDefault(); onFolderContextMenu?.(folder, e); }}
-              className="cursor-pointer border-b transition-colors hover:bg-[var(--accent-soft)]"
-              style={{ borderColor: "var(--border)" }}
-            >
-              <td className="w-8" />
-              <td className="flex items-center gap-2.5 px-4 py-2.5">
-                <FileIcon type="folder" size={16} />
-                <span className="truncate">{folder.name}</span>
-              </td>
-              <td className="px-4 py-2.5" style={{ color: "var(--muted)" }}>—</td>
-              <td className="px-4 py-2.5" style={{ color: "var(--muted)" }}>
-                {new Date(folder.updated_at).toLocaleDateString()}
-              </td>
-              <td />
-            </tr>
-          ))}
+          {folders.map((folder) => {
+            const isDeleting = deletingFolderId === folder.id;
+            return (
+              <tr
+                key={folder.id}
+                onDoubleClick={() => onNavigate(folder.id)}
+                onContextMenu={(e) => { e.preventDefault(); onFolderContextMenu?.(folder, e); }}
+                className="group cursor-pointer border-b transition-colors hover:bg-[var(--accent-soft)]"
+                style={{
+                  borderColor: "var(--border)",
+                  opacity: isDeleting ? 0.5 : 1,
+                  pointerEvents: isDeleting ? "none" : undefined,
+                }}
+              >
+                <td className="w-8" />
+                <td className="flex items-center gap-2.5 px-4 py-2.5">
+                  <FileIcon type="folder" size={16} />
+                  <span className="truncate">{folder.name}</span>
+                  {isDeleting && (
+                    <Loader2 size={14} className="animate-spin" style={{ color: "var(--accent)" }} />
+                  )}
+                </td>
+                <td className="px-4 py-2.5" style={{ color: "var(--muted)" }}>—</td>
+                <td className="px-4 py-2.5" style={{ color: "var(--muted)" }}>
+                  {new Date(folder.updated_at).toLocaleDateString()}
+                </td>
+                <td className="px-4 py-2.5">
+                  <button
+                    onClick={(e) => { e.stopPropagation(); onFolderContextMenu?.(folder, e); }}
+                    className="rounded p-0.5 opacity-0 transition-opacity group-hover:opacity-100"
+                    style={{ color: "var(--muted)" }}
+                  >
+                    <MoreHorizontal size={14} />
+                  </button>
+                </td>
+              </tr>
+            );
+          })}
           {files.map((file) => {
             const sel = selectedIds.has(file.id);
             const isDeleting = deletingId === file.id;
