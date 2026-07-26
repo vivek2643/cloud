@@ -355,6 +355,16 @@ def build_clip_tree(
             # "" / {} on a pre-migration cut.
             "screen_text": cut.get("screen_text") or "",
             "salience": cut.get("salience") or {},
+            # brain_perception_upgrade.plan.md Change 1: compact interior-
+            # structure landmarks (post._landmarks) powering the "sig:"
+            # beat-line breadcrumb (_landmarks_tag) below. {} on a
+            # pre-migration cut or one with no interior structure.
+            "landmarks": cut.get("landmarks") or {},
+            # The TRUE cut span (not anchor["in_ms"]/["out_ms"], which is the
+            # balanced-variant window) -- Mechanism B's inspect_cut sense
+            # (observe.py) windows to the FULL cut, not one zoom level of it.
+            "src_in_ms": cut.get("src_in_ms"),
+            "src_out_ms": cut.get("src_out_ms"),
             # av_coupling_authoritative.plan.md: this cut's baked authoritative
             # audio coupling -- carried through to ResolvedCut/segments so a
             # placed beat plays correct, in-sync audio without a lazy re-route
@@ -707,6 +717,34 @@ def _peak_tag(m: Dict[str, Any]) -> str:
     return f" peak:+{off_ms / 1000:.1f}s"
 
 
+# brain_perception_upgrade.plan.md Change 1, Mechanism A: fixed channel
+# order + codes for the "sig:" breadcrumb -- act = action hits, adx = audio
+# dynamics change points, sil = silence gaps, shot = internal shot/
+# composition cuts.
+_LANDMARK_TAG_ORDER = ("act", "adx", "sil", "shot")
+
+
+def _landmarks_tag(m: Dict[str, Any]) -> str:
+    """`sig:act3,shot1` -- a terse pointer naming ONLY the channels this cut
+    has interior structure on, with their counts (never offsets/values --
+    that's the whole point of keeping this always-on and free; the full
+    detail is a tool call away via `inspect_cut`). Counts come straight from
+    `landmarks[ch]["n"]` (the FULL interior count, which may exceed how many
+    offsets are actually stored), capped for display at "9+". '' when
+    `landmarks` is empty (no interior structure, or a pre-migration cut)."""
+    landmarks = m.get("landmarks") or {}
+    if not landmarks:
+        return ""
+    parts = []
+    for code in _LANDMARK_TAG_ORDER:
+        ch = landmarks.get(code)
+        n = int((ch or {}).get("n") or 0)
+        if n <= 0:
+            continue
+        parts.append(f"{code}{n}" if n <= 9 else f"{code}9+")
+    return f" sig:{','.join(parts)}" if parts else ""
+
+
 def _dur_tag(m: Dict[str, Any]) -> str:
     """The cut's PLAY length (after any breath/dead-air excision) so the brain
     can pace + honor a target length without arithmetic on the timestamps."""
@@ -925,6 +963,7 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     cam = (m.get("camera") or "").strip()
     cam_tag = f" cam:{cam.replace(' ', '-')}" if cam and cam not in ("static", "unknown") else ""
     peak_tag = _peak_tag(m)
+    landmarks_tag = _landmarks_tag(m)
     # A structural fact only -- this moment's audio is shared verbatim with the
     # other angles (the outlook group's authoritative track), so picture choice
     # is entirely the brain's call and switching angles never jumps the audio.
@@ -933,7 +972,7 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     line = (f"  {m['moment_id'].split(':')[-1]} {_capture_tag(m)} {pic} {snd} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])} {_dur_tag(m)}] "
             f"\"{primary}\"{vis_tag}{gloss}{scr_tag} · "
-            f"nrg:{nrg}{aud_tag}{pace_tag}{cam_tag}{peak_tag}{outlook_tag}{cut_tag}{run}{alt}")
+            f"nrg:{nrg}{aud_tag}{pace_tag}{cam_tag}{peak_tag}{landmarks_tag}{outlook_tag}{cut_tag}{run}{alt}")
     piece_lines = _piece_lines(m)
     return "\n".join([line] + piece_lines) if piece_lines else line
 

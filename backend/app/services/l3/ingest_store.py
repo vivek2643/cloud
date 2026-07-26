@@ -141,7 +141,7 @@ def insert_cut_records(ingest_run_id: str, records: List[CutRecord]) -> List[str
                     take_group_id, take_role, junk, junk_reason,
                     framing, look, caption_zones, pace, hero_ts_ms, channel, continuity,
                     speech_quality, total_quality, characteristics, camera, sync_group_id,
-                    screen_text, salience, voice_ids, speaker_person, visible_persons,
+                    screen_text, salience, landmarks, voice_ids, speaker_person, visible_persons,
                     audio_file_id, audio_offset_ms, audio_align_confidence
                 ) values (
                     %s, %s, %s, %s, %s,
@@ -149,7 +149,7 @@ def insert_cut_records(ingest_run_id: str, records: List[CutRecord]) -> List[str
                     %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s,
                     %s, %s, %s
                 )
                 returning id::text
@@ -167,7 +167,7 @@ def insert_cut_records(ingest_run_id: str, records: List[CutRecord]) -> List[str
                     json.dumps(r.continuity),
                     r.speech_quality, r.total_quality, json.dumps(r.characteristics),
                     r.camera, r.sync_group_id,
-                    r.screen_text, json.dumps(r.salience),
+                    r.screen_text, json.dumps(r.salience), json.dumps(r.landmarks),
                     json.dumps(r.voice_ids), r.speaker_person, json.dumps(r.visible_persons),
                     r.audio_file_id or None, r.audio_offset_ms, r.audio_align_confidence,
                 ),

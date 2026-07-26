@@ -577,6 +577,66 @@ def test_peak_tag_absent_when_pinned_to_the_end():
     print("ok  test_peak_tag_absent_when_pinned_to_the_end")
 
 
+# --------------------------------------------------------------------------
+# landmarks breadcrumb (brain_perception_upgrade.plan.md Change 1, Mechanism
+# A): `sig:act3,shot1` -- counts only, never offsets/values.
+# --------------------------------------------------------------------------
+
+def _landmarks_cut(hero_id, in_ms, out_ms, landmarks):
+    return _cut(hero_id, in_ms, out_ms, "watch this", landmarks=landmarks)
+
+
+def test_landmarks_tag_fixed_channel_order_regardless_of_dict_order():
+    m = {"landmarks": {"shot": {"n": 1, "cuts": []}, "act": {"n": 2, "hits": []}, "sil": {"n": 1, "gaps": []}}}
+    tag = fm._landmarks_tag(m)
+    assert tag == " sig:act2,sil1,shot1", tag
+    print("ok  test_landmarks_tag_fixed_channel_order_regardless_of_dict_order")
+
+
+def test_landmarks_tag_renders_present_channels_via_moment_line():
+    cut = _landmarks_cut("f:lm", 1000, 4000, {
+        "shot": {"n": 1, "cuts": [{"off": 2000, "hard": True}]},
+        "act": {"n": 3, "hits": [500, 1000, 1500]},
+    })
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "sig:act3,shot1" in line, line
+    print("ok  test_landmarks_tag_renders_present_channels_via_moment_line")
+
+
+def test_landmarks_tag_never_shows_offsets_or_values():
+    cut = _landmarks_cut("f:lm", 1000, 4000, {"act": {"n": 1, "hits": [500]}})
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "sig:act1" in line, line
+    assert "500" not in line, line
+    print("ok  test_landmarks_tag_never_shows_offsets_or_values")
+
+
+def test_landmarks_tag_caps_display_at_nine_plus():
+    cut = _landmarks_cut("f:lm", 1000, 4000, {"sil": {"n": 12, "gaps": []}})
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "sig:sil9+" in line, line
+    print("ok  test_landmarks_tag_caps_display_at_nine_plus")
+
+
+def test_landmarks_tag_absent_when_landmarks_empty():
+    cut = _landmarks_cut("f:lm", 1000, 4000, {})
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "sig:" not in line, line
+    print("ok  test_landmarks_tag_absent_when_landmarks_empty")
+
+
+def test_landmarks_tag_skips_a_channel_present_but_zero_count():
+    cut = _landmarks_cut("f:lm", 1000, 4000, {"act": {"n": 0, "hits": []}})
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "sig:" not in line, line
+    print("ok  test_landmarks_tag_skips_a_channel_present_but_zero_count")
+
+
 def test_cast_line_lists_majors_with_voices_and_others_by_id():
     persons = [
         {"person_id": "P0", "display": "bald man, beard", "is_major": True, "owned_voices": ["V0"]},
@@ -827,6 +887,12 @@ def main():
     test_peak_tag_absent_on_no_signal_fallback()
     test_peak_tag_absent_when_pinned_to_the_start()
     test_peak_tag_absent_when_pinned_to_the_end()
+    test_landmarks_tag_fixed_channel_order_regardless_of_dict_order()
+    test_landmarks_tag_renders_present_channels_via_moment_line()
+    test_landmarks_tag_never_shows_offsets_or_values()
+    test_landmarks_tag_caps_display_at_nine_plus()
+    test_landmarks_tag_absent_when_landmarks_empty()
+    test_landmarks_tag_skips_a_channel_present_but_zero_count()
     test_source_contiguous_beats_form_a_run_channel_agnostic()
     test_cast_line_lists_majors_with_voices_and_others_by_id()
     test_cast_line_empty_with_no_persons()

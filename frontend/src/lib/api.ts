@@ -282,6 +282,17 @@ export interface CutRecord {
     primary?: number;
     density?: number;
   } | null;
+  // brain_perception_upgrade.plan.md Change 1: compact interior-structure
+  // landmarks (post._landmarks), code-computed -- powers the beat-line
+  // "sig:" breadcrumb and warms the inspect_cut sense. Each channel is
+  // present only when the cut has interior events on it; absent/{} on a
+  // pre-migration cut or one with no interior structure.
+  landmarks?: {
+    act?: { n: number; hits: number[] };
+    adx?: { n: number; changes: { off: number; dir: "up" | "down" }[] };
+    sil?: { n: number; gaps: { off: number; dur: number }[] };
+    shot?: { n: number; cuts: { off: number; hard: boolean }[] };
+  } | null;
   // av_coupling_authoritative.plan.md: this cut's baked AUTHORITATIVE audio
   // source, decided once at ingest (never re-derived lazily at render time).
   // audio_file_id defaults to this cut's own file_id (same-source, offset 0)
@@ -680,28 +691,6 @@ export interface EditFormat {
 /** Per-project sequence-level color grade selection (SS2.4). */
 export type EditLook = SequenceLook;
 
-export interface EditBeat {
-  beat_id: string;
-  purpose: string;
-  intent: string;
-  target_s?: number;
-}
-
-export type SpineKind = "dialogue" | "music" | "visual" | "sync" | "other";
-
-export interface EditSpineRegion {
-  kind: SpineKind;
-  label?: string;
-  locked_channels?: ("video" | "audio")[];
-  source_file_ids?: string[];
-  protected_windows?: { file_id: string; start_ms: number; end_ms: number; reason?: string }[];
-  rationale?: string;
-}
-
-export interface EditSpine {
-  regions?: EditSpineRegion[];
-}
-
 export interface EditSegment {
   seg_id: string;
   file_id: string;
@@ -913,11 +902,9 @@ export interface EditDocument {
   format?: EditFormat;
   look?: EditLook;
   captions?: EditCaptions;
-  spine?: EditSpine | null;
   operations?: EditOperation[];
   layout_regions?: LayoutRegion[];
   resolved?: ResolvedTimeline | null;
-  outline?: EditBeat[];
   timeline?: EditSegment[];
   open_questions?: EditQuestion[];
   summary?: string;

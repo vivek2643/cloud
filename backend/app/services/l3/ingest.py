@@ -459,7 +459,8 @@ def _run_ingest(project_id: str, settings, ingest_run_id: str) -> str:
                                             synced_file_ids=outlook_file_ids,
                                             sync_group_by_file=outlook_group_by_file,
                                             sync_info_by_file=outlook_by_file,
-                                            v4_meta_by_ref=v4_meta_by_ref or None)
+                                            v4_meta_by_ref=v4_meta_by_ref or None,
+                                            scene_by_file=scene_by_file)
 
         store.delete_cut_records_for_run(ingest_run_id)
         record_ids = store.insert_cut_records(ingest_run_id, records)

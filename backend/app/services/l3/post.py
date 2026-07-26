@@ -407,6 +407,226 @@ def _salience(
     return {"peak_ms": int((lo_i + peak_i) * hop_ms), "score": round(score, 3)}
 
 
+# --------------------------------------------------------------------------
+# Landmarks (brain_perception_upgrade.plan.md Change 1, Mechanism A): a
+# compact, code-owned distillation of INTERIOR structure within a cut's own
+# span -- action hits, audio rise/fall change points, silence gaps, and
+# internal shot/composition cuts -- computed once at ingest and stored
+# alongside salience. Powers the beat-line "sig:" breadcrumb (counts only,
+# see footage_map._landmarks_tag) and warms Mechanism B's on-demand
+# inspect_cut sense (observe.py). Any channel with zero interior events is
+# OMITTED entirely, so a fully static/silent cut lands as {} -- no
+# breadcrumb, no wasted bytes.
+# --------------------------------------------------------------------------
+
+_LANDMARK_ACT_CAP = 5
+_LANDMARK_ADX_CAP = 5
+_LANDMARK_SIL_CAP = 5
+_LANDMARK_SHOT_CAP = 8
+# Data-derived (not an absolute dB constant): a normalized-domain floor so a
+# perfectly flat clip (mean_abs_diff == 0) doesn't flag every sampling
+# wiggle as a "change" -- see _adx_changes.
+_ADX_MIN_DELTA = 0.12
+
+
+def _interior_edge_guard(span_ms: int) -> int:
+    """Mirrors footage_map._peak_tag's edge band: ~1 hop (L1's own
+    granularity, 100ms) or 10% of the span, whichever is larger -- a
+    landmark pinned to the cut's own boundary is just that edge restated,
+    not real interior structure."""
+    return max(100, span_ms // 10)
+
+
+def _is_interior(off_ms: int, span_ms: int, edge_guard: int) -> bool:
+    return edge_guard <= off_ms <= span_ms - edge_guard
+
+
+def _act_hits(
+    action_energy: List[float], action_points: List[Dict[str, Any]], hop_ms: int,
+    s: int, e: int, edge_guard: int,
+) -> Optional[Dict[str, Any]]:
+    """Interior local maxima of `action_energy` AND/OR `action_points`
+    (subject-motion impacts) that fall inside the span, deduped to one
+    candidate per hop bin (an action_point landing on a local max shouldn't
+    double-count), ranked by the raw action_energy value at that bin (a
+    within-span ranking -- scores are never surfaced, only used to pick the
+    top-K), then reported in TIME order."""
+    span_ms = e - s
+    if hop_ms <= 0 or span_ms <= 0:
+        return None
+    candidates: Dict[int, float] = {}  # bin index -> score
+
+    if action_energy and len(action_energy) >= 3:
+        lo_i, hi_i = s // hop_ms, max(s // hop_ms, (e - 1) // hop_ms)
+        for i in range(max(1, lo_i), min(len(action_energy) - 1, hi_i + 1)):
+            # Strict on both sides -- a flat/plateau run (>= would flag EVERY
+            # point on a perfectly flat curve as its own "local max") has no
+            # real interior structure at all.
+            if action_energy[i] > action_energy[i - 1] and action_energy[i] > action_energy[i + 1]:
+                off = i * hop_ms - s
+                if _is_interior(off, span_ms, edge_guard):
+                    candidates[i] = max(candidates.get(i, 0.0), action_energy[i])
+
+    for pt in (action_points or []):
+        try:
+            ts = int(pt.get("ts_ms", 0))
+        except (TypeError, ValueError):
+            continue
+        if not (s <= ts < e):
+            continue
+        off = ts - s
+        if not _is_interior(off, span_ms, edge_guard):
+            continue
+        i = ts // hop_ms
+        fallback = action_energy[i] if 0 <= i < len(action_energy) else 1.0
+        candidates[i] = max(candidates.get(i, 0.0), fallback)
+
+    if not candidates:
+        return None
+    n = len(candidates)
+    top = sorted(candidates.items(), key=lambda kv: kv[1], reverse=True)[:_LANDMARK_ACT_CAP]
+    offsets = sorted(i * hop_ms - s for i, _score in top)
+    return {"n": n, "hits": offsets}
+
+
+def _adx_changes(
+    rms_db: List[float], rms_hop_ms: int, rms_lo: Optional[float], rms_hi: Optional[float],
+    s: int, e: int, edge_guard: int,
+) -> Optional[Dict[str, Any]]:
+    """Significant rises/falls of the clip-relative-normalized rms envelope
+    (SAME `_norm_in_clip`/`_series_lohi` normalization the quality scores
+    use -- no absolute-dB constants). A change point is a consecutive-bin
+    delta that exceeds a threshold derived from THIS span's own diff
+    distribution (floored at `_ADX_MIN_DELTA` so a flat span can't flag
+    noise), ranked by magnitude for the top-K, reported in TIME order."""
+    span_ms = e - s
+    if not rms_db or rms_hop_ms <= 0 or span_ms <= 0:
+        return None
+    lo_i, hi_i = s // rms_hop_ms, max(s // rms_hop_ms, (e - 1) // rms_hop_ms)
+    idxs = [i for i in range(lo_i, hi_i + 1) if 0 <= i < len(rms_db)]
+    if len(idxs) < 2:
+        return None
+    curve = [_norm_in_clip(rms_db[i], rms_lo, rms_hi) for i in idxs]
+    if any(v is None for v in curve):
+        return None
+    diffs = [curve[k + 1] - curve[k] for k in range(len(curve) - 1)]
+    mean_abs = _mean([abs(d) for d in diffs]) or 0.0
+    threshold = max(mean_abs * 1.5, _ADX_MIN_DELTA)
+    candidates: List[Tuple[float, int, str]] = []
+    for k, d in enumerate(diffs):
+        if abs(d) < threshold:
+            continue
+        off = idxs[k + 1] * rms_hop_ms - s
+        if not _is_interior(off, span_ms, edge_guard):
+            continue
+        candidates.append((abs(d), off, "up" if d > 0 else "down"))
+    if not candidates:
+        return None
+    n = len(candidates)
+    top = sorted(candidates, key=lambda c: c[0], reverse=True)[:_LANDMARK_ADX_CAP]
+    top.sort(key=lambda c: c[1])
+    return {"n": n, "changes": [{"off": off, "dir": d} for _score, off, d in top]}
+
+
+def _sil_gaps(
+    silence_intervals: List[dict], rms_hop_ms: int, s: int, e: int, edge_guard: int,
+) -> Optional[Dict[str, Any]]:
+    """`silence_intervals` clipped to the span, ranked by clipped duration
+    (a longer gap is more worth surfacing) for the top-K, reported in TIME
+    order. Ignores anything shorter than one `prosody_hop_ms` (L1's own
+    sampling grain -- a shorter "gap" isn't a real measured silence)."""
+    span_ms = e - s
+    if not silence_intervals or span_ms <= 0:
+        return None
+    min_dur = max(1, rms_hop_ms)
+    candidates: List[Tuple[int, int]] = []
+    for gap in silence_intervals:
+        try:
+            g0, g1 = int(gap["start_ms"]), int(gap["end_ms"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        c0, c1 = max(g0, s), min(g1, e)
+        dur = c1 - c0
+        if dur < min_dur:
+            continue
+        off = c0 - s
+        if not _is_interior(off, span_ms, edge_guard):
+            continue
+        candidates.append((dur, off))
+    if not candidates:
+        return None
+    n = len(candidates)
+    top = sorted(candidates, key=lambda c: c[0], reverse=True)[:_LANDMARK_SIL_CAP]
+    top.sort(key=lambda c: c[1])
+    return {"n": n, "gaps": [{"off": off, "dur": dur} for dur, off in top]}
+
+
+def _shot_cuts(
+    shot_points: List[Dict[str, Any]], composition_points: List[Dict[str, Any]],
+    s: int, e: int, edge_guard: int,
+) -> Optional[Dict[str, Any]]:
+    """`shot_points` (hard=true) + `composition_points` (hard=false)
+    strictly inside `(s, e)` and past the edge guard -- an edge "shot cut"
+    is just this cut's own boundary. No magnitude to rank by (every internal
+    cut is structurally equal); kept in TIME order, capped at K."""
+    span_ms = e - s
+    if span_ms <= 0:
+        return None
+    candidates: List[Tuple[int, bool]] = []
+    for pt in (shot_points or []):
+        try:
+            ts = int(pt.get("ts_ms", 0))
+        except (TypeError, ValueError):
+            continue
+        off = ts - s
+        if s < ts < e and _is_interior(off, span_ms, edge_guard):
+            candidates.append((off, True))
+    for pt in (composition_points or []):
+        try:
+            ts = int(pt.get("ts_ms", 0))
+        except (TypeError, ValueError):
+            continue
+        off = ts - s
+        if s < ts < e and _is_interior(off, span_ms, edge_guard):
+            candidates.append((off, False))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c[0])
+    n = len(candidates)
+    kept = candidates[:_LANDMARK_SHOT_CAP]
+    return {"n": n, "cuts": [{"off": off, "hard": hard} for off, hard in kept]}
+
+
+def _landmarks(
+    action_energy: List[float], action_points: List[Dict[str, Any]], hop_ms: int,
+    rms_db: List[float], rms_hop_ms: int, rms_lo: Optional[float], rms_hi: Optional[float],
+    silence_intervals: List[dict], shot_points: List[Dict[str, Any]],
+    composition_points: List[Dict[str, Any]], s: int, e: int,
+) -> Dict[str, Any]:
+    """Compute all four landmark channels for one cut's span. Pure,
+    deterministic -- see the module section header above for the shape and
+    rationale. {} when the cut has no interior structure on any channel
+    (or a degenerate/zero-length span)."""
+    span_ms = e - s
+    if span_ms <= 0:
+        return {}
+    edge_guard = _interior_edge_guard(span_ms)
+    out: Dict[str, Any] = {}
+    act = _act_hits(action_energy, action_points, hop_ms, s, e, edge_guard)
+    if act:
+        out["act"] = act
+    adx = _adx_changes(rms_db, rms_hop_ms, rms_lo, rms_hi, s, e, edge_guard)
+    if adx:
+        out["adx"] = adx
+    sil = _sil_gaps(silence_intervals, rms_hop_ms, s, e, edge_guard)
+    if sil:
+        out["sil"] = sil
+    shot = _shot_cuts(shot_points, composition_points, s, e, edge_guard)
+    if shot:
+        out["shot"] = shot
+    return out
+
+
 @dataclass
 class CutRecord:
     file_id: str
@@ -462,6 +682,11 @@ class CutRecord:
     # perception_upgrade.plan.md Part D ("F8"): the cut's single strongest
     # INSTANT, code-computed -- see _salience. {} on a cut with no signal.
     salience: Dict[str, Any] = field(default_factory=dict)
+    # brain_perception_upgrade.plan.md Change 1: compact interior-structure
+    # distillation (action hits, audio change points, silence gaps, internal
+    # shot cuts), code-computed -- see _landmarks. {} on a cut with no
+    # interior structure (or a pre-migration row).
+    landmarks: Dict[str, Any] = field(default_factory=dict)
     # voice_first_identity.plan.md Phase C/D/G -- all three code-derived,
     # never LLM-echoed:
     #   - voice_ids: global voice(s) heard in this cut (Pass 1 word-level
@@ -505,6 +730,7 @@ class CutRecord:
             "characteristics": self.characteristics, "camera": self.camera,
             "sync_group_id": self.sync_group_id,
             "screen_text": self.screen_text, "salience": self.salience,
+            "landmarks": self.landmarks,
             "voice_ids": self.voice_ids, "speaker_person": self.speaker_person,
             "visible_persons": self.visible_persons,
             "audio_file_id": self.audio_file_id, "audio_offset_ms": self.audio_offset_ms,
@@ -788,6 +1014,7 @@ def assemble_cut_records(
     sync_group_by_file: Optional[Dict[str, str]] = None,
     sync_info_by_file: Optional[Dict[str, Dict[str, Any]]] = None,
     v4_meta_by_ref: Optional[Dict[str, Dict[str, Any]]] = None,
+    scene_by_file: Optional[Dict[str, dict]] = None,
 ) -> List[CutRecord]:
     """Resolve every judged cut to its final ms span (word/atom edges only,
     by construction), enforce zero-overlap per file (gaps are legal -- cuts are
@@ -812,7 +1039,12 @@ def assemble_cut_records(
     and salience (v4_segment.VideoCut), and its pace envelope's min_ms is
     density-scaled instead of anchor-derived. Raises ``ValueError`` (stage
     ``post``, per the plan's "no fallback" rule) on any invariant violation --
-    the caller marks the ingest run ``failed`` for re-run."""
+    the caller marks the ingest run ``failed`` for re-run. ``scene_by_file``
+    (brain_perception_upgrade.plan.md Change 1): ``{file_id: {"hop_ms",
+    "shot_points", "composition_points"}}`` (``l1.snapshot``'s ``scene_cuts``
+    shape) -- the only source of a cut's ``landmarks.shot`` channel.
+    None/empty -> every cut's landmarks simply have no shot channel (today's
+    behavior for any caller/test that doesn't pass it)."""
     junk_by_file: Dict[str, List[JunkSuspect]] = {}
     for js in (junk_suspects or []):
         junk_by_file.setdefault(js.file_id, []).append(js)
@@ -820,6 +1052,7 @@ def assemble_cut_records(
     audio_by_file = audio_by_file or {}
     sync_info_by_file = sync_info_by_file or {}
     v4_meta_by_ref = v4_meta_by_ref or {}
+    scene_by_file = scene_by_file or {}
     # Clip-relative normalisers for the quality scores: each signal is ranked
     # against its OWN clip's spread, so there are no absolute dB/pixel constants.
     rms_lohi = {fid: _series_lohi((a or {}).get("rms_db") or []) for fid, a in audio_by_file.items()}
@@ -940,6 +1173,20 @@ def assemble_cut_records(
                 anchors, audio.get("onsets_ms") or [], hero_ts,
             )
 
+        # brain_perception_upgrade.plan.md Change 1: landmarks are computed
+        # for EVERY cut (speech and video alike), independent of the
+        # V4-vs-speech salience branch above -- interior structure is a
+        # property of the span itself, not of how salience got computed.
+        scene = scene_by_file.get(cut.file_id) or {}
+        lm_rms_lo, lm_rms_hi = rms_lohi.get(cut.file_id, (None, None))
+        landmarks = _landmarks(
+            action_energy, motion.get("action_points") or [], hop_ms,
+            audio.get("rms_db") or [], int(audio.get("hop_ms") or 0), lm_rms_lo, lm_rms_hi,
+            silences_by_file.get(cut.file_id, []),
+            scene.get("shot_points") or [], scene.get("composition_points") or [],
+            s, e,
+        )
+
         # av_coupling_authoritative.plan.md: bake this cut's coupled audio
         # source NOW (assembly time), never re-derived lazily at render time.
         # Same-source (no group, or this file already IS the authoritative
@@ -976,7 +1223,7 @@ def assemble_cut_records(
             continuity=continuity_by_idx.get(idx, {}),
             camera=classify_camera_move(motion, s, e),
             sync_group_id=(sync_group_by_file or {}).get(cut.file_id),
-            screen_text=cut.screen_text, salience=salience,
+            screen_text=cut.screen_text, salience=salience, landmarks=landmarks,
             voice_ids=cut.voice_ids, speaker_person=cut.speaker_person,
             visible_persons=cut.visible_persons,
             audio_file_id=audio_file_id, audio_offset_ms=audio_offset_ms,

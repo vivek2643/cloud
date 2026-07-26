@@ -76,6 +76,13 @@ def _specs() -> List[Dict[str, Any]]:
           "Pass seg_id to ALSO resolve that one cut's spoken words down to program-time "
           "offsets -- e.g. to land an overlay precisely on a line; omit it for a plain look.",
           obj({"seg_id": {"type": "string"}})),
+        S("inspect_cut", "Returns the rich per-cut signal detail behind a Beat Index "
+          "line's sig: breadcrumb: a downsampled action-energy curve + hit offsets, a "
+          "downsampled loudness envelope + rise/fall change offsets + silence-gap "
+          "offsets, and internal shot/composition-cut offsets -- all measured from the "
+          "cut's own start. Pass ref (a Beat Index moment id, e.g. from a sig: line) to "
+          "inspect a cut not yet placed, or seg_id for an already-placed one.",
+          obj({"ref": {"type": "string"}, "seg_id": {"type": "string"}})),
         S("predict", "Returns the program LENGTH under a proposed change without "
           "applying it: set_level re-takes every main-line cut at that level, drop "
           "removes those seg_ids, add appends [{ref, level}] cuts. Gives "
@@ -431,6 +438,9 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
         # OBSERVE (read-only)
         if name == "read_state":
             return _json(observe.read_state(doc, ctx, seg_id=args.get("seg_id"))), doc, False
+        if name == "inspect_cut":
+            return _json(observe.inspect_cut(
+                ctx, ref=args.get("ref"), seg_id=args.get("seg_id"), document=doc)), doc, False
         if name == "predict":
             return _json(observe.predict(doc, ctx, set_level=args.get("set_level"),
                                          drop=args.get("drop"), add=args.get("add"))), doc, False

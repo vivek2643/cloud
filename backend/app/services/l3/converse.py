@@ -115,7 +115,10 @@ _LOOP_SYSTEM = (
     "JUNK beat sits there), with `↔` = that neighbour welds into one continuous "
     "shot and `⋯` = a real break; `peak:+Xs` (when present) = this cut's single "
     "strongest INSTANT, code-computed, as an offset from the cut's own start -- "
-    "lean on it for emphasis / punch-in / hold timing; `·alt-PIC` = the same "
+    "lean on it for emphasis / punch-in / hold timing; `sig:` (when present) = "
+    "counts of interior action hits / audio dynamics / silence gaps / internal "
+    "shot cuts this cut has (e.g. `sig:act3,shot1`) -- call `inspect_cut` on its "
+    "ref for the full offsets/curves behind the count; `·alt-PIC` = the same "
     "sound is also available as a picture from another camera/take (its own "
     "ref). A `[JUNK: reason]` line "
     "(camera cue, false start, dead air) marks a cut flagged as junk; it stays "
@@ -168,6 +171,92 @@ _LOOP_SYSTEM = (
     "(3) SPECIFIC FLAGS -- the rest (speaker runs, low-energy stretches, redundant "
     "takes, rough heads/tails, overlay fit, audio gaps, loudness balance) is "
     "advisory -- act on what serves the goal, ignore the rest."
+)
+
+
+# brain_perception_upgrade.plan.md Change 2: a distinct, detailed provenance
+# section describing HOW everything the brain reads was produced --
+# segmentation -> cuts -> scoring -> takes/outlooks -> tags -> identity ->
+# beat index / program map. Purely descriptive: HOW it is produced, never
+# whether to trust it -- the brain judges reliability itself from context.
+# A static constant, so it stays inside the cached prefix alongside
+# _LOOP_SYSTEM/_guidance_block (see the assembly in respond()).
+_PROVENANCE = (
+    "\n\nHOW YOUR SENSES ARE PRODUCED. Everything below describes how the "
+    "text you read was made from the footage.\n\n"
+    "1. FROM FOOTAGE TO CUTS. One GPU pass (L1) derives per-file signals "
+    "from the proxy and the audio track: motion (action energy, camera "
+    "motion, blur), audio (loudness envelope, silence, onsets), and "
+    "scene/shot boundaries; a transcript is produced with word timings and "
+    "speaker diarization. A first text pass segments each clip into cuts "
+    "along word and shot edges. A vision pass then describes each cut from "
+    "sampled frames. Assembly snaps every boundary to a word or shot edge.\n\n"
+    "2. CUT SPANS AND HERO FRAME. A speech cut's src_in_ms/src_out_ms are "
+    "set by snapping to word edges; a video cut's span comes directly from "
+    "a deterministic motion/audio/scene segmenter, never an LLM-emitted "
+    "millisecond. hero_ts_ms -- the still shown for the cut -- is chosen "
+    "in order: an anchor timestamp when the cut has one, else the "
+    "sharpest (least motion-blurred) frame in the span, else the span's "
+    "midpoint.\n\n"
+    "3. SCORING. speech_quality (a speech cut's delivery) is computed from "
+    "how much of the span is clean speech (word timings, minus removable "
+    "dead-air/filler) blended with loudness, normalized against that "
+    "clip's own range. total_quality blends speech_quality with the "
+    "visual score (on-camera presence, framing, sharpness, look) for a "
+    "speech cut, or is the visual score alone for a video cut. PIC's "
+    "q.XX is that visual score.\n\n"
+    "4. TAKES & OUTLOOKS. Cuts sharing the same words and the same setting "
+    "(a retry of one shot) are grouped into a take; the group's highest "
+    "total_quality member is code-crowned the winner, the rest render as "
+    "'take'. Cuts sharing the same words but a different camera "
+    "(simultaneous angles of one moment) are grouped into an outlook; "
+    "outlook members share one authoritative audio track and are never "
+    "ranked against each other.\n\n"
+    "5. SALIENCE / PEAK. peak:+Xs is the argmax of a curve fused from "
+    "normalized action energy, normalized loudness, and a flat bump at "
+    "any onset or word-anchor instant inside the cut's span, expressed as "
+    "an offset from the cut's own start.\n\n"
+    "6. CAMERA / ENERGY / PACE. cam: is read from the per-hop signed "
+    "camera velocity model (pan/tilt/zoom rate + coherence) fit at L1. "
+    "nrg: levels and the pace tag (pace:LO-HIx for video, trim<=Xs for "
+    "speech) come from the pace envelope -- a set of playback-speed rungs "
+    "for a video cut, or the removable dead-air/filler budget for a "
+    "speech cut, both derived from the same motion/word signals.\n\n"
+    "7. CONTINUITY. cut:N/of numbers a cut among ALL of its clip's cuts in "
+    "source order, including junk -- a gap in the numbering marks where a "
+    "junk beat sits. The ↔ mark toward a neighbor means the seam "
+    "classifier found the two cuts weldable into one continuous shot; "
+    "⋯ means it found a real break (a shot change, a speaker change, "
+    "or a flagged gap).\n\n"
+    "8. THE PER-CUT SIGNAL BREADCRUMB (sig:). At ingest, each cut's L1 "
+    "signals are scanned for interior structure: local peaks in action "
+    "energy or motion-impact points (act), rises/falls in the loudness "
+    "envelope (adx), silence gaps (sil), and internal shot or composition "
+    "cuts (shot) -- counted only when they fall clearly inside the cut's "
+    "span, not right at its edges. sig:act3,shot1 reports the COUNT on "
+    "each channel that has any; a channel with nothing interior is simply "
+    "absent from the tag.\n\n"
+    "9. ON-DEMAND CUT INSPECTION (inspect_cut). Calling inspect_cut on a "
+    "cut returns, computed fresh from the same L1 arrays: a downsampled "
+    "action-energy curve plus the offsets of its strongest hits, a "
+    "downsampled loudness-envelope curve plus rise/fall change offsets "
+    "and silence-gap offsets, and the offsets of any internal shot or "
+    "composition cuts -- all measured from the cut's own start and "
+    "sampled at the L1 hop.\n\n"
+    "10. IDENTITY / CAST. Diarization labels each word with a per-file "
+    "speaker id; those voiceprints are clustered across every clip into "
+    "global voices. A speaking voice is bound to a person by intersecting "
+    "diarized turns against active-speaker intervals detected from face "
+    "tracks. On-screen persons come from clustering those same face "
+    "tracks across clips. The CAST line lists the shoot's named persons "
+    "(Px ids) once, each with the voice(s) confirmed theirs; everyone "
+    "else recognized but not cast-table-worthy is listed by id under "
+    "'other'.\n\n"
+    "11. THE BEAT INDEX AND PROGRAM MAP. The BEAT INDEX lists every usable "
+    "cut in source order per clip, each with a placeable ref. The PROGRAM "
+    "MAP is rendered from the resolved layer stack -- main line plus any "
+    "V2/coverage layers and audio beds -- laid out on the shared program "
+    "clock, the same clock read_state and the render use."
 )
 
 
@@ -257,6 +346,36 @@ def _project_overview(ctx: "observe.EditContext") -> str:
     return "\n".join(lines)
 
 
+def _voiceover_block(ctx: "observe.EditContext") -> str:
+    """VOICEOVER / NARRATION SCRIPTS -- every uploaded audio asset that has a
+    transcript, shown verbatim with per-sentence timings (voiceover-as-spine).
+    Always-on so the brain can read a narration script and sync visual cuts to
+    its sentences and the pauses between them, rather than reporting it has "no
+    transcript I can read". Iterates ALL audio assets (not just unplaced ones),
+    so the script stays visible even after the VO is placed as a bed. Empty
+    string when no audio asset carries a transcript (music/SFX only, etc.)."""
+    lines: List[str] = []
+    for a in getattr(ctx, "audio_assets", []) or []:
+        t = a.get("transcript")
+        segs = (t or {}).get("segments") or []
+        if not segs:
+            continue
+        kind = "music/lyrics" if a.get("is_musical") else "voiceover/narration"
+        lines.append(
+            f'"{a.get("name")}" ({kind}, {a.get("dur_ms")}ms) '
+            f'[file {observe._fid8(a["file_id"])}]:')
+        for s in segs:
+            lines.append(f'  [{s.get("start_ms")}-{s.get("end_ms")}ms] {s.get("text", "")}')
+    if not lines:
+        return ""
+    return (
+        "VOICEOVER / NARRATION SCRIPTS (verbatim transcript with per-sentence "
+        "word-timed boundaries -- the exact words in each uploaded audio track. "
+        "Use these sentence boundaries, and the gaps between one sentence's end "
+        "and the next one's start, to place/pace/sync visual cuts to the "
+        "narration):\n" + "\n".join(lines))
+
+
 def _context_block(file_ids: List[str], document: Optional[dict],
                    ctx: "observe.EditContext") -> str:
     """CUT-CENTRIC context (cuts_v3_continuity.plan.md): no raw-footage
@@ -275,6 +394,15 @@ def _context_block(file_ids: List[str], document: Optional[dict],
             parts.append(overview)
     except Exception:
         logger.exception("converse: project overview failed (continuing without it)")
+    try:
+        vo = _voiceover_block(ctx)
+        if vo:
+            if len(vo) > _INDEX_CHAR_CAP:
+                vo = vo[:_INDEX_CHAR_CAP] + (
+                    "\n[TRUNCATED: voiceover scripts exceeded budget here.]")
+            parts.append(vo)
+    except Exception:
+        logger.exception("converse: voiceover block failed (continuing without it)")
     try:
         text = (footage_map.assemble_map(
             file_ids, run_id=getattr(ctx, "run_id", None)).get("text") or ""
@@ -310,8 +438,6 @@ def _seed_document(file_ids: List[str]) -> dict:
     return {
         "brief": {"goal": None, "aspect": "landscape", "target_duration_s": None, "assumptions": []},
         "format": {"aspect": "landscape"},
-        "spine": {"regions": []},
-        "outline": [],
         "timeline": [],
         "operations": [],
         "open_questions": [],
@@ -389,7 +515,7 @@ def respond(thread_id: str, *, llm: Optional[LLMClient] = None) -> ConverseResul
     max_tokens = settings.autoedit_max_output_tokens
     try:
         ctx = observe.build_context(file_ids, run_id=pinned_run, thread_id=thread_id)
-        system = (_LOOP_SYSTEM + _guidance_block()
+        system = (_LOOP_SYSTEM + _guidance_block() + _PROVENANCE
                   + "\n\n" + _context_block(file_ids, document, ctx))
         result = tools.run_edit_loop(llm, system=system, messages=messages,
                                      ctx=ctx, document=working, max_tokens=max_tokens)
