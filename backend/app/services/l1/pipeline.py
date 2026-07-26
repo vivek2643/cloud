@@ -47,10 +47,13 @@ STAGES = ("proxy", "transcript", "audio_features", "diarization", "motion_dynami
 STAGES_V2 = STAGES + ("scene_detect",)
 # color grading: additive, independent of the cuts-v2 versioning above.
 STAGES_COLOR = STAGES_V2 + ("color_stats",)
-# Audio-only uploads run a different, video-free set of stages. `transcript`/
-# `diarization` are CONDITIONAL (audio_sync.plan.md SS4.1): they only run when
-# `audio_features.is_musical` comes back false (a spoken external-mic/audio
-# file, not music/SFX) -- see `_orchestrate_audio`.
+# Audio-only uploads run a different, video-free set of stages. `transcript` is
+# now UNCONDITIONAL (voiceover-as-spine: a narration/VO is a first-class
+# editorial source, so its transcript must always exist -- the `is_musical`
+# heuristic misclassifies VO-over-music and would wrongly drop it). `diarization`
+# stays CONDITIONAL on likely-speech (`audio_features.is_musical` false), since
+# assigning speakers to pure music/SFX is wasteful and meaningless -- see
+# `_orchestrate_audio`.
 AUDIO_STAGES = ("audio_proxy", "audio_features", "transcript", "diarization")
 
 
@@ -931,9 +934,11 @@ def _run_deep_stages_parallel(
 # --- Audio-only (music) orchestrator -------------------------------------
 
 def _orchestrate_audio(file_id: str, r2_key: str, settings) -> None:
-    """L1 for a standalone music/audio upload. No video proxy, no motion, no
-    speech tools. Runs: playable proxy + waveform thumb, audio_features
-    (loudness/BPM/onsets). Stages are idempotent via processing_jobs."""
+    """L1 for a standalone audio upload (music, SFX, or voiceover/narration). No
+    video proxy, no motion. Runs: playable proxy + waveform thumb, audio_features
+    (loudness/BPM/onsets), ALWAYS a transcript (a VO is a first-class editorial
+    source), and diarization when the file is likely speech (not musical). Stages
+    are idempotent via processing_jobs."""
     _set_l1_status(file_id, "running")
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -967,18 +972,20 @@ def _orchestrate_audio(file_id: str, r2_key: str, settings) -> None:
                 _run_stage(conn, file_id, "audio_features",
                            _stage5_audio, file_id, wav_path, conn)
 
-                # audio_sync.plan.md SS4.1: a spoken external-mic/audio upload
-                # needs a transcript + diarization to ever be an authoritative
-                # sync source. Gate on `is_musical` (the only "is this speech"
-                # signal that exists today -- see audio_features._detect_musicality)
-                # so a pure music/SFX file skips the heavy speech stages
-                # entirely, same as before this change.
+                # voiceover-as-spine: ALWAYS transcribe an audio upload. A
+                # voiceover/narration is a first-class editorial source and its
+                # transcript must exist regardless of the `is_musical` heuristic
+                # (which misclassifies VO laid over a music bed and would wrongly
+                # drop the transcript). Diarization stays gated on likely-speech
+                # (not is_musical): assigning speakers to a pure music/SFX file is
+                # wasteful and meaningless. `is_musical` still comes from
+                # audio_features._detect_musicality.
+                _run_stage(conn, file_id, "transcript", _stage2_transcript, file_id, wav_path, conn)
                 row = conn.execute(
                     "select is_musical from audio_features where file_id = %s", (file_id,)
                 ).fetchone()
                 is_musical = bool(row[0]) if row else False
                 if not is_musical:
-                    _run_stage(conn, file_id, "transcript", _stage2_transcript, file_id, wav_path, conn)
                     _run_stage(conn, file_id, "diarization", _stage6_diarization, file_id, wav_path, conn)
 
         _set_l1_status(file_id, "ready")
