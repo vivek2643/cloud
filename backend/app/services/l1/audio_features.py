@@ -137,10 +137,29 @@ def _detect_structure(onset_env, onset_times_ms, beat_times_ms,
     return sections, drop_ms
 
 
+# Musicality thresholds, calibrated on real beds vs voiceover (measured:
+# music onset-variance 2.4-5.0 / pulse 3.4-3.7; voiceover onset-variance
+# 11.5-12.3 / pulse 2.8-3.0). A track is a beat-driven MUSICAL bed -- i.e. we
+# can beat-lock cuts to it -- when it has (a) a clear, steady PULSE (onset
+# strength on the beat well above the overall mean), (b) REGULAR onsets (low
+# onset-envelope variance; speech/VO is bursty and irregular), and (c) a
+# plausible tempo. NOTE: spectral flatness -- the previous SOLE gate
+# (flatness>0.08) -- was removed: it is high for noise/percussion but LOW for
+# tonal, melodic music, so every melodic bed (e.g. "Bright Upbeat Corporate")
+# fell under the threshold and was wrongly read as non-musical (no beat grid ->
+# the brain couldn't beat-lock and fell back to non-musical cutting).
+_MUSIC_ONSET_VAR_MAX = 8.0
+_MUSIC_PULSE_MIN = 3.0
+_MUSIC_BPM_LO, _MUSIC_BPM_HI = 40.0, 200.0
+
+
 def _detect_musicality(wav_path: str) -> Tuple[bool, float, List[int], List[dict], Optional[int]]:
-    """
-    Heuristic: high spectral flatness + low onset-envelope variance => musical.
-    Returns (is_musical, bpm, onsets_ms, sections, drop_ms).
+    """Is this audio a beat-driven MUSICAL track (can we beat-lock cuts to it)?
+
+    Decided from the ONSET ENVELOPE (pulse clarity + onset regularity + tempo),
+    NOT spectral flatness -- see the threshold notes above for why flatness
+    misclassified melodic beds. Returns (is_musical, bpm, onsets_ms, sections,
+    drop_ms); a non-musical track (speech/VO/ambient) returns all-empty.
     """
     import librosa
     import numpy as np
@@ -149,26 +168,31 @@ def _detect_musicality(wav_path: str) -> Tuple[bool, float, List[int], List[dict
     if y.size == 0:
         return False, 0.0, [], [], None
 
-    flatness = float(librosa.feature.spectral_flatness(y=y).mean())
     onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-    onset_var = float(onset_env.var()) if onset_env.size else 0.0
+    if onset_env.size == 0:
+        return False, 0.0, [], [], None
+    onset_var = float(onset_env.var())
 
-    # Calibrated thresholds: speech has low flatness (<0.05) and high
-    # onset-envelope variance. Music sits in the opposite regime.
-    is_musical = flatness > 0.08 and onset_var > 1e-2
+    tempo, beat_frames = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
+    # librosa.beat.beat_track sometimes returns tempo as a 1-element array.
+    tempo = float(np.ravel(tempo)[0]) if np.size(tempo) else 0.0
 
+    # Pulse clarity: mean onset strength ON the detected beats vs the overall
+    # mean -- a strong, steady beat pushes this well above 1.0. Needs >=4 beats
+    # to be a meaningful ratio (a near-silent/ambient clip has none).
+    beat_frames = np.asarray(beat_frames)
+    pulse = (float(onset_env[beat_frames].mean() / (onset_env.mean() + 1e-9))
+             if beat_frames.size >= 4 else 0.0)
+
+    is_musical = (
+        onset_var < _MUSIC_ONSET_VAR_MAX
+        and pulse >= _MUSIC_PULSE_MIN
+        and _MUSIC_BPM_LO <= tempo <= _MUSIC_BPM_HI
+    )
     if not is_musical:
         return False, 0.0, [], [], None
 
-    tempo, beat_frames = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
     onsets_ms = [int(librosa.frames_to_time(f, sr=sr) * 1000) for f in beat_frames]
-
-    # librosa.beat.beat_track sometimes returns tempo as an array; normalize.
-    if hasattr(tempo, "__len__"):
-        tempo = float(tempo[0]) if len(tempo) else 0.0
-    else:
-        tempo = float(tempo)
-
     onset_times_ms = librosa.frames_to_time(np.arange(onset_env.size), sr=sr) * 1000.0
     sections, drop_ms = _detect_structure(onset_env, onset_times_ms, onsets_ms, tempo)
     return True, tempo, onsets_ms, sections, drop_ms
