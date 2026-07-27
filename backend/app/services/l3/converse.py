@@ -107,6 +107,9 @@ _LOOP_SYSTEM = (
     "alongside it (when present) is the visual note for what's on screen / how "
     "it looks, and `aud:` is that line's delivery quality (crispness+loudness). "
     "For an action beat the quoted text is still the visual description. "
+    "`spec:\"...\"` (when present) is a sharper, footage-derived specific for "
+    "the same beat, additive alongside the generic text, never a replacement "
+    "for it -- lean on it once it's there. "
     "Then tags: "
     "`nrg:` the energy takes `tighten` accepts; `pace:LO-HIx` a video cut's "
     "playback-speed room / `trim<=Xs` a speech cut's removable dead-air budget "
@@ -174,30 +177,59 @@ _LOOP_SYSTEM = (
 )
 
 
-# brain_perception_upgrade.plan.md Change 2: a distinct, detailed provenance
+# brain_perception_upgrade.plan.md Change 2 (base) + cut_structure_and_
+# scene_specificity.plan.md Part 4 (REQUIRED update, kept in sync in the
+# same PR as Part 1/Part 3 changes -- see that plan for the source of truth
+# on cut formation + scene specificity): a distinct, detailed provenance
 # section describing HOW everything the brain reads was produced --
 # segmentation -> cuts -> scoring -> takes/outlooks -> tags -> identity ->
-# beat index / program map. Purely descriptive: HOW it is produced, never
-# whether to trust it -- the brain judges reliability itself from context.
-# A static constant, so it stays inside the cached prefix alongside
-# _LOOP_SYSTEM/_guidance_block (see the assembly in respond()).
+# scene specificity -> beat index / program map. Purely descriptive: HOW
+# something is produced and its known mechanism/limits, never a command to
+# trust one signal over another -- the brain reasons about reliability
+# itself from that description. A static constant, so it stays inside the
+# cached prefix alongside _LOOP_SYSTEM/_guidance_block (see the assembly in
+# respond()).
 _PROVENANCE = (
     "\n\nHOW YOUR SENSES ARE PRODUCED. Everything below describes how the "
     "text you read was made from the footage.\n\n"
     "1. FROM FOOTAGE TO CUTS. One GPU pass (L1) derives per-file signals "
     "from the proxy and the audio track: motion (action energy, camera "
-    "motion, blur), audio (loudness envelope, silence, onsets), and "
-    "scene/shot boundaries; a transcript is produced with word timings and "
-    "speaker diarization. A first text pass segments each clip into cuts "
-    "along word and shot edges. A vision pass then describes each cut from "
-    "sampled frames. Assembly snaps every boundary to a word or shot edge.\n\n"
+    "motion, blur, stability), audio (loudness envelope, silence, onsets), "
+    "and scene/shot/composition boundaries; a transcript is produced with "
+    "word timings and speaker diarization. Speech cuts and video cuts are "
+    "formed differently. A speech cut comes from a first text pass that "
+    "groups the transcript into cuts along word and shot edges. A video "
+    "cut's LOCATION is decided entirely by code, content-first, from those "
+    "same L1 signals: an isolated burst of action or audio novelty, a "
+    "sustained run of above-baseline action energy (split into separate "
+    "moments wherever it genuinely lulls), a scene/composition change, or "
+    "-- for repetitive footage (reps, a turntable, a conveyor) -- one "
+    "representative cycle, each anchor where a cut begins. Camera motion "
+    "and blur only REFINE an edge the content layer already chose: a "
+    "stability change, a deliberate move starting or ending, a blur "
+    "spike, or an existing shot/scene-transition seam can snap a nearby "
+    "edge to a cleaner frame when doing so trims only a sliver, but never "
+    "invents a cut on its own, and is suppressed entirely when it falls "
+    "inside an ongoing content-bearing move, action run, or "
+    "composition-continuous stretch. A stretch that is purely static, "
+    "silent, and motionless -- including a stretch of otherwise-generous "
+    "padding that itself carries no energy -- is dropped entirely rather "
+    "than becoming a cut of its own, or padded into, at all; nothing "
+    "manufactures a cut out of dead footage. A vision pass then describes "
+    "each already-located cut from sampled frames; the VLM never decides "
+    "WHERE a cut is, only what it shows and, for a video cut, which side "
+    "of its key moment carries more value (`shape`). Assembly snaps every "
+    "boundary to a word edge (speech) or the segmenter's own structural "
+    "edge (video).\n\n"
     "2. CUT SPANS AND HERO FRAME. A speech cut's src_in_ms/src_out_ms are "
-    "set by snapping to word edges; a video cut's span comes directly from "
-    "a deterministic motion/audio/scene segmenter, never an LLM-emitted "
-    "millisecond. hero_ts_ms -- the still shown for the cut -- is chosen "
-    "in order: an anchor timestamp when the cut has one, else the "
-    "sharpest (least motion-blurred) frame in the span, else the span's "
-    "midpoint.\n\n"
+    "set by snapping to word edges. A video cut's span comes directly from "
+    "the content-first segmenter described above -- a best-effort read of "
+    "where a moment visually begins and ends from motion/audio/scene "
+    "signals, not a judgment about what the moment MEANS; never an "
+    "LLM-emitted millisecond either way. hero_ts_ms -- the still shown for "
+    "the cut -- is chosen in order: an anchor timestamp when the cut has "
+    "one, else the sharpest (least motion-blurred) frame in the span, else "
+    "the span's midpoint.\n\n"
     "3. SCORING. speech_quality (a speech cut's delivery) is computed from "
     "how much of the span is clean speech (word timings, minus removable "
     "dead-air/filler) blended with loudness, normalized against that "
@@ -221,7 +253,12 @@ _PROVENANCE = (
     "nrg: levels and the pace tag (pace:LO-HIx for video, trim<=Xs for "
     "speech) come from the pace envelope -- a set of playback-speed rungs "
     "for a video cut, or the removable dead-air/filler budget for a "
-    "speech cut, both derived from the same motion/word signals.\n\n"
+    "speech cut, both derived from the same motion/word signals. The dial "
+    "only subdivides or fuses the events already found inside an "
+    "already-located cut into tighter or broader pieces as energy rises "
+    "or falls -- it has no mechanism to invent a boundary the content "
+    "layer above didn't find, or to recover one a dead stretch caused to "
+    "be dropped.\n\n"
     "7. CONTINUITY. cut:N/of numbers a cut among ALL of its clip's cuts in "
     "source order, including junk -- a gap in the numbering marks where a "
     "junk beat sits. The ↔ mark toward a neighbor means the seam "
@@ -256,7 +293,29 @@ _PROVENANCE = (
     "cut in source order per clip, each with a placeable ref. The PROGRAM "
     "MAP is rendered from the resolved layer stack -- main line plus any "
     "V2/coverage layers and audio beds -- laid out on the shared program "
-    "clock, the same clock read_state and the render use."
+    "clock, the same clock read_state and the render use.\n\n"
+    "12. SCENE SPECIFICITY (spec:, PROJECT DOMAIN, taxonomy). A cut's "
+    "label/summary come from the first, generic vision pass, which names "
+    "whatever concrete specifics it can see -- objects, on-screen text, "
+    "part numbers, the literal action -- even where it cannot interpret "
+    "them. In the background, AFTER cuts are already shown, a text pass "
+    "reads every cut together and infers the project's DOMAIN (e.g. 'CNC "
+    "machine shop', 'Indian wedding (Gujarati)') and, ONLY when a "
+    "genuinely closed answer set exists for that domain, a TAXONOMY of "
+    "named categories -- it also writes targeted, footage-derived "
+    "questions for cuts whose generic description would benefit from a "
+    "closer look. A second, targeted vision pass then answers those "
+    "questions from the cut's own frame and writes one short, specific "
+    "line: `spec:` in the beat line, ADDITIVE alongside the generic "
+    "label/summary, never replacing it. This is a best-effort, model-"
+    "inferred derivation -- domain, taxonomy entries, and specifics can be "
+    "wrong or approximate, and 'other'/'unsure'/'unknown' are the honest, "
+    "correct answer when the evidence does not clearly resolve to "
+    "something sharper, not a failure. A cut this background pass has not "
+    "reached yet, or a project whose evidence never converges on a "
+    "domain, simply has no `spec:` tag and no PROJECT DOMAIN block -- the "
+    "generic label/summary alone is exactly today's behavior, not a "
+    "degraded one."
 )
 
 
@@ -346,6 +405,32 @@ def _project_overview(ctx: "observe.EditContext") -> str:
     return "\n".join(lines)
 
 
+def _scene_domain_block(ctx: "observe.EditContext") -> str:
+    """PROJECT DOMAIN + closed-set TAXONOMY (cut_structure_and_scene_
+    specificity.plan.md Part 3's middle text layer), when it has run -- a
+    short, one-time orientation so the brain reads per-cut `spec:` tags
+    against a stated frame of reference. '' when enrichment hasn't reached
+    this run yet (a normal, common state -- it runs in the background after
+    cuts are shown) or found the footage too mixed for a domain to emerge."""
+    taxonomy = getattr(ctx, "scene_taxonomy", None)
+    if not taxonomy:
+        return ""
+    domain = (taxonomy.get("domain") or "").strip()
+    if not domain or domain == "unknown/mixed":
+        return ""
+    lines = [f"PROJECT DOMAIN: {domain} (confidence: {taxonomy.get('confidence', 'low')})"]
+    evidence = [e for e in (taxonomy.get("evidence") or []) if e]
+    if evidence:
+        lines.append("  evidence: " + "; ".join(evidence[:5]))
+    entries = taxonomy.get("taxonomy") or []
+    if entries:
+        items = [str(e.get("id")) + (f" ({e['definition']})" if e.get("definition") else "")
+                for e in entries if e.get("id")]
+        if items:
+            lines.append("  known categories: " + ", ".join(items))
+    return "\n".join(lines)
+
+
 def _voiceover_block(ctx: "observe.EditContext") -> str:
     """VOICEOVER / NARRATION SCRIPTS -- every uploaded audio asset that has a
     transcript, shown verbatim with per-sentence timings (voiceover-as-spine).
@@ -394,6 +479,12 @@ def _context_block(file_ids: List[str], document: Optional[dict],
             parts.append(overview)
     except Exception:
         logger.exception("converse: project overview failed (continuing without it)")
+    try:
+        domain_block = _scene_domain_block(ctx)
+        if domain_block:
+            parts.append(domain_block)
+    except Exception:
+        logger.exception("converse: scene domain block failed (continuing without it)")
     try:
         vo = _voiceover_block(ctx)
         if vo:

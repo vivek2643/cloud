@@ -118,6 +118,11 @@ def _basic_patches(p, fake_store, file_rows):
           lambda file_rows, outlook_hints=None: ic.Completion(data=_GOOD_PASS1, usage={}, attempts=1))
     p.set(ingest.ip, "build_image_plan", lambda *a, **k: [])
     p.set(ingest.fr, "extract_for_planned_frames", lambda *a, **k: {})
+    # cut_structure_and_scene_specificity.plan.md Part 3: defer_scene_enrich
+    # opens a REAL procrastinate/DB connector -- stub it the same way
+    # defer_ingest's own network call is never exercised from these
+    # orchestration-only tests (see test_ingest.py's own module docstring).
+    p.set(ingest, "defer_scene_enrich", lambda project_id, ingest_run_id: None)
 
 
 def test_run_ingest_happy_path_sequences_stages_in_order():
@@ -139,6 +144,48 @@ def test_run_ingest_happy_path_sequences_stages_in_order():
     assert fake_store.deleted_for == "run-1"
     assert fake_store.inserted == []
     print("ok  test_run_ingest_happy_path_sequences_stages_in_order")
+
+
+def test_run_ingest_fires_scene_enrich_after_ready_not_on_failure():
+    """cut_structure_and_scene_specificity.plan.md Part 3: the enrich hook
+    fires exactly once, only AFTER status is set 'ready' (cuts already
+    visible) -- and never at all on a failed run."""
+    fake_store = FakeStore()
+    file_rows = [("f1", "a.mp4", 2000, _lattice("f1"))]
+    p = _Patcher()
+    _basic_patches(p, fake_store, file_rows)
+    p.set(ingest.post, "assemble_cut_records", lambda *a, **k: [])
+    p.set(ingest, "_extract_and_upload_heroes", lambda *a, **k: None)
+    calls = []
+    p.set(ingest, "defer_scene_enrich", lambda project_id, ingest_run_id: calls.append(
+        (project_id, ingest_run_id, list(fake_store.status_history))))
+    try:
+        run_id = ingest.run_ingest("proj-1")
+    finally:
+        p.restore()
+    assert calls == [("proj-1", run_id, [("pass1", None), ("images", None),
+                                         ("pass2", None), ("post", None), ("ready", None)])], calls
+    print("ok  test_run_ingest_fires_scene_enrich_after_ready_not_on_failure")
+
+    fake_store2 = FakeStore()
+    p = _Patcher()
+    _basic_patches(p, fake_store2, file_rows)
+
+    def boom_post(*a, **k):
+        raise ValueError("boom")
+
+    p.set(ingest.post, "assemble_cut_records", boom_post)
+    calls2 = []
+    p.set(ingest, "defer_scene_enrich", lambda project_id, ingest_run_id: calls2.append(1))
+    try:
+        try:
+            ingest.run_ingest("proj-1")
+        except ValueError:
+            pass
+    finally:
+        p.restore()
+    assert calls2 == [], "enrich must never fire on a failed run"
+    print("ok  test_run_ingest_never_fires_scene_enrich_on_a_failed_run")
 
 
 def test_run_ingest_calls_pass2_per_batch():
@@ -335,6 +382,7 @@ def test_run_many_isolates_one_projects_failure_from_the_rest():
 
 def main():
     test_run_ingest_happy_path_sequences_stages_in_order()
+    test_run_ingest_fires_scene_enrich_after_ready_not_on_failure()
     test_run_ingest_calls_pass2_per_batch()
     test_run_ingest_runs_pass2_batches_concurrently_not_sequentially()
     test_run_ingest_marks_failed_and_reraises_on_pass1_failure()

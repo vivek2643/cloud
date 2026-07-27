@@ -360,6 +360,11 @@ def build_clip_tree(
             # beat-line breadcrumb (_landmarks_tag) below. {} on a
             # pre-migration cut or one with no interior structure.
             "landmarks": cut.get("landmarks") or {},
+            # cut_structure_and_scene_specificity.plan.md Part 3: this cut's
+            # sharpened scene specific (Pass B), when the background
+            # enrichment has reached it. {} until then -- _specific_tag
+            # below renders nothing in that case, identical to today.
+            "scene_specifics": cut.get("scene_specifics") or {},
             # The TRUE cut span (not anchor["in_ms"]/["out_ms"], which is the
             # balanced-variant window) -- Mechanism B's inspect_cut sense
             # (observe.py) windows to the FULL cut, not one zoom level of it.
@@ -745,6 +750,22 @@ def _landmarks_tag(m: Dict[str, Any]) -> str:
     return f" sig:{','.join(parts)}" if parts else ""
 
 
+def _specific_tag(m: Dict[str, Any]) -> str:
+    """`spec:"pheras -- couple circling the fire"` -- cut_structure_and_
+    scene_specificity.plan.md Part 3's sharpened, footage-derived specific
+    for this cut (a two-pass vision derivation: a generic pass, a text step
+    inferring the project domain + writing targeted questions, a second
+    vision pass answering them), ADDITIVE alongside the generic label/
+    summary -- never replaces them, since the generic description is still
+    what's shown when enrichment hasn't reached this cut yet (a normal,
+    common state -- it runs in the background after cuts are shown). ''
+    when `scene_specifics` is empty."""
+    specific = ((m.get("scene_specifics") or {}).get("specific") or "").strip()
+    if not specific:
+        return ""
+    return f" spec:\"{_short_gist(specific)}\""
+
+
 def _dur_tag(m: Dict[str, Any]) -> str:
     """The cut's PLAY length (after any breath/dead-air excision) so the brain
     can pace + honor a target length without arithmetic on the timestamps."""
@@ -951,6 +972,7 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     # when present so text-free footage stays terse. "" on a pre-migration cut.
     scr = (m.get("screen_text") or "").strip().replace("\n", " ")
     scr_tag = f" text:\"{_short_gist(scr)}\"" if scr else ""
+    spec_tag = _specific_tag(m)
     # Continuity run: this beat is part of one uninterrupted same-clip shot
     # (members listed in source order); keep run members together + in order.
     run = ""
@@ -971,7 +993,7 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     alt = _alt_pic_segment(m)
     line = (f"  {m['moment_id'].split(':')[-1]} {_capture_tag(m)} {pic} {snd} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])} {_dur_tag(m)}] "
-            f"\"{primary}\"{vis_tag}{gloss}{scr_tag} · "
+            f"\"{primary}\"{vis_tag}{gloss}{scr_tag}{spec_tag} · "
             f"nrg:{nrg}{aud_tag}{pace_tag}{cam_tag}{peak_tag}{landmarks_tag}{outlook_tag}{cut_tag}{run}{alt}")
     piece_lines = _piece_lines(m)
     return "\n".join([line] + piece_lines) if piece_lines else line

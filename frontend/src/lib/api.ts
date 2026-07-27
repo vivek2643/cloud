@@ -293,6 +293,17 @@ export interface CutRecord {
     sil?: { n: number; gaps: { off: number; dur: number }[] };
     shot?: { n: number; cuts: { off: number; hard: boolean }[] };
   } | null;
+  // cut_structure_and_scene_specificity.plan.md Part 3: this cut's
+  // sharpened, footage-derived specific from the two-pass background
+  // enrichment (a generic vision pass -> a text pass inferring the
+  // project's domain + targeted questions -> a second, targeted vision
+  // pass). Additive alongside label/summary, never a replacement. Absent/
+  // {} until the background job reaches this cut (a normal, common state
+  // -- it runs after cuts are already shown) or on a pre-migration row.
+  scene_specifics?: {
+    specific?: string;
+    label?: string;
+  } | null;
   // av_coupling_authoritative.plan.md: this cut's baked AUTHORITATIVE audio
   // source, decided once at ingest (never re-derived lazily at render time).
   // audio_file_id defaults to this cut's own file_id (same-source, offset 0)

@@ -81,6 +81,12 @@ class EditContext:
     # real thread), which just means the resolve falls back to `legacy`-style
     # inline computation for that turn.
     thread_id: Optional[str] = None
+    # cut_structure_and_scene_specificity.plan.md Part 3: the middle text
+    # layer's project-level output for `run_id` -- {"domain", "confidence",
+    # "evidence", "taxonomy", ...} -- or None when enrichment hasn't reached
+    # this run yet (a normal, common state; it runs in the background after
+    # cuts are shown) or nothing is ingested at all.
+    scene_taxonomy: Optional[Dict[str, Any]] = None
 
     @property
     def meta_by_ref(self) -> Dict[str, dict]:
@@ -133,6 +139,13 @@ def build_context(file_ids: List[str], run_id: Optional[str] = None,
         audio_features = _fetch_audio_features(all_audio_ids)
     except Exception:
         logger.exception("observe: audio_features lookup failed (continuing)")
+    scene_taxonomy: Optional[Dict[str, Any]] = None
+    if eff_run:
+        try:
+            from app.services.l3 import ingest_store
+            scene_taxonomy = ingest_store.get_scene_taxonomy(eff_run)
+        except Exception:
+            logger.exception("observe: scene_taxonomy lookup failed (continuing)")
     return EditContext(
         file_ids=list(file_ids),
         index=_MapIndex(map_struct),
@@ -144,6 +157,7 @@ def build_context(file_ids: List[str], run_id: Optional[str] = None,
         audio_assets=audio_assets,
         run_id=eff_run,
         thread_id=thread_id,
+        scene_taxonomy=scene_taxonomy,
     )
 
 

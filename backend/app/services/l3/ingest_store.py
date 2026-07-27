@@ -94,6 +94,40 @@ def set_timings(ingest_run_id: str, timings_ms: Dict[str, float]) -> None:
         )
 
 
+def set_scene_taxonomy(ingest_run_id: str, taxonomy: Dict[str, Any]) -> None:
+    """Persist the Part 3 middle text layer's project-level output
+    (cut_structure_and_scene_specificity.plan.md) -- domain/confidence/
+    evidence/taxonomy/clusters/needs_pass_b. Written once by the background
+    l3_scene_enrich task; NULL on a run it hasn't reached (or predating this
+    plan) is a normal, expected state, never an error."""
+    with _pg_conn() as conn:
+        conn.execute(
+            "update ingest_runs set scene_taxonomy = %s where id = %s",
+            (json.dumps(taxonomy), ingest_run_id),
+        )
+
+
+def get_scene_taxonomy(ingest_run_id: str) -> Optional[Dict[str, Any]]:
+    with _pg_conn() as conn:
+        row = conn.execute(
+            "select scene_taxonomy from ingest_runs where id = %s", (ingest_run_id,)
+        ).fetchone()
+    if not row or not row[0]:
+        return None
+    return row[0] if isinstance(row[0], dict) else json.loads(row[0])
+
+
+def update_cut_scene_specifics(cut_id: str, specifics: Dict[str, Any]) -> None:
+    """One Pass-B answer, written onto its own cut_records row. Best-effort
+    per cut -- a caller iterating many cuts should let one failure here stay
+    isolated to that cut, never abort the batch (see l3_scene_enrich)."""
+    with _pg_conn() as conn:
+        conn.execute(
+            "update cut_records set scene_specifics = %s where id = %s",
+            (json.dumps(specifics), cut_id),
+        )
+
+
 def accumulate_pass2_usage(ingest_run_id: str, usage: Dict[str, int]) -> None:
     with _pg_conn() as conn:
         conn.execute(

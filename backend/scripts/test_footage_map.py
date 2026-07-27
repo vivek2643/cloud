@@ -637,6 +637,39 @@ def test_landmarks_tag_skips_a_channel_present_but_zero_count():
     print("ok  test_landmarks_tag_skips_a_channel_present_but_zero_count")
 
 
+# --------------------------------------------------------------------------
+# scene specificity (cut_structure_and_scene_specificity.plan.md Part 3):
+# `spec:"..."` -- ADDITIVE alongside the generic label/summary, never a
+# replacement.
+# --------------------------------------------------------------------------
+
+def test_specific_tag_renders_when_scene_specifics_present():
+    cut = _cut("f:sp", 1000, 4000, "a machine in a factory",
+               scene_specifics={"specific": "CNC lathe turning a steel shaft", "label": "milling"})
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert 'spec:"CNC lathe turning a steel shaft"' in line, line
+    # Additive: the generic label still renders too (never replaced).
+    assert "a machine in a factory" in line, line
+    print("ok  test_specific_tag_renders_when_scene_specifics_present")
+
+
+def test_specific_tag_absent_when_not_yet_enriched():
+    cut = _cut("f:sp", 1000, 4000, "a machine in a factory")
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "spec:" not in line, line
+    print("ok  test_specific_tag_absent_when_not_yet_enriched")
+
+
+def test_specific_tag_absent_when_specifics_present_but_empty_string():
+    cut = _cut("f:sp", 1000, 4000, "a machine in a factory", scene_specifics={"specific": "", "label": ""})
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "spec:" not in line, line
+    print("ok  test_specific_tag_absent_when_specifics_present_but_empty_string")
+
+
 def test_cast_line_lists_majors_with_voices_and_others_by_id():
     persons = [
         {"person_id": "P0", "display": "bald man, beard", "is_major": True, "owned_voices": ["V0"]},
@@ -893,6 +926,9 @@ def main():
     test_landmarks_tag_caps_display_at_nine_plus()
     test_landmarks_tag_absent_when_landmarks_empty()
     test_landmarks_tag_skips_a_channel_present_but_zero_count()
+    test_specific_tag_renders_when_scene_specifics_present()
+    test_specific_tag_absent_when_not_yet_enriched()
+    test_specific_tag_absent_when_specifics_present_but_empty_string()
     test_source_contiguous_beats_form_a_run_channel_agnostic()
     test_cast_line_lists_majors_with_voices_and_others_by_id()
     test_cast_line_empty_with_no_persons()

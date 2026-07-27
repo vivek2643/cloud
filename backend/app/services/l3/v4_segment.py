@@ -41,13 +41,19 @@ from typing import Any, Dict, List, Optional, Tuple
 from app.services.l3.lattice import _subtract
 from app.services.l3.post import _mean, _norm_in_clip, _series_lohi, _span_slice
 from app.services.l3.v4_segment_params import (
-    CAMERA_MOVE_COHERENCE_MIN, CAMERA_MOVE_MAGNITUDE_MIN, CAMERA_MOVE_MIN_MS,
-    CLUSTER_SEPARATION_MULTIPLIER, DECAY_FRACTION, DENSITY_PEAKS_PER_SEC_CAP,
-    EDGE_SNAP_SEARCH_MS, EDGE_SNAP_STABILITY_MAX, FOLLOW_THROUGH_FLOOR_MS,
+    CAMERA_MOVE_COHERENCE_MIN, CAMERA_MOVE_MIN_MS,
+    CLUSTER_SEPARATION_MULTIPLIER, DEAD_ENERGY_FLOOR, DECAY_FRACTION,
+    DENSITY_PEAKS_PER_SEC_CAP, FOLLOW_THROUGH_FLOOR_MS,
+    ACTION_RUN_BASELINE_FRACTION, ACTION_RUN_LEFTOVER_MIN_MS, ACTION_RUN_MIN_MS,
+    LULL_LEVEL_FRACTION, LULL_MIN_MS,
     MAX_CLUSTER_SEPARATION_MS, MAX_PAD_MS, MIN_CUT_DURATION_MS, MIN_CUT_GAP_MS,
+    MOVE_ABSOLUTE_FLOOR, MOVE_MAGNITUDE_PERCENTILE_HI, MOVE_MAGNITUDE_PERCENTILE_LO,
+    MOVE_RELATIVE_FRACTION, MOVE_SPREAD_RATIO_MIN,
     NOVELTY_ABSOLUTE_FLOOR, NOVELTY_BASELINE_RADIUS_MS, PEAK_MIN_GAP_MS,
-    PEAK_PROMINENCE_RATIO, PERIODICITY_SCORE_THRESHOLD, REPRESENTATIVE_WINDOW_MS,
-    RUN_UP_FLOOR_MS,
+    PEAK_PROMINENCE_RATIO, PERIODICITY_SCORE_THRESHOLD, REGIME_BLUR_MAX,
+    REGIME_COHERENCE_MOVE_MIN, REGIME_MAGNITUDE_MOVE_MIN,
+    REGIME_STABILITY_TRANSIENT_MAX, REPRESENTATIVE_WINDOW_MS, RUN_UP_FLOOR_MS,
+    SNAP_FRAC, SNAP_MS_FLOOR,
 )
 
 
@@ -161,34 +167,41 @@ def _channel_novelty(values: List[float], lo: Optional[float], hi: Optional[floa
     return [max(im, st) for im, st in zip(impulse, step)]
 
 
-def _periodicity_score(values: List[float]) -> float:
-    """0..1: best normalized autocorrelation of the signal's FIRST DIFFERENCE
-    at a non-trivial lag -- a blinking light / wave / timelapse has a
-    periodically repeating CHANGE pattern; a one-off burst or a ramp into a
-    new sustained level has exactly one isolated change and does not
-    correlate with a shifted copy of itself anywhere. Differencing first
-    (rather than testing the raw levels) is what tells "oscillates
-    repeatedly" apart from "holds one long constant/flat stretch", which
-    would otherwise trivially self-correlate at every lag. Signal-only (no
-    action_points needed), so it catches a periodic CONTINUOUS signal too,
-    not just evenly-spaced discrete events."""
+def _periodicity_score(values: List[float]) -> Tuple[float, int]:
+    """(0..1 score, period_in_samples): best normalized autocorrelation of
+    the signal's FIRST DIFFERENCE at a non-trivial lag, and the lag it was
+    found at -- a blinking light / wave / timelapse has a periodically
+    repeating CHANGE pattern; a one-off burst or a ramp into a new sustained
+    level has exactly one isolated change and does not correlate with a
+    shifted copy of itself anywhere. Differencing first (rather than testing
+    the raw levels) is what tells "oscillates repeatedly" apart from "holds
+    one long constant/flat stretch", which would otherwise trivially
+    self-correlate at every lag -- and doesn't shift where a repeat lands,
+    so the winning lag is the period of the ORIGINAL (undifferenced) signal
+    too (cuts_content_first_segmentation.plan.md Part 6 reuses it exactly
+    this way, in _representative_window). Signal-only (no action_points
+    needed), so it catches a periodic CONTINUOUS signal too, not just
+    evenly-spaced discrete events. period is 0 when nothing periodic was
+    found (degenerate signal, or the search space was too short)."""
     if len(values) < 7:
-        return 0.0
-    values = [b - a for a, b in zip(values, values[1:])]
-    n = len(values)
-    mean = sum(values) / n
-    centered = [v - mean for v in values]
+        return 0.0, 0
+    diffs = [b - a for a, b in zip(values, values[1:])]
+    n = len(diffs)
+    mean = sum(diffs) / n
+    centered = [v - mean for v in diffs]
     energy = sum(c * c for c in centered)
     if energy <= 1e-9:
-        return 0.0
+        return 0.0, 0
     max_lag = min(n - 1, n // 2)
     best = 0.0
+    best_lag = 0
     for lag in range(2, max_lag + 1):
         num = sum(centered[i] * centered[i + lag] for i in range(n - lag))
         corr = num / energy
         if corr > best:
             best = corr
-    return max(0.0, min(1.0, best))
+            best_lag = lag
+    return max(0.0, min(1.0, best)), best_lag
 
 
 def _evenly_spaced(ts: List[int]) -> bool:
@@ -249,7 +262,8 @@ def _novelty_curve(
     # (a blink is all "change", no "event"); a one-off burst (low score) is
     # untouched. Below the threshold, no discount at all -- incidental
     # autocorrelation in a short/noisy curve shouldn't nibble real events.
-    periodicity = max(_periodicity_score(action), 1.0 if _evenly_spaced(sorted(anchors)) else 0.0)
+    action_periodicity_score, _action_period_hops = _periodicity_score(action)
+    periodicity = max(action_periodicity_score, 1.0 if _evenly_spaced(sorted(anchors)) else 0.0)
     if periodicity >= PERIODICITY_SCORE_THRESHOLD:
         curve = [c * max(0.0, 1.0 - periodicity) for c in curve]
     return curve
@@ -303,12 +317,48 @@ def _true_runs(flags: List[bool]) -> List[Tuple[int, int]]:
     return runs
 
 
-def _camera_move_cores(motion: dict, span: Tuple[int, int], hop_ms: int) -> List[Tuple[int, int]]:
+def _clip_move_threshold(motion: dict) -> float:
+    """cuts_content_first_segmentation.plan.md Part 1: this clip's own
+    clip-relative "deliberate move" magnitude threshold, replacing the flat
+    REGIME_MAGNITUDE_MOVE_MIN (0.03) that aerial/drone footage's ~50x-
+    smaller flow magnitude never clears. A robust HIGH percentile of the
+    WHOLE clip's own per-hop |dx|+|dy|+|zoom| magnitude series, scaled down
+    by MOVE_RELATIVE_FRACTION -- a hop doesn't have to be this clip's single
+    highest instant to count, just solidly in its own upper range.
+
+    Guarded on both sides: MOVE_ABSOLUTE_FLOOR keeps a literal near-zero
+    clip from ever registering (roundoff, not motion), and the spread test
+    (this clip's own high percentile vs its low percentile) keeps a
+    genuinely locked/still clip's uniform sensor jitter from being promoted
+    to "a move" just because it's this clip's own relative maximum -- that
+    case falls back to the OLD absolute floor untouched, never lowering the
+    bar for footage that was never moving in the first place."""
+    dx = motion.get("camera_dx") or []
+    dy = motion.get("camera_dy") or []
+    dz = motion.get("camera_zoom") or []
+    n = max(len(dx), len(dy), len(dz))
+    if n < 4:
+        return REGIME_MAGNITUDE_MOVE_MIN
+    mags = sorted(
+        (abs(dx[i]) if i < len(dx) else 0.0) + (abs(dy[i]) if i < len(dy) else 0.0)
+        + (abs(dz[i]) if i < len(dz) else 0.0)
+        for i in range(n)
+    )
+    lo = mags[int(MOVE_MAGNITUDE_PERCENTILE_LO * (n - 1))]
+    hi = mags[int(MOVE_MAGNITUDE_PERCENTILE_HI * (n - 1))]
+    if hi < MOVE_SPREAD_RATIO_MIN * max(lo, MOVE_ABSOLUTE_FLOOR):
+        return REGIME_MAGNITUDE_MOVE_MIN
+    return max(MOVE_ABSOLUTE_FLOOR, MOVE_RELATIVE_FRACTION * hi)
+
+
+def _camera_move_cores(motion: dict, span: Tuple[int, int], hop_ms: int,
+                       move_threshold: float = REGIME_MAGNITUDE_MOVE_MIN) -> List[Tuple[int, int]]:
     """(start_ms, end_ms) of EVERY sustained, coherent camera move in
     ``span`` -- v4_cluster_tree_cuts.plan.md section 4.2 (the pan-loss bug):
     a SECOND good pan must not be silently dropped just because an earlier
     one happened to be longer. A hop counts as "moving" once its combined
-    |dx|+|dy|+|zoom| clears CAMERA_MOVE_MAGNITUDE_MIN AND coherence clears
+    |dx|+|dy|+|zoom| clears ``move_threshold`` (Part 1: this clip's own
+    clip-relative gate, see ``_clip_move_threshold``) AND coherence clears
     CAMERA_MOVE_COHERENCE_MIN (deliberate, not shake); each run must sustain
     CAMERA_MOVE_MIN_MS to count as a real payload."""
     s, e = span
@@ -324,7 +374,7 @@ def _camera_move_cores(motion: dict, span: Tuple[int, int], hop_ms: int) -> List
         return arr[i] if i < len(arr) else default
 
     moving = [
-        (abs(_at(dx, i, 0.0)) + abs(_at(dy, i, 0.0)) + abs(_at(dz, i, 0.0))) >= CAMERA_MOVE_MAGNITUDE_MIN
+        (abs(_at(dx, i, 0.0)) + abs(_at(dy, i, 0.0)) + abs(_at(dz, i, 0.0))) >= move_threshold
         and _at(coh, i, 0.0) >= CAMERA_MOVE_COHERENCE_MIN
         for i in range(n)
     ]
@@ -336,24 +386,109 @@ def _camera_move_cores(motion: dict, span: Tuple[int, int], hop_ms: int) -> List
     return out
 
 
-def _representative_window(motion: dict, span: Tuple[int, int], hop_ms: int) -> Tuple[int, int]:
-    """Modest window centered on the steadiest, sharpest instant -- Step 3.4,
-    the "nothing stands out anywhere" fallback. Never the whole span."""
+def _peak_norm(values: List[float], lo: Optional[float], hi: Optional[float]) -> float:
+    """Highest clip-normalized value in ``values``, or 0.0 when there's no
+    usable signal (empty, or degenerate -- lo==hi, no clip-relative
+    variation at all to normalize against)."""
+    if not values or lo is None or hi is None or hi <= lo:
+        return 0.0
+    return max((_norm_in_clip(v, lo, hi) or 0.0) for v in values)
+
+
+def _has_energy_in(
+    motion: dict, hop_ms: int, s: int, e: int,
+    ae_lohi: Tuple[Optional[float], Optional[float]], rms_lohi: Tuple[Optional[float], Optional[float]],
+) -> bool:
+    """True when [s, e) carries ANY clip-relative action/rms amplitude at or
+    above DEAD_ENERGY_FLOOR, or ANY camera motion reaching REGIME_MAGNITUDE_
+    MOVE_MIN -- the shared "is something actually happening in this stretch"
+    amplitude test behind both ``_span_is_dead`` (a whole working span) and
+    the padding floors' sub-region gate (Part 4, ``_broad_window_for_event``).
+    Distinct from low NOVELTY -- a periodic/blinking signal has real
+    amplitude but low novelty (see _novelty_curve's periodicity discount)."""
+    if e <= s:
+        return False
+    action = _span_slice(motion.get("action_energy") or [], hop_ms, s, e)
+    if _peak_norm(action, *ae_lohi) >= DEAD_ENERGY_FLOOR:
+        return True
+    rms = _span_slice(motion.get("_rms_at_motion_hop") or [], hop_ms, s, e)
+    if _peak_norm(rms, *rms_lohi) >= DEAD_ENERGY_FLOOR:
+        return True
+    dx = _span_slice(motion.get("camera_dx") or [], hop_ms, s, e)
+    dy = _span_slice(motion.get("camera_dy") or [], hop_ms, s, e)
+    dz = _span_slice(motion.get("camera_zoom") or [], hop_ms, s, e)
+    n = max(len(dx), len(dy), len(dz))
+    for i in range(n):
+        magnitude = ((abs(dx[i]) if i < len(dx) else 0.0) + (abs(dy[i]) if i < len(dy) else 0.0)
+                    + (abs(dz[i]) if i < len(dz) else 0.0))
+        if magnitude >= REGIME_MAGNITUDE_MOVE_MIN:
+            return True
+    return False
+
+
+def _span_is_dead(
+    motion: dict, span: Tuple[int, int], hop_ms: int,
+    ae_lohi: Tuple[Optional[float], Optional[float]], rms_lohi: Tuple[Optional[float], Optional[float]],
+) -> bool:
+    """True when NOTHING salient could possibly be happening anywhere in
+    ``span`` (see ``_has_energy_in``) -- feeds the camera-start-still fix: a
+    dead span now produces no event at all rather than a fabricated one."""
     s, e = span
-    stability = _span_slice(motion.get("camera_stability") or [], hop_ms, s, e)
-    blur = _span_slice(motion.get("blur") or [], hop_ms, s, e)
-    n = max(len(stability), len(blur))
-    half = min(REPRESENTATIVE_WINDOW_MS, e - s) // 2
+    return not _has_energy_in(motion, hop_ms, s, e, ae_lohi, rms_lohi)
+
+
+def _representative_window(
+    motion: dict, span: Tuple[int, int], hop_ms: int,
+    ae_lohi: Tuple[Optional[float], Optional[float]], rms_lohi: Tuple[Optional[float], Optional[float]],
+) -> Optional[Tuple[int, int]]:
+    """Modest window centered on the highest-ENERGY instant (peak of
+    clip-normalized action + rms + camera magnitude) -- Step 3.4, the
+    "nothing else fired" fallback. Biased toward where something is
+    actually HAPPENING, never toward stillness: picking the steadiest,
+    sharpest instant is exactly what used to land this fallback on a
+    locked-off camera-start still. Returns None when the whole span is dead
+    (_span_is_dead) -- a genuinely empty span now produces NO event at all
+    rather than a fabricated one.
+
+    cuts_content_first_segmentation.plan.md Part 6 (lever A): when the
+    span's action is periodic (reps, turntable, waves, conveyor -- the SAME
+    autocorrelation _novelty_curve already runs to discount periodic
+    novelty, reused here for its LAG instead), the window width is the
+    detected PERIOD -- one clean cycle -- instead of the generic fixed
+    REPRESENTATIVE_WINDOW_MS. A mis-locked period is no worse than today's
+    arbitrary window (Risk: low)."""
+    s, e = span
+    if _span_is_dead(motion, span, hop_ms, ae_lohi, rms_lohi):
+        return None
+
+    action = _span_slice(motion.get("action_energy") or [], hop_ms, s, e)
+    rms = _span_slice(motion.get("_rms_at_motion_hop") or [], hop_ms, s, e)
+    dx = _span_slice(motion.get("camera_dx") or [], hop_ms, s, e)
+    dy = _span_slice(motion.get("camera_dy") or [], hop_ms, s, e)
+    dz = _span_slice(motion.get("camera_zoom") or [], hop_ms, s, e)
+    n = max(len(action), len(rms), len(dx), len(dy), len(dz))
+    periodicity, period_hops = _periodicity_score(action)
+    if periodicity >= PERIODICITY_SCORE_THRESHOLD and period_hops > 0:
+        width = max(MIN_CUT_DURATION_MS, min(period_hops * hop_ms, e - s))
+    else:
+        width = min(REPRESENTATIVE_WINDOW_MS, e - s)
+    half = width // 2
     if n == 0:
         mid = (s + e) // 2
         return max(s, mid - half), min(e, mid + half)
 
-    def _cost(i: int) -> float:
-        st = stability[i] if i < len(stability) else 1.0
-        bl = blur[i] if i < len(blur) else 0.0
-        return bl - st
+    ae_lo, ae_hi = ae_lohi
+    rms_lo, rms_hi = rms_lohi
 
-    best_i = min(range(n), key=_cost)
+    def _energy_at(i: int) -> float:
+        a = _norm_in_clip(action[i], ae_lo, ae_hi) if i < len(action) else None
+        r = _norm_in_clip(rms[i], rms_lo, rms_hi) if i < len(rms) else None
+        magnitude = ((abs(dx[i]) if i < len(dx) else 0.0) + (abs(dy[i]) if i < len(dy) else 0.0)
+                    + (abs(dz[i]) if i < len(dz) else 0.0))
+        cam = min(1.0, magnitude / max(REGIME_MAGNITUDE_MOVE_MIN, 1e-6))
+        return (a or 0.0) + (r or 0.0) + cam
+
+    best_i = max(range(n), key=_energy_at)
     center = s + best_i * hop_ms
     in_ms = max(s, min(center - half, e - 2 * half))
     out_ms = min(e, in_ms + 2 * half)
@@ -387,24 +522,154 @@ def _decay_bound(curve: List[float], peak_i: int, direction: int, floor_i: int, 
     return i
 
 
-def _snap_to_quality_gate(motion: dict, hop_ms: int, ts_ms: int, lo_ms: int, hi_ms: int) -> int:
-    """Nudge ``ts_ms`` to the nearest instant within EDGE_SNAP_SEARCH_MS whose
-    camera_stability reads as a whip/bump (a clean place to cut) rather than a
-    smooth in-progress move -- Step 4's camera-quality gate. A no-op when
-    there's no stability signal, or nothing better is found nearby."""
+# --------------------------------------------------------------------------
+# cut_structure_and_scene_specificity.plan.md Part 1, Step 1: structure-first
+# camera-regime classification -- WHERE it is visually clean to cut, computed
+# from camera + blur ONLY, no content signal at all. Regime boundaries +
+# premium seams (whips, blur spikes, move onset/offset, existing
+# transition_points) are the candidate clean cut points. A seam alone never
+# invents a cut -- Step 3 (_snap_edge_to_seam) only ever SNAPS an
+# already-content-chosen edge to the nearest one.
+# --------------------------------------------------------------------------
+
+def _camera_regime_at(motion: dict, i: int,
+                      move_threshold: float = REGIME_MAGNITUDE_MOVE_MIN) -> Tuple[str, str]:
+    """(stability_regime, move_regime) at GLOBAL motion hop index ``i``:
+      stability_regime: "steady" | "transient" (whip/bump -- low camera_stability)
+      move_regime: "static-hold" | "coherent-move" | "shake"
+
+    ``move_threshold`` is this clip's own clip-relative move-magnitude gate
+    (Part 1, see ``_clip_move_threshold``) -- defaults to the old absolute
+    REGIME_MAGNITUDE_MOVE_MIN so a caller that never computed one (e.g. a
+    direct unit-test call) keeps the pre-Part-1 behavior exactly."""
     stability = motion.get("camera_stability") or []
-    if not stability or hop_ms <= 0:
-        return ts_ms
-    lo_i = max(lo_ms // hop_ms, (ts_ms - EDGE_SNAP_SEARCH_MS) // hop_ms)
-    hi_i = min((hi_ms - 1) // hop_ms if hi_ms > 0 else 0, (ts_ms + EDGE_SNAP_SEARCH_MS) // hop_ms)
-    hi_i = min(hi_i, len(stability) - 1)
-    if lo_i > hi_i:
-        return ts_ms
-    cur_i = min(max(ts_ms // hop_ms, 0), len(stability) - 1)
-    if stability[cur_i] <= EDGE_SNAP_STABILITY_MAX:
-        return ts_ms
-    best_i = min(range(lo_i, hi_i + 1), key=lambda i: (stability[i], abs(i - cur_i)))
-    return best_i * hop_ms if stability[best_i] <= EDGE_SNAP_STABILITY_MAX else ts_ms
+    dx = motion.get("camera_dx") or []
+    dy = motion.get("camera_dy") or []
+    dz = motion.get("camera_zoom") or []
+    coh = motion.get("camera_coherence") or []
+
+    def _at(arr: List[float], default: float) -> float:
+        return arr[i] if i < len(arr) else default
+
+    stability_regime = "transient" if _at(stability, 1.0) <= REGIME_STABILITY_TRANSIENT_MAX else "steady"
+
+    magnitude = abs(_at(dx, 0.0)) + abs(_at(dy, 0.0)) + abs(_at(dz, 0.0))
+    if magnitude < move_threshold:
+        move_regime = "static-hold"
+    elif _at(coh, 0.0) >= REGIME_COHERENCE_MOVE_MIN:
+        move_regime = "coherent-move"
+    else:
+        move_regime = "shake"
+    return stability_regime, move_regime
+
+
+def _move_is_content(
+    move_core: Tuple[int, int], motion: dict, hop_ms: int,
+    ae_lohi: Tuple[Optional[float], Optional[float]], rms_lohi: Tuple[Optional[float], Optional[float]],
+) -> bool:
+    """True when a camera-move core overlaps real action/rms energy (peak
+    clip-normalized value >= DEAD_ENERGY_FLOOR anywhere inside it) -- a
+    content-bearing move, not free structure. A coherent-move that's
+    content is never treated as disposable padding the way a static,
+    silent hold's edges are (below)."""
+    s, e = move_core
+    action = _span_slice(motion.get("action_energy") or [], hop_ms, s, e)
+    if _peak_norm(action, *ae_lohi) >= DEAD_ENERGY_FLOOR:
+        return True
+    rms = _span_slice(motion.get("_rms_at_motion_hop") or [], hop_ms, s, e)
+    return _peak_norm(rms, *rms_lohi) >= DEAD_ENERGY_FLOOR
+
+
+def _structural_seams(
+    motion: dict, scene: dict, span: Tuple[int, int], hop_ms: int,
+    ae_lohi: Tuple[Optional[float], Optional[float]], rms_lohi: Tuple[Optional[float], Optional[float]],
+    move_threshold: float = REGIME_MAGNITUDE_MOVE_MIN,
+) -> List[int]:
+    """Every candidate CLEAN cut point in ``span``: camera/blur regime-
+    boundary instants, transient (whip/bump) instants, blur spikes, move
+    onset/offset, and existing ``transition_points``. A transient/blur
+    instant that falls INSIDE ongoing continuous content (see
+    ``_inside_continuous_content``) is excluded -- that reads as motion blur
+    from a real pan/rally/scene, not a clean edit point; a move's own
+    onset/offset is still always a seam regardless (the moment right
+    before/after a deliberate move genuinely is a clean cut point)."""
+    s, e = span
+    if hop_ms <= 0 or e <= s:
+        return []
+    lo_i, hi_i = s // hop_ms, (e - 1) // hop_ms
+    n = hi_i - lo_i + 1
+    if n <= 0:
+        return []
+
+    content_moves = [core for core in _camera_move_cores(motion, span, hop_ms, move_threshold)
+                     if _move_is_content(core, motion, hop_ms, ae_lohi, rms_lohi)]
+    action_runs = _action_runs_and_lulls(span, motion, hop_ms, ae_lohi)
+    composition_ts = [int(p["ts_ms"]) for p in (scene.get("composition_points") or [])
+                      if s <= int(p.get("ts_ms", -1)) < e]
+
+    def _inside_continuous_content(ts: int) -> bool:
+        """cuts_content_first_segmentation.plan.md Part 5: protects a
+        candidate seam not just inside a content-bearing camera move (the
+        original mechanism) but ALSO when action is sustained (Part 3's own
+        run/lull structure -- inside a run means away from a lull edge) OR
+        composition drift is low right here (no composition_point sits
+        within SNAP_MS_FLOOR -- reuses the same "genuine sliver" scale
+        _snap_edge_to_seam already uses, rather than inventing a new one;
+        only engages when this file actually HAS composition points to
+        check against, never a blanket protect-everything default)."""
+        if any(c0 <= ts < c1 for c0, c1 in content_moves):
+            return True
+        if any(r0 <= ts < r1 for r0, r1 in action_runs):
+            return True
+        return bool(composition_ts) and not any(abs(ts - cp) <= SNAP_MS_FLOOR for cp in composition_ts)
+
+    blur = motion.get("blur") or []
+    seams: set = set()
+    prev_stab: Optional[str] = None
+    prev_move: Optional[str] = None
+    for k in range(n):
+        gi = lo_i + k
+        ts = gi * hop_ms
+        stab_regime, move_regime = _camera_regime_at(motion, gi, move_threshold)
+        content_here = _inside_continuous_content(ts)
+        if stab_regime == "transient" and not content_here:
+            seams.add(ts)
+        if prev_stab is not None and stab_regime != prev_stab and not content_here:
+            seams.add(ts)
+        if prev_move is not None and move_regime != prev_move:
+            seams.add(ts)                                     # move onset/offset: always a seam
+        if gi < len(blur) and blur[gi] >= REGIME_BLUR_MAX and not content_here:
+            seams.add(ts)
+        prev_stab, prev_move = stab_regime, move_regime
+
+    for p in (motion.get("transition_points") or []):
+        ts = int(p.get("ts_ms", -1))
+        if s <= ts < e:
+            seams.add(ts)
+
+    return sorted(t for t in seams if s <= t < e)
+
+
+def _snap_edge_to_seam(edge_ms: int, far_ms: int, seams: List[int]) -> int:
+    """Step 3's 25%+ms-floor reconcile rule: among ``seams``, the one
+    nearest ``edge_ms`` snaps it there IF that seam sits within SNAP_FRAC of
+    the [edge_ms, far_ms] window's own duration from ``edge_ms`` AND the
+    resulting trim is under SNAP_MS_FLOOR ms (a genuine sliver -- a clean
+    trim that loses almost nothing). Otherwise the seam sits too far into
+    real content -- ``edge_ms`` is left untouched; a cut is never forced at
+    a seam that hasn't earned it."""
+    if not seams:
+        return edge_ms
+    window_ms = abs(far_ms - edge_ms)
+    if window_ms <= 0:
+        return edge_ms
+    nearest = min(seams, key=lambda t: abs(t - edge_ms))
+    sliver_ms = abs(nearest - edge_ms)
+    if sliver_ms == 0:
+        return edge_ms
+    if sliver_ms / window_ms < SNAP_FRAC and sliver_ms < SNAP_MS_FLOOR:
+        return nearest
+    return edge_ms
 
 
 def _score_at(curve: List[float], i: int) -> float:
@@ -430,14 +695,30 @@ def _point_event(curve: List[float], span: Tuple[int, int], hop_ms: int,
             "onset_ms": onset_ms, "settle_ms": settle_ms, "span_ms": None}
 
 
-def _broad_window_for_event(event: Dict[str, Any], motion: dict, hop_ms: int,
-                            span: Tuple[int, int]) -> Tuple[int, int]:
-    """The event's own BROAD (energy=0) window -- floor/MAX_PAD-clamped and
-    quality-gate-snapped. Byte-identical to the pre-cluster _point_edges
-    formula for a point event (given the RAW onset/settle _point_event
-    produces), so a cluster of one event reproduces today's V4 span exactly.
-    A span event's own core, clamped to the working span; the representative-
-    window fallback's own bounds verbatim (already inside the span)."""
+def _broad_window_for_event(
+    event: Dict[str, Any], motion: dict, hop_ms: int, span: Tuple[int, int], seams: List[int],
+    ae_lohi: Tuple[Optional[float], Optional[float]] = (None, None),
+    rms_lohi: Tuple[Optional[float], Optional[float]] = (None, None),
+) -> Tuple[int, int]:
+    """The event's own BROAD (energy=0) window -- floor/MAX_PAD-clamped, then
+    Step 3 reconciled (each edge snapped to the nearest structural seam only
+    when it's a genuine sliver -- see ``_snap_edge_to_seam``). Backward
+    compatible by construction for a cluster of one event when ``seams`` is
+    empty (no camera/blur structure in this span at all): byte-identical to
+    the pre-Part-1 ``_point_edges`` formula. A span event's own core,
+    clamped to the working span (never snapped -- its onset/offset already
+    ARE a structural seam by construction, see ``_structural_seams``); the
+    representative-window fallback's own bounds verbatim (already inside
+    the span).
+
+    cut_content_first_segmentation.plan.md Part 4: RUN_UP_FLOOR_MS/
+    FOLLOW_THROUGH_FLOOR_MS only apply across time that itself carries energy
+    (``_has_energy_in``) -- the raw decay-walk bound (onset_ms/settle_ms) is
+    always honored regardless (that reach IS the event, floor or not); it's
+    only the FLOOR'S OWN extra reach *beyond* that raw bound (a sharp event
+    whose natural decay is narrower than the floor) that's now conditional.
+    A dead sub-region there (the "camera-start-still at the padding level"
+    bug) no longer gets padded into -- the edge trims back to the raw bound."""
     kind = event.get("kind")
     if kind == "span":
         s0, e0 = event["span_ms"]
@@ -445,12 +726,20 @@ def _broad_window_for_event(event: Dict[str, Any], motion: dict, hop_ms: int,
     if kind == "none":
         return event["onset_ms"], event["settle_ms"]
     peak = event["peak_ms"]
-    run_up = max(RUN_UP_FLOOR_MS, min(MAX_PAD_MS, peak - event["onset_ms"]))
-    follow_through = max(FOLLOW_THROUGH_FLOOR_MS, min(MAX_PAD_MS, event["settle_ms"] - peak))
+    raw_onset, raw_settle = event["onset_ms"], event["settle_ms"]
+    run_up = max(RUN_UP_FLOOR_MS, min(MAX_PAD_MS, peak - raw_onset))
+    follow_through = max(FOLLOW_THROUGH_FLOOR_MS, min(MAX_PAD_MS, raw_settle - peak))
     in_ms = max(span[0], peak - run_up)
     out_ms = min(span[1], peak + follow_through)
-    in_ms = _snap_to_quality_gate(motion, hop_ms, in_ms, span[0], peak)
-    out_ms = _snap_to_quality_gate(motion, hop_ms, out_ms, peak, span[1])
+    # Floor-only reach: the stretch beyond the raw decay bound the floor
+    # alone is responsible for. Non-empty only when the floor pushed past
+    # what the curve itself decayed to.
+    if in_ms < raw_onset and not _has_energy_in(motion, hop_ms, in_ms, raw_onset, ae_lohi, rms_lohi):
+        in_ms = raw_onset
+    if out_ms > raw_settle and not _has_energy_in(motion, hop_ms, raw_settle, out_ms, ae_lohi, rms_lohi):
+        out_ms = raw_settle
+    in_ms = _snap_edge_to_seam(in_ms, peak, seams)
+    out_ms = _snap_edge_to_seam(out_ms, peak, seams)
     return min(in_ms, peak), max(out_ms, peak)
 
 
@@ -489,15 +778,99 @@ def _dedupe_point_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return merged + others
 
 
+def _composition_events_for_span(span: Tuple[int, int], scene: dict) -> List[Dict[str, Any]]:
+    """cuts_content_first_segmentation.plan.md Part 2: scene.composition_points
+    (soft within-shot content change -- HS-histogram drift, already
+    thresholded/spaced by L1's scene_detect stage) as first-class point
+    events, so a static-camera content change (a machine advancing to a new
+    operation, a subject entering) can open a boundary even when action and
+    camera are both quiet. Each survivor's onset/settle is set DIRECTLY to
+    RUN_UP_FLOOR_MS/FOLLOW_THROUGH_FLOOR_MS (not a zero-width raw reach) --
+    deliberately independent of local action/rms/camera amplitude (Part 4's
+    energy gate): composition drift IS this event's own justification, and
+    doesn't need a second, redundant proof from a channel it was
+    specifically added to cover for. Subject to the SAME discrete
+    periodicity discipline _novelty_curve applies to action_points/onsets
+    (``_evenly_spaced``) -- an evenly-spaced run (a strobe/blinking reframe)
+    is suppressed entirely rather than spamming one boundary per flicker.
+    The underlying drift CURVE isn't persisted (only these thresholded
+    points), so unlike action/audio this can't drive a prominence-ranked
+    curve -- every surviving point is used as-is."""
+    s, e = span
+    points = [p for p in (scene.get("composition_points") or [])
+             if isinstance(p, dict) and s < int(p.get("ts_ms", -1)) < e]
+    if not points:
+        return []
+    ts_list = sorted(int(p["ts_ms"]) for p in points)
+    if _evenly_spaced(ts_list):
+        return []
+    return [
+        {"peak_ms": int(p["ts_ms"]), "score": float(p.get("score", 1.0)), "kind": "point",
+         "onset_ms": int(p["ts_ms"]) - RUN_UP_FLOOR_MS, "settle_ms": int(p["ts_ms"]) + FOLLOW_THROUGH_FLOOR_MS,
+         "span_ms": None}
+        for p in points
+    ]
+
+
+def _action_runs_and_lulls(
+    span: Tuple[int, int], motion: dict, hop_ms: int,
+    ae_lohi: Tuple[Optional[float], Optional[float]],
+) -> List[Tuple[int, int]]:
+    """cuts_content_first_segmentation.plan.md Part 3: sustained action-
+    energy STRUCTURE as a content anchor, alongside isolated novelty peaks.
+    Constant-motion footage (machinery, a continuous rally) has no isolated
+    peak to anchor on -- nothing "surprises" a flat, continuously-elevated
+    signal, so the novelty curve stays near zero throughout. A contiguous
+    clip-relative-elevated stretch (>= ACTION_RUN_MIN_MS) is one candidate
+    moment; a drop below LULL_LEVEL_FRACTION of the RUN's OWN mean level
+    (not the clip baseline) sustained for >= LULL_MIN_MS -- a lull -- splits
+    it into separate moments. Returns raw (start_ms, end_ms) candidates,
+    unfiltered against what the novelty-curve/camera-move events already
+    cover -- the caller subtracts those (this mechanism only fills the gaps
+    they leave, never double-counts a burst those already anchor)."""
+    s, e = span
+    action = _span_slice(motion.get("action_energy") or [], hop_ms, s, e)
+    ae_lo, ae_hi = ae_lohi
+    norm = [(_norm_in_clip(v, ae_lo, ae_hi) or 0.0) for v in action]
+    n = len(norm)
+    if n == 0:
+        return []
+
+    active = [v >= ACTION_RUN_BASELINE_FRACTION for v in norm]
+    out: List[Tuple[int, int]] = []
+    for run_s, run_e in _true_runs(active):
+        if (run_e - run_s) * hop_ms < ACTION_RUN_MIN_MS:
+            continue
+        run_level = sum(norm[run_s:run_e]) / (run_e - run_s)
+        if run_level <= 0:
+            continue
+        lull_thr = LULL_LEVEL_FRACTION * run_level
+        low = [norm[i] < lull_thr for i in range(run_s, run_e)]
+        lulls = [(run_s + a, run_s + b) for a, b in _true_runs(low)
+                if (b - a) * hop_ms >= LULL_MIN_MS]
+        cursor = run_s
+        for lull_s, lull_e in lulls:
+            if lull_s > cursor:
+                out.append((s + cursor * hop_ms, s + lull_s * hop_ms))
+            cursor = lull_e
+        if cursor < run_e:
+            out.append((s + cursor * hop_ms, s + run_e * hop_ms))
+    return out
+
+
 def _events_for_span(
-    span: Tuple[int, int], motion: dict, audio: dict, hop_ms: int,
+    span: Tuple[int, int], motion: dict, audio: dict, scene: dict, hop_ms: int,
     ae_lohi: Tuple[Optional[float], Optional[float]], rms_lohi: Tuple[Optional[float], Optional[float]],
+    move_threshold: float = REGIME_MAGNITUDE_MOVE_MIN,
 ) -> Tuple[List[Dict[str, Any]], float]:
     """Every salient event in one working span, plus this span's own density
-    stat. Point events (transition seams + novelty peaks) and span events
-    (every sustained camera move) all coexist -- never a first-match
-    early-exit. Falls back to one synthetic kind="none" representative-window
-    event only when nothing else fired at all."""
+    stat. Point events (transition seams + novelty peaks + composition
+    changes) and span events (every sustained camera move) all coexist --
+    never a first-match early-exit. Falls back to one synthetic kind="none"
+    representative-window event only when nothing else fired at all AND the
+    span isn't dead (_representative_window returns None on a dead span --
+    see there); a genuinely dead span then contributes NO events, and so no
+    cut, at all."""
     s, e = span
     curve = _novelty_curve(span, motion, audio, hop_ms, ae_lohi, rms_lohi)
     density = _novelty_density(curve, hop_ms)
@@ -523,20 +896,44 @@ def _events_for_span(
                 continue
             events.append(_point_event(curve, span, hop_ms, i))
 
+    # Composition changes (Part 2) -- static-camera content boundaries
+    # invisible to action/camera.
+    events.extend(_composition_events_for_span(span, scene))
+
     events = _dedupe_point_events(events)
 
     # EVERY sustained camera move -- span events (never just the longest).
-    for core_s, core_e in _camera_move_cores(motion, span, hop_ms):
+    for core_s, core_e in _camera_move_cores(motion, span, hop_ms, move_threshold):
         coh = _span_slice(motion.get("camera_coherence") or [], hop_ms, core_s, core_e)
         score = max(0.0, min(1.0, _mean(coh) or 0.0))
         events.append({"peak_ms": core_s + (core_e - core_s) // 2, "score": score,
                        "kind": "span", "onset_ms": core_s, "settle_ms": core_e,
                        "span_ms": [core_s, core_e]})
 
+    # Part 3: action runs/lulls -- fills gaps the novelty-curve/camera-move
+    # events above don't already cover (constant-motion content with no
+    # isolated peak). Subtracted against every event claimed so far, so a
+    # short isolated burst (already fully covered by its own point event's
+    # onset/settle) never also spawns a redundant run event.
+    ae_lo, ae_hi = ae_lohi
+    claimed = [(ev["onset_ms"], ev["settle_ms"]) for ev in events]
+    for run_s, run_e in _action_runs_and_lulls(span, motion, hop_ms, ae_lohi):
+        for frag_s, frag_e in _subtract((run_s, run_e), claimed):
+            if frag_e - frag_s < ACTION_RUN_LEFTOVER_MIN_MS:
+                continue
+            frag_action = _span_slice(motion.get("action_energy") or [], hop_ms, frag_s, frag_e)
+            frag_norm = [(_norm_in_clip(v, ae_lo, ae_hi) or 0.0) for v in frag_action]
+            score = max(0.0, min(1.0, _mean(frag_norm) or 0.0))
+            events.append({"peak_ms": frag_s + (frag_e - frag_s) // 2, "score": score,
+                           "kind": "span", "onset_ms": frag_s, "settle_ms": frag_e,
+                           "span_ms": [frag_s, frag_e]})
+
     if not events:
-        win_s, win_e = _representative_window(motion, span, hop_ms)
-        events.append({"peak_ms": win_s + (win_e - win_s) // 2, "score": 0.0,
-                       "kind": "none", "onset_ms": win_s, "settle_ms": win_e, "span_ms": None})
+        window = _representative_window(motion, span, hop_ms, ae_lohi, rms_lohi)
+        if window is not None:
+            win_s, win_e = window
+            events.append({"peak_ms": win_s + (win_e - win_s) // 2, "score": 0.0,
+                           "kind": "none", "onset_ms": win_s, "settle_ms": win_e, "span_ms": None})
 
     return events, density
 
@@ -565,17 +962,20 @@ def _cluster_separation_ms(gaps: List[int]) -> int:
                                        statistics.median(positive) * CLUSTER_SEPARATION_MULTIPLIER)))
 
 
-def _cluster_events(events: List[Dict[str, Any]], motion: dict, hop_ms: int,
-                    span: Tuple[int, int]) -> List[List[Dict[str, Any]]]:
+def _cluster_events(
+    events: List[Dict[str, Any]], motion: dict, hop_ms: int, span: Tuple[int, int], seams: List[int],
+    ae_lohi: Tuple[Optional[float], Optional[float]] = (None, None),
+    rms_lohi: Tuple[Optional[float], Optional[float]] = (None, None),
+) -> List[List[Dict[str, Any]]]:
     """Group one working span's events into clusters by their own BROAD
     (energy=0) window gaps -- the same window ``_broad_window_for_event``
     already computes for cluster-extent purposes, so "close enough to fuse
-    at the broadest window" is judged on the exact windows that fusion would
-    use. Always >= 1 cluster when ``events`` is non-empty."""
+    at the broadest window" is judged on the exact (seam-reconciled) windows
+    that fusion would use. Always >= 1 cluster when ``events`` is non-empty."""
     if not events:
         return []
-    windows = sorted(((_broad_window_for_event(ev, motion, hop_ms, span), ev) for ev in events),
-                     key=lambda x: x[0][0])
+    windows = sorted(((_broad_window_for_event(ev, motion, hop_ms, span, seams, ae_lohi, rms_lohi), ev)
+                      for ev in events), key=lambda x: x[0][0])
     gaps = [windows[i + 1][0][0] - windows[i][0][1] for i in range(len(windows) - 1)]
     threshold = _cluster_separation_ms(gaps)
     clusters: List[List[Dict[str, Any]]] = [[windows[0][1]]]
@@ -709,6 +1109,7 @@ def segment_video(
     rms = audio.get("rms_db") or []
     rms_hop_ms = int(audio.get("hop_ms") or 0)
     rms_lohi = _series_lohi(rms)
+    move_threshold = _clip_move_threshold(motion)
     # Resample rms onto the motion hop grid ONCE (spans share the same
     # file-wide grids) so _novelty_curve can treat both channels uniformly.
     motion = dict(motion)
@@ -720,9 +1121,15 @@ def segment_video(
 
     cuts: List[VideoCut] = []
     for span in spans:
-        events, density = _events_for_span(span, motion, audio, hop_ms, ae_lohi, rms_lohi)
-        for cluster in _cluster_events(events, motion, hop_ms, span):
-            windows = [_broad_window_for_event(ev, motion, hop_ms, span) for ev in cluster]
+        # Step 1 (structure) computed once per working span, independent of
+        # content; Step 2 (content, _events_for_span) unchanged in spirit;
+        # Step 3 (reconcile) happens inside _broad_window_for_event, which
+        # every window below already routes through.
+        seams = _structural_seams(motion, scene, span, hop_ms, ae_lohi, rms_lohi, move_threshold)
+        events, density = _events_for_span(span, motion, audio, scene, hop_ms, ae_lohi, rms_lohi, move_threshold)
+        for cluster in _cluster_events(events, motion, hop_ms, span, seams, ae_lohi, rms_lohi):
+            windows = [_broad_window_for_event(ev, motion, hop_ms, span, seams, ae_lohi, rms_lohi)
+                      for ev in cluster]
             in_ms = max(span[0], min(w[0] for w in windows))
             out_ms = min(span[1], max(w[1] for w in windows))
             if out_ms <= in_ms:

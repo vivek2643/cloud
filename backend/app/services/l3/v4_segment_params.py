@@ -62,11 +62,98 @@ RUN_UP_FLOOR_MS = 300
 FOLLOW_THROUGH_FLOOR_MS = 500
 MAX_PAD_MS = 3000
 
-# Camera-quality edge snap (Step 4): search this far around a computed edge
-# for a cleaner instant (a whip/bump -- low camera_stability -- or a blurred
-# frame) to land on instead, so an edge never freezes mid-smooth-move.
-EDGE_SNAP_SEARCH_MS = 300
+# Camera-quality edge snap floor: a hop at/below this camera_stability reads
+# as a whip/bump (a clean place to cut) rather than a smooth in-progress
+# move. Shared with the Step-1 structural regime classification below
+# (REGIME_STABILITY_TRANSIENT_MAX) -- same physical meaning, one name would
+# be redundant to invent twice.
 EDGE_SNAP_STABILITY_MAX = 0.4
+
+# --------------------------------------------------------------------------
+# cut_structure_and_scene_specificity.plan.md Part 1: structure-first camera-
+# regime classification -- WHERE it is visually clean to cut, independent of
+# content. Reuses the SAME physical thresholds already established just
+# above (EDGE_SNAP_STABILITY_MAX) and for deliberate-move classification
+# (CAMERA_MOVE_COHERENCE_MIN / CAMERA_MOVE_MAGNITUDE_MIN) rather than
+# inventing new numbers with the same meaning.
+# --------------------------------------------------------------------------
+
+# A hop's camera_stability at/below this reads as "transient" (whip/bump) --
+# the same bar the old edge-quality snap used.
+REGIME_STABILITY_TRANSIENT_MAX = EDGE_SNAP_STABILITY_MAX
+# A hop's |dx|+|dy|+|zoom| at/above this AND camera_coherence at/above this
+# reads as a deliberate "coherent-move"; below the magnitude floor it's a
+# "static-hold"; above the magnitude floor but below the coherence floor
+# it's "shake" (moving, but not as one rigid gesture).
+REGIME_MAGNITUDE_MOVE_MIN = CAMERA_MOVE_MAGNITUDE_MIN
+REGIME_COHERENCE_MOVE_MIN = CAMERA_MOVE_COHERENCE_MIN
+# blur is already clip-relative at the source (motion_dynamics: 1 - sharp /
+# the clip's own reference-percentile sharpness), so a fixed 0..1 threshold
+# is meaningful the same way EDGE_SNAP_STABILITY_MAX is: a hop at/above this
+# reads as visibly softer than the clip's own typical sharpness.
+REGIME_BLUR_MAX = 0.5
+
+# cuts_content_first_segmentation.plan.md Part 1: clip-relative camera-move
+# gate. REGIME_MAGNITUDE_MOVE_MIN (0.03, absolute) never clears for aerial/
+# drone flow (~50x smaller) -- _clip_move_threshold instead reads a hop as
+# "moving" once it clears a robust HIGH percentile of THIS clip's own
+# |dx|+|dy|+|zoom| magnitude series, scaled by MOVE_RELATIVE_FRACTION.
+MOVE_MAGNITUDE_PERCENTILE_LO = 0.25
+MOVE_MAGNITUDE_PERCENTILE_HI = 0.75
+MOVE_RELATIVE_FRACTION = 0.5
+# Minimum absolute magnitude a hop must ALSO clear regardless of the clip-
+# relative math -- far below REGIME_MAGNITUDE_MOVE_MIN, but still well above
+# pure optical-flow roundoff/sensor noise.
+MOVE_ABSOLUTE_FLOOR = 0.008
+# The clip's own high percentile must clear this many multiples of its low
+# percentile (or the absolute floor, whichever's larger) to count as genuine
+# motion SPREAD -- otherwise (a uniformly near-zero, truly locked/still
+# clip) the relative gate is skipped entirely and REGIME_MAGNITUDE_MOVE_MIN
+# is used unchanged, so sensor noise is never promoted to "a move."
+MOVE_SPREAD_RATIO_MIN = 2.5
+
+# cuts_content_first_segmentation.plan.md Part 3: action-energy STRUCTURE
+# (peaks -> peaks + runs/lulls) -- a separate, coarser anchor from the
+# novelty curve's local-contrast peaks, for constant-motion content with no
+# isolated peak to stand out against (nothing "surprises" a flat,
+# continuously-elevated signal). Deliberately conservative -- start with
+# fewer, cleaner edges; calibrate against the harness, not by eye (the
+# plan's own instruction).
+# A hop counts as "in an active run" once clip-normalized action clears this
+# fraction of the clip's own range.
+ACTION_RUN_BASELINE_FRACTION = 0.3
+# A run shorter than this is noise, never its own "moment."
+ACTION_RUN_MIN_MS = 800
+# Within a run, a drop below this fraction of the RUN's OWN mean level (not
+# the clip baseline) is a candidate lull -- splits the run into separate
+# moments.
+LULL_LEVEL_FRACTION = 0.4
+# A dip shorter than this is wobble, not a real lull.
+LULL_MIN_MS = 600
+# After subtracting whatever the novelty-curve/camera-move events already
+# cover (this mechanism only fills gaps they leave -- never double-counts a
+# burst/pan those already anchor), a surviving fragment shorter than this
+# isn't its own moment either.
+ACTION_RUN_LEFTOVER_MIN_MS = 500
+
+# A working span is "dead" (nothing salient anywhere, not even a quiet
+# blink) when its peak clip-normalized action_energy AND peak clip-
+# normalized rms both sit below this floor, AND no hop even reaches
+# REGIME_MAGNITUDE_MOVE_MIN of camera motion. Distinct from low NOVELTY (a
+# periodic/blinking signal has real amplitude but scores low on contrast --
+# see _novelty_curve's periodicity discount; that still gets a "none"-kind
+# representative cut). A genuinely dead span now produces NO event at all
+# (the camera-start-still fix) rather than a fabricated "steadiest instant."
+DEAD_ENERGY_FLOOR = 0.15
+
+# Step 3 reconcile: a content event's padded edge only snaps to a nearby
+# structural seam when the seam sits within this fraction of the edge's own
+# padded window duration (a genuine sliver, not real content) AND the
+# resulting trim is under SNAP_MS_FLOOR ms -- both must hold, so a short
+# window isn't gutted just because a seam happens to sit proportionally
+# close. Otherwise the seam sits inside real content and is left alone.
+SNAP_FRAC = 0.25
+SNAP_MS_FLOOR = 400
 
 # Consolidation floor (Step 5): two anchors' cuts closer than this merge into
 # one (content-aware only in the loose sense that it's the same perceptual

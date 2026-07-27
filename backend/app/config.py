@@ -149,6 +149,24 @@ class Settings(BaseSettings):
     # Only affects the gemini pass-2 path.
     ingest_pass2_thinking: str = "low"
 
+    # cut_structure_and_scene_specificity.plan.md Part 3: the two-pass scene-
+    # specificity enrichment (runs AFTER cuts are shown, background, never
+    # blocks ingest). Middle text layer -- one TEXT-only, no-re-ask call on a
+    # CAPABLE model (quality matters here: it infers the project's domain and
+    # writes the targeted questions Pass B answers) that turns Pass A's
+    # generic summaries into sharp, footage-derived questions.
+    ingest_scene_text_model: str = "gemini-3.1-pro-preview"
+    # Pass B -- targeted vision, one call per taxonomy cluster, small output.
+    # flash/flash-lite is enough: it's answering a SPECIFIC, already-written
+    # question against a couple of frames, not inferring the domain itself.
+    ingest_pass_b_model: str = "gemini-3.1-flash-lite"
+    ingest_pass_b_thinking: str = "low"
+    # Short-TTL safety net for the Part 3 CachedContent (system + gist +
+    # taxonomy) -- deleted on completion regardless; this only bounds the
+    # cost of a crash between creation and that delete. "Never hold a
+    # provider cache idle" (locked decision) -- keep this short.
+    ingest_scene_cache_ttl_seconds: int = 1800
+
     # scale_architecture.plan.md Pillar 4: PROACTIVE limiter on in-flight LLM
     # calls, per provider -- separate from llm/client.py's existing REACTIVE
     # retry (backoff on a 429/5xx after it happens). Without this, bumping
