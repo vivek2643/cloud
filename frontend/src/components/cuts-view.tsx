@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAuthStore } from "@/stores/auth-store";
 import { useDriveStore } from "@/stores/drive-store";
+import { useTimelineView } from "@/stores/timeline-view";
+import { useEditDocStore } from "@/stores/edit-doc-store";
 import {
   createProject,
   kickIngest,
@@ -18,6 +20,7 @@ import { cn } from "@/lib/utils";
 import {
   Sparkles,
   Play,
+  Plus,
   ChevronDown,
   Check,
   GripVertical,
@@ -394,6 +397,21 @@ function cropForAspect(cut: CutRecord, aspect: Aspect): [number, number, number,
 export function CutsView() {
   const token = useAuthStore((s) => s.session?.access_token);
   const files = useDriveStore((s) => s.files);
+  // "Snap" mode (toggled on the timeline toolbar): clicking a cut appends it
+  // straight onto the timeline spine, so an edit can be built by clicking.
+  const snapAddEnabled = useTimelineView((s) => s.snapAddEnabled);
+  const addSegment = useEditDocStore((s) => s.addSegment);
+  const [addToast, setAddToast] = useState<string | null>(null);
+  const addToastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const addToTimeline = useCallback(
+    (c: CutRecord, inMs: number, outMs: number) => {
+      addSegment({ file_id: c.file_id, in_ms: inMs, out_ms: outMs });
+      setAddToast("Added to timeline");
+      if (addToastTimer.current) clearTimeout(addToastTimer.current);
+      addToastTimer.current = setTimeout(() => setAddToast(null), 1200);
+    },
+    [addSegment]
+  );
   const [aspect, setAspect] = useState<Aspect>("landscape");
   const [fit, setFit] = useState<"adjusted" | "original">("adjusted");
   // Pace: pick ONE shared pace level for the whole project. Because pace.levels[i]
@@ -769,6 +787,18 @@ export function CutsView() {
         <EnergyBar value={energy} onChange={setEnergy} />
       </div>
 
+      {snapAddEnabled && (
+        <div
+          className="mb-6 flex items-center gap-2 rounded-lg border px-4 py-2.5 text-sm"
+          style={{ borderColor: "var(--accent)", background: "var(--accent-soft)", color: "var(--foreground)" }}
+        >
+          <Sparkles size={14} style={{ color: "var(--accent)" }} />
+          <span>
+            <span className="font-medium">Snap on</span> — click any cut to add it to the timeline.
+          </span>
+        </div>
+      )}
+
       <GenerationStatus mode={genMode} run={run} />
 
       {loading && !data && (
@@ -860,6 +890,8 @@ export function CutsView() {
                             onActivate={() => setActiveKey(cutKey(c))}
                             onDeactivate={() => setActiveKey((k) => (k === cutKey(c) ? null : k))}
                             takeCount={takeCount}
+                            snapAdd={snapAddEnabled}
+                            onSnapAdd={(inMs, outMs) => addToTimeline(c, inMs, outMs)}
                           />
                         )}
                       </div>
@@ -869,6 +901,15 @@ export function CutsView() {
               </div>
             );
           })}
+        </div>
+      )}
+
+      {addToast && (
+        <div
+          className="pointer-events-none fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-full px-4 py-2 text-sm font-medium shadow-lg"
+          style={{ background: "var(--accent)", color: "var(--background)" }}
+        >
+          {addToast}
         </div>
       )}
     </div>
@@ -1230,6 +1271,8 @@ function CutCard({
   onActivate,
   onDeactivate,
   takeCount,
+  snapAdd,
+  onSnapAdd,
 }: {
   file?: FileRecord;
   cut: CutRecord;
@@ -1246,6 +1289,8 @@ function CutCard({
   onActivate: () => void;
   onDeactivate: () => void;
   takeCount: number;
+  snapAdd?: boolean;
+  onSnapAdd?: (inMs: number, outMs: number) => void;
 }) {
   const [playUrl, setPlayUrl] = useState<string | null>(null);
   const [muted, setMuted] = useState(false);
@@ -1424,7 +1469,15 @@ function CutCard({
       className="shrink-0 first:ml-0"
     >
       <div
-        onClick={onToggle}
+        onClick={() => {
+          // Snap mode: a click builds the timeline (append this cut) instead of
+          // toggling selection.
+          if (snapAdd && file) {
+            onSnapAdd?.(inMs, outMs);
+            return;
+          }
+          onToggle();
+        }}
         onMouseEnter={() => {
           onActivate();
           ensureUrl();
@@ -1510,12 +1563,22 @@ function CutCard({
           </button>
         )}
 
-        <span
-          className="pointer-events-none absolute left-1/2 top-1/2 z-10 flex h-11 w-11 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full opacity-100 shadow-lg transition-opacity group-hover:opacity-0"
-          style={{ background: "var(--accent)" }}
-        >
-          <Play size={20} className="ml-0.5" fill="currentColor" style={{ color: "var(--background)" }} />
-        </span>
+        {snapAdd ? (
+          <span
+            className="pointer-events-none absolute left-1/2 top-1/2 z-10 flex h-11 w-11 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full opacity-90 shadow-lg transition-transform group-hover:scale-110"
+            style={{ background: "var(--accent)" }}
+            title="Add to timeline"
+          >
+            <Plus size={22} style={{ color: "var(--background)" }} />
+          </span>
+        ) : (
+          <span
+            className="pointer-events-none absolute left-1/2 top-1/2 z-10 flex h-11 w-11 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full opacity-100 shadow-lg transition-opacity group-hover:opacity-0"
+            style={{ background: "var(--accent)" }}
+          >
+            <Play size={20} className="ml-0.5" fill="currentColor" style={{ color: "var(--background)" }} />
+          </span>
+        )}
 
         <span className="absolute bottom-2 right-2 z-10 rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-medium text-white">
           {fmtDur(playedMs)}
