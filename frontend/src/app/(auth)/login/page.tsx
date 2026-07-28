@@ -30,7 +30,7 @@ export default function LoginPage() {
         return;
       }
 
-      router.push("/drive");
+      router.push("/drive?intro=1");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong");
     } finally {
