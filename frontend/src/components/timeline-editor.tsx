@@ -137,6 +137,7 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
   const pxPerSec = useTimelineView((s) => s.pxPerSec);
   const scrollLeftPx = useTimelineView((s) => s.scrollLeftPx);
   const snapEnabled = useTimelineView((s) => s.snapEnabled);
+  const snapAddEnabled = useTimelineView((s) => s.snapAddEnabled);
   const snapGuideMs = useTimelineView((s) => s.snapGuideMs);
   const trackMeta = useTimelineView((s) => s.trackMeta);
   const clipboard = useTimelineView((s) => s.clipboard);
@@ -144,6 +145,7 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
   const zoomToFit = useTimelineView((s) => s.zoomToFit);
   const setScrollLeft = useTimelineView((s) => s.setScrollLeft);
   const toggleSnap = useTimelineView((s) => s.toggleSnap);
+  const toggleSnapAdd = useTimelineView((s) => s.toggleSnapAdd);
   const setSnapGuide = useTimelineView((s) => s.setSnapGuide);
   const setTrackMeta = useTimelineView((s) => s.setTrackMeta);
   const setClipboard = useTimelineView((s) => s.setClipboard);
@@ -911,9 +913,10 @@ export function TimelineEditor({ ensureThread }: { ensureThread: () => Promise<s
           (the most-used controls); right: focus mode + zoom + timecode
           (editor_ui.plan.md SS1.3) */}
       <div className="flex shrink-0 items-center gap-1">
-        <IconBtn active={snapEnabled} title="Snap (S)" onClick={toggleSnap}>
+        <IconBtn active={snapEnabled} title="Snap to grid (S)" onClick={toggleSnap}>
           <Magnet size={14} />
         </IconBtn>
+        <SnapAddToggle enabled={snapAddEnabled} onToggle={toggleSnapAdd} />
         <Divider />
         <IconBtn title="Undo (⌘Z)" onClick={undo} disabled={!canUndo}>
           <Undo2 size={14} />
@@ -1619,6 +1622,35 @@ function IconBtn({
 
 function TextTag({ children }: { children: React.ReactNode }) {
   return <span className="px-0.5 text-[10px] font-semibold">{children}</span>;
+}
+
+/** "Snap" mode: a labeled pill switch. When ON, clicking a cut in the Cuts
+ * view appends it straight onto the timeline (build-by-clicking instead of
+ * drag). Distinct from the magnet "snap to grid" above. */
+function SnapAddToggle({ enabled, onToggle }: { enabled: boolean; onToggle: () => void }) {
+  return (
+    <button
+      onClick={onToggle}
+      title="Snap — click a cut in the Cuts view to add it to the timeline"
+      className="flex items-center gap-1.5 rounded-md px-1.5 py-1 text-[11px] font-medium transition-colors hover:bg-[var(--accent-soft)]"
+      style={{ color: enabled ? "var(--foreground)" : "var(--muted)" }}
+    >
+      <span>Snap</span>
+      <span
+        className="relative inline-flex h-[16px] w-[28px] shrink-0 items-center rounded-full transition-colors"
+        style={{ background: enabled ? "var(--accent)" : "var(--border)" }}
+      >
+        <span
+          className="absolute h-3 w-3 rounded-full transition-transform"
+          style={{
+            left: 2,
+            transform: enabled ? "translateX(12px)" : "translateX(0)",
+            background: enabled ? "var(--background)" : "var(--muted)",
+          }}
+        />
+      </span>
+    </button>
+  );
 }
 
 function Divider() {

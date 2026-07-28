@@ -34,6 +34,11 @@ interface TimelineViewState {
   pxPerSec: number;
   scrollLeftPx: number;
   snapEnabled: boolean;
+  /** "Snap-add" mode: when on, CLICKING a cut in the Cuts view appends it to
+   * the timeline (spine) — a click-to-build affordance that avoids drag. Kept
+   * here (view state, not render truth) so both the timeline toolbar toggle and
+   * the Cuts view read the same flag. */
+  snapAddEnabled: boolean;
   /** Ms currently highlighted as the active snap target during a drag (null = none). */
   snapGuideMs: number | null;
   trackMeta: Record<string, TrackMeta>;
@@ -60,6 +65,7 @@ interface TimelineViewState {
   zoomToFit: (viewportPx: number, totalMs: number) => void;
   setScrollLeft: (px: number) => void;
   toggleSnap: () => void;
+  toggleSnapAdd: () => void;
   setSnapGuide: (ms: number | null) => void;
   setTrackMeta: (trackId: string, patch: Partial<TrackMeta>) => void;
   setClipboard: (entries: ClipboardEntry[]) => void;
@@ -76,6 +82,7 @@ export const useTimelineView = create<TimelineViewState>((set) => ({
   pxPerSec: DEFAULT_PX_PER_SEC,
   scrollLeftPx: 0,
   snapEnabled: true,
+  snapAddEnabled: false,
   snapGuideMs: null,
   trackMeta: {},
   clipboard: [],
@@ -93,6 +100,7 @@ export const useTimelineView = create<TimelineViewState>((set) => ({
   },
   setScrollLeft: (px) => set({ scrollLeftPx: Math.max(0, px) }),
   toggleSnap: () => set((s) => ({ snapEnabled: !s.snapEnabled })),
+  toggleSnapAdd: () => set((s) => ({ snapAddEnabled: !s.snapAddEnabled })),
   setSnapGuide: (ms) => set({ snapGuideMs: ms }),
   setTrackMeta: (trackId, patch) =>
     set((s) => ({
