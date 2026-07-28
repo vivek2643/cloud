@@ -2,12 +2,14 @@
 
 import { useEffect, useRef, useState } from "react";
 
-// Plays the brand logo animation (public/logo_animation.mp4) as a full-screen
-// intro the FIRST time you enter the platform in a browser session. It fades
-// out on end / click / a safety timeout, and never blocks the app: any autoplay
-// or decode failure dismisses it immediately. Session-scoped (sessionStorage)
-// so it plays once on entry, not on every in-app navigation.
-const SEEN_KEY = "edso-intro-seen";
+// Plays the brand logo animation (public/logo_animation.mp4) ONLY when you
+// arrive at /drive from an entry point (sign-in, sign-up, OAuth callback, or a
+// home-page CTA). Those redirects tag the URL with `?intro=1`; this overlay
+// plays once, then strips the tag. Navigating within the app (e.g. a folder ->
+// drive) never carries the tag, so the logo doesn't replay.
+//
+// It never blocks the app: any autoplay/decode failure dismisses immediately,
+// and a safety timeout always tears it down.
 const MAX_MS = 7000;
 
 export function IntroOverlay() {
@@ -17,8 +19,16 @@ export function IntroOverlay() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    if (window.sessionStorage.getItem(SEEN_KEY)) return;
-    window.sessionStorage.setItem(SEEN_KEY, "1");
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("intro") !== "1") return;
+    // Strip the tag so a refresh / back-forward doesn't replay it.
+    params.delete("intro");
+    const qs = params.toString();
+    window.history.replaceState(
+      null,
+      "",
+      window.location.pathname + (qs ? `?${qs}` : "")
+    );
     setShow(true);
   }, []);
 
