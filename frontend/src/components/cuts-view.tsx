@@ -423,6 +423,10 @@ export function CutsView() {
   const [filter, setFilter] = useState<FilterKey>("all");
   const [showDiscarded, setShowDiscarded] = useState(false);
   const [showMicro, setShowMicro] = useState(false);
+  // Takes view: "all" shows every take/angle; "best" keeps only the winning
+  // take of each same-beat group (singletons — cuts with no take group — always
+  // stay). Lets the strip read as a clean best-of edit.
+  const [takesMode, setTakesMode] = useState<"all" | "best">("all");
   // Energy dial (cuts_v3_boundaries_v2.plan.md §D). 0 = full grounded span,
   // 1 = tightest (negative padding toward the anchor). Pure view-math over the
   // stored pace envelope -- never re-fetches or re-ingests. Defaults to the
@@ -603,6 +607,21 @@ export function CutsView() {
     return byGroup;
   }, [cuts]);
 
+  // "Best takes": the one cut to keep per same-beat group. Prefer the model's
+  // flagged winner; fall back to the earliest cut in the group so a group with
+  // no explicit winner never disappears. Cuts with no take_group_id are their
+  // own "best" and are always kept.
+  const bestTakeIds = useMemo(() => {
+    const keep = new Set<string>();
+    for (const c of cuts) if (!c.take_group_id) keep.add(c.id);
+    for (const list of Object.values(takeGroups)) {
+      const winner = list.find((c) => c.take_role === "winner");
+      const chosen = winner ?? [...list].sort((a, b) => a.src_in_ms - b.src_in_ms)[0];
+      if (chosen) keep.add(chosen.id);
+    }
+    return keep;
+  }, [cuts, takeGroups]);
+
   // Every take is shown -- we do NOT pick a "best" one. take_group_id still
   // tags which cuts are the same beat captured more than once (a retake or
   // another angle), surfaced as a passive badge so the editor can see the
@@ -643,9 +662,13 @@ export function CutsView() {
   const baseCuts = useMemo(
     () =>
       cuts.filter(
-        (c) => filesById[c.file_id] && (showDiscarded || !c.junk) && (showMicro || !isMicro(c))
+        (c) =>
+          filesById[c.file_id] &&
+          (showDiscarded || !c.junk) &&
+          (showMicro || !isMicro(c)) &&
+          (takesMode === "all" || bestTakeIds.has(c.id))
       ),
-    [cuts, filesById, showDiscarded, showMicro, isMicro]
+    [cuts, filesById, showDiscarded, showMicro, isMicro, takesMode, bestTakeIds]
   );
   const counts = useMemo(() => {
     const c: Record<string, number> = {};
@@ -760,6 +783,11 @@ export function CutsView() {
               const found = (Object.keys(PACE_LABEL) as PaceMode[]).find((k) => PACE_LABEL[k] === v);
               if (found) setPaceMode(found);
             }}
+          />
+          <PillDropdown
+            options={["All takes", "Best takes"]}
+            value={takesMode === "best" ? "Best takes" : "All takes"}
+            onChange={(v) => setTakesMode(v === "Best takes" ? "best" : "all")}
           />
           <TrayToggle
             active={showDiscarded}
