@@ -13,6 +13,31 @@ class Settings(BaseSettings):
     r2_secret_access_key: str
     r2_bucket_name: str = "aerodrive"
 
+    # --- LOCAL-DEV DATA ISOLATION (opt-in, default == production) ---------
+    # A separate Postgres SCHEMA to point ALL app tables + the Procrastinate
+    # queue tables at, so local development never reads/writes production's
+    # `public` tables or shares its job queue -- while production keeps using
+    # `public`. UNSET (empty) is the PRODUCTION default: no search_path is
+    # set on any connection, the Supabase (PostgREST) client stays on its
+    # default schema, and the migration ledger stays `public.schema_migrations`
+    # -- i.e. byte-for-byte today's behavior. Set to e.g. "dev" ONLY in a
+    # local .env to flip local dev onto an isolated schema. The Supabase
+    # `auth` schema stays shared regardless (same users locally + in prod).
+    # NOTE: routing the Supabase/PostgREST client to a non-`public` schema
+    # ALSO requires exposing that schema in Supabase (Project Settings -> API
+    # -> Exposed schemas); psycopg/Procrastinate only need the schema to exist.
+    db_schema: str = ""
+
+    # Object-key PREFIX prepended to every R2 key at the storage boundary
+    # (app/services/r2.py, app/services/processing.py) so local dev media
+    # lives under its own keyspace (e.g. "dev/raw/...") and can never read,
+    # overwrite, or (cascade-)delete a production object. UNSET (empty) is the
+    # PRODUCTION default: keys are used verbatim, exactly as today. Stored DB
+    # keys stay "logical" (unprefixed); the prefix is applied transparently on
+    # every get/put/delete/multipart op, so a delete can only ever target
+    # `<prefix>/<key>` and never a bare production key.
+    r2_key_prefix: str = ""
+
     # Session/direct Postgres connection string -- Procrastinate (LISTEN/
     # NOTIFY) and the migration runner's advisory lock (session-scoped,
     # needs one pinned backend connection) MUST stay on this route, never
@@ -211,6 +236,33 @@ class Settings(BaseSettings):
     @property
     def r2_endpoint(self) -> str:
         return f"https://{self.r2_account_id}.r2.cloudflarestorage.com"
+
+    @property
+    def effective_db_schema(self) -> str:
+        """The schema unqualified DB access resolves to: DB_SCHEMA when set,
+        else "public" (production)."""
+        return self.db_schema.strip() or "public"
+
+    @property
+    def pg_options(self) -> str:
+        """libpq `options` connection parameter that pins the session
+        search_path to DB_SCHEMA (with `public` kept as a fallback so
+        extensions -- uuid-ossp/vector/pg_trgm -- and their types/functions
+        still resolve). Returns "" when DB_SCHEMA is unset, so callers pass NO
+        options and behave byte-for-byte like production. `public` stays in the
+        path only as a fallback; every app + Procrastinate table is created in
+        DB_SCHEMA by the schema-aware migration runner, so unqualified names
+        resolve there first."""
+        schema = self.db_schema.strip()
+        if not schema:
+            return ""
+        return f"-c search_path={schema},public"
+
+    def pg_connect_kwargs(self) -> dict:
+        """Extra psycopg connect kwargs to isolate this process onto DB_SCHEMA.
+        Empty dict when DB_SCHEMA is unset (production: pass nothing)."""
+        opts = self.pg_options
+        return {"options": opts} if opts else {}
 
     model_config = {"env_file": "../.env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
