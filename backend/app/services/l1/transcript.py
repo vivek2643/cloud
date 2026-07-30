@@ -49,6 +49,10 @@ class Word:
     end_ms: int
     text: str
     is_filler: bool = False
+    # Whisper's own per-word confidence (0..1). A strong articulation/clarity
+    # proxy for downstream take-selection -- low confidence tracks mumbled or
+    # off-mic delivery. None for older transcripts predating this capture.
+    probability: Optional[float] = None
 
 
 @dataclass
@@ -57,6 +61,10 @@ class Segment:
     end_ms: int
     text: str
     words: List[Word] = field(default_factory=list)
+    # Segment-level Whisper confidence: mean token log-prob (higher == more
+    # confident) and P(no speech here). Both None for older transcripts.
+    avg_logprob: Optional[float] = None
+    no_speech_prob: Optional[float] = None
 
 
 @dataclass
@@ -108,18 +116,24 @@ def transcribe(wav_path: str) -> TranscriptResult:
         words: List[Word] = []
         if seg.words:
             for w in seg.words:
+                w_prob = getattr(w, "probability", None)
                 wm = Word(
                     start_ms=int((w.start or 0) * 1000),
                     end_ms=int((w.end or 0) * 1000),
                     text=w.word.strip() if w.word else "",
+                    probability=float(w_prob) if w_prob is not None else None,
                 )
                 words.append(wm)
                 all_words.append(wm)
+        seg_logprob = getattr(seg, "avg_logprob", None)
+        seg_nospeech = getattr(seg, "no_speech_prob", None)
         s = Segment(
             start_ms=int(seg.start * 1000),
             end_ms=int(seg.end * 1000),
             text=seg.text.strip(),
             words=words,
+            avg_logprob=float(seg_logprob) if seg_logprob is not None else None,
+            no_speech_prob=float(seg_nospeech) if seg_nospeech is not None else None,
         )
         segments.append(s)
         full_text_parts.append(s.text)
@@ -258,12 +272,15 @@ def serialize_segments(segments: Iterable[Segment]) -> list:
             "start_ms": s.start_ms,
             "end_ms": s.end_ms,
             "text": s.text,
+            "avg_logprob": s.avg_logprob,
+            "no_speech_prob": s.no_speech_prob,
             "words": [
                 {
                     "start_ms": w.start_ms,
                     "end_ms": w.end_ms,
                     "text": w.text,
                     "is_filler": w.is_filler,
+                    "probability": w.probability,
                 }
                 for w in s.words
             ],
