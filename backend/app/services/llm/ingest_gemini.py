@@ -271,6 +271,19 @@ def _diag(resp: Any) -> str:
             f"think_tok={getattr(um, 'thoughts_token_count', None)}")
 
 
+def _top_array_field(schema: Type[BaseModel]) -> Optional[str]:
+    """The name of the schema's single top-level array field -- "cuts" for
+    Pass2BatchOutput, "answers" for the speech FrameSchema. Lets the re-ask
+    correction name the RIGHT wrapper key instead of a hardcoded {"cuts"},
+    which only ever helped the video pass. Returns None (caller keeps the
+    "cuts" default) for a schema with no top-level array."""
+    props = schema.model_json_schema().get("properties") or {}
+    for name, spec in props.items():
+        if isinstance(spec, dict) and spec.get("type") == "array":
+            return name
+    return None
+
+
 def _parse_raw(resp: Any) -> Optional[Dict[str, Any]]:
     text = _response_text(resp).strip()
     if not text:
@@ -288,9 +301,34 @@ def _parse_raw(resp: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+# pass1_video_input.plan.md section 4.4: "low"/"medium"/"high" -> the SDK's
+# MediaResolution enum member NAME. Mirrors _resolve_thinking_budget's
+# degrade-gracefully contract -- an unrecognized value logs and is ignored
+# (Gemini's own default) rather than raising.
+_MEDIA_RESOLUTIONS = {
+    "low": "MEDIA_RESOLUTION_LOW", "medium": "MEDIA_RESOLUTION_MEDIUM", "high": "MEDIA_RESOLUTION_HIGH",
+}
+
+
+def _resolve_media_resolution(types: Any, media_resolution: Optional[str]) -> Optional[Any]:
+    if not media_resolution:
+        return None
+    key = str(media_resolution).strip().lower()
+    name = _MEDIA_RESOLUTIONS.get(key)
+    if name is None:
+        logger.warning("ingest_gemini: unrecognized media_resolution=%r, ignoring", media_resolution)
+        return None
+    try:
+        return getattr(types.MediaResolution, name)
+    except Exception:
+        logger.exception("ingest_gemini: failed to resolve MediaResolution %s; continuing without it", name)
+        return None
+
+
 def _build_config(
     types: Any, schema: Type[BaseModel], system: str, max_tokens: int,
     thinking: Optional[str], cached_content: Optional[str],
+    media_resolution: Optional[str] = None,
 ) -> Any:
     kwargs: Dict[str, Any] = {
         "max_output_tokens": max_tokens,
@@ -308,6 +346,9 @@ def _build_config(
     tc = _thinking_config(types, thinking)
     if tc is not None:
         kwargs["thinking_config"] = tc
+    mr = _resolve_media_resolution(types, media_resolution)
+    if mr is not None:
+        kwargs["media_resolution"] = mr
     return types.GenerateContentConfig(**kwargs)
 
 
@@ -318,6 +359,29 @@ def _build_config(
 # fail the whole run. Small backoff, scaled by attempt.
 _EMPTY_RETRIES = 2
 _EMPTY_BACKOFF_S = 1.0
+
+# Transient infra-error retry (distinct from the empty-output retry above and
+# from a schema disagreement): Gemini intermittently returns 503 UNAVAILABLE /
+# 500 INTERNAL / 429 RESOURCE_EXHAUSTED ("overloaded"), especially under the
+# fan-out of a whole-project Pass-1 batch. These are NOT a degraded result to
+# fall back from -- the SAME request retried yields the SAME real answer -- so
+# we retry with exponential backoff rather than aborting the run. This is
+# resilience, not a fallback (nothing is substituted).
+_TRANSIENT_RETRIES = 4
+_TRANSIENT_BACKOFF_S = 2.0
+_TRANSIENT_CODES = {429, 500, 502, 503, 504}
+_TRANSIENT_MARKERS = ("UNAVAILABLE", "RESOURCE_EXHAUSTED", "INTERNAL",
+                      "DEADLINE", "OVERLOADED", "TRY AGAIN", "TEMPORARILY")
+
+
+def _is_transient(exc: Exception) -> bool:
+    code = getattr(exc, "code", None)
+    if not isinstance(code, int):
+        code = getattr(exc, "status_code", None)
+    if isinstance(code, int) and code in _TRANSIENT_CODES:
+        return True
+    msg = str(exc).upper()
+    return any(m in msg for m in _TRANSIENT_MARKERS)
 
 
 def complete_gemini(
@@ -331,6 +395,7 @@ def complete_gemini(
     model: Optional[str] = None,
     thinking: Optional[str] = None,
     cached_content: Optional[str] = None,
+    media_resolution: Optional[str] = None,
 ) -> Completion:
     """Gemini's structured-output equivalent of ``client.complete()`` --
     same contract (``Completion``, one re-ask then ``IngestFailure``, an
@@ -340,7 +405,9 @@ def complete_gemini(
     ``CachedContent`` resource name (P4, see ``create_pass2_cache``); when
     given, ``blocks`` should be ONLY the per-call (uncached) content -- the
     cache already carries the system instruction and any content baked into
-    it at creation time."""
+    it at creation time. ``media_resolution`` ("low"/"medium"/"high",
+    pass1_video_input.plan.md section 4.4) is a video/image token-density
+    knob -- None leaves the SDK's own default."""
     settings = get_settings()
     client, types = _sdk()
     resolved_model = model or settings.ingest_pass2_model
@@ -348,10 +415,23 @@ def complete_gemini(
     all_blocks = list(blocks) + list(extra_blocks or [])
     parts = _parts_for_content(all_blocks, types, {})
     contents = [types.Content(role="user", parts=parts)]
-    config = _build_config(types, schema, system, max_tokens, thinking, cached_content)
+    config = _build_config(types, schema, system, max_tokens, thinking, cached_content, media_resolution)
 
     def _gen(call_contents: Any) -> Any:
-        return client.models.generate_content(model=resolved_model, contents=call_contents, config=config)
+        last: Optional[Exception] = None
+        for attempt in range(_TRANSIENT_RETRIES + 1):
+            try:
+                return client.models.generate_content(
+                    model=resolved_model, contents=call_contents, config=config)
+            except Exception as exc:  # noqa: BLE001
+                if not _is_transient(exc) or attempt == _TRANSIENT_RETRIES:
+                    raise
+                last = exc
+                delay = _TRANSIENT_BACKOFF_S * (2 ** attempt)
+                logger.warning("ingest_gemini: transient model error (%s); retry %d/%d in %.1fs",
+                               str(exc)[:160], attempt + 1, _TRANSIENT_RETRIES, delay)
+                time.sleep(delay)
+        raise last  # unreachable
 
     def _gen_with_empty_retry(call_contents: Any, label: str) -> tuple[Any, Any, Dict[str, int]]:
         """One structured call, retried ONLY on an empty/no-output response
@@ -389,10 +469,18 @@ def complete_gemini(
         return Completion(data=parsed.model_dump(), usage=usage, attempts=1)
 
     logger.warning("ingest_gemini: schema/semantic violation, re-asking once: %s", err)
+    # Name the schema's OWN wrapper key + item noun so the correction actually
+    # helps non-cuts callers (the speech FrameSchema is {"answers": [...]});
+    # for the {"cuts"} schema this reproduces the original message verbatim, so
+    # the proven video path is byte-for-byte unchanged.
+    array_field = _top_array_field(schema) or "cuts"
+    item_hint = ("one cut per shown source_ref" if array_field == "cuts"
+                 else f"one {array_field[:-1] if array_field.endswith('s') else array_field} "
+                      f"per shown input")
     correction = (
         f"Your previous JSON failed validation: {err}\n"
-        f'Re-emit ONLY a valid JSON object {{"cuts": [...]}} for the schema; include '
-        f"every required field, one cut per shown source_ref."
+        f'Re-emit ONLY a valid JSON object {{"{array_field}": [...]}} for the schema; include '
+        f"every required field, {item_hint}."
     )
     contents2 = contents + [
         types.Content(role="model", parts=[types.Part(text=_response_text(resp) or "{}")]),
@@ -468,6 +556,58 @@ def delete_pass2_cache(name: Optional[str]) -> None:
         client.caches.delete(name=name)
     except Exception:
         logger.warning("ingest_gemini: failed to delete pass2 CachedContent %s (will expire via TTL)", name)
+
+
+# --------------------------------------------------------------------------
+# pass1_video_input.plan.md section 4.3 -- Files API upload + lifecycle.
+# Generic adapter layer (no vcut/L3 knowledge): a caller uploads a local
+# clip, gets a {uri, name} handle to build a video_file_block from, and
+# tears it down when done. NEVER a hard failure -- None on any upload/poll
+# problem, so the caller (pass1.py) falls back to frames for that one file.
+# --------------------------------------------------------------------------
+
+_UPLOAD_POLL_S = 1.0
+_UPLOAD_TIMEOUT_S = 120.0
+
+
+def upload_video(
+    path: str, *, mime_type: str = "video/mp4",
+    poll_s: float = _UPLOAD_POLL_S, timeout_s: float = _UPLOAD_TIMEOUT_S,
+) -> Optional[Dict[str, str]]:
+    """Upload a local clip to the Gemini Files API and poll until it reaches
+    state ACTIVE. Returns {"uri": ..., "name": ...} (the resource name, for
+    delete_uploaded_file) -- None on any upload failure, a FAILED processing
+    state, or a poll timeout. Files also auto-expire (~48h) independent of
+    delete_uploaded_file, so a caller that never gets a handle back has
+    nothing further to clean up."""
+    try:
+        client, types = _sdk()
+        f = client.files.upload(file=path, config=types.UploadFileConfig(mime_type=mime_type))
+        deadline = time.monotonic() + timeout_s
+        while f.state == types.FileState.PROCESSING:
+            if time.monotonic() >= deadline:
+                logger.warning("ingest_gemini: upload_video timed out waiting for ACTIVE (%s)", path)
+                return None
+            time.sleep(poll_s)
+            f = client.files.get(name=f.name)
+        if f.state != types.FileState.ACTIVE:
+            logger.warning("ingest_gemini: upload_video ended in state=%s (%s)", f.state, path)
+            return None
+        return {"uri": f.uri, "name": f.name}
+    except Exception:
+        logger.exception("ingest_gemini: upload_video failed for %s -- caller falls back to frames", path)
+        return None
+
+
+def delete_uploaded_file(name: Optional[str]) -> None:
+    """Best-effort teardown -- see upload_video's own auto-expiry note."""
+    if not name:
+        return
+    try:
+        client, _types = _sdk()
+        client.files.delete(name=name)
+    except Exception:
+        logger.warning("ingest_gemini: failed to delete uploaded file %s (will auto-expire)", name)
 
 
 # `run_pass2_batch` / `client.complete()` are unchanged call sites (see the

@@ -80,3 +80,4 @@ def register_tasks() -> None:
     from app.services.l3.grade import job as grade_job  # noqa: F401
     from app.services.render import tasks as render_tasks  # noqa: F401
     from app.services.export import tasks as export_tasks  # noqa: F401
+    from app.services.vcut import orchestrate as vcut_orchestrate  # noqa: F401

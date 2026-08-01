@@ -27,6 +27,14 @@ backend/logs/
 # _out/qa/baselines/<date>.json locally, not to git prod code").
 backend/scripts/_out/
 
+# cpd_boundary_segmenter.plan.md: downloaded GEBD videos/annotations,
+# extracted per-clip feature matrices, and the trained model artifact --
+# large binary/data files, regenerated locally by the cpd/*.py scripts,
+# never committed. Keep the eval report (a small text/json summary) out of
+# this list if it's ever written under data/ -- move it elsewhere to commit.
+backend/scripts/cpd/data/
+backend/models/
+
 # IDE
 .vscode/
 .idea/

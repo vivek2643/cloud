@@ -88,7 +88,7 @@ def load_cuts(project_id: str, user_id: str) -> Optional[Dict[str, Any]]:
             """
             select id::text, status, pass1_model, pass2_model,
                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                   cost_usd, project_summary, error, created_at, updated_at
+                   cost_usd, project_summary, error, created_at, updated_at, speech_channel_status
               from ingest_runs where project_id = %s
              order by created_at desc limit 1
             """,
@@ -109,6 +109,10 @@ def load_cuts(project_id: str, user_id: str) -> Optional[Dict[str, Any]]:
             "cost_usd": float(run["cost_usd"]) if run["cost_usd"] is not None else None,
             "project_summary": run["project_summary"], "error": run["error"],
             "created_at": _iso(run["created_at"]), "updated_at": _iso(run["updated_at"]),
+            # vcut_moment_energy.plan.md section 8: {source: "pipeline"|
+            # "copy_prior", error} -- null on an old/pre-migration run or a
+            # v3 run (this pipeline never writes it), never a missing key.
+            "speech_channel_status": run["speech_channel_status"],
         },
         "cuts": rows_for_run(run["id"]),
     }

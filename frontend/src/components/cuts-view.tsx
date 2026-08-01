@@ -10,6 +10,8 @@ import {
   kickIngest,
   getCuts,
   getFilePlaybackUrl,
+  setCutsEnergy,
+  getCutsEnergyLevels,
   type CutRecord,
   type CutsResponse,
   type FileRecord,
@@ -62,6 +64,11 @@ const MICRO_FRAC = 0.5;
 // Speech never trims (native speed), so this axis bites on video/action cuts.
 const ENERGY_LABELS = ["Broad", "Long-form", "Standard", "Short-form", "Punchy"];
 const energyLabel = (e: number) => ENERGY_LABELS[Math.min(4, Math.round(e * 4))];
+
+// Numeric dial stop -> the string key the backend's energy_levels response is
+// keyed by ("0","0.25","0.5","0.75","1"). String(0.25)==="0.25" etc., and
+// String(1)==="1" (never "1.0"), matching backend _energy_key exactly.
+const energyKey = (e: number) => String(Math.round(e * 4) / 4);
 
 // Cuts v3 (see cuts_v3.plan.md). One LLM ingest pass per project decides the
 // final speech/video grouping, cross-clip takes, and every per-cut judgment
@@ -455,6 +462,85 @@ export function CutsView() {
   const pendingRunRef = useRef(false);
   const candidateCountRef = useRef(0);
 
+  // vcut_moment_energy.plan.md section 6: wire the dial to the SERVER re-
+  // resolver for a vcut run only -- v3 runs keep the existing client-side
+  // tightenedSpan/playSegments view-math above, completely untouched. A
+  // vcut video cut always carries a FLAT pace envelope (vcut.store.
+  // _pace_for pins min_ms==natural_ms), so that view-math is already a
+  // permanent no-op for vcut cuts regardless of `energy` -- the actual
+  // tightening/loosening happens server-side, and the refetched
+  // cut_records simply replace src_in_ms/src_out_ms directly.
+  const isVcutRun = data?.ingest_run?.pass1_model?.startsWith("vcut:") ?? false;
+  const vcutDefaultAppliedRef = useRef<string | null>(null);
+  // Precomputed cut responses for the 5 dial stops ("0".."1"), fetched ONCE
+  // per run id so the dial swaps tightness instantly client-side (setData off
+  // this map) instead of a per-drag server round-trip. `vcutLevelsRunRef`
+  // guards the prefetch to fire exactly once per run id (a new ingest refetches).
+  const vcutLevelsRef = useRef<Record<string, CutsResponse>>({});
+  const vcutLevelsRunRef = useRef<string | null>(null);
+
+  // Default the dial to 0 (loose) the FIRST time a vcut run's cuts appear --
+  // once per run id, so it never fights a later user drag when a background
+  // poll/refetch refreshes `data`. v3's own default (0.5) is untouched.
+  useEffect(() => {
+    const runId = data?.ingest_run?.id;
+    if (!runId || !isVcutRun) return;
+    if (vcutDefaultAppliedRef.current === runId) return;
+    vcutDefaultAppliedRef.current = runId;
+    setEnergy(0);
+  }, [data?.ingest_run?.id, isVcutRun]);
+
+  // Prefetch every dial stop ONCE per vcut run id: the backend assembles all 5
+  // energy levels in a single call (backend/app/routers/projects.py's
+  // get_cuts_energy_levels), so subsequent dial moves are pure client-side
+  // swaps. Seed the current run's already-loaded data at its own stop so that
+  // level is never a blank flash before the prefetch lands.
+  useEffect(() => {
+    const runId = data?.ingest_run?.id;
+    if (!isVcutRun || !projectId || !token || !runId) return;
+    if (vcutLevelsRunRef.current === runId) return;
+    vcutLevelsRunRef.current = runId;
+    vcutLevelsRef.current = data ? { [energyKey(energy)]: data } : {};
+    getCutsEnergyLevels(projectId, token)
+      .then((r) => {
+        // A newer run surfaced mid-flight -> drop this stale prefetch.
+        if (vcutLevelsRunRef.current !== runId) return;
+        vcutLevelsRef.current = r.levels;
+        const cached = r.levels[energyKey(energy)];
+        if (cached) setData(cached);
+      })
+      .catch(() => {
+        // Best-effort: on failure the debounced setCutsEnergy fallback below
+        // still keeps the dial working via the server, just not instant.
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data?.ingest_run?.id, isVcutRun, projectId, token]);
+
+  // Dial moved (vcut runs only): swap to the precomputed level SYNCHRONOUSLY
+  // (instant, no network) when cached, and fire a best-effort background
+  // persist so other consumers (export/timeline) see the same geometry. The
+  // persist never gates the visual swap; a cache miss (prefetch not landed
+  // yet) falls back to the server re-resolve so the dial always responds.
+  useEffect(() => {
+    if (!isVcutRun || !projectId || !token) return;
+    const key = energyKey(energy);
+    const cached = vcutLevelsRef.current[key];
+    if (cached) {
+      setData(cached);
+      const t = setTimeout(() => {
+        setCutsEnergy(projectId, energy, token).catch(() => {});
+      }, 350);
+      return () => clearTimeout(t);
+    }
+    const t = setTimeout(() => {
+      setCutsEnergy(projectId, energy, token)
+        .then((r) => setData(r))
+        .catch(() => {});
+    }, 350);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [energy, isVcutRun, projectId, token]);
+
   const candidates = useMemo(
     () => files.filter((f) => f.file_type === "video" && f.l1_status === "ready"),
     [files]
@@ -607,16 +693,22 @@ export function CutsView() {
     return byGroup;
   }, [cuts]);
 
-  // "Best takes": the one cut to keep per same-beat group. Prefer the model's
-  // flagged winner; fall back to the earliest cut in the group so a group with
-  // no explicit winner never disappears. Cuts with no take_group_id are their
-  // own "best" and are always kept.
+  // "Best takes" collapses only real RETAKES (different audio, same words) down
+  // to the winning one. OUTLOOKS (take_role="outlook" -- equal camera angles of
+  // the same audio) are never a retake to choose among, so every outlook angle
+  // is always kept and stays visible. Cuts with no take_group_id are their own
+  // "best". Within a group we keep only the winning take-class member (prefer
+  // the model's flagged winner, else the earliest) -- outlooks are kept above.
   const bestTakeIds = useMemo(() => {
     const keep = new Set<string>();
-    for (const c of cuts) if (!c.take_group_id) keep.add(c.id);
+    for (const c of cuts) {
+      if (!c.take_group_id || c.take_role === "outlook") keep.add(c.id);
+    }
     for (const list of Object.values(takeGroups)) {
-      const winner = list.find((c) => c.take_role === "winner");
-      const chosen = winner ?? [...list].sort((a, b) => a.src_in_ms - b.src_in_ms)[0];
+      const takeClass = list.filter((c) => c.take_role !== "outlook");
+      if (takeClass.length === 0) continue;
+      const winner = takeClass.find((c) => c.take_role === "winner");
+      const chosen = winner ?? [...takeClass].sort((a, b) => a.src_in_ms - b.src_in_ms)[0];
       if (chosen) keep.add(chosen.id);
     }
     return keep;

@@ -205,6 +205,39 @@ class Settings(BaseSettings):
     ingest_llm_max_inflight_anthropic: int = 8
     ingest_llm_max_inflight_gemini: int = 8
 
+    # --- seam_cut_pipeline.plan.md: vcut, the seam-driven VLM cut pipeline -
+    # A separate cuts pipeline from the L3 ingest above (app.services.vcut/,
+    # cuts_pipeline flag below selects which one project ingest dispatches
+    # to). Cost first (plan principle 6): flash-lite for both passes by
+    # default, one knob per stage so pass 2 can be upgraded independently
+    # later without touching pass 1.
+    vcut_pass1_model: str = "gemini-3.1-flash-lite"
+    vcut_pass2_model: str = "gemini-3.1-flash-lite"
+    # vcut_pass2_rich.plan.md section 3.1: TTL for the shared Gemini
+    # CachedContent both passes ride -- comfortably covers Pass 1 plus the
+    # gap until the background vcut_enrich task runs.
+    vcut_cache_ttl_s: int = 1200
+    # speech_cuts_pipeline.plan.md section 15: the speech channel's ONE
+    # text-only call (speech/segment_llm.py) -- a pro-class model, not
+    # flash-lite, per the plan's own "not sonnet, use a pro model" decision
+    # (beat segmentation + retake clustering needs stronger judgment than
+    # the video channel's frame-labeling calls). The speech frame pass
+    # (speech/frames.py) reuses vcut_pass2_model (flash-lite) -- no
+    # separate knob for that one.
+    vcut_speech_model: str = "gemini-3.1-pro-preview"
+    # pass1_video_input.plan.md section 8: Pass 1's input medium. "frames"
+    # (default, shipped) = today's sampled-JPEG path. "video" = feed each
+    # file's non-speech video (speech cut out) instead -- flip per-env to
+    # A/B and roll back instantly, no code change either way.
+    vcut_pass1_input_mode: str = "frames"
+    vcut_video_fps: float = 2.0
+    vcut_video_media_resolution: str = "low"
+    # Which cuts pipeline `projects.kick_ingest` enqueues: "v3" (default,
+    # today's app.services.l3.ingest) or "vcut" (app.services.vcut.
+    # orchestrate). Env-driven so the two can run side by side per
+    # environment/A-B without deleting either (plan section 11).
+    cuts_pipeline: str = "v3"
+
     # migration_runner.plan.md: the startup guard's sanctioned local-dev
     # bypass. "on" (default) means every process refuses to boot on schema
     # drift; "off" disables that check for THIS process only, loudly (a

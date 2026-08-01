@@ -36,8 +36,9 @@ if BACKEND not in sys.path:
 from app.config import get_settings  # noqa: E402
 from app.services.l3 import pass2  # noqa: E402
 from app.services.llm import client as ic  # noqa: E402
+from app.services.llm import gemini_client as gc  # noqa: E402
 from app.services.llm import ingest_gemini as ig  # noqa: E402
-from app.services.llm.base import text_block  # noqa: E402
+from app.services.llm.base import text_block, video_file_block  # noqa: E402
 from test_ingest_client import FakeBlock, FakeClient, FakeResponse  # noqa: E402
 
 
@@ -214,6 +215,54 @@ def test_usage_of_maps_gemini_fields_to_the_shared_shape():
     print("ok  test_usage_of_maps_gemini_fields_to_the_shared_shape")
 
 
+def test_resolve_media_resolution():
+    types = _types()
+    assert ig._resolve_media_resolution(types, "low") == types.MediaResolution.MEDIA_RESOLUTION_LOW
+    assert ig._resolve_media_resolution(types, "MEDIUM") == types.MediaResolution.MEDIA_RESOLUTION_MEDIUM
+    assert ig._resolve_media_resolution(types, "high") == types.MediaResolution.MEDIA_RESOLUTION_HIGH
+    assert ig._resolve_media_resolution(types, None) is None
+    assert ig._resolve_media_resolution(types, "") is None
+    assert ig._resolve_media_resolution(types, "bogus") is None   # unrecognized -> ignored, not raised
+    print("ok  test_resolve_media_resolution")
+
+
+# --------------------------------------------------------------------------
+# gemini_client._parts_for_content -- video_file block (pass1_video_input.
+# plan.md section 4.2). Pure (no network) against the REAL SDK types module,
+# so this also catches an SDK-shape drift the plan's own pseudocode already
+# hit once (Part.from_uri doesn't accept video_metadata as a kwarg).
+# --------------------------------------------------------------------------
+
+def test_parts_for_content_video_file_with_fps_and_offsets():
+    types = _types()
+    block = video_file_block("files/abc123", fps=2.0, start_ms=1500, end_ms=9000)
+    parts = gc._parts_for_content([block], types, {})
+    assert len(parts) == 1
+    part = parts[0]
+    assert part.file_data.file_uri == "files/abc123"
+    assert part.file_data.mime_type == "video/mp4"
+    assert part.video_metadata.fps == 2.0
+    assert part.video_metadata.start_offset == "1.500s"
+    assert part.video_metadata.end_offset == "9.000s"
+    print("ok  test_parts_for_content_video_file_with_fps_and_offsets")
+
+
+def test_parts_for_content_video_file_with_no_metadata_at_all():
+    types = _types()
+    block = video_file_block("files/abc123")
+    parts = gc._parts_for_content([block], types, {})
+    assert parts[0].video_metadata is None
+    print("ok  test_parts_for_content_video_file_with_no_metadata_at_all")
+
+
+def test_parts_for_content_video_file_custom_mime_type():
+    types = _types()
+    block = video_file_block("files/xyz", mime_type="video/webm")
+    parts = gc._parts_for_content([block], types, {})
+    assert parts[0].file_data.mime_type == "video/webm"
+    print("ok  test_parts_for_content_video_file_custom_mime_type")
+
+
 # --------------------------------------------------------------------------
 # complete_gemini -- mocked SDK client throughout, zero real API calls
 # --------------------------------------------------------------------------
@@ -387,6 +436,40 @@ def test_complete_gemini_omits_system_instruction_when_cached():
     print("ok  test_complete_gemini_omits_system_instruction_when_cached")
 
 
+def test_complete_gemini_passes_media_resolution_through_to_the_config():
+    captured = {}
+
+    def fake_generate_content(model, contents, config):
+        captured["config"] = config
+        return _FakeGeminiResp(_GOOD_CUT)
+
+    fake_client = mock.Mock()
+    fake_client.models.generate_content = fake_generate_content
+    with mock.patch.object(ig, "_sdk", return_value=(fake_client, _types())):
+        ig.complete_gemini("sys", [text_block("hello")], pass2.Pass2BatchOutput,
+                           max_tokens=1000, media_resolution="low")
+
+    types = _types()
+    assert captured["config"].media_resolution == types.MediaResolution.MEDIA_RESOLUTION_LOW
+    print("ok  test_complete_gemini_passes_media_resolution_through_to_the_config")
+
+
+def test_complete_gemini_media_resolution_none_leaves_the_sdk_default():
+    captured = {}
+
+    def fake_generate_content(model, contents, config):
+        captured["config"] = config
+        return _FakeGeminiResp(_GOOD_CUT)
+
+    fake_client = mock.Mock()
+    fake_client.models.generate_content = fake_generate_content
+    with mock.patch.object(ig, "_sdk", return_value=(fake_client, _types())):
+        ig.complete_gemini("sys", [text_block("hello")], pass2.Pass2BatchOutput, max_tokens=1000)
+
+    assert captured["config"].media_resolution is None
+    print("ok  test_complete_gemini_media_resolution_none_leaves_the_sdk_default")
+
+
 # --------------------------------------------------------------------------
 # P4 cache manager
 # --------------------------------------------------------------------------
@@ -425,6 +508,95 @@ def test_delete_pass2_cache_calls_the_sdk_and_none_is_a_noop():
         ig.delete_pass2_cache(None)
     fake_client2.caches.delete.assert_not_called()
     print("ok  test_delete_pass2_cache_calls_the_sdk_and_none_is_a_noop")
+
+
+# --------------------------------------------------------------------------
+# upload_video / delete_uploaded_file -- pass1_video_input.plan.md section
+# 4.3, Files API upload + lifecycle. Mocked SDK client throughout.
+# --------------------------------------------------------------------------
+
+class _FakeUploadedFile:
+    def __init__(self, name, uri, state):
+        self.name = name
+        self.uri = uri
+        self.state = state
+
+
+def test_upload_video_active_on_first_check_returns_the_handle():
+    types = _types()
+    fake_client = mock.Mock()
+    fake_client.files.upload = mock.Mock(
+        return_value=_FakeUploadedFile("files/abc", "https://x/abc", types.FileState.ACTIVE))
+    with mock.patch.object(ig, "_sdk", return_value=(fake_client, types)):
+        handle = ig.upload_video("/tmp/clip.mp4")
+    assert handle == {"uri": "https://x/abc", "name": "files/abc"}
+    fake_client.files.get.assert_not_called()   # already ACTIVE -- never needed to poll
+    print("ok  test_upload_video_active_on_first_check_returns_the_handle")
+
+
+def test_upload_video_polls_through_processing_to_active():
+    types = _types()
+    fake_client = mock.Mock()
+    fake_client.files.upload = mock.Mock(
+        return_value=_FakeUploadedFile("files/abc", "https://x/abc", types.FileState.PROCESSING))
+    fake_client.files.get = mock.Mock(side_effect=[
+        _FakeUploadedFile("files/abc", "https://x/abc", types.FileState.PROCESSING),
+        _FakeUploadedFile("files/abc", "https://x/abc", types.FileState.ACTIVE),
+    ])
+    with mock.patch.object(ig, "_sdk", return_value=(fake_client, types)), \
+         mock.patch.object(ig.time, "sleep", lambda *a: None):
+        handle = ig.upload_video("/tmp/clip.mp4", poll_s=0.01)
+    assert handle == {"uri": "https://x/abc", "name": "files/abc"}
+    assert fake_client.files.get.call_count == 2
+    print("ok  test_upload_video_polls_through_processing_to_active")
+
+
+def test_upload_video_failed_state_returns_none():
+    types = _types()
+    fake_client = mock.Mock()
+    fake_client.files.upload = mock.Mock(
+        return_value=_FakeUploadedFile("files/abc", "https://x/abc", types.FileState.FAILED))
+    with mock.patch.object(ig, "_sdk", return_value=(fake_client, types)):
+        handle = ig.upload_video("/tmp/clip.mp4")
+    assert handle is None
+    print("ok  test_upload_video_failed_state_returns_none")
+
+
+def test_upload_video_timeout_returns_none():
+    types = _types()
+    fake_client = mock.Mock()
+    fake_client.files.upload = mock.Mock(
+        return_value=_FakeUploadedFile("files/abc", "https://x/abc", types.FileState.PROCESSING))
+    with mock.patch.object(ig, "_sdk", return_value=(fake_client, types)), \
+         mock.patch.object(ig.time, "sleep", lambda *a: None), \
+         mock.patch.object(ig.time, "monotonic", side_effect=[0.0, 10.0]):
+        handle = ig.upload_video("/tmp/clip.mp4", poll_s=0.01, timeout_s=5.0)
+    assert handle is None
+    fake_client.files.get.assert_not_called()   # timed out before ever polling .get
+    print("ok  test_upload_video_timeout_returns_none")
+
+
+def test_upload_video_exception_returns_none_not_raise():
+    fake_client = mock.Mock()
+    fake_client.files.upload = mock.Mock(side_effect=RuntimeError("boom"))
+    with mock.patch.object(ig, "_sdk", return_value=(fake_client, _types())):
+        handle = ig.upload_video("/tmp/clip.mp4")
+    assert handle is None
+    print("ok  test_upload_video_exception_returns_none_not_raise")
+
+
+def test_delete_uploaded_file_calls_the_sdk_and_none_is_a_noop():
+    fake_client = mock.Mock()
+    fake_client.files.delete = mock.Mock()
+    with mock.patch.object(ig, "_sdk", return_value=(fake_client, _types())):
+        ig.delete_uploaded_file("files/abc")
+    fake_client.files.delete.assert_called_once_with(name="files/abc")
+
+    fake_client2 = mock.Mock()
+    with mock.patch.object(ig, "_sdk", return_value=(fake_client2, _types())):
+        ig.delete_uploaded_file(None)
+    fake_client2.files.delete.assert_not_called()
+    print("ok  test_delete_uploaded_file_calls_the_sdk_and_none_is_a_noop")
 
 
 def test_pass2_cache_scope_propagates_through_threadpoolexecutor():
@@ -650,8 +822,12 @@ def main():
     test_gemini_schema_accepted_by_the_real_sdk_config()
     test_gemini_schema_is_a_noop_on_a_schema_without_the_pass2_shape()
     test_resolve_thinking_budget()
+    test_resolve_media_resolution()
     test_parse_raw_normalizes_bare_list_and_rejects_garbage()
     test_usage_of_maps_gemini_fields_to_the_shared_shape()
+    test_parts_for_content_video_file_with_fps_and_offsets()
+    test_parts_for_content_video_file_with_no_metadata_at_all()
+    test_parts_for_content_video_file_custom_mime_type()
     test_complete_gemini_success_first_try()
     test_complete_gemini_reasks_once_then_succeeds()
     test_complete_gemini_raises_ingest_failure_after_two_failures()
@@ -659,9 +835,17 @@ def main():
     test_complete_gemini_empty_forever_is_bounded_and_still_fails_loud()
     test_complete_gemini_passes_response_schema_and_thinking_config()
     test_complete_gemini_omits_system_instruction_when_cached()
+    test_complete_gemini_passes_media_resolution_through_to_the_config()
+    test_complete_gemini_media_resolution_none_leaves_the_sdk_default()
     test_create_pass2_cache_returns_the_resource_name()
     test_create_pass2_cache_degrades_to_none_on_failure()
     test_delete_pass2_cache_calls_the_sdk_and_none_is_a_noop()
+    test_upload_video_active_on_first_check_returns_the_handle()
+    test_upload_video_polls_through_processing_to_active()
+    test_upload_video_failed_state_returns_none()
+    test_upload_video_timeout_returns_none()
+    test_upload_video_exception_returns_none_not_raise()
+    test_delete_uploaded_file_calls_the_sdk_and_none_is_a_noop()
     test_pass2_cache_scope_propagates_through_threadpoolexecutor()
     test_bare_pool_submit_does_not_see_the_cache_scope()
     test_pass2_cache_scope_sequential_scopes_do_not_leak()

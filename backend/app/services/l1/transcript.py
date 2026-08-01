@@ -101,11 +101,31 @@ class _WhisperEngine:
 def transcribe(wav_path: str) -> TranscriptResult:
     """Run Whisper -> two-pass filler detection -> structured TranscriptResult."""
     model = _WhisperEngine.get()
+    # Anti-hallucination config. Without these, Whisper decodes ambient/
+    # background noise into confident-looking text ("phantom speech") that then
+    # becomes spurious speech cuts downstream:
+    #   - vad_filter: Silero VAD strips non-speech audio BEFORE decoding -- the
+    #     single most effective guard against transcribing noise/silence.
+    #   - condition_on_previous_text=False: stop a hallucination from being fed
+    #     back as context and propagating/repeating into later segments.
+    #   - no_speech_threshold / log_prob_threshold / compression_ratio_threshold:
+    #     set explicitly (not left implicit) so a low-confidence or repetitive
+    #     decode is suppressed rather than emitted.
+    #   - hallucination_silence_threshold: with word_timestamps, skip long silent
+    #     gaps the model would otherwise "fill" with invented words.
+    # no_speech_prob/avg_logprob are still captured per segment so the speech
+    # pipeline can second-guess anything that slips through (inputs.py gate).
     segments_iter, info = model.transcribe(
         wav_path,
         word_timestamps=True,
         initial_prompt=WHISPER_INITIAL_PROMPT,
-        vad_filter=False,
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=200),
+        condition_on_previous_text=False,
+        no_speech_threshold=0.6,
+        log_prob_threshold=-1.0,
+        compression_ratio_threshold=2.4,
+        hallucination_silence_threshold=2.0,
     )
 
     segments: List[Segment] = []

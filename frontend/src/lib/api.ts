@@ -332,6 +332,10 @@ export interface IngestRun {
   error: string | null;
   created_at: string | null;
   updated_at: string | null;
+  // vcut_moment_energy.plan.md section 8: {source: "pipeline"|"copy_prior",
+  // error} -- which speech path actually ran. null on a v3 run or a
+  // pre-migration vcut run.
+  speech_channel_status: { source: "pipeline" | "copy_prior"; error: string | null } | null;
 }
 
 export interface CutsResponse {
@@ -363,6 +367,28 @@ export function getCuts(projectId: string, token: string) {
     token,
     cache: "no-store",
   });
+}
+
+// seam_cut_pipeline.plan.md section 9: re-derive vcut video cut boundaries
+// at a new global energy (0..1) -- no model call, instant. vcut runs only;
+// 409 on a project whose latest run has no seam_cache/loose_plan artifacts.
+export function setCutsEnergy(projectId: string, energy: number, token: string) {
+  return request<CutsResponse>(`/api/projects/${projectId}/cuts/energy`, {
+    method: "POST",
+    token,
+    body: JSON.stringify({ energy }),
+  });
+}
+
+// Precompute the assembled cut response for all 5 dial stops in one call, so
+// the dial can swap tightness instantly client-side (no per-drag round-trip).
+// vcut runs only; keys are "0"/"0.25"/"0.5"/"0.75"/"1". 409 like setCutsEnergy
+// when the latest run has no seam_cache/loose_plan artifacts.
+export function getCutsEnergyLevels(projectId: string, token: string) {
+  return request<{ levels: Record<string, CutsResponse> }>(
+    `/api/projects/${projectId}/cuts/energy_levels`,
+    { token, cache: "no-store" }
+  );
 }
 
 // --- Upload ---
