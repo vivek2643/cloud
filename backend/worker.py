@@ -74,21 +74,31 @@ async def main() -> None:
     _check_schema()
     register_tasks()
 
+    from app.config import get_settings
+    settings = get_settings()
+
     # Concurrency defaults to 1 (Whisper + SigLIP saturate one CPU). On a GPU
     # box you can raise it via WORKER_CONCURRENCY, but a single GPU usually
     # still wants 1 to avoid VRAM contention. WORKER_QUEUES (comma-separated)
     # restricts which queues this worker pulls; empty = all queues.
     concurrency = int(os.getenv("WORKER_CONCURRENCY", "1"))
     queues_env = os.getenv("WORKER_QUEUES", "").strip()
-    queues = [q.strip() for q in queues_env.split(",") if q.strip()] or None
+    requested = [q.strip() for q in queues_env.split(",") if q.strip()] or None
+    # QUEUE_PREFIX (local-dev queue isolation, see local_dev_queue_isolation.
+    # plan.md): map the requested base queues to the names THIS process listens
+    # on. Production (no prefix): unchanged -- `requested` passes straight
+    # through, None still means "all queues". Local (QUEUE_PREFIX=dev): the
+    # dev-* set with the shared `gpu` queue dropped, so a dev worker can never
+    # pull a real user's L1 (or any bare prod) job -- even if WORKER_QUEUES is
+    # unset or lists `gpu`.
+    queues = settings.worker_queues(requested)
 
     # Only the ingest workers run Whisper; L2 (Gemini) and L3 (Claude) workers
     # are network-bound, so skip the model warmup/load for them. The Render
     # `edso-gpu-dispatcher` also pulls the "gpu" queue but never runs models
     # itself (GPU_EXECUTION=runpod forwards compute to RunPod), so it skips the
     # warmup too -- otherwise it would pointlessly download ~3-4GB of weights.
-    from app.config import get_settings
-    is_dispatcher = get_settings().gpu_execution == "runpod"
+    is_dispatcher = settings.gpu_execution == "runpod"
     if (queues is None or "gpu" in queues) and not is_dispatcher:
         _warmup()
 

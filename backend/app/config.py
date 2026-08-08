@@ -4,6 +4,22 @@ from pydantic_settings import BaseSettings
 from functools import lru_cache
 
 
+# --- LOCAL-DEV QUEUE ISOLATION (see local_dev_queue_isolation.plan.md) --------
+# Base Procrastinate queue names local dev "owns" and iterates on -- everything
+# EXCEPT the shared gpu/L1 queue. A local worker started with no explicit
+# WORKER_QUEUES listens on the PREFIXED form of exactly these (never a bare/prod
+# queue). Superset of what the code enqueues today (ingest/grade/render/export)
+# plus the extra lanes the worker fleet listens on (cpu/l3, currently unused by
+# any enqueue site) so a local fleet mirrors prod's minus gpu, and any future
+# cpu/l3 enqueue is auto-prefixed and stays isolated.
+DEV_OWNED_QUEUES = ("ingest", "grade", "render", "export", "cpu", "l3")
+# The one queue NEVER prefixed: L1 GPU compute is SHARED with production. Local
+# runs no gpu worker; prod's RunPod workers do all L1 and write back to the
+# shared DB. Keeping this bare is what makes "L1 same for prod and local,
+# everything else separate" true.
+SHARED_QUEUE = "gpu"
+
+
 class Settings(BaseSettings):
     supabase_url: str
     supabase_service_key: str
@@ -37,6 +53,21 @@ class Settings(BaseSettings):
     # every get/put/delete/multipart op, so a delete can only ever target
     # `<prefix>/<key>` and never a bare production key.
     r2_key_prefix: str = ""
+
+    # --- LOCAL-DEV QUEUE ISOLATION (opt-in, default == production) ---------
+    # Namespacing prefix for the "dev-owned" Procrastinate queues, so a local
+    # worker running in-development branch code can NEVER pull a real user's
+    # production job (and prod never pulls a local test job) -- while still
+    # SHARING prod's data (public schema), R2 media, and L1/GPU compute. UNSET
+    # (empty) is the PRODUCTION default: effective_queue() is the identity and
+    # worker_queues() passes through unchanged (None == all queues), i.e.
+    # byte-for-byte today's behavior. Set to e.g. "dev" ONLY in a local .env:
+    # then enqueues + the local worker use dev-ingest/dev-grade/dev-render/
+    # dev-export, while the gpu/L1 queue stays BARE (never prefixed) and local
+    # simply runs no gpu worker, so all L1 flows to prod's RunPod workers. A
+    # trailing "-" is optional ("dev" and "dev-" both yield "dev-<queue>").
+    # See local_dev_queue_isolation.plan.md.
+    queue_prefix: str = ""
 
     # Session/direct Postgres connection string -- Procrastinate (LISTEN/
     # NOTIFY) and the migration runner's advisory lock (session-scoped,
@@ -302,6 +333,52 @@ class Settings(BaseSettings):
         Empty dict when DB_SCHEMA is unset (production: pass nothing)."""
         opts = self.pg_options
         return {"options": opts} if opts else {}
+
+    # --- LOCAL-DEV QUEUE ISOLATION helpers --------------------------------
+    @property
+    def normalized_queue_prefix(self) -> str:
+        """QUEUE_PREFIX with surrounding whitespace and any trailing '-'
+        stripped, so "dev" and "dev-" both yield "dev" (and then "dev-<queue>").
+        Empty string in production."""
+        return self.queue_prefix.strip().rstrip("-")
+
+    def effective_queue(self, base: str) -> str:
+        """Map a base queue name to the name THIS environment enqueues onto /
+        listens on. Production (empty QUEUE_PREFIX): identity -- byte-for-byte
+        today. Local (QUEUE_PREFIX=dev): "ingest" -> "dev-ingest", etc., EXCEPT
+        the shared gpu/L1 queue, which always stays bare so local L1 flows to
+        prod's GPU workers and prod's L1 never diverges."""
+        prefix = self.normalized_queue_prefix
+        if not prefix or base == SHARED_QUEUE:
+            return base
+        return f"{prefix}-{base}"
+
+    def worker_queues(self, requested):
+        """Resolve the concrete queue list a worker process should listen on
+        from its WORKER_QUEUES base names.
+
+        Production (empty QUEUE_PREFIX): pass ``requested`` through unchanged --
+        ``None`` still means "all queues", identical to today, and a gpu
+        dispatcher still listens on bare ``gpu``.
+
+        Local (QUEUE_PREFIX set): map every base through :meth:`effective_queue`
+        AND drop the shared ``gpu`` queue, so a dev worker can NEVER pull a real
+        user's L1 (or any bare prod) job -- even if WORKER_QUEUES is unset or
+        lists ``gpu``. When nothing is requested under a prefix, default to the
+        dev-owned set rather than "all queues" (which would include prod's bare
+        queues)."""
+        prefix = self.normalized_queue_prefix
+        if not prefix:
+            return requested
+        bases = requested if requested else list(DEV_OWNED_QUEUES)
+        out: list[str] = []
+        for base in bases:
+            if base == SHARED_QUEUE:
+                continue
+            eff = self.effective_queue(base)
+            if eff not in out:
+                out.append(eff)
+        return out or None
 
     model_config = {"env_file": "../.env", "env_file_encoding": "utf-8", "extra": "ignore"}
 

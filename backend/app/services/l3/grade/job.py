@@ -369,7 +369,9 @@ def maybe_enqueue(thread_id: str, document: Dict[str, Any]) -> None:
         enqueue_app = App(connector=PsycopgConnector(
             conninfo=get_settings().database_url, min_size=1, max_size=2))
         with enqueue_app.open():
-            enqueue_app.configure_task("run_grade_job", queue="grade").defer(thread_id=thread_id)
+            enqueue_app.configure_task(
+                "run_grade_job", queue=get_settings().effective_queue("grade"),
+            ).defer(thread_id=thread_id)
     except Exception:
         logger.exception("grade.job: failed to enqueue run_grade_job for thread %s", thread_id)
 

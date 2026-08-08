@@ -406,7 +406,7 @@ def defer_vcut_enrich(project_id: str, ingest_run_id: str) -> None:
             conninfo=get_settings().database_url, min_size=1, max_size=2))
         with enqueue_app.open():
             enqueue_app.configure_task(
-                "vcut_enrich", queue="ingest",
+                "vcut_enrich", queue=get_settings().effective_queue("ingest"),
                 queueing_lock=f"vcut_enrich:{ingest_run_id}",
             ).defer(project_id=project_id, ingest_run_id=ingest_run_id)
     except Exception:
@@ -429,6 +429,7 @@ def defer_vcut_ingest(project_id: str, user_id: str) -> None:
         conninfo=get_settings().database_url, min_size=1, max_size=2))
     with enqueue_app.open():
         enqueue_app.configure_task(
-            "vcut_ingest", queue="ingest", priority=priority,
+            "vcut_ingest", queue=get_settings().effective_queue("ingest"),
+            priority=priority,
             lock=f"vcut_ingest:{project_id}", queueing_lock=f"vcut_ingest:{project_id}",
         ).defer(project_id=project_id)
