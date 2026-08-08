@@ -541,8 +541,18 @@ def create_pass2_cache(
             ),
         )
         return cache.name
-    except Exception:
-        logger.exception("ingest_gemini: pass2 CachedContent creation failed -- continuing uncached")
+    except Exception as exc:
+        # A short sub-clip below Gemini's min cache-token floor
+        # (min_total_token_count) is an expected, benign degradation --
+        # the caller just sends the video inline uncached. Log it quietly;
+        # keep genuine/unexpected cache failures at full-traceback level.
+        if "min_total_token_count" in str(exc) or "too small" in str(exc).lower():
+            logger.warning(
+                "ingest_gemini: pass2 CachedContent below min token floor -- continuing uncached (%s)",
+                exc,
+            )
+        else:
+            logger.exception("ingest_gemini: pass2 CachedContent creation failed -- continuing uncached")
         return None
 
 

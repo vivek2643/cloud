@@ -229,7 +229,7 @@ class Settings(BaseSettings):
     # (default, shipped) = today's sampled-JPEG path. "video" = feed each
     # file's non-speech video (speech cut out) instead -- flip per-env to
     # A/B and roll back instantly, no code change either way.
-    vcut_pass1_input_mode: str = "frames"
+    vcut_pass1_input_mode: str = "video"
     vcut_video_fps: float = 2.0
     vcut_video_media_resolution: str = "low"
     # vcut_pass2_video_specifics.plan.md section 4.5/9: the question
@@ -242,7 +242,7 @@ class Settings(BaseSettings):
     # today's app.services.l3.ingest) or "vcut" (app.services.vcut.
     # orchestrate). Env-driven so the two can run side by side per
     # environment/A-B without deleting either (plan section 11).
-    cuts_pipeline: str = "v3"
+    cuts_pipeline: str = "vcut"
 
     # migration_runner.plan.md: the startup guard's sanctioned local-dev
     # bypass. "on" (default) means every process refuses to boot on schema
