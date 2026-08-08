@@ -791,6 +791,22 @@ def _audio_channel(audio: dict, s: int, e: int, step_ms: int) -> Dict[str, Any]:
     return {"curve": curve, "changes": changes, "silence": silence}
 
 
+def _full_specifics(meta: dict) -> Dict[str, Any]:
+    """brain_cut_specifics_wiring.plan.md section 3: the COMPLETE scene_
+    specifics blob for one cut -- unlike the beat-line's terse, priority-
+    capped `spec:"..."` tag (footage_map._specific_tag), this carries every
+    field the vision model answered (count, notable_object, continuity_cue,
+    setting, custom-probe answers, the full `moments` mini shot-list for a
+    merged loose cut), so the brain can pull the complete shot log for one
+    cut on demand instead of guessing from the compact line. Empty/falsy
+    fields are dropped (no bare label with no value); {} when the cut has
+    no specifics yet -- a normal, common pre-enrichment state (the caller
+    then omits the "specifics" key entirely rather than including an empty
+    one, keeping the common not-yet-enriched case lean)."""
+    spec = meta.get("scene_specifics") or {}
+    return {k: v for k, v in spec.items() if v not in (None, "", [], {})}
+
+
 def _shots_channel(scene: dict, s: int, e: int) -> Dict[str, Any]:
     candidates: List[Tuple[int, bool]] = []
     for pt in (scene.get("shot_points") or []):
@@ -849,7 +865,7 @@ def inspect_cut(ctx: EditContext, *, ref: Optional[str] = None, seg_id: Optional
     hop_ms = int(signals["motion"].get("hop_ms") or signals["audio"].get("hop_ms") or 100)
     step_ms = max(hop_ms, math.ceil(span_ms / _INSPECT_MAX_SAMPLES))
 
-    return {
+    result = {
         "ref": ref,
         "file": _fid8(file_id),
         "span_ms": span_ms,
@@ -858,6 +874,10 @@ def inspect_cut(ctx: EditContext, *, ref: Optional[str] = None, seg_id: Optional
         "audio": _audio_channel(signals["audio"], s, e, step_ms),
         "shots": _shots_channel(signals["scene"], s, e),
     }
+    specifics = _full_specifics(meta)
+    if specifics:
+        result["specifics"] = specifics
+    return result
 
 
 # --------------------------------------------------------------------------

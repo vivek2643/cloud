@@ -42,6 +42,20 @@ class MomentFlag:
     t_ms: int
     shape: str = DEFAULT_TAG   # "build" | "settle" | "both"
     summary: str = ""
+    # vcut_pass2_video_specifics.plan.md section 7.1: planner output
+    # (qplan.py) and Pass 2's answers, living on the FLAG rather than any
+    # ephemeral cut id -- resolve.py composes these onto whatever cut ends
+    # up containing the flag, at ANY energy, so they can never be wiped by
+    # an energy re-resolve.
+    question_ids: List[str] = field(default_factory=list)
+    custom_questions: List[Dict[str, str]] = field(default_factory=list)
+    specifics: Dict[str, Any] = field(default_factory=dict)
+    # reframe_vcut_geometry.plan.md section 3: the subject anchor, normalized
+    # [x, y, w, h] in the (uprighted) source frame -- Pass 2 emits it for
+    # EVERY moment (not gated by question_ids/the bank, unlike specifics),
+    # and it composes onto a resolved cut the same representative-flag way,
+    # so the energy dial can't wipe it either.
+    subject_box: Optional[Tuple[float, float, float, float]] = None
 
 
 @dataclass
@@ -50,13 +64,25 @@ class FilePlan:
     flags: List[MomentFlag] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"flags": [{"t_ms": f.t_ms, "shape": f.shape, "summary": f.summary} for f in self.flags]}
+        return {"flags": [
+            {"t_ms": f.t_ms, "shape": f.shape, "summary": f.summary,
+             "question_ids": f.question_ids, "custom_questions": f.custom_questions,
+             "specifics": f.specifics,
+             "subject_box": list(f.subject_box) if f.subject_box else None}
+            for f in self.flags
+        ]}
 
     @staticmethod
     def from_dict(file_id: str, data: Dict[str, Any]) -> "FilePlan":
         if "flags" in data:
             flags = [
-                MomentFlag(t_ms=int(f["t_ms"]), shape=f.get("shape") or DEFAULT_TAG, summary=f.get("summary") or "")
+                MomentFlag(
+                    t_ms=int(f["t_ms"]), shape=f.get("shape") or DEFAULT_TAG, summary=f.get("summary") or "",
+                    question_ids=list(f.get("question_ids") or []),
+                    custom_questions=list(f.get("custom_questions") or []),
+                    specifics=dict(f.get("specifics") or {}),
+                    subject_box=tuple(f["subject_box"]) if f.get("subject_box") else None,
+                )
                 for f in (data.get("flags") or [])
             ]
             return FilePlan(file_id=file_id, flags=flags)
@@ -64,7 +90,9 @@ class FilePlan:
         # {meaning, question_ids, loose_cuts: [{span_ms, peaks: [{t_ms, tag}]}]}
         # -- flatten every loose_cut's peaks into flags, carrying the
         # clip-level meaning down onto each flattened flag's summary so the
-        # dial keeps working on a not-yet-re-ingested run.
+        # dial keeps working on a not-yet-re-ingested run. question_ids/
+        # custom_questions/specifics stay at their dataclass defaults (empty)
+        # -- a pre-existing run simply has no planner/Pass-2 output yet.
         meaning = data.get("meaning") or ""
         flags = [
             MomentFlag(t_ms=int(p["t_ms"]), shape=p.get("tag") or DEFAULT_TAG, summary=meaning)
@@ -77,13 +105,23 @@ class FilePlan:
 @dataclass
 class MomentPlan:
     files: List[FilePlan] = field(default_factory=list)
+    # vcut_pass2_video_specifics.plan.md section 4.4: the planner's one
+    # run-level judgment (e.g. "performance"/"tutorial"/"vlog") -- carried
+    # alongside the per-file flags under a reserved "__meta__" key so old
+    # plans (no key at all) round-trip to genre="" without any migration.
+    genre: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
-        return {f.file_id: f.to_dict() for f in self.files}
+        out: Dict[str, Any] = {f.file_id: f.to_dict() for f in self.files}
+        if self.genre:
+            out["__meta__"] = {"genre": self.genre}
+        return out
 
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "MomentPlan":
-        return MomentPlan(files=[FilePlan.from_dict(file_id, d) for file_id, d in data.items()])
+        meta = data.get("__meta__") or {}
+        files = [FilePlan.from_dict(file_id, d) for file_id, d in data.items() if file_id != "__meta__"]
+        return MomentPlan(files=files, genre=meta.get("genre") or "")
 
 
 # --------------------------------------------------------------------------
@@ -98,6 +136,15 @@ class ResolvedCut:
     peak_ms: int
     tag: str
     summary: str
+    # section 7.2: composed from the group of flags this cut absorbed --
+    # a single-flag cut's specifics pass through unchanged; a merged cut
+    # carries the representative flag's fields plus a "moments" mini shot-
+    # list (see _composed_specifics). Always JSON-serializable.
+    specifics: Dict[str, Any] = field(default_factory=dict)
+    # reframe_vcut_geometry.plan.md section 3: the representative flag's own
+    # subject_box (no merge -- a box doesn't compose across moments the way
+    # specifics do); None when no absorbed flag had one.
+    subject_box: Optional[Tuple[float, float, float, float]] = None
 
 
 # --------------------------------------------------------------------------
@@ -117,6 +164,8 @@ class _Candidate:
     span_lo: float
     span_hi: float
     has_peak: bool = True
+    specifics: Dict[str, Any] = field(default_factory=dict)
+    subject_box: Optional[Tuple[float, float, float, float]] = None
 
 
 # --------------------------------------------------------------------------
@@ -246,14 +295,15 @@ def _clamp_windows(
 # --------------------------------------------------------------------------
 
 def _merge_windows(
-    peaks_ms: List[int], tags: List[str], summaries: List[str],
+    peaks_ms: List[int], tags: List[str], summaries: List[str], specifics_list: List[Dict[str, Any]],
+    subject_boxes: List[Optional[Tuple[float, float, float, float]]],
     windows: List[Tuple[float, float]], bounds: List[Tuple[float, float]],
 ) -> List[Dict[str, Any]]:
     """Merge overlapping/touching clamped windows: peaks_ms must already be
     sorted ascending, and windows/bounds aligned/ordered the same way
     (guaranteed by _clamp_windows, which preserves input order)."""
     groups: List[Dict[str, Any]] = [{
-        "peaks": [(peaks_ms[0], tags[0], summaries[0])],
+        "peaks": [(peaks_ms[0], tags[0], summaries[0], specifics_list[0], subject_boxes[0])],
         "a": windows[0][0], "b": windows[0][1],
         "extent_lo": bounds[0][0], "extent_hi": bounds[0][1],
     }]
@@ -262,24 +312,28 @@ def _merge_windows(
         cur = groups[-1]
         if a <= cur["b"]:
             cur["b"] = max(cur["b"], b)
-            cur["peaks"].append((peaks_ms[i], tags[i], summaries[i]))
+            cur["peaks"].append((peaks_ms[i], tags[i], summaries[i], specifics_list[i], subject_boxes[i]))
             cur["extent_hi"] = bounds[i][1]
         else:
             groups.append({
-                "peaks": [(peaks_ms[i], tags[i], summaries[i])], "a": a, "b": b,
+                "peaks": [(peaks_ms[i], tags[i], summaries[i], specifics_list[i], subject_boxes[i])],
+                "a": a, "b": b,
                 "extent_lo": bounds[i][0], "extent_hi": bounds[i][1],
             })
     return groups
 
 
+_GroupPeak = Tuple[int, str, str, Dict[str, Any], Optional[Tuple[float, float, float, float]]]
+
+
 def _representative_peak(
-    group_peaks: List[Tuple[int, str, str]], hop_ms: int, action_energy: List[float],
+    group_peaks: List[_GroupPeak], hop_ms: int, action_energy: List[float],
 ) -> Tuple[int, str]:
     """A merged window may carry several flags (e.g. 8 push-up tops at low
     energy) -- pick the strongest one (by refined action_energy) as the
     single representative peak_ms/tag a CutRecord needs (hero_ts_ms)."""
     if len(group_peaks) == 1:
-        t_ms, tag, _summary = group_peaks[0]
+        t_ms, tag, _summary, _specifics, _box = group_peaks[0]
         return t_ms, tag
 
     def _strength(t_ms: int) -> float:
@@ -288,11 +342,11 @@ def _representative_peak(
         i = max(0, min(len(action_energy) - 1, int(round(t_ms / hop_ms))))
         return action_energy[i]
 
-    t_ms, tag, _summary = max(group_peaks, key=lambda pt: _strength(pt[0]))
+    t_ms, tag, _summary, _specifics, _box = max(group_peaks, key=lambda pt: _strength(pt[0]))
     return t_ms, tag
 
 
-def _joined_summary(group_peaks: List[Tuple[int, str, str]]) -> str:
+def _joined_summary(group_peaks: List[_GroupPeak]) -> str:
     """A merged cut's summary (section 4.4): the joined summaries of every
     flag it absorbed, order-preserving and de-duplicated (a repeated action
     -- "does a push-up" x8 -- collapses to one mention, not eight) -- more
@@ -300,10 +354,45 @@ def _joined_summary(group_peaks: List[Tuple[int, str, str]]) -> str:
     flag's summary alone."""
     ordered = sorted(group_peaks, key=lambda pt: pt[0])
     seen: List[str] = []
-    for _t_ms, _tag, summary in ordered:
+    for _t_ms, _tag, summary, _specifics, _box in ordered:
         if summary and summary not in seen:
             seen.append(summary)
     return "; ".join(seen)
+
+
+def _composed_specifics(group_peaks: List[_GroupPeak], representative_t_ms: int) -> Dict[str, Any]:
+    """vcut_pass2_video_specifics.plan.md section 7.2: a resolved cut's
+    scene_specifics, composed from the flags it absorbed. A single-flag cut
+    passes that flag's own specifics through unchanged. A merged multi-flag
+    cut (loose energy) carries the REPRESENTATIVE flag's fields at the top
+    level (so a single-question UI still shows something sensible) plus a
+    "moments" mini shot-list -- one entry per absorbed flag, each with its
+    own t_ms/summary/specifics -- so nothing a non-representative flag
+    answered is lost. Always JSON-serializable (plain dicts/lists only)."""
+    if len(group_peaks) == 1:
+        _t_ms, _tag, _summary, specifics, _box = group_peaks[0]
+        return dict(specifics or {})
+
+    rep = next((p for p in group_peaks if p[0] == representative_t_ms), group_peaks[0])
+    composed = dict(rep[3] or {})
+    composed["moments"] = [
+        {"t_ms": t_ms, "summary": summary, **dict(specifics or {})}
+        for t_ms, _tag, summary, specifics, _box in sorted(group_peaks, key=lambda p: p[0])
+    ]
+    return composed
+
+
+def _representative_subject_box(
+    group_peaks: List[_GroupPeak], representative_t_ms: int,
+) -> Optional[Tuple[float, float, float, float]]:
+    """reframe_vcut_geometry.plan.md section 3: a merged cut carries the
+    REPRESENTATIVE flag's own subject_box, unlike specifics -- a box
+    doesn't compose sensibly across multiple moments (there's no sensible
+    "joined" rectangle), so no moments-list here. None when that flag had
+    none. Energy-invariant the same way _composed_specifics is: the SAME
+    representative_t_ms _representative_peak already picked."""
+    rep = next((p for p in group_peaks if p[0] == representative_t_ms), group_peaks[0])
+    return rep[4]
 
 
 # --------------------------------------------------------------------------
@@ -335,7 +424,7 @@ def _argmax_s_ms(
 
 
 def _snap_group_edges(
-    a: float, b: float, group_peaks: List[Tuple[int, str, str]], hop_ms: int, S: List[float],
+    a: float, b: float, group_peaks: List[_GroupPeak], hop_ms: int, S: List[float],
     extent: Tuple[float, float],
 ) -> Tuple[int, int]:
     earliest_peak = min(p[0] for p in group_peaks)
@@ -410,7 +499,7 @@ def _widen_to_min_cut(cands: List[_Candidate]) -> List[_Candidate]:
         a = max(c.span_lo, mid - MIN_CUT_MS / 2.0)
         b = min(c.span_hi, mid + MIN_CUT_MS / 2.0)
         out.append(_Candidate(c.file_id, a, b, c.peak_ms, c.tag, c.summary,
-                              c.span_lo, c.span_hi, c.has_peak))
+                              c.span_lo, c.span_hi, c.has_peak, c.specifics, c.subject_box))
     return out
 
 
@@ -448,29 +537,34 @@ def _resolve_file(
     extent = (0.0, float(len(S) * hop_ms))
 
     refined = sorted(
-        ((_refine_peak_ms(f.t_ms, hop_ms, action_energy, frame_diff), f.shape or DEFAULT_TAG, f.summary)
+        ((_refine_peak_ms(f.t_ms, hop_ms, action_energy, frame_diff), f.shape or DEFAULT_TAG, f.summary,
+          f.specifics, f.subject_box)
          for f in flags),
         key=lambda x: x[0],
     )
     peaks_ms = [r[0] for r in refined]
     tags = [r[1] for r in refined]
     summaries = [r[2] for r in refined]
+    specifics_list = [r[3] for r in refined]
+    subject_boxes = [r[4] for r in refined]
 
     width_ms = _window_width_ms(energy)
     raw_windows = [_tag_window(pm, tag, width_ms) for pm, tag in zip(peaks_ms, tags)]
     walls = _wall_positions(peaks_ms, hop_ms, S)
     clamped, bounds = _clamp_windows(peaks_ms, raw_windows, extent, walls)
-    groups = _merge_windows(peaks_ms, tags, summaries, clamped, bounds)
+    groups = _merge_windows(peaks_ms, tags, summaries, specifics_list, subject_boxes, clamped, bounds)
 
     out: List[_Candidate] = []
     for g in groups:
         peak_ms, tag = _representative_peak(g["peaks"], hop_ms, action_energy)
         summary = _joined_summary(g["peaks"])
+        specifics = _composed_specifics(g["peaks"], peak_ms)
+        subject_box = _representative_subject_box(g["peaks"], peak_ms)
         group_extent = (g["extent_lo"], g["extent_hi"])
         a_star, b_star = _snap_group_edges(g["a"], g["b"], g["peaks"], hop_ms, S, group_extent)
         out.append(_Candidate(
             file_id=file_id, a=a_star, b=b_star, peak_ms=peak_ms, tag=tag, summary=summary,
-            span_lo=g["extent_lo"], span_hi=g["extent_hi"],
+            span_lo=g["extent_lo"], span_hi=g["extent_hi"], specifics=specifics, subject_box=subject_box,
         ))
     return out
 
@@ -507,7 +601,8 @@ def resolve_cuts(plan: MomentPlan, seam: Dict[str, dict], energy: float) -> List
         cands = _widen_to_min_cut(cands)
         resolved.extend(
             ResolvedCut(file_id=c.file_id, in_ms=int(round(c.a)), out_ms=int(round(c.b)),
-                       peak_ms=c.peak_ms, tag=c.tag, summary=c.summary)
+                       peak_ms=c.peak_ms, tag=c.tag, summary=c.summary, specifics=c.specifics,
+                       subject_box=c.subject_box)
             for c in cands
         )
 

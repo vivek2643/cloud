@@ -5,6 +5,14 @@ the frames (no extra call); Pass 2 (pass2.py) answers exactly that subset
 against the shared frame cache. Closed: selection can only choose ids that
 exist here, never mint new ones -- bounded, cheap, parseable, generic
 across monuments/events/actions/people.
+
+vcut_pass2_video_specifics.plan.md section 4.3 extends the bank with edit-
+decision dimensions (shot_size/camera_move/motion_direction/subject_entry_
+exit/headroom_lookroom/usable/energy_emotion/hook_potential/tags) so the
+question planner (qplan.py) has real choices beyond the original monument/
+event-centric set -- selected per moment from real video content, not asked
+of every moment by default (see qplan.DEFAULT_QUESTION_IDS below for the
+still-small fallback set).
 """
 from __future__ import annotations
 
@@ -33,6 +41,24 @@ BANK: Dict[str, Question] = {
         Question("motion_quality", "energy of the shot", "one of: static, subtle, dynamic"),
         Question("continuity_cue", "does it visually continue/precede another shown moment",
                  "short hint, or empty if none"),
+        # --- edit-decision dimensions (vcut_pass2_video_specifics.plan.md section 4.3) ---
+        Question("shot_size", "the framing/shot size",
+                 "one of: wide, medium, close, extreme_close"),
+        Question("camera_move", "how the camera moves during the moment",
+                 "one of: static, pan, tilt, push, handheld"),
+        Question("motion_direction", "the dominant on-screen motion direction (for match cuts)",
+                 "one of: left_to_right, right_to_left, toward_camera, away_from_camera, up, down, none"),
+        Question("subject_entry_exit", "does the subject enter or exit frame during the moment",
+                 "one of: enters, exits, both, neither"),
+        Question("headroom_lookroom", "framing headroom/lookroom quality (for reframe/crop)",
+                 "one of: tight, good, loose, off_balance"),
+        Question("usable", "how usable this take/moment is as a shot",
+                 "one of: strong, ok, weak"),
+        Question("energy_emotion", "the emotional/energy tone of the moment", "short string"),
+        Question("hook_potential", "how likely this moment works as an opening hook",
+                 "one of: high, medium, low"),
+        Question("tags", "a few keyword tags for search/filtering",
+                 "array of short lowercase strings"),
     )
 }
 

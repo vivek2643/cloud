@@ -15,7 +15,7 @@ enqueues it, so a request never blocks on a real model call.
 from __future__ import annotations
 
 import logging
-from typing import List
+from typing import Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -110,6 +110,31 @@ def _latest_run_id(project_id: str) -> str | None:
     return row["id"] if row else None
 
 
+def _resolve_energy_preserving(
+    project_id: str,
+    user_id: str,
+    ingest_run_id: str,
+    plan,
+    seam_cache: Dict[str, dict],
+    energy: float,
+) -> dict:
+    """resolve -> insert the kind='video' cuts at ``energy``. vcut_pass2_
+    video_specifics.plan.md section 7.4 retires this function's own former
+    band-aid (a hero-containment snapshot/re-map of Pass-2 specifics across
+    the delete+reinsert an energy change causes): specifics now live on the
+    plan's own MomentFlags and are composed onto whatever cut contains them
+    by resolve_cuts itself, at ANY energy -- so a plain resolve+insert (via
+    vstore.insert_video_cuts, section 7.3) already yields specifics-bearing
+    rows with zero ambiguity, no remap needed. Shared by set_cuts_energy and
+    the energy_levels prefetch."""
+    from app.services.vcut import store as vstore
+    from app.services.vcut.resolve import resolve_cuts
+
+    resolved = resolve_cuts(plan, seam_cache, energy=energy)
+    vstore.insert_video_cuts(ingest_run_id, resolved, seam_cache)
+    return read.load_cuts(project_id, user_id)
+
+
 @router.post("/{project_id}/cuts/energy")
 def set_cuts_energy(project_id: str, body: EnergyBody, user_id: str = Depends(get_current_user_id)):
     """seam_cut_pipeline.plan.md section 9: re-derive video cut boundaries
@@ -127,9 +152,8 @@ def set_cuts_energy(project_id: str, body: EnergyBody, user_id: str = Depends(ge
     "simplest, recommended for v1" choice)."""
     _owned_project(project_id, user_id)
 
-    from app.services.l3 import ingest_store as l3store
     from app.services.vcut import store as vstore
-    from app.services.vcut.resolve import MomentPlan, resolve_cuts
+    from app.services.vcut.resolve import MomentPlan
 
     ingest_run_id = _latest_run_id(project_id)
     if not ingest_run_id:
@@ -143,12 +167,7 @@ def set_cuts_energy(project_id: str, body: EnergyBody, user_id: str = Depends(ge
         )
 
     plan = MomentPlan.from_dict(loose_plan_dict)
-    resolved = resolve_cuts(plan, seam_cache, energy=body.energy)
-    records = vstore.build_cut_records(resolved, seam_cache)
-    vstore.delete_video_cuts_for_run(ingest_run_id)
-    l3store.insert_cut_records(ingest_run_id, records)
-
-    return read.load_cuts(project_id, user_id)
+    return _resolve_energy_preserving(project_id, user_id, ingest_run_id, plan, seam_cache, body.energy)
 
 
 # The five discrete dial stops (EnergyBar snaps to Math.round(t*4)/4). Kept as
@@ -173,9 +192,8 @@ def get_cuts_energy_levels(project_id: str, user_id: str = Depends(get_current_u
     409 when the latest run has no seam_cache/loose_plan to re-derive from."""
     _owned_project(project_id, user_id)
 
-    from app.services.l3 import ingest_store as l3store
     from app.services.vcut import store as vstore
-    from app.services.vcut.resolve import MomentPlan, resolve_cuts
+    from app.services.vcut.resolve import MomentPlan
 
     ingest_run_id = _latest_run_id(project_id)
     if not ingest_run_id:
@@ -191,11 +209,7 @@ def get_cuts_energy_levels(project_id: str, user_id: str = Depends(get_current_u
     plan = MomentPlan.from_dict(loose_plan_dict)
 
     def _resolve_at(energy: float) -> dict:
-        resolved = resolve_cuts(plan, seam_cache, energy=energy)
-        records = vstore.build_cut_records(resolved, seam_cache)
-        vstore.delete_video_cuts_for_run(ingest_run_id)
-        l3store.insert_cut_records(ingest_run_id, records)
-        return read.load_cuts(project_id, user_id)
+        return _resolve_energy_preserving(project_id, user_id, ingest_run_id, plan, seam_cache, energy)
 
     levels = {_energy_key(energy): _resolve_at(energy) for energy in _ENERGY_STOPS}
 

@@ -750,20 +750,153 @@ def _landmarks_tag(m: Dict[str, Any]) -> str:
     return f" sig:{','.join(parts)}" if parts else ""
 
 
-def _specific_tag(m: Dict[str, Any]) -> str:
+_SPEC_MOMENTS_MAX = 5
+# Values that carry no signal for their field -- omitted rather than
+# rendered as noise (a static/unlabeled camera move, "good" headroom, "none"
+# motion direction all mean "nothing notable to say here").
+_SPEC_CAMERA_NULL = ("static", "unknown", "")
+_SPEC_MOTION_NULL = ("none", "")
+_SPEC_HEADROOM_NULL = ("good", "")
+
+
+def _spec_field(spec: Dict[str, Any], key: str) -> str:
+    return str(spec.get(key) or "").strip()
+
+
+def _dedupes_code_tag(spec_value: str, code_value: str) -> bool:
+    """True when the vision-model's free-text field says essentially the
+    same thing as the existing code-derived tag on the line (brain_cut_
+    specifics_wiring.plan.md section 4) -- a loose substring match either
+    way, since the two fields don't share a fixed vocabulary (code's `cam`
+    might say "pan left", vcut's `camera_move` bank field just "pan")."""
+    a, b = spec_value.strip().lower(), code_value.strip().lower()
+    if not a or not b:
+        return False
+    return a in b or b in a
+
+
+def _spec_groups(spec: Dict[str, Any], m: Dict[str, Any]) -> List[str]:
+    """The ordered, priority-capped list of compact tokens that make up a
+    new-shape spec tag's body (brain_cut_specifics_wiring.plan.md section
+    1b) -- shared by the single-flag and merged-cut renderers, since a
+    merged cut's representative fields compose exactly the same way."""
+    groups: List[str] = []
+
+    subject, action = _spec_field(spec, "subject"), _spec_field(spec, "action")
+    if subject and action:
+        groups.append(f"{subject} {action}")
+    elif subject or action:
+        groups.append(subject or action)
+
+    shot_size = _spec_field(spec, "shot_size")
+    if shot_size:
+        groups.append(shot_size)
+
+    camera_move = _spec_field(spec, "camera_move")
+    if camera_move and camera_move.lower() not in _SPEC_CAMERA_NULL:
+        if not _dedupes_code_tag(camera_move, m.get("camera") or ""):
+            groups.append(camera_move)
+
+    on_screen_text = _spec_field(spec, "on_screen_text")
+    if on_screen_text and not _dedupes_code_tag(on_screen_text, m.get("screen_text") or ""):
+        groups.append(f"text:'{_short_gist(on_screen_text)}'")
+
+    motion_direction = _spec_field(spec, "motion_direction")
+    if motion_direction and motion_direction.lower() not in _SPEC_MOTION_NULL:
+        groups.append(motion_direction)
+
+    headroom_lookroom = _spec_field(spec, "headroom_lookroom")
+    if headroom_lookroom and headroom_lookroom.lower() not in _SPEC_HEADROOM_NULL:
+        groups.append(headroom_lookroom)
+
+    usable = _spec_field(spec, "usable")
+    if usable:
+        groups.append(f"usable:{usable}")
+
+    hook = _spec_field(spec, "hook_potential")
+    if hook:
+        groups.append(f"hook:{hook}")
+
+    tags = [str(t).strip() for t in (spec.get("tags") or []) if str(t).strip()]
+    if tags:
+        groups.append(f"tags:{','.join(tags[:3])}")
+
+    return groups
+
+
+def _render_moments_list(moments: List[Dict[str, Any]], cut_in_ms: int) -> str:
+    """`+1.2s barista grabs cup; +3.4s pours latte, close; ...` -- the mini
+    shot-list for a merged loose cut (section 1c), one entry per absorbed
+    moment, capped at `_SPEC_MOMENTS_MAX` with a `...+N more` tail. Each
+    moment's own `summary` is preferred; a moment with neither summary nor
+    subject/action contributes nothing (never a bare timestamp)."""
+    entries: List[str] = []
+    for mo in moments[:_SPEC_MOMENTS_MAX]:
+        t_ms = mo.get("t_ms")
+        if t_ms is None:
+            continue
+        summary = (mo.get("summary") or "").strip()
+        if not summary:
+            subj, act = (mo.get("subject") or "").strip(), (mo.get("action") or "").strip()
+            summary = f"{subj} {act}".strip()
+        if not summary:
+            continue
+        delta_s = (int(t_ms) - int(cut_in_ms or 0)) / 1000.0
+        entries.append(f"+{delta_s:.1f}s {_short_gist(summary)}")
+    if not entries:
+        return ""
+    if len(moments) > _SPEC_MOMENTS_MAX:
+        entries.append(f"…+{len(moments) - _SPEC_MOMENTS_MAX} more")
+    return "; ".join(entries)
+
+
+def _render_new_specifics(spec: Dict[str, Any], m: Dict[str, Any], *, compact: bool) -> str:
+    """The new (vcut_pass2_video_specifics.plan.md) flat, question-bank-
+    keyed shape -> a compact `spec:"..."` (+ `moments:[...]` for a merged
+    loose cut). Resident mode renders everything; compact mode keeps only
+    the lead group (subject/action + shot_size) and drops the moments list
+    entirely, relying on `inspect_cut` for full detail (section 2)."""
+    groups = _spec_groups(spec, m)
+    moments = spec.get("moments") or []
+    if compact:
+        groups = groups[:2]
+        moments = []
+
+    tag = f' spec:"{" · ".join(groups)}"' if groups else ""
+    if moments:
+        moments_str = _render_moments_list(moments, m.get("in_ms", 0))
+        if moments_str:
+            tag += f" moments:[{moments_str}]"
+    return tag
+
+
+def _specific_tag(m: Dict[str, Any], *, compact: bool = False) -> str:
     """`spec:"pheras -- couple circling the fire"` -- cut_structure_and_
     scene_specificity.plan.md Part 3's sharpened, footage-derived specific
-    for this cut (a two-pass vision derivation: a generic pass, a text step
-    inferring the project domain + writing targeted questions, a second
-    vision pass answering them), ADDITIVE alongside the generic label/
-    summary -- never replaces them, since the generic description is still
-    what's shown when enrichment hasn't reached this cut yet (a normal,
-    common state -- it runs in the background after cuts are shown). ''
-    when `scene_specifics` is empty."""
-    specific = ((m.get("scene_specifics") or {}).get("specific") or "").strip()
-    if not specific:
+    for this cut, ADDITIVE alongside the generic label/summary -- never
+    replaces them, since the generic description is still what's shown
+    when enrichment hasn't reached this cut yet (a normal, common state --
+    it runs in the background after cuts are shown). '' when
+    `scene_specifics` is empty.
+
+    brain_cut_specifics_wiring.plan.md: the vcut pipeline's Pass 2 writes a
+    DIFFERENT shape now -- a flat dict keyed by question-bank ids (subject/
+    action/shot_size/usable/tags/... -- questions.py) rather than the old
+    {"specific", "label"} pair the scene_specificity.py Pass-B wrote. Both
+    shapes render: a legacy row (`specific` key present) keeps exactly the
+    original one-line rendering below; the new shape composes a priority-
+    ordered, token-bounded tag (`_render_new_specifics`) so un-migrated old
+    runs and freshly-enriched vcut runs both surface correctly with zero
+    branching at any call site."""
+    spec = m.get("scene_specifics") or {}
+    if not spec:
         return ""
-    return f" spec:\"{_short_gist(specific)}\""
+
+    legacy = (spec.get("specific") or "").strip()
+    if legacy:
+        return f" spec:\"{_short_gist(legacy)}\""
+
+    return _render_new_specifics(spec, m, compact=compact)
 
 
 def _dur_tag(m: Dict[str, Any]) -> str:
@@ -972,7 +1105,7 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     # when present so text-free footage stays terse. "" on a pre-migration cut.
     scr = (m.get("screen_text") or "").strip().replace("\n", " ")
     scr_tag = f" text:\"{_short_gist(scr)}\"" if scr else ""
-    spec_tag = _specific_tag(m)
+    spec_tag = _specific_tag(m, compact=compact)
     # Continuity run: this beat is part of one uninterrupted same-clip shot
     # (members listed in source order); keep run members together + in order.
     run = ""

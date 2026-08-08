@@ -174,6 +174,41 @@ def cut_non_speech_subclip(
     return SubClip(path=out_path, segments=_build_segments(spans), duration_ms=total_ms)
 
 
+def probe_proxy_dims(proxy_key: str) -> Optional[Tuple[int, int]]:
+    """(width, height) of the proxy's own video stream, via a presigned-URL
+    ffprobe -- no local download (a faststart mp4, which both the L1 proxy
+    encode and this module's own subclip output use, only needs its header
+    read, and R2/S3 support HTTP range requests either way).
+
+    reframe_vcut_geometry.plan.md section 2: this is deliberately the
+    PROXY's own dims, not ``files.width``/``files.height`` (probed from the
+    RAW upload before L1's proxy encode runs, so they can be pre-rotation
+    and mismatched with the proxy's actual pixel layout). The proxy is also
+    already upright -- l1.pipeline._encode_proxy auto-applies rotation
+    during transcode -- so no rotation reading is needed here; see store.py
+    for where rotation_deg is set (always 0.0, with that reasoning spelled
+    out there too).
+
+    None on any probe failure (framing then falls back to a centered crop
+    for that file -- never a hard failure, matching the rest of this
+    module's fail-open-to-frames contract)."""
+    from app.services.processing import _probe_video
+    from app.services.r2 import generate_presigned_get
+
+    try:
+        url = generate_presigned_get(proxy_key)
+        probe = _probe_video(url)
+    except Exception:
+        logger.exception("vcut subclip: failed to probe proxy dims for %s", proxy_key)
+        return None
+    for stream in probe.get("streams", []):
+        if stream.get("codec_type") == "video":
+            w, h = int(stream.get("width", 0) or 0), int(stream.get("height", 0) or 0)
+            if w > 0 and h > 0:
+                return w, h
+    return None
+
+
 def cleanup_subclip(sub: Optional[SubClip]) -> None:
     """Best-effort local temp-dir cleanup, called once the clip has been
     uploaded (or the upload attempt has already failed) -- never worth

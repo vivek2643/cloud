@@ -80,7 +80,12 @@ def _specs() -> List[Dict[str, Any]]:
           "line's sig: breadcrumb: a downsampled action-energy curve + hit offsets, a "
           "downsampled loudness envelope + rise/fall change offsets + silence-gap "
           "offsets, and internal shot/composition-cut offsets -- all measured from the "
-          "cut's own start. Pass ref (a Beat Index moment id, e.g. from a sig: line) to "
+          "cut's own start. Also returns specifics: the COMPLETE scene_specifics for "
+          "this cut when the vision model has enriched it -- every answered field "
+          "(count, notable_object, continuity_cue, setting, custom-probe answers, and "
+          "the full moments shot-list for a merged loose cut), beyond what the "
+          "beat line's compact spec: tag shows. Omitted when the cut isn't enriched yet. "
+          "Pass ref (a Beat Index moment id, e.g. from a sig: line) to "
           "inspect a cut not yet placed, or seg_id for an already-placed one.",
           obj({"ref": {"type": "string"}, "seg_id": {"type": "string"}})),
         S("predict", "Returns the program LENGTH under a proposed change without "

@@ -1,8 +1,15 @@
 """One-off: re-ingest EVERY project on the NEW vcut cuts pipeline, synchronously
 (no procrastinate workers). Per project: run_vcut_ingest (spans -> seam -> Pass1
--> resolve -> video+speech cut_records -> 'ready') then run_enrich inline (Pass2
-scene_specifics, rides the still-warm shared cache). The latest ingest_run wins,
+-> resolve -> video+speech cut_records -> 'ready'). The latest ingest_run wins,
 so the frontend shows these cuts immediately.
+
+Pass 2 (scene_specifics): in VIDEO mode, run_vcut_ingest already runs the
+question planner + Pass-2 enrich INLINE on the still-warm per-file video cache
+(vcut_pass2_video_specifics.plan.md section 6.1), so this script must NOT call
+run_enrich again -- doing so would run the FRAMES-mode hero-still enrich and
+overwrite the good cached-video specifics. Only in FRAMES mode (input mode !=
+'video') does this script call run_enrich itself (the deferred vcut_enrich task
+is otherwise bypassed by running synchronously here).
 
 SPENDS REAL MONEY: one Gemini Pass-1 vision + one speech Gemini-pro text + one
 Pass-2 enrich (cache-discounted) per project. Sequential + per-project retry so a
@@ -15,6 +22,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from app.config import get_settings  # noqa: E402
 from app.services import db  # noqa: E402
 from app.services.vcut import pass2 as p2  # noqa: E402
 from app.services.vcut.orchestrate import run_vcut_ingest  # noqa: E402
@@ -72,10 +80,15 @@ def _run_one(pid):
     for attempt in range(_RETRIES + 1):
         try:
             rid = run_vcut_ingest(pid)
-            try:
-                p2.run_enrich(pid, rid)
-            except Exception as e:  # noqa: BLE001 - enrich is best-effort
-                print(f"    enrich failed for {pid} (cuts still visible): {e!r}", flush=True)
+            # VIDEO mode already enriched inline inside run_vcut_ingest -- only
+            # the FRAMES-mode path needs an explicit run_enrich here (see module
+            # docstring: a second call in video mode would overwrite the good
+            # cached-video specifics with hero-still ones).
+            if get_settings().vcut_pass1_input_mode != "video":
+                try:
+                    p2.run_enrich(pid, rid)
+                except Exception as e:  # noqa: BLE001 - enrich is best-effort
+                    print(f"    enrich failed for {pid} (cuts still visible): {e!r}", flush=True)
             return rid, _counts(rid)
         except Exception as exc:  # noqa: BLE001
             last = exc

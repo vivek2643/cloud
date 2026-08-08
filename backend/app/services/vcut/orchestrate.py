@@ -23,6 +23,8 @@ from app.config import get_settings
 from app.services.jobs import app
 from app.services.l3 import ingest_store as l3store
 from app.services.vcut import pass1 as p1
+from app.services.vcut import pass2 as p2
+from app.services.vcut import qplan
 from app.services.vcut import resolve as rv
 from app.services.vcut import sampling
 from app.services.vcut import spans as sp
@@ -81,6 +83,43 @@ def _build_seam_cache(file_ids: List[str]) -> Dict[str, dict]:
     return seam_cache
 
 
+def _add_dims_to_seam_cache(seam_cache: Dict[str, dict], proxy_key_by_file: Dict[str, str]) -> None:
+    """reframe_vcut_geometry.plan.md section 2: mutate ``seam_cache`` in
+    place, adding {src_w, src_h} (the proxy's own probed dims) to each
+    file entry that resolved a seam curve. Threading this onto the SAME
+    dict store.build_cut_records already reads means zero extra plumbing
+    -- seam_cache round-trips through persist_seam_and_plan/load_seam_
+    and_plan as-is, so the energy re-resolve path (routers/projects.py)
+    gets these for free too. Sequential per file (a natural follow-up to
+    parallelize, like _build_seam_cache/sampling.sample_frames_for_files,
+    if this proves to be a bottleneck; not done here to keep this change
+    minimal). A probe failure just leaves that file's entry without dims
+    -- store.py then falls back to an empty framing for its cuts."""
+    for file_id, entry in seam_cache.items():
+        proxy_key = proxy_key_by_file.get(file_id)
+        if not proxy_key:
+            continue
+        dims = subclip.probe_proxy_dims(proxy_key)
+        if dims:
+            entry["src_w"], entry["src_h"] = dims
+
+
+def _words_by_file(prompt_rows: List[Tuple[str, str, int]]) -> Dict[str, List[Tuple[int, int, str]]]:
+    """{file_id: [(start_ms, end_ms, text), ...]} -- qplan.py's local
+    transcript-context input (section 4.1), read via the SAME loader the
+    speech channel itself uses (app.services.vcut.speech.inputs, vcut-
+    internal, not L3 -- principle 7's isolation constraint is unaffected).
+    A plain read (no model cost); a file with no transcript at all is
+    simply absent, same as load_project_inputs' own contract."""
+    from app.services.vcut.speech.inputs import load_project_inputs
+
+    inputs_by_file = load_project_inputs(prompt_rows)
+    return {
+        file_id: [(w.start_ms, w.end_ms, w.text) for w in fi.words]
+        for file_id, fi in inputs_by_file.items()
+    }
+
+
 def _create_vcut_cache(
     prompt_rows: List[Tuple[str, str, int]],
     non_speech_by_file: Dict[str, List[Tuple[int, int]]],
@@ -136,20 +175,30 @@ def _run_speech_channel(project_id: str, ingest_run_id: str, seam_cache: Dict[st
     return n
 
 
+_VideoCleanupEntry = Tuple[subclip.SubClip, Optional[Dict[str, str]], Optional[str]]
+
+
 def _prepare_video_inputs(
     file_rows: List[Tuple[str, str, int, str]],
     non_speech_by_file: Dict[str, List[Tuple[int, int]]],
     settings,
-) -> Tuple[Dict[str, p1.VideoHandle], List[Tuple[subclip.SubClip, Optional[Dict[str, str]]]]]:
+) -> Tuple[Dict[str, p1.VideoHandle], List[_VideoCleanupEntry]]:
     """pass1_video_input.plan.md section 7, Phase 1: cut + upload each
     file's non-speech sub-clip, sequentially (a natural follow-up to
     parallelize -- like _build_seam_cache/sampling.sample_frames_for_files
     already do -- if this proves to be a bottleneck; not done here to keep
-    this Phase-1 change minimal). Returns ({file_id: VideoHandle} for files
-    where BOTH the cut AND the upload succeeded) and the full cleanup list
-    (every SubClip actually cut, paired with its upload handle or None) so
-    the caller can always tear down local temp files + uploaded Files API
-    objects regardless of outcome.
+    this Phase-1 change minimal). vcut_pass2_video_specifics.plan.md section
+    3.2: after a successful upload, also create that file's per-file video
+    CachedContent (shared by Pass 1 and Pass 2) -- a cache-creation failure
+    or below-min-token-floor clip degrades to None (VideoHandle.cache_name),
+    never a hard failure; that file's calls just send the video inline
+    instead, uncached.
+
+    Returns ({file_id: VideoHandle} for files where BOTH the cut AND the
+    upload succeeded) and the full cleanup list (every SubClip actually cut,
+    paired with its upload handle and cache name, either of which may be
+    None) so the caller can always tear down local temp files + uploaded
+    Files API objects + CachedContents regardless of outcome.
 
     NO FALLBACK: there is no frames substitution any more. A file whose cut
     produced nothing, or whose upload returned None, is simply left ABSENT
@@ -157,10 +206,10 @@ def _prepare_video_inputs(
     any missing file (it names them). An unexpected exception here (ffmpeg
     crash, network error) is no longer swallowed -- it propagates and aborts
     the run, rather than silently degrading that file to sampled frames."""
-    from app.services.llm.ingest_gemini import upload_video
+    from app.services.llm.ingest_gemini import create_video_cache, upload_video
 
     video_by_file: Dict[str, p1.VideoHandle] = {}
-    cleanup: List[Tuple[subclip.SubClip, Optional[Dict[str, str]]]] = []
+    cleanup: List[_VideoCleanupEntry] = []
     for file_id, _name, _dur, proxy_key in file_rows:
         sub = subclip.cut_non_speech_subclip(
             proxy_key, non_speech_by_file.get(file_id) or [],
@@ -170,21 +219,30 @@ def _prepare_video_inputs(
             # Left absent -> run_vcut_ingest's missing-file check hard-fails.
             continue
         handle = upload_video(sub.path)
-        cleanup.append((sub, handle))
+        cache_name: Optional[str] = None
         if handle is not None:
-            video_by_file[file_id] = p1.VideoHandle(file_uri=handle["uri"], segments=sub.segments)
+            cache_name = create_video_cache(
+                p1.NEUTRAL_SYSTEM, handle["uri"], model=settings.vcut_pass1_model,
+                ttl_seconds=settings.vcut_cache_ttl_s, fps=settings.vcut_video_fps,
+            )
+        cleanup.append((sub, handle, cache_name))
+        if handle is not None:
+            video_by_file[file_id] = p1.VideoHandle(
+                file_uri=handle["uri"], segments=sub.segments, cache_name=cache_name)
         # handle is None -> file stays absent -> caller hard-fails (clip still
         # tracked in cleanup above so its temp file is torn down).
     return video_by_file, cleanup
 
 
-def _cleanup_video_inputs(cleanup: List[Tuple[subclip.SubClip, Optional[Dict[str, str]]]]) -> None:
-    """Best-effort teardown of every uploaded Files API object + local temp
-    clip from a video-mode run, called in run_vcut_ingest's finally block
-    regardless of success/failure."""
-    from app.services.llm.ingest_gemini import delete_uploaded_file
+def _cleanup_video_inputs(cleanup: List[_VideoCleanupEntry]) -> None:
+    """Best-effort teardown of every uploaded Files API object + per-file
+    video CachedContent + local temp clip from a video-mode run, called in
+    run_vcut_ingest's finally block regardless of success/failure."""
+    from app.services.llm.ingest_gemini import delete_pass2_cache, delete_uploaded_file
 
-    for sub, handle in cleanup:
+    for sub, handle, cache_name in cleanup:
+        if cache_name is not None:
+            delete_pass2_cache(cache_name)
         if handle is not None:
             delete_uploaded_file(handle.get("name"))
         subclip.cleanup_subclip(sub)
@@ -204,7 +262,7 @@ def run_vcut_ingest(project_id: str) -> str:
     settings = get_settings()
     ingest_run_id = l3store.create_ingest_run(
         project_id, f"vcut:{settings.vcut_pass1_model}", f"vcut:{settings.vcut_pass2_model}")
-    video_cleanup: List[Tuple[subclip.SubClip, Optional[Dict[str, str]]]] = []
+    video_cleanup: List[_VideoCleanupEntry] = []
     try:
         file_rows = _project_file_rows(project_id)
         if not file_rows:
@@ -217,6 +275,7 @@ def run_vcut_ingest(project_id: str) -> str:
         l3store.set_status(ingest_run_id, "images")
         non_speech_by_file = {fid: sp.non_speech_spans(fid, duration_by_file[fid]) for fid in file_ids}
         seam_cache = _build_seam_cache(file_ids)
+        _add_dims_to_seam_cache(seam_cache, proxy_key_by_file)
 
         video_by_file: Dict[str, p1.VideoHandle] = {}
         images_by_key: Dict[Tuple[str, int], str] = {}
@@ -267,17 +326,47 @@ def run_vcut_ingest(project_id: str) -> str:
 
         l3store.set_status(ingest_run_id, "post")
         resolved = rv.resolve_cuts(plan, seam_cache, energy=DEFAULT_ENERGY)
-        records = store.build_cut_records(resolved, seam_cache)
-        store.delete_video_cuts_for_run(ingest_run_id)
-        l3store.insert_cut_records(ingest_run_id, records)
+        video_ids = store.insert_video_cuts(ingest_run_id, resolved, seam_cache)
 
         n_speech = _run_speech_channel(project_id, ingest_run_id, seam_cache)
+
+        # vcut_pass2_video_specifics.plan.md section 4/6.1: the question
+        # planner (one cheap text-only call) runs for BOTH input modes --
+        # it writes question_ids/custom_questions onto the plan's flags,
+        # which pass2.run_enrich(_inline) (video, here) or the deferred
+        # vcut_enrich task (frames) then answers. Never a hard failure
+        # (qplan.plan_questions itself never raises).
+        words_by_file = _words_by_file(prompt_rows)
+        plan, qplan_usage = qplan.plan_questions(plan, words_by_file)
+        if qplan_usage:
+            l3store.accumulate_pass2_usage(ingest_run_id, qplan_usage)
         store.persist_seam_and_plan(ingest_run_id, seam_cache, plan.to_dict())
+
+        if settings.vcut_pass1_input_mode == "video":
+            # section 6.1: run enrich INLINE, before _cleanup_video_inputs
+            # tears the per-file video caches/uploads down below -- a
+            # deferred call risks the CachedContent's TTL expiring between
+            # passes. Re-resolving + rewriting cut_records here is what
+            # makes the shown cuts carry their composed specifics
+            # immediately (section 5.4/7.3) instead of waiting on the
+            # background vcut_enrich task.
+            plan, enrich_usage = p2.run_enrich_inline(plan, video_by_file)
+            if enrich_usage:
+                l3store.accumulate_pass2_usage(ingest_run_id, enrich_usage)
+            store.persist_seam_and_plan(ingest_run_id, seam_cache, plan.to_dict())
+            resolved = rv.resolve_cuts(plan, seam_cache, energy=DEFAULT_ENERGY)
+            video_ids = store.insert_video_cuts(ingest_run_id, resolved, seam_cache)
 
         l3store.set_status(ingest_run_id, "ready")
         logger.info("vcut_ingest run %s: %d video cut(s), %d speech cut(s), %d file(s)",
-                   ingest_run_id, len(records), n_speech, len(file_ids))
-        defer_vcut_enrich(project_id, ingest_run_id)
+                   ingest_run_id, len(video_ids), n_speech, len(file_ids))
+        if settings.vcut_pass1_input_mode != "video":
+            # Video mode already enriched inline above -- deferring vcut_
+            # enrich here too would redundantly re-answer every flagged
+            # moment from hero-still frames (pass2.run_enrich is a FRAMES-
+            # mode function now, section 6.1), spending real money twice
+            # for no benefit. Frames mode still defers it, unchanged.
+            defer_vcut_enrich(project_id, ingest_run_id)
     except Exception as e:
         logger.exception("vcut_ingest run %s failed", ingest_run_id)
         l3store.set_status(ingest_run_id, "failed", error=str(e))

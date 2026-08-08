@@ -350,6 +350,171 @@ def test_file_plan_to_dict_round_trips_through_from_dict():
     print("ok  test_file_plan_to_dict_round_trips_through_from_dict")
 
 
+def test_moment_flag_round_trips_question_ids_custom_questions_specifics():
+    fp = FilePlan(file_id="f1", flags=[MomentFlag(
+        t_ms=100, shape="build", summary="s",
+        question_ids=["subject", "action"],
+        custom_questions=[{"key": "brand", "prompt": "what brand is shown?"}],
+        specifics={"subject": "a shoe"},
+        subject_box=(0.1, 0.2, 0.3, 0.4),
+    )])
+    round_tripped = FilePlan.from_dict("f1", fp.to_dict())
+    assert round_tripped.flags == fp.flags
+    print("ok  test_moment_flag_round_trips_question_ids_custom_questions_specifics")
+
+
+def test_legacy_from_dict_leaves_new_fields_at_their_defaults():
+    legacy = {"meaning": "m", "loose_cuts": [{"span_ms": [0, 100], "peaks": [{"t_ms": 50, "tag": "build"}]}]}
+    fp = FilePlan.from_dict("f1", legacy)
+    assert fp.flags[0].question_ids == []
+    assert fp.flags[0].custom_questions == []
+    assert fp.flags[0].specifics == {}
+    assert fp.flags[0].subject_box is None
+    print("ok  test_legacy_from_dict_leaves_new_fields_at_their_defaults")
+
+
+def test_moment_plan_genre_round_trips_through_reserved_meta_key():
+    plan = MomentPlan(files=[FilePlan(file_id="f1", flags=[MomentFlag(t_ms=100)])], genre="tutorial")
+    data = plan.to_dict()
+    assert data["__meta__"] == {"genre": "tutorial"}
+    assert "f1" in data
+    round_tripped = MomentPlan.from_dict(data)
+    assert round_tripped.genre == "tutorial"
+    assert [fp.file_id for fp in round_tripped.files] == ["f1"]
+    print("ok  test_moment_plan_genre_round_trips_through_reserved_meta_key")
+
+
+def test_moment_plan_from_dict_no_meta_key_defaults_genre_to_empty():
+    data = {"f1": {"flags": [{"t_ms": 100, "shape": "both", "summary": "x"}]}}
+    plan = MomentPlan.from_dict(data)
+    assert plan.genre == ""
+    print("ok  test_moment_plan_from_dict_no_meta_key_defaults_genre_to_empty")
+
+
+# --------------------------------------------------------------------------
+# vcut_pass2_video_specifics.plan.md section 7.2: composed specifics --
+# single-flag cut passes through unchanged; merged multi-flag cut carries
+# the representative flag's fields + a "moments" mini shot-list. Energy-
+# invariant: a moment's specifics always land on whatever cut contains it.
+# --------------------------------------------------------------------------
+
+def test_composed_specifics_single_flag_passes_through_unchanged():
+    n = 101
+    plan = _plan("f1", [MomentFlag(t_ms=5000, shape="both", specifics={"subject": "a dog"})])
+    seam = {"f1": _seam(n, action_energy=_spike(n, 50))}
+    out = resolve_cuts(plan, seam, energy=0.5)
+    assert len(out) == 1
+    assert out[0].specifics == {"subject": "a dog"}
+    print("ok  test_composed_specifics_single_flag_passes_through_unchanged")
+
+
+def test_composed_specifics_merged_cut_carries_representative_plus_moments_list():
+    n = 141
+    flags = [
+        MomentFlag(t_ms=5000, shape="both", summary="a", specifics={"subject": "dog"}),
+        MomentFlag(t_ms=7000, shape="both", summary="b", specifics={"subject": "cat"}),
+        MomentFlag(t_ms=9000, shape="both", summary="c", specifics={"subject": "bird"}),
+    ]
+    plan = _plan("f1", flags)
+    ae = _spike(n, 70)   # strongest action_energy at 7000 -> the representative
+    for ms in (5000, 9000):
+        ae[ms // 100] = 0.5
+    seam = {"f1": _seam(n, S=_low_seam(n, high_at=5), action_energy=ae)}
+
+    out = resolve_cuts(plan, seam, energy=0.0)  # fuses into ONE cut (see test_fuse_at_energy_zero)
+    assert len(out) == 1
+    cut = out[0]
+    assert cut.peak_ms == 7000
+    assert cut.specifics["subject"] == "cat"   # representative flag's own field, at the top level
+    moments = cut.specifics["moments"]
+    assert len(moments) == 3
+    by_t = {m["t_ms"]: m for m in moments}
+    assert by_t[5000] == {"t_ms": 5000, "summary": "a", "subject": "dog"}
+    assert by_t[7000] == {"t_ms": 7000, "summary": "b", "subject": "cat"}
+    assert by_t[9000] == {"t_ms": 9000, "summary": "c", "subject": "bird"}
+    print("ok  test_composed_specifics_merged_cut_carries_representative_plus_moments_list")
+
+
+def test_composed_specifics_energy_invariant_lands_on_whatever_cut_contains_it():
+    n = 141
+    flags = [
+        MomentFlag(t_ms=5000, shape="both", summary="a", specifics={"subject": "dog"}),
+        MomentFlag(t_ms=7000, shape="both", summary="b", specifics={"subject": "cat"}),
+        MomentFlag(t_ms=9000, shape="both", summary="c", specifics={"subject": "bird"}),
+    ]
+    plan = _plan("f1", flags)
+    ae = _spike(n, 70)
+    for ms in (5000, 9000):
+        ae[ms // 100] = 0.5
+    seam = {"f1": _seam(n, S=_low_seam(n, high_at=5), action_energy=ae)}
+
+    low = resolve_cuts(plan, seam, energy=0.0)
+    assert len(low) == 1
+    low_subjects = {m["subject"] for m in low[0].specifics["moments"]}
+    assert low_subjects == {"dog", "cat", "bird"}
+
+    high = resolve_cuts(plan, seam, energy=1.0)
+    assert len(high) == 3
+    by_peak = {c.peak_ms: c for c in high}
+    assert by_peak[5000].specifics == {"subject": "dog"}
+    assert by_peak[7000].specifics == {"subject": "cat"}
+    assert by_peak[9000].specifics == {"subject": "bird"}
+    print("ok  test_composed_specifics_energy_invariant_lands_on_whatever_cut_contains_it")
+
+
+# --------------------------------------------------------------------------
+# reframe_vcut_geometry.plan.md section 3/testing: composed subject_box --
+# a single-flag cut passes its box through; a merged cut carries the
+# REPRESENTATIVE flag's own box (no merge, unlike specifics' moments-list);
+# energy 0 and 1 give the same box for a given moment.
+# --------------------------------------------------------------------------
+
+def test_composed_subject_box_single_flag_passes_through_unchanged():
+    n = 101
+    plan = _plan("f1", [MomentFlag(t_ms=5000, shape="both", subject_box=(0.1, 0.2, 0.3, 0.4))])
+    seam = {"f1": _seam(n, action_energy=_spike(n, 50))}
+    out = resolve_cuts(plan, seam, energy=0.5)
+    assert len(out) == 1
+    assert out[0].subject_box == (0.1, 0.2, 0.3, 0.4)
+    print("ok  test_composed_subject_box_single_flag_passes_through_unchanged")
+
+
+def test_composed_subject_box_none_when_no_flag_has_one():
+    n = 101
+    plan = _plan("f1", [MomentFlag(t_ms=5000, shape="both")])
+    seam = {"f1": _seam(n, action_energy=_spike(n, 50))}
+    out = resolve_cuts(plan, seam, energy=0.5)
+    assert out[0].subject_box is None
+    print("ok  test_composed_subject_box_none_when_no_flag_has_one")
+
+
+def test_composed_subject_box_merged_cut_carries_representative_box_energy_invariant():
+    n = 141
+    flags = [
+        MomentFlag(t_ms=5000, shape="both", summary="a", subject_box=(0.0, 0.0, 0.1, 0.1)),
+        MomentFlag(t_ms=7000, shape="both", summary="b", subject_box=(0.4, 0.4, 0.2, 0.2)),
+        MomentFlag(t_ms=9000, shape="both", summary="c", subject_box=(0.8, 0.8, 0.1, 0.1)),
+    ]
+    plan = _plan("f1", flags)
+    ae = _spike(n, 70)   # strongest action_energy at 7000 -> the representative
+    for ms in (5000, 9000):
+        ae[ms // 100] = 0.5
+    seam = {"f1": _seam(n, S=_low_seam(n, high_at=5), action_energy=ae)}
+
+    low = resolve_cuts(plan, seam, energy=0.0)  # fuses into ONE cut (see test_fuse_at_energy_zero)
+    assert len(low) == 1
+    assert low[0].peak_ms == 7000
+    assert low[0].subject_box == (0.4, 0.4, 0.2, 0.2)  # the representative flag's own box, not merged
+
+    high = resolve_cuts(plan, seam, energy=1.0)  # falls apart into 3 -- same box per moment either way
+    assert len(high) == 3
+    by_peak = {c.peak_ms: c for c in high}
+    assert by_peak[5000].subject_box == (0.0, 0.0, 0.1, 0.1)
+    assert by_peak[7000].subject_box == (0.4, 0.4, 0.2, 0.2)
+    assert by_peak[9000].subject_box == (0.8, 0.8, 0.1, 0.1)
+    print("ok  test_composed_subject_box_merged_cut_carries_representative_box_energy_invariant")
+
+
 def test_back_compat_from_dict_resolves_correctly_end_to_end():
     n = 101
     legacy = {"meaning": "m", "loose_cuts": [{"span_ms": [0, 10000], "peaks": [{"t_ms": 5000, "tag": "both"}]}]}
@@ -424,6 +589,16 @@ def main():
     test_file_plan_from_dict_legacy_shape_flattens_peaks_to_flags()
     test_moment_plan_from_dict_multi_file_both_shapes()
     test_file_plan_to_dict_round_trips_through_from_dict()
+    test_moment_flag_round_trips_question_ids_custom_questions_specifics()
+    test_legacy_from_dict_leaves_new_fields_at_their_defaults()
+    test_moment_plan_genre_round_trips_through_reserved_meta_key()
+    test_moment_plan_from_dict_no_meta_key_defaults_genre_to_empty()
+    test_composed_specifics_single_flag_passes_through_unchanged()
+    test_composed_specifics_merged_cut_carries_representative_plus_moments_list()
+    test_composed_specifics_energy_invariant_lands_on_whatever_cut_contains_it()
+    test_composed_subject_box_single_flag_passes_through_unchanged()
+    test_composed_subject_box_none_when_no_flag_has_one()
+    test_composed_subject_box_merged_cut_carries_representative_box_energy_invariant()
     test_back_compat_from_dict_resolves_correctly_end_to_end()
     test_pushup_worked_example_low_and_high_energy()
     print("\nall vcut resolve tests passed")

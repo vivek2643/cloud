@@ -548,7 +548,9 @@ def create_pass2_cache(
 
 def delete_pass2_cache(name: Optional[str]) -> None:
     """Best-effort teardown -- a failed delete just means the cache expires
-    on its own TTL instead; never worth failing the ingest run over."""
+    on its own TTL instead; never worth failing the ingest run over. Works
+    for ANY CachedContent resource name, not just create_pass2_cache's own
+    -- also used to tear down create_video_cache's caches."""
     if not name:
         return
     try:
@@ -556,6 +558,35 @@ def delete_pass2_cache(name: Optional[str]) -> None:
         client.caches.delete(name=name)
     except Exception:
         logger.warning("ingest_gemini: failed to delete pass2 CachedContent %s (will expire via TTL)", name)
+
+
+# --------------------------------------------------------------------------
+# vcut_pass2_video_specifics.plan.md section 3.1 -- a per-file video
+# CachedContent, shared by Pass 1 and Pass 2 (both read it at the
+# discounted cached-input rate; the video itself is only ever processed
+# once). A CachedContent is bound to the model that creates it, so this
+# must be created with the SAME model both passes call with (section 1's
+# "one model everywhere" principle) -- callers pass settings.vcut_pass1_model
+# for both.
+# --------------------------------------------------------------------------
+
+def create_video_cache(
+    system: str, file_uri: str, *, model: str, ttl_seconds: int, fps: Optional[float] = None,
+) -> Optional[str]:
+    """Thin wrapper over create_pass2_cache: a ``video_file_block`` flows
+    through ``_parts_for_content`` exactly like any other block (confirmed
+    -- gemini_client's own "video_file" branch), so no separate SDK-calling
+    code is needed. ``fps`` is baked into the cache's own VideoMetadata (a
+    CachedContent's Parts are fixed at creation -- unlike media_resolution,
+    which stays a per-call GenerateContentConfig setting and is passed at
+    each complete_gemini() call site instead, cached or not). None on
+    failure or the model's min-cache-token floor (a very short sub-clip may
+    not clear it) -- caller falls back to sending the video inline; never a
+    hard failure."""
+    from app.services.llm.base import video_file_block
+
+    return create_pass2_cache(
+        system, [video_file_block(file_uri, fps=fps)], model=model, ttl_seconds=ttl_seconds)
 
 
 # --------------------------------------------------------------------------

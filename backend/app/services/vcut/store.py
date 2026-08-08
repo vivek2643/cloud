@@ -15,7 +15,26 @@ import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.services.l3.post import CutRecord, PaceEnvelope
+from app.services.vcut.reframe import solve_crops
 from app.services.vcut.resolve import ResolvedCut
+
+# reframe_vcut_geometry.plan.md section 2: rotation_deg is always 0.0 for
+# every vcut cut. The proxy vcut reads (subclip's video input, Pass 2's
+# frames) is ALREADY upright -- app.services.l1.pipeline._encode_proxy
+# auto-applies rotation during transcode (ffmpeg's own default
+# auto-rotate-on-decode behavior; see that module's own docstring) -- and
+# nothing downstream persists the raw upload's original rotation metadata
+# once the proxy exists (files.width/height are probed from the RAW file
+# BEFORE the proxy encode runs, so they're not a trustworthy source
+# either). subject_box (from Pass 2, which only ever sees the proxy) is
+# therefore already expressed in upright coordinates, so there is never a
+# remaining correction: writing a nonzero rotation_deg here would instead
+# DOUBLE-rotate an already-correct preview (cuts-view.tsx applies
+# framing.rotation_deg as a raw CSS transform on top of the proxy's own
+# playback URL). solve_crops still accepts a rotation_deg param (see
+# reframe.py) so it stays correct for a hypothetical future caller that
+# does have a genuine value.
+_ROTATION_DEG = 0.0
 
 # A vcut cut never speed-ramps (pace/reframe is out of scope, plan section
 # 0) -- min/natural/max all pinned to the cut's own length. 5 == the old
@@ -74,6 +93,26 @@ def _pace_for(duration_ms: int) -> PaceEnvelope:
                         levels=list(_PACE_LEVELS), energy_grade="calm", natural_sound=True)
 
 
+def _framing_for(cut: ResolvedCut, file_seam: dict) -> Dict[str, Any]:
+    """reframe_vcut_geometry.plan.md section 4: subject_box (the resolved
+    cut's own composed anchor, from resolve._representative_subject_box)
+    plus the three deterministically-solved delivery crops. src_w/src_h
+    come from the seam entry's own probed proxy dims (orchestrate.
+    _add_dims_to_seam_cache) -- absent (older run, or a probe failure)
+    degrades to an empty framing, same as today's shipped default, never a
+    hard failure."""
+    src_w = int(file_seam.get("src_w") or 0)
+    src_h = int(file_seam.get("src_h") or 0)
+    if src_w <= 0 or src_h <= 0:
+        return {}
+    crops = solve_crops(cut.subject_box, src_w, src_h, rotation_deg=_ROTATION_DEG)
+    return {
+        "subject_box": list(cut.subject_box) if cut.subject_box else None,
+        "rotation_deg": _ROTATION_DEG,
+        **crops,
+    }
+
+
 def build_cut_records(resolved: List[ResolvedCut], seam: Dict[str, dict]) -> List[CutRecord]:
     """One minimal, non-speech CutRecord per ResolvedCut (vcut_moment_
     energy.plan.md section 7.1): kind="video", channel="shown".
@@ -81,7 +120,10 @@ def build_cut_records(resolved: List[ResolvedCut], seam: Dict[str, dict]) -> Lis
     pipeline's own definition of quality, not borrowed from the old
     pipeline's judgment model. scene_specifics is left at its column
     default; Pass 2 (pass2.py/vcut_enrich) fills it in later, same contract
-    as the old pipeline's l3_scene_enrich."""
+    as the old pipeline's l3_scene_enrich. framing is populated per
+    reframe_vcut_geometry.plan.md (re-derived at every resolve from the
+    cut's own composed subject_box, same energy-invariance guarantee as
+    scene_specifics -- see insert_video_cuts)."""
     records: List[CutRecord] = []
     for cut in resolved:
         file_seam = seam.get(cut.file_id) or {}
@@ -99,11 +141,35 @@ def build_cut_records(resolved: List[ResolvedCut], seam: Dict[str, dict]) -> Lis
             kind="video", word_span=None, atom_ids=None,
             label=_short_label(cut.summary), summary=cut.summary,
             on_camera=None, junk=False, junk_reason="",
-            framing={}, look={}, caption_zones=[],
+            framing=_framing_for(cut, file_seam), look={}, caption_zones=[],
             hero_ts_ms=cut.peak_ms, pace=pace, take_group_id=None, take_role=None,
             channel="shown", speech_quality=None, total_quality=total_quality,
         ))
     return records
+
+
+def insert_video_cuts(ingest_run_id: str, resolved: List[ResolvedCut], seam: Dict[str, dict]) -> List[str]:
+    """build_cut_records -> delete -> insert -> write each cut's own
+    composed specifics (vcut_pass2_video_specifics.plan.md section 7.3), in
+    one place -- this exact sequence is shared by run_vcut_ingest AND the
+    energy re-resolve path (routers/projects.py), and both need every video
+    cut to carry its derived specifics with zero ambiguity. ``CutRecord``
+    (l3.post) has no scene_specifics column to insert directly, so this
+    still goes through the existing post-insert ingest_store.update_cut_
+    scene_specifics -- but ``records``/``resolved`` share order 1:1
+    (build_cut_records is a straight list comprehension), so the returned
+    ids zip DIRECTLY against resolved's own specifics; no hero-containment
+    matching needed any more (that band-aid is retired -- specifics are
+    derived from the plan at every resolve, never stored-and-fragile)."""
+    from app.services.l3 import ingest_store as l3store
+
+    records = build_cut_records(resolved, seam)
+    delete_video_cuts_for_run(ingest_run_id)
+    new_ids = l3store.insert_cut_records(ingest_run_id, records)
+    for cut_id, cut in zip(new_ids, resolved):
+        if cut.specifics:
+            l3store.update_cut_scene_specifics(cut_id, cut.specifics)
+    return new_ids
 
 
 def delete_video_cuts_for_run(ingest_run_id: str) -> None:

@@ -496,6 +496,51 @@ def test_create_pass2_cache_degrades_to_none_on_failure():
     print("ok  test_create_pass2_cache_degrades_to_none_on_failure")
 
 
+def test_create_video_cache_returns_the_resource_name_with_video_content():
+    captured = {}
+
+    def fake_create(model, config):
+        captured["model"] = model
+        captured["config"] = config
+        return _FakeCache()
+
+    fake_client = mock.Mock()
+    fake_client.caches.create = mock.Mock(side_effect=fake_create)
+    with mock.patch.object(ig, "_sdk", return_value=(fake_client, _types())):
+        name = ig.create_video_cache(
+            "sys", "files/abc123", model="gemini-3.1-flash-lite", ttl_seconds=900, fps=2.0)
+
+    assert name == "cachedContents/abc123"
+    assert captured["model"] == "gemini-3.1-flash-lite"
+    config = captured["config"]
+    assert config.ttl == "900s"
+    assert config.system_instruction == "sys"
+    part = config.contents[0].parts[0]
+    assert part.file_data.file_uri == "files/abc123"
+    assert part.video_metadata.fps == 2.0
+    print("ok  test_create_video_cache_returns_the_resource_name_with_video_content")
+
+
+def test_create_video_cache_degrades_to_none_on_failure():
+    fake_client = mock.Mock()
+    fake_client.caches.create = mock.Mock(side_effect=RuntimeError("boom"))
+    with mock.patch.object(ig, "_sdk", return_value=(fake_client, _types())):
+        name = ig.create_video_cache("sys", "files/abc123", model="gemini-3.1-flash-lite", ttl_seconds=900)
+    assert name is None
+    print("ok  test_create_video_cache_degrades_to_none_on_failure")
+
+
+def test_delete_pass2_cache_tears_down_a_video_cache_too():
+    # delete_pass2_cache works for ANY CachedContent resource name -- it's
+    # reused as create_video_cache's own teardown, no separate delete needed.
+    fake_client = mock.Mock()
+    fake_client.caches.delete = mock.Mock()
+    with mock.patch.object(ig, "_sdk", return_value=(fake_client, _types())):
+        ig.delete_pass2_cache("cachedContents/video-f1")
+    fake_client.caches.delete.assert_called_once_with(name="cachedContents/video-f1")
+    print("ok  test_delete_pass2_cache_tears_down_a_video_cache_too")
+
+
 def test_delete_pass2_cache_calls_the_sdk_and_none_is_a_noop():
     fake_client = mock.Mock()
     fake_client.caches.delete = mock.Mock()
@@ -839,6 +884,9 @@ def main():
     test_complete_gemini_media_resolution_none_leaves_the_sdk_default()
     test_create_pass2_cache_returns_the_resource_name()
     test_create_pass2_cache_degrades_to_none_on_failure()
+    test_create_video_cache_returns_the_resource_name_with_video_content()
+    test_create_video_cache_degrades_to_none_on_failure()
+    test_delete_pass2_cache_tears_down_a_video_cache_too()
     test_delete_pass2_cache_calls_the_sdk_and_none_is_a_noop()
     test_upload_video_active_on_first_check_returns_the_handle()
     test_upload_video_polls_through_processing_to_active()

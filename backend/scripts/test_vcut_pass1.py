@@ -34,15 +34,23 @@ class _FakeCompletion:
         self.usage = usage
 
 
+def _scoped_file_id(returns_by_file, system, blocks):
+    """Recover which file a call is scoped to from _task_text's "FILE <id>"
+    marker -- present in ``system`` for every uncached path (frames, inline
+    video), but in a per-call TEXT BLOCK instead when riding a per-file
+    video cache (system is NEUTRAL_SYSTEM there, section 3.2/13 step 4) --
+    so search both rather than assuming one location."""
+    haystacks = [system] + [b.get("text", "") for b in blocks if b.get("type") == "text"]
+    return next(fid for fid in returns_by_file if any(f"FILE {fid} " in h for h in haystacks))
+
+
 def _fake_complete_gemini(returns_by_file, calls_seen=None):
     """Build a thread-safe complete_gemini stand-in. ``returns_by_file`` maps
     a file_id -> either (data_dict, usage_dict) or an Exception instance to
-    raise. The scoped file is recovered from the ``system`` text, which
-    _run_pass1_for_file passes as _task_text(file_id, filename) ("FILE
-    <id>")."""
+    raise. The scoped file is recovered via _scoped_file_id."""
     def fake(system, blocks, schema, **kwargs):
         assert schema is _Pass1FileSchema, schema
-        file_id = next(fid for fid in returns_by_file if f"FILE {fid} " in system)
+        file_id = _scoped_file_id(returns_by_file, system, blocks)
         if calls_seen is not None:
             calls_seen.append(file_id)
         spec = returns_by_file[file_id]
@@ -237,7 +245,7 @@ def _fake_complete_gemini_capturing(returns_by_file, calls_info):
     sent, not just the parsed result."""
     def fake(system, blocks, schema, **kwargs):
         assert schema is _Pass1FileSchema, schema
-        file_id = next(fid for fid in returns_by_file if f"FILE {fid} " in system)
+        file_id = _scoped_file_id(returns_by_file, system, blocks)
         calls_info[file_id] = {"system": system, "blocks": blocks, "kwargs": kwargs}
         spec = returns_by_file[file_id]
         if isinstance(spec, Exception):
@@ -326,6 +334,64 @@ def test_video_mode_still_clamps_the_remapped_ms_to_non_speech_spans():
     print("ok  test_video_mode_still_clamps_the_remapped_ms_to_non_speech_spans")
 
 
+def test_video_handle_with_cache_name_rides_the_cache_not_inline_video():
+    """vcut_pass2_video_specifics.plan.md section 3.2/13 step 4: a
+    VideoHandle carrying a cache_name sends ONLY the task text as a block
+    (no video_file_block) and passes cached_content -- the cache already
+    carries the video."""
+    calls_info: dict = {}
+    handle = VideoHandle(file_uri="files/abc123", segments=_VIDEO_SEGMENTS, cache_name="cachedContents/f1")
+    returns = {"f1": ({"moments": []}, {})}
+    with _patch_gemini(_fake_complete_gemini_capturing(returns, calls_info)):
+        run_pass1([_FILE_ROWS[0]], _SPANS, {}, cached_content=None, video_by_file={"f1": handle})
+
+    info = calls_info["f1"]
+    assert len(info["blocks"]) == 1
+    assert info["blocks"][0]["type"] == "text"
+    assert all(b["type"] != "video_file" for b in info["blocks"])
+    assert info["kwargs"]["cached_content"] == "cachedContents/f1"
+    assert "ONE CONTINUOUS CLIP" in info["blocks"][0]["text"]
+    print("ok  test_video_handle_with_cache_name_rides_the_cache_not_inline_video")
+
+
+def test_video_handle_without_cache_name_sends_inline_video_and_no_cache():
+    """Regression guard: a VideoHandle with cache_name=None (the default --
+    creation failed or below the min-token floor) must still send the video
+    inline, exactly as before cache support existed."""
+    calls_info: dict = {}
+    handle = VideoHandle(file_uri="files/abc123", segments=_VIDEO_SEGMENTS)  # cache_name defaults to None
+    returns = {"f1": ({"moments": []}, {})}
+    with _patch_gemini(_fake_complete_gemini_capturing(returns, calls_info)):
+        run_pass1([_FILE_ROWS[0]], _SPANS, {}, cached_content=None, video_by_file={"f1": handle})
+
+    info = calls_info["f1"]
+    assert len(info["blocks"]) == 1
+    assert info["blocks"][0]["type"] == "video_file"
+    assert info["blocks"][0]["file_uri"] == "files/abc123"
+    assert info["kwargs"]["cached_content"] is None
+    print("ok  test_video_handle_without_cache_name_sends_inline_video_and_no_cache")
+
+
+def test_video_mode_remap_join_and_clamp_still_apply_when_cached():
+    """The post-processing pipeline (join-drop, remap, clamp) must not
+    depend on whether the call was cached or inline -- only the INPUT
+    transport differs."""
+    handle = VideoHandle(file_uri="files/abc123", segments=_VIDEO_SEGMENTS, cache_name="cachedContents/f1")
+    returns = {
+        "f1": ({"moments": [
+            {"t_ms": 5000, "shape": "both", "summary": "on the seam"},       # dropped: join artifact
+            {"t_ms": 100, "shape": "both", "summary": "early"},              # remapped -> orig 100
+        ]}, {}),
+    }
+    with _patch_gemini(_fake_complete_gemini(returns)):
+        plan, _usage = run_pass1([_FILE_ROWS[0]], _SPANS, {}, cached_content=None, video_by_file={"f1": handle})
+
+    flags = plan.files[0].flags
+    assert len(flags) == 1
+    assert flags[0].summary == "early" and flags[0].t_ms == 100
+    print("ok  test_video_mode_remap_join_and_clamp_still_apply_when_cached")
+
+
 def test_a_file_absent_from_video_by_file_falls_back_to_frames_per_file():
     """f1 has a video handle (video path); f2/f3 don't (frames path) -- one
     run_pass1 call exercises both, proving the choice is genuinely per-file,
@@ -369,6 +435,9 @@ def main():
     test_video_mode_drops_moments_landing_on_a_join_artifact()
     test_video_mode_drops_out_of_range_moments()
     test_video_mode_still_clamps_the_remapped_ms_to_non_speech_spans()
+    test_video_handle_with_cache_name_rides_the_cache_not_inline_video()
+    test_video_handle_without_cache_name_sends_inline_video_and_no_cache()
+    test_video_mode_remap_join_and_clamp_still_apply_when_cached()
     test_a_file_absent_from_video_by_file_falls_back_to_frames_per_file()
     print("\nall vcut pass1 tests passed")
 

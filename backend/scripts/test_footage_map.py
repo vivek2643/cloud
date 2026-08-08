@@ -670,6 +670,173 @@ def test_specific_tag_absent_when_specifics_present_but_empty_string():
     print("ok  test_specific_tag_absent_when_specifics_present_but_empty_string")
 
 
+# --------------------------------------------------------------------------
+# brain_cut_specifics_wiring.plan.md: the NEW flat, question-bank-keyed
+# scene_specifics shape (vcut_pass2_video_specifics.plan.md) -- rendered via
+# _specific_tag directly (minimal dicts) for precise coverage of the
+# composition/dedupe/compact logic, plus one full-pipeline sanity check.
+# --------------------------------------------------------------------------
+
+def test_specific_tag_new_shape_absent_when_scene_specifics_missing_entirely():
+    assert fm._specific_tag({}) == ""
+    print("ok  test_specific_tag_new_shape_absent_when_scene_specifics_missing_entirely")
+
+
+def test_specific_tag_new_shape_absent_when_scene_specifics_is_empty_dict():
+    assert fm._specific_tag({"scene_specifics": {}}) == ""
+    print("ok  test_specific_tag_new_shape_absent_when_scene_specifics_is_empty_dict")
+
+
+def test_specific_tag_new_single_flag_renders_subject_action_shot_size_camera():
+    m = {"scene_specifics": {
+        "subject": "barista", "action": "pours latte", "shot_size": "medium", "camera_move": "push",
+    }, "camera": "static"}
+    line = fm._specific_tag(m)
+    assert "barista pours latte" in line, line
+    assert "medium" in line, line
+    assert "push" in line, line
+    print("ok  test_specific_tag_new_single_flag_renders_subject_action_shot_size_camera")
+
+
+def test_specific_tag_new_single_flag_subject_only_no_dangling_space():
+    m = {"scene_specifics": {"subject": "a dog"}}
+    assert fm._specific_tag(m) == ' spec:"a dog"'
+    print("ok  test_specific_tag_new_single_flag_subject_only_no_dangling_space")
+
+
+def test_specific_tag_new_shape_omits_static_camera_move_and_none_motion_and_good_headroom():
+    m = {"scene_specifics": {
+        "subject": "x", "camera_move": "static", "motion_direction": "none", "headroom_lookroom": "good",
+    }, "camera": ""}
+    line = fm._specific_tag(m)
+    assert "static" not in line, line
+    assert "none" not in line, line
+    assert "good" not in line, line
+    print("ok  test_specific_tag_new_shape_omits_static_camera_move_and_none_motion_and_good_headroom")
+
+
+def test_specific_tag_new_shape_renders_on_screen_text_gisted_and_quoted():
+    m = {"scene_specifics": {"subject": "sign", "on_screen_text": "50% off everything this weekend only"},
+        "screen_text": ""}
+    line = fm._specific_tag(m)
+    assert "text:'" in line, line
+    print("ok  test_specific_tag_new_shape_renders_on_screen_text_gisted_and_quoted")
+
+
+def test_specific_tag_new_shape_renders_usable_hook_and_capped_tags():
+    m = {"scene_specifics": {
+        "subject": "x", "usable": "weak", "hook_potential": "high",
+        "tags": ["pour", "closeup", "coffee", "extra", "dropped"],
+    }}
+    line = fm._specific_tag(m)
+    assert "usable:weak" in line, line
+    assert "hook:high" in line, line
+    assert "tags:pour,closeup,coffee" in line, line
+    assert "extra" not in line and "dropped" not in line, line
+    print("ok  test_specific_tag_new_shape_renders_usable_hook_and_capped_tags")
+
+
+def test_specific_tag_dedupes_camera_move_against_code_derived_cam():
+    m = {"scene_specifics": {"subject": "x", "camera_move": "pan"}, "camera": "pan left"}
+    line = fm._specific_tag(m)
+    assert "pan" not in line, line  # dropped -- the code cam: tag already says it
+    print("ok  test_specific_tag_dedupes_camera_move_against_code_derived_cam")
+
+
+def test_specific_tag_dedupes_on_screen_text_against_code_derived_screen_text():
+    m = {"scene_specifics": {"subject": "x", "on_screen_text": "SALE 50% OFF"}, "screen_text": "SALE 50% OFF"}
+    line = fm._specific_tag(m)
+    assert "text:" not in line, line
+    print("ok  test_specific_tag_dedupes_on_screen_text_against_code_derived_screen_text")
+
+
+def test_specific_tag_camera_move_survives_when_it_does_not_match_code_cam():
+    m = {"scene_specifics": {"subject": "x", "camera_move": "handheld"}, "camera": "static"}
+    line = fm._specific_tag(m)
+    assert "handheld" in line, line
+    print("ok  test_specific_tag_camera_move_survives_when_it_does_not_match_code_cam")
+
+
+def test_specific_tag_new_merged_renders_mini_shot_list_with_deltas():
+    m = {"scene_specifics": {
+        "subject": "barista", "action": "works counter", "shot_size": "medium",
+        "moments": [
+            {"t_ms": 1200, "summary": "barista grabs cup"},
+            {"t_ms": 3400, "summary": "pours latte, close"},
+            {"t_ms": 5100, "summary": "slides across counter"},
+        ],
+    }, "in_ms": 0}
+    line = fm._specific_tag(m)
+    assert 'spec:"barista works counter · medium"' in line, line
+    assert "moments:[" in line, line
+    assert "+1.2s barista grabs cup" in line, line
+    assert "+3.4s pours latte, close" in line, line
+    assert "+5.1s slides across counter" in line, line
+    print("ok  test_specific_tag_new_merged_renders_mini_shot_list_with_deltas")
+
+
+def test_specific_tag_new_merged_deltas_are_relative_to_the_cuts_own_in_ms():
+    m = {"scene_specifics": {"subject": "x", "moments": [
+        {"t_ms": 5200, "summary": "a"}, {"t_ms": 7200, "summary": "b"},
+    ]}, "in_ms": 5000}
+    line = fm._specific_tag(m)
+    assert "+0.2s a" in line, line
+    assert "+2.2s b" in line, line
+    print("ok  test_specific_tag_new_merged_deltas_are_relative_to_the_cuts_own_in_ms")
+
+
+def test_specific_tag_new_merged_caps_moments_list_with_more_suffix():
+    moments = [{"t_ms": 1000 * i, "summary": f"moment {i}"} for i in range(8)]
+    m = {"scene_specifics": {"subject": "x", "moments": moments}, "in_ms": 0}
+    line = fm._specific_tag(m)
+    assert line.count("moment ") == 5, line
+    assert "…+3 more" in line, line
+    print("ok  test_specific_tag_new_merged_caps_moments_list_with_more_suffix")
+
+
+def test_specific_tag_new_merged_moment_falls_back_to_subject_action_with_no_summary():
+    m = {"scene_specifics": {"subject": "x", "moments": [
+        {"t_ms": 1000, "subject": "cup", "action": "fills"},
+    ]}, "in_ms": 0}
+    line = fm._specific_tag(m)
+    assert "cup fills" in line, line
+    print("ok  test_specific_tag_new_merged_moment_falls_back_to_subject_action_with_no_summary")
+
+
+def test_specific_tag_compact_mode_drops_moments_list_and_secondary_tokens():
+    m = {"scene_specifics": {
+        "subject": "barista", "action": "pours latte", "shot_size": "medium",
+        "usable": "strong", "tags": ["a", "b"],
+        "moments": [{"t_ms": 1200, "summary": "grabs cup"}, {"t_ms": 3400, "summary": "pours"}],
+    }, "in_ms": 0}
+    line = fm._specific_tag(m, compact=True)
+    assert "barista pours latte" in line and "medium" in line, line
+    assert "usable" not in line, line
+    assert "tags:" not in line, line
+    assert "moments:" not in line, line
+    print("ok  test_specific_tag_compact_mode_drops_moments_list_and_secondary_tokens")
+
+
+def test_specific_tag_compact_mode_legacy_shape_unaffected():
+    m = {"scene_specifics": {"specific": "CNC lathe turning a steel shaft", "label": "milling"}}
+    assert fm._specific_tag(m, compact=True) == fm._specific_tag(m, compact=False)
+    print("ok  test_specific_tag_compact_mode_legacy_shape_unaffected")
+
+
+def test_specific_tag_full_pipeline_new_shape_renders_on_the_beat_line():
+    """Full pipeline sanity (item 7): a real cut fixture carrying the new
+    vcut scene_specifics shape renders spec:"..." on assemble_map's beat
+    line, alongside the generic label -- additive, matching the legacy
+    behavior already proven above."""
+    cut = _cut("f:sp2", 1000, 4000, "a person at a counter",
+              scene_specifics={"subject": "barista", "action": "pours latte", "shot_size": "medium"})
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert 'spec:"barista pours latte · medium"' in line, line
+    assert "a person at a counter" in line, line
+    print("ok  test_specific_tag_full_pipeline_new_shape_renders_on_the_beat_line")
+
+
 def test_cast_line_lists_majors_with_voices_and_others_by_id():
     persons = [
         {"person_id": "P0", "display": "bald man, beard", "is_major": True, "owned_voices": ["V0"]},
@@ -929,6 +1096,23 @@ def main():
     test_specific_tag_renders_when_scene_specifics_present()
     test_specific_tag_absent_when_not_yet_enriched()
     test_specific_tag_absent_when_specifics_present_but_empty_string()
+    test_specific_tag_new_shape_absent_when_scene_specifics_missing_entirely()
+    test_specific_tag_new_shape_absent_when_scene_specifics_is_empty_dict()
+    test_specific_tag_new_single_flag_renders_subject_action_shot_size_camera()
+    test_specific_tag_new_single_flag_subject_only_no_dangling_space()
+    test_specific_tag_new_shape_omits_static_camera_move_and_none_motion_and_good_headroom()
+    test_specific_tag_new_shape_renders_on_screen_text_gisted_and_quoted()
+    test_specific_tag_new_shape_renders_usable_hook_and_capped_tags()
+    test_specific_tag_dedupes_camera_move_against_code_derived_cam()
+    test_specific_tag_dedupes_on_screen_text_against_code_derived_screen_text()
+    test_specific_tag_camera_move_survives_when_it_does_not_match_code_cam()
+    test_specific_tag_new_merged_renders_mini_shot_list_with_deltas()
+    test_specific_tag_new_merged_deltas_are_relative_to_the_cuts_own_in_ms()
+    test_specific_tag_new_merged_caps_moments_list_with_more_suffix()
+    test_specific_tag_new_merged_moment_falls_back_to_subject_action_with_no_summary()
+    test_specific_tag_compact_mode_drops_moments_list_and_secondary_tokens()
+    test_specific_tag_compact_mode_legacy_shape_unaffected()
+    test_specific_tag_full_pipeline_new_shape_renders_on_the_beat_line()
     test_source_contiguous_beats_form_a_run_channel_agnostic()
     test_cast_line_lists_majors_with_voices_and_others_by_id()
     test_cast_line_empty_with_no_persons()

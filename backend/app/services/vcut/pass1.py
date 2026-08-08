@@ -37,19 +37,27 @@ retained solely for Pass 2 / enrich, which is unchanged.
 
 pass1_video_input.plan.md, Phase 1: when a per-file ``VideoHandle`` is
 given (``video_by_file``, built by orchestrate.py from subclip.py's
-ffmpeg-cut, uploaded non-speech clip), that file's call sends a
-``video_file_block`` instead of sampled frames -- the model sees actual
-motion (build/settle, camera moves) over the file's non-speech footage
-only (speech regions are cut out before upload), at ``vcut_video_fps``/
-``vcut_video_media_resolution``. The model's returned ``t_ms`` is in
-SUB-CLIP time; a join-artifact/out-of-range check plus
-``subclip.map_sub_to_orig`` remap it back to real file ms before the
-existing ``_clamp_moment`` safety net runs (unchanged). A file absent from
-``video_by_file`` uses the frames path instead -- this is how "frames"
+ffmpeg-cut, uploaded non-speech clip), that file's call sends video instead
+of sampled frames -- the model sees actual motion (build/settle, camera
+moves) over the file's non-speech footage only (speech regions are cut out
+before upload), at ``vcut_video_fps``/``vcut_video_media_resolution``. The
+model's returned ``t_ms`` is in SUB-CLIP time; a join-artifact/out-of-range
+check plus ``subclip.map_sub_to_orig`` remap it back to real file ms before
+the existing ``_clamp_moment`` safety net runs (unchanged). A file absent
+from ``video_by_file`` uses the frames path instead -- this is how "frames"
 input mode works (video mode off). In "video" mode orchestrate.py now
 guarantees EVERY file has a handle before calling run_pass1 (a file whose
 cut/upload failed to yield a handle aborts the run there); there is no
 per-file frames substitution for a failed video prep any more.
+
+vcut_pass2_video_specifics.plan.md section 3.2/13 step 4: when that
+VideoHandle also carries a ``cache_name`` (a per-file video CachedContent,
+created once in orchestrate._prepare_video_inputs and shared with Pass 2),
+Pass 1 rides that cache instead of sending the video inline -- only the
+task text goes per-call, cached-input rate for the (paid-once) video.
+``cache_name`` is None when creation failed or the clip was below the
+model's min-cache-token floor; that file's call falls back to inline video,
+a cost regression only, never a correctness one.
 
 THIS MODULE SPENDS REAL MONEY once invoked (one Gemini call per file per
 project), same disclosure as l3/ingest.py's own docstring.
@@ -97,9 +105,16 @@ class VideoHandle:
     video input (pass1_video_input.plan.md section 5) -- a minimal
     projection of subclip.SubClip + the Files API upload result, built by
     orchestrate.py. ``segments`` is SubClip.segments verbatim (needed to
-    remap the model's sub-clip-time t_ms back to original-file ms)."""
+    remap the model's sub-clip-time t_ms back to original-file ms).
+    ``cache_name`` (vcut_pass2_video_specifics.plan.md section 3.2): the
+    per-file video CachedContent's resource name, or None when cache
+    creation failed / the clip was below the model's min-cache-token floor
+    -- Pass 1 (and later Pass 2) then send the video inline via
+    ``file_uri`` instead, uncached (a cost regression, never a correctness
+    one)."""
     file_uri: str
     segments: List[Tuple[int, int, int]]
+    cache_name: Optional[str] = None
 
 
 def _task_text(file_id: str, filename: str, *, video_mode: bool = False) -> str:
@@ -242,15 +257,20 @@ def _run_pass1_for_file(
     model: str,
     video_handle: Optional[VideoHandle] = None,
 ) -> Tuple[FilePlan, Dict[str, int]]:
-    """One file's Pass 1 call (section 2.5) -> (FilePlan, usage). Sends a
-    video_file_block when ``video_handle`` is given (pass1_video_input.
-    plan.md Phase 1); otherwise sends THIS file's sampled frames inline,
-    with the task text as the call's real system either way. Runs on a
-    worker thread from ``run_pass1``'s pool -- raises on persistent failure
-    (schema validation failed twice, or any other exception), which now
-    propagates through the caller and aborts the whole run (no per-file
-    masking). A file that legitimately yields zero moments returns an empty
-    FilePlan (nonempty is NOT required per call)."""
+    """One file's Pass 1 call (section 2.5) -> (FilePlan, usage). Sends
+    video when ``video_handle`` is given (pass1_video_input.plan.md Phase
+    1) -- riding that file's per-file video CachedContent
+    (vcut_pass2_video_specifics.plan.md section 3.2/13 step 4) when
+    ``video_handle.cache_name`` is set (shared with Pass 2: only the task
+    text goes per-call, the cache already carries the video + a neutral
+    system), else sending the video inline via ``video_file_block`` (no
+    cache -- creation failed or the clip was below the model's min-cache-
+    token floor). Otherwise sends THIS file's sampled frames inline. Runs
+    on a worker thread from ``run_pass1``'s pool -- raises on persistent
+    failure (schema validation failed twice, or any other exception),
+    which now propagates through the caller and aborts the whole run (no
+    per-file masking). A file that legitimately yields zero moments returns
+    an empty FilePlan (nonempty is NOT required per call)."""
     from app.config import get_settings
     from app.services.llm.ingest_gemini import complete_gemini
 
@@ -258,12 +278,18 @@ def _run_pass1_for_file(
 
     if video_handle is not None:
         settings = get_settings()
+        task_text = _task_text(file_id, filename, video_mode=True)
+        if video_handle.cache_name:
+            system = NEUTRAL_SYSTEM
+            video_blocks: List[Block] = [text_block(task_text)]
+        else:
+            system = task_text
+            video_blocks = [video_file_block(video_handle.file_uri, fps=settings.vcut_video_fps)]
         completion = complete_gemini(
-            _task_text(file_id, filename, video_mode=True),
-            [video_file_block(video_handle.file_uri, fps=settings.vcut_video_fps)],
-            _Pass1FileSchema,
+            system, video_blocks, _Pass1FileSchema,
             model=model, max_tokens=_PER_FILE_MAX_TOKENS, thinking="low",
             media_resolution=settings.vcut_video_media_resolution,
+            cached_content=video_handle.cache_name,
         )
         parsed = _Pass1FileSchema.model_validate(completion.data)
         flags = _moments_from_video(parsed.moments, video_handle, spans)

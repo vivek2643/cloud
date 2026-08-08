@@ -30,13 +30,15 @@ fm._sentences_for_file = lambda file_id: ()
 _FILE_ID = "ffffffff-1111"
 
 
-def _cut(hero_id, in_ms, out_ms):
-    return {
+def _cut(hero_id, in_ms, out_ms, **extra):
+    d = {
         "hero_id": hero_id, "file_id": _FILE_ID, "channel": "shown",
         "subject": "object", "label": "watch this", "src_in_ms": in_ms, "src_out_ms": out_ms,
         "play_ms": out_ms - in_ms, "keep_spans": None, "score": 0.6, "speaker": None,
         "flags": [], "take_count": 1, "ladder": None,
     }
+    d.update(extra)
+    return d
 
 
 def _map(cuts):
@@ -174,6 +176,62 @@ def test_inspect_cut_empty_channels_when_file_has_no_l1_rows():
     print("ok  test_inspect_cut_empty_channels_when_file_has_no_l1_rows")
 
 
+# --------------------------------------------------------------------------
+# brain_cut_specifics_wiring.plan.md section 3: the full, untruncated
+# scene_specifics blob on demand -- unlike the beat line's capped spec: tag.
+# --------------------------------------------------------------------------
+
+def test_inspect_cut_includes_specifics_when_scene_specifics_present():
+    struct = _map([_cut("f:m0", 1000, 5000, scene_specifics={"subject": "a dog", "action": "runs"})])
+    ctx = _ctx(struct)
+    with mock.patch.object(observe, "_fetch_signal_window", return_value=_signals()):
+        result = observe.inspect_cut(ctx, ref="ffffffff:m00")
+    assert result["specifics"] == {"subject": "a dog", "action": "runs"}, result
+    print("ok  test_inspect_cut_includes_specifics_when_scene_specifics_present")
+
+
+def test_inspect_cut_omits_specifics_key_when_scene_specifics_empty():
+    struct = _map([_cut("f:m0", 1000, 5000)])  # no scene_specifics at all
+    ctx = _ctx(struct)
+    with mock.patch.object(observe, "_fetch_signal_window", return_value=_signals()):
+        result = observe.inspect_cut(ctx, ref="ffffffff:m00")
+    assert "specifics" not in result, result
+    print("ok  test_inspect_cut_omits_specifics_key_when_scene_specifics_empty")
+
+
+def test_inspect_cut_specifics_drops_empty_fields():
+    spec = {"subject": "a dog", "action": "", "count": None, "tags": [], "notable_object": "leash"}
+    struct = _map([_cut("f:m0", 1000, 5000, scene_specifics=spec)])
+    ctx = _ctx(struct)
+    with mock.patch.object(observe, "_fetch_signal_window", return_value=_signals()):
+        result = observe.inspect_cut(ctx, ref="ffffffff:m00")
+    assert result["specifics"] == {"subject": "a dog", "notable_object": "leash"}, result
+    print("ok  test_inspect_cut_specifics_drops_empty_fields")
+
+
+def test_inspect_cut_specifics_includes_the_full_untruncated_moments_list():
+    moments = [{"t_ms": 1000 * i, "summary": f"moment {i}"} for i in range(8)]
+    spec = {"subject": "barista", "moments": moments}
+    struct = _map([_cut("f:m0", 0, 20000, scene_specifics=spec)])
+    ctx = _ctx(struct)
+    with mock.patch.object(observe, "_fetch_signal_window", return_value=_signals()):
+        result = observe.inspect_cut(ctx, ref="ffffffff:m00")
+    # unlike footage_map._specific_tag's capped-at-5 beat-line rendering,
+    # inspect_cut carries every moment -- the whole point of "on demand".
+    assert len(result["specifics"]["moments"]) == 8, result["specifics"]["moments"]
+    print("ok  test_inspect_cut_specifics_includes_the_full_untruncated_moments_list")
+
+
+def test_inspect_cut_specifics_legacy_shape_passes_through_too():
+    struct = _map([_cut("f:m0", 1000, 5000,
+                        scene_specifics={"specific": "CNC lathe turning a steel shaft", "label": "milling"})])
+    ctx = _ctx(struct)
+    with mock.patch.object(observe, "_fetch_signal_window", return_value=_signals()):
+        result = observe.inspect_cut(ctx, ref="ffffffff:m00")
+    assert result["specifics"] == {"specific": "CNC lathe turning a steel shaft", "label": "milling"}, result
+    print("ok  test_inspect_cut_specifics_legacy_shape_passes_through_too")
+
+
 def main():
     test_inspect_cut_resolves_by_ref_and_windows_to_the_true_span()
     test_inspect_cut_resolves_by_seg_id_via_placed_document()
@@ -184,6 +242,11 @@ def main():
     test_inspect_cut_shots_capped_and_offsets_within_span()
     test_inspect_cut_silence_offsets_relative_to_cut_start()
     test_inspect_cut_empty_channels_when_file_has_no_l1_rows()
+    test_inspect_cut_includes_specifics_when_scene_specifics_present()
+    test_inspect_cut_omits_specifics_key_when_scene_specifics_empty()
+    test_inspect_cut_specifics_drops_empty_fields()
+    test_inspect_cut_specifics_includes_the_full_untruncated_moments_list()
+    test_inspect_cut_specifics_legacy_shape_passes_through_too()
     print("\nall inspect_cut tests passed")
 
 

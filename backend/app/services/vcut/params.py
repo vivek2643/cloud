@@ -31,6 +31,12 @@ SUBCLIP_MIN_MS = 1500          # below this total non-speech, not worth cutting/
 SUBCLIP_MAX_MS = 20 * 60 * 1000  # safety ceiling against a pathological all-non-speech file
 JOIN_GUARD_MS = 200            # a moment landing within this of a concat seam is a splice artifact, drop it
 
+# --- vcut_pass2_video_specifics.plan.md section 4/9 -- qplan.py, the
+# question planner. ---
+
+QPLAN_CTX_MS = 4000            # local transcript window around each moment: [t-CTX, t+CTX]
+QPLAN_MAX_CUSTOM = 2           # free-text custom probes per moment, on top of the closed bank
+
 # --- Stage 3 -- resolve.py, "the algorithm" (section 7) --------------------
 
 # Step 0: snap a VLM peak timestamp onto the nearest local max of

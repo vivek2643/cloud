@@ -19,14 +19,24 @@ from app.services.vcut.questions import (  # noqa: E402
 )
 
 
-def test_bank_has_the_nine_documented_ids():
-    expected = {
-        "subject", "action", "moment_type", "setting", "on_screen_text",
-        "notable_object", "count", "motion_quality", "continuity_cue",
-    }
+_ORIGINAL_NINE_IDS = {
+    "subject", "action", "moment_type", "setting", "on_screen_text",
+    "notable_object", "count", "motion_quality", "continuity_cue",
+}
+
+# vcut_pass2_video_specifics.plan.md section 4.3: edit-decision dimensions
+# added for the question planner (qplan.py) to choose from.
+_EDIT_DECISION_IDS = {
+    "shot_size", "camera_move", "motion_direction", "subject_entry_exit",
+    "headroom_lookroom", "usable", "energy_emotion", "hook_potential", "tags",
+}
+
+
+def test_bank_has_the_nine_documented_ids_plus_the_edit_decision_expansion():
+    expected = _ORIGINAL_NINE_IDS | _EDIT_DECISION_IDS
     assert set(BANK.keys()) == expected, set(BANK.keys())
     assert set(ALL_IDS) == expected
-    print("ok  test_bank_has_the_nine_documented_ids")
+    print("ok  test_bank_has_the_nine_documented_ids_plus_the_edit_decision_expansion")
 
 
 def test_validate_drops_unknown_ids():
@@ -65,7 +75,7 @@ def test_bank_prompt_lines_mentions_every_id():
 
 
 def main():
-    test_bank_has_the_nine_documented_ids()
+    test_bank_has_the_nine_documented_ids_plus_the_edit_decision_expansion()
     test_validate_drops_unknown_ids()
     test_validate_dedupes_order_preserving()
     test_validate_empty_selection_applies_default_set()

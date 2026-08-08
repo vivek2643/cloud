@@ -232,6 +232,12 @@ class Settings(BaseSettings):
     vcut_pass1_input_mode: str = "frames"
     vcut_video_fps: float = 2.0
     vcut_video_media_resolution: str = "low"
+    # vcut_pass2_video_specifics.plan.md section 4.5/9: the question
+    # planner's ONE text-only call per run -- cheap even on a slightly
+    # stronger model, so it gets its own override knob; defaults to the SAME
+    # model as vcut_pass1_model (flash-lite), not a sentinel, matching every
+    # other vcut model setting's own concrete-default convention.
+    vcut_qplan_model: str = "gemini-3.1-flash-lite"
     # Which cuts pipeline `projects.kick_ingest` enqueues: "v3" (default,
     # today's app.services.l3.ingest) or "vcut" (app.services.vcut.
     # orchestrate). Env-driven so the two can run side by side per
