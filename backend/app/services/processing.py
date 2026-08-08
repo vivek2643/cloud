@@ -12,15 +12,18 @@ import json
 import subprocess
 
 from app.services import limits
-from app.services.r2 import _get_client
+from app.services.r2 import _get_client, _full_key
 from app.config import get_settings
 
 
 def _download_from_r2(r2_key: str, dest_path: str) -> None:
     settings = get_settings()
     client = _get_client()
+    # Route through the same R2_KEY_PREFIX chokepoint as r2.py so local-dev
+    # reads its own prefixed objects (and prod, with the prefix unset, is
+    # unchanged).
     with limits.r2_slot():
-        client.download_file(settings.r2_bucket_name, r2_key, dest_path)
+        client.download_file(settings.r2_bucket_name, _full_key(r2_key), dest_path)
 
 
 def _upload_to_r2(local_path: str, r2_key: str, content_type: str = "application/octet-stream") -> None:
@@ -30,7 +33,7 @@ def _upload_to_r2(local_path: str, r2_key: str, content_type: str = "application
         client.upload_file(
             local_path,
             settings.r2_bucket_name,
-            r2_key,
+            _full_key(r2_key),
             ExtraArgs={"ContentType": content_type},
         )
 

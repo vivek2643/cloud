@@ -42,6 +42,22 @@ def _make_connector() -> PsycopgConnector:
             "(Project Settings -> Database -> Connection string -> URI) before "
             "starting the worker or enqueuing jobs."
         )
+    # DB_SCHEMA (local-dev isolation): route Procrastinate's own tables
+    # (procrastinate_jobs/events/periodic_defers/...) into the dev schema by
+    # pinning each connection's search_path via libpq `options`. When
+    # DB_SCHEMA is unset, pg_connect_kwargs() is empty -> `connector_kwargs`
+    # stays {} and we pass NO `kwargs` to the pool, exactly like production.
+    # The dev schema must first have Procrastinate installed into it:
+    #   `procrastinate -a app.services.jobs.app schema --apply` run with
+    #   DB_SCHEMA set (see the isolation report).
+    connector_kwargs = settings.pg_connect_kwargs()
+    if connector_kwargs:
+        return PsycopgConnector(
+            conninfo=settings.database_url,
+            min_size=1,
+            max_size=DB_POOL_MAX,
+            kwargs=connector_kwargs,
+        )
     return PsycopgConnector(
         conninfo=settings.database_url,
         min_size=1,
@@ -64,3 +80,4 @@ def register_tasks() -> None:
     from app.services.l3.grade import job as grade_job  # noqa: F401
     from app.services.render import tasks as render_tasks  # noqa: F401
     from app.services.export import tasks as export_tasks  # noqa: F401
+    from app.services.vcut import orchestrate as vcut_orchestrate  # noqa: F401

@@ -30,6 +30,7 @@ Feel is delegated to ``feel.simulate`` (also pure). Nothing here renders.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,6 +40,7 @@ from app.services.l3.arrange import _MapIndex, _weld_segments
 from app.services.l3.captions import resolver as captions_resolver
 from app.services.l3.captions import timing as captions_timing
 from app.services.l3.grade.steer import explain_grade
+from app.services.l3.post import _ADX_MIN_DELTA, _mean, _norm_in_clip, _series_lohi
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +81,12 @@ class EditContext:
     # real thread), which just means the resolve falls back to `legacy`-style
     # inline computation for that turn.
     thread_id: Optional[str] = None
+    # cut_structure_and_scene_specificity.plan.md Part 3: the middle text
+    # layer's project-level output for `run_id` -- {"domain", "confidence",
+    # "evidence", "taxonomy", ...} -- or None when enrichment hasn't reached
+    # this run yet (a normal, common state; it runs in the background after
+    # cuts are shown) or nothing is ingested at all.
+    scene_taxonomy: Optional[Dict[str, Any]] = None
 
     @property
     def meta_by_ref(self) -> Dict[str, dict]:
@@ -131,6 +139,13 @@ def build_context(file_ids: List[str], run_id: Optional[str] = None,
         audio_features = _fetch_audio_features(all_audio_ids)
     except Exception:
         logger.exception("observe: audio_features lookup failed (continuing)")
+    scene_taxonomy: Optional[Dict[str, Any]] = None
+    if eff_run:
+        try:
+            from app.services.l3 import ingest_store
+            scene_taxonomy = ingest_store.get_scene_taxonomy(eff_run)
+        except Exception:
+            logger.exception("observe: scene_taxonomy lookup failed (continuing)")
     return EditContext(
         file_ids=list(file_ids),
         index=_MapIndex(map_struct),
@@ -142,6 +157,7 @@ def build_context(file_ids: List[str], run_id: Optional[str] = None,
         audio_assets=audio_assets,
         run_id=eff_run,
         thread_id=thread_id,
+        scene_taxonomy=scene_taxonomy,
     )
 
 
@@ -201,11 +217,66 @@ def _fetch_audio_assets(file_ids: List[str]) -> List[dict]:
             """,
             (owner[0],),
         ).fetchall()
-    return [
+    assets = [
         {"file_id": r[0], "name": r[1], "dur_ms": int(float(r[2]) * 1000),
          "is_musical": r[3], "bpm": r[4]}
         for r in rows
     ]
+    # voiceover-as-spine: attach each audio asset's own transcript (the verbatim
+    # narration) so the brain can READ a VO/narration script and sync visual cuts
+    # to its sentence + pause boundaries, instead of being told "no transcript I
+    # can read". Sentence granularity carries word-timed start/end per sentence
+    # (breaths/pauses are the gaps between them); the full text is the readable
+    # spine. Fail-open: a file with no transcript (music/SFX, or not yet
+    # transcribed) simply has no `transcript` key -- never a fabricated one.
+    try:
+        tx = captions_resolver.fetch_transcripts([a["file_id"] for a in assets])
+        for a in assets:
+            segs = (tx.get(a["file_id"]) or {}).get("segments") or []
+            if not segs:
+                continue
+            a["transcript"] = {
+                "text": " ".join(s.get("text", "") for s in segs).strip(),
+                "segments": [
+                    {"text": s.get("text", ""),
+                     "start_ms": s.get("start_ms"), "end_ms": s.get("end_ms")}
+                    for s in segs
+                ],
+            }
+    except Exception:
+        logger.exception("observe: audio transcript fetch failed (continuing)")
+    return assets
+
+
+def _fetch_signal_window(file_id: str) -> Dict[str, dict]:
+    """brain_perception_upgrade.plan.md Change 1, Mechanism B: a targeted,
+    single-file read of the three L1 signal tables `inspect_cut` needs --
+    the one place `_fetch_audio_features`'s `rms_db`/`silence_intervals`
+    omission is addressed, LOCALLY for the one inspected file, never
+    globally per turn (that omission is deliberate everywhere else -- see
+    `_fetch_audio_features`'s docstring). A file with no row on a table
+    simply has an empty dict for that channel -- never an error."""
+    with _pg_conn() as conn:
+        motion = conn.execute(
+            "select hop_ms, action_energy, action_points from motion_dynamics where file_id = %s",
+            (file_id,),
+        ).fetchone()
+        audio = conn.execute(
+            "select prosody_hop_ms, rms_db, silence_intervals from audio_features where file_id = %s",
+            (file_id,),
+        ).fetchone()
+        scene = conn.execute(
+            "select hop_ms, shot_points, composition_points from scene_cuts where file_id = %s",
+            (file_id,),
+        ).fetchone()
+    return {
+        "motion": ({"hop_ms": motion[0], "action_energy": motion[1] or [], "action_points": motion[2] or []}
+                   if motion else {}),
+        "audio": ({"hop_ms": audio[0], "rms_db": audio[1] or [], "silence_intervals": audio[2] or []}
+                  if audio else {}),
+        "scene": ({"hop_ms": scene[0], "shot_points": scene[1] or [], "composition_points": scene[2] or []}
+                  if scene else {}),
+    }
 
 
 def resolve_doc(document: dict, ctx: EditContext) -> dict:
@@ -583,6 +654,230 @@ def read_state(document: dict, ctx: EditContext, *, seg_id: Optional[str] = None
             except Exception:
                 logger.exception("read_state: word-offset detail failed for seg %s", seg_id)
     return state
+
+
+# --------------------------------------------------------------------------
+# 1a2. inspect_cut (brain_perception_upgrade.plan.md Change 1, Mechanism B):
+# on-demand rich signal payload for ONE cut -- the deep counterpart to the
+# beat-line's "sig:" breadcrumb (footage_map._landmarks_tag). Computed at
+# request time from the live L1 arrays: no migration, no re-ingest, works on
+# any run including one ingested before this plan.
+# --------------------------------------------------------------------------
+
+_INSPECT_MAX_SAMPLES = 24
+_INSPECT_MAX_HITS = 8
+_INSPECT_MAX_SHOTS = 12
+
+
+def _downsample_curve(
+    arr: List[float], hop_ms: int, s: int, e: int, step_ms: int,
+    lo: Optional[float], hi: Optional[float],
+) -> List[float]:
+    """Bin-mean downsample of `arr` over `[s, e)` at `step_ms`, clip-
+    relative-normalized (same `_norm_in_clip`/`_series_lohi` normalization
+    the quality scores + landmarks use). A bin with no underlying samples is
+    simply skipped -- never a fabricated/interpolated point."""
+    if not arr or hop_ms <= 0 or step_ms <= 0:
+        return []
+    out: List[float] = []
+    t = s
+    while t < e and len(out) < _INSPECT_MAX_SAMPLES:
+        bin_end = min(t + step_ms, e)
+        lo_i, hi_i = t // hop_ms, max(t // hop_ms, (bin_end - 1) // hop_ms)
+        vals = [arr[i] for i in range(lo_i, hi_i + 1) if 0 <= i < len(arr)]
+        if vals:
+            v = _norm_in_clip(_mean(vals), lo, hi)
+            if v is not None:
+                out.append(round(v, 3))
+        t += step_ms
+    return out
+
+
+def _dedup_points(points: List[Dict[str, Any]], bin_ms: int) -> List[Dict[str, Any]]:
+    """Collapse points landing in the same hop bin, keeping the higher
+    score -- an `action_points` impact coinciding with a local max of
+    `action_energy` shouldn't double-count as two separate hits."""
+    best: Dict[int, Dict[str, Any]] = {}
+    for p in points:
+        b = p["off"] // max(1, bin_ms)
+        cur = best.get(b)
+        if cur is None or p["score"] > cur["score"]:
+            best[b] = p
+    return list(best.values())
+
+
+def _action_channel(motion: dict, s: int, e: int, step_ms: int) -> Dict[str, Any]:
+    action_energy = motion.get("action_energy") or []
+    hop_ms = int(motion.get("hop_ms") or 0)
+    ae_lo, ae_hi = _series_lohi(action_energy)
+    curve = _downsample_curve(action_energy, hop_ms, s, e, step_ms, ae_lo, ae_hi)
+    hits: List[Dict[str, Any]] = []
+    if action_energy and hop_ms > 0 and len(action_energy) >= 3:
+        lo_i, hi_i = s // hop_ms, max(s // hop_ms, (e - 1) // hop_ms)
+        for i in range(max(1, lo_i), min(len(action_energy) - 1, hi_i + 1)):
+            # Strict on both sides -- see post._act_hits for why (a flat
+            # curve has no real interior structure, even though every point
+            # on it trivially satisfies a >= comparison against its equal
+            # neighbors).
+            if action_energy[i] > action_energy[i - 1] and action_energy[i] > action_energy[i + 1]:
+                v = _norm_in_clip(action_energy[i], ae_lo, ae_hi)
+                if v is not None:
+                    hits.append({"off": i * hop_ms - s, "score": round(v, 3)})
+    for pt in (motion.get("action_points") or []):
+        try:
+            ts = int(pt.get("ts_ms", 0))
+        except (TypeError, ValueError):
+            continue
+        if not (s <= ts < e):
+            continue
+        score = 1.0
+        if hop_ms > 0:
+            i = ts // hop_ms
+            v = _norm_in_clip(action_energy[i], ae_lo, ae_hi) if 0 <= i < len(action_energy) else None
+            if v is not None:
+                score = v
+        hits.append({"off": ts - s, "score": round(score, 3)})
+    hits = _dedup_points(hits, hop_ms or 100)
+    hits.sort(key=lambda h: h["score"], reverse=True)
+    hits = hits[:_INSPECT_MAX_HITS]
+    hits.sort(key=lambda h: h["off"])
+    return {"curve": curve, "hits": hits}
+
+
+def _audio_channel(audio: dict, s: int, e: int, step_ms: int) -> Dict[str, Any]:
+    rms_db = audio.get("rms_db") or []
+    rms_hop_ms = int(audio.get("hop_ms") or 0)
+    rms_lo, rms_hi = _series_lohi(rms_db)
+    curve = _downsample_curve(rms_db, rms_hop_ms, s, e, step_ms, rms_lo, rms_hi)
+
+    changes: List[Dict[str, Any]] = []
+    if rms_db and rms_hop_ms > 0:
+        lo_i, hi_i = s // rms_hop_ms, max(s // rms_hop_ms, (e - 1) // rms_hop_ms)
+        idxs = [i for i in range(lo_i, hi_i + 1) if 0 <= i < len(rms_db)]
+        if len(idxs) >= 2:
+            norm = [_norm_in_clip(rms_db[i], rms_lo, rms_hi) for i in idxs]
+            if all(v is not None for v in norm):
+                diffs = [norm[k + 1] - norm[k] for k in range(len(norm) - 1)]
+                mean_abs = _mean([abs(d) for d in diffs]) or 0.0
+                threshold = max(mean_abs * 1.5, _ADX_MIN_DELTA)
+                for k, d in enumerate(diffs):
+                    if abs(d) >= threshold:
+                        changes.append({
+                            "off": idxs[k + 1] * rms_hop_ms - s,
+                            "dir": "up" if d > 0 else "down",
+                            "_mag": abs(d),
+                        })
+    changes.sort(key=lambda c: c["_mag"], reverse=True)
+    changes = changes[:_INSPECT_MAX_HITS]
+    changes.sort(key=lambda c: c["off"])
+    for c in changes:
+        c.pop("_mag", None)
+
+    silence: List[Dict[str, Any]] = []
+    for gap in (audio.get("silence_intervals") or []):
+        try:
+            g0, g1 = int(gap["start_ms"]), int(gap["end_ms"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        c0, c1 = max(g0, s), min(g1, e)
+        dur = c1 - c0
+        if dur <= 0:
+            continue
+        silence.append({"off": c0 - s, "dur": dur})
+    silence.sort(key=lambda g: g["dur"], reverse=True)
+    silence = silence[:_INSPECT_MAX_HITS]
+    silence.sort(key=lambda g: g["off"])
+
+    return {"curve": curve, "changes": changes, "silence": silence}
+
+
+def _full_specifics(meta: dict) -> Dict[str, Any]:
+    """brain_cut_specifics_wiring.plan.md section 3: the COMPLETE scene_
+    specifics blob for one cut -- unlike the beat-line's terse, priority-
+    capped `spec:"..."` tag (footage_map._specific_tag), this carries every
+    field the vision model answered (count, notable_object, continuity_cue,
+    setting, custom-probe answers, the full `moments` mini shot-list for a
+    merged loose cut), so the brain can pull the complete shot log for one
+    cut on demand instead of guessing from the compact line. Empty/falsy
+    fields are dropped (no bare label with no value); {} when the cut has
+    no specifics yet -- a normal, common pre-enrichment state (the caller
+    then omits the "specifics" key entirely rather than including an empty
+    one, keeping the common not-yet-enriched case lean)."""
+    spec = meta.get("scene_specifics") or {}
+    return {k: v for k, v in spec.items() if v not in (None, "", [], {})}
+
+
+def _shots_channel(scene: dict, s: int, e: int) -> Dict[str, Any]:
+    candidates: List[Tuple[int, bool]] = []
+    for pt in (scene.get("shot_points") or []):
+        try:
+            ts = int(pt.get("ts_ms", 0))
+        except (TypeError, ValueError):
+            continue
+        if s <= ts < e:
+            candidates.append((ts - s, True))
+    for pt in (scene.get("composition_points") or []):
+        try:
+            ts = int(pt.get("ts_ms", 0))
+        except (TypeError, ValueError):
+            continue
+        if s <= ts < e:
+            candidates.append((ts - s, False))
+    candidates.sort(key=lambda c: c[0])
+    kept = candidates[:_INSPECT_MAX_SHOTS]
+    return {"cuts": [{"off": off, "hard": hard} for off, hard in kept]}
+
+
+def inspect_cut(ctx: EditContext, *, ref: Optional[str] = None, seg_id: Optional[str] = None,
+                document: Optional[dict] = None) -> dict:
+    """The rich, windowed+downsampled counterpart to the beat-line's "sig:"
+    breadcrumb: for ONE cut, a downsampled action-energy curve + hit
+    offsets, a downsampled loudness envelope + rise/fall change offsets +
+    silence-gap offsets, and internal shot/composition-cut offsets -- all
+    measured from the cut's own start, sampled at (or coarser than) the L1
+    hop, capped at `_INSPECT_MAX_SAMPLES` curve points. Resolves `ref` (a
+    beat-index moment id) directly, or `seg_id` of an already-placed
+    main-line segment (mapped to its own ref) when `ref` is omitted --
+    same resolution `place`/`read_state` use (`ctx.meta_by_ref`). Computed
+    at request time from the live L1 arrays: no migration, works on any run.
+    Never fabricates -- a channel with no data for this file/span comes
+    back with empty curve/point lists, never invented ones."""
+    if not ref and seg_id and document:
+        for seg in document.get("timeline") or []:
+            if seg.get("seg_id") == seg_id:
+                ref = seg.get("ref")
+                break
+    if not ref:
+        return {"error": "no cut resolved -- pass ref, or seg_id of a placed cut"}
+    meta = ctx.meta_by_ref.get(ref)
+    if not meta:
+        return {"error": f"unknown ref {ref!r}"}
+    file_id = meta.get("file_id")
+    try:
+        s, e = int(meta.get("src_in_ms")), int(meta.get("src_out_ms"))
+    except (TypeError, ValueError):
+        return {"error": f"ref {ref!r} has no resolvable span"}
+    span_ms = e - s
+    if not file_id or span_ms <= 0:
+        return {"ref": ref, "file": _fid8(file_id or ""), "span_ms": max(0, span_ms), "hop_ms": 0}
+
+    signals = _fetch_signal_window(file_id)
+    hop_ms = int(signals["motion"].get("hop_ms") or signals["audio"].get("hop_ms") or 100)
+    step_ms = max(hop_ms, math.ceil(span_ms / _INSPECT_MAX_SAMPLES))
+
+    result = {
+        "ref": ref,
+        "file": _fid8(file_id),
+        "span_ms": span_ms,
+        "hop_ms": hop_ms,
+        "action": _action_channel(signals["motion"], s, e, step_ms),
+        "audio": _audio_channel(signals["audio"], s, e, step_ms),
+        "shots": _shots_channel(signals["scene"], s, e),
+    }
+    specifics = _full_specifics(meta)
+    if specifics:
+        result["specifics"] = specifics
+    return result
 
 
 # --------------------------------------------------------------------------

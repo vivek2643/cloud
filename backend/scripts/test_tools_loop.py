@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -242,6 +243,23 @@ def _bed_doc():
          "source_file_id": "bed1", "src_in_ms": 0, "src_out_ms": 2000,
          "from_ms": 1000, "to_ms": 3000, "gain_db": 0.0, "duck_db": 0.0},
     ]}
+
+
+def test_dispatch_inspect_cut_returns_windowed_payload_and_leaves_doc_unchanged():
+    """brain_perception_upgrade.plan.md Change 1, Mechanism B: inspect_cut is
+    an OBSERVE tool (read-only) -- dispatched, it must never mutate the
+    working document, same as read_state/predict/validate."""
+    struct = _struct()
+    ctx = _ctx(struct)
+    doc = _seed_doc()
+    signals = {"motion": {}, "audio": {}, "scene": {}}
+    with mock.patch.object(observe, "_fetch_signal_window", return_value=signals):
+        obs, new, changed = tools._dispatch("inspect_cut", {"ref": "ffffffff:m00"}, ctx, doc)
+    assert not changed, obs
+    assert new is doc
+    assert '"ref": "ffffffff:m00"' in obs, obs
+    assert '"action"' in obs and '"audio"' in obs and '"shots"' in obs, obs
+    print("ok  dispatch: inspect_cut returns the windowed payload, doc unchanged")
 
 
 def test_trim_snap_beat_lands_an_ops_resulting_edge_on_the_grid():
@@ -522,6 +540,7 @@ def main():
     test_normalize_questions_still_drops_under_two_options()
     test_normalize_questions_no_recommendation_omits_the_keys()
     test_loop_split_screen_after_answer()
+    test_dispatch_inspect_cut_returns_windowed_payload_and_leaves_doc_unchanged()
     test_trim_snap_beat_lands_an_ops_resulting_edge_on_the_grid()
     test_trim_snap_beat_is_a_noop_pass_through_without_music()
     test_move_shift_to_align_slides_an_op_by_the_computed_offset()

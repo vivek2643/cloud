@@ -20,7 +20,12 @@ def _check_schema() -> None:
     from app.config import get_settings
     from app.services.db_migrations import assert_up_to_date
 
-    conn = psycopg.connect(get_settings().database_url, autocommit=True)
+    settings = get_settings()
+    # DB_SCHEMA (local-dev isolation): read the dev ledger, not public's.
+    # pg_connect_kwargs() is empty when DB_SCHEMA is unset (production).
+    conn = psycopg.connect(
+        settings.database_url, autocommit=True, **settings.pg_connect_kwargs()
+    )
     try:
         assert_up_to_date(conn)
     finally:
@@ -107,6 +112,9 @@ app.include_router(grade.router)
 app.include_router(captions.router)
 app.include_router(sync.router)
 app.include_router(exports.router)
+
+from app.routers import cutviz  # noqa: E402  (debug-only cut-signal viz)
+app.include_router(cutviz.router)
 
 
 @app.get("/health")

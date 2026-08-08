@@ -60,6 +60,19 @@ def image_block(data_b64: str, media_type: str = "image/jpeg") -> Block:
     return {"type": "image", "data": data_b64, "media_type": media_type}
 
 
+def video_file_block(
+    file_uri: str, *, mime_type: str = "video/mp4", fps: Optional[float] = None,
+    start_ms: Optional[int] = None, end_ms: Optional[int] = None,
+) -> Block:
+    """A previously-uploaded video file (Files API URI, or a CachedContent-
+    backed reference in a later phase), optionally scoped to a playback fps
+    and/or a start/end offset window. Provider support: Gemini only today
+    (gemini_client._parts_for_content); an adapter without video support can
+    ignore this block type without crashing (pass1_video_input.plan.md)."""
+    return {"type": "video_file", "file_uri": file_uri, "media_type": mime_type,
+           "fps": fps, "start_ms": start_ms, "end_ms": end_ms}
+
+
 def tool_use_block(id: str, name: str, input: Dict[str, Any]) -> Block:
     return {"type": "tool_use", "id": id, "name": name, "input": input}
 

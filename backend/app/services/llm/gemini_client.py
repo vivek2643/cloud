@@ -54,6 +54,14 @@ def _id_to_name_map(messages: List[Message]) -> Dict[str, str]:
     return out
 
 
+def _video_offset(ms: Optional[int]) -> Optional[str]:
+    """VideoMetadata.start_offset/end_offset are Duration STRINGS ("1.500s"),
+    not ints, per the installed google-genai SDK's field type."""
+    if ms is None:
+        return None
+    return f"{ms / 1000.0:.3f}s"
+
+
 def _parts_for_content(content: Any, types, id_to_name: Dict[str, str]) -> List[Any]:
     if isinstance(content, str):
         return [types.Part(text=content)]
@@ -67,6 +75,24 @@ def _parts_for_content(content: Any, types, id_to_name: Dict[str, str]) -> List[
             parts.append(
                 types.Part.from_bytes(data=raw, mime_type=b.get("media_type", "image/jpeg"))
             )
+        elif btype == "video_file":
+            # NOTE: Part.from_uri's installed signature (google-genai 1.20.0)
+            # only accepts file_uri/mime_type -- video_metadata is NOT a
+            # from_uri kwarg despite some SDK docs/examples suggesting
+            # otherwise; it must be set as an attribute on the built Part.
+            # Degrade gracefully (log + send without it) if that ever stops
+            # working across an SDK upgrade -- a missing fps/offset should
+            # never crash the call, just widen what the model sees.
+            part = types.Part.from_uri(file_uri=b["file_uri"], mime_type=b.get("media_type", "video/mp4"))
+            fps, start_ms, end_ms = b.get("fps"), b.get("start_ms"), b.get("end_ms")
+            if fps is not None or start_ms is not None or end_ms is not None:
+                try:
+                    part.video_metadata = types.VideoMetadata(
+                        fps=fps, start_offset=_video_offset(start_ms), end_offset=_video_offset(end_ms),
+                    )
+                except Exception:
+                    logger.exception("gemini_client: failed to attach VideoMetadata -- sending video without it")
+            parts.append(part)
         elif btype == "tool_use":
             parts.append(
                 types.Part(

@@ -59,11 +59,17 @@ def _build_pool() -> ConnectionPool:
             "db.py: neither DATABASE_POOL_URL nor DATABASE_URL is set -- "
             "cannot open the business-query connection pool."
         )
+    # DB_SCHEMA (local-dev isolation): pin every pooled connection's
+    # search_path to the dev schema via a libpq startup `options` param.
+    # settings.pg_connect_kwargs() is EMPTY when DB_SCHEMA is unset, so
+    # production keeps the exact same connect kwargs as before.
+    conn_kwargs = {"autocommit": True, "prepare_threshold": None}
+    conn_kwargs.update(settings.pg_connect_kwargs())
     pool = ConnectionPool(
         conninfo=pool_url,
         min_size=1,
         max_size=max(1, settings.db_pool_max_size),
-        kwargs={"autocommit": True, "prepare_threshold": None},
+        kwargs=conn_kwargs,
         open=False,
     )
     pool.open()

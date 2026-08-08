@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import zlib
 from contextlib import contextmanager
 from pathlib import Path
@@ -33,6 +34,32 @@ from typing import Iterator, List, Tuple
 logger = logging.getLogger(__name__)
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent.parent / "migrations"
+
+
+def _target_schema() -> str:
+    """Schema this runner reads/writes -- DB_SCHEMA when set, else "public"
+    (production). Read straight from the env (not the Settings object) so the
+    ledger path stays standalone: unset -> "public" -> every SQL string below
+    is byte-for-byte what it was before local-dev isolation existed. Local dev
+    sets DB_SCHEMA=dev to get its OWN migration ledger + tables, independent of
+    prod's public.schema_migrations."""
+    return (os.environ.get("DB_SCHEMA") or "").strip() or "public"
+
+
+def _migrations_table() -> str:
+    return f"{_target_schema()}.schema_migrations"
+
+
+def _rewrite_schema(sql_text: str, schema: str) -> str:
+    """Retarget a migration file's hardcoded `public.` schema qualifiers onto
+    `schema` when applying into a non-public (dev) schema. Safe blanket text
+    substitution: every `public.` in backend/migrations/ is a genuine schema
+    qualifier -- verified none appear inside comments or string literals.
+    A no-op when schema == "public" (production)."""
+    if schema == "public":
+        return sql_text
+    return sql_text.replace("public.", f"{schema}.")
+
 
 # A file whose first line is exactly this marker is applied in autocommit
 # mode (one statement, no wrapping transaction) instead of the default
@@ -89,7 +116,7 @@ def fetch_applied(conn) -> dict:
     exist yet -- that's the pre-bootstrap state, never an error."""
     try:
         rows = conn.execute(
-            "select filename, checksum from public.schema_migrations"
+            f"select filename, checksum from {_migrations_table()}"
         ).fetchall()
     except Exception:
         conn.rollback()
@@ -112,7 +139,7 @@ def pending(conn) -> Tuple[List[Path], List[str]]:
 
 def _ensure_tracking_table(conn) -> None:
     conn.execute(
-        "create table if not exists public.schema_migrations ("
+        f"create table if not exists {_migrations_table()} ("
         "  filename text primary key,"
         "  checksum text not null,"
         "  applied_at timestamptz not null default now()"
@@ -136,18 +163,23 @@ def apply_pending(conn) -> List[str]:
     skips ahead to a later file.
     """
     _ensure_tracking_table(conn)
+    schema = _target_schema()
+    table = _migrations_table()
     to_apply, _drifted = pending(conn)
     applied_names: List[str] = []
     for path in to_apply:
         logger.info("Applying migration %s", path.name)
-        sql_text = path.read_text(encoding="utf-8")
+        # Checksum is over the ON-DISK file (unrewritten) so dev + prod ledgers
+        # agree and the drift guard compares like-for-like. The rewrite below
+        # only changes what actually executes when targeting a dev schema.
+        sql_text = _rewrite_schema(path.read_text(encoding="utf-8"), schema)
         cksum = checksum(path)
         if _is_no_transaction(path):
             conn.autocommit = True
             try:
                 conn.execute(sql_text)
                 conn.execute(
-                    "insert into public.schema_migrations (filename, checksum) "
+                    f"insert into {table} (filename, checksum) "
                     "values (%s, %s)",
                     (path.name, cksum),
                 )
@@ -165,7 +197,7 @@ def apply_pending(conn) -> List[str]:
             try:
                 conn.execute(sql_text)
                 conn.execute(
-                    "insert into public.schema_migrations (filename, checksum) "
+                    f"insert into {table} (filename, checksum) "
                     "values (%s, %s)",
                     (path.name, cksum),
                 )
@@ -194,7 +226,7 @@ def reconcile(conn, filename: str) -> None:
     if not path.exists():
         raise FileNotFoundError(f"No such migration file: {filename}")
     cur = conn.execute(
-        "update public.schema_migrations set checksum = %s where filename = %s",
+        f"update {_migrations_table()} set checksum = %s where filename = %s",
         (checksum(path), filename),
     )
     if cur.rowcount == 0:

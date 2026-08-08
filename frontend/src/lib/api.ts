@@ -282,6 +282,28 @@ export interface CutRecord {
     primary?: number;
     density?: number;
   } | null;
+  // brain_perception_upgrade.plan.md Change 1: compact interior-structure
+  // landmarks (post._landmarks), code-computed -- powers the beat-line
+  // "sig:" breadcrumb and warms the inspect_cut sense. Each channel is
+  // present only when the cut has interior events on it; absent/{} on a
+  // pre-migration cut or one with no interior structure.
+  landmarks?: {
+    act?: { n: number; hits: number[] };
+    adx?: { n: number; changes: { off: number; dir: "up" | "down" }[] };
+    sil?: { n: number; gaps: { off: number; dur: number }[] };
+    shot?: { n: number; cuts: { off: number; hard: boolean }[] };
+  } | null;
+  // cut_structure_and_scene_specificity.plan.md Part 3: this cut's
+  // sharpened, footage-derived specific from the two-pass background
+  // enrichment (a generic vision pass -> a text pass inferring the
+  // project's domain + targeted questions -> a second, targeted vision
+  // pass). Additive alongside label/summary, never a replacement. Absent/
+  // {} until the background job reaches this cut (a normal, common state
+  // -- it runs after cuts are already shown) or on a pre-migration row.
+  scene_specifics?: {
+    specific?: string;
+    label?: string;
+  } | null;
   // av_coupling_authoritative.plan.md: this cut's baked AUTHORITATIVE audio
   // source, decided once at ingest (never re-derived lazily at render time).
   // audio_file_id defaults to this cut's own file_id (same-source, offset 0)
@@ -310,6 +332,10 @@ export interface IngestRun {
   error: string | null;
   created_at: string | null;
   updated_at: string | null;
+  // vcut_moment_energy.plan.md section 8: {source: "pipeline"|"copy_prior",
+  // error} -- which speech path actually ran. null on a v3 run or a
+  // pre-migration vcut run.
+  speech_channel_status: { source: "pipeline" | "copy_prior"; error: string | null } | null;
 }
 
 export interface CutsResponse {
@@ -341,6 +367,28 @@ export function getCuts(projectId: string, token: string) {
     token,
     cache: "no-store",
   });
+}
+
+// seam_cut_pipeline.plan.md section 9: re-derive vcut video cut boundaries
+// at a new global energy (0..1) -- no model call, instant. vcut runs only;
+// 409 on a project whose latest run has no seam_cache/loose_plan artifacts.
+export function setCutsEnergy(projectId: string, energy: number, token: string) {
+  return request<CutsResponse>(`/api/projects/${projectId}/cuts/energy`, {
+    method: "POST",
+    token,
+    body: JSON.stringify({ energy }),
+  });
+}
+
+// Precompute the assembled cut response for all 5 dial stops in one call, so
+// the dial can swap tightness instantly client-side (no per-drag round-trip).
+// vcut runs only; keys are "0"/"0.25"/"0.5"/"0.75"/"1". 409 like setCutsEnergy
+// when the latest run has no seam_cache/loose_plan artifacts.
+export function getCutsEnergyLevels(projectId: string, token: string) {
+  return request<{ levels: Record<string, CutsResponse> }>(
+    `/api/projects/${projectId}/cuts/energy_levels`,
+    { token, cache: "no-store" }
+  );
 }
 
 // --- Upload ---
@@ -680,28 +728,6 @@ export interface EditFormat {
 /** Per-project sequence-level color grade selection (SS2.4). */
 export type EditLook = SequenceLook;
 
-export interface EditBeat {
-  beat_id: string;
-  purpose: string;
-  intent: string;
-  target_s?: number;
-}
-
-export type SpineKind = "dialogue" | "music" | "visual" | "sync" | "other";
-
-export interface EditSpineRegion {
-  kind: SpineKind;
-  label?: string;
-  locked_channels?: ("video" | "audio")[];
-  source_file_ids?: string[];
-  protected_windows?: { file_id: string; start_ms: number; end_ms: number; reason?: string }[];
-  rationale?: string;
-}
-
-export interface EditSpine {
-  regions?: EditSpineRegion[];
-}
-
 export interface EditSegment {
   seg_id: string;
   file_id: string;
@@ -913,11 +939,9 @@ export interface EditDocument {
   format?: EditFormat;
   look?: EditLook;
   captions?: EditCaptions;
-  spine?: EditSpine | null;
   operations?: EditOperation[];
   layout_regions?: LayoutRegion[];
   resolved?: ResolvedTimeline | null;
-  outline?: EditBeat[];
   timeline?: EditSegment[];
   open_questions?: EditQuestion[];
   summary?: string;

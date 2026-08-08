@@ -166,6 +166,110 @@ def test_salience_uses_rms_loudness_when_action_energy_flat():
     print("ok  test_salience_uses_rms_loudness_when_action_energy_flat")
 
 
+# --------------------------------------------------------------------------
+# landmarks (brain_perception_upgrade.plan.md Change 1, Mechanism A): compact
+# interior-structure distillation -- action hits, audio dynamics change
+# points, silence gaps, internal shot/composition cuts.
+# --------------------------------------------------------------------------
+
+def test_landmarks_empty_with_no_signal_at_all():
+    lm = post._landmarks([], [], 0, [], 0, None, None, [], [], [], 0, 1000)
+    assert lm == {}, lm
+    print("ok  test_landmarks_empty_with_no_signal_at_all")
+
+
+def test_landmarks_empty_on_a_flat_action_energy_curve():
+    # Every point on a perfectly flat curve trivially satisfies a >= self
+    # comparison against equal neighbors -- must NOT be treated as a "local
+    # max"; a flat run has no real interior structure.
+    lm = post._landmarks([0.3] * 100, [], 100, [], 0, None, None, [], [], [], 0, 10000)
+    assert lm == {}, lm
+    print("ok  test_landmarks_empty_on_a_flat_action_energy_curve")
+
+
+def test_landmarks_act_hits_interior_local_maxima_only():
+    ae = [0.1] * 100
+    ae[50] = 0.9    # 5000ms -- well interior for a 10s span (edge_guard=1000ms)
+    ae[2] = 0.95    # 200ms -- pinned near the start edge, must be excluded
+    lm = post._landmarks(ae, [], 100, [], 0, None, None, [], [], [], 0, 10000)
+    assert lm["act"]["n"] == 1, lm["act"]
+    assert lm["act"]["hits"] == [5000], lm["act"]
+    print("ok  test_landmarks_act_hits_interior_local_maxima_only")
+
+
+def test_landmarks_act_caps_at_five_ranked_by_score_kept_in_time_order():
+    ae = [0.1] * 100
+    for i, v in {20: 0.2, 30: 0.3, 40: 0.4, 50: 0.5, 60: 0.6, 70: 0.7, 80: 0.8}.items():
+        ae[i] = v
+    lm = post._landmarks(ae, [], 100, [], 0, None, None, [], [], [], 0, 10000)
+    assert lm["act"]["n"] == 7, lm["act"]                       # full interior count
+    assert lm["act"]["hits"] == [4000, 5000, 6000, 7000, 8000], lm["act"]["hits"]
+    print("ok  test_landmarks_act_caps_at_five_ranked_by_score_kept_in_time_order")
+
+
+def test_landmarks_act_dedupes_an_action_point_on_the_same_bin_as_a_local_max():
+    ae = [0.1] * 100
+    ae[50] = 0.9
+    pts = [{"ts_ms": 5000, "kind": "action_impact", "score": 1.0}]
+    lm = post._landmarks(ae, pts, 100, [], 0, None, None, [], [], [], 0, 10000)
+    assert lm["act"]["n"] == 1, lm["act"]           # not 2 -- same hop bin, deduped
+    assert lm["act"]["hits"] == [5000], lm["act"]
+    print("ok  test_landmarks_act_dedupes_an_action_point_on_the_same_bin_as_a_local_max")
+
+
+def test_landmarks_adx_detects_rise_and_fall():
+    rms = [-40.0] * 15 + [-10.0] * 15 + [-40.0] * 20   # 200ms hop, 50 samples = 10000ms
+    lo, hi = post._series_lohi(rms)
+    lm = post._landmarks([], [], 0, rms, 200, lo, hi, [], [], [], 0, 10000)
+    assert lm["adx"]["n"] == 2, lm["adx"]
+    assert lm["adx"]["changes"] == [
+        {"off": 3000, "dir": "up"}, {"off": 6000, "dir": "down"},
+    ], lm["adx"]["changes"]
+    print("ok  test_landmarks_adx_detects_rise_and_fall")
+
+
+def test_landmarks_adx_absent_on_a_flat_clip():
+    # lo == hi -> _norm_in_clip is None everywhere -> no absolute-dB
+    # fallback, just no adx channel at all.
+    rms = [-20.0] * 50
+    lo, hi = post._series_lohi(rms)
+    lm = post._landmarks([], [], 0, rms, 200, lo, hi, [], [], [], 0, 10000)
+    assert "adx" not in lm, lm
+    print("ok  test_landmarks_adx_absent_on_a_flat_clip")
+
+
+def test_landmarks_sil_gaps_clipped_ranked_by_duration_kept_in_time_order():
+    gaps = [
+        {"start_ms": 2000, "end_ms": 2500},   # 500ms, interior
+        {"start_ms": 100, "end_ms": 300},     # interior-duration but pinned near the edge
+        {"start_ms": 4000, "end_ms": 4050},   # 50ms -- shorter than one prosody hop, ignored
+        {"start_ms": 6000, "end_ms": 7000},   # 1000ms, interior, longest
+    ]
+    lm = post._landmarks([], [], 0, [], 100, None, None, gaps, [], [], 0, 10000)
+    assert lm["sil"]["n"] == 2, lm["sil"]
+    assert lm["sil"]["gaps"] == [
+        {"off": 2000, "dur": 500}, {"off": 6000, "dur": 1000},
+    ], lm["sil"]["gaps"]
+    print("ok  test_landmarks_sil_gaps_clipped_ranked_by_duration_kept_in_time_order")
+
+
+def test_landmarks_shot_cuts_hard_and_soft_exclusive_of_exact_edges():
+    shot_points = [
+        {"ts_ms": 3000, "kind": "shot_cut", "score": 1.0},
+        {"ts_ms": 0, "kind": "shot_cut", "score": 1.0},                  # exact start edge
+    ]
+    comp_points = [
+        {"ts_ms": 5000, "kind": "composition_change", "score": 1.0},
+        {"ts_ms": 10000, "kind": "composition_change", "score": 1.0},   # exact end edge
+    ]
+    lm = post._landmarks([], [], 0, [], 0, None, None, [], shot_points, comp_points, 0, 10000)
+    assert lm["shot"]["n"] == 2, lm["shot"]
+    assert lm["shot"]["cuts"] == [
+        {"off": 3000, "hard": True}, {"off": 5000, "hard": False},
+    ], lm["shot"]["cuts"]
+    print("ok  test_landmarks_shot_cuts_hard_and_soft_exclusive_of_exact_edges")
+
+
 def _cam_motion(dx=None, dy=None, dz=None, action=None, coherence=None, hop_ms=100, n=10):
     z = [0.0] * n
     return {
@@ -965,6 +1069,15 @@ def main():
     test_salience_onset_bump_dominates_flat_energy()
     test_salience_onset_outside_span_is_ignored()
     test_salience_uses_rms_loudness_when_action_energy_flat()
+    test_landmarks_empty_with_no_signal_at_all()
+    test_landmarks_empty_on_a_flat_action_energy_curve()
+    test_landmarks_act_hits_interior_local_maxima_only()
+    test_landmarks_act_caps_at_five_ranked_by_score_kept_in_time_order()
+    test_landmarks_act_dedupes_an_action_point_on_the_same_bin_as_a_local_max()
+    test_landmarks_adx_detects_rise_and_fall()
+    test_landmarks_adx_absent_on_a_flat_clip()
+    test_landmarks_sil_gaps_clipped_ranked_by_duration_kept_in_time_order()
+    test_landmarks_shot_cuts_hard_and_soft_exclusive_of_exact_edges()
     test_classify_camera_move()
     test_validate_no_overlap_passes_exact_coverage()
     test_validate_no_overlap_allows_start_gap()

@@ -459,7 +459,8 @@ def _run_ingest(project_id: str, settings, ingest_run_id: str) -> str:
                                             synced_file_ids=outlook_file_ids,
                                             sync_group_by_file=outlook_group_by_file,
                                             sync_info_by_file=outlook_by_file,
-                                            v4_meta_by_ref=v4_meta_by_ref or None)
+                                            v4_meta_by_ref=v4_meta_by_ref or None,
+                                            scene_by_file=scene_by_file)
 
         store.delete_cut_records_for_run(ingest_run_id)
         record_ids = store.insert_cut_records(ingest_run_id, records)
@@ -479,6 +480,10 @@ def _run_ingest(project_id: str, settings, ingest_run_id: str) -> str:
         )
 
         store.set_status(ingest_run_id, "ready")
+        # cut_structure_and_scene_specificity.plan.md Part 3: cuts are
+        # already visible at this point -- the enrichment runs in the
+        # background from here on and must never affect this run's outcome.
+        defer_scene_enrich(project_id, ingest_run_id)
     except Exception as e:
         logger.exception("ingest run %s failed", ingest_run_id)
         timings_ms["total"] = (time.monotonic() - t_start) * 1000
@@ -508,6 +513,54 @@ def l3_cuts_v3_ingest(project_id: str) -> None:
     ``defer_ingest`` below only ever enqueues the new name -- remove this
     once the ``ingest`` queue has drained past this release."""
     run_ingest(project_id)
+
+
+@app.task(name="l3_scene_enrich", queue="ingest", retry=False)
+def l3_scene_enrich(project_id: str, ingest_run_id: str) -> None:
+    """cut_structure_and_scene_specificity.plan.md Part 3: background scene-
+    specificity enrichment -- middle text layer -> Pass B -> persist onto
+    the already-inserted cut_records/ingest_runs rows. Fired right after
+    run_ingest sets status 'ready' (defer_scene_enrich, below), so cuts are
+    already visible; this only sharpens their descriptions afterward. A
+    failure anywhere in here is logged and swallowed -- cuts remain fully
+    usable without scene_specifics, this is a quality improvement, never a
+    correctness requirement."""
+    from app.services.l3 import scene_specificity, scene_taxonomy
+    try:
+        taxonomy = scene_taxonomy.build_scene_taxonomy(ingest_run_id)
+        store.set_scene_taxonomy(ingest_run_id, taxonomy)
+        specifics = scene_specificity.run_pass_b(ingest_run_id, taxonomy)
+        for cut_id, payload in specifics.items():
+            try:
+                store.update_cut_scene_specifics(cut_id, payload)
+            except Exception:
+                logger.exception("l3_scene_enrich: failed to persist scene_specifics for cut %s", cut_id)
+        logger.info("l3_scene_enrich: project %s run %s domain=%r specifics=%d",
+                   project_id, ingest_run_id, taxonomy.get("domain"), len(specifics))
+    except Exception:
+        logger.exception("l3_scene_enrich: enrichment failed for project %s run %s "
+                         "(cuts remain usable without specifics)", project_id, ingest_run_id)
+
+
+def defer_scene_enrich(project_id: str, ingest_run_id: str) -> None:
+    """Enqueue the background enrichment job. Best-effort: a failure to
+    enqueue is logged and swallowed here too -- cuts are already visible and
+    usable; missing specifics is a quality gap, never a run failure.
+    queueing_lock keyed on the run (not the project) since a project can
+    have several runs over time and each one's own enrichment is
+    independent."""
+    try:
+        from procrastinate import App, PsycopgConnector
+
+        enqueue_app = App(connector=PsycopgConnector(
+            conninfo=get_settings().database_url, min_size=1, max_size=2))
+        with enqueue_app.open():
+            enqueue_app.configure_task(
+                "l3_scene_enrich", queue="ingest",
+                queueing_lock=f"scene_enrich:{ingest_run_id}",
+            ).defer(project_id=project_id, ingest_run_id=ingest_run_id)
+    except Exception:
+        logger.exception("could not enqueue scene enrichment for run %s", ingest_run_id)
 
 
 def defer_ingest(project_id: str, user_id: str) -> None:

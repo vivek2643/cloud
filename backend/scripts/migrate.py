@@ -36,7 +36,15 @@ from app.services.db_migrations import (  # noqa: E402
 
 def _connect():
     import psycopg
-    return psycopg.connect(get_settings().database_url, autocommit=False)
+    settings = get_settings()
+    # DB_SCHEMA (local-dev isolation): pin search_path so the schema-aware
+    # runner (db_migrations.py) creates the ledger + all `public.`-rewritten
+    # tables inside the dev schema, and extension types/functions still
+    # resolve via the `public` fallback. pg_connect_kwargs() is EMPTY when
+    # DB_SCHEMA is unset -> production applies migrations exactly as before.
+    return psycopg.connect(
+        settings.database_url, autocommit=False, **settings.pg_connect_kwargs()
+    )
 
 
 def cmd_apply() -> int:

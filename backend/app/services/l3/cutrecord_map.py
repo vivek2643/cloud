@@ -552,6 +552,15 @@ def _to_cut_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         # screen_text/salience tags silently always rendered empty).
         "screen_text": row.get("screen_text") or "",
         "salience": row.get("salience") or {},
+        # brain_perception_upgrade.plan.md Change 1: compact interior-
+        # structure landmarks (post._landmarks), code-computed. {} on a
+        # pre-migration row or a cut with no interior structure.
+        "landmarks": row.get("landmarks") or {},
+        # cut_structure_and_scene_specificity.plan.md Part 3: this cut's
+        # sharpened scene specific (Pass B), when the background enrichment
+        # has reached it -- {} until then (a normal, common state; cuts are
+        # fully usable without it). {"specific", "label"}.
+        "scene_specifics": row.get("scene_specifics") or {},
         # av_coupling_authoritative.plan.md: this cut's baked, authoritative
         # audio coupling. audio_file_id defaults to this cut's OWN file_id
         # (same-source) for a pre-migration row (DB column is NULL there).

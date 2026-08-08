@@ -42,7 +42,7 @@ import logging
 import math
 import subprocess
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 from app.services import limits
 from app.services.l1.cut_grid_common import (
@@ -93,6 +93,17 @@ class MotionDynamics:
     camera_coherence: List[float] = field(default_factory=list)  # 1 = rigid global move
     camera_stability: List[float] = field(default_factory=list)  # 1 = steady/sustained
     blur: List[float] = field(default_factory=list)              # 1 = fully blurred/distorted
+    # Temporal pixel change: mean |gray delta| between consecutive frames,
+    # file-normalized (1 = the picture is changing a lot). Unlike action_energy
+    # this is model-free -- it does NOT subtract camera motion -- so it reads
+    # "is anything on screen changing at all" (a frozen establishing hold -> ~0).
+    frame_diff: List[float] = field(default_factory=list)
+    # Raw, UN-normalized magnitudes (not percentile-scaled) -- kept so the
+    # normalization inflation on flat/aerial footage is inspectable and so a
+    # de-contaminated content signal can be built later. Physical units noted.
+    action_energy_raw: List[float] = field(default_factory=list)   # subject residual, px/frame
+    camera_motion_raw: List[float] = field(default_factory=list)   # fitted camera disp, px/frame
+    frame_diff_raw: List[float] = field(default_factory=list)       # mean |gray delta|, 0..255
     # SIGNED per-hop camera velocity (absolute, NOT file-normalized -- so a pan
     # is a pan regardless of the clip's own spread), used only for the direction
     # of a cut's camera-move label (post._classify_camera_move). Sign convention
@@ -120,6 +131,10 @@ class MotionDynamics:
             "camera_coherence": self.camera_coherence,
             "camera_stability": self.camera_stability,
             "blur": self.blur,
+            "frame_diff": self.frame_diff,
+            "action_energy_raw": self.action_energy_raw,
+            "camera_motion_raw": self.camera_motion_raw,
+            "frame_diff_raw": self.frame_diff_raw,
             "camera_dx": self.camera_dx,
             "camera_dy": self.camera_dy,
             "camera_zoom": self.camera_zoom,
@@ -229,6 +244,8 @@ def compute_motion_dynamics(
     camera_raw: List[float] = []
     coherence: List[float] = []
     sharp_raw: List[float] = []
+    # Model-free temporal pixel change (mean |gray delta| per hop).
+    framediff_raw: List[float] = []
     # cuts-v3: fraction of the sampled grid sweeping at RAW flow magnitude above
     # WIPE_MAG_PX -- the occlusion-wipe signal (see transition_points below).
     # RAW (pre camera-model) on purpose: a near-field object crossing the lens
@@ -252,7 +269,11 @@ def compute_motion_dynamics(
                 params.append((0.0, 0.0, 0.0, 0.0))
                 centroids.append((0.5, 0.5))
                 wipe_frac_raw.append(0.0)
+                framediff_raw.append(0.0)
             else:
+                framediff_raw.append(
+                    float(np.mean(np.abs(frame.astype(np.int16) - prev.astype(np.int16))))
+                )
                 # Deep pyramid (5 levels) + wide window so a fast pan/whip (large
                 # per-hop displacement) is still tracked instead of read as noise.
                 flow = cv2.calcOpticalFlowFarneback(
@@ -290,6 +311,7 @@ def compute_motion_dynamics(
 
     action_n = normalize_pctl(action_raw, MOTION_NORM_PCTL)
     camera_n = normalize_pctl(camera_raw, MOTION_NORM_PCTL)
+    frame_diff_n = normalize_pctl(framediff_raw, MOTION_NORM_PCTL)
 
     # Temporal stability via RELATIVE jerk: |change in camera velocity| divided by
     # the current speed. A constant-velocity move (any speed) -> ~0 -> steady;
@@ -377,6 +399,10 @@ def compute_motion_dynamics(
         camera_coherence=_fit([round(c, 3) for c in coherence]),
         camera_stability=_fit(stability),
         blur=_fit(blur),
+        frame_diff=_fit([round(v, 3) for v in frame_diff_n]),
+        action_energy_raw=_fit([round(v, 4) for v in action_raw]),
+        camera_motion_raw=_fit([round(v, 4) for v in camera_raw]),
+        frame_diff_raw=_fit([round(v, 3) for v in framediff_raw]),
         camera_dx=_fit(cam_dx),
         camera_dy=_fit(cam_dy),
         camera_zoom=_fit(cam_zoom),

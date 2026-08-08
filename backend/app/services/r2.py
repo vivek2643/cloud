@@ -13,6 +13,23 @@ MIN_PART_SIZE = 256 * 1024 * 1024  # 256 MiB
 MAX_PARTS = 9000
 
 
+def _full_key(key: str) -> str:
+    """Prepend R2_KEY_PREFIX (local-dev isolation) to a logical object key.
+
+    Returns the key UNCHANGED when R2_KEY_PREFIX is unset -> byte-for-byte
+    production behavior. When set (e.g. "dev"), every get/put/delete/multipart
+    op is transparently scoped to "<prefix>/<key>", so DB-stored keys stay
+    logical (unprefixed) and a delete can only ever target a prefixed key --
+    it can NEVER name a bare production object. This is the single storage
+    chokepoint: processing.py's raw boto3 download/upload route their keys
+    through here too.
+    """
+    prefix = get_settings().r2_key_prefix.strip().strip("/")
+    if not prefix:
+        return key
+    return f"{prefix}/{key}"
+
+
 def _get_client():
     settings = get_settings()
     return boto3.client(
@@ -32,7 +49,7 @@ def generate_presigned_put(key: str, content_type: str, expires_in: int = 3600) 
         "put_object",
         Params={
             "Bucket": settings.r2_bucket_name,
-            "Key": key,
+            "Key": _full_key(key),
             "ContentType": content_type,
         },
         ExpiresIn=expires_in,
@@ -46,7 +63,7 @@ def generate_presigned_get(key: str, expires_in: int = 3600) -> str:
         "get_object",
         Params={
             "Bucket": settings.r2_bucket_name,
-            "Key": key,
+            "Key": _full_key(key),
         },
         ExpiresIn=expires_in,
     )
@@ -55,7 +72,7 @@ def generate_presigned_get(key: str, expires_in: int = 3600) -> str:
 def delete_object(key: str) -> None:
     settings = get_settings()
     client = _get_client()
-    client.delete_object(Bucket=settings.r2_bucket_name, Key=key)
+    client.delete_object(Bucket=settings.r2_bucket_name, Key=_full_key(key))
 
 
 # --- Multipart upload (for files > 5 GiB, and any large upload) ---------------
@@ -70,7 +87,7 @@ def create_multipart_upload(key: str, content_type: str) -> str:
     client = _get_client()
     resp = client.create_multipart_upload(
         Bucket=settings.r2_bucket_name,
-        Key=key,
+        Key=_full_key(key),
         ContentType=content_type,
     )
     return resp["UploadId"]
@@ -83,6 +100,7 @@ def generate_presigned_upload_parts(
     slow multi-GB uploads don't outlive the signature."""
     settings = get_settings()
     client = _get_client()
+    full_key = _full_key(key)
     urls: List[str] = []
     for part_number in range(1, part_count + 1):
         urls.append(
@@ -90,7 +108,7 @@ def generate_presigned_upload_parts(
                 "upload_part",
                 Params={
                     "Bucket": settings.r2_bucket_name,
-                    "Key": key,
+                    "Key": full_key,
                     "UploadId": upload_id,
                     "PartNumber": part_number,
                 },
@@ -107,6 +125,7 @@ def complete_multipart_upload(key: str, upload_id: str) -> None:
     settings = get_settings()
     client = _get_client()
     bucket = settings.r2_bucket_name
+    key = _full_key(key)
 
     parts: List[dict] = []
     marker = 0
@@ -138,7 +157,7 @@ def abort_multipart_upload(key: str, upload_id: str) -> None:
     client = _get_client()
     try:
         client.abort_multipart_upload(
-            Bucket=settings.r2_bucket_name, Key=key, UploadId=upload_id
+            Bucket=settings.r2_bucket_name, Key=_full_key(key), UploadId=upload_id
         )
     except Exception:
         pass
