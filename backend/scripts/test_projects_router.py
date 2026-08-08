@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from app.auth import get_current_user_id  # noqa: E402
 from app.main import app as fastapi_app  # noqa: E402
 from app.routers import projects  # noqa: E402
+from app.services.vcut import orchestrate  # noqa: E402
 from app.services.vcut.resolve import ResolvedCut  # noqa: E402
 
 
@@ -73,10 +74,13 @@ def test_create_project_rejects_empty_file_ids():
 
 
 def test_kick_ingest_enqueues_and_returns_queued():
+    # cuts_pipeline defaults to "vcut" (config.py), so kick_ingest dispatches
+    # to app.services.vcut.orchestrate.defer_vcut_ingest -- mock that, not the
+    # old v3 defer_ingest, so no real fairness/DB UUID-cast runs.
     calls = []
     p = _Patcher()
     p.set(projects, "_owned_project", lambda project_id, user_id: None)
-    p.set(projects, "defer_ingest", lambda project_id, user_id: calls.append((project_id, user_id)))
+    p.set(orchestrate, "defer_vcut_ingest", lambda project_id, user_id: calls.append((project_id, user_id)))
     _as_user("user-1")
     try:
         client = TestClient(fastapi_app)
@@ -101,7 +105,7 @@ def test_kick_ingest_treats_already_enqueued_as_a_noop():
 
     p = _Patcher()
     p.set(projects, "_owned_project", lambda project_id, user_id: None)
-    p.set(projects, "defer_ingest", already)
+    p.set(orchestrate, "defer_vcut_ingest", already)
     _as_user("user-1")
     try:
         client = TestClient(fastapi_app)
@@ -125,7 +129,7 @@ def test_kick_ingest_429s_when_over_capacity():
 
     p = _Patcher()
     p.set(projects, "_owned_project", lambda project_id, user_id: None)
-    p.set(projects, "defer_ingest", over_capacity)
+    p.set(orchestrate, "defer_vcut_ingest", over_capacity)
     _as_user("user-1")
     try:
         client = TestClient(fastapi_app)
@@ -160,7 +164,7 @@ def test_kick_ingest_503s_when_enqueue_fails():
 
     p = _Patcher()
     p.set(projects, "_owned_project", lambda project_id, user_id: None)
-    p.set(projects, "defer_ingest", boom)
+    p.set(orchestrate, "defer_vcut_ingest", boom)
     _as_user("user-1")
     try:
         client = TestClient(fastapi_app)
