@@ -44,19 +44,6 @@ _PACE_LEVELS = [1.0] * 5
 
 _ENERGY_GRADE_BANDS = (("calm", 0.33), ("medium", 0.66))  # else "high"
 
-# Columns copied byte-for-byte from a prior run's speech cut_records (every
-# CutRecord column except id/ingest_run_id/created_at/updated_at/hero_key/
-# scene_specifics/transition_in/transition_out/junk_confidence -- those stay
-# NULL/default on the copy, matching a fresh insert_cut_records() row).
-_SPEECH_COPY_COLUMNS = (
-    "file_id", "src_in_ms", "src_out_ms", "kind", "word_span", "atom_ids",
-    "label", "summary", "on_camera", "take_group_id", "take_role", "junk", "junk_reason",
-    "framing", "look", "caption_zones", "pace", "hero_ts_ms", "channel", "continuity",
-    "speech_quality", "total_quality", "characteristics", "camera", "sync_group_id",
-    "screen_text", "salience", "landmarks", "voice_ids", "speaker_person", "visible_persons",
-    "audio_file_id", "audio_offset_ms", "audio_align_confidence",
-)
-
 
 def _pg_conn():
     from app.services import db
@@ -210,10 +197,11 @@ def load_seam_and_plan(ingest_run_id: str) -> Tuple[Dict[str, dict], Dict[str, A
 
 
 def persist_speech_channel_status(ingest_run_id: str, status: Dict[str, Any]) -> None:
-    """vcut_moment_energy.plan.md section 8: {source: "pipeline"|
-    "copy_prior", error: str|None} -- makes a silently-degrading speech
-    pipeline observable (GET /cuts, logs) instead of looking identical to a
-    working one."""
+    """vcut_moment_energy.plan.md section 8: {source: "pipeline"|"failed",
+    error: str|None} -- makes a failing speech pipeline observable (GET
+    /cuts, logs) instead of looking identical to a working one. There is no
+    "copy_prior" source any more: the speech channel has no fallback (a
+    broken pass fails the run), so it is either "pipeline" or "failed"."""
     with _pg_conn() as conn:
         conn.execute(
             "update ingest_runs set speech_channel_status = %s where id = %s",
@@ -242,32 +230,3 @@ def load_vcut_cache(ingest_run_id: str) -> Optional[Dict[str, Any]]:
     return row[0] if isinstance(row[0], dict) else json.loads(row[0])
 
 
-def _latest_other_run_id(project_id: str, exclude_run_id: str) -> Optional[str]:
-    with _pg_conn() as conn:
-        row = conn.execute(
-            "select id::text from ingest_runs where project_id = %s and id != %s "
-            "order by created_at desc limit 1",
-            (project_id, exclude_run_id),
-        ).fetchone()
-    return row[0] if row else None
-
-
-def copy_prior_speech_cuts(project_id: str, new_ingest_run_id: str) -> int:
-    """Principle 1/section 2: speech is a separate channel, reused verbatim
-    -- vcut never generates its own speech cuts (no L3 pass1/lattice call;
-    principle 7's isolation constraint rules that out). Copies the most
-    recent OTHER ingest_run's kind='speech' cut_records as-is (new id, new
-    ingest_run_id, every other column byte-identical) into this run. A
-    project with no prior ingest at all simply contributes zero speech cuts
-    -- graceful degradation, not an error."""
-    prior_run_id = _latest_other_run_id(project_id, new_ingest_run_id)
-    if not prior_run_id:
-        return 0
-    cols = ", ".join(_SPEECH_COPY_COLUMNS)
-    with _pg_conn() as conn:
-        result = conn.execute(
-            f"insert into cut_records (ingest_run_id, {cols}) "
-            f"select %s, {cols} from cut_records where ingest_run_id = %s and kind = 'speech'",
-            (new_ingest_run_id, prior_run_id),
-        )
-        return result.rowcount or 0

@@ -1,7 +1,7 @@
 """
 Pure unit tests for the non-DB parts of app.services.vcut.store --
 build_cut_records and its small helpers. The DB-touching functions
-(persist_seam_and_plan/load_seam_and_plan/copy_prior_speech_cuts) need a
+(persist_seam_and_plan/load_seam_and_plan) need a
 live Postgres connection and are exercised via the vcut smoke run instead,
 matching this codebase's convention (see test_ingest_store.py).
 
