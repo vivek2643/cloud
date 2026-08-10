@@ -64,7 +64,8 @@ def test_mean_in_range_empty_track_is_zero():
 
 def test_build_cut_records_shape_and_channel():
     cuts = [ResolvedCut(file_id="f1", in_ms=1000, out_ms=3000, peak_ms=2000,
-                        tag="build", summary="doing push-ups")]
+                        tag="build", summary="doing push-ups",
+                        moments=[{"peak_ms": 2000, "shape": "build", "summary": "doing push-ups"}])]
     seam = {"f1": _seam(S=[0.8] * 101)}
     records = build_cut_records(cuts, seam)
     assert len(records) == 1
@@ -81,7 +82,7 @@ def test_build_cut_records_shape_and_channel():
 
 def test_build_cut_records_missing_seam_falls_back_to_zero_quality():
     cuts = [ResolvedCut(file_id="missing", in_ms=0, out_ms=1000, peak_ms=500,
-                        tag="both", summary="m")]
+                        tag="both", summary="m", moments=[{"peak_ms": 500, "shape": "both", "summary": "m"}])]
     records = build_cut_records(cuts, {})
     assert records[0].total_quality == 0.0
     print("ok  test_build_cut_records_missing_seam_falls_back_to_zero_quality")
@@ -96,7 +97,8 @@ def test_build_cut_records_missing_seam_falls_back_to_zero_quality():
 
 def test_build_cut_records_writes_full_framing_when_dims_present():
     cuts = [ResolvedCut(file_id="f1", in_ms=1000, out_ms=3000, peak_ms=2000,
-                        tag="build", summary="doing push-ups", subject_box=(0.4, 0.4, 0.2, 0.2))]
+                        tag="build", summary="doing push-ups", subject_box=(0.4, 0.4, 0.2, 0.2),
+                        moments=[{"peak_ms": 2000, "shape": "build", "summary": "doing push-ups"}])]
     seam = _seam(S=[0.8] * 101)
     seam["src_w"], seam["src_h"] = 1920, 1080
     records = build_cut_records(cuts, {"f1": seam})
@@ -110,7 +112,8 @@ def test_build_cut_records_writes_full_framing_when_dims_present():
 
 def test_build_cut_records_no_subject_box_still_yields_centered_crops():
     cuts = [ResolvedCut(file_id="f1", in_ms=1000, out_ms=3000, peak_ms=2000,
-                        tag="build", summary="m")]  # no subject_box
+                        tag="build", summary="m",  # no subject_box
+                        moments=[{"peak_ms": 2000, "shape": "build", "summary": "m"}])]
     seam = _seam(S=[0.8] * 101)
     seam["src_w"], seam["src_h"] = 1920, 1080
     records = build_cut_records(cuts, {"f1": seam})
@@ -122,10 +125,35 @@ def test_build_cut_records_no_subject_box_still_yields_centered_crops():
 
 def test_build_cut_records_missing_dims_yields_empty_framing():
     cuts = [ResolvedCut(file_id="f1", in_ms=1000, out_ms=3000, peak_ms=2000,
-                        tag="build", summary="m", subject_box=(0.1, 0.1, 0.1, 0.1))]
+                        tag="build", summary="m", subject_box=(0.1, 0.1, 0.1, 0.1),
+                        moments=[{"peak_ms": 2000, "shape": "build", "summary": "m"}])]
     records = build_cut_records(cuts, {"f1": _seam(S=[0.8] * 101)})  # no src_w/src_h in this seam entry
     assert records[0].framing == {}
     print("ok  test_build_cut_records_missing_dims_yields_empty_framing")
+
+
+# --------------------------------------------------------------------------
+# brain_cut_salience_parity.plan.md: build_cut_records also populates
+# salience/landmarks (vcut/salience.py's bridge). The bridge's own logic is
+# unit-tested in test_vcut_salience.py; here we only need to confirm
+# build_cut_records actually wires it in.
+# --------------------------------------------------------------------------
+
+def test_build_cut_records_writes_salience_and_landmarks():
+    cuts = [ResolvedCut(
+        file_id="f1", in_ms=1000, out_ms=3000, peak_ms=2000, tag="build", summary="doing push-ups",
+        moments=[{"peak_ms": 2000, "shape": "build", "summary": "doing push-ups"}],
+    )]
+    seam = {"f1": _seam(S=[0.8] * 101, action_energy=[0.5] * 101)}
+    records = build_cut_records(cuts, seam)
+    salience = records[0].salience
+    assert salience["kind"] == "point" and salience["shape"] == "before"
+    assert salience["peak_ms"] == 2000
+    assert len(salience["events"]) == 1
+    # The one moment's peak sits well interior to its own cut (1000ms in of a
+    # 2000ms span) -- landmarks.act reports it.
+    assert records[0].landmarks == {"act": {"n": 1, "hits": [1000]}}
+    print("ok  test_build_cut_records_writes_salience_and_landmarks")
 
 
 # --------------------------------------------------------------------------
@@ -138,9 +166,11 @@ def test_build_cut_records_missing_dims_yields_empty_framing():
 def test_insert_video_cuts_builds_deletes_inserts_and_writes_specifics():
     cuts = [
         ResolvedCut(file_id="f1", in_ms=0, out_ms=1000, peak_ms=500, tag="both",
-                    summary="m1", specifics={"subject": "a dog"}),
+                    summary="m1", specifics={"subject": "a dog"},
+                    moments=[{"peak_ms": 500, "shape": "both", "summary": "m1"}]),
         ResolvedCut(file_id="f1", in_ms=2000, out_ms=3000, peak_ms=2500, tag="both",
-                    summary="m2", specifics={}),  # no specifics -- update must be skipped for this one
+                    summary="m2", specifics={},  # no specifics -- update must be skipped for this one
+                    moments=[{"peak_ms": 2500, "shape": "both", "summary": "m2"}]),
     ]
     with patch("app.services.vcut.store.delete_video_cuts_for_run") as delete_mock, \
          patch("app.services.l3.ingest_store.insert_cut_records", return_value=["id1", "id2"]) as insert_mock, \
@@ -157,7 +187,8 @@ def test_insert_video_cuts_builds_deletes_inserts_and_writes_specifics():
 
 
 def test_insert_video_cuts_no_cut_has_specifics_writes_nothing():
-    cuts = [ResolvedCut(file_id="f1", in_ms=0, out_ms=1000, peak_ms=500, tag="both", summary="m")]
+    cuts = [ResolvedCut(file_id="f1", in_ms=0, out_ms=1000, peak_ms=500, tag="both", summary="m",
+                        moments=[{"peak_ms": 500, "shape": "both", "summary": "m"}])]
     with patch("app.services.vcut.store.delete_video_cuts_for_run"), \
          patch("app.services.l3.ingest_store.insert_cut_records", return_value=["id1"]), \
          patch("app.services.l3.ingest_store.update_cut_scene_specifics") as update_mock:
@@ -176,6 +207,7 @@ def main():
     test_build_cut_records_writes_full_framing_when_dims_present()
     test_build_cut_records_no_subject_box_still_yields_centered_crops()
     test_build_cut_records_missing_dims_yields_empty_framing()
+    test_build_cut_records_writes_salience_and_landmarks()
     test_insert_video_cuts_builds_deletes_inserts_and_writes_specifics()
     test_insert_video_cuts_no_cut_has_specifics_writes_nothing()
     print("\nall vcut store tests passed")

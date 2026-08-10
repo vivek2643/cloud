@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from app.services.l3.post import CutRecord, PaceEnvelope
 from app.services.vcut.reframe import solve_crops
 from app.services.vcut.resolve import ResolvedCut
+from app.services.vcut.salience import build_landmarks, build_salience
 
 # reframe_vcut_geometry.plan.md section 2: rotation_deg is always 0.0 for
 # every vcut cut. The proxy vcut reads (subclip's video input, Pass 2's
@@ -110,7 +111,11 @@ def build_cut_records(resolved: List[ResolvedCut], seam: Dict[str, dict]) -> Lis
     as the old pipeline's l3_scene_enrich. framing is populated per
     reframe_vcut_geometry.plan.md (re-derived at every resolve from the
     cut's own composed subject_box, same energy-invariance guarantee as
-    scene_specifics -- see insert_video_cuts)."""
+    scene_specifics -- see insert_video_cuts). salience/landmarks are
+    populated per brain_cut_salience_parity.plan.md (vcut/salience.py),
+    re-derived from the cut's own moments at every resolve for the SAME
+    energy-invariance guarantee -- this is what lights up cutrecord_map's
+    content-aware ladder for vcut cuts."""
     records: List[CutRecord] = []
     for cut in resolved:
         file_seam = seam.get(cut.file_id) or {}
@@ -131,6 +136,8 @@ def build_cut_records(resolved: List[ResolvedCut], seam: Dict[str, dict]) -> Lis
             framing=_framing_for(cut, file_seam), look={}, caption_zones=[],
             hero_ts_ms=cut.peak_ms, pace=pace, take_group_id=None, take_role=None,
             channel="shown", speech_quality=None, total_quality=total_quality,
+            salience=build_salience(cut, hop_ms, action_energy, mean_ae),
+            landmarks=build_landmarks(cut, file_seam),
         ))
     return records
 

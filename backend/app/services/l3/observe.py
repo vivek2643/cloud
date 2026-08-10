@@ -40,7 +40,12 @@ from app.services.l3.arrange import _MapIndex, _weld_segments
 from app.services.l3.captions import resolver as captions_resolver
 from app.services.l3.captions import timing as captions_timing
 from app.services.l3.grade.steer import explain_grade
-from app.services.l3.post import _ADX_MIN_DELTA, _mean, _norm_in_clip, _series_lohi
+from app.services.l3.landmarks import (
+    _ADX_MIN_DELTA,
+    _mean,
+    _norm_in_clip,
+    series_lohi as _series_lohi,
+)
 
 logger = logging.getLogger(__name__)
 

@@ -65,6 +65,15 @@ actual length back from `read_state`/the Program Map (or `review`, once
 placed) and adjust again if it's off; that loop is exact, blind arithmetic
 isn't.
 
+When you're trimming a video shot rather than a speech line, aim the trim at
+the shot's key frame. Each shot tells you where its strongest instant is
+(`peak:+Xs`) and which way it leans: a shot that BUILDS wants its run-up kept
+and lands on the impact, so trim from the HEAD; one that SETTLES wants the
+landing kept, so trim from the TAIL; a balanced one tightens from BOTH sides
+toward the peak. Trim toward the key frame that way, then read the length back
+from `read_state`/`review` and adjust — never clip the peak itself, and don't
+compute the result blind.
+
 ## 4. Select for the video's purpose
 Most videos exist to serve a higher purpose for their audience — a teaser to
 spark curiosity, a tutorial to help viewers learn, a documentary to inform and

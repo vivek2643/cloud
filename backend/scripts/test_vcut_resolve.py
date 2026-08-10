@@ -429,9 +429,9 @@ def test_composed_specifics_merged_cut_carries_representative_plus_moments_list(
     moments = cut.specifics["moments"]
     assert len(moments) == 3
     by_t = {m["t_ms"]: m for m in moments}
-    assert by_t[5000] == {"t_ms": 5000, "summary": "a", "subject": "dog"}
-    assert by_t[7000] == {"t_ms": 7000, "summary": "b", "subject": "cat"}
-    assert by_t[9000] == {"t_ms": 9000, "summary": "c", "subject": "bird"}
+    assert by_t[5000] == {"t_ms": 5000, "shape": "both", "summary": "a", "subject": "dog"}
+    assert by_t[7000] == {"t_ms": 7000, "shape": "both", "summary": "b", "subject": "cat"}
+    assert by_t[9000] == {"t_ms": 9000, "shape": "both", "summary": "c", "subject": "bird"}
     print("ok  test_composed_specifics_merged_cut_carries_representative_plus_moments_list")
 
 

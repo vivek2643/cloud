@@ -111,7 +111,14 @@ logger = logging.getLogger(__name__)
 # dialogue_segments transcript over the cut's own span (beat_transcript.
 # plan.md), joined at tree-build time so the resident line can quote the
 # actual words instead of just the vision-model paraphrase.
-TREE_VERSION = 20
+# v21: brain_cut_salience_parity.plan.md section 4 -- the rendered moments
+# list (_render_new_specifics/_live_moments) now prefers the moment set that
+# SURVIVES the sharpest-band salience prune over the frozen scene_specifics.
+# moments snapshot, so it recomposes per energy for a re-ingested vcut cut.
+# v22: brain_cut_salience_parity.plan.md full-landmark-parity extension --
+# vcut cuts now carry all four landmark channels (act/adx/sil/shot), so the
+# `sig:` breadcrumb renders adx/sil/shot counts too; cached trees rebuild.
+TREE_VERSION = 22
 
 # Two moments are one continuous source run when the next starts within this gap
 # of where the previous ended (back-to-back in the original footage). Loose
@@ -850,6 +857,33 @@ def _render_moments_list(moments: List[Dict[str, Any]], cut_in_ms: int) -> str:
     return "; ".join(entries)
 
 
+def _live_moments(spec: Dict[str, Any], m: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """brain_cut_salience_parity.plan.md section 4: the moments list should
+    be the composition of exactly what the cut CURRENTLY contains, and
+    recompose as the energy dial regroups/shrinks it -- not a snapshot
+    frozen at ingest energy. Prefer the moment set that SURVIVES the
+    sharpest-band prune off this cut's own salience.events (the SAME
+    survivor set piece_breakdown computes) over the frozen
+    scene_specifics.moments snapshot. Falls back to spec["moments"] for a
+    single-event cut (nothing to recompose -- matches _composed_specifics'
+    own "no moments list for a single flag" contract) or a legacy row whose
+    events carry no descriptive payload (an un-re-ingested run predating
+    this plan)."""
+    events = (m.get("salience") or {}).get("events") or []
+    if len(events) <= 1:
+        return spec.get("moments") or []
+    described = [e for e in events if e.get("summary") or e.get("specifics")]
+    if not described:
+        return spec.get("moments") or []
+    sharp_energy = cutrecord_map._BAND_ENERGIES[-1]
+    survivors = cutrecord_map._prune_events(events, sharp_energy)
+    ordered = sorted(survivors, key=lambda e: e.get("peak_ms", 0))
+    return [
+        {"t_ms": e.get("peak_ms"), "summary": e.get("summary") or "", **(e.get("specifics") or {})}
+        for e in ordered
+    ]
+
+
 def _render_new_specifics(spec: Dict[str, Any], m: Dict[str, Any], *, compact: bool) -> str:
     """The new (vcut_pass2_video_specifics.plan.md) flat, question-bank-
     keyed shape -> a compact `spec:"..."` (+ `moments:[...]` for a merged
@@ -857,7 +891,7 @@ def _render_new_specifics(spec: Dict[str, Any], m: Dict[str, Any], *, compact: b
     the lead group (subject/action + shot_size) and drops the moments list
     entirely, relying on `inspect_cut` for full detail (section 2)."""
     groups = _spec_groups(spec, m)
-    moments = spec.get("moments") or []
+    moments = _live_moments(spec, m)
     if compact:
         groups = groups[:2]
         moments = []

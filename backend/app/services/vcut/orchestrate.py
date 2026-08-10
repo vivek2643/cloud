@@ -104,6 +104,50 @@ def _add_dims_to_seam_cache(seam_cache: Dict[str, dict], proxy_key_by_file: Dict
             entry["src_w"], entry["src_h"] = dims
 
 
+def _add_landmark_signals_to_seam_cache(seam_cache: Dict[str, dict]) -> None:
+    """brain_cut_salience_parity.plan.md (full-landmark-parity extension):
+    mutate ``seam_cache`` in place, adding the persisted L1 signals the
+    adx/sil/shot landmark channels need to each file entry that resolved a
+    seam curve -- ``rms_db``/``rms_hop_ms``/``silence_intervals`` (from
+    ``audio_features``, exactly the fields l3.snapshot.build_l1_snapshot
+    reads for l3.post's own _landmarks) and ``shot_points``/
+    ``composition_points`` (from ``scene_cuts``). These are the SAME signals
+    the OLD pipeline fed post._landmarks; vcut simply never persisted them
+    in its seam cache before, which is why adx/sil/shot were dark.
+
+    Threading them onto the SAME dict store.build_cut_records already reads
+    (like _add_dims_to_seam_cache) means zero extra plumbing -- they round-
+    trip through persist_seam_and_plan/load_seam_and_plan as-is, so the
+    energy re-resolve path (routers/projects.py) rebuilds the full landmarks
+    for free too. Read-only, direct SELECTs (same table/field access
+    app.services.seam.signals already uses, so no L1-isolation boundary is
+    newly crossed). A file with no audio_features / scene_cuts row simply
+    gets no rms/silence / shot signal -- an honest per-file absence (silent
+    footage, no detected shot cuts), NOT a fabricated channel: build_landmarks
+    then omits that channel exactly as post._landmarks would for empty inputs.
+    """
+    from app.services import db
+
+    for file_id, entry in seam_cache.items():
+        with db.connection_dict_row() as conn:
+            af = conn.execute(
+                "select prosody_hop_ms, rms_db, silence_intervals "
+                "from audio_features where file_id = %s",
+                (file_id,),
+            ).fetchone()
+            sc = conn.execute(
+                "select shot_points, composition_points from scene_cuts where file_id = %s",
+                (file_id,),
+            ).fetchone()
+        if af:
+            entry["rms_hop_ms"] = int(af["prosody_hop_ms"] or 0)
+            entry["rms_db"] = list(af["rms_db"] or [])
+            entry["silence_intervals"] = list(af["silence_intervals"] or [])
+        if sc:
+            entry["shot_points"] = list(sc["shot_points"] or [])
+            entry["composition_points"] = list(sc["composition_points"] or [])
+
+
 def _words_by_file(prompt_rows: List[Tuple[str, str, int]]) -> Dict[str, List[Tuple[int, int, str]]]:
     """{file_id: [(start_ms, end_ms, text), ...]} -- qplan.py's local
     transcript-context input (section 4.1), read via the SAME loader the
@@ -276,6 +320,7 @@ def run_vcut_ingest(project_id: str) -> str:
         non_speech_by_file = {fid: sp.non_speech_spans(fid, duration_by_file[fid]) for fid in file_ids}
         seam_cache = _build_seam_cache(file_ids)
         _add_dims_to_seam_cache(seam_cache, proxy_key_by_file)
+        _add_landmark_signals_to_seam_cache(seam_cache)
 
         video_by_file: Dict[str, p1.VideoHandle] = {}
         images_by_key: Dict[Tuple[str, int], str] = {}

@@ -46,7 +46,17 @@ logger = logging.getLogger(__name__)
 # v3: cluster ladder gains the rising salience gate (_prune_events) -- a dense
 # cluster now compresses to its salient few as energy rises instead of keeping
 # every event's window, so cached rungs must rebuild.
-CUTRECORD_MAP_VERSION = 3
+# v4: brain_cut_salience_parity.plan.md -- vcut cuts now populate salience/
+# landmarks (via vcut/store.build_cut_records -> vcut/salience.py's bridge),
+# lighting up the cluster ladder/directional trim for vcut cuts that
+# previously fell through to the dumb symmetric-shrink branch; cached rungs
+# for those cuts must rebuild.
+# v5: brain_cut_salience_parity.plan.md full-landmark-parity extension --
+# vcut landmarks now emit all four channels (act/adx/sil/shot) instead of
+# act-only, from the widened seam cache (rms_db/silence_intervals/
+# shot_points); the landmarks shape/coverage changed, so cached trees/rungs
+# must rebuild.
+CUTRECORD_MAP_VERSION = 5
 
 # broad -> sharp, matching footage_map._LEVEL_NAMES; the same five band
 # centers the (now-retired) hero-cut ladders used to zoom at.
