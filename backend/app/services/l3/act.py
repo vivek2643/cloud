@@ -61,7 +61,7 @@ def _segments_from_cut(rc: ResolvedCut) -> List[dict]:
     """A resolved cut -> one or more main-line segments (one per keep_span so a
     breath-excised jump-cut survives). The segment shape matches what the timeline
     / render read; adjacent contiguous slices are later merged by
-    ``arrange._weld_segments`` in ``observe.resolve_doc``. ``rc.keep_spans`` is the
+    ``arrange.heal_adjacent_cuts`` in ``observe.resolve_doc``. ``rc.keep_spans`` is the
     canonical ``[(in_ms, out_ms), ...]`` (normalized in ``_MapIndex.resolve``)."""
     spans = rc.keep_spans or [(rc.src_in_ms, rc.src_out_ms)]
     out: List[dict] = []
@@ -773,6 +773,12 @@ def tighten(document: dict, index: _MapIndex, *,
                 if segs:
                     # keep the first slice's id so selections/refs stay stable
                     segs[0]["seg_id"] = seg.get("seg_id") or segs[0]["seg_id"]
+                    # heal_adjacent_cuts.plan.md §5: the intra-cut seams this
+                    # tighter energy level opens are DELIBERATE dead-air trims --
+                    # mark them hard so the compose-time heal never stitches the
+                    # tightened take back together (undoing the tighten).
+                    for extra in segs[1:]:
+                        extra["hard_seam"] = True
                     new_tl.extend(segs)
                     changed = True
                     continue
@@ -869,6 +875,10 @@ def retime(document: dict, index: _MapIndex, *,
                 slc["pace_level"] = pace
             if j > 0:
                 slc["seg_id"] = _new_seg_id()
+                # heal_adjacent_cuts.plan.md §5: this seam is a DELIBERATELY
+                # removed pause/filler -- mark it hard so the compose-time heal
+                # never merges the tightened dead air back in (undoing the trim).
+                slc["hard_seam"] = True
             new_tl.append(slc)
         changed = True
     if not changed:

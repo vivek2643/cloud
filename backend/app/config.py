@@ -171,6 +171,17 @@ class Settings(BaseSettings):
     autoedit_model: str = "claude-opus-4-8"
     autoedit_max_output_tokens: int = 16384
 
+    # heal_adjacent_cuts.plan.md: two adjacent SAME-FILE spine segments whose
+    # source spans are within this many ms are HEALED into one continuous clip at
+    # compose time (arrange.heal_adjacent_cuts), run on BOTH the auto-assembly
+    # (observe.resolve_doc) and manual/snap (put_document) paths. Supersedes the
+    # old hard-coded _WELD_TOL_MS=120: 130ms real-world micro-jumps (demo run
+    # 6f31d648) sat just above 120 and glitched. Kept below the size of a
+    # DELIBERATE dead-air trim so healing never silently undoes a tighten -- the
+    # `hard_seam` marker (stamped by retime/tighten) is the second line of
+    # defense. Compose-time knob: applied on the next resolve/save, no migration.
+    heal_gap_ms: int = 200
+
     # --- Cuts v3: LLM-grouped ingest (app.services.llm.client) -----------
     # Two structured Sonnet-class calls per project ingest (text-only pass 1,
     # then vision pass 2) decide MEANING (grouping/takes/junk/framing/etc.);

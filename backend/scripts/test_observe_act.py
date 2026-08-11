@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.services.l3 import act, arrange, layers, observe  # noqa: E402
 from app.services.l3 import footage_map as fm  # noqa: E402
-from app.services.l3.arrange import Placement, _MapIndex, _weld_segments  # noqa: E402
+from app.services.l3.arrange import Placement, _MapIndex, heal_adjacent_cuts  # noqa: E402
 
 # build_clip_tree calls _said_text_for_span -> _sentences_for_file for every
 # "said" cut (beat_transcript.plan.md), which would otherwise hit a real DB.
@@ -63,13 +63,13 @@ def _ctx(struct):
 
 def _doc(struct, refs):
     """Build a starting document from (ref, level) main-line picks via the real
-    act.place path, then weld -- exactly what observe.resolve_doc does on persist."""
+    act.place path, then heal -- exactly what observe.resolve_doc does on persist."""
     idx = _MapIndex(struct)
     doc = {"brief": {"aspect": "landscape"}, "format": {"aspect": "landscape"},
            "timeline": [], "operations": []}
     for ref, lv in refs:
         doc = act.place(doc, idx, ref, level=lv, channel="V1")
-    doc["timeline"] = _weld_segments(doc["timeline"])
+    doc["timeline"], _merged = heal_adjacent_cuts(doc["timeline"], gap_ms=200, reindex=True)
     return doc
 
 
@@ -439,31 +439,36 @@ def test_validate_flags_bad_split_edit():
     print("ok  validate flags orphaned + first-cut split edits")
 
 
-def test_weld_remaps_split_edit_seams():
-    """resolve_doc's weld re-issues seg_ids; a split at a SURVIVING seam is
-    remapped, a split at a seam that welded away is dropped."""
+def test_heal_remaps_seam_ops():
+    """resolve_doc's heal re-issues seg_ids; a split_edit/crossfade at a
+    SURVIVING seam is remapped, one at a seam that healed away is dropped."""
     struct = _map()
     ctx = _ctx(struct)
     # m00 tight (0-2000) + m01 tight (4000-6000): non-contiguous, both survive.
     doc = _doc(struct, [("ffffffff:m00", "tight"), ("ffffffff:m01", "tight")])
     ids = [s["seg_id"] for s in doc["timeline"]]
     doc = act.split_edit(doc, ids[1], audio_offset_ms=-400)
+    doc = act.crossfade(doc, ids[1], ms=300)
     out = observe.resolve_doc(doc, ctx)
-    ses = [o for o in out["operations"] if o["type"] == "split_edit"]
     new_ids = [s["seg_id"] for s in out["timeline"]]
+    ses = [o for o in out["operations"] if o["type"] == "split_edit"]
+    xfs = [o for o in out["operations"] if o["type"] == "crossfade"]
     assert len(ses) == 1 and ses[0]["seam_seg_id"] == new_ids[1], (ses, new_ids)
+    assert len(xfs) == 1 and xfs[0]["seam_seg_id"] == new_ids[1], (xfs, new_ids)
 
-    # m00 balanced (0-4000) + m01 balanced (4000-8000): contiguous -> weld away.
+    # m00 balanced (0-4000) + m01 balanced (4000-8000): contiguous -> heal away.
     doc2 = _doc(struct, [("ffffffff:m00", "balanced")])
     idx = _MapIndex(struct)
     doc2 = act.place(doc2, idx, "ffffffff:m01", level="balanced", channel="V1")
     seam_id = doc2["timeline"][1]["seg_id"]
     doc2 = act.split_edit(doc2, seam_id, audio_offset_ms=-400)
+    doc2 = act.crossfade(doc2, seam_id, ms=300)
     out2 = observe.resolve_doc(doc2, ctx)
-    assert len(out2["timeline"]) == 1, out2["timeline"]          # welded
-    assert not [o for o in out2["operations"] if o["type"] == "split_edit"], \
-        out2["operations"]                                        # split moot -> dropped
-    print("ok  weld remaps surviving split seams and drops welded-away ones")
+    assert len(out2["timeline"]) == 1, out2["timeline"]          # healed
+    assert not [o for o in out2["operations"]
+                if o["type"] in ("split_edit", "crossfade")], \
+        out2["operations"]                                        # seam moot -> dropped
+    print("ok  heal remaps surviving seam ops (split_edit+crossfade) and drops healed-away ones")
 
 
 def test_split_screen_snap_cap_keeps_edge_and_suggests():
@@ -1258,7 +1263,7 @@ def main():
     test_split_edit_add_replace_clear_and_guards()
     test_split_edit_resolves_decoupled_audio()
     test_validate_flags_bad_split_edit()
-    test_weld_remaps_split_edit_seams()
+    test_heal_remaps_seam_ops()
     test_split_screen_snap_cap_keeps_edge_and_suggests()
     test_split_screen_snap_off_places_raw()
     test_seams_for_file_fails_open_with_no_run_id()

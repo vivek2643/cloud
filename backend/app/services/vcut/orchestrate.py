@@ -402,6 +402,16 @@ def run_vcut_ingest(project_id: str) -> str:
             resolved = rv.resolve_cuts(plan, seam_cache, energy=DEFAULT_ENERGY)
             video_ids = store.insert_video_cuts(ingest_run_id, resolved, seam_cache)
 
+        # identity_map_vcut.plan.md: reconcile this run's cast from shared L1
+        # signals (voices/faces/ASD) and persist identity_map, mirroring
+        # l3/ingest.py's order (identity after cuts, before "ready"). Runs once
+        # here -- the payload is energy-invariant, so it is NOT re-run in the
+        # energy re-resolve path. Self-guarding (fail-open): never raises, so a
+        # project with no face tracks / nothing to reconcile leaves identity_map
+        # NULL with no error and a byte-identical footage index.
+        from app.services.vcut import identity as vcut_identity
+        vcut_identity.reconcile_and_store(ingest_run_id, file_ids)
+
         l3store.set_status(ingest_run_id, "ready")
         logger.info("vcut_ingest run %s: %d video cut(s), %d speech cut(s), %d file(s)",
                    ingest_run_id, len(video_ids), n_speech, len(file_ids))
