@@ -24,7 +24,8 @@ def _row_to_dict(row) -> Optional[Dict[str, Any]]:
 _L1_STAGES = ("proxy", "transcript", "audio_features", "diarization",
               "motion_dynamics", "dialogue_segments", "audio_proxy",
               "scene_detect",  # cuts-v2, additive -- see STAGES_V2
-              "color_stats")  # color grading, additive -- see STAGES_COLOR
+              "color_stats",  # color grading, additive -- see STAGES_COLOR
+              "frame_descriptors")  # brain_mirror Phase 1, additive -- see STAGES_DESCRIPTORS
 
 
 def _iso(v) -> Optional[str]:
