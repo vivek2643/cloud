@@ -31,6 +31,7 @@ from app.services.l1 import audio_features as af_mod
 from app.services.l1 import color_stats as color_stats_mod
 from app.services.l1 import diarization as diar_mod
 from app.services.l1 import dialogue_segments as dlg_mod
+from app.services.l1 import frame_descriptors as fdesc_mod
 from app.services.l1 import motion_dynamics as motion_mod
 from app.services.l1 import scene_cuts as scene_mod
 from app.services.l1 import transcript as tr_mod
@@ -47,6 +48,9 @@ STAGES = ("proxy", "transcript", "audio_features", "diarization", "motion_dynami
 STAGES_V2 = STAGES + ("scene_detect",)
 # color grading: additive, independent of the cuts-v2 versioning above.
 STAGES_COLOR = STAGES_V2 + ("color_stats",)
+# brain_mirror Phase 1: per-frame pHash descriptor -- additive, shares the
+# motion track's proxy, fail-open (see _stage_frame_descriptors).
+STAGES_DESCRIPTORS = STAGES_COLOR + ("frame_descriptors",)
 # Audio-only uploads run a different, video-free set of stages. `transcript` is
 # now UNCONDITIONAL (voiceover-as-spine: a narration/VO is a first-class
 # editorial source, so its transcript must always exist -- the `is_musical`
@@ -759,6 +763,27 @@ def _stage_scene_detect(
     )
 
 
+def _stage_frame_descriptors(
+    file_id: str, video_path: str, duration_s: float, conn: psycopg.Connection
+) -> None:
+    """brain_mirror Phase 1: sample the proxy at 2 fps -> one 64-bit DCT pHash
+    per frame -> persist for same-shot seam comparison. Best-effort: a decode
+    failure (or no frames) no-ops without failing L1 and writes no row, so the
+    signal is purely additive.
+    """
+    fd = fdesc_mod.compute_frame_descriptors(
+        video_path, duration_ms=int((duration_s or 0) * 1000)
+    )
+    if not fd.has_frames:
+        return
+
+    fdesc_mod.upsert_frame_descriptors(conn, file_id, fd)
+    logger.info(
+        "Frame descriptors: %s -> %d pHashes at hop %dms",
+        file_id, len(fd.phashes), fd.hop_ms,
+    )
+
+
 def _stage_color_stats(
     file_id: str, video_path: str, duration_s: float, conn: psycopg.Connection
 ) -> None:
@@ -892,9 +917,10 @@ def _track_audio(file_id: str, wav_path: str, duration_s: float) -> None:
 
 def _track_motion(file_id: str, video_source: str, duration_s: float) -> None:
     """motion_dynamics (optical flow) -> scene_detect (histogram drift) ->
-    color_stats (sampled-frame color measurement). Independent of all audio
-    stages; scene_detect/color_stats share this track's proxy (additive --
-    see STAGES_V2/STAGES_COLOR)."""
+    color_stats (sampled-frame color measurement) -> frame_descriptors (per-frame
+    pHash). Independent of all audio stages; every video stage after
+    motion_dynamics shares this track's proxy (additive -- see
+    STAGES_V2/STAGES_COLOR/STAGES_DESCRIPTORS)."""
     with _pg_conn() as conn:
         _run_stage(conn, file_id, "motion_dynamics",
                    _stage9_motion_dynamics, file_id, video_source, duration_s, conn)
@@ -902,6 +928,8 @@ def _track_motion(file_id: str, video_source: str, duration_s: float) -> None:
                    _stage_scene_detect, file_id, video_source, duration_s, conn)
         _run_stage(conn, file_id, "color_stats",
                    _stage_color_stats, file_id, video_source, duration_s, conn)
+        _run_stage(conn, file_id, "frame_descriptors",
+                   _stage_frame_descriptors, file_id, video_source, duration_s, conn)
 
 
 def _run_deep_stages_parallel(
