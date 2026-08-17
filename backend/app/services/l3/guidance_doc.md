@@ -60,9 +60,12 @@ Two situations are the SAME generic operation: landing an overlay on a specific
 line, and cutting a shot to a beat. Both just fit a clip to a target program
 window `[A,B]`. To do it: get `[A,B]` from whatever sense exposes it, then
 adjust the clip's length with `trim` or pace (`retime` for video's playback
-speed, or speech's dead-air trim). Don't compute the exact result — read the
-actual length back from `read_state`/the Program Map (or `review`, once
-placed) and adjust again if it's off; that loop is exact, blind arithmetic
+speed, or speech's dead-air trim — the mirror flags a lingering gap as
+`dead-air`, and a seam trimmed into a word rather than around it as
+`broken-line`; see the flag glossary below). Don't compute the exact
+result — read the actual length back from `read_state`/the Program Map (or
+`review`, once placed) and adjust again if it's off; that loop is exact,
+blind arithmetic
 isn't.
 
 When you're trimming a video shot rather than a speech line, aim the trim at
@@ -92,7 +95,21 @@ listed beat stays reachable individually even if tightening would have dropped
 it — the Beat Index marks which beats are core (survive tightening) and which
 drop early, so you can sharpen for punch or pick out one beat deliberately.
 
-## 5. Working with music
+## 5. Keep a continuous shot continuous
+Beats that share a `run:` tag are one uninterrupted stretch of a single clip —
+the camera never stopped between them. Treat that run as one shot: keep its
+members together and in their source order (the `run:rN[i/of]` position), and
+prefer placing a whole run as a single continuous stretch rather than scattering
+its pieces. Do not shuffle a run's beats out of order or interleave another clip
+between them unless you have a real reason — cutting from one piece of a shot to
+an EARLIER or much-later piece of the SAME shot is a jump cut (same room, same
+person, only the source time leaps), the most jarring join there is. Splitting a
+run, or reordering it, is a deliberate move you can make when it serves the story
+— but never the accidental byproduct of picking beats by meaning and ignoring
+where they came from. When you do need a beat from mid-run, bridge the seam with
+a DIFFERENT clip rather than a backward jump within the same one.
+
+## 6. Working with music
 When a musical bed is in play the beat grid (bpm + onset positions in program
 time) is yours to build against — it appears only when a musical source exists,
 so where there's no music you don't try to snap to it. Music is a free
@@ -122,12 +139,36 @@ Don't hand-compute the milliseconds. Beat-snap where it's offered and the
 fit-to-window loop (§3) land things on the grid exactly; you decide which beat
 and which moment, they handle the frames.
 
-## 6. Color can follow the story
+## 7. Color can follow the story
 When it serves the piece, the grade can track the story's arc — a tense beat
 settling cooler, a resolution warming — the same way pacing or a music swell
 would. This is a categorical position (tag it, don't compute a color), and it
 only shows once the user has turned up how strongly the arc should read;
 never reach for it as a default look.
+
+## Flag glossary
+The mirror (and `read_state`/`diagnose`/`review`) name what they see using
+this vocabulary, not raw signal jargon — read a flag as the editing
+situation it names:
+
+- **match-cut** / **seamless** — the join is invisible: a continuous
+  same-source run, or two frames close enough that no cut reads. Nothing to
+  fix.
+- **jump-cut** — a same-shot join where the source jumps backward or skips
+  ahead within one framing (§5): same room, same person, only the source
+  time leaps. The most jarring join there is — cross it only on purpose.
+- **cut** — an ordinary, motivated cut to genuinely different content. The
+  default, unflagged case.
+- **broken-line** — the seam lands mid-word or mid-sentence on a
+  speech-bearing clip. Never cut mid-sentence or mid-word — move the seam to
+  a clean word boundary, or make room with `trim`/`retime` (§3).
+- **incidental** (orphan-audio) — speech is present on a clip you're not
+  using as the `said` line (background chatter, ambient talk). It stays
+  audible unless it's musical/ambient noise, in which case it's muted but
+  still shown as speech with a `muted` tag — decide whether it should play,
+  duck under the lead line, or stay muted.
+- **dead-air** — a low-energy lull. Consider tightening (§4) or covering it
+  with a cutaway or a music swell (§6) rather than leaving the sag.
 
 ## Podcast / multicam (worked example — uses both principles)
 Conversation filmed from several fixed angles. The alternate angles of one

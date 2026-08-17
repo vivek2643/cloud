@@ -35,7 +35,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.services.l3 import feel, footage_map, framing, layers
+from app.services.l3 import cutrecord_map, feel, footage_map, framing, layers
 from app.config import get_settings
 from app.services.l3.arrange import _MapIndex, _SEAM_OP_TYPES, heal_adjacent_cuts
 from app.services.l3.captions import resolver as captions_resolver
@@ -93,6 +93,14 @@ class EditContext:
     # this run yet (a normal, common state; it runs in the background after
     # cuts are shown) or nothing is ingested at all.
     scene_taxonomy: Optional[Dict[str, Any]] = None
+    # brain_mirror_readside.plan.md section 2.4: per-file pHash samples
+    # (l1.frame_descriptors.load_descriptors' own shape: {file_id:
+    # [(t_ms, phash_int), ...]}), loaded ONCE here so feel.join_continuity's
+    # seam-continuity grading has real pixels to compare across the whole
+    # turn. {} (not an error) for a file predating the L1 descriptor
+    # backfill -- the read side fails open (no descriptor -> no false
+    # alarm), never a hard requirement.
+    frame_descriptors: Dict[str, List[Tuple[int, int]]] = field(default_factory=dict)
 
     @property
     def meta_by_ref(self) -> Dict[str, dict]:
@@ -152,6 +160,13 @@ def build_context(file_ids: List[str], run_id: Optional[str] = None,
             scene_taxonomy = ingest_store.get_scene_taxonomy(eff_run)
         except Exception:
             logger.exception("observe: scene_taxonomy lookup failed (continuing)")
+    frame_descriptors: Dict[str, List[Tuple[int, int]]] = {}
+    try:
+        from app.services.l1.frame_descriptors import load_descriptors
+        with _pg_conn() as conn:
+            frame_descriptors = load_descriptors(conn, file_ids)
+    except Exception:
+        logger.exception("observe: frame_descriptors lookup failed (continuing)")
     return EditContext(
         file_ids=list(file_ids),
         index=_MapIndex(map_struct),
@@ -164,6 +179,7 @@ def build_context(file_ids: List[str], run_id: Optional[str] = None,
         run_id=eff_run,
         thread_id=thread_id,
         scene_taxonomy=scene_taxonomy,
+        frame_descriptors=frame_descriptors,
     )
 
 
@@ -483,7 +499,11 @@ def read_state(document: dict, ctx: EditContext, *, seg_id: Optional[str] = None
     never pays a transcript fetch."""
     timeline = document.get("timeline") or []
     ops = document.get("operations") or []
-    report = feel.simulate(timeline, ctx.meta_by_ref)
+    report = feel.simulate(timeline, ctx.meta_by_ref, ctx.frame_descriptors)
+    # brain_continuity_awareness.plan.md section 3.2: the join INTO each cut
+    # (keyed by to_pos, 1-based) -- distinct from continuity's SOURCE-neighbor
+    # welds, this scores the seam the brain itself just created.
+    joins = {j["to_pos"]: j for j in feel.join_continuity(report.cuts, report.descriptors)}
 
     # Grade summaries (color_grading.plan.md SS10 "explain the grade") read
     # from the LAST resolve's snapshot -- same staleness as everything else
@@ -570,6 +590,22 @@ def read_state(document: dict, ctx: EditContext, *, seg_id: Optional[str] = None
         pieces = footage_map.piece_breakdown(meta)
         if pieces is not None:
             cut["pieces"] = pieces
+        # brain_mirror_readside.plan.md section 2/4: the join INTO this cut
+        # from the one before it, frame-grounded (feel.join_continuity) --
+        # omitted for pos==1 (no prior seam) and for a normal "cut" (not
+        # flagged, the common case).
+        j = joins.get(i + 1)
+        if j and j["kind"] != "cut":
+            cut["join"] = j["kind"]           # "seamless" | "jump-cut"
+            if j["pic_bits"] is not None:
+                cut["join_pic_bits"] = j["pic_bits"]
+            if j["kind"] == "jump-cut":
+                # jump-cut always implies same_clip (see join_continuity) --
+                # src_gap_ms is therefore always set.
+                cut["join_note"] = (
+                    "jump-cut: same shot, source "
+                    + ("goes backward" if j["backward"] else f"skips {(j['src_gap_ms'] or 0) // 1000}s")
+                )
         cuts.append(cut)
         prog += dur
 
@@ -1171,11 +1207,18 @@ def diagnose(document: dict, ctx: EditContext) -> List[dict]:
     findings: List[dict] = []
     if not timeline:
         return findings
-    report = feel.simulate(timeline, ctx.meta_by_ref)
+    report = feel.simulate(timeline, ctx.meta_by_ref, ctx.frame_descriptors)
 
     for lo, hi in feel._same_speaker_runs(report.cuts):
         findings.append({"severity": "warn", "anchor": f"cuts {lo}-{hi}",
                          "message": "same speaker back-to-back (jump-cut risk)"})
+    # brain_mirror_readside.plan.md section 2/5: a frame-grounded jump-cut
+    # (same shot, source non-contiguous) -- the join the brain itself
+    # created, not a source-neighbor fact. §5 editing vocabulary.
+    for j in feel.join_continuity(report.cuts, report.descriptors):
+        if j["kind"] == "jump-cut":
+            findings.append({"severity": "warn", "anchor": f"cuts {j['from_pos']}-{j['to_pos']}",
+                             "message": "jump-cut: same shot, source non-contiguous"})
     for lo, hi in feel._low_energy_runs(report.cuts):
         findings.append({"severity": "info", "anchor": f"cuts {lo}-{hi}",
                          "message": "low-energy run"})
@@ -1502,6 +1545,17 @@ def review(document: dict, ctx: EditContext, *, user_ask: str = "") -> dict:
     except Exception:
         logger.exception("review: overlay-fit/audio flags failed (continuing without them)")
 
+    # brain_mirror_readside.plan.md section 2/5: the frame-grounded jump-cuts
+    # in the ASSEMBLED program, under their own "continuity" category. Always
+    # present in `review`'s own flags -- the mirror (section 4) additionally
+    # pushes these every turn, so this is no longer the sole reveal path.
+    report = feel.simulate(timeline, ctx.meta_by_ref, ctx.frame_descriptors)
+    flags.extend(_tag_category(
+        [{"severity": "warn", "anchor": f"cuts {j['from_pos']}-{j['to_pos']}",
+          "message": "jump-cut: same shot, source non-contiguous"}
+         for j in feel.join_continuity(report.cuts, report.descriptors) if j["kind"] == "jump-cut"],
+        "continuity"))
+
     target_s = (document.get("brief") or {}).get("target_duration_s")
     return {
         "items": items,
@@ -1510,6 +1564,213 @@ def review(document: dict, ctx: EditContext, *, user_ask: str = "") -> dict:
         "cut_count": len(timeline),
         "flags": flags,
     }
+
+
+# --------------------------------------------------------------------------
+# 4.5 read_transcript (on-demand full text, replaces band-aid D)
+# --------------------------------------------------------------------------
+
+def read_transcript(document: dict, ctx: EditContext) -> dict:
+    """brain_mirror_readside.plan.md section 3.3: the on-demand FULL-TEXT
+    sense -- the complete, UNBOUNDED program-order transcript with verbatim
+    words for every placed segment, regardless of axis/channel (incidental
+    speech under a picture cut is included, never hidden -- the same
+    ungated read footage_map.build_clip_tree's said_text now uses).
+    Distinct from the always-present mirror's own BOUNDED per-segment gist
+    (section 4): this is the expensive, complete script the brain calls
+    for only when it actually needs the exact words (e.g. to check
+    wording before placing a cut), so the every-step mirror can stay
+    cheap. ``ctx`` is unused today (kept for signature symmetry with every
+    other sense, and in case a future read needs map context) --
+    said_text is resolved straight off each segment's own file_id/span."""
+    timeline = document.get("timeline") or []
+    segments: List[Dict[str, Any]] = []
+    prog = 0
+    for i, seg in enumerate(timeline):
+        in_ms, out_ms = int(seg.get("in_ms", 0)), int(seg.get("out_ms", 0))
+        dur = max(0, out_ms - in_ms)
+        text = footage_map._said_text_for_span(seg.get("file_id") or "", in_ms, out_ms)
+        if text:
+            segments.append({
+                "pos": i + 1, "ref": seg.get("ref"),
+                "prog_start_ms": prog, "prog_end_ms": prog + dur, "text": text,
+            })
+        prog += dur
+    return {"text": " ".join(s["text"] for s in segments), "segments": segments}
+
+
+# --------------------------------------------------------------------------
+# 4.6 mirror (always-present push, section 4 -- replaces the one-shot gate)
+# --------------------------------------------------------------------------
+
+# A short head...tail of spoken text for the mirror's per-segment speech
+# gist -- bounded so the every-step push stays cheap; the complete script is
+# read_transcript's job, on demand (section 3.3).
+_MIRROR_GIST_HEAD_CHARS = 40
+_MIRROR_GIST_TAIL_CHARS = 40
+
+
+def _bounded_gist(text: str) -> str:
+    text = (text or "").strip()
+    if len(text) <= _MIRROR_GIST_HEAD_CHARS + _MIRROR_GIST_TAIL_CHARS + 1:
+        return text
+    return f"{text[:_MIRROR_GIST_HEAD_CHARS].rstrip()}…{text[-_MIRROR_GIST_TAIL_CHARS:].lstrip()}"
+
+
+def mirror(document: dict, ctx: EditContext) -> dict:
+    """brain_mirror_readside.plan.md section 4.2: the ALWAYS-PRESENT mirror
+    -- a compact, per-segment read of the edit AS IT NOW STANDS: the join
+    INTO each placed segment (section 2's frame-grounded verdict), speech
+    presence (has-words / muted, transcript-truth per section 3.2), and the
+    small §5 flag set (``jump-cut``, ``broken-line``, ``incidental``,
+    ``dead-air``). Distinct from ``read_state``'s full pull -- this is the
+    compact projection pushed into the loop's own reasoning context after
+    EVERY tool call (``tools.run_edit_loop``), not only when a sense is
+    explicitly called, so the brain never reasons blind about the edit it
+    just changed. Pure function of (document, ctx) -- idempotent: the SAME
+    state always renders the SAME mirror, so pushing it every step can
+    never itself thrash the loop. {"segments": []} for an empty timeline."""
+    timeline = document.get("timeline") or []
+    if not timeline:
+        return {"segments": []}
+    report = feel.simulate(timeline, ctx.meta_by_ref, ctx.frame_descriptors)
+    joins = {j["to_pos"]: j for j in feel.join_continuity(report.cuts, report.descriptors)}
+    low_energy_positions = {
+        p for lo, hi in feel._low_energy_runs(report.cuts) for p in range(lo, hi + 1)
+    }
+
+    segments: List[Dict[str, Any]] = []
+    for i, seg in enumerate(timeline):
+        pos = i + 1
+        in_ms, out_ms = int(seg.get("in_ms", 0)), int(seg.get("out_ms", 0))
+        file_id = str(seg.get("file_id") or "")
+        meta = ctx.meta_by_ref.get(seg.get("ref") or "") or {}
+        row: Dict[str, Any] = {"pos": pos, "ref": seg.get("ref")}
+        flags: List[str] = []
+
+        j = joins.get(pos)
+        if j and j["kind"] != "cut":
+            row["join"] = j["kind"]           # "seamless" | "jump-cut"
+            if j["pic_bits"] is not None:
+                row["join_pic_bits"] = j["pic_bits"]
+            if j["kind"] == "jump-cut":
+                flags.append("jump-cut")
+
+        _word_count, has_speech, _is_musical = cutrecord_map.speech_words_in_span(
+            file_id, in_ms, out_ms)
+        if has_speech:
+            gist = _bounded_gist(footage_map._said_text_for_span(file_id, in_ms, out_ms))
+            row["speech"] = {"has_words": True, "muted": bool(seg.get("mute")), "gist": gist}
+            if meta.get("channel") != "said":
+                flags.append("incidental")
+            boundary = cutrecord_map.speech_boundary_flags(file_id, in_ms, out_ms)
+            if boundary["clipped_head"] or boundary["clipped_tail"] or boundary["mid_sentence"]:
+                flags.append("broken-line")
+
+        if pos in low_energy_positions:
+            flags.append("dead-air")
+
+        if flags:
+            row["flags"] = flags
+        segments.append(row)
+
+    return {"segments": segments}
+
+
+def render_mirror(m: Dict[str, Any]) -> str:
+    """Compact prose rendering of ``mirror()`` for injection into the loop's
+    reasoning context (``tools.run_edit_loop``) -- one line per placed
+    segment: position + ref, the join INTO it (when not a plain cut),
+    speech presence, and any §5 flags. '' for an empty timeline (nothing to
+    show yet)."""
+    segments = m.get("segments") or []
+    if not segments:
+        return ""
+    lines = ["MIRROR (the edit as it now stands -- read before your next move):"]
+    for row in segments:
+        bits = [f"cut {row['pos']}"]
+        if row.get("ref"):
+            bits.append(f"({row['ref']})")
+        if row.get("join"):
+            note = f"join:{row['join']}"
+            if row.get("join_pic_bits") is not None:
+                note += f"[{row['join_pic_bits']}bits]"
+            bits.append(note)
+        speech = row.get("speech")
+        if speech:
+            state = "muted" if speech.get("muted") else "audible"
+            gist = speech.get("gist") or ""
+            bits.append(f"speech({state}):\"{gist}\"" if gist else f"speech({state})")
+        if row.get("flags"):
+            bits.append("flags:" + ",".join(row["flags"]))
+        lines.append("  " + " ".join(bits))
+    return "\n".join(lines)
+
+
+def mirror_text(document: dict, ctx: EditContext) -> str:
+    """``render_mirror(mirror(...))`` in one call -- what
+    ``tools.run_edit_loop`` pushes after every tool call."""
+    return render_mirror(mirror(document, ctx))
+
+
+# brain_plan_altitude.plan.md SS5: a clip-id-looking token leaking into a
+# beat. A ref is `<fid8>:m<NN>` (footage_map.py:294) and the beat index also
+# prints the bare `m<NN>` shorthand (footage_map.py:1112/1188). `m\d{2,}`
+# (2+ digits, matching the `:02d` padding) keeps stray prose like "m1" from
+# false-firing. Case-insensitive for the hex prefix.
+_CLIP_ID_IN_BEAT_RE = re.compile(r"\b(?:[0-9a-f]{8}:)?m\d{2,}\b", re.IGNORECASE)
+
+
+def _beat_view(entry):
+    """Coerce a stored `structure` entry to (beat_text, need) for rendering.
+    Accepts the new {beat, need} dict AND an OLD-shape bare string (a
+    pre-altitude stored plan) -> (str, None). Fail-open, never raises
+    (brain_plan_altitude.plan.md SS6)."""
+    if isinstance(entry, dict):
+        return str(entry.get("beat") or "").strip(), entry.get("need")
+    return str(entry or "").strip(), None
+
+
+def plan_mirror_text(document: dict, *, building: bool = False) -> str:
+    """The PLAN mirror (brain_plan_mechanism.plan.md §4): the brain's own
+    durable plan echoed back compactly, right beside the EDIT MIRROR, so it
+    builds against the ordered intent it committed to instead of drifting.
+    Absent plan -> a visible nudge (loud when `building` and the edit has
+    already moved this turn). Pure + idempotent."""
+    plan = (document or {}).get("plan") or {}
+    has = any(plan.get(k) for k in ("purpose", "carries", "structure", "watch"))
+    if not has:
+        return ("PLAN: none written yet -- you're building without a written plan. "
+                "Reason to the ordered plan (purpose / what carries it / structure / "
+                "what to watch) and call set_plan, then build against it."
+                if building else
+                "PLAN: none written yet -- write one with set_plan before you build.")
+    lines = [f"PLAN (rev {plan.get('rev', 1)} -- build against this; "
+             f"update with set_plan when reading changes your mind):"]
+    if plan.get("purpose"):
+        lines.append(f"  purpose: {plan['purpose']}")
+    if plan.get("carries"):
+        lines.append("  carries: " + "; ".join(plan["carries"]))
+    if plan.get("structure"):
+        lines.append("  structure (BEATS -- build against these, not clip ids):")
+        leaked = False
+        for i, entry in enumerate(plan["structure"], 1):
+            beat, need = _beat_view(entry)
+            mark = {"required": " [required]", "optional": " [optional]"}.get(need, "")
+            lines.append(f"    {i}. {beat}{mark}")
+            if _CLIP_ID_IN_BEAT_RE.search(beat):
+                leaked = True
+        if leaked:
+            lines.append(
+                "    ^^ a beat names a clip id -- the PLAN is STRATEGY (beats at "
+                "intent level), not tactics. Which take carries a beat is chosen "
+                "at the timeline; re-call set_plan with that beat rewritten as its "
+                "JOB (what it must accomplish), not a specific take.")
+    if plan.get("watch"):
+        lines.append("  watch: " + "; ".join(plan["watch"]))
+    if plan.get("updated_note"):
+        lines.append(f"  last change: {plan['updated_note']}")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------
@@ -1563,6 +1824,30 @@ def affordances(document: dict, ctx: EditContext) -> dict:
         if m.get("channel") in ("done", "shown") and m["moment_id"] not in on_line
         and not m.get("junk")
     ]
+
+    # brain_continuity_awareness.plan.md section 4.2(b): present each
+    # continuity run (footage_map._assign_runs) as a placeable UNIT -- member
+    # refs in SOURCE order -- so the brain can place a whole run in one
+    # ordered stretch instead of discovering its members beat-by-beat.
+    # run_id is clip-LOCAL (footage_map.py), so group by (file_id, run_id).
+    runs_by_key: Dict[Tuple[Optional[str], str], List[Dict[str, Any]]] = {}
+    for clip in ctx.map_struct.get("clips", []):
+        for m in clip.get("moments", []) or []:
+            rid = m.get("run_id")
+            if rid:
+                runs_by_key.setdefault((clip.get("file_id"), rid), []).append(m)
+    runs = []
+    for (file_id, rid), members in runs_by_key.items():
+        member_refs = [m["moment_id"] for m in sorted(members, key=lambda m: m.get("run_pos", 0))]
+        runs.append({
+            "run_id": rid, "file": _fid8(file_id or ""),
+            "member_refs": member_refs,
+            # True once every member is placed -- False covers both "not yet
+            # started" and "only partially placed" (the brain already knows
+            # exactly which via the timeline it's holding).
+            "on_line": all(ref in on_line for ref in member_refs),
+        })
+
     channels = ["V1", "A1"] if timeline else []
     if any(o.get("type") == "place_video" for o in (document.get("operations") or [])):
         channels.append("V2")
@@ -1574,6 +1859,7 @@ def affordances(document: dict, ctx: EditContext) -> dict:
         "channels_in_use": channels,
         "can_add_channel": ["V2", "A2"],
         "cutaway_pool": cutaway_pool[:50],
+        "runs": runs,
         "layout_templates": ["split_h", "split_v", "pip"],
         # This user's unused-audio-file count (audio_brain.plan.md 1d) -- the
         # full list with names/duration/bpm is `audio_state`'s `assets`.
@@ -1584,9 +1870,9 @@ def affordances(document: dict, ctx: EditContext) -> dict:
         # source of awareness now).
         "verbs": ["place", "trim", "remove", "move", "set_audio", "place_audio",
                   "set_gain", "duck", "fade_audio", "crossfade", "replace_audio",
-                  "tighten", "retime", "split_screen"],
+                  "tighten", "retime", "split_screen", "set_plan", "wrap_up"],
         "senses": ["read_state", "predict", "validate", "diagnose", "affordances",
-                   "audio_state", "review"],
+                   "audio_state", "review", "read_transcript"],
     }
 
 
