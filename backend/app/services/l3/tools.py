@@ -17,13 +17,14 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple
 
 from app.services.l3 import act, observe
 from app.services.l3.grade.arc import ARC_INTENTS
 from app.services.l3.observe import EditContext
-from app.services.llm import LLMClient, tool_result_block, tool_spec, user_message
+from app.services.llm import LLMClient, text_block, tool_result_block, tool_spec, user_message
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +47,16 @@ class LoopResult:
     document: dict
     changed: bool = False
     steps: List[str] = field(default_factory=list)   # tool names called, in order
-    # Full per-call trace ({name, args, applied, result}) so a turn's REASONING
-    # is auditable after the fact ("check the reasoning") without re-running it.
+    # Ordered per-turn AUDIT LOG, in true loop order. Two entry kinds share this
+    # one list (each carries a "kind"):
+    #   kind="reasoning": the assistant's per-step natural-language content --
+    #     {turn, kind, reasoning, thinking?} -- so a turn's WHY (how it planned/
+    #     decided, not just what it called) is auditable after the fact. Captured
+    #     for EVERY step, including a step that makes no tool call.
+    #   kind="tool":      a tool call -- {turn, kind, name, args, applied, result}.
+    # Persisted verbatim onto edit_turns.trace (jsonb); a reasoning entry sits
+    # right before the tool entries of the same step (the prose that motivated
+    # them). See run_edit_loop.
     trace: List[dict] = field(default_factory=list)
     # When the brain called ask_user, the turn PAUSES: these are the questions to
     # surface, and the user's next message is their answer (the loop resumes).
@@ -99,7 +108,8 @@ def _specs() -> List[Dict[str, Any]]:
         S("validate", "Returns STRUCTURAL problems in the edit (spans out of range, "
           "empty cuts, malformed V2 cutaways/layouts). Empty result means clean.", obj({})),
         S("diagnose", "Returns editorial findings computed from the edit (same-speaker "
-          "runs, low-energy runs, distance from any target length, same-beat takes "
+          "runs, low-energy runs, jump-cuts -- same clip placed out of "
+          "source order, distance from any target length, same-beat takes "
           "that are both on the main line). Observations only.",
           obj({})),
         S("affordances", "Returns what is POSSIBLE: per cut the retake levels "
@@ -117,6 +127,12 @@ def _specs() -> List[Dict[str, Any]]:
           "sections and drop_ms when detected: coarse phrase boundaries and the "
           "single strongest musical moment, a prior worth checking, not a fact).",
           obj({})),
+        S("read_transcript", "Returns the COMPLETE, unbounded program-order transcript "
+          "-- every placed segment's verbatim spoken words, including incidental "
+          "speech under a picture cut (never hidden). The always-present mirror "
+          "already carries a short per-cut gist every turn; call this only when you "
+          "need the exact full wording (e.g. to quote precisely or check phrasing "
+          "before placing a cut).", obj({})),
         S("review", "Returns the ASSEMBLED program read back, per cut in order: "
           "played_text (the verbatim words actually spoken over that cut's PLAYED "
           "span, after any trim) and word-level program-time offsets, plus "
@@ -325,6 +341,59 @@ def _specs() -> List[Dict[str, Any]]:
               "preview": {"type": "string", "description":
                   "Optional: one short line on what you'll do if they pick `recommended`."}},
               "required": ["prompt", "options"]}}}, ["questions"])),
+        # --- PLAN (the durable plan artifact, brain_plan_mechanism.plan.md) ---
+        S("set_plan", "Write (or rewrite) your PLAN for this edit -- the ordered intent "
+          "you reasoned to before building, per PLAN BEFORE YOU BUILD. It is echoed back "
+          "to you every turn as the PLAN mirror and survives across turns, so build "
+          "against it and re-call this to UPDATE it (rather than drifting) when reading "
+          "changes your mind. Full replace each time: pass the whole plan. Keep it tight.",
+          obj({"purpose": {"type": "string",
+                           "description": "what the piece is FOR, in one line"},
+               "carries": {"type": "array", "items": {"type": "string"},
+                           "description": "what LEADS moment to moment (a line, the "
+                           "picture, music, a mix) -- one entry, or one per section"},
+               "structure": {"type": "array",
+                             "description": "the ORDERED BEATS -- one per section, "
+                             "at INTENT level (a JOB like 'hook -- founder's "
+                             "strongest intro', 'differentiator -- shown through "
+                             "the demo'), in play order. NEVER a clip id: which "
+                             "clip carries a beat is a tactic you discover at the "
+                             "timeline, not part of the plan.",
+                             "items": {"type": "object",
+                                       "properties": {
+                                           "beat": {"type": "string",
+                                                    "description": "the beat's job "
+                                                    "-- what this section must "
+                                                    "accomplish, at intent level"},
+                                           "need": {"type": "string",
+                                                    "enum": ["required", "optional"],
+                                                    "description": "required = "
+                                                    "non-negotiable (if its tactic "
+                                                    "fails, find another route or "
+                                                    "surface the ceiling -- never "
+                                                    "silently drop it); optional = "
+                                                    "include only if the material "
+                                                    "supports it. Defaults to "
+                                                    "required."}},
+                                       "required": ["beat"]}},
+               "watch": {"type": "array", "items": {"type": "string"},
+                         "description": "the hard spots to watch (a jump risk, a thin "
+                         "stretch, a take choice)"},
+               "note": {"type": "string",
+                        "description": "optional: one line on what changed your mind, "
+                        "when this call is an update"}})),
+        S("wrap_up", "Write the user-facing WRAP-UP for this edit: `summary` -- "
+          "ONE short, clean recap for the user of what you built and, when you "
+          "made a compromise (a required beat you couldn't land cleanly, a ceiling "
+          "the material or an asset forced), what it was and why. `open_questions` "
+          "-- anything you need the user to decide; `notes` -- anything they should "
+          "know. This is the ONLY channel the user actually SEES besides your reply, "
+          "so when you finish with a known compromise it MUST be stated here -- "
+          "never finish a compromised edit with an empty summary. Keep it tight and "
+          "human; it is NOT a place to dump internal craft reasoning.",
+          obj({"summary": {"type": "string"},
+               "open_questions": {"type": "array", "items": {"type": "string"}},
+               "notes": {"type": "array", "items": {"type": "string"}}})),
     ]
 
 
@@ -365,6 +434,30 @@ def _beat_grid_ms(document: dict, ctx: EditContext) -> List[int]:
            for ms in entry.get("onsets_ms") or []]
 
 
+def _edit_fingerprint(doc: dict) -> tuple:
+    """A CONTENT fingerprint of the edit's meaningful state -- the ordered spine
+    plus the ops -- with the random per-place seg_id/op_id EXCLUDED, so a revert
+    to an arrangement already held (place->remove->place the same ref; A->B->A)
+    hashes IDENTICAL even though ids are freshly minted each place. Spine ORDER
+    matters (a move is a real change); op order does not (resolve sorts them), so
+    ops are sorted. Pure; used only for churn detection (brain_loop_convergence.
+    plan.md Part 1)."""
+    spine = tuple(
+        (s.get("file_id"), int(s.get("in_ms") or 0), int(s.get("out_ms") or 0),
+         s.get("ref"), s.get("level"), bool(s.get("mute")),
+         s.get("audio_override") and tuple(sorted(s["audio_override"].items())))
+        for s in (doc.get("timeline") or []))
+    ops = tuple(sorted(
+        (o.get("type"), o.get("source_file_id"), o.get("seam_seg_id"),
+         int(o.get("from_ms") or 0), int(o.get("to_ms") or 0),
+         int(o.get("src_in_ms") or 0), int(o.get("src_out_ms") or 0),
+         o.get("role"), o.get("audio_kind"),
+         float(o.get("gain_db") or 0.0), float(o.get("duck_db") or 0.0),
+         int(o.get("audio_offset_ms") or 0), int(o.get("ms") or 0))
+        for o in (doc.get("operations") or [])))
+    return (spine, ops)
+
+
 def _snap_trim_to_beat(doc: dict, ctx: EditContext, target_id: str,
                        in_ms: Any, out_ms: Any, delta_in_ms: Any, delta_out_ms: Any):
     """Beat-snap a `trim`'s resulting program-time edge for a placed OP (a V2
@@ -399,6 +492,37 @@ def _snap_trim_to_beat(doc: dict, ctx: EditContext, target_id: str,
     if out_ms is not None or delta_out_ms is not None:
         return new_in, new_out + delta, snap
     return new_in - delta, new_out, snap
+
+
+def _trim_domain_reason(doc, ctx, target_id, in_ms, out_ms, delta_in_ms, delta_out_ms):
+    """Part 3 (brain_loop_convergence.plan.md): reject a trim whose RESULTING
+    absolute source edge lands well past the source's own length -- the
+    fingerprint of an absolute source timestamp passed where a relative delta
+    was meant (footgun b). Cheap + generic; returns a plain reason or None.
+    Fail-open: unknown target/duration -> None (let the verb's own validation
+    run)."""
+    op = next((o for o in doc.get("operations") or []
+               if o.get("op_id") == target_id
+               and o.get("type") in ("place_video", "place_audio")), None)
+    seg = None if op else next((s for s in doc.get("timeline") or []
+                                if s.get("seg_id") == target_id), None)
+    src = (op or {}).get("source_file_id") or (seg or {}).get("file_id")
+    if not src:
+        return None
+    dur = ctx.durations.get(src)
+    if dur is None:
+        dur = next((a["dur_ms"] for a in getattr(ctx, "audio_assets", []) or []
+                    if a["file_id"] == src), None)
+    if not dur:
+        return None
+    cur_out = int((op or seg or {}).get("src_out_ms", (seg or {}).get("out_ms", 0)))
+    new_out = int(out_ms) if out_ms is not None else cur_out + int(delta_out_ms or 0)
+    if new_out > int(dur) + 1000:     # >1s past the source end -> almost certainly a mix-up
+        return (f"trim's resulting source out ({new_out}ms) is past this source's "
+                f"length ({int(dur)}ms). in_ms/out_ms/delta_* are SOURCE times -- "
+                "did you pass an absolute timestamp where a relative delta_* was "
+                "meant, or vice versa?")
+    return None
 
 
 def _normalize_questions(args: Dict[str, Any]) -> List[dict]:
@@ -459,6 +583,8 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
             return _json(observe.audio_state(doc, ctx)), doc, False
         if name == "review":
             return _json(observe.review(doc, ctx, user_ask=user_ask)), doc, False
+        if name == "read_transcript":
+            return _json(observe.read_transcript(doc, ctx)), doc, False
 
         # ACT (mutate)
         if name == "place":
@@ -470,6 +596,15 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
         elif name == "trim":
             tr_in, tr_out = args.get("in_ms"), args.get("out_ms")
             tr_din, tr_dout = args.get("delta_in_ms"), args.get("delta_out_ms")
+            # Part 3 domain guard (brain_loop_convergence.plan.md): an ABSOLUTE
+            # source edge past the source's own length almost always means an
+            # absolute value was passed where a relative delta was meant. Reject
+            # loudly (the verb can't see the source length; _dispatch can).
+            # Fail-open: no known duration -> skip.
+            trim_reason = _trim_domain_reason(doc, ctx, args["target_id"],
+                                              tr_in, tr_out, tr_din, tr_dout)
+            if trim_reason:
+                return _json({"applied": False, "reason": trim_reason}), doc, False
             if args.get("snap") == "beat":
                 snapped = _snap_trim_to_beat(doc, ctx, args["target_id"],
                                              tr_in, tr_out, tr_din, tr_dout)
@@ -568,6 +703,28 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
                                    from_ms=args.get("from_ms"), to_ms=args.get("to_ms"),
                                    level=args.get("level", "balanced"),
                                    audio=args.get("audio"), reason=args.get("reason", ""))
+        elif name == "set_plan":
+            # brain_plan_mechanism.plan.md §3.2: echo the rendered plan (not
+            # read_state) so the tool result is a tight confirmation, not a
+            # full state dump -- returns directly, bypassing the shared
+            # changed/read_state tail below.
+            new = act.set_plan(doc, purpose=args.get("purpose"),
+                               carries=args.get("carries"), structure=args.get("structure"),
+                               watch=args.get("watch"), note=args.get("note"))
+            changed = new is not doc
+            return _json({"applied": changed,
+                          "plan": (new.get("plan") if changed else None)}), new, changed
+        elif name == "wrap_up":
+            # brain_plan_conformance.plan.md §3.2: same direct-return shape as
+            # set_plan -- echo the written surface, not a full read_state dump.
+            new = act.wrap_up(doc, summary=args.get("summary"),
+                              open_questions=args.get("open_questions"),
+                              notes=args.get("notes"))
+            changed = new is not doc
+            return _json({"applied": changed,
+                          "surface": {"summary": new.get("summary"),
+                                      "open_questions": new.get("open_questions"),
+                                      "notes": new.get("notes")} if changed else None}), new, changed
         else:
             return _json({"error": f"unknown tool {name}"}), doc, False
 
@@ -587,6 +744,11 @@ def _dispatch(name: str, args: Dict[str, Any], ctx: EditContext,
                      or "suggested_ms" in snap_info)):
             result["snap"] = snap_info
         return _json(result), new, changed
+    except act.EditReject as r:
+        # brain_loop_convergence.plan.md Part 3: a verb rejected the request with
+        # a specific reason -- surface it immediately as applied=false so the brain
+        # corrects THIS turn, not later via review.
+        return _json({"applied": False, "reason": r.reason}), doc, False
     except Exception as e:  # a bad tool call must never crash the turn
         logger.exception("tools: %s failed", name)
         return _json({"error": f"{type(e).__name__}: {e}"}), doc, False
@@ -596,11 +758,56 @@ def _json(obj: Any) -> str:
     return json.dumps(obj, default=str)[:12000]
 
 
+# Generous per-step cap for captured reasoning: NOT the tiny result[:600] used
+# for tool results -- reasoning is the whole point here, so we keep it in full
+# up to this bound. Only pathological runaway prose is trimmed, purely to bound
+# a single jsonb row's size. Comfortably larger than a normal edit-turn reply.
+_REASONING_CAP = 8000
+
+
+def _reasoning_from_response(resp: Any) -> Tuple[str, str]:
+    """Pull this loop step's natural-language reasoning out of an LLMResponse:
+    the assistant's TEXT content (its prose reasoning, emitted alongside/between
+    tool calls) and, when a provider returns them, its extended-THINKING blocks.
+
+    Text is read from ``resp.text`` (the neutral, already-joined assistant text).
+    Thinking is best-effort: today the Anthropic edit-loop client neither enables
+    extended thinking nor surfaces thinking blocks, so this is a no-op for
+    thinking now -- but we scan both the neutral ``assistant_message`` content and
+    the provider-native ``raw`` completion for ``thinking``/``redacted_thinking``
+    blocks so the capture starts working automatically if thinking is ever turned
+    on, without another code change. Returns (text, thinking); either may be ''."""
+    text = (getattr(resp, "text", "") or "").strip()
+    thinking_parts: List[str] = []
+    msg = getattr(resp, "assistant_message", None)
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking"):
+                t = b.get("thinking") or b.get("text") or b.get("data") or ""
+                if t:
+                    thinking_parts.append(str(t))
+    if not thinking_parts:  # provider-native fallback (e.g. an Anthropic completion)
+        raw_content = getattr(getattr(resp, "raw", None), "content", None)
+        if isinstance(raw_content, list):
+            for blk in raw_content:
+                if getattr(blk, "type", None) in ("thinking", "redacted_thinking"):
+                    t = getattr(blk, "thinking", None) or getattr(blk, "data", None) or ""
+                    if t:
+                        thinking_parts.append(str(t))
+    return text, "\n".join(thinking_parts).strip()
+
+
 # --------------------------------------------------------------------------
 # The loop
 # --------------------------------------------------------------------------
 
 _STRUCT_MAX_TRIES = 3
+# brain_plan_conformance.plan.md Part A: bounds how many times the surface-
+# non-empty block can re-fire for one finish attempt -- unlike the once-fired
+# advisory stages, Part A must actually GATE (re-block until filled), so it
+# needs a cap of its own to guarantee the loop still terminates.
+_SURFACE_MAX_BLOCKS = 2
 
 
 def _latest_user_text(messages: List[dict]) -> str:
@@ -621,89 +828,532 @@ def _latest_user_text(messages: List[dict]) -> str:
     return ""
 
 
+# --------------------------------------------------------------------------
+# brain_plan_conformance.plan.md: Part A (surface-non-empty) + Part B
+# (plan-conformance accountability) -- see _verify_before_finish below for
+# where these slot into the done-gate ladder.
+# --------------------------------------------------------------------------
+
+_SYNC_WORDS_RE = re.compile(r"\b(beat|grid|snap|sync|on the beat|downbeat|onset)\b", re.IGNORECASE)
+_PUNCHY_WORDS_RE = re.compile(r"\b(punch\w*|quick|fast|snappy|rapid|energetic|tight cut\w*|"
+                              r"quick succession|fast[- ]?paced)\b", re.IGNORECASE)
+_LONG_CUT_MS = 4000          # a "long" main-line cut for a piece that declared punch
+_FAST_PACE = {"faster", "much_faster"}   # act._PACE_STEPS toward quick
+
+
+def _plan_text(plan: dict) -> str:
+    """All free-form plan prose the brain wrote -- purpose + carries + watch +
+    beat texts -- lowercased into one blob for keyword hints."""
+    parts = [str(plan.get("purpose") or "")]
+    parts += [str(x) for x in (plan.get("carries") or [])]
+    parts += [str(x) for x in (plan.get("watch") or [])]
+    parts += [observe._beat_view(e)[0] for e in (plan.get("structure") or [])]
+    return " ".join(parts).lower()
+
+
+def _hint_beatsync_declared_but_absent(working, ctx, plan) -> str | None:
+    """§4.5.1: plan text declares beat-sync intent AND a musical grid exists
+    AND no placed op edge actually lands on it. Ops record no snap flag
+    (§1.4), so this measures op edges against the real grid directly."""
+    if not _SYNC_WORDS_RE.search(_plan_text(plan)):
+        return None
+    grid = _beat_grid_ms(working, ctx)
+    if not grid:
+        return None                              # no music grid -> nothing to sync TO
+    ops = [o for o in working.get("operations") or []
+           if o.get("type") in ("place_video", "place_audio")]
+    if not ops:
+        return None
+    TOL = 60                                      # ms; well inside _SNAP_CAP_MS=400
+
+    def _on_grid(ms):
+        s = observe.snap_to_beats(grid, ms, max_move_ms=_SNAP_CAP_MS)
+        return s.get("snapped") and abs(int(s.get("ms", ms)) - int(ms)) <= TOL
+
+    aligned = any(_on_grid(o.get("from_ms")) or (o.get("to_ms") is not None and _on_grid(o["to_ms"]))
+                  for o in ops)
+    if aligned:
+        return None
+    return ("plan/watch calls for beat-sync but no placed overlay/bed edge lands "
+            "on the music grid -- either snap the ones that should hit the beat, "
+            "or surface that you chose not to.")
+
+
+def _hint_punchy_declared_but_flat(working, ctx, plan) -> str | None:
+    """§4.5.2: plan text declares punchy/quick pacing AND the main line is
+    mostly long cuts at natural pace (no pace_level toward faster)."""
+    if not _PUNCHY_WORDS_RE.search(_plan_text(plan)):
+        return None
+    try:
+        cuts = observe.read_state(working, ctx).get("cuts") or []
+    except Exception:
+        return None
+    main = [c for c in cuts if c.get("dur_ms") is not None]
+    if len(main) < 3:
+        return None                              # too short to judge pace
+    long_cuts = [c for c in main if int(c.get("dur_ms") or 0) >= _LONG_CUT_MS]
+    any_fast = any((c.get("pace_level") in _FAST_PACE) for c in main)
+    if any_fast or len(long_cuts) < (len(main) + 1) // 2:   # <half are long -> fine
+        return None
+    return (f"plan calls for punchy/quick pacing but {len(long_cuts)} of "
+            f"{len(main)} main-line cuts run long ({_LONG_CUT_MS}ms+) at natural "
+            "pace -- tighten/retime the ones that drag, or surface that the "
+            "material can't go faster.")
+
+
+def _conformance_hints(working: dict, ctx: EditContext, plan: dict | None) -> List[str]:
+    """The cheap, robust advisory signals fed to the conformance checkpoint
+    (brain_plan_conformance.plan.md §4.5). Few by design; each fail-open."""
+    if not plan:
+        return []
+    out: List[str] = []
+    for fn in (_hint_beatsync_declared_but_absent, _hint_punchy_declared_but_flat):
+        try:
+            h = fn(working, ctx, plan)
+            if h:
+                out.append(h)
+        except Exception:
+            logger.exception("conformance hint %s failed (skipping)", getattr(fn, "__name__", "?"))
+    return out
+
+
+def _surface_is_empty(working: dict) -> bool:
+    """True when NONE of the user-facing surface fields carry content
+    (brain_plan_conformance.plan.md Part A). summary is the primary channel;
+    open_questions/notes also count as surfaced."""
+    if (working.get("summary") or "").strip():
+        return False
+    if [q for q in (working.get("open_questions") or []) if str(q).strip()]:
+        return False
+    if [n for n in (working.get("notes") or []) if str(n).strip()]:
+        return False
+    return True
+
+
+def _plan_conformance(working: dict, ctx: EditContext,
+                      plan: dict | None, state: Dict[str, Any]) -> str | None:
+    """Part B (brain_plan_conformance.plan.md): the finish-time plan-conformance
+    accountability CHECKPOINT. Beats are intent-level prose with no clip ids, so
+    this is an LLM self-accountability stage -- it PRESENTS the written plan
+    (beats + carries + watch) beside the built timeline and a few advisory HINTS,
+    and requires the brain to account for each required beat + each declared craft
+    intention (delivered / fixed / compromised-and-surfaced), mirroring the
+    FIT-TO-CRAFT discipline. Fires at most once (state-tracked). Fail-open: any
+    error -> None (the edit still finishes). Returns feedback or None."""
+    if state.get("conformance_surfaced"):
+        return None
+    if not (plan and (plan.get("structure") or plan.get("carries") or plan.get("watch"))):
+        return None                     # no plan of record -> nothing to conform to
+    try:
+        required = [b for b in (observe._beat_view(e) for e in plan.get("structure") or [])
+                    if b[0] and b[1] != "optional"]           # (beat_text, need)
+        declared = list(plan.get("carries") or []) + list(plan.get("watch") or [])
+        hints = _conformance_hints(working, ctx, plan)        # advisory, few (§4.5)
+    except Exception:
+        logger.exception("_plan_conformance: presentation build failed (finishing)")
+        return None
+    if not required and not declared and not hints:
+        return None
+    state["conformance_surfaced"] = True
+    lines = ["AUTOMATIC CHECK -- plan conformance: hold the edit you BUILT against "
+             "the plan you WROTE. For EACH item below, account in one line: "
+             "DELIVERED (it's in the cut), FIXED (you're about to build/repair it), "
+             "or COMPROMISED (the material genuinely can't land it) -- and a "
+             "COMPROMISE MUST be surfaced to the user via wrap_up (summary/"
+             "open_questions), never left silent. Same rule as fit-to-craft: a gap "
+             "may pass ONLY for one of two reasons -- the ask required it, or the "
+             "material can't support better -- named plainly."]
+    if required:
+        lines.append("  required beats (each must be delivered, or its ceiling surfaced):")
+        lines += [f"    - {b}" for b, _ in required]
+    if declared:
+        lines.append("  declared craft intentions (carries / watch -- honor or surface):")
+        lines += [f"    - {d}" for d in declared]
+    if hints:
+        lines.append("  advisory signals (cheap checks -- confirm or refute, don't trust blindly):")
+        lines += [f"    - {h}" for h in hints]
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# brain_accountability_architecture.plan.md PART 1: the done-gate as a
+# DECLARED ORDERED LIST of stages, not a chain of nested early-returns.
+#
+# Each stage is a pure (or fail-open) function of one _GateCtx and returns its
+# OWN feedback string or None. A stage NEVER returns on behalf of a later
+# stage -- the evaluator (_run_gate_stages) owns the ladder -- which is what
+# makes a mandatory invariant structurally unskippable and makes it impossible
+# to orphan a stage by adding a `return` above it.
+#
+#   kind="mandatory": an invariant. Runs on EVERY gate evaluation, on EVERY
+#     termination path. Never filtered by the advisory-skip.
+#   kind="advisory":  a redundant nudge. May be skipped when the brain already
+#     self-reviewed this turn (the ONLY thing the old `reviewed` short-circuit
+#     was ever meant to skip).
+# --------------------------------------------------------------------------
+
+MANDATORY, ADVISORY = "mandatory", "advisory"
+
+
+@dataclass(frozen=True)
+class _Stage:
+    key: str        # the `state` key this stage OWNS (its once-fired bookkeeping)
+    kind: str       # MANDATORY | ADVISORY
+    label: str      # stable machine token, recorded in the trace
+    fn: Any         # (_GateCtx) -> str | None
+
+
+@dataclass
+class _GateCtx:
+    """Everything a stage may read, computed ONCE per gate evaluation.
+
+    `findings` (observe.diagnose) and `review_out` (observe.review) are computed
+    UNCONDITIONALLY -- the old code skipped review() whenever the brain had
+    self-reviewed, which silently emptied Stage 1's ask-flags (Bypass 2b). A
+    mandatory stage may never depend on an optimization for an advisory one."""
+    working: dict
+    ctx: EditContext
+    state: Dict[str, Any]
+    steps: List[str]
+    user_ask: str
+    advisory_skip: bool
+    findings: List[dict] = field(default_factory=list)
+    review_out: Dict[str, Any] | None = None
+    # Per-evaluation AUDIT of the ladder: one entry per declared stage, in
+    # declared order -- {stage, kind, fired, why?}. Recorded into the trace so
+    # "did the mandatory invariant actually run?" is assertable from a session
+    # test and diagnosable from a stored thread.
+    fired: List[dict] = field(default_factory=list)
+
+
+def _gate_ctx(working: dict, ctx: EditContext, state: Dict[str, Any],
+              steps: List[str], user_ask: str = "") -> _GateCtx:
+    """Build the per-evaluation context. Fail-open: a sense that raises yields
+    an empty projection, never an aborted gate."""
+    advisory_skip = bool(
+        "diagnose" in steps or "validate" in steps or "review" in steps
+        or state.get("reviewed"))
+    try:
+        findings = observe.diagnose(working, ctx)
+    except Exception:
+        logger.exception("_gate_ctx: diagnose failed (continuing with none)")
+        findings = []
+    try:
+        review_out = observe.review(working, ctx, user_ask=user_ask)
+    except Exception:
+        logger.exception("_gate_ctx: review failed (continuing without it)")
+        review_out = None
+    return _GateCtx(working=working, ctx=ctx, state=state, steps=steps,
+                    user_ask=user_ask, advisory_skip=advisory_skip,
+                    findings=findings, review_out=review_out)
+
+
+def _stage_structural(gc: _GateCtx) -> str | None:
+    issues = observe.validate(gc.working, gc.ctx)
+    if not issues or gc.state["struct_tries"] >= _STRUCT_MAX_TRIES:
+        return None
+    gc.state["struct_tries"] += 1
+    body = "; ".join(f"{i.get('kind')} {i.get('id')}: {i.get('message')}"
+                     for i in issues[:8])
+    return ("AUTOMATIC CHECK -- structural problems that would break the render. "
+            "Fix these before finishing:\n" + body)
+
+
+def _stage_length(gc: _GateCtx) -> str | None:
+    over = [f for f in gc.findings if "over target" in (f.get("message") or "")]
+    if not over or gc.state["length_surfaced"]:
+        return None
+    gc.state["length_surfaced"] = True
+    return ("AUTOMATIC CHECK -- length: " + (over[0].get("message") or "") +
+            ". Either trim to the target, or say in one line why this length is "
+            "right, then finish.")
+
+
+def _stage_intent(gc: _GateCtx) -> str | None:
+    """Stage 1, fit to the ask. MANDATORY -- and it now actually sees flags on a
+    self-reviewed turn (Bypass 2b), because _gate_ctx always computes review."""
+    ask_flags = [f for f in (gc.review_out or {}).get("flags", [])
+                 if f.get("category") == "ask"]
+    if not ask_flags or gc.state["intent_surfaced"]:
+        return None
+    gc.state["intent_surfaced"] = True
+    body = "\n".join(f"- {f.get('message')}" for f in ask_flags[:8])
+    return ("AUTOMATIC CHECK -- Stage 1, fit to your ask: a feature you named "
+            "isn't actually in the edit:\n" + body +
+            "\nAdd it, or finish only if the material genuinely can't support it.")
+
+
+def _stage_craft(gc: _GateCtx) -> str | None:
+    if not gc.working.get("timeline") or gc.state["craft_surfaced"]:
+        return None
+    gc.state["craft_surfaced"] = True
+    return ("AUTOMATIC CHECK -- Stage 2, fit to craft: forget the ask entirely -- "
+            "judge this edit the way you'd judge any finished video handed to you "
+            "cold. Does it look and sound like a real, high-quality piece of work? "
+            "Fix what falls short. If you finish anyway with a known flaw, name in "
+            "ONE line which of exactly two reasons applies: (a) the user's ask "
+            "required it, or (b) the material can't support better. Any other "
+            "reason ('looks fine anyway') isn't enough -- fix it instead.")
+
+
+def _stage_flags(gc: _GateCtx) -> str | None:
+    """Stage 3, specific flags. The ONE advisory stage -- the only thing the old
+    `reviewed` short-circuit was ever meant to skip. brain_mirror_readside.
+    plan.md section 4.2: the former Stage 2.5 (a one-shot, reviewed-gate-
+    bypassing continuity reveal) is RETIRED -- the always-present mirror
+    already puts jump-cut/broken-line/incidental flags in front of the brain
+    continuously, so this stage no longer needs a special *revealing* role for
+    continuity. A jump-cut finding still reaches this stage (folded into
+    `rest`, same as any other advisory flag) -- it's just never uniquely
+    surfaced anymore."""
+    rest = [f for f in gc.findings if "target" not in (f.get("message") or "")]
+    rest += [f for f in (gc.review_out or {}).get("flags", []) if f.get("category") != "ask"]
+    if not rest or gc.state["reviewed"]:
+        return None
+    gc.state["reviewed"] = True
+    body = "\n".join(
+        f"- [{f.get('severity') or 'info'}]"
+        + (f" ({f['category']})" if f.get("category") else "") + " "
+        + (f"{f['anchor']}: " if f.get("anchor") else "") + (f.get("message") or "")
+        for f in rest[:12])
+    return ("AUTOMATIC CHECK -- Stage 3, specific flags: advisory -- act on what "
+            "serves the goal, ignore the rest, then finish:\n" + body)
+
+
+def _stage_conformance(gc: _GateCtx) -> str | None:
+    return _plan_conformance(gc.working, gc.ctx, gc.working.get("plan"), gc.state)
+
+
+def _stage_surface(gc: _GateCtx) -> str | None:
+    """Part A (brain_plan_conformance.plan.md): never finish a KNOWN compromise
+    with an empty surface. "Compromise in play" = the conformance stage has
+    run (an account was demanded) AND a live advisory hint. Bounded by
+    surface_blocked so a stubborn brain still terminates."""
+    compromise_in_play = gc.state.get("conformance_surfaced") and bool(
+        _conformance_hints(gc.working, gc.ctx, gc.working.get("plan")))
+    if not (gc.working.get("timeline") and compromise_in_play
+            and _surface_is_empty(gc.working)
+            and gc.state["surface_blocked"] < _SURFACE_MAX_BLOCKS):
+        return None
+    gc.state["surface_blocked"] += 1
+    return ("AUTOMATIC CHECK -- surface: this edit carries a known compromise "
+            "but nothing is surfaced to the user. Call wrap_up with a short, "
+            "human `summary` that states plainly what you built and what was "
+            "compromised and why (and open_questions if the user should weigh "
+            "in). Don't finish a compromised edit silent.")
+
+
+# THE LADDER. Order is data, not source order. A new stage is added HERE or it
+# never runs (loud in review) -- it can no longer be orphaned by an earlier
+# `return`. The MANDATORY set is asserted in the tests, so silently demoting an
+# invariant to advisory fails CI.
+_GATE_STAGES: Tuple[_Stage, ...] = (
+    _Stage("struct_tries",         MANDATORY, "structural",  _stage_structural),
+    _Stage("length_surfaced",      MANDATORY, "length",      _stage_length),
+    _Stage("intent_surfaced",      MANDATORY, "intent",      _stage_intent),
+    _Stage("craft_surfaced",       MANDATORY, "craft",       _stage_craft),
+    _Stage("reviewed",             ADVISORY,  "flags",       _stage_flags),
+    _Stage("conformance_surfaced", MANDATORY, "conformance", _stage_conformance),
+    _Stage("surface_blocked",      MANDATORY, "surface",     _stage_surface),
+)
+
+
+def _run_gate_stages(gc: _GateCtx, *, kinds=(MANDATORY, ADVISORY),
+                     collect: bool = False) -> Any:
+    """Evaluate the declared ladder in order.
+
+    Semantics, explicit and total:
+      * a stage whose `kind` is not in `kinds` is not evaluated (recorded as
+        skipped-by-scope);
+      * an ADVISORY stage is skipped when `gc.advisory_skip` -- this is the ONLY
+        skip mechanism, and it can never reach a MANDATORY stage;
+      * a stage that raises is logged and treated as "nothing to say" (fail-open,
+        house rule) -- it can never suppress the stages after it;
+      * `collect=False` (interactive): return the FIRST stage's feedback, or None
+        -> the loop asks one thing at a time, exactly as today;
+      * `collect=True` (enforcement, used by the ONE finalizer): evaluate EVERY
+        in-scope stage and return the list of all outstanding feedback.
+    Every outcome is appended to `gc.fired` for the trace."""
+    out: List[str] = []
+    for st in _GATE_STAGES:
+        if st.kind not in kinds:
+            gc.fired.append({"stage": st.label, "kind": st.kind, "fired": False,
+                             "why": "out-of-scope"})
+            continue
+        if st.kind == ADVISORY and gc.advisory_skip:
+            gc.fired.append({"stage": st.label, "kind": st.kind, "fired": False,
+                             "why": "advisory-skip: brain self-reviewed"})
+            continue
+        try:
+            fb = st.fn(gc)
+        except Exception:
+            logger.exception("gate stage %s failed (fail-open)", st.label)
+            gc.fired.append({"stage": st.label, "kind": st.kind, "fired": False,
+                             "why": "error"})
+            continue
+        gc.fired.append({"stage": st.label, "kind": st.kind, "fired": fb is not None})
+        if fb is None:
+            continue
+        if not collect:
+            return fb
+        out.append(fb)
+    return out if collect else None
+
+
 def _verify_before_finish(working: dict, ctx: EditContext,
                           state: Dict[str, Any], steps: List[str],
                           user_ask: str = "") -> str | None:
-    """The done-gate: when the brain tries to FINISH a turn that changed the
-    edit, check the result against the contract, IN ORDER (audio_and_audit.
-    plan.md Phase 5 -- the two-pass audit): structural legality (hard) ->
-    length (fix-or-justify) -> STAGE 1 fit to INTENT (a user_ask-named
-    feature actually present) -> STAGE 2 fit to CRAFT (a blind, whole-edit
-    verdict) -> STAGE 3 the rest of diagnose/review's findings (advisory).
-    Returns feedback the brain MUST act on (the loop keeps going), or None to
-    let it finish -- each stage surfaces at most ONCE (state-tracked) so the
-    loop always terminates.
+    """The done-gate, interactive mode: evaluate the DECLARED ladder
+    (_GATE_STAGES) and return the first stage's feedback, or None to allow
+    finishing. The ladder's order, and which stages are mandatory vs advisory,
+    are declared data -- see _GATE_STAGES. This function no longer contains any
+    stage logic and MUST NOT grow an early return."""
+    return _run_gate_stages(_gate_ctx(working, ctx, state, steps, user_ask))
 
-    STAGE 2's discipline (the key rule, stated to the brain in
-    ``converse._LOOP_SYSTEM`` -- this gate only forces the checkpoint, once,
-    for any turn that changed a non-empty edit; it never parses the brain's
-    reply, since the verdict is prose, same as the length justification
-    above): a known flaw may pass ONLY if the brain names, in one line, that
-    (a) the user's ask required it or (b) the material can't support better.
 
-    A brain that already called ``diagnose``/``validate``/``review`` this
-    turn has self-reviewed, so STAGE 3's redundant nudge is skipped -- STAGE
-    2 is NOT skippable this way: calling a deterministic sense is not the
-    same as producing the blind holistic verdict Stage 2 asks for.
-    edso_think_act_check.plan.md change 4 / Phase 5: ``review`` is passed
-    ``user_ask`` so its ``category=="ask"`` flags feed Stage 1, checked
-    ahead of Stage 3's guidance/craft flags."""
-    issues = observe.validate(working, ctx)
-    if issues and state["struct_tries"] < _STRUCT_MAX_TRIES:
-        state["struct_tries"] += 1
-        body = "; ".join(f"{i.get('kind')} {i.get('id')}: {i.get('message')}"
-                         for i in issues[:8])
-        return ("AUTOMATIC CHECK -- structural problems that would break the render. "
-                "Fix these before finishing:\n" + body)
+def _record_gate(trace: List[dict], *, exit_reason: str, gc: _GateCtx | None,
+                 note: str = "") -> None:
+    """The ladder's own outcome, once per gate evaluation:
+    {kind:"gate", exit_reason, stages:[{stage, kind, fired, why?}], note?}.
+    This is what makes "the mandatory invariant ACTUALLY fired" assertable from
+    a session test and diagnosable from a stored thread -- the missing evidence
+    that let two dead-code bugs ship 'verified'. Fail-open: a recording error
+    must never alter the edit or the reply."""
+    try:
+        entry: Dict[str, Any] = {"kind": "gate", "exit_reason": exit_reason,
+                                 "stages": gc.fired if gc is not None else []}
+        if note:
+            entry["note"] = note
+        trace.append(entry)
+    except Exception:
+        logger.exception("tools: gate trace record failed (continuing)")
 
-    findings = observe.diagnose(working, ctx)
-    over = [f for f in findings if "over target" in (f.get("message") or "")]
-    if over and not state["length_surfaced"]:
-        state["length_surfaced"] = True
-        return ("AUTOMATIC CHECK -- length: " + (over[0].get("message") or "") +
-                ". Either trim to the target, or say in one line why this length is "
-                "right, then finish.")
 
-    reviewed = "diagnose" in steps or "validate" in steps or "review" in steps
-    review_out = None
-    if not reviewed:
-        try:
-            review_out = observe.review(working, ctx, user_ask=user_ask)
-        except Exception:
-            logger.exception("_verify_before_finish: review() failed (continuing with diagnose only)")
+def _finalize_turn(llm, *, system, convo, ctx, working, tools, state, steps,
+                   user_ask, trace, edit_moved, questions, exit_reason,
+                   max_tokens) -> dict:
+    """THE ONE FINALIZATION CHOKE POINT (PART 1). Every termination path lands
+    here exactly once -- voluntary finish, cap exhaustion, last-turn finish,
+    ask_user pause -- and the MANDATORY stages are evaluated in ENFORCEMENT mode
+    (collect=True) regardless of which path arrived. There is no flag that can
+    say "already fine": whether anything is outstanding is READ OFF the declared
+    ladder and the state dict.
 
-    ask_flags = [f for f in (review_out or {}).get("flags", []) if f.get("category") == "ask"]
-    if ask_flags and not state["intent_surfaced"]:
-        state["intent_surfaced"] = True
-        body = "\n".join(f"- {f.get('message')}" for f in ask_flags[:8])
-        return ("AUTOMATIC CHECK -- Stage 1, fit to your ask: a feature you named "
-                "isn't actually in the edit:\n" + body +
-                "\nAdd it, or finish only if the material genuinely can't support it.")
+    `exit_reason` is recorded, never consulted for control flow -- except for the
+    one legitimate case: a paused ask_user turn keeps its own question framing
+    (the turn isn't over, the user is being asked something).
 
-    if working.get("timeline") and not state["craft_surfaced"]:
-        state["craft_surfaced"] = True
-        return ("AUTOMATIC CHECK -- Stage 2, fit to craft: forget the ask entirely -- "
-                "judge this edit the way you'd judge any finished video handed to you "
-                "cold. Does it look and sound like a real, high-quality piece of work? "
-                "Fix what falls short. If you finish anyway with a known flaw, name in "
-                "ONE line which of exactly two reasons applies: (a) the user's ask "
-                "required it, or (b) the material can't support better. Any other "
-                "reason ('looks fine anyway') isn't enough -- fix it instead.")
+    Fail-open: any error leaves `working` untouched; the reply builder's
+    last_text fallback is unchanged."""
+    try:
+        if questions:
+            _record_gate(trace, exit_reason=exit_reason, gc=None,
+                         note="paused for ask_user -- finalization deferred")
+            return working
+        if not edit_moved:                    # a plan-only turn is not an edit
+            return working
+        gc = _gate_ctx(working, ctx, state, steps, user_ask)
+        outstanding = _run_gate_stages(gc, kinds=(MANDATORY,), collect=True)
+        _record_gate(trace, exit_reason=exit_reason, gc=gc)
+        if outstanding or _surface_is_empty(working):
+            working = _finalize_after_loop(
+                llm, system=system, convo=convo, ctx=ctx, working=working,
+                tools=tools, verify=state, user_ask=user_ask, trace=trace,
+                outstanding=outstanding, max_tokens=max_tokens)
+        return working
+    except Exception:
+        logger.exception("tools: _finalize_turn failed (leaving working untouched)")
+        return working
 
-    if reviewed or state["reviewed"]:
-        return None
-    rest = [f for f in findings if "target" not in (f.get("message") or "")]
-    rest += [f for f in (review_out or {}).get("flags", []) if f.get("category") != "ask"]
-    if rest:
-        state["reviewed"] = True
-        body = "\n".join(
-            f"- [{f.get('severity') or 'info'}]"
-            + (f" ({f['category']})" if f.get("category") else "") + " "
-            + (f"{f['anchor']}: " if f.get("anchor") else "") + (f.get("message") or "")
-            for f in rest[:12])
-        return ("AUTOMATIC CHECK -- Stage 3, specific flags: advisory -- act on what "
-                "serves the goal, ignore the rest, then finish:\n" + body)
-    return None
+
+def _fallback_summary(working: dict, ctx: EditContext) -> str:
+    """A plain, truthful one-liner built from the edit STATE (never leftover
+    mid-action prose) for when the brain runs out of budget without a wrap_up.
+    Names the size of what was built and any LIVE compromise the advisory hints
+    already detected, so even the floor tells the user the truth. Pure/fail-open."""
+    try:
+        st = observe.read_state(working, ctx)      # returns cut_count + total_ms
+        n = st.get("cut_count") or len(st.get("cuts") or [])
+        total = st.get("total_ms")
+    except Exception:
+        n, total = len(working.get("timeline") or []), None
+    dur = f", ~{int(total)//1000}s" if total else ""
+    base = f"Assembled {n} cut{'s' if n != 1 else ''}{dur}."
+    hints = _conformance_hints(working, ctx, working.get("plan"))
+    if hints:
+        base += (" Ran out of editing room before fully resolving: "
+                 + "; ".join(h.split(" -- ")[0] for h in hints) + ".")
+    else:
+        base += " Ran out of editing room before a final self-review."
+    return base
+
+
+def _finalize_after_loop(llm, *, system, convo, ctx, working, tools, verify,
+                         user_ask, trace, outstanding, max_tokens) -> dict:
+    """PART 1 (brain_accountability_architecture.plan.md): make a NON-voluntary
+    exit (the max_turns cap, a last-turn finish, or a self-reviewed turn that
+    left a mandatory invariant outstanding) finalize as truthfully as a clean
+    voluntary finish would. Runs ONE bounded finalization step: it instructs
+    the brain to STOP editing, ACCEPT the best-available version of anything
+    that didn't land, and call wrap_up with a real recap + any surfaced
+    compromise. Any wrap_up (or tiny lock-in edit) it makes is applied. Returns
+    the (possibly updated) working doc. Fail-open: any error -> working unchanged.
+
+    `outstanding` is the list of feedback lines `_finalize_turn` already
+    COLLECTED from the declared ladder (in enforcement mode) -- this function
+    presents those lines rather than re-deriving them by calling
+    `_plan_conformance` itself, which would find `conformance_surfaced` already
+    True (set by that same collection pass) and silently return nothing: a
+    double-fire hazard against the SAME state dict, not a double message.
+    `trace` is accepted for the observability funnel that later work wires
+    the finalize instruction through; unused here."""
+    try:
+        instruct = (
+            "AUTOMATIC FINALIZE -- you've reached this turn's build budget. Stop "
+            "opening new work. In ONE step: if a required beat or a declared "
+            "intention didn't land, ACCEPT the best version you have (do NOT retry) "
+            "and call wrap_up with a short, human `summary` of what you built and "
+            "any compromise + why (open_questions if it's the user's to weigh). "
+            "Make at most a single tiny edit only if it LOCKS the best-available "
+            "version; otherwise just wrap_up.")
+        if outstanding:
+            instruct += "\n\n" + "\n\n".join(outstanding)
+        convo.append(user_message(instruct))
+        resp = llm.run(system=system, messages=convo, tools=tools,
+                       max_tokens=max_tokens, cache_system=True)
+        for tc in (resp.tool_calls or []):
+            if tc.name == "ask_user":       # finalization never pauses for a question
+                continue
+            _obs, working, _did = _dispatch(tc.name, tc.input or {}, ctx, working, user_ask)
+    except Exception:
+        logger.exception("tools: forced finalization step failed (continuing)")
+    # Deterministic floor: if the brain still left the surface empty, synthesize a
+    # truthful recap from the built state so the reply is NEVER leftover reasoning.
+    try:
+        if working.get("timeline") and _surface_is_empty(working):
+            working = act.wrap_up(working, summary=_fallback_summary(working, ctx))
+    except Exception:
+        logger.exception("tools: fallback summary failed (continuing)")
+    return working
+
+
+def _progress_note(turn: int, max_turns: int, *, churn: bool = False) -> str:
+    """A per-turn CONVERGENCE note (brain_loop_convergence.plan.md Part 1),
+    pushed beside the mirror. Deliberately framed around PROGRESS + converging,
+    NOT a countdown to rush: budget visibility exists so the brain reserves room
+    to finish and knows when to accept-and-surface a ceiling. Pure."""
+    used, remaining = turn + 1, max_turns - (turn + 1)
+    head = (f"PROGRESS: step {used} of {max_turns} this turn (~{remaining} left "
+            "before it auto-finalizes).")
+    body = (" This is room to CONVERGE, not a clock to beat: attempt each goal "
+            "honestly, but if a goal genuinely won't land after a real attempt, "
+            "that's a CEILING -- accept the best available version and SURFACE it "
+            "with wrap_up rather than retrying. Reserve room to finish cleanly.")
+    if remaining <= 4:
+        body += (" You're near this turn's budget -- move to CONVERGE: lock the "
+                 "best version you have, resolve or surface any open compromise, "
+                 "and leave a wrap_up recap. Don't open new threads of work.")
+    return head + body
 
 
 def run_edit_loop(llm: LLMClient, *, system: str, messages: List[dict],
@@ -721,7 +1371,19 @@ def run_edit_loop(llm: LLMClient, *, system: str, messages: List[dict],
     last_text = ""
     questions: List[dict] = []
     verify = {"struct_tries": 0, "length_surfaced": False, "intent_surfaced": False,
-             "craft_surfaced": False, "reviewed": False}
+             "craft_surfaced": False, "reviewed": False,
+             "conformance_surfaced": False, "surface_blocked": 0}
+    # brain_accountability_architecture.plan.md PART 1: recorded, never consulted
+    # for control flow (except the ask_user pause, which keeps its own question
+    # framing) -- the ONE finalizer (_finalize_turn) reads outstanding work off
+    # the declared ladder + state, never off a boolean set at an exit site.
+    exit_reason = "cap"
+    # brain_loop_convergence.plan.md Part 1: fingerprints of every DISTINCT edit
+    # state seen this turn (excluding random ids), and the states already flagged
+    # as churn so the same revert isn't nagged every step. Generic no-progress
+    # signal -- never a retry cap.
+    seen_states: dict = {_edit_fingerprint(working): -1}   # fp -> turn first seen
+    churned_states: set = set()
     # edso_think_act_check.plan.md change 4: the done-gate's audit checks a
     # NAMED feature (split screen, a music bed) is actually present -- needs
     # the user's own latest words, computed once here.
@@ -732,14 +1394,36 @@ def run_edit_loop(llm: LLMClient, *, system: str, messages: List[dict],
                        max_tokens=max_tokens, cache_system=True)
         last_text = (resp.text or "").strip() or last_text
         convo.append(resp.assistant_message)
+        # Capture this step's natural-language reasoning (+ thinking, if the
+        # provider ever returns it) into the ordered trace, BEFORE the step's
+        # tool entries so the prose sits with the actions it motivated. Runs
+        # for every step -- including a no-tool step (a finish attempt / a
+        # blocked done-gate turn) -- so no reasoning is lost. Additive and
+        # fail-open: a capture error must never alter the edit or the reply.
+        try:
+            r_text, r_think = _reasoning_from_response(resp)
+            if r_text or r_think:
+                entry: Dict[str, Any] = {"turn": turn, "kind": "reasoning",
+                                         "reasoning": r_text[:_REASONING_CAP]}
+                if r_think:
+                    entry["thinking"] = r_think[:_REASONING_CAP]
+                trace.append(entry)
+        except Exception:
+            logger.exception("tools: reasoning capture failed (continuing)")
         if not resp.tool_calls:
-            # Finish attempt: don't let a changed edit exit unchecked against the
-            # contract (structural = hard, length = fix-or-justify, rest advisory).
-            if changed and turn < max_turns - 1:
+            # Finish attempt. The gate now runs on EVERY finish attempt, the last
+            # turn included (the old `turn < max_turns - 1` guard is what made a
+            # last-turn finish skip the ladder entirely). On the last turn there
+            # is no room to iterate, so feedback is not injected; the stages have
+            # still marked `verify`, and _finalize_turn enforces whatever is left
+            # outstanding.
+            edit_moved = changed   # PART 4 will define edit_moved properly; until then an alias
+            if edit_moved:
                 feedback = _verify_before_finish(working, ctx, verify, steps, user_ask)
-                if feedback is not None:
+                if feedback is not None and turn < max_turns - 1:
                     convo.append(user_message(feedback))
                     continue
+            exit_reason = "voluntary"
             break
         results = []
         asked = False
@@ -750,23 +1434,93 @@ def run_edit_loop(llm: LLMClient, *, system: str, messages: List[dict],
                 asked = True
                 results.append(tool_result_block(tc.id, _json(
                     {"posed": True, "note": "Shown to the user; end your turn and wait for their answer."})))
-                trace.append({"turn": turn, "name": tc.name, "args": tc.input or {},
+                trace.append({"turn": turn, "kind": "tool", "name": tc.name,
+                              "args": tc.input or {},
                               "applied": False, "result": "posed to user"})
                 continue
             obs, working, did = _dispatch(tc.name, tc.input or {}, ctx, working, user_ask)
             changed = changed or did
             results.append(tool_result_block(tc.id, obs))
-            trace.append({"turn": turn, "name": tc.name, "args": tc.input or {},
+            trace.append({"turn": turn, "kind": "tool", "name": tc.name,
+                          "args": tc.input or {},
                           "applied": bool(did), "result": obs[:600]})
+        # brain_loop_convergence.plan.md Part 1: did this turn's edits land the
+        # program back on an arrangement it already held at an EARLIER turn?
+        # (Revert / net-zero swap / place-remove-place.) Generic, id-independent;
+        # advisory only -- never stops the loop, just nudges toward accept+surface.
+        churn_now = churn_hint = None
+        try:
+            if changed:
+                fp = _edit_fingerprint(working)
+                prior_turn = seen_states.get(fp)
+                # A match to a state first seen strictly before the last step means
+                # the edit left that state and came back -- churn. (A match to the
+                # immediately prior step is a same-turn no-op, handled by Part 3's
+                # fail-loud verbs.)
+                if prior_turn is not None and prior_turn < turn - 1 and fp not in churned_states:
+                    churned_states.add(fp)
+                    churn_now = True
+                    churn_hint = (
+                        "CHURN: this edit has returned to an arrangement you already "
+                        "built earlier -- you're cycling (revert / swap-back / place-"
+                        "remove-place) without net progress. Treat this as a CEILING: "
+                        "pick the best version you have and MOVE ON (accept + surface "
+                        "the trade-off with wrap_up), rather than trying the same "
+                        "swap again.")
+                seen_states.setdefault(fp, turn)
+        except Exception:
+            logger.exception("tools: churn detection failed (continuing)")
+        # brain_mirror_readside.plan.md section 4.2: push the always-present
+        # mirror after EVERY tool call (not only when a sense is explicitly
+        # called) -- a plain text block alongside this iteration's tool_result
+        # blocks (a user-role message may legally mix both), so the brain
+        # sees the CURRENT join/speech/flag state before its next move. Pure
+        # + idempotent (observe.mirror), so pushing it every step can never
+        # itself thrash the loop.
+        mirror_text = observe.mirror_text(working, ctx)
+        if mirror_text:
+            results.append(text_block(mirror_text))
+        # brain_plan_mechanism.plan.md §4.2: the PLAN mirror, pushed the same
+        # way -- so a set_plan this round is reflected immediately, and building
+        # WITHOUT a plan is nudged (building=changed makes the absence loud only
+        # once the edit has actually moved this turn).
+        plan_text = observe.plan_mirror_text(working, building=changed)
+        if plan_text:
+            results.append(text_block(plan_text))
+        # brain_loop_convergence.plan.md Part 1: per-turn budget/progress +
+        # convergence discipline, and a churn hint when the edit is not making
+        # progress (returned to a prior state). Advisory text blocks, same shape
+        # as the mirrors; pure + fail-open (never mutate the edit or reply).
+        results.append(text_block(_progress_note(turn, max_turns, churn=churn_now)))
+        if churn_hint:
+            results.append(text_block(churn_hint))
         convo.append(user_message(results))
         # ask_user PAUSES the turn: the user's next message is the answer.
         if asked and questions:
+            exit_reason = "asked"
             break
     else:
-        logger.info("tools: hit max_turns=%d; wrapping up", max_turns)
+        logger.info("tools: hit max_turns=%d; finalizing", max_turns)
+
+    # brain_accountability_architecture.plan.md PART 1: the ONE finalization
+    # choke point. Unconditional on the exit path -- no `finished_clean`, no
+    # `not questions and not …` guard chain deciding whether the invariants get
+    # to run. Whether anything is outstanding is read off the declared ladder.
+    edit_moved = changed   # PART 4 will define edit_moved properly; until then an alias
+    working = _finalize_turn(
+        llm, system=system, convo=convo, ctx=ctx, working=working, tools=tools,
+        state=verify, steps=steps, user_ask=user_ask, trace=trace,
+        edit_moved=edit_moved, questions=questions, exit_reason=exit_reason,
+        max_tokens=max_tokens)
 
     awaiting = bool(questions)
-    reply = last_text or (
+    # brain_plan_conformance.plan.md Part A: the user-facing reply prefers the
+    # brain's deliberate wrap-up (act.wrap_up -> document["summary"]) over the
+    # last internal prose line, so a finished edit surfaces a clean recap (and
+    # any compromise) instead of leftover craft reasoning. Falls back to
+    # last_text (chat turns, no-op turns) so nothing regresses.
+    summary = (working.get("summary") or "").strip()
+    reply = (summary if summary and not awaiting else last_text) or (
         "Before I go further I need your call on a couple of things below."
         if awaiting else "Done.")
     return LoopResult(reply=reply, document=working, changed=changed, steps=steps,

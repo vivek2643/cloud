@@ -14,8 +14,13 @@ a V2 ``place_video`` op; audio beds are A2 ``place_audio`` ops. ``place`` writes
 onto V1 or V2; the span-level verbs (``trim``/``set_audio``) act on whichever
 clip owns the id.
 
-Every verb is total: an unknown id or illegal arg is a no-op returning the doc
-unchanged (the caller diagnoses), never an exception that could crash a turn.
+Every verb is total: an unknown id, out-of-domain target, or a request that
+produces no (or a degenerate) change is a REJECT -- `raise EditReject(reason)`,
+the sanctioned, loop-caught reject channel (brain_loop_convergence.plan.md Part
+3): `tools._dispatch` catches it and surfaces `applied=false` + the reason to
+the brain the SAME turn. It never escapes the loop and never crashes a turn --
+the totality contract holds at the loop boundary, just with a legible reason
+attached instead of a silent no-op.
 """
 from __future__ import annotations
 
@@ -28,6 +33,20 @@ from app.services.l3.grade.arc import ARC_INTENTS
 from app.services.l3.grade.cdl import Grade, compose
 from app.services.l3.grade.steer import solve_steer_grade
 from app.services.l3.arrange import Placement, ResolvedCut, _MapIndex
+
+
+class EditReject(Exception):
+    """A verb's STRUCTURED rejection of an inapplicable request -- an unknown id,
+    an out-of-domain target, or an argument that produces no (or a degenerate)
+    change. Carries a plain-language `reason` the loop surfaces to the brain the
+    SAME turn (tools._dispatch catches it -> applied=false + reason), so the brain
+    corrects in one turn instead of discovering the no-op later via review. It
+    NEVER escapes the loop -- _dispatch converts it to feedback -- so a verb still
+    never crashes a turn (the totality contract holds at the loop boundary)."""
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
 
 # Pacing scale for `retime`, broad..sharp (index 0..4). Maps onto a video cut's
 # cross-clip-normalized ``pace.levels`` (idx 2 = the cut's ~natural 1x); for a
@@ -130,14 +149,16 @@ def place_span(document: dict, file_id: str, *, in_ms: int, out_ms: int,
     channel="V1": insert on the main line at index ``at`` (default append).
     channel="V2": lay a video cutaway over the program at ``from_ms``.
     ``axis="speech"`` marks the span as audio-load-bearing (protects it in the
-    weld/coverage). Boundaries are expected to be seam-snapped by the caller.
-    Empty/invalid span or missing file -> unchanged doc."""
+    weld/coverage). Boundaries are expected to be seam-snapped by the caller."""
     try:
         a, b = int(in_ms), int(out_ms)
     except (TypeError, ValueError):
-        return document
-    if not file_id or b <= a:
-        return document
+        raise EditReject(f"in_ms/out_ms must be integers (got in_ms={in_ms!r}, "
+                         f"out_ms={out_ms!r}).")
+    if not file_id:
+        raise EditReject("place_span needs a file_id.")
+    if b <= a:
+        raise EditReject(f"place_span's span collapses (out {b}ms <= in {a}ms).")
 
     doc = _clone(document)
     if channel.upper() == "V1":
@@ -201,20 +222,22 @@ def place(document: dict, index: _MapIndex, ref: str, *,
     ``piece`` (v4_cluster_read_act.plan.md Part C): place just ONE beat of a
     multi-beat cluster (the 1-based position shown in the Beat Index /
     read_state) instead of the whole moment; ``level`` is ignored when set.
-    Unknown/illegal ref, or an out-of-range/inapplicable piece -> unchanged doc.
     """
     p = Placement(ref=ref, level=level, track=(0 if channel.upper() == "V1" else 1),
                   from_ms=from_ms, reason=reason, audio=audio, piece=piece)
     rc = index.resolve(p)
     if rc is None:
-        return document
+        raise EditReject(f"no placeable moment matching ref '{ref}' at level "
+                         f"'{level}'" + (f" piece {piece}" if piece is not None else "")
+                         + " -- unknown ref, or piece out of range.")
     rc = _snap_cut_to_sentences(rc)
     doc = _clone(document)
 
     if channel.upper() == "V1":
         segs = _segments_from_cut(rc)
         if not segs:
-            return document
+            raise EditReject(f"ref '{ref}' resolved to no placeable span (its keep_spans "
+                             "excise the whole cut).")
         tl = doc["timeline"]
         idx = len(tl) if at is None else max(0, min(int(at), len(tl)))
         doc["timeline"] = tl[:idx] + segs + tl[idx:]
@@ -270,23 +293,27 @@ def place_audio(
 
     `duck_db` defaults to 0 (no duck) -- ``layers._apply_levels`` only ever
     ducks when the caller (the brain, via this op or the `duck` verb)
-    explicitly sets it negative. Illegal role/window/source -> unchanged doc."""
-    if role not in _AUDIO_ROLES or not source_file_id:
-        return document
+    explicitly sets it negative."""
+    if role not in _AUDIO_ROLES:
+        raise EditReject(f"role must be one of {sorted(_AUDIO_ROLES)} (got {role!r}).")
+    if not source_file_id:
+        raise EditReject("place_audio needs a source file id.")
     try:
         f, t = int(from_ms), int(to_ms)
         s_in = max(0, int(src_in_ms))
     except (TypeError, ValueError):
-        return document
+        raise EditReject(f"from_ms/to_ms/src_in_ms must be integers (got "
+                         f"from_ms={from_ms!r}, to_ms={to_ms!r}, src_in_ms={src_in_ms!r}).")
     if t <= f:
-        return document
+        raise EditReject(f"place_audio's program window collapses (to_ms {t}ms <= "
+                         f"from_ms {f}ms).")
     window = t - f
 
     if src_out_ms is not None:
         try:
             s_out = int(src_out_ms)
         except (TypeError, ValueError):
-            return document
+            raise EditReject(f"src_out_ms must be an integer (got {src_out_ms!r}).")
     elif asset_dur_ms is not None:
         s_out = min(int(asset_dur_ms), s_in + window)
     else:
@@ -296,7 +323,8 @@ def place_audio(
     if asset_dur_ms is not None:
         s_out = min(s_out, int(asset_dur_ms))
     if s_out <= s_in:
-        return document
+        raise EditReject(f"place_audio's source span collapses (src_out {s_out}ms <= "
+                         f"src_in {s_in}ms) -- the asset may be shorter than src_in_ms.")
 
     doc = _clone(document)
     doc["operations"].append({
@@ -316,21 +344,24 @@ def place_audio(
 def set_gain(document: dict, target_id: str, *, gain_db: float) -> dict:
     """Set a layer's OWN level (dB) -- a main-line seg's coupled audio, or an
     A2 `place_audio` bed. Separate from `duck` (a side-chain reduction applied
-    only where a bed overlaps dialogue); this is the layer's base level.
-    Illegal id or value -> unchanged doc."""
+    only where a bed overlaps dialogue); this is the layer's base level."""
     try:
         g = float(gain_db)
     except (TypeError, ValueError):
-        return document
+        raise EditReject(f"gain_db must be a number (got {gain_db!r}).")
     doc = _clone(document)
     seg = next((s for s in doc["timeline"] if s.get("seg_id") == target_id), None)
     if seg is not None:
+        if seg.get("gain_db") == g:
+            raise EditReject(f"gain_db is already {g} for '{target_id}' -- unchanged.")
         seg["gain_db"] = g
         return doc
     op = next((o for o in doc["operations"]
                if o.get("op_id") == target_id and o.get("type") == "place_audio"), None)
     if op is None:
-        return document
+        raise EditReject(f"no main-line cut or place_audio bed with id '{target_id}'.")
+    if op.get("gain_db") == g:
+        raise EditReject(f"gain_db is already {g} for '{target_id}' -- unchanged.")
     op["gain_db"] = g
     return doc
 
@@ -340,17 +371,18 @@ def duck(document: dict, target_id: str, *, amount_db: float) -> dict:
     it overlaps live spine dialogue (`layers._apply_levels`); 0 clears it.
     There is no auto-duck: a bed ducks only by what this (or `place_audio`)
     sets. Only targets a `place_audio` op -- the live spine track is never a
-    valid target (nothing ducks it; it's what other beds duck under).
-    Illegal id or value -> unchanged doc."""
+    valid target (nothing ducks it; it's what other beds duck under)."""
     try:
         d = float(amount_db)
     except (TypeError, ValueError):
-        return document
+        raise EditReject(f"amount_db must be a number (got {amount_db!r}).")
     doc = _clone(document)
     op = next((o for o in doc["operations"]
                if o.get("op_id") == target_id and o.get("type") == "place_audio"), None)
     if op is None:
-        return document
+        raise EditReject(f"no place_audio bed with id '{target_id}'.")
+    if op.get("duck_db") == d:
+        raise EditReject(f"duck_db is already {d} for '{target_id}' -- unchanged.")
     op["duck_db"] = d
     return doc
 
@@ -360,24 +392,27 @@ def fade_audio(document: dict, target_id: str, *,
     """Set a fade envelope on a layer's own edges -- a main-line seg's coupled
     audio, or an A2 bed. `in_ms`/`out_ms` are fade DURATIONS in ms (0 clears
     that edge); an omitted edge is left as-is. Hard start/stop by default --
-    nothing fades unless this sets it. Illegal id/value or both edges omitted
-    -> unchanged doc."""
+    nothing fades unless this sets it."""
     if in_ms is None and out_ms is None:
-        return document
+        raise EditReject("fade_audio needs at least one of in_ms/out_ms.")
     try:
         f_in = int(in_ms) if in_ms is not None else None
         f_out = int(out_ms) if out_ms is not None else None
     except (TypeError, ValueError):
-        return document
+        raise EditReject(f"in_ms/out_ms must be integers (got in_ms={in_ms!r}, "
+                         f"out_ms={out_ms!r}).")
     if (f_in is not None and f_in < 0) or (f_out is not None and f_out < 0):
-        return document
+        raise EditReject(f"fade durations must be >= 0 (got in_ms={f_in}, out_ms={f_out}).")
     doc = _clone(document)
     target = next((s for s in doc["timeline"] if s.get("seg_id") == target_id), None)
     if target is None:
         target = next((o for o in doc["operations"]
                       if o.get("op_id") == target_id and o.get("type") == "place_audio"), None)
     if target is None:
-        return document
+        raise EditReject(f"no main-line cut or place_audio bed with id '{target_id}'.")
+    provided = [(k, v) for k, v in (("fade_in_ms", f_in), ("fade_out_ms", f_out)) if v is not None]
+    if provided and all(target.get(k) == v for k, v in provided):
+        raise EditReject("fade_audio: the given edge(s) already match the current fade -- unchanged.")
     if f_in is not None:
         target["fade_in_ms"] = f_in
     if f_out is not None:
@@ -391,18 +426,25 @@ def crossfade(document: dict, seam_seg_id: str, *, ms: int) -> dict:
     `ms` (split evenly, each extending toward the other) and fade across that
     overlap (`layers._apply_crossfades`). One crossfade per seam (re-issuing
     replaces); `ms<=0` clears. The first segment has no seam before it, and a
-    negative `ms` makes no sense here (unlike `split_edit`'s signed J/L offset)
-    -> unchanged doc."""
+    negative `ms` makes no sense here (unlike `split_edit`'s signed J/L offset)."""
     try:
         m = int(ms)
     except (TypeError, ValueError):
-        return document
+        raise EditReject(f"ms must be an integer (got {ms!r}).")
     if m < 0:
-        return document
+        raise EditReject(f"ms must be >= 0 (got {m}); crossfade has no signed J/L sense "
+                         "like split_edit's audio_offset_ms.")
     timeline = document.get("timeline") or []
     i = next((idx for idx, s in enumerate(timeline) if s.get("seg_id") == seam_seg_id), None)
     if i is None or i == 0:
-        return document
+        raise EditReject(f"no seam before '{seam_seg_id}' -- unknown id, or it's the "
+                         "first main-line cut (no seam precedes it).")
+    existing = next((o for o in document.get("operations") or []
+                     if o.get("type") == "crossfade" and o.get("seam_seg_id") == seam_seg_id), None)
+    if m == 0 and existing is None:
+        raise EditReject(f"no crossfade at the seam before '{seam_seg_id}' to clear.")
+    if existing is not None and m > 0 and existing.get("ms") == m:
+        raise EditReject(f"crossfade at the seam before '{seam_seg_id}' is already {m}ms -- unchanged.")
     doc = _clone(document)
     doc["operations"] = [
         o for o in doc["operations"]
@@ -422,20 +464,25 @@ def replace_audio(document: dict, target_id: str, *,
     the escape hatch for outlook authoritative routing (audio_sync.plan.md):
     this wins over the auto-computed route (`layers.resolve` checks the
     override first). Also the general tool for swapping a cut's sound to any
-    other file's span regardless of routing. Illegal seg/span -> unchanged doc."""
+    other file's span regardless of routing."""
     try:
         s_in, s_out = int(src_in_ms), int(src_out_ms)
     except (TypeError, ValueError):
-        return document
-    if not source_file_id or s_out <= s_in:
-        return document
+        raise EditReject(f"src_in_ms/src_out_ms must be integers (got "
+                         f"src_in_ms={src_in_ms!r}, src_out_ms={src_out_ms!r}).")
+    if not source_file_id:
+        raise EditReject("replace_audio needs a source file id.")
+    if s_out <= s_in:
+        raise EditReject(f"replace_audio's span collapses (src_out {s_out}ms <= "
+                         f"src_in {s_in}ms).")
     doc = _clone(document)
     seg = next((s for s in doc["timeline"] if s.get("seg_id") == target_id), None)
     if seg is None:
-        return document
-    seg["audio_override"] = {
-        "source_file_id": source_file_id, "src_in_ms": s_in, "src_out_ms": s_out,
-    }
+        raise EditReject(f"no main-line cut with id '{target_id}'.")
+    new_override = {"source_file_id": source_file_id, "src_in_ms": s_in, "src_out_ms": s_out}
+    if seg.get("audio_override") == new_override:
+        raise EditReject(f"'{target_id}' already has this exact audio override -- unchanged.")
+    seg["audio_override"] = new_override
     return doc
 
 
@@ -472,7 +519,8 @@ def remove(document: dict, target_id: str) -> dict:
         doc.pop("layout_regions", None)
     after = len(doc["timeline"]) + len(doc["operations"]) + len(kept_regions)
     if after == before:
-        return document  # nothing matched -> unchanged
+        raise EditReject(f"no main-line cut, operation, or layout region with id "
+                         f"'{target_id}' -- nothing removed.")
     return doc
 
 
@@ -483,33 +531,37 @@ def move(document: dict, target_id: str,
     start at program ``to_ms``, keeping its own duration (audio_brain.plan.md:
     extends this one verb to beds instead of a separate op-reposition verb).
     Exactly one of ``to_index``/``to_ms`` applies, matching whichever kind of
-    id ``target_id`` resolves to; neither given, or the id doesn't match that
-    kind -> unchanged doc."""
+    id ``target_id`` resolves to."""
     doc = _clone(document)
     if to_index is not None:
         tl = doc["timeline"]
         src = next((i for i, s in enumerate(tl) if s.get("seg_id") == target_id), None)
         if src is None:
-            return document
+            raise EditReject(f"no main-line cut with id '{target_id}'.")
+        dst = max(0, min(int(to_index), len(tl) - 1))
+        if dst == src:
+            raise EditReject(f"'{target_id}' is already at index {src} -- unchanged.")
         seg = tl.pop(src)
-        dst = max(0, min(int(to_index), len(tl)))
         tl.insert(dst, seg)
         return doc
     if to_ms is not None:
         op = next((o for o in doc["operations"] if o.get("op_id") == target_id
                    and o.get("type") in ("place_video", "place_audio")), None)
         if op is None:
-            return document
+            raise EditReject(f"no V2/A2 operation with id '{target_id}'.")
         try:
             new_from = max(0, int(to_ms))
         except (TypeError, ValueError):
-            return document
+            raise EditReject(f"to_ms must be an integer (got {to_ms!r}).")
         dur = int(op.get("to_ms", 0)) - int(op.get("from_ms", 0))
         if dur <= 0:
-            return document
+            raise EditReject(f"'{target_id}' has a degenerate duration ({dur}ms) -- cannot move.")
+        if new_from == int(op.get("from_ms", 0)):
+            raise EditReject(f"'{target_id}' is already at from_ms={new_from} -- unchanged.")
         op["from_ms"], op["to_ms"] = new_from, new_from + dur
         return doc
-    return document
+    raise EditReject("move needs exactly one of to_index (for a main-line cut) or "
+                     "to_ms (for a V2/A2 operation).")
 
 
 def trim(document: dict, target_id: str, *,
@@ -521,7 +573,10 @@ def trim(document: dict, target_id: str, *,
 
     Absolute (``in_ms``/``out_ms``) or relative (``delta_in_ms``/``delta_out_ms``,
     e.g. delta_in_ms=+200 nudges the in-point 200ms later). The result is clamped
-    so out stays > in; a no-op span is rejected (unchanged doc)."""
+    so out stays > in."""
+    if in_ms is None and out_ms is None and delta_in_ms is None and delta_out_ms is None:
+        raise EditReject("trim needs a source edit: in_ms/out_ms (ABSOLUTE source "
+                         "ms) or delta_in_ms/delta_out_ms (RELATIVE nudge).")
     doc = _clone(document)
     seg = next((s for s in doc["timeline"] if s.get("seg_id") == target_id), None)
     if seg is not None:
@@ -530,19 +585,30 @@ def trim(document: dict, target_id: str, *,
         new_out = int(out_ms) if out_ms is not None else cur_out + int(delta_out_ms or 0)
         new_in = max(0, new_in)
         if new_out <= new_in:
-            return document
+            raise EditReject(
+                f"trim collapses the span (out {new_out}ms <= in {new_in}ms). "
+                "in_ms/out_ms are ABSOLUTE source times; to nudge by a relative "
+                "amount pass delta_in_ms/delta_out_ms instead.")
+        if new_in == cur_in and new_out == cur_out:
+            raise EditReject("trim leaves the span unchanged -- the in/out you gave "
+                             "equal the current span.")
         seg["in_ms"], seg["out_ms"] = new_in, new_out
         return doc
     op = next((o for o in doc["operations"] if o.get("op_id") == target_id
                and o.get("type") in ("place_video", "place_audio")), None)
     if op is None:
-        return document
+        raise EditReject(f"no main-line cut or trimmable op with id '{target_id}'.")
     cur_in, cur_out = int(op["src_in_ms"]), int(op["src_out_ms"])
     new_in = int(in_ms) if in_ms is not None else cur_in + int(delta_in_ms or 0)
     new_out = int(out_ms) if out_ms is not None else cur_out + int(delta_out_ms or 0)
     new_in = max(0, new_in)
     if new_out <= new_in:
-        return document
+        raise EditReject(
+            f"trim collapses this {op['type']} op's span (out {new_out}ms <= in "
+            f"{new_in}ms). in_ms/out_ms are ABSOLUTE source times; use "
+            "delta_in_ms/delta_out_ms for a relative nudge.")
+    if new_in == cur_in and new_out == cur_out:
+        raise EditReject("trim leaves this op's source span unchanged.")
     op["src_in_ms"], op["src_out_ms"] = new_in, new_out
     op["to_ms"] = int(op.get("from_ms", 0)) + (new_out - new_in)
     return doc
@@ -557,18 +623,26 @@ def split_edit(document: dict, seam_seg_id: str, *, audio_offset_ms: int) -> dic
     previous picture. offset 0 clears any existing split at that seam.
 
     One split per seam: re-issuing replaces the previous offset. The first
-    segment has no seam before it -> unchanged doc. The offset itself is applied
-    at resolve time (``layers._apply_split_edits``), so it survives welds that
-    keep the seam and simply no-ops if the seam disappears."""
+    segment has no seam before it. The offset itself is applied at resolve time
+    (``layers._apply_split_edits``), so it survives welds that keep the seam and
+    simply no-ops if the seam disappears."""
     try:
         offset = int(audio_offset_ms)
     except (TypeError, ValueError):
-        return document
+        raise EditReject(f"audio_offset_ms must be an integer (got {audio_offset_ms!r}).")
     timeline = document.get("timeline") or []
     idx = next((i for i, s in enumerate(timeline)
                 if s.get("seg_id") == seam_seg_id), None)
     if idx is None or idx == 0:
-        return document
+        raise EditReject(f"no seam before '{seam_seg_id}' -- unknown id, or it's the "
+                         "first main-line cut (no seam precedes it).")
+    existing = next((o for o in document.get("operations") or []
+                     if o.get("type") == "split_edit" and o.get("seam_seg_id") == seam_seg_id), None)
+    if offset == 0 and existing is None:
+        raise EditReject(f"no split_edit at the seam before '{seam_seg_id}' to clear.")
+    if existing is not None and offset != 0 and existing.get("audio_offset_ms") == offset:
+        raise EditReject(f"split_edit at the seam before '{seam_seg_id}' is already "
+                         f"audio_offset_ms={offset} -- unchanged.")
 
     doc = _clone(document)
     ops = [o for o in doc["operations"]
@@ -591,12 +665,16 @@ def set_audio(document: dict, target_id: str, *, mute: bool) -> dict:
     doc = _clone(document)
     seg = next((s for s in doc["timeline"] if s.get("seg_id") == target_id), None)
     if seg is not None:
+        if bool(seg.get("mute")) == bool(mute):
+            raise EditReject(f"'{target_id}' is already {'muted' if mute else 'unmuted'} -- unchanged.")
         seg["mute"] = True if mute else None
         return doc
     op = next((o for o in doc["operations"]
                if o.get("op_id") == target_id and o.get("type") == "place_video"), None)
     if op is None:
-        return document
+        raise EditReject(f"no main-line cut or V2 cutaway with id '{target_id}'.")
+    if bool(op.get("mute")) == bool(mute):
+        raise EditReject(f"'{target_id}' is already {'muted' if mute else 'unmuted'} -- unchanged.")
     op["mute"] = bool(mute)
     return doc
 
@@ -605,19 +683,85 @@ def set_arc_intent(document: dict, target_id: str, *, intent: str) -> dict:
     """Tag a main-line segment (A1) or a V2 cutaway with its position in the
     emotional arc (one of ARC_INTENTS): calm/build/peak/resolve. Invisible
     by default -- has no effect until the user's arc intensity dial is
-    raised above 0. An unrecognized intent is a no-op (the caller diagnoses)."""
+    raised above 0."""
     if intent not in ARC_INTENTS:
-        return document
+        raise EditReject(f"intent must be one of {sorted(ARC_INTENTS)} (got {intent!r}).")
     doc = _clone(document)
     seg = next((s for s in doc["timeline"] if s.get("seg_id") == target_id), None)
     if seg is not None:
+        if seg.get("arc_intent") == intent:
+            raise EditReject(f"'{target_id}' is already tagged arc_intent={intent!r} -- unchanged.")
         seg["arc_intent"] = intent
         return doc
     op = next((o for o in doc["operations"]
                if o.get("op_id") == target_id and o.get("type") == "place_video"), None)
     if op is None:
-        return document
+        raise EditReject(f"no main-line cut or V2 cutaway with id '{target_id}'.")
+    if op.get("arc_intent") == intent:
+        raise EditReject(f"'{target_id}' is already tagged arc_intent={intent!r} -- unchanged.")
     op["arc_intent"] = intent
+    return doc
+
+
+_BEAT_NEEDS = ("required", "optional")
+
+
+def _norm_beat(entry) -> dict | None:
+    """Normalize one `structure` entry to a beat {beat, need}. Accepts a
+    {beat, need} dict OR a bare string (the LLM's old habit); an empty beat
+    is dropped (returns None). `need` defaults to 'required' -- a beat is a
+    commitment unless the brain explicitly marks it optional
+    (brain_plan_altitude.plan.md SS2.1)."""
+    if isinstance(entry, dict):
+        beat = str(entry.get("beat") or "").strip()
+        need = entry.get("need")
+    else:
+        beat, need = str(entry or "").strip(), None
+    if not beat:
+        return None
+    return {"beat": beat, "need": need if need in _BEAT_NEEDS else "required"}
+
+
+def set_plan(document: dict, *, purpose=None, carries=None,
+             structure=None, watch=None, note=None) -> dict:
+    """Write/replace document['plan'] -- the brain's durable, ordered plan
+    (brain_plan_mechanism.plan.md). Full replace of the plan block; bumps
+    `rev` and records an optional `updated_note`. `structure` entries are
+    normalized to {beat, need} beats (brain_plan_altitude.plan.md). Pure:
+    returns a new doc."""
+    doc = _clone(document)
+    prev_rev = int((document.get("plan") or {}).get("rev") or 0)
+    plan = {
+        "purpose": (purpose or "").strip() or None,
+        "carries": [str(c).strip() for c in (carries or []) if str(c).strip()],
+        "structure": [b for b in (_norm_beat(s) for s in (structure or [])) if b],
+        "watch": [str(w).strip() for w in (watch or []) if str(w).strip()],
+        "rev": prev_rev + 1,
+    }
+    if note and note.strip():
+        plan["updated_note"] = note.strip()
+    doc["plan"] = plan
+    return doc
+
+
+def wrap_up(document: dict, *, summary=None, open_questions=None, notes=None) -> dict:
+    """Write the user-facing WRAP-UP onto the document's surface fields
+    (brain_plan_conformance.plan.md Part A): `summary` -- one short, clean
+    user-facing recap of what you built and, when one exists, the compromise
+    you made and why; `open_questions` / `notes` -- anything the user should
+    decide or know. This is the ONLY brain write path to the surface the API
+    shows the user (GET /threads/{id}: open_questions; the stored reply/summary).
+    Full replace of whichever field is passed; a field left None is untouched.
+    Pure: returns a new doc (so the turn persists and the reply carries it)."""
+    if summary is None and open_questions is None and notes is None:
+        return document
+    doc = _clone(document)
+    if summary is not None:
+        doc["summary"] = str(summary).strip()
+    if open_questions is not None:
+        doc["open_questions"] = [str(q).strip() for q in open_questions if str(q).strip()]
+    if notes is not None:
+        doc["notes"] = [str(n).strip() for n in notes if str(n).strip()]
     return doc
 
 
@@ -636,13 +780,12 @@ def set_grade(
     CDL delta (grade.steer.solve_steer_grade), composed onto whatever grade
     override the target already has (stacks with earlier steers instead of
     replacing them). With target_id -> that cut; without -> every main-line
-    cut (a whole-document steer). A no-op (identical dials) or an unknown
-    target_id is a no-op, matching every other verb's contract."""
+    cut (a whole-document steer)."""
     delta = solve_steer_grade(
         warmth=warmth, tint=tint, brightness=brightness, contrast=contrast, saturation=saturation,
     )
     if delta == Grade():
-        return document
+        raise EditReject("set_grade's dials are all 0/omitted -- nothing to nudge.")
 
     doc = _clone(document)
     if target_id:
@@ -653,11 +796,11 @@ def set_grade(
                        if o.get("op_id") == target_id and o.get("type") == "place_video"), None)
             targets = [op] if op is not None else []
         if not targets:
-            return document
+            raise EditReject(f"no main-line cut or V2 cutaway with id '{target_id}'.")
     else:
         targets = list(doc["timeline"]) + [o for o in doc["operations"] if o.get("type") == "place_video"]
     if not targets:
-        return document
+        raise EditReject("no cuts to grade -- the timeline is empty.")
 
     for t in targets:
         existing = Grade.from_dict(t.get("grade"))
@@ -689,35 +832,41 @@ def split_screen(document: dict, index: _MapIndex, ref: Optional[str] = None, *,
     REGION assigning the spine to one cell and the op to the other per the template
     (split_h/split_v/pip). The added cell is silent by default (audio="keep" plays
     its sound). This is a user-owned look -- the brain should ``ask_user`` before
-    calling it. Unknown template / no source / bad window -> unchanged doc."""
+    calling it."""
     cells = _SPLIT_CELLS.get(template)
     if cells is None:
-        return document
+        raise EditReject(f"template must be one of {sorted(_SPLIT_CELLS)} (got {template!r}).")
     # Resolve the added source: a map ref, else a raw (file, in, out) window.
     if ref:
         rc = index.resolve(Placement(ref=ref, level=level))
         if rc is None:
-            return document
+            raise EditReject(f"no placeable moment matching ref '{ref}' at level '{level}'.")
         src_file, src_in, src_out = rc.file_id, int(rc.src_in_ms), int(rc.src_out_ms)
     elif file and in_ms is not None and out_ms is not None:
         try:
             src_in, src_out = int(in_ms), int(out_ms)
         except (TypeError, ValueError):
-            return document
+            raise EditReject(f"in_ms/out_ms must be integers (got in_ms={in_ms!r}, "
+                             f"out_ms={out_ms!r}).")
         if src_out <= src_in:
-            return document
+            raise EditReject(f"the second cell's source window collapses (out "
+                             f"{src_out}ms <= in {src_in}ms).")
         src_file = file
     else:
-        return document
+        raise EditReject("split_screen needs a second-cell source: either `ref` "
+                         "(a map moment) or `file`+`in_ms`+`out_ms` (a raw window).")
     try:
         f, t = int(from_ms), int(to_ms)
     except (TypeError, ValueError):
-        return document
+        raise EditReject(f"from_ms/to_ms must be integers (got from_ms={from_ms!r}, "
+                         f"to_ms={to_ms!r}).")
     if t <= f:
-        return document
+        raise EditReject(f"the program window collapses (to_ms {t}ms <= from_ms {f}ms).")
     span = min(t - f, src_out - src_in)
     if span < 200:
-        return document
+        raise EditReject(f"the resulting split-screen span ({span}ms, the shorter of "
+                         "the program window and the source window) is under the "
+                         "200ms floor.")
 
     doc = _clone(document)
     doc.setdefault("layout_regions", list(document.get("layout_regions") or []))
@@ -760,6 +909,9 @@ def tighten(document: dict, index: _MapIndex, *,
     map ref and a variant at ``level``. A cut whose ref lacks that level is left
     as-is (partial tighten is fine). Re-resolves each cut's span from the map at
     the new level, preserving order + provenance."""
+    if seg_id is not None and not any(
+            s.get("seg_id") == seg_id for s in document.get("timeline") or []):
+        raise EditReject(f"no main-line cut with id '{seg_id}'.")
     doc = _clone(document)
     changed = False
     new_tl: List[dict] = []
@@ -784,7 +936,9 @@ def tighten(document: dict, index: _MapIndex, *,
                     continue
         new_tl.append(seg)
     if not changed:
-        return document
+        if seg_id is not None:
+            raise EditReject(f"'{seg_id}' has no '{level}' variant to tighten to.")
+        raise EditReject(f"no main-line cut has a '{level}' variant to tighten to.")
     doc["timeline"] = new_tl
     return doc
 
@@ -811,16 +965,16 @@ def retime(document: dict, index: _MapIndex, *,
         source spans).
 
     With ``seg_id`` -> just that cut; without -> every main-line cut. A cut whose
-    ref/pace envelope is unknown is left as-is. Unknown ``pace`` -> unchanged."""
+    ref/pace envelope is unknown is left as-is."""
     if pace not in _PACE_STEPS:
-        return document
+        raise EditReject(f"pace must be one of {_PACE_STEPS} (got {pace!r}).")
     idx = _PACE_STEPS.index(pace)
     tl = document.get("timeline") or []
     focus = None
     if seg_id is not None:
         focus = next((s for s in tl if s.get("seg_id") == seg_id), None)
         if focus is None:
-            return document
+            raise EditReject(f"no main-line cut with id '{seg_id}'.")
     focus_ref = focus.get("ref") if focus is not None else None
 
     doc = _clone(document)
@@ -882,6 +1036,8 @@ def retime(document: dict, index: _MapIndex, *,
             new_tl.append(slc)
         changed = True
     if not changed:
-        return document
+        if seg_id is not None:
+            raise EditReject(f"'{seg_id}' has no known ref/pace envelope to retime.")
+        raise EditReject("no main-line cut has a known ref/pace envelope to retime.")
     doc["timeline"] = new_tl
     return doc
