@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BACKEND = os.path.dirname(HERE)
@@ -139,6 +140,116 @@ def test_audio_mute_rule():
     audio, mute, flags = cm._audio_mute_for("done", _row(pace={"natural_sound": False}))
     assert audio == "silent" and mute is True and flags == ["muted"]
     print("ok  test_audio_mute_rule")
+
+
+# --------------------------------------------------------------------------
+# brain_mirror_readside.plan.md section 3.2: transcript-truth speech
+# labeling -- mute is a GATED decision, never a blind channel/natural_sound
+# call, once the span's own transcript carries words (band-aid C retired).
+# --------------------------------------------------------------------------
+
+def test_audio_mute_gate_spoken_narration_under_a_shown_cut_is_never_muted():
+    """The exact band-aid-C regression: a slide/screen cut whose span
+    carries genuine spoken narration (not musical/ambient) must NOT be
+    auto-muted, regardless of channel or pace.natural_sound."""
+    with patch.object(cm, "speech_words_in_span", return_value=(12, True, False)):
+        audio, mute, flags = cm._audio_mute_for("shown", _row(pace={"natural_sound": False}))
+    assert audio == "speech" and mute is False, (audio, mute, flags)
+    assert flags == ["speech", "incidental"], flags
+    print("ok  test_audio_mute_gate_spoken_narration_under_a_shown_cut_is_never_muted")
+
+
+def test_audio_mute_gate_musical_words_under_a_shown_cut_are_muted_with_flag():
+    """Words present but musical/ambient (a singer's lyrics, an ambient
+    bed with vocals) -- mute by default, same as before, but the choice is
+    now VISIBLE to the brain via the incidental+muted flags, never silent."""
+    with patch.object(cm, "speech_words_in_span", return_value=(8, True, True)):
+        audio, mute, flags = cm._audio_mute_for("done", _row(pace={"natural_sound": True}))
+    assert audio == "speech" and mute is True, (audio, mute, flags)
+    assert flags == ["speech", "incidental", "muted"], flags
+    print("ok  test_audio_mute_gate_musical_words_under_a_shown_cut_are_muted_with_flag")
+
+
+def test_audio_mute_gate_falls_back_to_natural_sound_when_genuinely_silent():
+    """No transcript words at all over the span -- unchanged behavior, the
+    pace envelope's own natural_sound judgment decides."""
+    with patch.object(cm, "speech_words_in_span", return_value=(0, False, False)):
+        audio, mute, flags = cm._audio_mute_for("shown", _row(pace={"natural_sound": True}))
+    assert audio == "sound" and mute is False and flags == []
+    with patch.object(cm, "speech_words_in_span", return_value=(0, False, False)):
+        audio, mute, flags = cm._audio_mute_for("done", _row(pace={"natural_sound": False}))
+    assert audio == "silent" and mute is True and flags == ["muted"]
+    print("ok  test_audio_mute_gate_falls_back_to_natural_sound_when_genuinely_silent")
+
+
+def test_audio_mute_gate_said_channel_never_consults_the_transcript_gate():
+    """A `said` cut short-circuits before speech_words_in_span is even
+    called -- its audio IS the point, unconditionally."""
+    with patch.object(cm, "speech_words_in_span") as mock_words:
+        audio, mute, flags = cm._audio_mute_for("said", _row())
+    mock_words.assert_not_called()
+    assert audio is None and mute is False and flags == []
+    print("ok  test_audio_mute_gate_said_channel_never_consults_the_transcript_gate")
+
+
+def test_speech_words_in_span_counts_overlapping_words_only():
+    words = ({"start_ms": 900, "end_ms": 1100, "text": "hi"},
+             {"start_ms": 2000, "end_ms": 2200, "text": "there"},
+             {"start_ms": 5000, "end_ms": 5200, "text": "later"})
+    with patch.object(cm, "_words_for_file", return_value=words), \
+         patch.object(cm, "_file_is_musical", return_value=False):
+        n, has_speech, is_musical = cm.speech_words_in_span("f1", 1000, 3000)
+    assert n == 2 and has_speech is True and is_musical is False, (n, has_speech, is_musical)
+    print("ok  test_speech_words_in_span_counts_overlapping_words_only")
+
+
+def test_speech_words_in_span_no_overlap_is_silent_never_hits_is_musical():
+    words = ({"start_ms": 900, "end_ms": 1100, "text": "hi"},)
+    with patch.object(cm, "_words_for_file", return_value=words), \
+         patch.object(cm, "_file_is_musical") as mock_musical:
+        n, has_speech, is_musical = cm.speech_words_in_span("f1", 5000, 6000)
+    assert n == 0 and has_speech is False and is_musical is False
+    mock_musical.assert_not_called()
+    print("ok  test_speech_words_in_span_no_overlap_is_silent_never_hits_is_musical")
+
+
+# --------------------------------------------------------------------------
+# brain_mirror_readside.plan.md section 3.3: boundary/broken-line detection.
+# --------------------------------------------------------------------------
+
+def test_speech_boundary_flags_clean_cut_no_flags():
+    words = ({"start_ms": 1000, "end_ms": 1400, "text": "Hello."},
+             {"start_ms": 1400, "end_ms": 1900, "text": "World."})
+    with patch.object(cm, "_words_for_file", return_value=words):
+        flags = cm.speech_boundary_flags("f1", 1000, 2000)
+    assert flags == {"clipped_head": False, "clipped_tail": False, "mid_sentence": False}, flags
+    print("ok  test_speech_boundary_flags_clean_cut_no_flags")
+
+
+def test_speech_boundary_flags_clipped_head_and_tail():
+    # First word starts BEFORE in_ms; last word ends AFTER out_ms.
+    words = ({"start_ms": 800, "end_ms": 1400, "text": "Hello"},
+             {"start_ms": 1900, "end_ms": 2600, "text": "world"})
+    with patch.object(cm, "_words_for_file", return_value=words):
+        flags = cm.speech_boundary_flags("f1", 1000, 2000)
+    assert flags["clipped_head"] is True and flags["clipped_tail"] is True, flags
+    print("ok  test_speech_boundary_flags_clipped_head_and_tail")
+
+
+def test_speech_boundary_flags_mid_sentence_when_tail_lacks_punctuation():
+    words = ({"start_ms": 1000, "end_ms": 1400, "text": "and"},
+             {"start_ms": 1400, "end_ms": 1900, "text": "then"})   # no terminal punctuation
+    with patch.object(cm, "_words_for_file", return_value=words):
+        flags = cm.speech_boundary_flags("f1", 1000, 2000)
+    assert flags["mid_sentence"] is True and flags["clipped_tail"] is False, flags
+    print("ok  test_speech_boundary_flags_mid_sentence_when_tail_lacks_punctuation")
+
+
+def test_speech_boundary_flags_no_words_is_all_false():
+    with patch.object(cm, "_words_for_file", return_value=()):
+        flags = cm.speech_boundary_flags("f1", 1000, 2000)
+    assert flags == {"clipped_head": False, "clipped_tail": False, "mid_sentence": False}, flags
+    print("ok  test_speech_boundary_flags_no_words_is_all_false")
 
 
 def test_people_from_speaker():
@@ -496,6 +607,16 @@ def main():
     test_junk_and_continuity_ride_through_unfiltered()
     test_subject_derivation()
     test_audio_mute_rule()
+    test_audio_mute_gate_spoken_narration_under_a_shown_cut_is_never_muted()
+    test_audio_mute_gate_musical_words_under_a_shown_cut_are_muted_with_flag()
+    test_audio_mute_gate_falls_back_to_natural_sound_when_genuinely_silent()
+    test_audio_mute_gate_said_channel_never_consults_the_transcript_gate()
+    test_speech_words_in_span_counts_overlapping_words_only()
+    test_speech_words_in_span_no_overlap_is_silent_never_hits_is_musical()
+    test_speech_boundary_flags_clean_cut_no_flags()
+    test_speech_boundary_flags_clipped_head_and_tail()
+    test_speech_boundary_flags_mid_sentence_when_tail_lacks_punctuation()
+    test_speech_boundary_flags_no_words_is_all_false()
     test_people_from_speaker()
     test_score_prefers_longer_better_anchored_cuts()
     test_ladder_never_trims_past_the_anchor_or_the_source_span()

@@ -118,7 +118,11 @@ logger = logging.getLogger(__name__)
 # v22: brain_cut_salience_parity.plan.md full-landmark-parity extension --
 # vcut cuts now carry all four landmark channels (act/adx/sil/shot), so the
 # `sig:` breadcrumb renders adx/sil/shot counts too; cached trees rebuild.
-TREE_VERSION = 22
+# v23: brain_mirror_readside.plan.md Phase 3 -- said_text is no longer
+# gated on channel=="said" (a shown/done cut's incidental transcript words
+# now surface too), and _audio_mute_for reads transcript-truth speech
+# presence instead of blind channel/natural_sound; cached trees rebuild.
+TREE_VERSION = 23
 
 # Two moments are one continuous source run when the next starts within this gap
 # of where the previous ended (back-to-back in the original footage). Loose
@@ -274,12 +278,17 @@ def build_clip_tree(
             anchor = _flat_variant(cut)
             variants[anchor["level"]] = anchor
 
-        # beat_transcript.plan.md: the verbatim words for a speech beat's OWN
-        # span (never padded, unlike Tier-1's _span_detail window) -- reused
-        # by _moment_line to quote the actual dialogue instead of just the
-        # vision-model paraphrase. '' for a non-speech beat (never fabricated).
-        said_text = (_said_text_for_span(file_id, anchor["in_ms"], anchor["out_ms"])
-                    if cut.get("channel") == "said" else "")
+        # beat_transcript.plan.md / brain_mirror_readside.plan.md section 3.2:
+        # the verbatim words over this beat's OWN span (never padded, unlike
+        # Tier-1's _span_detail window) -- reused by _moment_line to quote
+        # the actual dialogue instead of just the vision-model paraphrase.
+        # NOT gated on channel=="said" (band-aid C's twin: the beat index
+        # must show the words that WILL play under every cut, muted or not,
+        # so incidental speech under a `shown`/`done` cut is never hidden --
+        # _said_text_for_span itself already returns "" when nothing
+        # overlaps, so this never fabricates a line for a genuinely silent
+        # cut).
+        said_text = _said_text_for_span(file_id, anchor["in_ms"], anchor["out_ms"])
 
         moments.append({
             "moment_id": f"{fid8}:m{idx:02d}",
@@ -1109,19 +1118,31 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     pic = _pic_segment(m)
     snd = _snd_segment(m)
     gist = (m.get("gist") or "").strip().replace("\n", " ")
+    is_said_beat = m.get("channel") == "said"
     # beat_transcript.plan.md: a speech beat quotes the VERBATIM words first
     # (what the brain should actually read to choose dialogue/takes) -- the
     # vision-model gist rides along as a short secondary note (vis:"...")
     # rather than being dropped. A beat with no transcript (older footage, no
     # dialogue_segments row) falls back to the gist as the primary quote,
     # exactly like before this plan.
+    #
+    # brain_mirror_readside.plan.md section 3.2: said_text is now computed
+    # for EVERY channel (not just "said"), so a done/shown beat's own PIC
+    # gist must stay primary -- it describes what's ON SCREEN, which is
+    # still the more useful lead for a visual beat even when incidental
+    # words happen to overlap it in time. Those words still surface, just
+    # as a separate `incidental:"..."` tag (below) rather than displacing
+    # the visual description.
     said = (m.get("said_text") or "").strip().replace("\n", " ")
-    primary = said or gist
+    primary = (said or gist) if is_said_beat else (gist or said)
     # Resident mode gives the model the FULL line so it picks by reading, not
     # guessing; compact (paged) mode truncates and relies on inspect_moment.
     if compact and len(primary) > 80:
         primary = primary[:77] + "..."
-    vis_tag = f" vis:\"{_short_gist(gist)}\"" if said and gist else ""
+    vis_tag = f" vis:\"{_short_gist(gist)}\"" if is_said_beat and said and gist else ""
+    # The words playing under a NON-speech cut (§5 "orphan-audio"/
+    # "incidental") -- never hidden, never the primary quote.
+    incidental_tag = f" incidental:\"{_short_gist(said)}\"" if not is_said_beat and said else ""
     # A graphic's gist, only when speech doesn't already narrate it (else it's
     # redundant -- the brain hears it). Short tag; full text via inspect_moment.
     gloss = ""
@@ -1144,7 +1165,13 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     # (members listed in source order); keep run members together + in order.
     run = ""
     if m.get("run_id"):
-        run = f" · run:{m['run_id']}"
+        # brain_continuity_awareness.plan.md section 4.2(a): show the
+        # member's POSITION within the run (1-based; run_pos is stored
+        # 0-indexed), not just membership, so the brain can see both which
+        # beats share a run AND their source order within it.
+        pos, ln = m.get("run_pos"), m.get("run_len")
+        run = (f" · run:{m['run_id']}[{pos + 1}/{ln}]" if pos is not None and ln
+               else f" · run:{m['run_id']}")
     cut_tag = _continuity_tag(m)
     pace_tag = _pace_tag(m)
     # Camera move, only when there's something to say (a static/unknown shot
@@ -1160,7 +1187,7 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     alt = _alt_pic_segment(m)
     line = (f"  {m['moment_id'].split(':')[-1]} {_capture_tag(m)} {pic} {snd} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])} {_dur_tag(m)}] "
-            f"\"{primary}\"{vis_tag}{gloss}{scr_tag}{spec_tag} · "
+            f"\"{primary}\"{vis_tag}{incidental_tag}{gloss}{scr_tag}{spec_tag} · "
             f"nrg:{nrg}{aud_tag}{pace_tag}{cam_tag}{peak_tag}{landmarks_tag}{outlook_tag}{cut_tag}{run}{alt}")
     piece_lines = _piece_lines(m)
     return "\n".join([line] + piece_lines) if piece_lines else line

@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 # v4_cluster_tree_cuts.plan.md section 5: the SAME per-event floors
@@ -56,7 +57,11 @@ logger = logging.getLogger(__name__)
 # act-only, from the widened seam cache (rms_db/silence_intervals/
 # shot_points); the landmarks shape/coverage changed, so cached trees/rungs
 # must rebuild.
-CUTRECORD_MAP_VERSION = 5
+# v6: brain_mirror_readside.plan.md Phase 3 -- _audio_mute_for now reads
+# transcript-truth speech presence (speech_words_in_span) instead of just
+# channel/pace.natural_sound, so a `shown`/`done` cut whose span actually
+# carries spoken words is no longer blind-muted; cached rows must recompute.
+CUTRECORD_MAP_VERSION = 6
 
 # broad -> sharp, matching footage_map._LEVEL_NAMES; the same five band
 # centers the (now-retired) hero-cut ladders used to zoom at.
@@ -473,15 +478,145 @@ def _people_for(row: Dict[str, Any]) -> List[dict]:
     }]
 
 
+def _pg_conn():
+    from app.services import db
+    return db.connection()
+
+
+@lru_cache(maxsize=512)
+def _words_for_file(file_id: str) -> Tuple[Dict[str, Any], ...]:
+    """This file's flat, filler-free, time-ordered transcript words (mirrors
+    lattice._load_words' own extraction; a small local duplication rather
+    than a cross-module call, matching footage_map._sentences_for_file's
+    own per-process @lru_cache convention -- transcripts are immutable once
+    L1 writes them, so no invalidation concern). Tuple, not list, so the
+    result stays hashable for lru_cache. () on any read failure or missing
+    transcript -- never a hard failure."""
+    try:
+        with _pg_conn() as conn:
+            row = conn.execute(
+                "select segments from transcripts where file_id = %s", (file_id,)
+            ).fetchone()
+    except Exception:
+        logger.exception("_words_for_file: load failed for %s", file_id)
+        return ()
+    if not row or not row[0]:
+        return ()
+    segments = row[0] if isinstance(row[0], list) else json.loads(row[0])
+    words = [w for seg in segments for w in (seg.get("words") or []) if not w.get("is_filler")]
+    words.sort(key=lambda w: w.get("start_ms", 0))
+    return tuple(words)
+
+
+@lru_cache(maxsize=512)
+def _file_is_musical(file_id: str) -> bool:
+    """This file's own L1 audio-type classification (audio_features.
+    is_musical) -- the coarse "singing/instrumental bed vs spoken words"
+    signal speech_words_in_span's is_musical reads. False (never musical)
+    on any read failure or missing row."""
+    try:
+        with _pg_conn() as conn:
+            row = conn.execute(
+                "select is_musical from audio_features where file_id = %s", (file_id,)
+            ).fetchone()
+    except Exception:
+        logger.exception("_file_is_musical: lookup failed for %s", file_id)
+        return False
+    return bool(row and row[0])
+
+
+def speech_words_in_span(file_id: str, in_ms: int, out_ms: int) -> Tuple[int, bool, bool]:
+    """brain_mirror_readside.plan.md section 3.2: (word_count, has_speech,
+    is_musical) for ``[in_ms, out_ms)`` on this file's OWN transcript --
+    ground truth for "does this span actually carry spoken words?",
+    independent of which channel/kind the cut_records row was filed under
+    (the slide-voiceover mislabel band-aid C papered over). ``is_musical``
+    distinguishes a musical/ambient bed from genuine spoken narration via
+    the file's own L1 audio-type classification (audio_features.
+    is_musical) -- the gate _audio_mute_for's speech-bearing branch reads
+    to decide whether the words justify keeping the audio. Fail-open: any
+    read failure -> (0, False, False), never a hard failure."""
+    try:
+        words = [
+            w for w in _words_for_file(file_id)
+            if int(w.get("end_ms", 0) or 0) > in_ms and int(w.get("start_ms", 0) or 0) < out_ms
+        ]
+    except Exception:
+        logger.exception("speech_words_in_span: word overlap failed for %s", file_id)
+        return 0, False, False
+    if not words:
+        return 0, False, False
+    return len(words), True, _file_is_musical(file_id)
+
+
+# A word ending in one of these reads as a complete thought; anything else
+# (a dangling conjunction, a bare noun) reads as cut mid-sentence.
+_SENTENCE_FINAL = (".", "?", "!", "…")
+
+
+def speech_boundary_flags(file_id: str, in_ms: int, out_ms: int) -> Dict[str, bool]:
+    """brain_mirror_readside.plan.md section 3.3: does this span cut INTO a
+    word or a sentence, rather than landing cleanly on a boundary? Read off
+    the same transcript words speech_words_in_span reads -- purely
+    descriptive flags for the mirror/§5's "broken-line" warning, never a
+    mutation.
+      - clipped_head: the first overlapping word STARTED before in_ms (the
+        span begins mid-word).
+      - clipped_tail: the last overlapping word ENDS after out_ms (the
+        span ends mid-word).
+      - mid_sentence: the last overlapping word's own text lacks sentence-
+        final punctuation -- the cut ends mid-thought (independent of
+        clipped_tail: a word can end cleanly on its own audio yet still be
+        a dangling "and then—").
+    All False when the span carries no words at all (nothing to clip)."""
+    try:
+        words = [
+            w for w in _words_for_file(file_id)
+            if int(w.get("end_ms", 0) or 0) > in_ms and int(w.get("start_ms", 0) or 0) < out_ms
+        ]
+    except Exception:
+        logger.exception("speech_boundary_flags: word overlap failed for %s", file_id)
+        return {"clipped_head": False, "clipped_tail": False, "mid_sentence": False}
+    if not words:
+        return {"clipped_head": False, "clipped_tail": False, "mid_sentence": False}
+    first, last = words[0], words[-1]
+    tail_text = str(last.get("text") or "").strip()
+    return {
+        "clipped_head": int(first.get("start_ms", 0) or 0) < in_ms,
+        "clipped_tail": int(last.get("end_ms", 0) or 0) > out_ms,
+        "mid_sentence": not tail_text.endswith(_SENTENCE_FINAL),
+    }
+
+
 def _audio_mute_for(channel: str, row: Dict[str, Any]) -> Tuple[Optional[str], bool, List[str]]:
-    """The video default-mute rule: a video (done/shown) cut whose pace envelope
-    says its source sound ISN'T worth keeping (``natural_sound`` false) is muted
-    by default -- matching the old substrate's "b-roll shouldn't drag in stray
-    audio" policy, using the cut's own worth-keeping judgment as the signal
-    instead of a raw speech/silence re-analysis. Said cuts leave audio/mute at
-    their hero-cut default (unset/False) -- their audio IS the point."""
+    """The video default-mute rule -- transcript-truth gated (band-aid C
+    retired): a `said` cut leaves audio/mute at its hero-cut default (unset/
+    False); its audio IS the point. Otherwise, check the cut's own span for
+    ACTUAL transcript words (speech_words_in_span) before falling back to
+    the pace envelope's natural_sound judgment:
+      - words present AND genuinely spoken (not musical/ambient) -> the cut
+        is speech-bearing regardless of channel -- audio stays UNMUTED
+        (never auto-mute a voiceover/narration under a picture cut) and the
+        brain sees ``["speech", "incidental"]`` so it can still choose to
+        mute deliberately.
+      - words present but musical/ambient (lyrics, a singer's bed) -> mute
+        by default, same "incidental" flag plus "muted", the gate's choice
+        made visible rather than silent.
+      - no words at all -> unchanged: the pace envelope's own natural_sound
+        judgment (a video cut whose source sound isn't worth keeping is
+        muted by default)."""
     if channel == "said":
         return None, False, []
+    word_count, has_speech, is_musical = speech_words_in_span(
+        row.get("file_id") or "", int(row.get("src_in_ms") or 0), int(row.get("src_out_ms") or 0))
+    if has_speech:
+        # audio="speech" either way (words ARE present) -- footage_map.
+        # _snd_state's muted branch specifically renders "muted(talk)" for
+        # audio=="speech", so a muted musical/lyric span still reads as
+        # "there were words here, muted" rather than a generic "muted(audio)".
+        if is_musical:
+            return "speech", True, ["speech", "incidental", "muted"]
+        return "speech", False, ["speech", "incidental"]
     natural_sound = bool((row.get("pace") or {}).get("natural_sound"))
     if natural_sound:
         return "sound", False, []

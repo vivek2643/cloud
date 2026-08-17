@@ -211,6 +211,35 @@ def test_source_contiguous_beats_form_a_run_channel_agnostic():
     print("ok  test_source_contiguous_beats_form_a_run_channel_agnostic")
 
 
+def test_moment_line_renders_run_position_and_length():
+    """brain_continuity_awareness.plan.md section 4.2(a): the beat line shows
+    a run member's 1-based POSITION within the run (run_pos is stored
+    0-indexed), not just membership, so the brain reads both which beats
+    share a run and their source order down the (source-ordered) index."""
+    cuts = [
+        _cut("c:0", 0, 2000, "kick", channel="done", subject="person", speaker=None,
+             ladder=[_rung("balanced", 0, 2000, "kick", 0.6)]),
+        _cut("c:1", 500, 2500, "go go go", channel="said", subject="person", speaker="S1",
+             ladder=[_rung("balanced", 500, 2500, "go go go", 0.6)]),
+        _cut("c:2", 2100, 4000, "the scoreboard", channel="shown", subject="graphic",
+             speaker=None, ladder=[_rung("balanced", 2100, 4000, "the scoreboard", 0.6)]),
+        _cut("c:3", 4200, 6000, "shoot", channel="done", subject="person", speaker=None,
+             ladder=[_rung("balanced", 4200, 6000, "shoot", 0.6)]),
+        _cut("c:4", 30000, 32000, "later", channel="done", subject="person", speaker=None,
+             ladder=[_rung("balanced", 30000, 32000, "later", 0.6)]),
+    ]
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "Match", "duration_ms": 40000}, cuts)
+    by_id = {m["moment_id"].split(":")[-1]: m for m in tree["moments"]}
+    lines = {mid: fm._moment_line(by_id[mid]) for mid in ("m00", "m01", "m02", "m03", "m04")}
+    run_id = by_id["m00"]["run_id"]
+    assert f"run:{run_id}[1/4]" in lines["m00"], lines["m00"]
+    assert f"run:{run_id}[2/4]" in lines["m01"], lines["m01"]
+    assert f"run:{run_id}[3/4]" in lines["m02"], lines["m02"]
+    assert f"run:{run_id}[4/4]" in lines["m03"], lines["m03"]
+    assert "run:" not in lines["m04"], lines["m04"]   # lone moment -- no run tag at all
+    print("ok  test_moment_line_renders_run_position_and_length")
+
+
 def test_reconciled_shows_face_and_cam_override():
     """PIC reports WHOSE FACE is visible in the clip (per-cut-occurrence face
     clustering, voice_first_identity.plan.md Phase D) -- and SND names who's
@@ -294,10 +323,12 @@ def test_aud_tag_absent_without_speech_quality():
     print("ok  test_aud_tag_absent_without_speech_quality")
 
 
-def test_action_beat_never_gets_said_text():
-    """A done/shown beat's visual label stays primary, never overwritten by
-    transcript text that happens to overlap it in TIME -- said_text is only
-    ever computed for channel == 'said' cuts."""
+def test_action_beat_surfaces_incidental_said_text_brain_mirror_readside():
+    """brain_mirror_readside.plan.md section 3.2 (band-aid C retired): a
+    done/shown beat's visual label still leads the beat line, but said_text
+    is no longer gated on channel=="said" -- incidental spoken words under
+    a picture cut (the slide-voiceover case) now surface too, instead of
+    being silently hidden from the brain."""
     cut = _cut("f:tr2", 1000, 3000, "nods thoughtfully", channel="done", subject="person",
                score=0.6, ladder=[_rung("balanced", 1000, 3000, "nods thoughtfully", 0.6)])
     sentences = ({"speaker": "S0", "text": "narration that happens to overlap in time",
@@ -305,11 +336,22 @@ def test_action_beat_never_gets_said_text():
     with mock.patch.object(fm, "_sentences_for_file", return_value=sentences):
         tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
     m = tree["moments"][0]
-    assert m["said_text"] == "", m["said_text"]
+    assert m["said_text"] == "narration that happens to overlap in time", m["said_text"]
     line = fm._moment_line(m)
+    # The done beat's own visual gist still leads the primary quote (never
+    # displaced by incidental words); the words surface as a SEPARATE tag.
     assert '"nods thoughtfully"' in line, line
-    assert "narration that happens to overlap" not in line, line
-    print("ok  test_action_beat_never_gets_said_text")
+    assert 'incidental:"narration that happens to overlap' in line, line
+    print("ok  test_action_beat_surfaces_incidental_said_text_brain_mirror_readside")
+
+
+def test_action_beat_said_text_empty_when_nothing_overlaps():
+    cut = _cut("f:tr2b", 1000, 3000, "nods thoughtfully", channel="done", subject="person",
+               score=0.6, ladder=[_rung("balanced", 1000, 3000, "nods thoughtfully", 0.6)])
+    with mock.patch.object(fm, "_sentences_for_file", return_value=()):
+        tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    assert tree["moments"][0]["said_text"] == ""
+    print("ok  test_action_beat_said_text_empty_when_nothing_overlaps")
 
 
 def test_said_beat_transcript_truncates_in_compact_mode():
@@ -1068,7 +1110,8 @@ def main():
     test_said_beat_with_transcript_quotes_verbatim_text_first()
     test_said_beat_shows_aud_tag_from_speech_quality()
     test_aud_tag_absent_without_speech_quality()
-    test_action_beat_never_gets_said_text()
+    test_action_beat_surfaces_incidental_said_text_brain_mirror_readside()
+    test_action_beat_said_text_empty_when_nothing_overlaps()
     test_said_beat_transcript_truncates_in_compact_mode()
     test_said_beat_with_no_transcript_falls_back_to_visual_gist()
     test_span_detail_pads_and_filters_via_shared_sentences_cache()
@@ -1114,6 +1157,7 @@ def main():
     test_specific_tag_compact_mode_legacy_shape_unaffected()
     test_specific_tag_full_pipeline_new_shape_renders_on_the_beat_line()
     test_source_contiguous_beats_form_a_run_channel_agnostic()
+    test_moment_line_renders_run_position_and_length()
     test_cast_line_lists_majors_with_voices_and_others_by_id()
     test_cast_line_empty_with_no_persons()
     test_default_energy_from_genre()
