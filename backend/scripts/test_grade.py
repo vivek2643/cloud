@@ -782,6 +782,17 @@ def test_input_hash_unaffected_by_shot_reorder_being_a_real_change():
     print("ok  job: compute_input_hash reflects shot ORDER (neighbor grouping depends on it)")
 
 
+def test_input_hash_unaffected_by_a_plan_only_change():
+    """brain_plan_mechanism.plan.md §5/§9.5: compute_input_hash never reads
+    document["plan"] -- a plan write (or an edit to an existing plan) must
+    NOT invalidate the grade / trigger a re-grade."""
+    doc = _grade_doc([("f1", 0, 2000), ("f1", 2000, 5000)])
+    doc_planned = {**doc, "plan": {"purpose": "teach", "structure": ["cold-open", "demo"],
+                                   "carries": [], "watch": [], "rev": 1}}
+    assert grade_job.compute_input_hash(doc) == grade_job.compute_input_hash(doc_planned)
+    print("ok  job: compute_input_hash is unaffected by a plan-only change (no re-grade)")
+
+
 def test_ordered_shots_covers_spine_and_place_video_ops_in_order():
     doc = {
         "timeline": [{"seg_id": "s0", "file_id": "f1", "in_ms": 0, "out_ms": 1000}],
@@ -2477,6 +2488,7 @@ def main():
     test_input_hash_changes_when_a_span_trims()
     test_input_hash_changes_when_look_changes()
     test_input_hash_unaffected_by_shot_reorder_being_a_real_change()
+    test_input_hash_unaffected_by_a_plan_only_change()
     test_ordered_shots_covers_spine_and_place_video_ops_in_order()
     test_run_grade_job_end_to_end_mocked()
     test_run_grade_job_records_error_never_crashes()

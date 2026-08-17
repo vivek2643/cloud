@@ -24,6 +24,17 @@ from app.services.l3.arrange import Placement, _MapIndex, heal_adjacent_cuts  # 
 fm._sentences_for_file = lambda file_id: ()
 
 
+def _rejects(fn, *args, **kwargs) -> str:
+    """brain_loop_convergence.plan.md Part 3: act.* verbs now REJECT loud
+    (raise act.EditReject) instead of silently returning the doc unchanged.
+    Calls fn and asserts it raises EditReject, returning the reason string."""
+    try:
+        fn(*args, **kwargs)
+    except act.EditReject as r:
+        return r.reason
+    raise AssertionError(f"{fn} did not raise EditReject")
+
+
 def _rung(level, in_ms, out_ms, text="", score=0.6):
     return {"level": level, "spans": [{"in_ms": in_ms, "out_ms": out_ms}],
             "in_ms": in_ms, "out_ms": out_ms, "play_ms": out_ms - in_ms,
@@ -126,8 +137,9 @@ def test_trim_and_set_audio():
     sid = doc["timeline"][0]["seg_id"]
     doc2 = act.trim(doc, sid, delta_in_ms=200)
     assert doc2["timeline"][0]["in_ms"] == doc["timeline"][0]["in_ms"] + 200
-    # a trim that would invert the span is rejected (unchanged doc)
-    assert act.trim(doc, sid, out_ms=0) is doc
+    # a trim that would collapse the span is rejected loud (brain_loop_convergence.plan.md Part 3)
+    reason = _rejects(act.trim, doc, sid, out_ms=0)
+    assert "collapses" in reason, reason
     doc3 = act.set_audio(doc, sid, mute=True)
     assert doc3["timeline"][0]["mute"] is True
     print("ok  trim nudges span (guards inversion); set_audio mutes")
@@ -238,11 +250,13 @@ def test_split_screen_adds_op_and_region():
     cells = regs[0]["cells"]
     assert cells["left"]["layer"] == "spine", cells
     assert cells["right"]["layer"] == ops[0]["op_id"], cells
-    # bad template / window -> unchanged
-    assert act.split_screen(doc, idx, "ffffffff:m01", template="nope",
-                            from_ms=0, to_ms=1000) is doc
-    assert act.split_screen(doc, idx, "ffffffff:m01", template="pip",
-                            from_ms=1000, to_ms=1000) is doc
+    # bad template / window -> rejects loud (brain_loop_convergence.plan.md Part 3)
+    reason = _rejects(act.split_screen, doc, idx, "ffffffff:m01", template="nope",
+                      from_ms=0, to_ms=1000)
+    assert "template" in reason, reason
+    reason = _rejects(act.split_screen, doc, idx, "ffffffff:m01", template="pip",
+                      from_ms=1000, to_ms=1000)
+    assert "collapses" in reason, reason
     print("ok  split_screen adds a place_video op + a layout region")
 
 
@@ -294,9 +308,10 @@ def test_split_screen_window_path():
     assert ops[0]["src_in_ms"] == 5000 and ops[0]["purpose"] == "split_cell", ops
     regs = doc2["layout_regions"]
     assert regs[0]["cells"]["inset"]["layer"] == ops[0]["op_id"], regs
-    # neither ref nor a full window -> no-op
-    assert act.split_screen(doc, idx, None, template="pip",
-                            from_ms=1000, to_ms=2500) is doc
+    # neither ref nor a full window -> rejects loud (brain_loop_convergence.plan.md Part 3)
+    reason = _rejects(act.split_screen, doc, idx, None, template="pip",
+                      from_ms=1000, to_ms=2500)
+    assert "second-cell source" in reason, reason
     print("ok  split_screen fills a cell from a raw source window")
 
 
@@ -355,6 +370,7 @@ def test_affordances_menu():
     # cuts_v3_continuity.plan.md: the cut-centric loop drops the raw-footage
     # verbs/senses (source_awareness/scan_source/place_span) from the menu.
     assert "place" in aff["verbs"] and "place_span" not in aff["verbs"], aff
+    assert "set_plan" in aff["verbs"], aff   # brain_plan_mechanism.plan.md §3.3
     assert "source_awareness" not in aff["senses"] and "scan_source" not in aff["senses"], aff
     print("ok  affordances lists retake levels + channels + cut-centric verbs")
 
@@ -381,10 +397,12 @@ def test_place_span_v2_cutaway_and_bad_span_noop():
                           channel="V2", from_ms=prog, audio="keep")
     ops = [o for o in doc2["operations"] if o["type"] == "place_video"]
     assert ops and ops[-1]["from_ms"] == prog and ops[-1]["mute"] is False, ops
-    # empty/invalid span -> unchanged doc (total verb)
-    assert act.place_span(doc, "ffffffff-1111", in_ms=2000, out_ms=2000) is doc
-    assert act.place_span(doc, "", in_ms=0, out_ms=100) is doc
-    print("ok  place_span V2 cutaway keeps sound; bad span is a no-op")
+    # empty/invalid span -> rejects loud (brain_loop_convergence.plan.md Part 3)
+    reason = _rejects(act.place_span, doc, "ffffffff-1111", in_ms=2000, out_ms=2000)
+    assert "collapses" in reason, reason
+    reason = _rejects(act.place_span, doc, "", in_ms=0, out_ms=100)
+    assert "file_id" in reason, reason
+    print("ok  place_span V2 cutaway keeps sound; bad span rejects loud")
 
 
 def test_split_edit_add_replace_clear_and_guards():
@@ -403,9 +421,12 @@ def test_split_edit_add_replace_clear_and_guards():
     assert len(ses) == 1 and ses[0]["audio_offset_ms"] == 300, ses
     doc4 = act.split_edit(doc3, ids[1], audio_offset_ms=0)     # clear
     assert not [o for o in doc4["operations"] if o["type"] == "split_edit"]
-    assert act.split_edit(doc, ids[0], audio_offset_ms=-400) is doc   # first cut
-    assert act.split_edit(doc, "nope", audio_offset_ms=-400) is doc  # unknown
-    print("ok  split_edit adds/replaces/clears; first-cut + unknown are no-ops")
+    # first cut (no seam) + unknown id -> reject loud (brain_loop_convergence.plan.md Part 3)
+    reason = _rejects(act.split_edit, doc, ids[0], audio_offset_ms=-400)
+    assert "seam" in reason, reason
+    reason = _rejects(act.split_edit, doc, "nope", audio_offset_ms=-400)
+    assert "seam" in reason, reason
+    print("ok  split_edit adds/replaces/clears; first-cut + unknown reject loud")
 
 
 def test_split_edit_resolves_decoupled_audio():
@@ -651,12 +672,13 @@ def test_retime_speech_trims_dead_air_and_is_idempotent():
     print("ok  retime speech trims dead-air into jump-cuts, idempotent widen/restore")
 
 
-def test_retime_unknown_pace_is_noop():
+def test_retime_unknown_pace_rejects_loud():
     struct = _paced_struct()
     idx = _MapIndex(struct)
     doc = _paced_doc(struct)
-    assert act.retime(doc, idx, pace="turbo") is doc
-    print("ok  retime with an unknown pace is a no-op")
+    reason = _rejects(act.retime, doc, idx, pace="turbo")
+    assert "pace" in reason, reason
+    print("ok  retime with an unknown pace rejects loud")
 
 
 def test_pace_tag_and_affordances_surface_room():
@@ -1220,21 +1242,172 @@ def test_trim_works_on_a_placed_piece():
     print("ok  trim works on a placed single-piece segment")
 
 
-def test_place_bad_piece_is_clean_noop():
+def test_place_bad_piece_rejects_loud():
     struct = _cluster_struct()
     idx = _MapIndex(struct)
     doc = {"format": {"aspect": "landscape"}, "timeline": [], "operations": []}
-    assert act.place(doc, idx, "ffffffff:m00", piece=0, channel="V1") is doc
-    assert act.place(doc, idx, "ffffffff:m00", piece=99, channel="V1") is doc
-    print("ok  place(ref, piece=<out-of-range>) is a clean no-op")
+    reason = _rejects(act.place, doc, idx, "ffffffff:m00", piece=0, channel="V1")
+    assert "ref" in reason, reason
+    reason = _rejects(act.place, doc, idx, "ffffffff:m00", piece=99, channel="V1")
+    assert "ref" in reason, reason
+    print("ok  place(ref, piece=<out-of-range>) rejects loud")
 
 
-def test_place_piece_on_single_event_moment_is_noop():
+def test_place_piece_on_single_event_moment_rejects_loud():
     struct = _map()
     idx = _MapIndex(struct)
     doc = {"format": {"aspect": "landscape"}, "timeline": [], "operations": []}
-    assert act.place(doc, idx, "ffffffff:m00", piece=1, channel="V1") is doc
-    print("ok  place(ref, piece=1) on a single-event moment is a clean no-op")
+    reason = _rejects(act.place, doc, idx, "ffffffff:m00", piece=1, channel="V1")
+    assert "ref" in reason, reason
+    print("ok  place(ref, piece=1) on a single-event moment rejects loud")
+
+
+# --------------------------------------------------------------------------
+# brain_plan_mechanism.plan.md §9.1: act.set_plan
+# --------------------------------------------------------------------------
+
+def test_set_plan_on_a_seed_doc_returns_a_new_normalized_doc():
+    doc = {"timeline": [], "operations": []}
+    new = act.set_plan(doc, purpose="teach why the migration was worth it",
+                       carries=["founder VO", "  ", ""],
+                       structure=[{"beat": " the demo ", "need": "optional"},
+                                 "cold-open", {"beat": "  "}, ""],
+                       watch=["clip93 backward jump risk"])
+    assert new is not doc
+    assert "plan" not in doc                       # original untouched
+    assert new["plan"] == {
+        "purpose": "teach why the migration was worth it",
+        "carries": ["founder VO"],
+        "structure": [{"beat": "the demo", "need": "optional"},
+                      {"beat": "cold-open", "need": "required"}],  # empty dict dropped, bare string defaulted
+        "watch": ["clip93 backward jump risk"],
+        "rev": 1,
+    }, new["plan"]
+    print("ok  set_plan: new doc, normalized beats {beat,need}, whitespace-only entries dropped, rev=1")
+
+
+def test_set_plan_with_all_empty_inputs_is_still_a_legal_write():
+    doc = {"timeline": [], "operations": []}
+    new = act.set_plan(doc)
+    assert new is not doc
+    assert new["plan"] == {"purpose": None, "carries": [], "structure": [], "watch": [], "rev": 1}, new["plan"]
+    print("ok  set_plan: empty inputs -> empty lists, rev=1, never an error")
+
+
+def test_set_plan_recall_bumps_rev_and_records_updated_note():
+    doc = {"timeline": [], "operations": []}
+    doc1 = act.set_plan(doc, purpose="teach",
+                        structure=[{"beat": "cold-open", "need": "required"},
+                                  {"beat": "demo", "need": "optional"}])
+    doc2 = act.set_plan(doc1, purpose="teach",
+                        structure=[{"beat": "demo", "need": "optional"},
+                                  {"beat": "cold-open", "need": "required"}],
+                        note="reordered after reading the transcript")
+    assert doc2 is not doc1
+    assert doc2["plan"]["rev"] == 2, doc2["plan"]
+    assert doc2["plan"]["updated_note"] == "reordered after reading the transcript", doc2["plan"]
+    assert doc2["plan"]["structure"] == [{"beat": "demo", "need": "optional"},
+                                         {"beat": "cold-open", "need": "required"}], doc2["plan"]
+    assert "updated_note" not in doc1["plan"]        # prior revision untouched (purity)
+    print("ok  set_plan: re-calling bumps rev, preserves beat order + need, records updated_note")
+
+
+def test_set_plan_beat_need_defaults_to_required():
+    doc = {"timeline": [], "operations": []}
+    new = act.set_plan(doc, structure=[
+        "bare string beat",                                  # no need at all -> required
+        {"beat": "dict beat, need omitted"},                  # need omitted -> required
+        {"beat": "dict beat, explicit optional", "need": "optional"},
+        {"beat": "dict beat, garbage need", "need": "maybe"},  # invalid -> required
+    ])
+    structure = new["plan"]["structure"]
+    assert structure[0] == {"beat": "bare string beat", "need": "required"}, structure
+    assert structure[1] == {"beat": "dict beat, need omitted", "need": "required"}, structure
+    assert structure[2] == {"beat": "dict beat, explicit optional", "need": "optional"}, structure
+    assert structure[3] == {"beat": "dict beat, garbage need", "need": "required"}, structure
+    print("ok  set_plan: need defaults to required (bare string/omitted/garbage); explicit optional preserved")
+
+
+# --------------------------------------------------------------------------
+# brain_plan_mechanism.plan.md §9.2 / brain_plan_altitude.plan.md §7.2:
+# observe.plan_mirror_text
+# --------------------------------------------------------------------------
+
+def test_plan_mirror_text_absent_plan_quiet_nudge():
+    text = observe.plan_mirror_text({"timeline": []}, building=False)
+    assert text == "PLAN: none written yet -- write one with set_plan before you build.", text
+    print("ok  plan_mirror_text: absent plan, building=False -> quiet nudge")
+
+
+def test_plan_mirror_text_absent_plan_loud_nudge_when_building():
+    text = observe.plan_mirror_text({"timeline": []}, building=True)
+    assert "building without a written plan" in text, text
+    assert "set_plan" in text, text
+    print("ok  plan_mirror_text: absent plan, building=True -> loud nudge")
+
+
+def test_plan_mirror_text_populated_plan_renders_beats_with_need_markers():
+    doc = {"plan": {
+        "purpose": "teach why the migration was worth it",
+        "carries": ["founder VO", "screen-capture demo"],
+        "structure": [
+            {"beat": "cold-open", "need": "required"},
+            {"beat": "the demo", "need": "required"},
+            {"beat": "a customer quote if one lands", "need": "optional"},
+        ],
+        "watch": ["clip93 backward jump risk"],
+        "rev": 3,
+        "updated_note": "reordered the demo after reading the transcript",
+    }}
+    text = observe.plan_mirror_text(doc)
+    assert "PLAN (rev 3" in text, text
+    assert "purpose: teach why the migration was worth it" in text, text
+    assert "carries: founder VO; screen-capture demo" in text, text
+    assert "structure (BEATS" in text, text
+    assert "1. cold-open [required]" in text, text
+    assert "2. the demo [required]" in text, text
+    assert "3. a customer quote if one lands [optional]" in text, text
+    assert "watch: clip93 backward jump risk" in text, text
+    assert "last change: reordered the demo after reading the transcript" in text, text
+    assert "a beat names a clip id" not in text, text     # no leak -> no nudge
+    text2 = observe.plan_mirror_text(doc)
+    assert text2 == text                            # idempotent
+    print("ok  plan_mirror_text: populated plan renders beats + need markers, no false nudge, idempotent")
+
+
+def test_plan_mirror_text_nudges_on_a_leaked_clip_id():
+    leaked_full = {"plan": {"structure": [
+        {"beat": "differentiator -- use 93e94ec3:m14", "need": "required"}]}}
+    text_full = observe.plan_mirror_text(leaked_full)
+    assert "93e94ec3:m14" in text_full, text_full
+    assert "^^ a beat names a clip id" in text_full, text_full
+
+    leaked_bare = {"plan": {"structure": [{"beat": "use m14 for this one"}]}}
+    text_bare = observe.plan_mirror_text(leaked_bare)
+    assert "^^ a beat names a clip id" in text_bare, text_bare
+
+    clean = {"plan": {"structure": [{"beat": "show the differentiator through the demo"}]}}
+    text_clean = observe.plan_mirror_text(clean)
+    assert "^^ a beat names a clip id" not in text_clean, text_clean
+
+    # near-miss tokens must NOT false-fire: "mp4" (no digits after m) and
+    # "m1" (only 1 digit, below the :02d-padded m\d{2,} threshold).
+    near_miss = {"plan": {"structure": [{"beat": "export as mp4, take m1 of the intro"}]}}
+    text_near = observe.plan_mirror_text(near_miss)
+    assert "^^ a beat names a clip id" not in text_near, text_near
+    print("ok  plan_mirror_text: nudges on a leaked clip id (full ref or bare shorthand), silent on near-misses")
+
+
+def test_plan_mirror_text_renders_old_shape_structure_of_strings():
+    """Back-compat (brain_plan_altitude.plan.md §6): a pre-altitude stored
+    plan with structure:[str] must render cleanly, with no need markers, and
+    never raise."""
+    doc = {"plan": {"structure": ["cold-open", "the demo"], "rev": 1}}
+    text = observe.plan_mirror_text(doc)
+    assert "PLAN (rev 1" in text, text
+    assert "1. cold-open" in text and "[required]" not in text and "[optional]" not in text, text
+    assert "2. the demo" in text, text
+    print("ok  plan_mirror_text: old-shape structure:[str] renders with no markers, never raises")
 
 
 def main():
@@ -1270,7 +1443,7 @@ def main():
     test_snap_span_to_seams_pure_logic()
     test_retime_video_stamps_speed_not_span()
     test_retime_speech_trims_dead_air_and_is_idempotent()
-    test_retime_unknown_pace_is_noop()
+    test_retime_unknown_pace_rejects_loud()
     test_pace_tag_and_affordances_surface_room()
     test_resolve_uses_baked_coupling_over_legacy_audio_routes()
     test_resolve_falls_back_to_legacy_audio_routes_with_no_baked_coupling()
@@ -1304,8 +1477,17 @@ def main():
     test_place_cluster_whole_vs_pieces_via_level()
     test_place_piece_resolves_to_one_beat_span()
     test_trim_works_on_a_placed_piece()
-    test_place_bad_piece_is_clean_noop()
-    test_place_piece_on_single_event_moment_is_noop()
+    test_place_bad_piece_rejects_loud()
+    test_place_piece_on_single_event_moment_rejects_loud()
+    test_set_plan_on_a_seed_doc_returns_a_new_normalized_doc()
+    test_set_plan_with_all_empty_inputs_is_still_a_legal_write()
+    test_set_plan_recall_bumps_rev_and_records_updated_note()
+    test_set_plan_beat_need_defaults_to_required()
+    test_plan_mirror_text_absent_plan_quiet_nudge()
+    test_plan_mirror_text_absent_plan_loud_nudge_when_building()
+    test_plan_mirror_text_populated_plan_renders_beats_with_need_markers()
+    test_plan_mirror_text_nudges_on_a_leaked_clip_id()
+    test_plan_mirror_text_renders_old_shape_structure_of_strings()
     print("\nall observe/act tests passed")
 
 
