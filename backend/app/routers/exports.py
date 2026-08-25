@@ -51,7 +51,9 @@ def _enqueue(export_id: str) -> bool:
         enqueue_app = App(connector=PsycopgConnector(
             conninfo=get_settings().database_url, min_size=1, max_size=2))
         with enqueue_app.open():
-            enqueue_app.configure_task("build_export", queue="export").defer(export_id=export_id)
+            enqueue_app.configure_task(
+                "build_export", queue=get_settings().effective_queue("export"),
+            ).defer(export_id=export_id)
         return True
     except Exception:
         logger.exception("Could not enqueue export %s", export_id)

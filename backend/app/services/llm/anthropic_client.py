@@ -10,8 +10,23 @@ Prompt caching is first-class here (this is what ``cache_system=True`` was alway
 for): the stable prefix -- the system prompt, and the first user turn that
 carries the big footage map -- is marked with ``cache_control`` so multi-pass
 reasoning (draft -> critique) and multi-turn chat reuse it instead of re-sending
-it. ``effort`` / ``thinking_budget`` are accepted for call-site compatibility;
-Opus 4.8 already defaults its effort to high, so they are not forwarded.
+it.
+
+``effort`` / ``thinking_budget`` are accepted for call-site compatibility but
+still not forwarded (brain_extended_thinking.plan.md STEP ZERO, probed live
+against ``claude-opus-4-8`` on SDK 0.49.0): a plain call and one with
+``thinking={"type": "adaptive"}`` (the API's current param -- this SDK
+version has no typed support for it or for ``output_config``) produced
+materially the same visible step-by-step reasoning either way. The adaptive
+call DID return a signed ``thinking`` block, but its own ``thinking`` text
+field came back empty -- the reasoning stayed in the ordinary text block, as
+in the plain call. So there is no observability prize to forward yet; the
+budget stays unforwarded until a request shape that actually surfaces
+content is found. ``thinking``/``redacted_thinking`` blocks ARE correctly
+preserved end to end below regardless (``_block_to_anthropic``, ``run()``'s
+completion loop) -- required for correctness the moment any caller (this one
+or a future one) ever does send the parameter, since Anthropic rejects a
+tool-use continuation whose prior thinking block was dropped or altered.
 """
 from __future__ import annotations
 
@@ -58,6 +73,14 @@ def _block_to_anthropic(b: Dict[str, Any]) -> Dict[str, Any]:
             _block_to_anthropic(x) for x in inner]
         return {"type": "tool_result", "tool_use_id": b.get("tool_use_id", ""),
                 "content": content}
+    if btype in ("thinking", "redacted_thinking"):
+        # brain_extended_thinking.plan.md 3.1: returned to the API verbatim.
+        # These carry a cryptographic `signature` attesting the block came
+        # from the model; ANY mutation invalidates it and the next tool-use
+        # request is rejected. Never rebuild these field by field -- copy the
+        # block whole (the shape is provider-owned and versioned; naming
+        # fields would silently drop one the API adds later).
+        return dict(b)
     return {"type": "text", "text": ""}
 
 
@@ -122,8 +145,8 @@ class AnthropicClient:
         tools: Optional[List[Dict[str, Any]]] = None,
         max_tokens: int = 2048,
         cache_system: bool = False,
-        effort: Optional[str] = None,  # noqa: ARG002 - Opus 4.8 defaults to high
-        thinking_budget: int = 0,  # noqa: ARG002 - adaptive thinking is default
+        effort: Optional[str] = None,  # noqa: ARG002 - not forwarded, see module docstring
+        thinking_budget: int = 0,  # noqa: ARG002 - not forwarded, see module docstring
         **_: Any,
     ) -> LLMResponse:
         client = _sdk_client()
@@ -160,6 +183,21 @@ class AnthropicClient:
                 tool_calls.append(ToolCall(id=blk.id, name=blk.name, input=inp))
                 assistant_content.append(
                     {"type": "tool_use", "id": blk.id, "name": blk.name, "input": inp})
+            elif btype in ("thinking", "redacted_thinking"):
+                # brain_extended_thinking.plan.md 3.2: converting an SDK
+                # *object* (not a dict we already own) to our neutral shape,
+                # so fields must be named here -- the asymmetry with
+                # _block_to_anthropic's dict(b) copy above is deliberate.
+                # Ordering matters: Anthropic requires a thinking block to
+                # appear FIRST in assistant content, before text/tool_use --
+                # appending in completion.content order preserves this
+                # naturally since the API emits it first; never sort/filter.
+                blk_out: Dict[str, Any] = {"type": btype}
+                for f in ("thinking", "signature", "data"):
+                    v = getattr(blk, f, None)
+                    if v is not None:
+                        blk_out[f] = v
+                assistant_content.append(blk_out)
 
         usage: Dict[str, int] = {}
         u = getattr(completion, "usage", None)

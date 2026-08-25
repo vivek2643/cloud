@@ -86,8 +86,8 @@ def test_loop_reads_then_places_then_replies():
     ctx = _ctx(struct)
     script = [
         [ToolCall(id="t1", name="read_state", input={})],
-        [ToolCall(id="t2", name="place", input={"ref": "ffffffff:m00", "level": "balanced"})],
-        [ToolCall(id="t3", name="place", input={"ref": "ffffffff:m01", "level": "balanced"})],
+        [ToolCall(id="t2", name="place", input={"ref": "ffffffff:c00", "level": "balanced"})],
+        [ToolCall(id="t3", name="place", input={"ref": "ffffffff:c01", "level": "balanced"})],
         "I placed both beats on V1 in order.",             # finish attempt -> Stage 2 (craft) fires once
         "Reads clean -- it runs about 8 seconds.",          # blind verdict -> finish
     ]
@@ -204,9 +204,9 @@ def test_loop_split_screen_after_answer():
     struct = _struct()
     ctx = _ctx(struct)
     script = [
-        [ToolCall(id="t1", name="place", input={"ref": "ffffffff:m00", "level": "balanced"})],
+        [ToolCall(id="t1", name="place", input={"ref": "ffffffff:c00", "level": "balanced"})],
         [ToolCall(id="t2", name="split_screen", input={
-            "ref": "ffffffff:m01", "template": "split_h", "from_ms": 500, "to_ms": 3000})],
+            "ref": "ffffffff:c01", "template": "split_h", "from_ms": 500, "to_ms": 3000})],
         "Side-by-side over the first few seconds.",   # finish attempt -> Stage 2 (craft) fires once
         "Reads clean -- done.",                       # blind verdict -> finish
     ]
@@ -254,10 +254,10 @@ def test_dispatch_inspect_cut_returns_windowed_payload_and_leaves_doc_unchanged(
     doc = _seed_doc()
     signals = {"motion": {}, "audio": {}, "scene": {}}
     with mock.patch.object(observe, "_fetch_signal_window", return_value=signals):
-        obs, new, changed = tools._dispatch("inspect_cut", {"ref": "ffffffff:m00"}, ctx, doc)
+        obs, new, changed = tools._dispatch("inspect_cut", {"ref": "ffffffff:c00"}, ctx, doc)
     assert not changed, obs
     assert new is doc
-    assert '"ref": "ffffffff:m00"' in obs, obs
+    assert '"ref": "ffffffff:c00"' in obs, obs
     assert '"action"' in obs and '"audio"' in obs and '"shots"' in obs, obs
     print("ok  dispatch: inspect_cut returns the windowed payload, doc unchanged")
 
@@ -430,8 +430,8 @@ def test_gate_forces_length_reconcile_end_to_end():
     doc = _seed_doc()
     doc["brief"]["target_duration_s"] = 5      # the 8s edit will be over target (>1.2x)
     script = [
-        [ToolCall(id="t1", name="place", input={"ref": "ffffffff:m00", "level": "balanced"})],
-        [ToolCall(id="t2", name="place", input={"ref": "ffffffff:m01", "level": "balanced"})],
+        [ToolCall(id="t1", name="place", input={"ref": "ffffffff:c00", "level": "balanced"})],
+        [ToolCall(id="t2", name="place", input={"ref": "ffffffff:c01", "level": "balanced"})],
         "Placed both -- about 8 seconds.",                       # finish attempt #1 -> length gate fires
         "Both beats are essential, so I'm keeping it at ~8s.",   # justify -> Stage 2 (craft) fires
         "Reads clean -- keeping it at ~8s.",                     # blind verdict -> finish
@@ -457,7 +457,7 @@ def test_gate_surfaces_review_flags_end_to_end():
         {"speaker": "S0", "text": "we almost shut down", "src_in_ms": 400, "src_out_ms": 4000},
     )
     script = [
-        [ToolCall(id="t1", name="place", input={"ref": "ffffffff:m00", "level": "balanced"})],
+        [ToolCall(id="t1", name="place", input={"ref": "ffffffff:c00", "level": "balanced"})],
         "Placed the beat.",                               # finish attempt #1 -> Stage 2 (craft) fires
         "Reads clean.",                                   # blind verdict -> Stage 3 flags the head
         "Kept it -- the lead-in is a natural warm-up.",    # acknowledge -> finish
@@ -499,7 +499,7 @@ def test_gate_flags_a_requested_feature_missing_end_to_end():
     ctx = _ctx(_struct())
     doc = _seed_doc()
     script = [
-        [ToolCall(id="t1", name="place", input={"ref": "ffffffff:m00", "level": "balanced"})],
+        [ToolCall(id="t1", name="place", input={"ref": "ffffffff:c00", "level": "balanced"})],
         "Placed the beat.",                                          # finish #1 -> Stage 1 flags the missing split
         "Added a split screen instead of skipping it -- fixed now.",  # claim fix -> Stage 2 (craft) fires
         "Reads clean -- confirmed.",                                  # blind verdict -> finish
@@ -517,7 +517,7 @@ def test_gate_does_not_flag_a_feature_the_user_never_asked_for():
     ctx = _ctx(_struct())
     doc = _seed_doc()
     script = [
-        [ToolCall(id="t1", name="place", input={"ref": "ffffffff:m00", "level": "balanced"})],
+        [ToolCall(id="t1", name="place", input={"ref": "ffffffff:c00", "level": "balanced"})],
         "Placed the beat.",   # finish attempt -> Stage 1 has nothing to flag; Stage 2 (craft) still fires
         "Reads clean.",       # blind verdict -> finish
     ]

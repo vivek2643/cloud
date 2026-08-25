@@ -127,11 +127,19 @@ def _resolve_energy_preserving(
     vstore.insert_video_cuts, section 7.3) already yields specifics-bearing
     rows with zero ambiguity, no remap needed. Shared by set_cuts_energy and
     the energy_levels prefetch."""
+    from app.services.vcut import continuity as vcut_continuity
     from app.services.vcut import store as vstore
     from app.services.vcut.resolve import resolve_cuts
 
     resolved = resolve_cuts(plan, seam_cache, energy=energy)
     vstore.insert_video_cuts(ingest_run_id, resolved, seam_cache)
+    # brain_perception_blindness.plan.md B1: insert_video_cuts deletes and
+    # rebuilds every kind='video' row (fresh CutRecords, continuity={} by
+    # default) -- recompute it for the whole run (both kinds together, same
+    # as at ingest) or a dial drag silently blanks continuity on every video
+    # cut until the next full re-ingest, the exact "fails open, nobody
+    # notices" shape this plan exists to close.
+    vcut_continuity.write_continuity_for_run(ingest_run_id, seam_cache)
     return read.load_cuts(project_id, user_id)
 
 

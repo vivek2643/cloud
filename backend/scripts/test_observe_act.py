@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.services.l3 import act, arrange, layers, observe  # noqa: E402
 from app.services.l3 import footage_map as fm  # noqa: E402
-from app.services.l3.arrange import Placement, _MapIndex, _weld_segments  # noqa: E402
+from app.services.l3.arrange import Placement, _MapIndex, heal_adjacent_cuts  # noqa: E402
 
 # build_clip_tree calls _said_text_for_span -> _sentences_for_file for every
 # "said" cut (beat_transcript.plan.md), which would otherwise hit a real DB.
@@ -63,19 +63,19 @@ def _ctx(struct):
 
 def _doc(struct, refs):
     """Build a starting document from (ref, level) main-line picks via the real
-    act.place path, then weld -- exactly what observe.resolve_doc does on persist."""
+    act.place path, then heal -- exactly what observe.resolve_doc does on persist."""
     idx = _MapIndex(struct)
     doc = {"brief": {"aspect": "landscape"}, "format": {"aspect": "landscape"},
            "timeline": [], "operations": []}
     for ref, lv in refs:
         doc = act.place(doc, idx, ref, level=lv, channel="V1")
-    doc["timeline"] = _weld_segments(doc["timeline"])
+    doc["timeline"], _merged = heal_adjacent_cuts(doc["timeline"], gap_ms=200, reindex=True)
     return doc
 
 
 def test_read_state_reports_cuts_and_feel():
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "balanced"), ("ffffffff:m01", "balanced")])
+    doc = _doc(struct, [("ffffffff:c00", "balanced"), ("ffffffff:c01", "balanced")])
     st = observe.read_state(doc, _ctx(struct))
     # m00 (0-4000) welds with m01 (4000-8000) -> one continuous main-line segment.
     assert st["cut_count"] == 1, st
@@ -87,10 +87,10 @@ def test_read_state_reports_cuts_and_feel():
 
 def test_place_adds_main_line_cut():
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    doc = _doc(struct, [("ffffffff:c00", "balanced")])
     idx = _MapIndex(struct)
     before = len(doc["timeline"])
-    doc2 = act.place(doc, idx, "ffffffff:m01", level="balanced", channel="V1")
+    doc2 = act.place(doc, idx, "ffffffff:c01", level="balanced", channel="V1")
     assert len(doc2["timeline"]) == before + 1, doc2["timeline"]
     assert doc is not doc2 and "resolved" not in doc2      # immutable + stale dropped
     assert len(doc["timeline"]) == before                  # original untouched
@@ -99,9 +99,9 @@ def test_place_adds_main_line_cut():
 
 def test_place_v2_cutaway_op():
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    doc = _doc(struct, [("ffffffff:c00", "balanced")])
     idx = _MapIndex(struct)
-    doc2 = act.place(doc, idx, "ffffffff:m01", channel="V2", from_ms=500)
+    doc2 = act.place(doc, idx, "ffffffff:c01", channel="V2", from_ms=500)
     ops = [o for o in doc2["operations"] if o["type"] == "place_video"]
     assert len(ops) == 1 and ops[0]["from_ms"] == 500, ops
     assert ops[0]["mute"] is True                          # silent cutaway by default
@@ -110,7 +110,7 @@ def test_place_v2_cutaway_op():
 
 def test_remove_and_move():
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "tight"), ("ffffffff:m01", "tight")])
+    doc = _doc(struct, [("ffffffff:c00", "tight"), ("ffffffff:c01", "tight")])
     ids = [s["seg_id"] for s in doc["timeline"]]
     assert len(ids) == 2, ids                              # tight cuts don't weld (non-contiguous)
     doc2 = act.remove(doc, ids[0])
@@ -122,7 +122,7 @@ def test_remove_and_move():
 
 def test_trim_and_set_audio():
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "tight")])
+    doc = _doc(struct, [("ffffffff:c00", "tight")])
     sid = doc["timeline"][0]["seg_id"]
     doc2 = act.trim(doc, sid, delta_in_ms=200)
     assert doc2["timeline"][0]["in_ms"] == doc["timeline"][0]["in_ms"] + 200
@@ -135,7 +135,7 @@ def test_trim_and_set_audio():
 
 def test_tighten_reshapes_span():
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    doc = _doc(struct, [("ffffffff:c00", "balanced")])
     idx = _MapIndex(struct)
     sid = doc["timeline"][0]["seg_id"]
     doc2 = act.tighten(doc, idx, seg_id=sid, level="tight")
@@ -147,7 +147,7 @@ def test_tighten_reshapes_span():
 
 def test_predict_length_under_tighten():
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "balanced")])   # 4000ms
+    doc = _doc(struct, [("ffffffff:c00", "balanced")])   # 4000ms
     p = observe.predict(doc, _ctx(struct), set_level="tight")
     assert p["current_ms"] == 4000, p
     assert p["projected_ms"] == 2000, p                  # tight m00 = 2000ms
@@ -157,7 +157,7 @@ def test_predict_length_under_tighten():
 
 def test_validate_flags_bad_span():
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    doc = _doc(struct, [("ffffffff:c00", "balanced")])
     # Corrupt the span to exceed the source duration.
     doc["timeline"][0]["out_ms"] = 999999
     doc.pop("resolved", None)
@@ -185,10 +185,10 @@ def test_place_multispan_keep_spans_survives():
     struct = {"clips": [tree]}
     idx = _MapIndex(struct)
     # The map really carries pairs, and resolve normalizes to (in, out) tuples.
-    rc = idx.resolve(Placement(ref="ffffffff:m00", level="balanced"))
+    rc = idx.resolve(Placement(ref="ffffffff:c00", level="balanced"))
     assert rc is not None and rc.keep_spans == [(0, 1000), (1500, 3000)], rc.keep_spans
     doc = {"format": {"aspect": "landscape"}, "timeline": [], "operations": []}
-    doc2 = act.place(doc, idx, "ffffffff:m00", level="balanced", channel="V1")
+    doc2 = act.place(doc, idx, "ffffffff:c00", level="balanced", channel="V1")
     assert doc2 is not doc, "place no-oped -- the multi-span crash is back"
     spans = [(s["in_ms"], s["out_ms"]) for s in doc2["timeline"]]
     assert spans == [(0, 1000), (1500, 3000)], spans
@@ -207,7 +207,7 @@ def test_place_snaps_speech_cut_to_sentences():
               "src_in_ms": 0, "src_out_ms": 6000},)
     doc = {"format": {"aspect": "landscape"}, "timeline": [], "operations": []}
     with mock.patch.object(fm, "_sentences_for_file", return_value=sents):
-        doc2 = act.place(doc, idx, "ffffffff:m00", level="balanced", channel="V1")
+        doc2 = act.place(doc, idx, "ffffffff:c00", level="balanced", channel="V1")
     spans = [(s["in_ms"], s["out_ms"]) for s in doc2["timeline"]]
     assert spans == [(0, 6000)], spans   # 60ms mid-sentence seam swallowed
     print("ok  place snaps a speech cut's mid-sentence seam to one contiguous span")
@@ -225,9 +225,9 @@ def test_norm_keep_spans_accepts_both_shapes():
 def test_split_screen_adds_op_and_region():
     struct = _map()
     # One long welded main-line cut (0-8000ms) to place a split over.
-    doc = _doc(struct, [("ffffffff:m00", "balanced"), ("ffffffff:m01", "balanced")])
+    doc = _doc(struct, [("ffffffff:c00", "balanced"), ("ffffffff:c01", "balanced")])
     idx = _MapIndex(struct)
-    doc2 = act.split_screen(doc, idx, "ffffffff:m01", template="split_h",
+    doc2 = act.split_screen(doc, idx, "ffffffff:c01", template="split_h",
                             from_ms=1000, to_ms=3000)
     assert doc2 is not doc
     ops = [o for o in doc2["operations"] if o["type"] == "place_video"]
@@ -239,18 +239,18 @@ def test_split_screen_adds_op_and_region():
     assert cells["left"]["layer"] == "spine", cells
     assert cells["right"]["layer"] == ops[0]["op_id"], cells
     # bad template / window -> unchanged
-    assert act.split_screen(doc, idx, "ffffffff:m01", template="nope",
+    assert act.split_screen(doc, idx, "ffffffff:c01", template="nope",
                             from_ms=0, to_ms=1000) is doc
-    assert act.split_screen(doc, idx, "ffffffff:m01", template="pip",
+    assert act.split_screen(doc, idx, "ffffffff:c01", template="pip",
                             from_ms=1000, to_ms=1000) is doc
     print("ok  split_screen adds a place_video op + a layout region")
 
 
 def test_split_screen_resolves_to_dest_rects():
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "balanced"), ("ffffffff:m01", "balanced")])
+    doc = _doc(struct, [("ffffffff:c00", "balanced"), ("ffffffff:c01", "balanced")])
     idx = _MapIndex(struct)
-    doc = act.split_screen(doc, idx, "ffffffff:m01", template="split_h",
+    doc = act.split_screen(doc, idx, "ffffffff:c01", template="split_h",
                            from_ms=1000, to_ms=3000)
     rt = layers.resolve(doc, {"ffffffff-1111": 8000})
     # In-window: two picture layers (spine slice + op), each in its half.
@@ -268,9 +268,9 @@ def test_split_screen_resolves_to_dest_rects():
 
 def test_remove_tears_down_region():
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "balanced"), ("ffffffff:m01", "balanced")])
+    doc = _doc(struct, [("ffffffff:c00", "balanced"), ("ffffffff:c01", "balanced")])
     idx = _MapIndex(struct)
-    doc = act.split_screen(doc, idx, "ffffffff:m01", template="pip",
+    doc = act.split_screen(doc, idx, "ffffffff:c01", template="pip",
                            from_ms=1000, to_ms=3000)
     op_id = doc["operations"][0]["op_id"]
     doc2 = act.remove(doc, op_id)
@@ -283,7 +283,7 @@ def test_split_screen_window_path():
     """A cell source can be a raw (file, in, out) window, not just a map ref --
     the continuous-source path, mirroring place_span."""
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "balanced"), ("ffffffff:m01", "balanced")])
+    doc = _doc(struct, [("ffffffff:c00", "balanced"), ("ffffffff:c01", "balanced")])
     idx = _MapIndex(struct)
     doc2 = act.split_screen(doc, idx, None, file="ffffffff-1111",
                             in_ms=5000, out_ms=6500, template="pip",
@@ -304,9 +304,9 @@ def test_remove_region_tears_down_its_op():
     """Teardown symmetry: removing a REGION also retires the coverage op it fed
     (no orphaned full-frame silent paste-over left behind)."""
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "balanced"), ("ffffffff:m01", "balanced")])
+    doc = _doc(struct, [("ffffffff:c00", "balanced"), ("ffffffff:c01", "balanced")])
     idx = _MapIndex(struct)
-    doc = act.split_screen(doc, idx, "ffffffff:m01", template="split_h",
+    doc = act.split_screen(doc, idx, "ffffffff:c01", template="split_h",
                            from_ms=1000, to_ms=3000)
     region_id = doc["layout_regions"][0]["region_id"]
     doc2 = act.remove(doc, region_id)
@@ -320,7 +320,7 @@ def test_validate_flags_orphaned_split_cell():
     """A split_cell op with no region referencing it is an orphan; an ordinary
     V2 cutaway (region-less by design) is NOT flagged."""
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    doc = _doc(struct, [("ffffffff:c00", "balanced")])
     # An orphaned split cell (purpose marker, no region):
     doc["operations"].append({
         "op_id": "sp_orphan", "type": "place_video", "purpose": "split_cell",
@@ -346,7 +346,7 @@ def test_solve_layout_templates():
 
 def test_affordances_menu():
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    doc = _doc(struct, [("ffffffff:c00", "balanced")])
     aff = observe.affordances(doc, _ctx(struct))
     cut = aff["cuts"][0]
     assert "tight" in cut["can_tighten_to"], cut
@@ -362,7 +362,7 @@ def test_affordances_menu():
 def test_place_span_arbitrary_main_line():
     """place_span lifts ANY source window onto V1 -- no map ref needed."""
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    doc = _doc(struct, [("ffffffff:c00", "balanced")])
     n0 = len(doc["timeline"])
     doc2 = act.place_span(doc, "ffffffff-1111", in_ms=1200, out_ms=1900,
                           channel="V1", axis="any", content="silent reaction")
@@ -375,7 +375,7 @@ def test_place_span_arbitrary_main_line():
 
 def test_place_span_v2_cutaway_and_bad_span_noop():
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    doc = _doc(struct, [("ffffffff:c00", "balanced")])
     prog = act._program_end(doc)
     doc2 = act.place_span(doc, "ffffffff-1111", in_ms=3000, out_ms=3500,
                           channel="V2", from_ms=prog, audio="keep")
@@ -391,7 +391,7 @@ def test_split_edit_add_replace_clear_and_guards():
     """split_edit decouples the audio edge at a seam: adds one op per seam,
     re-issuing replaces, 0 clears, and the first cut (no seam) is a no-op."""
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "tight"), ("ffffffff:m01", "tight")])
+    doc = _doc(struct, [("ffffffff:c00", "tight"), ("ffffffff:c01", "tight")])
     ids = [s["seg_id"] for s in doc["timeline"]]
     assert len(ids) == 2, ids
 
@@ -412,7 +412,7 @@ def test_split_edit_resolves_decoupled_audio():
     """Through layers.resolve, a J-cut moves the AUDIO boundary and leaves the
     video boundary alone -- per-channel edges, end to end."""
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "tight"), ("ffffffff:m01", "tight")])
+    doc = _doc(struct, [("ffffffff:c00", "tight"), ("ffffffff:c01", "tight")])
     ids = [s["seg_id"] for s in doc["timeline"]]
     doc = act.split_edit(doc, ids[1], audio_offset_ms=-400)
     res = layers.resolve(doc, {"ffffffff-1111": 8000})
@@ -427,7 +427,7 @@ def test_split_edit_resolves_decoupled_audio():
 
 def test_validate_flags_bad_split_edit():
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "tight"), ("ffffffff:m01", "tight")])
+    doc = _doc(struct, [("ffffffff:c00", "tight"), ("ffffffff:c01", "tight")])
     ids = [s["seg_id"] for s in doc["timeline"]]
     doc["operations"].append({"op_id": "se_x", "type": "split_edit",
                               "seam_seg_id": "gone", "audio_offset_ms": -300})
@@ -439,31 +439,36 @@ def test_validate_flags_bad_split_edit():
     print("ok  validate flags orphaned + first-cut split edits")
 
 
-def test_weld_remaps_split_edit_seams():
-    """resolve_doc's weld re-issues seg_ids; a split at a SURVIVING seam is
-    remapped, a split at a seam that welded away is dropped."""
+def test_heal_remaps_seam_ops():
+    """resolve_doc's heal re-issues seg_ids; a split_edit/crossfade at a
+    SURVIVING seam is remapped, one at a seam that healed away is dropped."""
     struct = _map()
     ctx = _ctx(struct)
     # m00 tight (0-2000) + m01 tight (4000-6000): non-contiguous, both survive.
-    doc = _doc(struct, [("ffffffff:m00", "tight"), ("ffffffff:m01", "tight")])
+    doc = _doc(struct, [("ffffffff:c00", "tight"), ("ffffffff:c01", "tight")])
     ids = [s["seg_id"] for s in doc["timeline"]]
     doc = act.split_edit(doc, ids[1], audio_offset_ms=-400)
+    doc = act.crossfade(doc, ids[1], ms=300)
     out = observe.resolve_doc(doc, ctx)
-    ses = [o for o in out["operations"] if o["type"] == "split_edit"]
     new_ids = [s["seg_id"] for s in out["timeline"]]
+    ses = [o for o in out["operations"] if o["type"] == "split_edit"]
+    xfs = [o for o in out["operations"] if o["type"] == "crossfade"]
     assert len(ses) == 1 and ses[0]["seam_seg_id"] == new_ids[1], (ses, new_ids)
+    assert len(xfs) == 1 and xfs[0]["seam_seg_id"] == new_ids[1], (xfs, new_ids)
 
-    # m00 balanced (0-4000) + m01 balanced (4000-8000): contiguous -> weld away.
-    doc2 = _doc(struct, [("ffffffff:m00", "balanced")])
+    # m00 balanced (0-4000) + m01 balanced (4000-8000): contiguous -> heal away.
+    doc2 = _doc(struct, [("ffffffff:c00", "balanced")])
     idx = _MapIndex(struct)
-    doc2 = act.place(doc2, idx, "ffffffff:m01", level="balanced", channel="V1")
+    doc2 = act.place(doc2, idx, "ffffffff:c01", level="balanced", channel="V1")
     seam_id = doc2["timeline"][1]["seg_id"]
     doc2 = act.split_edit(doc2, seam_id, audio_offset_ms=-400)
+    doc2 = act.crossfade(doc2, seam_id, ms=300)
     out2 = observe.resolve_doc(doc2, ctx)
-    assert len(out2["timeline"]) == 1, out2["timeline"]          # welded
-    assert not [o for o in out2["operations"] if o["type"] == "split_edit"], \
-        out2["operations"]                                        # split moot -> dropped
-    print("ok  weld remaps surviving split seams and drops welded-away ones")
+    assert len(out2["timeline"]) == 1, out2["timeline"]          # healed
+    assert not [o for o in out2["operations"]
+                if o["type"] in ("split_edit", "crossfade")], \
+        out2["operations"]                                        # seam moot -> dropped
+    print("ok  heal remaps surviving seam ops (split_edit+crossfade) and drops healed-away ones")
 
 
 def test_split_screen_snap_cap_keeps_edge_and_suggests():
@@ -486,7 +491,7 @@ def test_split_screen_snap_cap_keeps_edge_and_suggests():
         {"src_in_ms": 3100, "src_out_ms": 8000},   # boundary at 3100ms -- 100ms from raw out
     ]
     try:
-        doc = _doc(struct, [("ffffffff:m00", "balanced")])
+        doc = _doc(struct, [("ffffffff:c00", "balanced")])
         obs, new, changed = tools._dispatch(
             "split_screen",
             {"file": "ffffffff", "in_ms": 2000, "out_ms": 3000,
@@ -508,7 +513,7 @@ def test_split_screen_snap_off_places_raw():
 
     struct = _map()
     ctx = _ctx(struct)
-    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    doc = _doc(struct, [("ffffffff:c00", "balanced")])
     _, new, changed = tools._dispatch(
         "split_screen",
         {"file": "ffffffff", "in_ms": 1150, "out_ms": 3000,
@@ -537,7 +542,7 @@ def test_split_screen_snaps_to_seam_via_dispatch():
         {"src_in_ms": 3200, "src_out_ms": 8000},   # boundary at 3200ms
     ]
     try:
-        doc = _doc(struct, [("ffffffff:m00", "balanced")])
+        doc = _doc(struct, [("ffffffff:c00", "balanced")])
         n0 = len(doc["operations"])
         obs, new, changed = tools._dispatch(
             "split_screen",
@@ -592,12 +597,12 @@ def _paced_struct():
         "content_type": "reel", "primary_axis": "action", "people": ["G1"],
         "moment_count": 2,
         "moments": [
-            {"moment_id": "ffffffff:m00", "file_id": "ffffffff-1111", "kind": "video",
+            {"cut_id": "ffffffff:c00", "file_id": "ffffffff-1111", "kind": "video",
              "channel": "shown", "in_ms": 1000, "out_ms": 5000, "play_ms": 4000,
              "variants": {"balanced": {"level": "balanced", "in_ms": 1000, "out_ms": 5000,
                                        "play_ms": 4000, "keep_spans": None}},
              "pace": {"levels": [0.5, 0.8, 1.0, 1.3, 1.8], "remove_spans": [], "min_ms": 1500}},
-            {"moment_id": "ffffffff:m01", "file_id": "ffffffff-1111", "kind": "speech",
+            {"cut_id": "ffffffff:c01", "file_id": "ffffffff-1111", "kind": "speech",
              "channel": "said", "speaker": "G1", "in_ms": 10000, "out_ms": 18000, "play_ms": 8000,
              "variants": {"balanced": {"level": "balanced", "in_ms": 10000, "out_ms": 18000,
                                        "play_ms": 8000, "keep_spans": None}},
@@ -608,8 +613,8 @@ def _paced_struct():
 def _paced_doc(struct):
     idx = _MapIndex(struct)
     doc = {"format": {"aspect": "landscape"}, "timeline": [], "operations": []}
-    doc = act.place(doc, idx, "ffffffff:m00", level="balanced", channel="V1")
-    doc = act.place(doc, idx, "ffffffff:m01", level="balanced", channel="V1")
+    doc = act.place(doc, idx, "ffffffff:c00", level="balanced", channel="V1")
+    doc = act.place(doc, idx, "ffffffff:c01", level="balanced", channel="V1")
     return doc
 
 
@@ -617,10 +622,10 @@ def test_retime_video_stamps_speed_not_span():
     struct = _paced_struct()
     idx = _MapIndex(struct)
     doc = _paced_doc(struct)
-    vid = next(s for s in doc["timeline"] if s["ref"] == "ffffffff:m00")
+    vid = next(s for s in doc["timeline"] if s["ref"] == "ffffffff:c00")
     span0 = (vid["in_ms"], vid["out_ms"])
     d2 = act.retime(doc, idx, seg_id=vid["seg_id"], pace="faster")
-    v = next(s for s in d2["timeline"] if s["ref"] == "ffffffff:m00")
+    v = next(s for s in d2["timeline"] if s["ref"] == "ffffffff:c00")
     assert v["speed"] == 1.3 and v["pace_level"] == "faster", v      # levels[3]
     assert (v["in_ms"], v["out_ms"]) == span0, v                     # span untouched (phase-2 render)
     assert doc is not d2 and "speed" not in vid                      # immutable
@@ -631,14 +636,14 @@ def test_retime_speech_trims_dead_air_and_is_idempotent():
     struct = _paced_struct()
     idx = _MapIndex(struct)
     doc = _paced_doc(struct)
-    sid = next(s for s in doc["timeline"] if s["ref"] == "ffffffff:m01")["seg_id"]
+    sid = next(s for s in doc["timeline"] if s["ref"] == "ffffffff:c01")["seg_id"]
 
     def spans(d):
-        return [(s["in_ms"], s["out_ms"]) for s in d["timeline"] if s.get("ref") == "ffffffff:m01"]
+        return [(s["in_ms"], s["out_ms"]) for s in d["timeline"] if s.get("ref") == "ffffffff:c01"]
 
     d = act.retime(doc, idx, seg_id=sid, pace="much_faster")
     assert spans(d) == [(10000, 12000), (13000, 15000), (15500, 18000)], spans(d)  # both gaps cut
-    assert all("speed" not in s for s in d["timeline"] if s.get("ref") == "ffffffff:m01")
+    assert all("speed" not in s for s in d["timeline"] if s.get("ref") == "ffffffff:c01")
     d = act.retime(d, idx, seg_id=sid, pace="faster")
     assert spans(d) == [(10000, 12000), (13000, 18000)], spans(d)     # only the longest gap
     d = act.retime(d, idx, seg_id=sid, pace="natural")
@@ -665,15 +670,15 @@ def test_pace_tag_and_affordances_surface_room():
     aff = observe.affordances(doc, ctx)
     assert "retime" in aff["verbs"], aff["verbs"]
     by_ref = {c["ref"]: c for c in aff["cuts"]}
-    assert by_ref["ffffffff:m00"]["retime_kind"] == "video_speed"
-    assert by_ref["ffffffff:m00"]["speed_by_step"]["faster"] == 1.3
-    assert by_ref["ffffffff:m01"]["retime_kind"] == "speech_trim"
-    assert by_ref["ffffffff:m01"]["trim_budget_ms"] == 1500
+    assert by_ref["ffffffff:c00"]["retime_kind"] == "video_speed"
+    assert by_ref["ffffffff:c00"]["speed_by_step"]["faster"] == 1.3
+    assert by_ref["ffffffff:c01"]["retime_kind"] == "speech_trim"
+    assert by_ref["ffffffff:c01"]["trim_budget_ms"] == 1500
 
     d = act.retime(doc, _MapIndex(struct),
-                   seg_id=by_ref["ffffffff:m00"]["seg_id"], pace="faster")
+                   seg_id=by_ref["ffffffff:c00"]["seg_id"], pace="faster")
     st = observe.read_state(d, ctx)
-    vcut = next(c for c in st["cuts"] if c["ref"] == "ffffffff:m00")
+    vcut = next(c for c in st["cuts"] if c["ref"] == "ffffffff:c00")
     assert vcut["pace_level"] == "faster" and vcut["speed"] == 1.3 and "speed_note" in vcut, vcut
     print("ok  pace tag + affordances + read_state surface the pacing room")
 
@@ -750,7 +755,7 @@ def test_program_map_renders_video_and_audio_tables_with_stacking():
     doc = {
         "timeline": [
             {"seg_id": "s0", "file_id": "ffffffff-1111", "in_ms": 0, "out_ms": 4000,
-             "ref": "ffffffff:m00", "level": "balanced", "content": "we almost shut down"},
+             "ref": "ffffffff:c00", "level": "balanced", "content": "we almost shut down"},
         ],
         "operations": [
             {"op_id": "ov1", "type": "place_video", "source_file_id": "9f0c1234-2222",
@@ -795,9 +800,9 @@ def test_program_map_empty_document_is_empty_string():
 
 def test_read_state_reports_video_stack_and_audio_layers():
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    doc = _doc(struct, [("ffffffff:c00", "balanced")])
     idx = _MapIndex(struct)
-    doc = act.place(doc, idx, "ffffffff:m01", channel="V2", from_ms=500)
+    doc = act.place(doc, idx, "ffffffff:c01", channel="V2", from_ms=500)
     st = observe.read_state(doc, _ctx(struct))
     assert "video_stack" in st and len(st["video_stack"]) == 1, st
     assert st["video_stack"][0]["z"] == layers.Z_COVERAGE, st["video_stack"]
@@ -807,7 +812,7 @@ def test_read_state_reports_video_stack_and_audio_layers():
 
 def test_read_state_omits_z_stack_keys_when_theres_no_coverage():
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    doc = _doc(struct, [("ffffffff:c00", "balanced")])
     st = observe.read_state(doc, _ctx(struct))
     assert "video_stack" not in st and "audio_layers" not in st, st
     print("ok  read_state omits the z-stack keys when there's no coverage")
@@ -892,7 +897,7 @@ def test_beat_grid_omits_sections_and_drop_when_undetected():
 
 def test_read_state_seg_id_detail_gives_word_program_offsets():
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    doc = _doc(struct, [("ffffffff:c00", "balanced")])
     seg_id = doc["timeline"][0]["seg_id"]
     transcript_segments = [{"words": [
         {"text": "we", "start_ms": 0, "end_ms": 300},
@@ -911,7 +916,7 @@ def test_read_state_seg_id_detail_gives_word_program_offsets():
 
 def test_word_offsets_stay_correct_after_an_upstream_trim():
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    doc = _doc(struct, [("ffffffff:c00", "balanced")])
     seg_id = doc["timeline"][0]["seg_id"]
     # Trim 500ms off the front: in_ms moves 0 -> 500, but this seg is still
     # FIRST on the main line so its own prog_start_ms stays 0 -- a word at
@@ -930,7 +935,7 @@ def test_word_offsets_stay_correct_after_an_upstream_trim():
 def test_review_flags_speaker_mismatch_filler_and_dead_air():
     doc = {"timeline": [
         {"seg_id": "s0", "file_id": "ffffffff-1111", "in_ms": 0, "out_ms": 5000,
-         "axis": "speech", "ref": "ffffffff:m00"},
+         "axis": "speech", "ref": "ffffffff:c00"},
     ], "operations": [], "brief": {"target_duration_s": 3}}
     sentences = (
         {"speaker": "S9", "text": "um", "src_in_ms": 0, "src_out_ms": 300},
@@ -952,7 +957,7 @@ def test_review_flags_speaker_mismatch_filler_and_dead_air():
 def test_review_played_text_reflects_the_excised_span_not_the_whole_cut():
     doc = {"timeline": [
         {"seg_id": "s0", "file_id": "ffffffff-1111", "in_ms": 1000, "out_ms": 2000,
-         "axis": "speech", "ref": "ffffffff:m00"},
+         "axis": "speech", "ref": "ffffffff:c00"},
     ], "operations": [], "brief": {}}
     sentences = (
         {"speaker": "S0", "text": "before the trim", "src_in_ms": 0, "src_out_ms": 900},
@@ -1041,18 +1046,18 @@ def test_offcam_speaker_flag_only_when_an_oncam_angle_exists():
     # off camera + a sibling angle shows the speaker -> flagged (with the ref)
     f = observe._offcam_speaker_flag(
         {"speaker_person": "P1", "on_camera": False,
-         "alt_pic": [{"moment_id": "1e529bed:m06", "visible_persons": ["P1"]}]},
+         "alt_pic": [{"cut_id": "1e529bed:c06", "visible_persons": ["P1"]}]},
         "cut 1 (s0)")
-    assert f and "off camera" in f[0]["message"] and "1e529bed:m06" in f[0]["message"], f
+    assert f and "off camera" in f[0]["message"] and "1e529bed:c06" in f[0]["message"], f
     assert "trim" not in f[0]["message"].lower()   # never a prescribed fix
     # speaker already on camera -> nothing to switch to
     assert observe._offcam_speaker_flag(
         {"speaker_person": "P1", "on_camera": True,
-         "alt_pic": [{"moment_id": "x:m1", "visible_persons": ["P1"]}]}, "a") == []
+         "alt_pic": [{"cut_id": "x:c1", "visible_persons": ["P1"]}]}, "a") == []
     # off camera but NO sibling shows the speaker (narration / voiceover-over-b-roll)
     assert observe._offcam_speaker_flag(
         {"speaker_person": "P1", "on_camera": False,
-         "alt_pic": [{"moment_id": "x:m1", "visible_persons": ["P0"]}]}, "a") == []
+         "alt_pic": [{"cut_id": "x:c1", "visible_persons": ["P0"]}]}, "a") == []
     # no speaker at all -> silent
     assert observe._offcam_speaker_flag({"on_camera": False, "alt_pic": []}, "a") == []
     print("ok  off-camera-speaker flag fires only when an on-camera angle exists")
@@ -1061,17 +1066,17 @@ def test_offcam_speaker_flag_only_when_an_oncam_angle_exists():
 def test_review_wires_the_offcam_speaker_flag():
     doc = {"timeline": [
         {"seg_id": "s0", "file_id": "ffffffff-1111", "in_ms": 0, "out_ms": 4000,
-         "axis": "speech", "ref": "ffffffff:m00"},
+         "axis": "speech", "ref": "ffffffff:c00"},
     ], "operations": [], "brief": {}}
     ctx = _ctx(_map())
-    ctx.index.moments["ffffffff:m00"] = {
+    ctx.index.moments["ffffffff:c00"] = {
         "speaker_person": "P1", "on_camera": False,
-        "alt_pic": [{"moment_id": "1e529bed:m06", "visible_persons": ["P1"]}],
+        "alt_pic": [{"cut_id": "1e529bed:c06", "visible_persons": ["P1"]}],
     }
     with mock.patch.object(fm, "_sentences_for_file", return_value=()):
         out = observe.review(doc, ctx)
     msgs = [f["message"] for f in out["flags"]]
-    assert any("off camera" in m and "1e529bed:m06" in m for m in msgs), msgs
+    assert any("off camera" in m and "1e529bed:c06" in m for m in msgs), msgs
     print("ok  review surfaces the off-camera-speaker flag end-to-end")
 
 
@@ -1155,9 +1160,9 @@ def _cluster_struct():
 def test_read_state_piece_breakdown_matches_beat_index_for_cluster():
     struct = _cluster_struct()
     idx = _MapIndex(struct)
-    m = idx.moments["ffffffff:m00"]
+    m = idx.moments["ffffffff:c00"]
     doc = act.place({"format": {"aspect": "landscape"}, "timeline": [], "operations": []},
-                    idx, "ffffffff:m00", level="broad", channel="V1")
+                    idx, "ffffffff:c00", level="broad", channel="V1")
     st = observe.read_state(doc, _ctx(struct))
     cut = st["cuts"][0]
     # Same shared helper (footage_map.piece_breakdown) the Beat Index's
@@ -1174,7 +1179,7 @@ def test_read_state_piece_breakdown_matches_beat_index_for_cluster():
 
 def test_read_state_omits_pieces_for_single_event_cut():
     struct = _map()
-    doc = _doc(struct, [("ffffffff:m00", "balanced")])
+    doc = _doc(struct, [("ffffffff:c00", "balanced")])
     st = observe.read_state(doc, _ctx(struct))
     assert "pieces" not in st["cuts"][0], st["cuts"][0]
     print("ok  read_state omits piece breakdown for a single-event cut")
@@ -1184,9 +1189,9 @@ def test_place_cluster_whole_vs_pieces_via_level():
     struct = _cluster_struct()
     idx = _MapIndex(struct)
     doc = {"format": {"aspect": "landscape"}, "timeline": [], "operations": []}
-    whole = act.place(doc, idx, "ffffffff:m00", level="broad", channel="V1")
+    whole = act.place(doc, idx, "ffffffff:c00", level="broad", channel="V1")
     assert [(s["in_ms"], s["out_ms"]) for s in whole["timeline"]] == [(0, 10000)], whole["timeline"]
-    pieces_doc = act.place(doc, idx, "ffffffff:m00", level="sharp", channel="V1")
+    pieces_doc = act.place(doc, idx, "ffffffff:c00", level="sharp", channel="V1")
     spans = [(s["in_ms"], s["out_ms"]) for s in pieces_doc["timeline"]]
     assert spans == [(700, 1500), (4700, 5500), (8700, 9500)], spans
     print("ok  place(ref, level) resolves a cluster whole (broad) <-> pieces (sharp)")
@@ -1196,7 +1201,7 @@ def test_place_piece_resolves_to_one_beat_span():
     struct = _cluster_struct()
     idx = _MapIndex(struct)
     doc = {"format": {"aspect": "landscape"}, "timeline": [], "operations": []}
-    doc2 = act.place(doc, idx, "ffffffff:m00", piece=2, channel="V1")
+    doc2 = act.place(doc, idx, "ffffffff:c00", piece=2, channel="V1")
     assert len(doc2["timeline"]) == 1, doc2["timeline"]
     seg = doc2["timeline"][0]
     assert (seg["in_ms"], seg["out_ms"]) == (4700, 5500), seg
@@ -1208,7 +1213,7 @@ def test_trim_works_on_a_placed_piece():
     struct = _cluster_struct()
     idx = _MapIndex(struct)
     doc = act.place({"format": {"aspect": "landscape"}, "timeline": [], "operations": []},
-                    idx, "ffffffff:m00", piece=2, channel="V1")
+                    idx, "ffffffff:c00", piece=2, channel="V1")
     seg_id = doc["timeline"][0]["seg_id"]
     doc2 = act.trim(doc, seg_id, delta_in_ms=100)
     assert doc2["timeline"][0]["in_ms"] == 4800, doc2["timeline"][0]
@@ -1219,8 +1224,8 @@ def test_place_bad_piece_is_clean_noop():
     struct = _cluster_struct()
     idx = _MapIndex(struct)
     doc = {"format": {"aspect": "landscape"}, "timeline": [], "operations": []}
-    assert act.place(doc, idx, "ffffffff:m00", piece=0, channel="V1") is doc
-    assert act.place(doc, idx, "ffffffff:m00", piece=99, channel="V1") is doc
+    assert act.place(doc, idx, "ffffffff:c00", piece=0, channel="V1") is doc
+    assert act.place(doc, idx, "ffffffff:c00", piece=99, channel="V1") is doc
     print("ok  place(ref, piece=<out-of-range>) is a clean no-op")
 
 
@@ -1228,7 +1233,7 @@ def test_place_piece_on_single_event_moment_is_noop():
     struct = _map()
     idx = _MapIndex(struct)
     doc = {"format": {"aspect": "landscape"}, "timeline": [], "operations": []}
-    assert act.place(doc, idx, "ffffffff:m00", piece=1, channel="V1") is doc
+    assert act.place(doc, idx, "ffffffff:c00", piece=1, channel="V1") is doc
     print("ok  place(ref, piece=1) on a single-event moment is a clean no-op")
 
 
@@ -1258,7 +1263,7 @@ def main():
     test_split_edit_add_replace_clear_and_guards()
     test_split_edit_resolves_decoupled_audio()
     test_validate_flags_bad_split_edit()
-    test_weld_remaps_split_edit_seams()
+    test_heal_remaps_seam_ops()
     test_split_screen_snap_cap_keeps_edge_and_suggests()
     test_split_screen_snap_off_places_raw()
     test_seams_for_file_fails_open_with_no_run_id()

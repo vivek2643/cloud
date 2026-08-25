@@ -234,7 +234,8 @@ def test_set_cuts_energy_resolves_and_reinserts_without_snapshot_remap():
         with mock.patch("app.services.vcut.store.load_seam_and_plan",
                         return_value=(seam_cache, loose_plan_dict)) as seam_mock, \
              mock.patch("app.services.vcut.resolve.resolve_cuts", return_value=fake_resolved) as resolve_mock, \
-             mock.patch("app.services.vcut.store.insert_video_cuts", return_value=["c1"]) as insert_mock:
+             mock.patch("app.services.vcut.store.insert_video_cuts", return_value=["c1"]) as insert_mock, \
+             mock.patch("app.services.vcut.continuity.write_continuity_for_run", return_value=0):
             client = TestClient(fastapi_app)
             resp = client.post("/api/projects/proj-123/cuts/energy", json={"energy": 0.5})
     finally:
@@ -295,7 +296,8 @@ def test_energy_levels_resolves_all_five_stops_plus_final_energy_zero():
         with mock.patch("app.services.vcut.store.load_seam_and_plan",
                         return_value=(seam_cache, loose_plan_dict)), \
              mock.patch("app.services.vcut.resolve.resolve_cuts", return_value=fake_resolved) as resolve_mock, \
-             mock.patch("app.services.vcut.store.insert_video_cuts", return_value=["c1"]):
+             mock.patch("app.services.vcut.store.insert_video_cuts", return_value=["c1"]), \
+             mock.patch("app.services.vcut.continuity.write_continuity_for_run", return_value=0):
             client = TestClient(fastapi_app)
             resp = client.get("/api/projects/proj-123/cuts/energy_levels")
     finally:

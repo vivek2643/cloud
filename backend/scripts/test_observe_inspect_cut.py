@@ -64,8 +64,8 @@ def test_inspect_cut_resolves_by_ref_and_windows_to_the_true_span():
         audio={"hop_ms": 100, "rms_db": [-40.0] * 200, "silence_intervals": []},
     )
     with mock.patch.object(observe, "_fetch_signal_window", return_value=signals):
-        result = observe.inspect_cut(ctx, ref="ffffffff:m00")
-    assert result["ref"] == "ffffffff:m00", result
+        result = observe.inspect_cut(ctx, ref="ffffffff:c00")
+    assert result["ref"] == "ffffffff:c00", result
     assert result["file"] == "ffffffff", result
     assert result["span_ms"] == 4000, result
     assert result["hop_ms"] == 100, result
@@ -75,11 +75,11 @@ def test_inspect_cut_resolves_by_ref_and_windows_to_the_true_span():
 def test_inspect_cut_resolves_by_seg_id_via_placed_document():
     struct = _map([_cut("f:m0", 1000, 5000)])
     ctx = _ctx(struct)
-    document = {"timeline": [{"seg_id": "s1", "ref": "ffffffff:m00", "in_ms": 0, "out_ms": 4000}]}
+    document = {"timeline": [{"seg_id": "s1", "ref": "ffffffff:c00", "in_ms": 0, "out_ms": 4000}]}
     signals = _signals()
     with mock.patch.object(observe, "_fetch_signal_window", return_value=signals):
         result = observe.inspect_cut(ctx, seg_id="s1", document=document)
-    assert result["ref"] == "ffffffff:m00", result
+    assert result["ref"] == "ffffffff:c00", result
     print("ok  test_inspect_cut_resolves_by_seg_id_via_placed_document")
 
 
@@ -95,7 +95,7 @@ def test_inspect_cut_unknown_seg_id_with_no_matching_ref_errors():
 def test_inspect_cut_unknown_ref_errors():
     struct = _map([_cut("f:m0", 1000, 5000)])
     ctx = _ctx(struct)
-    result = observe.inspect_cut(ctx, ref="ffffffff:m99")
+    result = observe.inspect_cut(ctx, ref="ffffffff:c99")
     assert "error" in result, result
     print("ok  test_inspect_cut_unknown_ref_errors")
 
@@ -109,7 +109,7 @@ def test_inspect_cut_curve_never_exceeds_max_samples():
         audio={"hop_ms": 100, "rms_db": [-40.0 + (i % 20) for i in range(200)], "silence_intervals": []},
     )
     with mock.patch.object(observe, "_fetch_signal_window", return_value=signals):
-        result = observe.inspect_cut(ctx, ref="ffffffff:m00")
+        result = observe.inspect_cut(ctx, ref="ffffffff:c00")
     assert len(result["action"]["curve"]) <= observe._INSPECT_MAX_SAMPLES, result["action"]["curve"]
     assert len(result["audio"]["curve"]) <= observe._INSPECT_MAX_SAMPLES, result["audio"]["curve"]
     print("ok  test_inspect_cut_curve_never_exceeds_max_samples")
@@ -123,7 +123,7 @@ def test_inspect_cut_action_hits_capped_and_offsets_within_span():
     ctx = _ctx(struct)
     signals = _signals(motion={"hop_ms": 100, "action_energy": ae, "action_points": []})
     with mock.patch.object(observe, "_fetch_signal_window", return_value=signals):
-        result = observe.inspect_cut(ctx, ref="ffffffff:m00")
+        result = observe.inspect_cut(ctx, ref="ffffffff:c00")
     hits = result["action"]["hits"]
     assert len(hits) <= observe._INSPECT_MAX_HITS, hits
     assert all(0 <= h["off"] < 20000 for h in hits), hits
@@ -141,7 +141,7 @@ def test_inspect_cut_shots_capped_and_offsets_within_span():
     ctx = _ctx(struct)
     signals = _signals(scene=scene)
     with mock.patch.object(observe, "_fetch_signal_window", return_value=signals):
-        result = observe.inspect_cut(ctx, ref="ffffffff:m00")
+        result = observe.inspect_cut(ctx, ref="ffffffff:c00")
     cuts = result["shots"]["cuts"]
     assert len(cuts) <= observe._INSPECT_MAX_SHOTS, cuts
     assert all(0 <= c["off"] < 20000 for c in cuts), cuts
@@ -157,7 +157,7 @@ def test_inspect_cut_silence_offsets_relative_to_cut_start():
         "silence_intervals": [{"start_ms": 3000, "end_ms": 3500}],
     })
     with mock.patch.object(observe, "_fetch_signal_window", return_value=signals):
-        result = observe.inspect_cut(ctx, ref="ffffffff:m00")
+        result = observe.inspect_cut(ctx, ref="ffffffff:c00")
     assert result["audio"]["silence"] == [{"off": 1000, "dur": 500}], result["audio"]["silence"]
     print("ok  test_inspect_cut_silence_offsets_relative_to_cut_start")
 
@@ -166,7 +166,7 @@ def test_inspect_cut_empty_channels_when_file_has_no_l1_rows():
     struct = _map([_cut("f:m0", 1000, 5000)])
     ctx = _ctx(struct)
     with mock.patch.object(observe, "_fetch_signal_window", return_value=_signals()):
-        result = observe.inspect_cut(ctx, ref="ffffffff:m00")
+        result = observe.inspect_cut(ctx, ref="ffffffff:c00")
     assert result["action"]["curve"] == [] and result["action"]["hits"] == [], result["action"]
     assert result["audio"]["curve"] == [] and result["audio"]["changes"] == [] \
         and result["audio"]["silence"] == [], result["audio"]
@@ -185,7 +185,7 @@ def test_inspect_cut_includes_specifics_when_scene_specifics_present():
     struct = _map([_cut("f:m0", 1000, 5000, scene_specifics={"subject": "a dog", "action": "runs"})])
     ctx = _ctx(struct)
     with mock.patch.object(observe, "_fetch_signal_window", return_value=_signals()):
-        result = observe.inspect_cut(ctx, ref="ffffffff:m00")
+        result = observe.inspect_cut(ctx, ref="ffffffff:c00")
     assert result["specifics"] == {"subject": "a dog", "action": "runs"}, result
     print("ok  test_inspect_cut_includes_specifics_when_scene_specifics_present")
 
@@ -194,7 +194,7 @@ def test_inspect_cut_omits_specifics_key_when_scene_specifics_empty():
     struct = _map([_cut("f:m0", 1000, 5000)])  # no scene_specifics at all
     ctx = _ctx(struct)
     with mock.patch.object(observe, "_fetch_signal_window", return_value=_signals()):
-        result = observe.inspect_cut(ctx, ref="ffffffff:m00")
+        result = observe.inspect_cut(ctx, ref="ffffffff:c00")
     assert "specifics" not in result, result
     print("ok  test_inspect_cut_omits_specifics_key_when_scene_specifics_empty")
 
@@ -204,7 +204,7 @@ def test_inspect_cut_specifics_drops_empty_fields():
     struct = _map([_cut("f:m0", 1000, 5000, scene_specifics=spec)])
     ctx = _ctx(struct)
     with mock.patch.object(observe, "_fetch_signal_window", return_value=_signals()):
-        result = observe.inspect_cut(ctx, ref="ffffffff:m00")
+        result = observe.inspect_cut(ctx, ref="ffffffff:c00")
     assert result["specifics"] == {"subject": "a dog", "notable_object": "leash"}, result
     print("ok  test_inspect_cut_specifics_drops_empty_fields")
 
@@ -215,7 +215,7 @@ def test_inspect_cut_specifics_includes_the_full_untruncated_moments_list():
     struct = _map([_cut("f:m0", 0, 20000, scene_specifics=spec)])
     ctx = _ctx(struct)
     with mock.patch.object(observe, "_fetch_signal_window", return_value=_signals()):
-        result = observe.inspect_cut(ctx, ref="ffffffff:m00")
+        result = observe.inspect_cut(ctx, ref="ffffffff:c00")
     # unlike footage_map._specific_tag's capped-at-5 beat-line rendering,
     # inspect_cut carries every moment -- the whole point of "on demand".
     assert len(result["specifics"]["moments"]) == 8, result["specifics"]["moments"]
@@ -227,7 +227,7 @@ def test_inspect_cut_specifics_legacy_shape_passes_through_too():
                         scene_specifics={"specific": "CNC lathe turning a steel shaft", "label": "milling"})])
     ctx = _ctx(struct)
     with mock.patch.object(observe, "_fetch_signal_window", return_value=_signals()):
-        result = observe.inspect_cut(ctx, ref="ffffffff:m00")
+        result = observe.inspect_cut(ctx, ref="ffffffff:c00")
     assert result["specifics"] == {"specific": "CNC lathe turning a steel shaft", "label": "milling"}, result
     print("ok  test_inspect_cut_specifics_legacy_shape_passes_through_too")
 

@@ -36,11 +36,17 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.services.l3 import feel, footage_map, framing, layers
-from app.services.l3.arrange import _MapIndex, _weld_segments
+from app.config import get_settings
+from app.services.l3.arrange import _MapIndex, _SEAM_OP_TYPES, heal_adjacent_cuts
 from app.services.l3.captions import resolver as captions_resolver
 from app.services.l3.captions import timing as captions_timing
 from app.services.l3.grade.steer import explain_grade
-from app.services.l3.post import _ADX_MIN_DELTA, _mean, _norm_in_clip, _series_lohi
+from app.services.l3.landmarks import (
+    _ADX_MIN_DELTA,
+    _mean,
+    _norm_in_clip,
+    series_lohi as _series_lohi,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +96,7 @@ class EditContext:
 
     @property
     def meta_by_ref(self) -> Dict[str, dict]:
-        """moment_id -> moment node (speaker / channel / variants / flags)."""
+        """cut_id -> cut node (speaker / channel / variants / flags)."""
         return self.index.moments
 
 
@@ -282,16 +288,19 @@ def _fetch_signal_window(file_id: str) -> Dict[str, dict]:
 def resolve_doc(document: dict, ctx: EditContext) -> dict:
     """Finalize the working document (in place) after a batch of acts, so preview
     == render and the timeline reads cleanly:
-      1. WELD the main line -- merge adjacent same-clip source-contiguous cuts
-         into one segment (act appends slices raw; welding removes the redundant
-         hard cuts, matching the old compile path). Jump-cuts / distant slices
-         stay separate by construction.
+      1. HEAL the main line -- merge adjacent same-source contiguous cuts into
+         one continuous segment (act appends slices raw; healing removes the
+         redundant micro jump-cuts, matching the old compile path). Jump-cuts /
+         distant slices / deliberately tightened (hard_seam) pauses stay
+         separate by construction. The SAME arrange.heal_adjacent_cuts the
+         manual/SNAP path (put_document) uses -- differing only by reindex.
       2. bake the reframe transform, then resolve the flat layer set.
     Reuses the same resolve the manual-edit path uses."""
     old_ids = [s.get("seg_id") for s in (document.get("timeline") or [])]
     old_segs = list(document.get("timeline") or [])
-    document["timeline"] = _weld_segments(document.get("timeline") or [])
-    _remap_split_edits(document, old_ids, old_segs)
+    document["timeline"], _merged = heal_adjacent_cuts(
+        document.get("timeline") or [], gap_ms=get_settings().heal_gap_ms, reindex=True)
+    _remap_seam_ops(document, old_ids, old_segs)
     try:
         framing.annotate_document(document)
     except Exception:
@@ -313,27 +322,30 @@ def resolve_doc(document: dict, ctx: EditContext) -> dict:
     return document
 
 
-def _remap_split_edits(document: dict, old_ids: List[Optional[str]],
-                       old_segs: List[dict]) -> None:
-    """Welding re-issues seg_ids, which would orphan split_edit (J/L cut) ops
-    keyed on ``seam_seg_id``. Weld keeps the SAME dicts for surviving segments
-    (mutating ids in place), so identity tells us where each seam went: a
-    surviving segment gets its op remapped to the new id; a segment that merged
-    into its predecessor lost its seam -- the split there is meaningless, drop it."""
+def _remap_seam_ops(document: dict, old_ids: List[Optional[str]],
+                    old_segs: List[dict]) -> None:
+    """Healing (reindex=True) re-issues seg_ids, which would orphan the ops keyed
+    on a ``seam_seg_id`` -- split_edit (J/L cut) AND crossfade. Heal keeps the
+    SAME dicts for surviving segments (mutating ids in place), so object identity
+    tells us where each seam went: a surviving segment gets its op remapped to
+    the new id; a segment that merged into its predecessor lost its seam -- the
+    transition there is meaningless, drop it. (Crossfades were NOT remapped
+    before heal -- a latent gap that becomes load-bearing now that heal merges
+    more seams.)"""
     ops = document.get("operations") or []
-    if not any(o.get("type") == "split_edit" for o in ops):
+    if not any(o.get("type") in _SEAM_OP_TYPES for o in ops):
         return
     survivors = {id(s): s.get("seg_id") for s in (document.get("timeline") or [])}
     new_by_old = {old: survivors.get(id(seg))
                   for old, seg in zip(old_ids, old_segs) if old}
     kept: List[dict] = []
     for o in ops:
-        if o.get("type") != "split_edit":
+        if o.get("type") not in _SEAM_OP_TYPES:
             kept.append(o)
             continue
         new_id = new_by_old.get(o.get("seam_seg_id"))
         if new_id is None:
-            continue                      # seam welded away -> split is moot
+            continue                      # seam healed away -> transition is moot
         o["seam_seg_id"] = new_id
         kept.append(o)
     document["operations"] = kept
@@ -1301,7 +1313,7 @@ def _offcam_speaker_flag(meta: dict, anchor: str) -> List[dict]:
              if spk in (a.get("visible_persons") or [])]
     if not oncam:
         return []
-    refs = ", ".join(sorted({str(a.get("moment_id")) for a in oncam if a.get("moment_id")}))
+    refs = ", ".join(sorted({str(a.get("cut_id")) for a in oncam if a.get("cut_id")}))
     where = f" ({refs})" if refs else ""
     return [{"severity": "info", "anchor": anchor,
              "message": f"plays speaker {spk} off camera while an on-camera angle of "
@@ -1546,9 +1558,9 @@ def affordances(document: dict, ctx: EditContext) -> dict:
     # out of this pool (still placeable by ref if the brain chooses to).
     on_line = {s.get("ref") for s in timeline}
     cutaway_pool = [
-        m["moment_id"] for clip in ctx.map_struct.get("clips", [])
+        m["cut_id"] for clip in ctx.map_struct.get("clips", [])
         for m in clip.get("moments", []) or []
-        if m.get("channel") in ("done", "shown") and m["moment_id"] not in on_line
+        if m.get("channel") in ("done", "shown") and m["cut_id"] not in on_line
         and not m.get("junk")
     ]
     channels = ["V1", "A1"] if timeline else []

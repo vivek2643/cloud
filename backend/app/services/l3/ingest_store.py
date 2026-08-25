@@ -128,6 +128,19 @@ def update_cut_scene_specifics(cut_id: str, specifics: Dict[str, Any]) -> None:
         )
 
 
+def update_cut_continuity(cut_id: str, continuity: Dict[str, Any]) -> None:
+    """brain_perception_blindness.plan.md B1: one cut's continuity block
+    (cut_no/of + weld verdicts toward each neighbor), written post-insert --
+    same one-row-per-call contract as update_cut_scene_specifics, for the
+    same reason (a caller iterating a whole run should let one row's
+    failure stay isolated, never abort the batch)."""
+    with _pg_conn() as conn:
+        conn.execute(
+            "update cut_records set continuity = %s where id = %s",
+            (json.dumps(continuity), cut_id),
+        )
+
+
 def accumulate_pass2_usage(ingest_run_id: str, usage: Dict[str, int]) -> None:
     with _pg_conn() as conn:
         conn.execute(

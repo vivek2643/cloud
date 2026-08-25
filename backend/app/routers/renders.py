@@ -43,7 +43,9 @@ def _enqueue(render_id: str) -> bool:
         enqueue_app = App(connector=PsycopgConnector(
             conninfo=get_settings().database_url, min_size=1, max_size=2))
         with enqueue_app.open():
-            enqueue_app.configure_task("render_edit", queue="render").defer(render_id=render_id)
+            enqueue_app.configure_task(
+                "render_edit", queue=get_settings().effective_queue("render"),
+            ).defer(render_id=render_id)
         return True
     except Exception:
         logger.exception("Could not enqueue render %s", render_id)

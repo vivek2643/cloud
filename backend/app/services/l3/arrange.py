@@ -6,7 +6,7 @@ and edits the document DIRECTLY with tools (``observe``/``act``). Those tools
 refer to content by this module's stable map ids and resolve them through
 ``_MapIndex``:
 
-  * a MOMENT id (e.g. ``ab12cd34:m07``) taken at one of its available energy
+  * a CUT id (e.g. ``ab12cd34:c07``) taken at one of its available energy
     LEVELS (broad/calm/balanced/tight/sharp), or
   * an ATOM id (a moment's finest sub-cut) when it wants just a piece.
 
@@ -14,8 +14,12 @@ What lives here now (the compile/arrange pipeline is gone -- ``act`` mutates the
 document and ``observe.resolve_doc`` resolves it):
   * ``Placement`` / ``ResolvedCut`` -- the neutral pick + its resolved span.
   * ``_MapIndex`` -- validate a ref + resolve (ref, level) -> a source span.
-  * ``_weld_segments`` -- merge adjacent same-clip contiguous main-line cuts
-    (used by ``observe.resolve_doc`` to keep the agentic timeline clean).
+  * ``heal_adjacent_cuts`` -- the shared deterministic HEAL pass: merge adjacent
+    SAME-SOURCE spine segments whose source spans are contiguous (or within a
+    tiny gap) into one continuous clip, so one take plays through with no micro
+    jump-cut. Wired into BOTH composition paths -- the auto-assembly/brain path
+    (``observe.resolve_doc``) and the manual/SNAP path (``put_document`` ->
+    ``resolve_document``). Generalizes the old ``_weld_segments``.
   * ``render_program_map`` -- render the ASSEMBLED edit (the fully-resolved
     layer stack) as two small tables for a chat turn.
 """
@@ -33,11 +37,12 @@ logger = logging.getLogger(__name__)
 # lane, anchored at a program time (never a "layer over" -- a full channel).
 _MAIN_TRACK = 0
 
-# Two adjacent main-line segments from the SAME clip whose source spans touch (or
-# overlap) within this tolerance are welded into one continuous segment -- no
-# redundant hard cut. ~3 frames @ 25fps; small enough that a real intra-clip jump
-# (distant slices) and a cut's own keep_spans jump-cuts stay separate.
-_WELD_TOL_MS = 120
+# heal_adjacent_cuts.plan.md: module fallback for call sites / tests that don't
+# thread `get_settings().heal_gap_ms`. Two adjacent SAME-FILE spine segments
+# whose source spans touch (or sit within this many ms) are HEALED into one
+# continuous segment -- no redundant hard cut, no micro jump-cut. Supersedes the
+# old hard-coded _WELD_TOL_MS=120 (a real 130ms micro-jump sat just above it).
+HEAL_GAP_MS_DEFAULT = 200
 
 
 # --------------------------------------------------------------------------
@@ -47,7 +52,7 @@ _WELD_TOL_MS = 120
 @dataclass
 class Placement:
     """One arranger choice: a map id taken at a level, placed on a track."""
-    ref: str                       # moment_id (validated against map)
+    ref: str                       # cut_id (validated against map)
     level: str = "balanced"        # energy level
     track: int = _MAIN_TRACK       # 0 = V1 main line; >=1 = V2+ cutaway lane
     from_ms: Optional[int] = None  # V2+ cutaway anchor on the program clock (track>=1)
@@ -131,14 +136,14 @@ def _resolve_mute(default_mute: bool, audio_override: Optional[str]) -> bool:
 
 
 class _MapIndex:
-    """Fast lookup over an ``assemble_map`` struct: moment_id -> moment. Owns
+    """Fast lookup over an ``assemble_map`` struct: cut_id -> moment. Owns
     the resolution of a (ref, level) to a span."""
 
     def __init__(self, map_struct: Dict[str, Any]) -> None:
         self.moments: Dict[str, dict] = {}
         for clip in (map_struct or {}).get("clips", []) or []:
             for m in clip.get("moments", []) or []:
-                self.moments[m["moment_id"]] = m
+                self.moments[m["cut_id"]] = m
 
     def has(self, ref: str) -> bool:
         return ref in self.moments
@@ -188,41 +193,129 @@ class _MapIndex:
 
 
 # --------------------------------------------------------------------------
-# Welding (used by observe.resolve_doc to keep the agentic main line clean)
+# Heal (the shared deterministic compose-time pass; wired into BOTH the
+# auto-assembly path -- observe.resolve_doc -- and the manual/SNAP path --
+# put_document). heal_adjacent_cuts.plan.md.
 # --------------------------------------------------------------------------
 
-def _weld_segments(segments: List[dict]) -> List[dict]:
-    """Merge consecutive main-line segments from the SAME clip whose source spans
-    are contiguous/overlapping (the next starts within ``_WELD_TOL_MS`` of where
-    the previous ended), so two adjacent slices of one continuous shot play as ONE
-    segment -- no redundant hard cut, no stutter.
+# Op types keyed on a SEAM segment id (the "next" cut a transition sits before);
+# both must be remapped/dropped when the heal merges the seam away.
+_SEAM_OP_TYPES = ("split_edit", "crossfade")
 
-    Safe by construction: a cut's own ``keep_spans`` jump-cuts and any intentional
-    intra-clip jump (distant slices) are NON-contiguous, so they fail the test and
-    stay separate. The merged segment keeps the first slice's level/ref/provenance
-    and is marked ``speech`` if either side carried audio. Seg ids are re-issued
-    (they are opaque everywhere downstream)."""
-    welded: List[dict] = []
+
+def _audio_coupling(seg: dict) -> Tuple[str, int, Any]:
+    """A segment's authoritative audio identity (file/offset/override). Two
+    contiguous slices are only heal-mergeable when these MATCH -- merging would
+    otherwise silently drop one side's routing (e.g. a replace_audio'd seam).
+    Defaults (missing keys) mirror _segments_from_cut: file_id / 0 / no override."""
+    override = seg.get("audio_override")
+    return (
+        str(seg.get("audio_file_id") or seg.get("file_id") or ""),
+        int(seg.get("audio_offset_ms") or 0),
+        None if override is None else _freeze(override),
+    )
+
+
+def _freeze(val: Any) -> Any:
+    if isinstance(val, dict):
+        return tuple(sorted((k, _freeze(v)) for k, v in val.items()))
+    if isinstance(val, (list, tuple)):
+        return tuple(_freeze(v) for v in val)
+    return val
+
+
+def _can_heal(prev: dict, s: dict, gap_ms: int) -> bool:
+    """Deterministic weld-vs-hard decision for one adjacent pair. HEAL when ALL:
+      * same file_id,
+      * the next segment is forward + contiguous within ``gap_ms``
+        (prev.in_ms <= s.in_ms <= prev.out_ms + gap_ms),
+      * ``s`` carries no ``hard_seam`` marker (a deliberately tightened pause,
+        stamped by retime/tighten, must NEVER heal -- §5 tighten guard), and
+      * both sides share the same authoritative audio coupling."""
+    if prev.get("file_id") != s.get("file_id"):
+        return False
+    if s.get("hard_seam"):
+        return False
+    try:
+        p_in, p_out, s_in = int(prev["in_ms"]), int(prev["out_ms"]), int(s["in_ms"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not (p_in <= s_in <= p_out + gap_ms):
+        return False
+    return _audio_coupling(prev) == _audio_coupling(s)
+
+
+def heal_adjacent_cuts(
+    segments: List[dict],
+    *,
+    gap_ms: int,
+    reindex: bool = True,
+) -> Tuple[List[dict], Dict[str, str]]:
+    """Merge adjacent SAME-SOURCE spine segments whose source spans are
+    contiguous or separated by at most ``gap_ms`` of dropped source, so one
+    continuous take plays as ONE segment (no micro jump-cut).
+
+    Deterministic: same file + forward source-adjacency within ``gap_ms`` (and a
+    matching audio coupling, no ``hard_seam`` guard -- see ``_can_heal``).
+    Healing sets ``prev.out_ms = max(prev.out_ms, next.out_ms)`` -- the source
+    plays straight through, bridging the dropped gap. Audio needs no handling
+    here: ``layers.resolve`` derives the dialogue layer per merged segment, so it
+    bridges the same gap automatically and stays aligned.
+
+    Returns ``(healed_segments, merged_map)`` where ``merged_map`` maps every
+    ABSORBED seg_id -> the surviving predecessor's (final) seg_id, so ops keyed
+    on a seam id (split_edit/crossfade) can be dropped/remapped.
+
+    ``reindex=True`` re-issues ids as ``a000, a001, ...`` (the brain refers to
+    cuts by these stable, human-readable ids). ``reindex=False`` keeps the
+    predecessor's own id (the manual/snap path, so client selection/undo
+    references survive). Idempotent: a second pass over an already-healed
+    timeline is a no-op and returns an empty ``merged_map``.
+
+    The merged segment keeps the first slice's level/ref/provenance, is marked
+    ``speech`` if either side carried audio, and concatenates content (matching
+    the old weld). Surviving segment DICTS are kept (mutated in place), so a
+    caller can still track a seam by object identity across the pass."""
+    healed: List[dict] = []
+    absorbed: List[Tuple[Optional[str], dict]] = []  # (absorbed seg_id, survivor dict)
     for s in segments:
-        prev = welded[-1] if welded else None
-        if (prev is not None
-                and prev["file_id"] == s["file_id"]
-                and prev["in_ms"] <= s["in_ms"] <= prev["out_ms"] + _WELD_TOL_MS):
+        prev = healed[-1] if healed else None
+        if prev is not None and _can_heal(prev, s, gap_ms):
             prev["out_ms"] = max(prev["out_ms"], s["out_ms"])
             if s.get("axis") == "speech":
                 prev["axis"] = "speech"
             # Keep audio if EITHER side wants it -- only a fully-stray merged span
-            # stays muted (never silence real speech that welded onto a video cut).
+            # stays muted (never silence real speech that healed onto a video cut).
             if not s.get("mute"):
                 prev["mute"] = None
             if s.get("content") and s["content"] != prev.get("content"):
                 prev["content"] = f"{(prev.get('content') or '').strip()} "\
                                   f"{s['content'].strip()}".strip()
+            absorbed.append((s.get("seg_id"), prev))
             continue
-        welded.append(s)
-    for i, s in enumerate(welded):
-        s["seg_id"] = f"a{i:03d}"
-    return welded
+        healed.append(s)
+    if reindex:
+        for i, s in enumerate(healed):
+            s["seg_id"] = f"a{i:03d}"
+    merged_map = {aid: surv.get("seg_id") for aid, surv in absorbed
+                  if aid and surv.get("seg_id")}
+    return healed, merged_map
+
+
+def _remap_seam_ops_list(operations: List[dict], merged_map: Dict[str, str]) -> List[dict]:
+    """Drop the split_edit/crossfade ops whose seam segment was healed AWAY
+    (its id is a key in ``merged_map`` -- it merged into its predecessor, so the
+    seam no longer exists). Ops on surviving seams pass through unchanged -- the
+    id-stable (``reindex=False``) call site's shared op-remap helper. The
+    reindex=True path (observe) remaps surviving ids too, by object identity."""
+    if not merged_map or not any(o.get("type") in _SEAM_OP_TYPES for o in operations):
+        return operations
+    kept: List[dict] = []
+    for o in operations:
+        if o.get("type") in _SEAM_OP_TYPES and o.get("seam_seg_id") in merged_map:
+            continue                      # seam healed away -> transition is moot
+        kept.append(o)
+    return kept
 
 
 def _label(text: Optional[str]) -> str:

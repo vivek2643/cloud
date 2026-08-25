@@ -77,7 +77,7 @@ def test_thought_levels_become_variants():
                               [_thought_cut()])
     assert tree["moment_count"] == 1, tree["moment_count"]
     m = tree["moments"][0]
-    assert m["moment_id"] == "ffffffff:m00", m["moment_id"]
+    assert m["cut_id"] == "ffffffff:c00", m["cut_id"]
     assert set(m["variants"].keys()) == {"broad", "calm", "balanced", "tight", "sharp"}, \
         m["variants"].keys()
     # The moment anchors on balanced (one complete thought per cut).
@@ -144,7 +144,7 @@ def test_map_text_lists_variants_no_atoms():
     lines = block.splitlines()
     assert lines[0].startswith('CLIP ffffffff "Take 2"'), lines[0]
     assert len(lines) == 1 + tree["moment_count"]
-    assert "nrg:broad|calm|balanced|tight|sharp" in lines[1], lines[1]
+    assert "levels:broad|calm|balanced|tight|sharp" in lines[1], lines[1]
     assert "atoms" not in lines[1], lines[1]
     print("ok  test_map_text_lists_variants_no_atoms")
 
@@ -196,19 +196,88 @@ def test_source_contiguous_beats_form_a_run_channel_agnostic():
              ladder=[_rung("balanced", 30000, 32000, "later", 0.6)]),
     ]
     tree = fm.build_clip_tree("ffffffff-1111", {"name": "Match", "duration_ms": 40000}, cuts)
-    by_id = {m["moment_id"].split(":")[-1]: m for m in tree["moments"]}
+    by_id = {m["cut_id"].split(":")[-1]: m for m in tree["moments"]}
     # m00..m03 are adjacent in source time (mixed channels) -> ONE run of 4.
-    run0 = by_id["m00"].get("run_id")
+    run0 = by_id["c00"].get("run_id")
     assert run0 is not None
-    assert all(by_id[mid]["run_id"] == run0 for mid in ("m00", "m01", "m02", "m03")), by_id
-    assert by_id["m00"]["run_len"] == 4, by_id["m00"]["run_len"]
-    assert [by_id[mid]["run_pos"] for mid in ("m00", "m01", "m02", "m03")] == [0, 1, 2, 3]
+    assert all(by_id[mid]["run_id"] == run0 for mid in ("c00", "c01", "c02", "c03")), by_id
+    assert by_id["c00"]["run_len"] == 4, by_id["c00"]["run_len"]
+    assert [by_id[mid]["run_pos"] for mid in ("c00", "c01", "c02", "c03")] == [0, 1, 2, 3]
     # The far-away beat (big gap) is its own lone run -> no tag.
-    assert by_id["m04"].get("run_id") is None, "far-away beat starts no (multi) run"
+    assert by_id["c04"].get("run_id") is None, "far-away beat starts no (multi) run"
     # Channel never entered it: a said and a shown sit inside the run too.
-    assert by_id["m01"]["channel"] == "said" and by_id["m02"]["channel"] == "shown"
-    assert "· run:" in fm._moment_line(by_id["m01"]), fm._moment_line(by_id["m01"])
+    assert by_id["c01"]["channel"] == "said" and by_id["c02"]["channel"] == "shown"
+    # brain_material_truth.plan.md Part 4.1: run membership is no longer an
+    # inline tag on the moment line -- it's structural now (_clip_block's
+    # header + indentation). See test_clip_block_groups_run_members below.
+    assert "run:" not in fm._moment_line(by_id["c01"]), fm._moment_line(by_id["c01"])
     print("ok  test_source_contiguous_beats_form_a_run_channel_agnostic")
+
+
+def test_clip_block_groups_run_members_under_a_continuity_header():
+    """brain_material_truth.plan.md Part 4.1: continuity is the SHAPE of the
+    listing now, not a suffix tag. A run's members render as one block --
+    a header (source-time span) followed by each member, indented, in
+    source order -- and a lone moment (no run) renders exactly as before,
+    at the top level, with no header at all."""
+    cuts = [
+        _cut("c:0", 0, 2000, "kick", channel="done", subject="person", speaker=None,
+             ladder=[_rung("balanced", 0, 2000, "kick", 0.6)]),
+        _cut("c:1", 500, 2500, "go go go", channel="said", subject="person", speaker="S1",
+             ladder=[_rung("balanced", 500, 2500, "go go go", 0.6)]),
+        _cut("c:2", 2100, 4000, "the scoreboard", channel="shown", subject="graphic",
+             speaker=None, ladder=[_rung("balanced", 2100, 4000, "the scoreboard", 0.6)]),
+        _cut("c:3", 4200, 6000, "shoot", channel="done", subject="person", speaker=None,
+             ladder=[_rung("balanced", 4200, 6000, "shoot", 0.6)]),
+        _cut("c:4", 30000, 32000, "later", channel="done", subject="person", speaker=None,
+             ladder=[_rung("balanced", 30000, 32000, "later", 0.6)]),
+    ]
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "Match", "duration_ms": 40000}, cuts)
+    block = fm._clip_block(tree)
+    lines = block.splitlines()
+    # Header, then the run's own continuity header, then 4 indented members,
+    # then the lone moment with no header at all -- source order throughout.
+    assert lines[0].startswith('CLIP ffffffff "Match"'), lines[0]
+    assert "plays continuously" in lines[1] and "0:00" in lines[1] and "0:06" in lines[1], lines[1]
+    member_lines = lines[2:6]
+    for ln, cut_no in zip(member_lines, ("c00", "c01", "c02", "c03")):
+        assert ln.startswith("    "), ln           # extra indent under the header
+        assert cut_no in ln, ln
+        assert "run:" not in ln, ln                # membership is structural now, not a tag
+    assert "c04" in lines[6] and not lines[6].startswith("    "), lines[6]
+    assert "plays continuously" not in lines[6], lines[6]   # lone moment -- no header
+    # Members stay in source order inside the block.
+    assert [ln.split()[0] for ln in member_lines] == ["c00", "c01", "c02", "c03"], member_lines
+    print("ok  test_clip_block_groups_run_members_under_a_continuity_header")
+
+
+def test_clip_block_run_indent_composes_with_takes_lines():
+    """Hard requirement (Part 4.1): `_takes_lines`' own sub-block formatting
+    is untouched -- a run member that also has take-group alternates still
+    gets its `takes:` sub-block, uniformly shifted under the run's extra
+    indent along with the rest of that member's line(s)."""
+    cut_a = _cut("c:0", 0, 2000, "hello", channel="said", speaker="S0",
+                ladder=[_rung("balanced", 0, 2000, "hello", 0.6)],
+                take_group_id="tg1", take_role="winner")
+    cut_b = _cut("c:1", 2100, 4000, "world", channel="said", speaker="S0",
+                ladder=[_rung("balanced", 2100, 4000, "world", 0.6)])
+    cut_other = _cut("o:0", 1000, 4000, "hello", channel="said", speaker="S9",
+                     ladder=[_rung("balanced", 1000, 4000, "hello", 0.73)],
+                     take_group_id="tg1", take_role="take")
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut_a, cut_b])
+    tree_other = fm.build_clip_tree("99999999-1111", {"name": "O", "duration_ms": 8000}, [cut_other])
+    fm._annotate_dups([tree, tree_other])
+
+    block = fm._clip_block(tree)
+    lines = block.splitlines()
+    assert "plays continuously" in lines[1], lines[1]
+    assert lines[2].startswith("    c00"), lines[2]
+    assert lines[3].strip().startswith("takes:"), lines[3]
+    assert lines[3].startswith("      "), lines[3]   # takes_lines' own 4sp + the block's 2sp
+    assert "99999999:c00" in lines[4], lines[4]
+    assert lines[4].startswith("      "), lines[4]
+    assert lines[5].startswith("    c01"), lines[5]
+    print("ok  test_clip_block_run_indent_composes_with_takes_lines")
 
 
 def test_reconciled_shows_face_and_cam_override():
@@ -217,7 +286,7 @@ def test_reconciled_shows_face_and_cam_override():
     heard, tagged OFF-CAM when the speaking voice's bound person isn't the
     one shown here (the listener-camera case: P1 talks, but this clip shows
     P0). PIC leads the line; SND trails it."""
-    cut = _cut("48c93cef:m03", 1000, 4000, "and then we shipped it", channel="said",
+    cut = _cut("48c93cef:c03", 1000, 4000, "and then we shipped it", channel="said",
                subject="person", score=0.6,
                ladder=[_rung("balanced", 1000, 4000, "and then we shipped it", 0.6)],
                voice_ids=["V1"], speaker_person="P1", visible_persons=["P0"], on_camera=False)
@@ -235,7 +304,7 @@ def test_said_beat_on_listener_camera_reads_pic_first_with_alt_pic():
     no longer be mistaken for showing the speaker -- and `alt-PIC` points at the
     camera that DOES show the speaker for the same words (Fact #2 folded onto
     the beat, not buried in a distant coverage block)."""
-    cut = _cut("48c93cef:m24", 1000, 4000, "that freedom he gave you", channel="said",
+    cut = _cut("48c93cef:c24", 1000, 4000, "that freedom he gave you", channel="said",
                subject="person", score=0.6,
                ladder=[_rung("balanced", 1000, 4000, "that freedom he gave you", 0.6)],
                voice_ids=["V2"], speaker_person="P2", visible_persons=["P1"], on_camera=False,
@@ -244,14 +313,14 @@ def test_said_beat_on_listener_camera_reads_pic_first_with_alt_pic():
     m = tree["moments"][0]
     # Folded on by `_annotate_dups` in the real path; set directly here to test
     # the render in isolation (mirrors how `_dups_block` fixtures worked before).
-    m["alt_pic"] = [{"moment_id": "1aedb093:m13", "file": "1aedb093-bbb",
+    m["alt_pic"] = [{"cut_id": "1aedb093:c13", "file": "1aedb093-bbb",
                      "visible_persons": ["P2"], "speaker_person": "P2",
                      "framing": "med", "score": 0.73, "restart": False}]
     line = fm._moment_line(m)
     assert "PIC:P1" in line, line
     assert "SND:P2 OFF-CAM speaking" in line, line
     assert line.index("PIC:") < line.index("SND:"), line
-    assert "·alt-PIC:P2→1aedb093:m13" in line, line
+    assert "·alt-PIC:P2→1aedb093:c13" in line, line
     print("ok  test_said_beat_on_listener_camera_reads_pic_first_with_alt_pic")
 
 
@@ -294,10 +363,12 @@ def test_aud_tag_absent_without_speech_quality():
     print("ok  test_aud_tag_absent_without_speech_quality")
 
 
-def test_action_beat_never_gets_said_text():
-    """A done/shown beat's visual label stays primary, never overwritten by
-    transcript text that happens to overlap it in TIME -- said_text is only
-    ever computed for channel == 'said' cuts."""
+def test_action_beat_surfaces_incidental_said_text_brain_mirror_readside():
+    """brain_mirror_readside.plan.md section 3.2 (band-aid C retired): a
+    done/shown beat's visual label still leads the beat line, but said_text
+    is no longer gated on channel=="said" -- incidental spoken words under
+    a picture cut (the slide-voiceover case) now surface too, instead of
+    being silently hidden from the brain."""
     cut = _cut("f:tr2", 1000, 3000, "nods thoughtfully", channel="done", subject="person",
                score=0.6, ladder=[_rung("balanced", 1000, 3000, "nods thoughtfully", 0.6)])
     sentences = ({"speaker": "S0", "text": "narration that happens to overlap in time",
@@ -305,11 +376,26 @@ def test_action_beat_never_gets_said_text():
     with mock.patch.object(fm, "_sentences_for_file", return_value=sentences):
         tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
     m = tree["moments"][0]
-    assert m["said_text"] == "", m["said_text"]
+    assert m["said_text"] == "narration that happens to overlap in time", m["said_text"]
     line = fm._moment_line(m)
+    # The done beat's own visual gist still leads the primary quote (never
+    # displaced by incidental words); the words surface as a SEPARATE tag.
     assert '"nods thoughtfully"' in line, line
-    assert "narration that happens to overlap" not in line, line
-    print("ok  test_action_beat_never_gets_said_text")
+    assert 'words:"narration that happens to overlap' in line, line
+    # brain_material_truth.plan.md Part 4.4: "incidental:" claimed an
+    # importance judgment this code has no basis to make -- renamed to the
+    # neutral `words:`.
+    assert "incidental:" not in line, line
+    print("ok  test_action_beat_surfaces_incidental_said_text_brain_mirror_readside")
+
+
+def test_action_beat_said_text_empty_when_nothing_overlaps():
+    cut = _cut("f:tr2b", 1000, 3000, "nods thoughtfully", channel="done", subject="person",
+               score=0.6, ladder=[_rung("balanced", 1000, 3000, "nods thoughtfully", 0.6)])
+    with mock.patch.object(fm, "_sentences_for_file", return_value=()):
+        tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    assert tree["moments"][0]["said_text"] == ""
+    print("ok  test_action_beat_said_text_empty_when_nothing_overlaps")
 
 
 def test_said_beat_transcript_truncates_in_compact_mode():
@@ -397,7 +483,7 @@ def test_speaker_person_renders_on_cam_when_shown():
     SND:<person> ON-CAM -- the straightforward, common case (voice_first_
     identity.plan.md Phase F/G: voice->person binding + visible_persons both
     resolve to the same id here)."""
-    cut = _cut("48c93cef:m00", 1000, 4000, "we shipped it",
+    cut = _cut("48c93cef:c00", 1000, 4000, "we shipped it",
                score=0.7, ladder=[_rung("balanced", 1000, 4000, "we shipped it", 0.7)],
                voice_ids=["V0"], speaker_person="P1", visible_persons=["P1"], on_camera=True)
     tree = fm.build_clip_tree("48c93cef-aaa", {"name": "T", "duration_ms": 8000}, [cut])
@@ -431,10 +517,39 @@ def test_annotate_dups_reads_take_group_id():
     assert g["group_id"] == "tg1", g
     ma, mb = tree_a["moments"][0], tree_b["moments"][0]
     assert ma["dup_group"] == "tg1" and mb["dup_group"] == "tg1"
-    assert ma["alt_pic"][0]["moment_id"] == mb["moment_id"], ma["alt_pic"]
-    assert mb["alt_pic"][0]["moment_id"] == ma["moment_id"], mb["alt_pic"]
+    assert ma["alt_pic"][0]["cut_id"] == mb["cut_id"], ma["alt_pic"]
+    assert mb["alt_pic"][0]["cut_id"] == ma["cut_id"], mb["alt_pic"]
     assert {mf["take_role"] for mf in g["member_facts"]} == {"winner", "take"}, g["member_facts"]
     print("ok  test_annotate_dups_reads_take_group_id")
+
+
+def test_snd_state_says_muted_talk_is_recoverable():
+    """brain_material_truth.plan.md Part 4.4: a cut still muted with real
+    words underneath must say the words can be unmuted, not merely that
+    they were suppressed -- the wording that let a founder's own slide
+    narration read as unusable noise in the failing edit ("these are
+    muted(talk) -- incidental founder speech")."""
+    cut = _cut("f:mt", 1000, 2000, "slide up", channel="shown", subject="object",
+               speaker=None, score=0.5, ladder=[_rung("balanced", 1000, 2000, "slide up", 0.5)],
+               audio="speech", mute=True)
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "SND:muted(talk→unmute)" in line, line
+    print("ok  test_snd_state_says_muted_talk_is_recoverable")
+
+
+def test_snd_state_ambient_mute_stays_terse():
+    """Only the talk case gets the recoverability wording -- an ambient/
+    other mute is genuinely just suppressed sound with no words to recover,
+    so it stays as terse as before."""
+    cut = _cut("f:ma", 1000, 2000, "b-roll", channel="shown", subject="object",
+               speaker=None, score=0.5, ladder=[_rung("balanced", 1000, 2000, "b-roll", 0.5)],
+               audio="sound", mute=True)
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "SND:muted(ambient)" in line, line
+    assert "unmute" not in line, line
+    print("ok  test_snd_state_ambient_mute_stays_terse")
 
 
 def test_junk_moment_renders_terse_line_not_the_rich_one():
@@ -452,9 +567,10 @@ def test_junk_moment_renders_terse_line_not_the_rich_one():
     m = tree["moments"][0]
     assert m["junk"] is True and m["junk_reason"] == "camera cue"
     line = fm._moment_line(m)
-    assert line.strip().startswith("m00 [JUNK: camera cue]"), line
+    assert line.strip().startswith("c00 [JUNK: camera cue]"), line
     assert "↔cut:2/3⋯" in line, line
-    assert "PIC:" not in line and "SND:" not in line and "nrg:" not in line, line
+    assert ("PIC:" not in line and "SND:" not in line
+            and "energy:" not in line and "levels:" not in line), line
     print("ok  test_junk_moment_renders_terse_line_not_the_rich_one")
 
 
@@ -466,7 +582,7 @@ def test_junk_moment_still_resolves_in_map_index():
                junk_reason="camera cue")
     tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
     idx = _MapIndex({"clips": [tree]})
-    mid = tree["moments"][0]["moment_id"]
+    mid = tree["moments"][0]["cut_id"]
     assert idx.has(mid)
     from app.services.l3.arrange import Placement
     resolved = idx.resolve(Placement(ref=mid))
@@ -768,7 +884,7 @@ def test_specific_tag_new_merged_renders_mini_shot_list_with_deltas():
     }, "in_ms": 0}
     line = fm._specific_tag(m)
     assert 'spec:"barista works counter · medium"' in line, line
-    assert "moments:[" in line, line
+    assert "inside:[" in line, line
     assert "+1.2s barista grabs cup" in line, line
     assert "+3.4s pours latte, close" in line, line
     assert "+5.1s slides across counter" in line, line
@@ -813,7 +929,7 @@ def test_specific_tag_compact_mode_drops_moments_list_and_secondary_tokens():
     assert "barista pours latte" in line and "medium" in line, line
     assert "usable" not in line, line
     assert "tags:" not in line, line
-    assert "moments:" not in line, line
+    assert "inside:" not in line, line
     print("ok  test_specific_tag_compact_mode_drops_moments_list_and_secondary_tokens")
 
 
@@ -837,6 +953,68 @@ def test_specific_tag_full_pipeline_new_shape_renders_on_the_beat_line():
     print("ok  test_specific_tag_full_pipeline_new_shape_renders_on_the_beat_line")
 
 
+# --------------------------------------------------------------------------
+# Fact dedup (brain_material_truth.plan.md Part 4.2): a slide cut's own text
+# used to render three times -- primary quote, graphic:, spec:"...text:'...'"
+# -- ~80 wasted chars per cut. Each duplicate is suppressed independently.
+# --------------------------------------------------------------------------
+
+def test_graphic_tag_suppressed_when_it_repeats_the_primary_quote():
+    cut = _cut("f:dup1", 1000, 4000, "Slide: The Insight", channel="shown", subject="graphic",
+               speaker=None, summary="The Insight")
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert '"Slide: The Insight"' in line, line
+    assert "graphic:" not in line, line
+    print("ok  test_graphic_tag_suppressed_when_it_repeats_the_primary_quote")
+
+
+def test_graphic_tag_still_renders_when_it_says_something_new():
+    cut = _cut("f:dup2", 1000, 4000, "Slide: The Insight", channel="shown", subject="graphic",
+               speaker=None, summary="a bar chart trending upward")
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert '"Slide: The Insight"' in line, line
+    assert 'graphic:"a bar chart trending upward"' in line, line
+    print("ok  test_graphic_tag_still_renders_when_it_says_something_new")
+
+
+def test_spec_on_screen_text_suppressed_when_it_repeats_the_primary_quote():
+    cut = _cut("f:dup3", 1000, 4000, "Slide: The Insight", channel="shown", subject="graphic",
+               speaker=None,
+               scene_specifics={"subject": "Slide", "on_screen_text": "The Insight"})
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert '"Slide: The Insight"' in line, line
+    assert 'spec:"Slide"' in line, line
+    assert "text:'" not in line, line
+    print("ok  test_spec_on_screen_text_suppressed_when_it_repeats_the_primary_quote")
+
+
+def test_spec_on_screen_text_still_renders_when_it_says_something_new():
+    cut = _cut("f:dup4", 1000, 4000, "Slide: The Insight", channel="shown", subject="graphic",
+               speaker=None,
+               scene_specifics={"subject": "Slide", "on_screen_text": "footnote: source, Q3 2026"})
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert '"Slide: The Insight"' in line, line
+    assert "text:'footnote: source, Q3 2026'" in line, line
+    print("ok  test_spec_on_screen_text_still_renders_when_it_says_something_new")
+
+
+def test_full_slide_scenario_says_the_fact_exactly_once():
+    """The plan's own concrete example: a slide cut whose text used to
+    render 3x (primary quote, graphic:, spec:"...text:'...'"). After the
+    dedup, "The Insight" appears exactly once on the line."""
+    cut = _cut("f:dup5", 1000, 4000, "Slide: The Insight", channel="shown", subject="graphic",
+               speaker=None, summary="The Insight",
+               scene_specifics={"subject": "Slide", "on_screen_text": "The Insight"})
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert line.count("The Insight") == 1, line
+    print("ok  test_full_slide_scenario_says_the_fact_exactly_once")
+
+
 def test_cast_line_lists_majors_with_voices_and_others_by_id():
     persons = [
         {"person_id": "P0", "display": "bald man, beard", "is_major": True, "owned_voices": ["V0"]},
@@ -854,6 +1032,76 @@ def test_cast_line_lists_majors_with_voices_and_others_by_id():
 def test_cast_line_empty_with_no_persons():
     assert fm._cast_line([]) == ""
     print("ok  test_cast_line_empty_with_no_persons")
+
+
+def _flat_cut():
+    """A ladder whose five levels all play the identical duration -- the
+    common vcut shape (`_PACE_LEVELS = [1.0]*5`, vcut/store.py) where the
+    zoom-ladder tag would be constant noise, not signal."""
+    return _cut("f:flat", 1000, 2000, "steady beat", score=0.6,
+                ladder=[_rung(level, 1000, 2000, "steady beat", 0.6)
+                        for level in fm._LEVEL_NAMES])
+
+
+def test_energy_tag_renders_real_grade_from_pace():
+    """brain_material_truth.plan.md Part 3: energy_grade lives on the cut's
+    pace envelope and used to reach the brain never -- render it as
+    `energy:GRADE` whenever it's present."""
+    cut = _flat_cut()
+    cut["pace"] = {"energy_grade": "high"}
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "energy:high" in line, line
+    print("ok  test_energy_tag_renders_real_grade_from_pace")
+
+
+def test_energy_tag_absent_without_pace_envelope():
+    """A legacy/pre-migration moment with no pace envelope at all renders no
+    energy tag -- there is nothing real to report, so it stays silent rather
+    than fabricate a grade."""
+    cut = _flat_cut()
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "energy:" not in line, line
+    print("ok  test_energy_tag_absent_without_pace_envelope")
+
+
+def test_levels_tag_suppressed_when_ladder_is_uniform():
+    """Part 2.2 route (b): a ladder where every level plays the identical
+    duration (vcut's `[1.0]*5`) carries no real information -- the old
+    `nrg:` tag rendered it unconditionally on nearly every video cut; the
+    replacement `levels:` tag must stay silent instead."""
+    cut = _flat_cut()
+    cut["pace"] = {"energy_grade": "medium"}
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "levels:" not in line, line
+    assert "energy:medium" in line, line
+    print("ok  test_levels_tag_suppressed_when_ladder_is_uniform")
+
+
+def test_levels_tag_renders_when_ladder_genuinely_varies():
+    """A real multi-piece cluster ladder (durations differ across levels)
+    still gets the honest `levels:` tag -- suppression is about uninformative
+    ladders, not the tag itself."""
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000},
+                              [_thought_cut()])
+    line = fm._moment_line(tree["moments"][0])
+    assert "levels:broad|calm|balanced|tight|sharp" in line, line
+    print("ok  test_levels_tag_renders_when_ladder_genuinely_varies")
+
+
+def test_no_dangling_separator_when_energy_and_levels_both_absent():
+    """When neither tag has anything to say, the tag section must not leave a
+    stray ` * ` bullet dangling off the quoted text (the old code had a
+    static separator that assumed energy_tag was always non-empty)."""
+    cut = _flat_cut()
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "energy:" not in line and "levels:" not in line, line
+    assert "·  ·" not in line, line
+    assert not line.rstrip().endswith("·"), line
+    print("ok  test_no_dangling_separator_when_energy_and_levels_both_absent")
 
 
 def test_default_energy_from_genre():
@@ -1007,7 +1255,7 @@ def test_moment_line_multi_event_cluster_is_multiline_and_generic():
     # The range line now makes the filtering explicit: plays whole, splits into
     # N addressable beats, or tightens down to the strongest few (punchy).
     assert "plays whole ~10.0s" in line, line
-    assert "splits into its 3 beats" in line, line
+    assert "splits into its 3 pieces" in line, line
     assert "down to ~1" in line, line
     # Per-piece rows carry the core/drops marking so the brain sees which beats
     # survive tightening and which fall away first.
@@ -1068,7 +1316,8 @@ def main():
     test_said_beat_with_transcript_quotes_verbatim_text_first()
     test_said_beat_shows_aud_tag_from_speech_quality()
     test_aud_tag_absent_without_speech_quality()
-    test_action_beat_never_gets_said_text()
+    test_action_beat_surfaces_incidental_said_text_brain_mirror_readside()
+    test_action_beat_said_text_empty_when_nothing_overlaps()
     test_said_beat_transcript_truncates_in_compact_mode()
     test_said_beat_with_no_transcript_falls_back_to_visual_gist()
     test_span_detail_pads_and_filters_via_shared_sentences_cache()
@@ -1076,6 +1325,8 @@ def main():
     test_done_beat_pic_first_parity_and_snd_silence()
     test_speaker_person_renders_on_cam_when_shown()
     test_annotate_dups_reads_take_group_id()
+    test_snd_state_says_muted_talk_is_recoverable()
+    test_snd_state_ambient_mute_stays_terse()
     test_junk_moment_renders_terse_line_not_the_rich_one()
     test_junk_moment_still_resolves_in_map_index()
     test_non_junk_moment_shows_continuity_position_and_weld_marks()
@@ -1113,9 +1364,21 @@ def main():
     test_specific_tag_compact_mode_drops_moments_list_and_secondary_tokens()
     test_specific_tag_compact_mode_legacy_shape_unaffected()
     test_specific_tag_full_pipeline_new_shape_renders_on_the_beat_line()
+    test_graphic_tag_suppressed_when_it_repeats_the_primary_quote()
+    test_graphic_tag_still_renders_when_it_says_something_new()
+    test_spec_on_screen_text_suppressed_when_it_repeats_the_primary_quote()
+    test_spec_on_screen_text_still_renders_when_it_says_something_new()
+    test_full_slide_scenario_says_the_fact_exactly_once()
     test_source_contiguous_beats_form_a_run_channel_agnostic()
+    test_clip_block_groups_run_members_under_a_continuity_header()
+    test_clip_block_run_indent_composes_with_takes_lines()
     test_cast_line_lists_majors_with_voices_and_others_by_id()
     test_cast_line_empty_with_no_persons()
+    test_energy_tag_renders_real_grade_from_pace()
+    test_energy_tag_absent_without_pace_envelope()
+    test_levels_tag_suppressed_when_ladder_is_uniform()
+    test_levels_tag_renders_when_ladder_genuinely_varies()
+    test_no_dangling_separator_when_energy_and_levels_both_absent()
     test_default_energy_from_genre()
     test_snap_merges_a_midsentence_seam()
     test_snap_keeps_a_between_sentence_seam()

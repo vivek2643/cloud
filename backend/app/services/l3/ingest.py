@@ -556,7 +556,7 @@ def defer_scene_enrich(project_id: str, ingest_run_id: str) -> None:
             conninfo=get_settings().database_url, min_size=1, max_size=2))
         with enqueue_app.open():
             enqueue_app.configure_task(
-                "l3_scene_enrich", queue="ingest",
+                "l3_scene_enrich", queue=get_settings().effective_queue("ingest"),
                 queueing_lock=f"scene_enrich:{ingest_run_id}",
             ).defer(project_id=project_id, ingest_run_id=ingest_run_id)
     except Exception:
@@ -598,7 +598,8 @@ def defer_ingest(project_id: str, user_id: str) -> None:
         conninfo=get_settings().database_url, min_size=1, max_size=2))
     with enqueue_app.open():
         enqueue_app.configure_task(
-            "l3_cuts_ingest", queue="ingest", priority=priority,
+            "l3_cuts_ingest", queue=get_settings().effective_queue("ingest"),
+            priority=priority,
             lock=f"ingest:{project_id}", queueing_lock=f"ingest:{project_id}",
         ).defer(project_id=project_id)
 

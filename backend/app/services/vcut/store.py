@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from app.services.l3.post import CutRecord, PaceEnvelope
 from app.services.vcut.reframe import solve_crops
 from app.services.vcut.resolve import ResolvedCut
+from app.services.vcut.salience import build_landmarks, build_salience
 
 # reframe_vcut_geometry.plan.md section 2: rotation_deg is always 0.0 for
 # every vcut cut. The proxy vcut reads (subclip's video input, Pass 2's
@@ -75,6 +76,16 @@ def _short_label(meaning: str, max_words: int = 6) -> str:
 
 
 def _pace_for(duration_ms: int) -> PaceEnvelope:
+    # brain_material_truth.plan.md Part 2.3: natural_sound feeds ONLY
+    # _audio_mute_for's no-words branch (cutrecord_map.py) -- a video cut
+    # whose span carries no transcript words at all. Part 1's per-span fix
+    # (speech_words_in_span's is_musical) has nothing to say about that
+    # case: it short-circuits to (0, False, False) before ever consulting
+    # _file_is_musical when there are no words, so there is no "Part 1
+    # answer" to wire in here for the wordless branch specifically. Left
+    # hardcoded True, as instructed when wiring it proves awkward -- this
+    # is second-order once Part 1 lands, since the now-larger speech-
+    # bearing branch returns before ever reaching this default.
     natural = max(1, duration_ms)
     return PaceEnvelope(min_ms=natural, natural_ms=natural, max_ms=natural,
                         levels=list(_PACE_LEVELS), energy_grade="calm", natural_sound=True)
@@ -110,7 +121,11 @@ def build_cut_records(resolved: List[ResolvedCut], seam: Dict[str, dict]) -> Lis
     as the old pipeline's l3_scene_enrich. framing is populated per
     reframe_vcut_geometry.plan.md (re-derived at every resolve from the
     cut's own composed subject_box, same energy-invariance guarantee as
-    scene_specifics -- see insert_video_cuts)."""
+    scene_specifics -- see insert_video_cuts). salience/landmarks are
+    populated per brain_cut_salience_parity.plan.md (vcut/salience.py),
+    re-derived from the cut's own moments at every resolve for the SAME
+    energy-invariance guarantee -- this is what lights up cutrecord_map's
+    content-aware ladder for vcut cuts."""
     records: List[CutRecord] = []
     for cut in resolved:
         file_seam = seam.get(cut.file_id) or {}
@@ -127,10 +142,23 @@ def build_cut_records(resolved: List[ResolvedCut], seam: Dict[str, dict]) -> Lis
             file_id=cut.file_id, src_in_ms=cut.in_ms, src_out_ms=cut.out_ms,
             kind="video", word_span=None, atom_ids=None,
             label=_short_label(cut.summary), summary=cut.summary,
+            # brain_material_truth.plan.md Part 2.4: junk=False is
+            # deliberately inert, not an oversight. Video-cut junk grading
+            # was built and then reverted at the user's own request (parked
+            # on wip/plan-a-junk-grading, the usability column dropped, the
+            # migration record removed) -- do not resurrect it here.
             on_camera=None, junk=False, junk_reason="",
             framing=_framing_for(cut, file_seam), look={}, caption_zones=[],
+            # brain_material_truth.plan.md Part 2.5: take_group_id=None is a
+            # real, out-of-scope gap (two shots of the same slide across
+            # files never surface as alternates) -- fixing it needs a design
+            # decision on what "the same take" means for PICTURE (visual
+            # similarity? content hash? pHash distance?), entangled with
+            # ingest_dedupe_and_descriptors.plan.md. Recorded, not fixed.
             hero_ts_ms=cut.peak_ms, pace=pace, take_group_id=None, take_role=None,
             channel="shown", speech_quality=None, total_quality=total_quality,
+            salience=build_salience(cut, hop_ms, action_energy, mean_ae),
+            landmarks=build_landmarks(cut, file_seam),
         ))
     return records
 

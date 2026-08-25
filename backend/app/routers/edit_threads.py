@@ -206,6 +206,19 @@ def put_document(
     timeline = _sanitize_timeline(body.timeline, durations)
     operations = _sanitize_operations(body.operations)
 
+    # heal_adjacent_cuts.plan.md Path B: the manual/SNAP path never welded before
+    # -- heal here, on the sanitized timeline, with the SAME shared function the
+    # brain path uses (reindex=False so surviving client selection/undo ids
+    # survive; only absorbed ids disappear). Then drop any split_edit/crossfade
+    # whose seam healed away, so the persisted human/snap spine is healed and
+    # authoritative -- a snap landing adjacent to a same-source contiguous
+    # segment heals identically to the brain's own placement.
+    from app.services.l3.arrange import _remap_seam_ops_list, heal_adjacent_cuts
+    from app.config import get_settings
+    timeline, merged_map = heal_adjacent_cuts(
+        timeline, gap_ms=get_settings().heal_gap_ms, reindex=False)
+    operations = _remap_seam_ops_list(operations, merged_map)
+
     new_doc = {**doc, "timeline": timeline, "operations": operations}
     if body.summary is not None:
         new_doc["summary"] = body.summary

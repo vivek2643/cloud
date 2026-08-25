@@ -388,7 +388,8 @@ def run_enrich(project_id: str, ingest_run_id: str) -> None:
     file's flagged moments, writes specifics onto the plan, persists it,
     then re-resolves at DEFAULT_ENERGY and rewrites cut_records so they
     carry the composed specifics (section 5.4/7.3 -- no more per-cut
-    update_cut_scene_specifics call for video cuts). Never raises upward in
+    update_cut_scene_specifics call for video cuts), then recomputes the
+    run's continuity blocks that rewrite necessarily discards. Never raises upward in
     practice (already wrapped by orchestrate.vcut_enrich), but stays
     defensive internally too: any problem here never affects whether the
     run's cuts are usable, only whether they carry specifics."""
@@ -434,5 +435,21 @@ def run_enrich(project_id: str, ingest_run_id: str) -> None:
 
     resolved = resolve_cuts(new_plan, seam_cache, energy=DEFAULT_ENERGY)
     n_written = len(vstore.insert_video_cuts(ingest_run_id, resolved, seam_cache))
+    # brain_perception_blindness.plan.md B1: insert_video_cuts DELETES and
+    # rebuilds every kind='video' row, and a fresh CutRecord carries the
+    # column default continuity={} -- so without this the enrich pass would
+    # blank continuity on every video cut of the run. Identical recompute to
+    # the energy-dial path (routers/projects._resolve_and_store) and to
+    # ingest itself: whole run, both kinds together, since a video cut's
+    # weld verdicts are computed against ALL of its file's cuts.
+    #
+    # This path is FRAMES mode only, so it is dormant while vcut_pass1_input_
+    # mode is "video" (enrich runs inline BEFORE orchestrate's own continuity
+    # write). That is exactly why it needs to be here rather than left to the
+    # caller: the mode is documented as a per-env A/B flip, and the loss would
+    # be silent -- _continuity_tag renders "" on a missing block, so every
+    # cut: tag would just vanish from the brain's index with nothing raised.
+    from app.services.vcut import continuity as vcut_continuity
+    vcut_continuity.write_continuity_for_run(ingest_run_id, seam_cache)
     logger.info("vcut pass2: project %s run %s enriched, %d video cut(s) rewritten",
                project_id, ingest_run_id, n_written)

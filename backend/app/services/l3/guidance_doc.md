@@ -20,7 +20,7 @@
 # Guidance: how to guess
 
 ## 1. Read the words and pictures as one
-The words and the pictures are a single reading, not a ranking — take each beat
+The words and the pictures are a single reading, not a ranking — take each cut
 from everything at once and lean on whichever carries the meaning at that moment.
 
 When the words lead (talk-driven material — vlog, tutorial, talking-head): read
@@ -35,22 +35,22 @@ alongside it.
 
 When the words DON'T lead (little or no speech — b-roll, montage, action): the
 pictures carry the meaning. Read the visual signals instead — each cut's energy
-(`nrg`), whether shots continue or break (welds / `cut:`), any on-screen
+(`energy:`), whether shots continue or break (welds / `cut:`), any on-screen
 `text:`, its `camera` move — to decide what matters and what follows what. There
 is NO house style to fall back on: take the shape and the pace from the user's
 goal and the material in front of you, never from a default "look". If music
 drives the piece, let its beat set the pace. In mixed material (reels, most
-social) the lead flips moment to moment — read each beat for whatever is carrying
+social) the lead flips moment to moment — read each cut for whatever is carrying
 it right then. When timing a punch-in or choosing where to hold within a cut,
 lean on its `peak:` (when present) — the cut's own strongest instant.
 
-## 2. Outlooks are alternate angles — pick per beat
+## 2. Outlooks are alternate angles — pick per cut
 An OUTLOOK is the same content shot from a different angle (not a retake, so it
-has no "winner"). When a beat has outlooks, choose the angle that best serves
-the moment and switch angles on the beat, never mid-thought. When someone is
+has no "winner"). When a cut has outlooks, choose the angle that best serves
+the moment and switch angles on the cut, never mid-thought. When someone is
 speaking, the default is the angle where the SPEAKER is on camera — cut to who's
 talking; holding on a listener or reaction shot is a deliberate choice, not the
-fallback. So if a beat plays the speaker OFF camera while an on-camera angle of
+fallback. So if a cut plays the speaker OFF camera while an on-camera angle of
 that same moment exists, that's usually a miss — switch to the on-camera angle
 unless you meant the reaction. This is how any multicam material is assembled
 (interviews included, which are otherwise just talk-driven like a podcast).
@@ -60,10 +60,22 @@ Two situations are the SAME generic operation: landing an overlay on a specific
 line, and cutting a shot to a beat. Both just fit a clip to a target program
 window `[A,B]`. To do it: get `[A,B]` from whatever sense exposes it, then
 adjust the clip's length with `trim` or pace (`retime` for video's playback
-speed, or speech's dead-air trim). Don't compute the exact result — read the
-actual length back from `read_state`/the Program Map (or `review`, once
-placed) and adjust again if it's off; that loop is exact, blind arithmetic
+speed, or speech's dead-air trim — a speech cut carries a removable
+dead-air budget, and trimming inside it shortens the line without
+touching the words). Don't compute the exact
+result — read the actual length back from `read_state`/the Program Map (or
+`review`, once placed) and adjust again if it's off; that loop is exact,
+blind arithmetic
 isn't.
+
+When you're trimming a video shot rather than a speech line, aim the trim at
+the shot's key frame. Each shot tells you where its strongest instant is
+(`peak:+Xs`) and which way it leans: a shot that BUILDS wants its run-up kept
+and lands on the impact, so trim from the HEAD; one that SETTLES wants the
+landing kept, so trim from the TAIL; a balanced one tightens from BOTH sides
+toward the peak. Trim toward the key frame that way, then read the length back
+from `read_state`/`review` and adjust — never clip the peak itself, and don't
+compute the result blind.
 
 ## 4. Select for the video's purpose
 Most videos exist to serve a higher purpose for their audience — a teaser to
@@ -73,17 +85,31 @@ purpose guide what to keep. Read the purpose from the user's ask and the
 material; when it's unclear and the selection hinges on it, ask rather than
 assume.
 
-A moment may hold several beats (a busy stretch with more than one distinct
+A cut may hold several pieces (a busy stretch with more than one distinct
 hit). You have three ways to take it, guided by your length budget and the
 video's purpose: play it WHOLE as one continuous stretch; TIGHTEN it along the
-energy levels (broad→sharp), which keeps only its strongest beats and drops the
+energy levels (broad→sharp), which keeps only its strongest pieces and drops the
 weaker/connective ones as you sharpen (so a tighter take is shorter and punchier
-but shows fewer beats); or place a SINGLE beat on its own by its position. Any
-listed beat stays reachable individually even if tightening would have dropped
-it — the Beat Index marks which beats are core (survive tightening) and which
-drop early, so you can sharpen for punch or pick out one beat deliberately.
+but shows fewer pieces); or place a SINGLE piece on its own by its position. Any
+listed piece stays reachable individually even if tightening would have dropped
+it — the Cut Index marks which pieces are core (survive tightening) and which
+drop early, so you can sharpen for punch or pick out one piece deliberately.
 
-## 5. Working with music
+## 5. Keep a continuous shot continuous
+Cuts that share a `run:` tag are one uninterrupted stretch of a single clip —
+the camera never stopped between them. Treat that run as one shot: keep its
+members together and in their source order (the `run:rN[i/of]` position), and
+prefer placing a whole run as a single continuous stretch rather than scattering
+its cuts. Do not shuffle a run's cuts out of order or interleave another clip
+between them unless you have a real reason — cutting from one part of a shot to
+an EARLIER or much-later part of the SAME shot is a jump cut (same room, same
+person, only the source time leaps), the most jarring join there is. Splitting a
+run, or reordering it, is a deliberate move you can make when it serves the story
+— but never the accidental byproduct of picking cuts by meaning and ignoring
+where they came from. When you do need a cut from mid-run, bridge the seam with
+a DIFFERENT clip rather than a backward jump within the same one.
+
+## 6. Working with music
 When a musical bed is in play the beat grid (bpm + onset positions in program
 time) is yours to build against — it appears only when a musical source exists,
 so where there's no music you don't try to snap to it. Music is a free
@@ -113,12 +139,38 @@ Don't hand-compute the milliseconds. Beat-snap where it's offered and the
 fit-to-window loop (§3) land things on the grid exactly; you decide which beat
 and which moment, they handle the frames.
 
-## 6. Color can follow the story
+## 7. Color can follow the story
 When it serves the piece, the grade can track the story's arc — a tense beat
 settling cooler, a resolution warming — the same way pacing or a music swell
 would. This is a categorical position (tag it, don't compute a color), and it
 only shows once the user has turned up how strongly the arc should read;
 never reach for it as a default look.
+
+## Flag glossary
+`read_state`, `diagnose` and `review` name what they see using this
+vocabulary, not raw signal jargon — read a flag as the editing situation it
+names. Every join between two placed cuts carries exactly one of these
+three verdicts:
+
+- **seamless** — the join is invisible: a continuous same-source run, or
+  two frames close enough that no cut reads. Nothing to fix.
+- **jump-cut** — a same-FILE join where the source jumps backward or skips
+  ahead inside one framing (§5): same room, same person, only the source
+  time leaps. The most jarring join there is — cross it only on purpose.
+  The same picture distance across two DIFFERENT files reads as `cut`
+  instead, since that is a deliberate match-adjacent join rather than a
+  jump.
+- **cut** — an ordinary, motivated cut to genuinely different content. The
+  default case, and what a join falls back to whenever the two frames
+  cannot be compared, so an absent descriptor never invents a jump.
+
+Two neighbouring things are NOT join verdicts. A speech cut's removable
+**dead-air** budget is what trimming spends (§3). And the `words:` tag on a
+shown cut reports speech audible on a clip you are not using as the `said`
+line — background chatter or ambient talk. It stays audible unless it is
+musical or ambient noise, in which case it is muted and reads
+`muted(talk→unmute)`; decide whether it should play, duck under the lead
+line, or stay muted.
 
 ## Podcast / multicam (worked example — uses both principles)
 Conversation filmed from several fixed angles. The alternate angles of one
@@ -139,6 +191,6 @@ guess. When no true wide angle exists (all cameras are single-person), you have
 two good moves for a lively exchange: stay on whoever is speaking and cut on
 each turn, OR use `split_screen` to show both single-person angles at once — the
 speaker on one side and the other person's outlook (their angle for the same
-beat) on the other, so the back-and-forth reads without whip-cutting. Reach for
+cut) on the other, so the back-and-forth reads without whip-cutting. Reach for
 the split when turns come too fast to cut cleanly. Cutaways/B-roll only to cover
 a real disfluency gap, not for variety.

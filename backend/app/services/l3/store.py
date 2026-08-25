@@ -3,8 +3,17 @@ Persistence for L3 edit threads: threads, the agent message log (turns), and
 versioned Edit Document snapshots.
 
 Turns store the *neutral* message dicts used by the LLM adapter, so resuming a
-paused thread is literally `messages = load_messages(thread_id)` -- the agent
-continues with byte-identical context (including preserved thinking blocks).
+paused thread is literally `messages = load_messages(thread_id)`. This is a
+DISTILLED history, not the raw per-step exchange: an assistant turn persists
+only the final prose reply (`edit_threads.py`'s `append_turn(thread_id,
+"assistant", result.reply, ...)`), never the block list a provider actually
+returned (tool_use/tool_result/thinking) -- that only ever lives in-memory,
+within `tools.run_edit_loop`'s own `convo`, for the duration of one
+`respond()` call. brain_extended_thinking.plan.md 3.5: this means a
+`thinking` block's cryptographic signature is never asked to survive a
+Postgres round-trip -- exactly what Anthropic requires (the signature is only
+checked within a single tool-use cycle, never across turns), with no extra
+stripping step needed to get there.
 Documents are append-only versions; the latest version is the live plan.
 """
 from __future__ import annotations

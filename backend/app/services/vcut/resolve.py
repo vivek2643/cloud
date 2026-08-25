@@ -145,6 +145,13 @@ class ResolvedCut:
     # subject_box (no merge -- a box doesn't compose across moments the way
     # specifics do); None when no absorbed flag had one.
     subject_box: Optional[Tuple[float, float, float, float]] = None
+    # brain_cut_salience_parity.plan.md section 3.2: first-class, time-ordered
+    # per-flag data (one entry per absorbed moment: {peak_ms, shape, summary,
+    # specifics}) -- a SUPERSET of what _composed_specifics' render-artifact
+    # "moments" list carries, kept separate so vcut/salience.py's bridge has
+    # a stable structured input independent of scene_specifics' rendering
+    # shape.
+    moments: List[Dict[str, Any]] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -166,6 +173,7 @@ class _Candidate:
     has_peak: bool = True
     specifics: Dict[str, Any] = field(default_factory=dict)
     subject_box: Optional[Tuple[float, float, float, float]] = None
+    moments: List[Dict[str, Any]] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -376,10 +384,26 @@ def _composed_specifics(group_peaks: List[_GroupPeak], representative_t_ms: int)
     rep = next((p for p in group_peaks if p[0] == representative_t_ms), group_peaks[0])
     composed = dict(rep[3] or {})
     composed["moments"] = [
-        {"t_ms": t_ms, "summary": summary, **dict(specifics or {})}
-        for t_ms, _tag, summary, specifics, _box in sorted(group_peaks, key=lambda p: p[0])
+        # brain_cut_salience_parity.plan.md section 5: `shape` is additive
+        # (existing readers ignore unknown keys) -- makes the persisted
+        # scene_specifics.moments list self-describing per absorbed flag.
+        {"t_ms": t_ms, "shape": tag, "summary": summary, **dict(specifics or {})}
+        for t_ms, tag, summary, specifics, _box in sorted(group_peaks, key=lambda p: p[0])
     ]
     return composed
+
+
+def _ordered_moments(group_peaks: List[_GroupPeak]) -> List[Dict[str, Any]]:
+    """brain_cut_salience_parity.plan.md section 3.2: one first-class entry
+    per absorbed flag, time-ordered -- {peak_ms, shape, summary, specifics}
+    -- the structured input vcut/salience.py's bridge consumes to build one
+    salience event per flag. A superset of what _composed_specifics already
+    computes from the SAME group_peaks, produced in the same loop so the two
+    can't drift (see resolve._resolve_file)."""
+    return [
+        {"peak_ms": t_ms, "shape": tag, "summary": summary, "specifics": dict(specifics or {})}
+        for t_ms, tag, summary, specifics, _box in sorted(group_peaks, key=lambda p: p[0])
+    ]
 
 
 def _representative_subject_box(
@@ -499,7 +523,7 @@ def _widen_to_min_cut(cands: List[_Candidate]) -> List[_Candidate]:
         a = max(c.span_lo, mid - MIN_CUT_MS / 2.0)
         b = min(c.span_hi, mid + MIN_CUT_MS / 2.0)
         out.append(_Candidate(c.file_id, a, b, c.peak_ms, c.tag, c.summary,
-                              c.span_lo, c.span_hi, c.has_peak, c.specifics, c.subject_box))
+                              c.span_lo, c.span_hi, c.has_peak, c.specifics, c.subject_box, c.moments))
     return out
 
 
@@ -560,11 +584,13 @@ def _resolve_file(
         summary = _joined_summary(g["peaks"])
         specifics = _composed_specifics(g["peaks"], peak_ms)
         subject_box = _representative_subject_box(g["peaks"], peak_ms)
+        moments = _ordered_moments(g["peaks"])
         group_extent = (g["extent_lo"], g["extent_hi"])
         a_star, b_star = _snap_group_edges(g["a"], g["b"], g["peaks"], hop_ms, S, group_extent)
         out.append(_Candidate(
             file_id=file_id, a=a_star, b=b_star, peak_ms=peak_ms, tag=tag, summary=summary,
             span_lo=g["extent_lo"], span_hi=g["extent_hi"], specifics=specifics, subject_box=subject_box,
+            moments=moments,
         ))
     return out
 
@@ -602,7 +628,7 @@ def resolve_cuts(plan: MomentPlan, seam: Dict[str, dict], energy: float) -> List
         resolved.extend(
             ResolvedCut(file_id=c.file_id, in_ms=int(round(c.a)), out_ms=int(round(c.b)),
                        peak_ms=c.peak_ms, tag=c.tag, summary=c.summary, specifics=c.specifics,
-                       subject_box=c.subject_box)
+                       subject_box=c.subject_box, moments=c.moments)
             for c in cands
         )
 
