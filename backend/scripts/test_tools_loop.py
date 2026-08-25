@@ -530,7 +530,25 @@ def test_gate_does_not_flag_a_feature_the_user_never_asked_for():
     print("ok  gate: no Stage-1 feature nudge when the ask never named one (Stage 2 still runs)")
 
 
+# --------------------------------------------------------------------------
+# brain_cut_index_fidelity.plan.md Stage 4: inspect_cut's own tool
+# description was a fourth prompt site pointing the brain at it for offsets
+# that are now resident on the sig: breadcrumb (footage_map._landmarks_tag)
+# -- the plan's own research only found 3 (all in converse.py); left stale
+# it would be an active instruction to waste a turn, same as those 3.
+# --------------------------------------------------------------------------
+
+def test_inspect_cut_spec_no_longer_claims_offsets_as_its_value():
+    spec = next(s for s in tools._specs() if s["name"] == "inspect_cut")
+    desc = spec["description"]
+    assert "already resident" in desc, desc
+    assert "curve" in desc, desc
+    assert "hit offsets" not in desc, desc
+    print("ok  test_inspect_cut_spec_no_longer_claims_offsets_as_its_value")
+
+
 def main():
+    test_inspect_cut_spec_no_longer_claims_offsets_as_its_value()
     test_loop_reads_then_places_then_replies()
     test_loop_pure_chat_no_change()
     test_loop_bad_tool_is_noop()

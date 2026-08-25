@@ -219,7 +219,7 @@ def test_landmarks_tag_renders_sig_actn_from_bridge_output():
     moments = [_moment(1000, "both"), _moment(5000, "both"), _moment(9000, "both")]
     cut = _cut(in_ms=0, out_ms=10000, peak_ms=5000, tag="both", moments=moments)
     m = {"landmarks": build_landmarks(cut, {})}
-    assert fm._landmarks_tag(m) == " sig:act3", fm._landmarks_tag(m)
+    assert fm._landmarks_tag(m) == " sig:act+1.0s,+5.0s,+9.0s", fm._landmarks_tag(m)
     print("ok  test_landmarks_tag_renders_sig_actn_from_bridge_output")
 
 
@@ -287,7 +287,8 @@ def test_build_landmarks_all_four_channels_and_full_sig_breadcrumb():
     lm = build_landmarks(cut, seam)
     assert set(lm) == {"act", "adx", "sil", "shot"}, set(lm)
     assert lm["act"]["n"] == 1 and lm["adx"]["n"] == 1 and lm["sil"]["n"] == 1 and lm["shot"]["n"] == 2
-    assert fm._landmarks_tag({"landmarks": lm}) == " sig:act1,adx1,sil1,shot2", fm._landmarks_tag({"landmarks": lm})
+    assert fm._landmarks_tag({"landmarks": lm}) == (
+        " sig:act+5.0s|adx+5.0s↑|sil+7.0s.1.0s|shot+3.0s!,+6.0s"), fm._landmarks_tag({"landmarks": lm})
     print("ok  test_build_landmarks_all_four_channels_and_full_sig_breadcrumb")
 
 

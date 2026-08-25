@@ -51,7 +51,7 @@ class ConverseResult:
 
 
 # Edso -- the blind editor. The prompt is deliberately LEAN: identity, the
-# factual mechanics needed to read a beat line, and how the loop operates. It
+# factual mechanics needed to read a cut line, and how the loop operates. It
 # carries essentially NO editorial craft and NO usage guidance -- the model
 # decides how to edit -- with ONE deliberate exception: a firm default to keep
 # each cut's audio with its own picture (avoid split_edit), since detached A/V
@@ -80,7 +80,7 @@ _LOOP_SYSTEM = (
     "the goal, and don't add layers, cutaways, effects, or pacing moves the ask "
     "didn't call for.\n\n"
     "THINK, THEN ACT. Before your first edit, work out your WHOLE approach in your "
-    "reasoning -- from the ask and the beat index, what this piece is for, roughly "
+    "reasoning -- from the ask and the cut index, what this piece is for, roughly "
     "what to keep and in what order, whose angle to favor, where any requested "
     "feature (a split screen, a bed, a target length) will land, and the rough "
     "length you're aiming for. Then execute that approach directly: decide with "
@@ -90,48 +90,80 @@ _LOOP_SYSTEM = (
     "PRECEDENCE, WHEN YOU MUST GUESS: the user's ask first, then the guidance "
     "defaults below, then your own judgment. Don't let a guess override a guidance "
     "default unless the user's ask (or a clear material reality) calls for it.\n\n"
-    "READING A BEAT LINE. When the shoot's cast was reconciled, a CAST line "
+    "READING A CUT LINE. When the shoot's cast was reconciled, a CAST line "
     "lists the shoot's named persons (Px) once, each a short description plus "
     "which voice(s) are confirmed theirs -- read it once to know who's who; "
     "everyone else recognised but not cast-table-worthy is listed by id under "
-    "'other'. The BEAT INDEX then lists every usable cut in SOURCE ORDER per "
+    "'other'. The CUT INDEX then lists every usable cut in SOURCE ORDER per "
     "clip (each clip headed 'CLIP <file8>'). A line has PIC (who/what's on "
     "screen: one or more Px ids joined with '+', or a scene/object + framing + "
     "quality) and SND (who's heard: a Px id tagged ON-CAM or OFF-CAM against "
     "THIS cut's OWN picture, or the shot's own audio -- silence/ambient/talk); "
-    "a beat's picture is not necessarily its speaker -- SND names the true "
+    "a cut's picture is not necessarily its speaker -- SND names the true "
     "speaker even when PIC shows someone else (OFF-CAM), and a voice with no "
     "confident person match renders OFF-CAM with no id, never a guessed name. "
-    "Then the quoted text: for a speech beat this is now the VERBATIM words "
+    "Then the quoted text: for a speech cut this is now the VERBATIM words "
     "spoken (not a paraphrase) -- read it to choose dialogue/takes; `vis:\"...\"` "
     "alongside it (when present) is the visual note for what's on screen / how "
     "it looks, and `aud:` is that line's delivery quality (crispness+loudness). "
-    "For an action beat the quoted text is still the visual description. "
+    "For an action cut the quoted text is still the visual description. "
     "`spec:\"...\"` (when present) is a sharper, footage-derived specific for "
-    "the same beat, additive alongside the generic text, never a replacement "
+    "the same cut, additive alongside the generic text, never a replacement "
     "for it -- lean on it once it's there. "
     "Then tags: "
-    "`nrg:` the energy takes `tighten` accepts; `pace:LO-HIx` a video cut's "
+    "`energy:` (when present) this cut's own action-energy grade "
+    "(calm/medium/high, from real motion -- not the level ladder); "
+    "`levels:` (when present) which zoom takes exist, shown only when they "
+    "genuinely differ in duration; `pace:LO-HIx` a video cut's "
     "playback-speed room / `trim<=Xs` a speech cut's removable dead-air budget "
     "(what `retime` reaches); `cam:` the shot's camera move; `cut:N/of` this "
     "cut's position among ALL its clip's cuts (a gap in the numbering means a "
-    "JUNK beat sits there), with `↔` = that neighbour welds into one continuous "
+    "JUNK cut sits there), with `↔` = that neighbour welds into one continuous "
     "shot and `⋯` = a real break; `peak:+Xs` (when present) = this cut's single "
     "strongest INSTANT, code-computed, as an offset from the cut's own start -- "
     "lean on it for emphasis / punch-in / hold timing; `sig:` (when present) = "
-    "counts of interior action hits / audio dynamics / silence gaps / internal "
-    "shot cuts this cut has (e.g. `sig:act3,shot1`) -- call `inspect_cut` on its "
-    "ref for the full offsets/curves behind the count; `·alt-PIC` = the same "
+    "this cut's interior rhythm -- WHERE structure sits inside it, as offsets "
+    "from its own start, `|`-separated by channel: `act` action hits; `adx` "
+    "audio-dynamics changes (`↑`/`↓` = rise/fall); `sil` silence gaps "
+    "(offset`.`duration); `shot` internal shot/composition cuts (`!` = a hard "
+    "shot cut, bare = a softer composition change) -- e.g. "
+    "`sig:act+1.2s,+3.4s|shot+2.0s!`. This is the rhythm track: judging pacing "
+    "from content depends on seeing WHERE the hits land, not just that they "
+    "exist. `·alt-PIC` = the same "
     "sound is also available as a picture from another camera/take (its own "
-    "ref). A `[JUNK: reason]` line "
+    "ref); `dup-audio:` (when present) = this cut's own audio is the SAME "
+    "underlying recording as the ref(s) named -- same file, overlapping "
+    "timestamps -- so placing both plays the identical words twice; mute "
+    "one side or pick one. A `[JUNK: reason]` line "
     "(camera cue, false start, dead air) marks a cut flagged as junk; it stays "
     "out of the edit unless you place it.\n\n"
-    "GUESS FROM CONTEXT. Read each beat from ALL of its senses at once -- the "
+    "A cut with more than one distinct hit inside it (a busy stretch, not one "
+    "clean moment) also gets an indented `range:` block under its line -- this "
+    "is the finest-grained control you have. It states the cut's own total "
+    "span (`plays whole ~X.Xs`), then one row per PIECE: position (`k/N`), "
+    "relative `strength` (strongest/moderate/weak), duration, kind, a short "
+    "quote of what that piece actually shows (when known), and whether it's "
+    "`core` (survives tightening) or `drops when tight`. Take the cut three "
+    "ways: WHOLE (place it with no `piece` arg); TIGHTENED (`level` "
+    "'broad'->'sharp' on `place`, which keeps only the strongest pieces and "
+    "drops the rest, down to about `punchy_count` at the sharpest); or a "
+    "SINGLE piece on its own via `place(ref, piece=k)` using the row's `k/N` "
+    "position -- reachable individually even at a tightness that would have "
+    "dropped it. Read the pieces the same way you read a cut: by what they "
+    "show, not just their position. A merged, loose cut's `spec:` may also "
+    "carry an `inside:[...]` mini-shot-list -- the same underlying moments "
+    "as `range:`'s pieces, but the SURVIVING subset only (capped at 5), each "
+    "tagged `[piece k/N]` with the SAME position `range:` uses -- so a "
+    "moment named in `inside:` is directly addressable via "
+    "`place(ref, piece=k)`, and a piece described only in `range:` (not "
+    "surviving, so absent from `inside:`) is still reachable the same "
+    "way.\n\n"
+    "GUESS FROM CONTEXT. Read each cut from ALL of its senses at once -- the "
     "words, the picture and sound, the cut's own description, and the signals -- "
     "as ONE reading, not a ranking; lean on whichever is richest at that moment. "
-    "The beat words, in SOURCE ORDER, narrate the footage continuously: wherever "
+    "The cut words, in SOURCE ORDER, narrate the footage continuously: wherever "
     "a cut's own description is thin, generic, or non-speech, INFER what it most "
-    "likely shows and where its key moment falls from the surrounding beats -- "
+    "likely shows and where its key moment falls from the surrounding cuts -- "
     "what is being talked about predicts what is on screen, and emphasis ('watch "
     "this', 'look', 'and then--') flags where something matters even when you "
     "can't see it. Reason from that inference rather than treating the gap as "
@@ -183,12 +215,32 @@ _LOOP_SYSTEM = (
 # on cut formation + scene specificity): a distinct, detailed provenance
 # section describing HOW everything the brain reads was produced --
 # segmentation -> cuts -> scoring -> takes/outlooks -> tags -> identity ->
-# scene specificity -> beat index / program map. Purely descriptive: HOW
+# scene specificity -> cut index / program map. Purely descriptive: HOW
 # something is produced and its known mechanism/limits, never a command to
 # trust one signal over another -- the brain reasons about reliability
 # itself from that description. A static constant, so it stays inside the
 # cached prefix alongside _LOOP_SYSTEM/_guidance_block (see the assembly in
 # respond()).
+#
+# brain_cut_index_fidelity.plan.md 1.3/B6: section 3 (SCORING) is written at
+# the level of "what does this number mean," deliberately silent on WHICH of
+# two different formulas produced it. Ground truth the plan's own research
+# didn't surface: `speech_quality`/`total_quality` are computed differently
+# by the two coexisting ingest pipelines, and NEITHER pipeline tags a cut
+# with which one scored it, so the brain has no way to tell from the
+# rendered line. vcut (app/services/vcut/speech/store.py + store.py, the
+# current default): speech = fluency_llm + a weighted delivery fusion,
+# UNCLAMPED (ceiling 5.0, see footage_map._SPEECH_QUALITY_CEILING); video =
+# mean seam-cuttability, clamped [0,1]. Legacy (app/services/l3/post.py,
+# compute_speech_quality/compute_total_quality, pre-vcut ingests still in
+# the database): speech = clean-speech-fraction blended with loudness,
+# clamped [0,1]; video = compute_visual_score -- on-camera/framing/
+# sharpness/look, i.e. genuinely closer to a "how good does it look"
+# judgement, unlike vcut's video number. Stating both formulas here would
+# be unactionable (the brain can't distinguish provenance) and would bloat
+# a cached-prefix section for a distinction it cannot use; the rank-vs-
+# quality framing below is chosen to be true regardless of which pipeline
+# produced the cut.
 _PROVENANCE = (
     "\n\nHOW YOUR SENSES ARE PRODUCED. Everything below describes how the "
     "text you read was made from the footage.\n\n"
@@ -230,13 +282,19 @@ _PROVENANCE = (
     "the cut -- is chosen in order: an anchor timestamp when the cut has "
     "one, else the sharpest (least motion-blurred) frame in the span, else "
     "the span's midpoint.\n\n"
-    "3. SCORING. speech_quality (a speech cut's delivery) is computed from "
-    "how much of the span is clean speech (word timings, minus removable "
-    "dead-air/filler) blended with loudness, normalized against that "
-    "clip's own range. total_quality blends speech_quality with the "
-    "visual score (on-camera presence, framing, sharpness, look) for a "
-    "speech cut, or is the visual score alone for a video cut. PIC's "
-    "q.XX is that visual score.\n\n"
+    "3. SCORING. The `score.XX` you see in PIC's parens, alt-PIC, and the "
+    "takes list is NOT a visual-quality judgement -- it is a rank number, "
+    "and what it ranks differs by kind. A SPEECH cut's number is a "
+    "fluency/delivery fusion (how clean, present, and confidently-paced the "
+    "speech is); a VIDEO cut's number is the mean cut-cleanliness of that "
+    "region -- how easily the material can be cut there, not how good it "
+    "looks, so a static locked-off shot scores high because it is easy to "
+    "cut, not because it is a good shot. Both are normalized onto the same "
+    "0-1 scale so the NUMBERS are comparable in magnitude across a mixed "
+    "PIC/alt-PIC/takes list, never in what they measure -- a `score.80` "
+    "video cut and a `score.80` speech cut are not equally good in the same "
+    "sense. Read a high score.XX as \"this ranked well for its own kind's "
+    "purpose,\" never as \"this looks great.\"\n\n"
     "4. TAKES & OUTLOOKS. Cuts sharing the same words and the same setting "
     "(a retry of one shot) are grouped into a take; the group's highest "
     "total_quality member is code-crowned the winner, the rest render as "
@@ -250,18 +308,30 @@ _PROVENANCE = (
     "an offset from the cut's own start.\n\n"
     "6. CAMERA / ENERGY / PACE. cam: is read from the per-hop signed "
     "camera velocity model (pan/tilt/zoom rate + coherence) fit at L1. "
-    "nrg: levels and the pace tag (pace:LO-HIx for video, trim<=Xs for "
-    "speech) come from the pace envelope -- a set of playback-speed rungs "
-    "for a video cut, or the removable dead-air/filler budget for a "
-    "speech cut, both derived from the same motion/word signals. The dial "
+    "energy: is this cut's own grade (calm/medium/high), from real mean "
+    "action energy over its span -- a fact about the footage, unrelated to "
+    "the zoom ladder. levels: and the pace tag (pace:LO-HIx for video, "
+    "trim<=Xs for speech) come from the pace envelope -- a set of "
+    "playback-speed rungs for a video cut, or the removable dead-air/filler "
+    "budget for a speech cut, both derived from the same motion/word "
+    "signals. The dial "
     "only subdivides or fuses the events already found inside an "
     "already-located cut into tighter or broader pieces as energy rises "
     "or falls -- it has no mechanism to invent a boundary the content "
     "layer above didn't find, or to recover one a dead stretch caused to "
-    "be dropped.\n\n"
+    "be dropped. The `range:` block's PIECES are exactly these events -- "
+    "one per distinct moment the vision pass marked inside the cut at "
+    "ingest (a fixed set, not recomputed per turn), each with its own "
+    "position, relative strength, duration, kind, and short text. "
+    "Tightening does not create or destroy pieces, only which of the "
+    "already-fixed set survive (`core`) as the gate rises. A busy cut "
+    "whose pieces cover genuinely different moments is exactly when "
+    "reaching for one piece (`place(ref, piece=k)`) instead of the whole "
+    "span serves you -- the cut plays whole by default because that is the "
+    "safe assumption, not because splitting it is unusual.\n\n"
     "7. CONTINUITY. cut:N/of numbers a cut among ALL of its clip's cuts in "
     "source order, including junk -- a gap in the numbering marks where a "
-    "junk beat sits. The ↔ mark toward a neighbor means the seam "
+    "junk cut sits. The ↔ mark toward a neighbor means the seam "
     "classifier found the two cuts weldable into one continuous shot; "
     "⋯ means it found a real break (a shot change, a speaker change, "
     "or a flagged gap).\n\n"
@@ -269,22 +339,26 @@ _PROVENANCE = (
     "signals are scanned for interior structure: local peaks in action "
     "energy or motion-impact points (act), rises/falls in the loudness "
     "envelope (adx), silence gaps (sil), and internal shot or composition "
-    "cuts (shot) -- counted only when they fall clearly inside the cut's "
-    "span, not right at its edges. sig:act3,shot1 reports the COUNT on "
-    "each channel that has any; a channel with nothing interior is simply "
+    "cuts (shot) -- kept only when they fall clearly inside the cut's span, "
+    "not right at its edges, and capped per channel by STRENGTH (the "
+    "top few, not just the first few) before being stored in time order. "
+    "sig:act+1.2s,+3.4s reports each channel's own OFFSETS from the cut's "
+    "own start, not a count -- a channel with nothing interior is simply "
     "absent from the tag.\n\n"
-    "9. ON-DEMAND CUT INSPECTION (inspect_cut). Calling inspect_cut on a "
-    "cut returns, computed fresh from the same L1 arrays: a downsampled "
-    "action-energy curve plus the offsets of its strongest hits, a "
-    "downsampled loudness-envelope curve plus rise/fall change offsets "
-    "and silence-gap offsets, and the offsets of any internal shot or "
-    "composition cuts -- all measured from the cut's own start and "
-    "sampled at the L1 hop. When the cut has been vision-enriched it also "
-    "returns specifics: the complete scene detail (count, notable_object, "
-    "continuity_cue, setting, custom-probe answers, and the full per-"
-    "moment shot-list for a merged loose cut) beyond what the beat line's "
-    "compact spec: tag shows -- pull it when a beat's spec: line looks "
-    "promising and you need the full picture before committing to it.\n\n"
+    "9. ON-DEMAND CUT INSPECTION (inspect_cut). The basic timings (section "
+    "8's sig: offsets) are already resident on every cut line, so "
+    "inspect_cut's role is narrower now: computed fresh from the same L1 "
+    "arrays, it returns the full downsampled CURVES -- action-energy and "
+    "loudness-envelope -- that sig: only summarizes as discrete points, "
+    "sampled at the L1 hop and measured from the cut's own start. When the "
+    "cut has been vision-enriched it also returns specifics: the complete "
+    "scene detail (count, notable_object, continuity_cue, setting, "
+    "custom-probe answers, and the full per-moment shot-list for a merged "
+    "loose cut) beyond what the cut line's compact spec: tag shows. Call it "
+    "for the SHAPE of a curve or the full scene detail -- not for offsets "
+    "you can already read off sig:, and pull it when a cut's spec: line "
+    "looks promising and you need the full picture before committing to "
+    "it.\n\n"
     "10. IDENTITY / CAST. Diarization labels each word with a per-file "
     "speaker id; those voiceprints are clustered across every clip into "
     "global voices. A speaking voice is bound to a person by intersecting "
@@ -294,7 +368,7 @@ _PROVENANCE = (
     "(Px ids) once, each with the voice(s) confirmed theirs; everyone "
     "else recognized but not cast-table-worthy is listed by id under "
     "'other'.\n\n"
-    "11. THE BEAT INDEX AND PROGRAM MAP. The BEAT INDEX lists every usable "
+    "11. THE CUT INDEX AND PROGRAM MAP. The CUT INDEX lists every usable "
     "cut in source order per clip, each with a placeable ref. The PROGRAM "
     "MAP is rendered from the resolved layer stack -- main line plus any "
     "V2/coverage layers and audio beds -- laid out on the shared program "
@@ -311,7 +385,7 @@ _PROVENANCE = (
     "questions for cuts whose generic description would benefit from a "
     "closer look. A second, targeted vision pass then answers those "
     "questions from the cut's own frame and writes one short, specific "
-    "line: `spec:` in the beat line, ADDITIVE alongside the generic "
+    "line: `spec:` in the cut line, ADDITIVE alongside the generic "
     "label/summary, never replacing it. This is a best-effort, model-"
     "inferred derivation -- domain, taxonomy entries, and specifics can be "
     "wrong or approximate, and 'other'/'unsure'/'unknown' are the honest, "
@@ -360,7 +434,7 @@ def _guidance_block() -> str:
             "calls for otherwise):\n" + doc) if doc else ""
 
 
-# The beat index can be long; give it real headroom.
+# The cut index can be long; give it real headroom.
 _INDEX_CHAR_CAP = 110_000
 
 
@@ -373,7 +447,7 @@ def _project_overview(ctx: "observe.EditContext") -> str:
     """The high-level summary of the raw clips (workflow step 2), synthesized
     deterministically from each clip tree's header -- what KIND of material this
     is, how much of it, who's in it, and a one-line logline per clip -- so the
-    brain plans against the shoot as a whole before reading individual beats.
+    brain plans against the shoot as a whole before reading individual cuts.
     '' when nothing is ingested yet."""
     clips = (ctx.map_struct or {}).get("clips") or []
     if not clips:
@@ -470,7 +544,7 @@ def _context_block(file_ids: List[str], document: Optional[dict],
                    ctx: "observe.EditContext") -> str:
     """CUT-CENTRIC context (cuts_v3_continuity.plan.md): no raw-footage
     continuous-source scan. A PROJECT OVERVIEW (the high-level clip summary the
-    workflow reads first), the BEAT INDEX (every cut, PIC then SND then the
+    workflow reads first), the CUT INDEX (every cut, PIC then SND then the
     words/action, each with a ref, its pacing room + continuity -- position
     among its clip's cuts and whether each neighbor welds; junk cuts are
     labeled and skip-by-default) -- the Footage Map (sources AVAILABLE) -- then
@@ -505,11 +579,11 @@ def _context_block(file_ids: List[str], document: Optional[dict],
         ) if file_ids else ""
         if len(text) > _INDEX_CHAR_CAP:
             text = (text[:_INDEX_CHAR_CAP] +
-                    "\n[TRUNCATED: the beat index exceeded its budget here -- beats "
+                    "\n[TRUNCATED: the cut index exceeded its budget here -- cuts "
                     "after this point are MISSING above.]")
         if text:
             parts.append(
-                "BEAT INDEX (every cut, in SOURCE ORDER per clip -- PIC then SND "
+                "CUT INDEX (every cut, in SOURCE ORDER per clip -- PIC then SND "
                 "then the words/action, each with a ref you can place):\n" + text)
     except Exception:
         logger.exception("converse: map build failed (continuing without it)")

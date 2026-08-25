@@ -981,9 +981,9 @@ def test_review_flags_an_overrunning_overlay():
     struct = _map()
     out = observe.review(doc, _ctx(struct))
     msgs = [f["message"] for f in out["flags"]]
-    assert any("extends past the beat" in m for m in msgs), msgs
+    assert any("extends past the cut" in m for m in msgs), msgs
     assert all("trim to" not in m.lower() and "set " not in m.lower() for m in msgs)
-    print("ok  review flags an overlay that overruns the beat it sits over")
+    print("ok  review flags an overlay that overruns the cut it sits over")
 
 
 def test_review_flags_an_underfilling_overlay():
@@ -998,7 +998,7 @@ def test_review_flags_an_underfilling_overlay():
     out = observe.review(doc, _ctx(struct))
     msgs = [f["message"] for f in out["flags"]]
     assert any("underfills" in m for m in msgs), msgs
-    print("ok  review flags an overlay that underfills the beat it sits over")
+    print("ok  review flags an overlay that underfills the cut it sits over")
 
 
 def test_review_flags_a_mid_program_audio_gap():

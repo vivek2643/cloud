@@ -78,7 +78,7 @@ class EditContext:
     audio_assets: List[dict] = field(default_factory=list)
     # The Cuts v3 ingest run this turn is resolved against -- the thread's pinned
     # run (migration 028) or the live "latest covering run", resolved ONCE here so
-    # every projection in the turn (the map struct + the re-assembled BEAT INDEX
+    # every projection in the turn (the map struct + the re-assembled CUT INDEX
     # text) reads the SAME snapshot. None when nothing is ingested yet.
     run_id: Optional[str] = None
     # color_grading_upgrade.plan.md Step 1.0: the edit thread id, needed only
@@ -108,7 +108,7 @@ def build_context(file_ids: List[str], run_id: Optional[str] = None,
     ``run_id`` is the thread's pinned Cuts v3 ingest run (migration 028). We
     resolve the EFFECTIVE run once here -- pinned when given, else the latest
     covering run -- and thread that concrete id through every projection so the
-    map struct and the re-assembled BEAT INDEX text agree within the turn (and a
+    map struct and the re-assembled CUT INDEX text agree within the turn (and a
     re-ingest mid-turn can't swap the snapshot between the two reads)."""
     eff_run = run_id
     if eff_run is None and file_ids:
@@ -564,7 +564,7 @@ def read_state(document: dict, ctx: EditContext, *, seg_id: Optional[str] = None
                 cut["speed"] = seg.get("speed")
                 cut["speed_note"] = "recorded; not yet applied to the export length"
         # v4_cluster_read_act.plan.md Part B.3.2: a multi-event cluster's
-        # piece breakdown, mirroring the Beat Index's own (footage_map.
+        # piece breakdown, mirroring the Cut Index's own (footage_map.
         # piece_breakdown) so a deep look agrees with what the brain already
         # saw up front. None (key omitted) for a single-event cut.
         pieces = footage_map.piece_breakdown(meta)
@@ -671,7 +671,7 @@ def read_state(document: dict, ctx: EditContext, *, seg_id: Optional[str] = None
 # --------------------------------------------------------------------------
 # 1a2. inspect_cut (brain_perception_upgrade.plan.md Change 1, Mechanism B):
 # on-demand rich signal payload for ONE cut -- the deep counterpart to the
-# beat-line's "sig:" breadcrumb (footage_map._landmarks_tag). Computed at
+# cut-line's "sig:" breadcrumb (footage_map._landmarks_tag). Computed at
 # request time from the live L1 arrays: no migration, no re-ingest, works on
 # any run including one ingested before this plan.
 # --------------------------------------------------------------------------
@@ -805,7 +805,7 @@ def _audio_channel(audio: dict, s: int, e: int, step_ms: int) -> Dict[str, Any]:
 
 def _full_specifics(meta: dict) -> Dict[str, Any]:
     """brain_cut_specifics_wiring.plan.md section 3: the COMPLETE scene_
-    specifics blob for one cut -- unlike the beat-line's terse, priority-
+    specifics blob for one cut -- unlike the cut-line's terse, priority-
     capped `spec:"..."` tag (footage_map._specific_tag), this carries every
     field the vision model answered (count, notable_object, continuity_cue,
     setting, custom-probe answers, the full `moments` mini shot-list for a
@@ -842,13 +842,13 @@ def _shots_channel(scene: dict, s: int, e: int) -> Dict[str, Any]:
 
 def inspect_cut(ctx: EditContext, *, ref: Optional[str] = None, seg_id: Optional[str] = None,
                 document: Optional[dict] = None) -> dict:
-    """The rich, windowed+downsampled counterpart to the beat-line's "sig:"
+    """The rich, windowed+downsampled counterpart to the cut-line's "sig:"
     breadcrumb: for ONE cut, a downsampled action-energy curve + hit
     offsets, a downsampled loudness envelope + rise/fall change offsets +
     silence-gap offsets, and internal shot/composition-cut offsets -- all
     measured from the cut's own start, sampled at (or coarser than) the L1
     hop, capped at `_INSPECT_MAX_SAMPLES` curve points. Resolves `ref` (a
-    beat-index moment id) directly, or `seg_id` of an already-placed
+    cut-index moment id) directly, or `seg_id` of an already-placed
     main-line segment (mapped to its own ref) when `ref` is omitted --
     same resolution `place`/`read_state` use (`ctx.meta_by_ref`). Computed
     at request time from the live L1 arrays: no migration, works on any run.
@@ -1201,7 +1201,7 @@ def diagnose(document: dict, ctx: EditContext) -> List[dict]:
         gid = group_of.get(seg.get("ref") or "")
         if gid and gid in seen_groups:
             findings.append({"severity": "warn", "anchor": f"cuts {seen_groups[gid]+1} & {i+1}",
-                             "message": "same-beat takes both on the main line"})
+                             "message": "same-cut takes both on the main line"})
         elif gid:
             seen_groups[gid] = i
     return findings
@@ -1225,8 +1225,8 @@ yeah yep yup okay ok so like right well
 # inside it reads as a real silent lead-in/tail worth flagging.
 _DEAD_AIR_HEAD_TAIL_MS = 400
 
-# An overlay covering less than this fraction of the beat it sits over
-# clearly underfills it; bleeding this many ms past the beat's own edge
+# An overlay covering less than this fraction of the cut it sits over
+# clearly underfills it; bleeding this many ms past the cut's own edge
 # clearly overruns into a neighboring one.
 _OVERLAY_UNDERFILL_RATIO = 0.5
 _OVERLAY_OVERRUN_MS = 500
@@ -1322,7 +1322,7 @@ def _offcam_speaker_flag(meta: dict, anchor: str) -> List[dict]:
 
 def _overlay_fit_flags(resolved: "layers.ResolvedTimeline") -> List[dict]:
     """Flag a V2 coverage layer whose program window clearly overruns or
-    underfills the spine beat it sits over -- a fact, never a prescribed
+    underfills the spine cut it sits over -- a fact, never a prescribed
     fix (the brain decides whether/how to retime it)."""
     findings: List[dict] = []
     spine = [v for v in resolved.video_layers if v.kind == "spine"]
@@ -1342,13 +1342,13 @@ def _overlay_fit_flags(resolved: "layers.ResolvedTimeline") -> List[dict]:
         anchor = f"overlay {cov.op_id or cov.layer_id}"
         if host_dur > 0 and cov_dur < host_dur * _OVERLAY_UNDERFILL_RATIO:
             findings.append({"severity": "info", "anchor": anchor,
-                             "message": f"covers {cov_dur}ms of a {host_dur}ms beat -- "
+                             "message": f"covers {cov_dur}ms of a {host_dur}ms cut -- "
                                         f"underfills the line it sits over"})
         overrun_before = host.prog_start_ms - cov.prog_start_ms
         overrun_after = cov.prog_end_ms - host.prog_end_ms
         if overrun_before >= _OVERLAY_OVERRUN_MS or overrun_after >= _OVERLAY_OVERRUN_MS:
             findings.append({"severity": "info", "anchor": anchor,
-                             "message": "extends past the beat it sits over into a "
+                             "message": "extends past the cut it sits over into a "
                                         "neighboring one"})
     return findings
 
@@ -1580,7 +1580,7 @@ def affordances(document: dict, ctx: EditContext) -> dict:
         "audio_assets": len(ctx.audio_assets),
         # cuts_v3_continuity.plan.md: the cut-centric loop places by ref only --
         # no raw-footage scan (source_awareness/scan_source/place_span retired
-        # from the tool loop; the beat index + its continuity block is the only
+        # from the tool loop; the cut index + its continuity block is the only
         # source of awareness now).
         "verbs": ["place", "trim", "remove", "move", "set_audio", "place_audio",
                   "set_gain", "duck", "fade_audio", "crossfade", "replace_audio",

@@ -523,6 +523,121 @@ def test_annotate_dups_reads_take_group_id():
     print("ok  test_annotate_dups_reads_take_group_id")
 
 
+# --------------------------------------------------------------------------
+# brain_cut_index_fidelity.plan.md 5 (A7): a `shown`/`done` cut and a `said`
+# cut from the SAME FILE with overlapping timestamps are, deterministically,
+# the same underlying audio -- placing both plays the identical words twice.
+# --------------------------------------------------------------------------
+
+def _said_and_shown_overlap(sentences=None):
+    said_cut = _cut("f:s", 1000, 4000, "thanks for having me", channel="said",
+                    speaker="S0", score=0.5,
+                    ladder=[_rung("balanced", 1000, 4000, "thanks for having me", 0.5)])
+    shown_cut = _cut("f:sh", 1500, 3500, "a wide shot of the room", channel="shown",
+                     subject="object", speaker=None, score=0.4,
+                     ladder=[_rung("balanced", 1500, 3500, "x", 0.4)])
+    with mock.patch.object(fm, "_sentences_for_file",
+                           return_value=sentences if sentences is not None else
+                           ({"speaker": "S0", "text": "thanks for having me",
+                             "src_in_ms": 1000, "src_out_ms": 4000},)):
+        tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000},
+                                  [said_cut, shown_cut])
+    return tree
+
+
+def test_annotate_shared_audio_links_overlapping_said_and_shown_same_file():
+    tree = _said_and_shown_overlap()
+    fm._annotate_shared_audio([tree])
+    said_m = next(m for m in tree["moments"] if m["channel"] == "said")
+    shown_m = next(m for m in tree["moments"] if m["channel"] == "shown")
+    assert said_m["dup_audio_refs"] == [shown_m["cut_id"]], said_m
+    assert shown_m["dup_audio_refs"] == [said_m["cut_id"]], shown_m
+    print("ok  test_annotate_shared_audio_links_overlapping_said_and_shown_same_file")
+
+
+def test_moment_line_renders_dup_audio_cross_reference_both_sides():
+    tree = _said_and_shown_overlap()
+    fm._annotate_shared_audio([tree])
+    said_m = next(m for m in tree["moments"] if m["channel"] == "said")
+    shown_m = next(m for m in tree["moments"] if m["channel"] == "shown")
+    said_line = fm._moment_line(said_m)
+    shown_line = fm._moment_line(shown_m)
+    assert f"dup-audio:{shown_m['cut_id']}" in said_line, said_line
+    assert f"dup-audio:{said_m['cut_id']}" in shown_line, shown_line
+    print("ok  test_moment_line_renders_dup_audio_cross_reference_both_sides")
+
+
+def test_annotate_shared_audio_no_link_without_temporal_overlap():
+    said_cut = _cut("f:s2", 1000, 2000, "hello", channel="said", speaker="S0", score=0.5,
+                    ladder=[_rung("balanced", 1000, 2000, "hello", 0.5)])
+    shown_cut = _cut("f:sh2", 5000, 6000, "a wide shot", channel="shown", subject="object",
+                     speaker=None, score=0.4, ladder=[_rung("balanced", 5000, 6000, "x", 0.4)])
+    with mock.patch.object(fm, "_sentences_for_file",
+                           return_value=({"speaker": "S0", "text": "hello",
+                                         "src_in_ms": 1000, "src_out_ms": 2000},)):
+        tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000},
+                                  [said_cut, shown_cut])
+    fm._annotate_shared_audio([tree])
+    for m in tree["moments"]:
+        assert "dup_audio_refs" not in m, m
+    print("ok  test_annotate_shared_audio_no_link_without_temporal_overlap")
+
+
+def test_annotate_shared_audio_no_link_when_shown_cut_carries_no_words():
+    """Overlap alone isn't enough -- a shown cut with NO incidental words
+    (silent b-roll) has no audio to duplicate, even if it overlaps a said
+    cut in time."""
+    said_cut = _cut("f:s3", 1000, 4000, "thanks for having me", channel="said",
+                    speaker="S0", score=0.5,
+                    ladder=[_rung("balanced", 1000, 4000, "thanks for having me", 0.5)])
+    shown_cut = _cut("f:sh3", 1500, 3500, "a wide shot of the room", channel="shown",
+                     subject="object", speaker=None, score=0.4,
+                     ladder=[_rung("balanced", 1500, 3500, "x", 0.4)])
+    with mock.patch.object(fm, "_sentences_for_file", return_value=()):
+        tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000},
+                                  [said_cut, shown_cut])
+    fm._annotate_shared_audio([tree])
+    for m in tree["moments"]:
+        assert "dup_audio_refs" not in m, m
+    print("ok  test_annotate_shared_audio_no_link_when_shown_cut_carries_no_words")
+
+
+def test_annotate_shared_audio_no_link_across_different_files():
+    said_cut = _cut("fa:s", 1000, 4000, "thanks for having me", channel="said",
+                    speaker="S0", score=0.5,
+                    ladder=[_rung("balanced", 1000, 4000, "thanks for having me", 0.5)])
+    shown_cut = _cut("fb:sh", 1500, 3500, "a wide shot", channel="shown", subject="object",
+                     speaker=None, score=0.4, ladder=[_rung("balanced", 1500, 3500, "x", 0.4)])
+    with mock.patch.object(fm, "_sentences_for_file",
+                           return_value=({"speaker": "S0", "text": "thanks for having me",
+                                         "src_in_ms": 1000, "src_out_ms": 4000},)):
+        tree_a = fm.build_clip_tree("ffffffff-1111", {"name": "A", "duration_ms": 8000}, [said_cut])
+        tree_b = fm.build_clip_tree("22222222-2222", {"name": "B", "duration_ms": 8000}, [shown_cut])
+    fm._annotate_shared_audio([tree_a, tree_b])
+    for m in tree_a["moments"] + tree_b["moments"]:
+        assert "dup_audio_refs" not in m, m
+    print("ok  test_annotate_shared_audio_no_link_across_different_files")
+
+
+def test_annotate_shared_audio_excludes_junk_on_either_side():
+    said_cut = _cut("f:s4", 1000, 4000, "thanks for having me", channel="said",
+                    speaker="S0", score=0.5,
+                    ladder=[_rung("balanced", 1000, 4000, "thanks for having me", 0.5)],
+                    junk=True, junk_reason="false start")
+    shown_cut = _cut("f:sh4", 1500, 3500, "a wide shot of the room", channel="shown",
+                     subject="object", speaker=None, score=0.4,
+                     ladder=[_rung("balanced", 1500, 3500, "x", 0.4)])
+    with mock.patch.object(fm, "_sentences_for_file",
+                           return_value=({"speaker": "S0", "text": "thanks for having me",
+                                         "src_in_ms": 1000, "src_out_ms": 4000},)):
+        tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000},
+                                  [said_cut, shown_cut])
+    fm._annotate_shared_audio([tree])
+    for m in tree["moments"]:
+        assert "dup_audio_refs" not in m, m
+    print("ok  test_annotate_shared_audio_excludes_junk_on_either_side")
+
+
 def test_snd_state_says_muted_talk_is_recoverable():
     """brain_material_truth.plan.md Part 4.4: a cut still muted with real
     words underneath must say the words can be unmuted, not merely that
@@ -572,6 +687,31 @@ def test_junk_moment_renders_terse_line_not_the_rich_one():
     assert ("PIC:" not in line and "SND:" not in line
             and "energy:" not in line and "levels:" not in line), line
     print("ok  test_junk_moment_renders_terse_line_not_the_rich_one")
+
+
+def test_junk_moment_renders_a_short_description():
+    """brain_cut_index_fidelity.plan.md 5 (A6): a bare [JUNK: reason] code
+    hides the whole clip behind it -- the brain can't judge whether the
+    junk call was right without seeing what it actually is. Short, matching
+    every other secondary tag's terse convention -- never the full line."""
+    cut = _cut("f:junk2", 1000, 1600, "camera pans to catch the crew adjusting a light stand",
+               channel="shown", subject="object", speaker=None, score=0.1,
+               ladder=[_rung("balanced", 1000, 1600, "x", 0.1)],
+               junk=True, junk_reason="camera cue")
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert '[JUNK: camera cue] "camera pans to catch the crew…"' in line, line
+    print("ok  test_junk_moment_renders_a_short_description")
+
+
+def test_junk_moment_renders_nothing_extra_when_no_description():
+    cut = _cut("f:junk3", 1000, 1600, "", channel="shown", subject="object", speaker=None,
+               score=0.1, ladder=[_rung("balanced", 1000, 1600, "x", 0.1)],
+               junk=True, junk_reason="dead air")
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert line.strip() == f"{tree['moments'][0]['cut_id'].split(':')[-1]} [JUNK: dead air] [0:01-0:01 0.6s]", line
+    print("ok  test_junk_moment_renders_nothing_extra_when_no_description")
 
 
 def test_junk_moment_still_resolves_in_map_index():
@@ -694,8 +834,10 @@ def test_peak_tag_absent_when_pinned_to_the_end():
 
 
 # --------------------------------------------------------------------------
-# landmarks breadcrumb (brain_perception_upgrade.plan.md Change 1, Mechanism
-# A): `sig:act3,shot1` -- counts only, never offsets/values.
+# landmarks breadcrumb (brain_cut_index_fidelity.plan.md 4.1, A3): `sig:`
+# renders each channel's own OFFSETS (act/adx/sil/shot), not a count -- a
+# count said structure exists but never where, which is exactly what
+# judging pacing from content needs.
 # --------------------------------------------------------------------------
 
 def _landmarks_cut(hero_id, in_ms, out_ms, landmarks):
@@ -703,38 +845,62 @@ def _landmarks_cut(hero_id, in_ms, out_ms, landmarks):
 
 
 def test_landmarks_tag_fixed_channel_order_regardless_of_dict_order():
-    m = {"landmarks": {"shot": {"n": 1, "cuts": []}, "act": {"n": 2, "hits": []}, "sil": {"n": 1, "gaps": []}}}
+    m = {"landmarks": {
+        "shot": {"n": 1, "cuts": [{"off": 2000, "hard": True}]},
+        "act": {"n": 2, "hits": [500, 1500]},
+        "sil": {"n": 1, "gaps": [{"off": 1000, "dur": 300}]},
+    }}
     tag = fm._landmarks_tag(m)
-    assert tag == " sig:act2,sil1,shot1", tag
+    # act, then sil, then shot -- fixed order (_LANDMARK_TAG_ORDER),
+    # independent of the dict's own insertion order above.
+    assert tag == " sig:act+0.5s,+1.5s|sil+1.0s.0.3s|shot+2.0s!", tag
     print("ok  test_landmarks_tag_fixed_channel_order_regardless_of_dict_order")
 
 
-def test_landmarks_tag_renders_present_channels_via_moment_line():
+def test_landmarks_tag_renders_offsets_via_moment_line():
     cut = _landmarks_cut("f:lm", 1000, 4000, {
         "shot": {"n": 1, "cuts": [{"off": 2000, "hard": True}]},
         "act": {"n": 3, "hits": [500, 1000, 1500]},
     })
     tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
     line = fm._moment_line(tree["moments"][0])
-    assert "sig:act3,shot1" in line, line
-    print("ok  test_landmarks_tag_renders_present_channels_via_moment_line")
+    assert "sig:act+0.5s,+1.0s,+1.5s|shot+2.0s!" in line, line
+    print("ok  test_landmarks_tag_renders_offsets_via_moment_line")
 
 
-def test_landmarks_tag_never_shows_offsets_or_values():
-    cut = _landmarks_cut("f:lm", 1000, 4000, {"act": {"n": 1, "hits": [500]}})
+def test_landmarks_tag_adx_shows_direction():
+    m = {"landmarks": {"adx": {"n": 2, "changes": [
+        {"off": 800, "dir": "up"}, {"off": 2100, "dir": "down"}]}}}
+    tag = fm._landmarks_tag(m)
+    assert tag == " sig:adx+0.8s↑,+2.1s↓", tag
+    print("ok  test_landmarks_tag_adx_shows_direction")
+
+
+def test_landmarks_tag_sil_shows_offset_and_duration():
+    m = {"landmarks": {"sil": {"n": 1, "gaps": [{"off": 1500, "dur": 300}]}}}
+    tag = fm._landmarks_tag(m)
+    assert tag == " sig:sil+1.5s.0.3s", tag
+    print("ok  test_landmarks_tag_sil_shows_offset_and_duration")
+
+
+def test_landmarks_tag_shot_marks_hard_cuts_not_soft_ones():
+    m = {"landmarks": {"shot": {"n": 2, "cuts": [
+        {"off": 2000, "hard": True}, {"off": 2500, "hard": False}]}}}
+    tag = fm._landmarks_tag(m)
+    assert tag == " sig:shot+2.0s!,+2.5s", tag
+    print("ok  test_landmarks_tag_shot_marks_hard_cuts_not_soft_ones")
+
+
+def test_landmarks_tag_caps_come_from_ingest_not_the_renderer():
+    """The renderer does not additionally truncate -- l3/landmarks.py's own
+    _LANDMARK_ACT_CAP (5) already capped this list at ingest, by strength,
+    before it was ever stored; the renderer just formats whatever is there."""
+    cut = _landmarks_cut("f:lm", 1000, 4000,
+                         {"act": {"n": 5, "hits": [100, 200, 300, 400, 500]}})
     tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
     line = fm._moment_line(tree["moments"][0])
-    assert "sig:act1" in line, line
-    assert "500" not in line, line
-    print("ok  test_landmarks_tag_never_shows_offsets_or_values")
-
-
-def test_landmarks_tag_caps_display_at_nine_plus():
-    cut = _landmarks_cut("f:lm", 1000, 4000, {"sil": {"n": 12, "gaps": []}})
-    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
-    line = fm._moment_line(tree["moments"][0])
-    assert "sig:sil9+" in line, line
-    print("ok  test_landmarks_tag_caps_display_at_nine_plus")
+    assert "sig:act+0.1s,+0.2s,+0.3s,+0.4s,+0.5s" in line, line
+    print("ok  test_landmarks_tag_caps_come_from_ingest_not_the_renderer")
 
 
 def test_landmarks_tag_absent_when_landmarks_empty():
@@ -745,12 +911,12 @@ def test_landmarks_tag_absent_when_landmarks_empty():
     print("ok  test_landmarks_tag_absent_when_landmarks_empty")
 
 
-def test_landmarks_tag_skips_a_channel_present_but_zero_count():
+def test_landmarks_tag_skips_a_channel_with_no_stored_offsets():
     cut = _landmarks_cut("f:lm", 1000, 4000, {"act": {"n": 0, "hits": []}})
     tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
     line = fm._moment_line(tree["moments"][0])
     assert "sig:" not in line, line
-    print("ok  test_landmarks_tag_skips_a_channel_present_but_zero_count")
+    print("ok  test_landmarks_tag_skips_a_channel_with_no_stored_offsets")
 
 
 # --------------------------------------------------------------------------
@@ -979,6 +1145,59 @@ def test_graphic_tag_still_renders_when_it_says_something_new():
     print("ok  test_graphic_tag_still_renders_when_it_says_something_new")
 
 
+# --------------------------------------------------------------------------
+# brain_cut_index_fidelity.plan.md 3 (A2): `summary` is the rich stored
+# description; `label` (which becomes `primary` for a shown/done cut) is a
+# SEPARATE, already-6-word-capped field derived FROM summary at ingest
+# (vcut/store.py._short_label), not an independent duplicate. The dedup
+# check must be ASYMMETRIC: `primary` being a strict prefix of a LONGER
+# `summary` is not redundancy, it's exactly the extra content 3/A2 exists
+# to surface -- confirmed against real data (label is uniformly 6.0 words,
+# summary median 11-15, max 93, on the same rows).
+# --------------------------------------------------------------------------
+
+def test_graphic_tag_renders_full_summary_when_primary_is_just_its_prefix():
+    """The exact real-data shape: label (primary) is summary's own first 6
+    words, truncated at ingest -- summary itself continues well past that
+    and must render in FULL, not be suppressed as a duplicate of the prefix
+    that was truncated FROM it."""
+    cut = _cut("f:dup6", 1000, 4000, "A slide titled 'The Market' is",
+               channel="shown", subject="graphic", speaker=None,
+               summary="A slide titled 'The Market' is shown, discussing the "
+                       "growth of the AI video editing market.")
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert ('graphic:"A slide titled \'The Market\' is shown, discussing the '
+            'growth of the AI video editing market."') in line, line
+    print("ok  test_graphic_tag_renders_full_summary_when_primary_is_just_its_prefix")
+
+
+def test_graphic_tag_not_truncated_to_six_words():
+    """Direct regression for the plan's own cited failure mode: a summary
+    longer than 6 words must not get chopped to 'A chef uses tongs to
+    stir' -- the discriminating tail is exactly what tells similar shots
+    apart."""
+    long_summary = ("A chef uses tongs to stir the vegetables sizzling in "
+                    "the wok, glancing up at the camera briefly.")
+    cut = _cut("f:dup7", 1000, 4000, "A chef uses tongs to",
+               channel="shown", subject="person", speaker=None, summary=long_summary)
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert f'graphic:"{long_summary}"' in line, line
+    assert "…" not in line, line
+    print("ok  test_graphic_tag_not_truncated_to_six_words")
+
+
+def test_graphic_tag_still_suppressed_when_summary_equals_primary_exactly():
+    cut = _cut("f:dup8", 1000, 4000, "The speaker appears on screen.",
+               channel="shown", subject="person", speaker=None,
+               summary="The speaker appears on screen.")
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "graphic:" not in line, line
+    print("ok  test_graphic_tag_still_suppressed_when_summary_equals_primary_exactly")
+
+
 def test_spec_on_screen_text_suppressed_when_it_repeats_the_primary_quote():
     cut = _cut("f:dup3", 1000, 4000, "Slide: The Insight", channel="shown", subject="graphic",
                speaker=None,
@@ -1032,6 +1251,81 @@ def test_cast_line_lists_majors_with_voices_and_others_by_id():
 def test_cast_line_empty_with_no_persons():
     assert fm._cast_line([]) == ""
     print("ok  test_cast_line_empty_with_no_persons")
+
+
+# --------------------------------------------------------------------------
+# brain_cut_index_fidelity.plan.md 1.2 (A5): one quality scale. Video's
+# total_quality is already clamped [0,1] at write time; speech's is not
+# (fluency 0-1 + a weighted delivery fusion whose own ceiling is 5.0) --
+# _qual must normalize speech onto the same [0,1] scale, and the rendered
+# token is `score.` now, not `q.` (which read as "quality" regardless of
+# what the prompt said, which was false for a video cut).
+# --------------------------------------------------------------------------
+
+def test_qual_renders_video_score_unchanged_on_its_native_0_1_scale():
+    assert fm._qual(0.42, "video") == "score.42"
+    assert fm._qual(1.0, "video") == "score.100"
+    assert fm._qual(0.0, "video") == "score.00"
+    print("ok  test_qual_renders_video_score_unchanged_on_its_native_0_1_scale")
+
+
+def test_qual_normalizes_speech_score_by_its_own_ceiling():
+    """Speech's total_quality (fluency 0-1 + weighted delivery, vcut/speech/
+    params.py's own weight sum) has a code-defined ceiling of 5.0, not 1.0 --
+    a raw 4.6 (near the real observed max) must NOT render as score.460."""
+    assert fm._qual(5.0, "speech") == "score.100"
+    assert fm._qual(0.0, "speech") == "score.00"
+    lo = fm._qual(4.6, "speech")
+    assert lo == "score.92", lo
+    print("ok  test_qual_normalizes_speech_score_by_its_own_ceiling")
+
+
+def test_qual_same_score_ranks_lower_for_speech_than_video():
+    """The whole point of 1.2: a raw value that would be near-maximal on
+    speech's 0-5 scale must not read as near-maximal when compared (in
+    magnitude only) against a video score on its native 0-1 scale."""
+    raw = 2.5
+    video_tok = fm._qual(raw, "video")   # already clamped -- unchanged
+    speech_tok = fm._qual(raw, "speech")  # normalized down
+    assert video_tok == "score.100", video_tok   # clamped, not silently >100
+    assert speech_tok == "score.50", speech_tok
+    print("ok  test_qual_same_score_ranks_lower_for_speech_than_video")
+
+
+def test_qual_no_kind_treats_score_as_already_0_1():
+    """A legacy hero-cut moment with no `kind` on it (pre-migration data)
+    falls back to treating the score as already on the 0-1 scale --
+    matching cutrecord_map._legacy_score_for's own [0,1] contract."""
+    assert fm._qual(0.75) == "score.75"
+    print("ok  test_qual_no_kind_treats_score_as_already_0_1")
+
+
+def test_qual_token_prefix_is_score_not_q():
+    assert fm._qual(0.5, "video").startswith("score.")
+    assert "q." not in fm._qual(0.5, "video")
+    print("ok  test_qual_token_prefix_is_score_not_q")
+
+
+def test_pic_segment_end_to_end_renders_score_prefix_for_a_video_cut():
+    cut = _cut("f:vq", 1000, 3000, "a shot", channel="shown", subject="object",
+               speaker=None, score=0.61, kind="video",
+               ladder=[_rung("balanced", 1000, 3000, "a shot", 0.61)])
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "PIC:object (score.61)" in line, line
+    assert "q.61" not in line, line
+    print("ok  test_pic_segment_end_to_end_renders_score_prefix_for_a_video_cut")
+
+
+def test_pic_segment_end_to_end_normalizes_a_speech_cut_score():
+    cut = _cut("f:sq", 1000, 3000, "hello there", channel="said", subject="person",
+               speaker="S0", score=4.6, kind="speech",
+               ladder=[_rung("balanced", 1000, 3000, "hello there", 4.6)])
+    tree = fm.build_clip_tree("ffffffff-1111", {"name": "T", "duration_ms": 8000}, [cut])
+    line = fm._moment_line(tree["moments"][0])
+    assert "score.92" in line, line
+    assert "score.460" not in line, line
+    print("ok  test_pic_segment_end_to_end_normalizes_a_speech_cut_score")
 
 
 def _flat_cut():
@@ -1248,6 +1542,60 @@ def test_piece_breakdown_all_strong_events_are_all_core():
     print("ok  test_piece_breakdown_all_strong_events_are_all_core")
 
 
+# --------------------------------------------------------------------------
+# brain_cut_index_fidelity.plan.md 2.1 (A1): each piece carries its OWN
+# event's summary, confirmed genuinely distinct on real multi-event cuts
+# (2026-08-25 live-DB check: 280/280 real multi-event video cuts had zero
+# duplicate/empty per-event summaries) -- never a broadcast copy, never
+# fabricated when absent.
+# --------------------------------------------------------------------------
+
+def _cluster_events_with_summaries():
+    events = _cluster_events()
+    texts = ["the user grabs the mug off the counter",
+             "the user pours water into the mug",
+             "the user carries the mug out of frame"]
+    for ev, t in zip(events, texts):
+        ev["summary"] = t
+    return events
+
+
+def test_piece_breakdown_carries_each_events_own_distinct_summary():
+    m = _cluster_moment(events=_cluster_events_with_summaries())
+    b = fm.piece_breakdown(m)
+    summaries = [p["summary"] for p in b["pieces"]]
+    assert summaries == [
+        "the user grabs the mug off the counter",
+        "the user pours water into the mug",
+        "the user carries the mug out of frame",
+    ], summaries
+    assert len(set(summaries)) == 3, summaries   # genuinely distinct, not a broadcast copy
+    print("ok  test_piece_breakdown_carries_each_events_own_distinct_summary")
+
+
+def test_piece_lines_quotes_each_events_own_text():
+    """Piece text is kept short (_short_gist, matching the other secondary
+    tags) -- Stage 3's full-description upgrade is for the cut's own PRIMARY
+    quote, not the piece list."""
+    m = _cluster_moment(events=_cluster_events_with_summaries())
+    lines = fm._piece_lines(m)
+    assert '"the user grabs the mug off…"' in lines[1], lines[1]
+    assert '"the user pours water into the…"' in lines[2], lines[2]
+    assert '"the user carries the mug out…"' in lines[3], lines[3]
+    print("ok  test_piece_lines_quotes_each_events_own_text")
+
+
+def test_piece_lines_render_nothing_extra_when_summary_absent():
+    """A legacy/un-re-ingested cut whose events carry no descriptive payload
+    (predates the salience bridge) must render the piece rows exactly as
+    before -- no fabricated placeholder text."""
+    m = _cluster_moment()   # _cluster_events(): no "summary" key at all
+    lines = fm._piece_lines(m)
+    assert '"' not in lines[1], lines[1]
+    assert lines[1] == "    1/3 moderate 0.8s point · drops when tight", lines[1]
+    print("ok  test_piece_lines_render_nothing_extra_when_summary_absent")
+
+
 def test_moment_line_multi_event_cluster_is_multiline_and_generic():
     m = _cluster_moment()
     line = fm._moment_line(m)
@@ -1325,9 +1673,17 @@ def main():
     test_done_beat_pic_first_parity_and_snd_silence()
     test_speaker_person_renders_on_cam_when_shown()
     test_annotate_dups_reads_take_group_id()
+    test_annotate_shared_audio_links_overlapping_said_and_shown_same_file()
+    test_moment_line_renders_dup_audio_cross_reference_both_sides()
+    test_annotate_shared_audio_no_link_without_temporal_overlap()
+    test_annotate_shared_audio_no_link_when_shown_cut_carries_no_words()
+    test_annotate_shared_audio_no_link_across_different_files()
+    test_annotate_shared_audio_excludes_junk_on_either_side()
     test_snd_state_says_muted_talk_is_recoverable()
     test_snd_state_ambient_mute_stays_terse()
     test_junk_moment_renders_terse_line_not_the_rich_one()
+    test_junk_moment_renders_a_short_description()
+    test_junk_moment_renders_nothing_extra_when_no_description()
     test_junk_moment_still_resolves_in_map_index()
     test_non_junk_moment_shows_continuity_position_and_weld_marks()
     test_first_cut_has_no_prev_weld_mark()
@@ -1339,11 +1695,13 @@ def main():
     test_peak_tag_absent_when_pinned_to_the_start()
     test_peak_tag_absent_when_pinned_to_the_end()
     test_landmarks_tag_fixed_channel_order_regardless_of_dict_order()
-    test_landmarks_tag_renders_present_channels_via_moment_line()
-    test_landmarks_tag_never_shows_offsets_or_values()
-    test_landmarks_tag_caps_display_at_nine_plus()
+    test_landmarks_tag_renders_offsets_via_moment_line()
+    test_landmarks_tag_adx_shows_direction()
+    test_landmarks_tag_sil_shows_offset_and_duration()
+    test_landmarks_tag_shot_marks_hard_cuts_not_soft_ones()
+    test_landmarks_tag_caps_come_from_ingest_not_the_renderer()
     test_landmarks_tag_absent_when_landmarks_empty()
-    test_landmarks_tag_skips_a_channel_present_but_zero_count()
+    test_landmarks_tag_skips_a_channel_with_no_stored_offsets()
     test_specific_tag_renders_when_scene_specifics_present()
     test_specific_tag_absent_when_not_yet_enriched()
     test_specific_tag_absent_when_specifics_present_but_empty_string()
@@ -1366,6 +1724,9 @@ def main():
     test_specific_tag_full_pipeline_new_shape_renders_on_the_beat_line()
     test_graphic_tag_suppressed_when_it_repeats_the_primary_quote()
     test_graphic_tag_still_renders_when_it_says_something_new()
+    test_graphic_tag_renders_full_summary_when_primary_is_just_its_prefix()
+    test_graphic_tag_not_truncated_to_six_words()
+    test_graphic_tag_still_suppressed_when_summary_equals_primary_exactly()
     test_spec_on_screen_text_suppressed_when_it_repeats_the_primary_quote()
     test_spec_on_screen_text_still_renders_when_it_says_something_new()
     test_full_slide_scenario_says_the_fact_exactly_once()
@@ -1374,6 +1735,13 @@ def main():
     test_clip_block_run_indent_composes_with_takes_lines()
     test_cast_line_lists_majors_with_voices_and_others_by_id()
     test_cast_line_empty_with_no_persons()
+    test_qual_renders_video_score_unchanged_on_its_native_0_1_scale()
+    test_qual_normalizes_speech_score_by_its_own_ceiling()
+    test_qual_same_score_ranks_lower_for_speech_than_video()
+    test_qual_no_kind_treats_score_as_already_0_1()
+    test_qual_token_prefix_is_score_not_q()
+    test_pic_segment_end_to_end_renders_score_prefix_for_a_video_cut()
+    test_pic_segment_end_to_end_normalizes_a_speech_cut_score()
     test_energy_tag_renders_real_grade_from_pace()
     test_energy_tag_absent_without_pace_envelope()
     test_levels_tag_suppressed_when_ladder_is_uniform()
@@ -1389,6 +1757,9 @@ def main():
     test_piece_breakdown_none_for_single_event_moment()
     test_piece_breakdown_shape_for_three_separated_events()
     test_piece_breakdown_all_strong_events_are_all_core()
+    test_piece_breakdown_carries_each_events_own_distinct_summary()
+    test_piece_lines_quotes_each_events_own_text()
+    test_piece_lines_render_nothing_extra_when_summary_absent()
     test_moment_line_multi_event_cluster_is_multiline_and_generic()
     test_resolve_piece_addresses_each_separated_event()
     test_resolve_piece_out_of_range_is_none()

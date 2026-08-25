@@ -153,8 +153,8 @@ TREE_VERSION = 26
 
 # Two moments are one continuous source run when the next starts within this gap
 # of where the previous ended (back-to-back in the original footage). Loose
-# enough to bridge the small breath between consecutive beats; tight enough that
-# genuinely separate beats (a real gap) stay apart.
+# enough to bridge the small breath between consecutive cuts; tight enough that
+# genuinely separate cuts (a real gap) stay apart.
 _RUN_GAP_MS = 500
 
 # Band index -> energy-level name. Band 2 (energy 0.5) is the anchor: one
@@ -233,7 +233,7 @@ def _assign_runs(moments: List[Dict[str, Any]]) -> None:
     A run is a maximal chain of moments that are back-to-back in source time --
     each starts within ``_RUN_GAP_MS`` of where the previous one ended (or
     overlaps it) -- i.e. one uninterrupted stretch of the original clip that got
-    atomized into several beats. This is a PURELY TEMPORAL fact about the source
+    atomized into several cuts. This is a PURELY TEMPORAL fact about the source
     (same clip + adjacent time); it is deliberately CHANNEL-AGNOSTIC -- said,
     done and shown are weighed equally, exactly like the compile-time weld. The
     cut's category never enters the decision.
@@ -306,10 +306,10 @@ def build_clip_tree(
             variants[anchor["level"]] = anchor
 
         # beat_transcript.plan.md / brain_mirror_readside.plan.md section 3.2:
-        # the verbatim words over this beat's OWN span (never padded, unlike
+        # the verbatim words over this cut's OWN span (never padded, unlike
         # Tier-1's _span_detail window) -- reused by _moment_line to quote
         # the actual dialogue instead of just the vision-model paraphrase.
-        # NOT gated on channel=="said" (band-aid C's twin: the beat index
+        # NOT gated on channel=="said" (band-aid C's twin: the cut index
         # must show the words that WILL play under every cut, muted or not,
         # so incidental speech under a `shown`/`done` cut is never hidden --
         # _said_text_for_span itself already returns "" when nothing
@@ -344,7 +344,7 @@ def build_clip_tree(
             "kind": cut.get("kind"),
             "subject": cut.get("subject"),
             # Plain camera-move phrase for the shot (static / pan / tilt / zoom /
-            # follow subject / shaky) -- surfaced in the beat line so the brain
+            # follow subject / shaky) -- surfaced in the cut line so the brain
             # knows how the shot moves.
             "camera": cut.get("camera") or "unknown",
             # Gist of an information-dense graphic (what it conveys), when present.
@@ -363,7 +363,7 @@ def build_clip_tree(
             "on_camera": cut.get("on_camera"),
             "gist": cut.get("label") or "",
             # beat_transcript.plan.md: verbatim dialogue_segments transcript
-            # over this speech beat's own span -- '' for a non-speech beat.
+            # over this speech cut's own span -- '' for a non-speech cut.
             "said_text": said_text,
             "flags": cut.get("flags") or [],
             # Source-audio facet for video cuts: what's on the track ("speech"/
@@ -376,7 +376,7 @@ def build_clip_tree(
             # speech_quality (delivery, ~equal across simultaneous angles) and
             # total_quality (speech + visual; the `score` above == total_quality
             # for a re-ingested cut). Let the brain "show the speaker" by ranking
-            # a beat's alternate angles on visual presentation.
+            # a cut's alternate angles on visual presentation.
             "speech_quality": cut.get("speech_quality"),
             "total_quality": cut.get("total_quality"),
             "in_ms": anchor["in_ms"],
@@ -389,7 +389,7 @@ def build_clip_tree(
             # carries it (None for legacy hero cuts) -- see _annotate_dups.
             "take_group_id": cut.get("take_group_id"),
             "take_role": cut.get("take_role"),
-            # Outlook group this beat belongs to (alternate cameras of one
+            # Outlook group this cut belongs to (alternate cameras of one
             # moment sharing an authoritative audio track). Carried through so
             # `_annotate_outlook_groups` can tell the brain the audio is
             # decoupled from whichever angle it shows. (DB column is
@@ -414,7 +414,7 @@ def build_clip_tree(
             "salience": cut.get("salience") or {},
             # brain_perception_upgrade.plan.md Change 1: compact interior-
             # structure landmarks (post._landmarks) powering the "sig:"
-            # beat-line breadcrumb (_landmarks_tag) below. {} on a
+            # cut-line breadcrumb (_landmarks_tag) below. {} on a
             # pre-migration cut or one with no interior structure.
             "landmarks": cut.get("landmarks") or {},
             # cut_structure_and_scene_specificity.plan.md Part 3: this cut's
@@ -429,7 +429,7 @@ def build_clip_tree(
             "src_out_ms": cut.get("src_out_ms"),
             # av_coupling_authoritative.plan.md: this cut's baked authoritative
             # audio coupling -- carried through to ResolvedCut/segments so a
-            # placed beat plays correct, in-sync audio without a lazy re-route
+            # placed cut plays correct, in-sync audio without a lazy re-route
             # at render time. Defaults to this cut's own file at offset 0
             # (cutrecord_map._to_cut_dict already resolves the legacy-row
             # NULL case, so this is never missing).
@@ -439,7 +439,7 @@ def build_clip_tree(
             "atoms": [],
         })
 
-    # Tag same-channel back-to-back beats as continuous source runs (one shot).
+    # Tag same-channel back-to-back cuts as continuous source runs (one shot).
     _assign_runs(moments)
 
     return {
@@ -604,7 +604,7 @@ def _short_gist(s: str, max_words: int = 6) -> str:
 
 
 def _pic_who(m: Dict[str, Any]) -> Optional[str]:
-    """WHO or WHAT is on screen for this beat (Fact #1's PICTURE half) --
+    """WHO or WHAT is on screen for this cut (Fact #1's PICTURE half) --
     every global person id visible in this cut (identity/reconcile.py's
     per-cut-occurrence face clustering, voice_first_identity.plan.md Phase
     D), joined; else the subject noun for a non-person capture (place/
@@ -636,9 +636,9 @@ def piece_breakdown(m: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Structural, generic per-piece breakdown for a multi-event cluster
     (v4_cluster_read_act.plan.md Part B): the cluster's broad<->punchy range,
     then each event's position/relative salience/duration/kind -- enough for
-    the brain to pick "the strongest piece" or "the last beat" positionally,
+    the brain to pick "the strongest piece" or "the last cut" positionally,
     with zero domain words. None for a single-event moment (the common case,
-    untouched). Shared by _piece_lines (the Beat Index's text rendering) and
+    untouched). Shared by _piece_lines (the Cut Index's text rendering) and
     observe.read_state (the same facts, structured, for a per-cut deep look)
     so the two always agree.
 
@@ -648,7 +648,7 @@ def piece_breakdown(m: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     strongest few. ``punchy_count``/``punchy_avg_s`` describe what survives at
     the sharpest band (energy 0.9 -- the tightest rung the timeline plays), and
     each piece's ``core`` flag marks whether that event is one of the survivors
-    (True) or one of the connective/droppable beats that fall away first
+    (True) or one of the connective/droppable cuts that fall away first
     (False). The single strongest event is always core."""
     sal = m.get("salience") or {}
     events = sal.get("events") or []
@@ -687,7 +687,17 @@ def piece_breakdown(m: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             strength = "moderate" if rel >= 0.5 else "weak"
         piece_list.append({"pos": pos, "of": len(ordered), "strength": strength,
                            "dur_s": round(dur_ms / 1000.0, 1), "kind": ev.get("kind") or "point",
-                           "core": id(ev) in survivor_ids})
+                           "core": id(ev) in survivor_ids,
+                           # brain_cut_index_fidelity.plan.md 2.1 (A1): the
+                           # event's OWN text (vcut/salience.py's per-flag
+                           # summary -- confirmed genuinely distinct per
+                           # event on real multi-event cuts, never a
+                           # broadcast copy of the parent cut's summary), so
+                           # a piece is addressable by WHAT it shows, not
+                           # just its position/strength/duration. "" on a
+                           # legacy/un-re-ingested cut whose events carry no
+                           # descriptive payload -- never fabricated.
+                           "summary": (ev.get("summary") or "").strip()})
     return {"broad_s": round(broad_s, 1), "tight_count": len(pieces),
            "tight_avg_s": round(tight_s, 1),
            "punchy_count": len(survivors), "punchy_avg_s": round(punchy_avg_s, 1),
@@ -695,7 +705,7 @@ def piece_breakdown(m: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def _piece_lines(m: Dict[str, Any]) -> List[str]:
-    """Text rendering of piece_breakdown for the Beat Index -- see there for
+    """Text rendering of piece_breakdown for the Cut Index -- see there for
     the shared facts. [] for a single-event moment.
 
     Makes the RENDERED FILTERING explicit: the cut can play whole, split
@@ -713,14 +723,19 @@ def _piece_lines(m: Dict[str, Any]) -> List[str]:
              f"(~{b['punchy_avg_s']:.1f}s each) at the sharpest, dropping the weaker ones:"]
     for p in b["pieces"]:
         tag = " \u00b7 core" if p["core"] else " \u00b7 drops when tight"
-        lines.append(f"    {p['pos']}/{p['of']} {p['strength']} {p['dur_s']:.1f}s {p['kind']}{tag}")
+        # brain_cut_index_fidelity.plan.md 2.1 (A1): the piece's own summary,
+        # when the cut actually carries per-event text -- "" on a legacy cut
+        # (an un-re-ingested run predating the salience bridge) renders
+        # nothing extra, never a fabricated placeholder.
+        text = f" \"{_short_gist(p['summary'])}\"" if p.get("summary") else ""
+        lines.append(f"    {p['pos']}/{p['of']} {p['strength']} {p['dur_s']:.1f}s {p['kind']}{text}{tag}")
     return lines
 
 
 def resolve_piece(m: Dict[str, Any], piece: int) -> Optional[Tuple[int, int]]:
     """A single piece's own resolved span (v4_cluster_read_act.plan.md Part C):
     the brain addresses a piece by the same 1-based position it was shown in
-    the Beat Index / read_state (``piece_breakdown``'s ``pos``) -- resolve that
+    the Cut Index / read_state (``piece_breakdown``'s ``pos``) -- resolve that
     back to its event, then to whichever UNGATED (prune=False) ``resolve_cluster``
     piece at energy=1.0 (the tightest split, every event kept) CONTAINS that
     event's own peak. Prune=False so a piece stays addressable even where the
@@ -786,25 +801,49 @@ def _peak_tag(m: Dict[str, Any]) -> str:
 _LANDMARK_TAG_ORDER = ("act", "adx", "sil", "shot")
 
 
+def _fmt_off(off_ms: int) -> str:
+    return f"+{int(off_ms) / 1000:.1f}s"
+
+
 def _landmarks_tag(m: Dict[str, Any]) -> str:
-    """`sig:act3,shot1` -- a terse pointer naming ONLY the channels this cut
-    has interior structure on, with their counts (never offsets/values --
-    that's the whole point of keeping this always-on and free; the full
-    detail is a tool call away via `inspect_cut`). Counts come straight from
-    `landmarks[ch]["n"]` (the FULL interior count, which may exceed how many
-    offsets are actually stored), capped for display at "9+". '' when
-    `landmarks` is empty (no interior structure, or a pre-migration cut)."""
+    """`sig:act+1.2s,+3.4s|shot+2.0s!` -- brain_cut_index_fidelity.plan.md
+    4.1 (A3): the RHYTHM TRACK. Each channel's own stored offsets (from
+    `landmarks[ch]` -- act:hits, adx:changes, sil:gaps, shot:cuts, all
+    measured from the cut's own start), not a count -- a count told the
+    brain STRUCTURE EXISTS but never WHERE, which is exactly what judging
+    pacing from content needs. Channels are `|`-separated, offsets within a
+    channel `,`-separated:
+      act  -- action hits, plain offsets.
+      adx  -- audio-dynamics changes, offset + direction arrow (up/down).
+      sil  -- silence gaps, offset + `.` + duration.
+      shot -- internal shot/composition cuts, offset (+ `!` when it's a
+              hard shot cut, not a softer composition change).
+    Each channel's list is ALREADY the top-K strongest (or, for shot, every
+    interior cut -- there is no magnitude to rank by), sorted to time order,
+    capped at ingest (l3/landmarks.py: _LANDMARK_ACT_CAP=5, _ADX_CAP=5,
+    _SIL_CAP=5, _SHOT_CAP=8) -- capped by usefulness, not truncated to a
+    display count. A channel with no offsets stored (older data, or `n>0`
+    with an empty list some other way) is simply omitted, same as a channel
+    absent entirely. '' when `landmarks` is empty (no interior structure, or
+    a pre-migration cut)."""
     landmarks = m.get("landmarks") or {}
     if not landmarks:
         return ""
-    parts = []
+    _arrow = {"up": "↑", "down": "↓"}
+    # (the list key inside landmarks[code], the per-entry formatter)
+    _channel_fmt = {
+        "act": ("hits", lambda off: _fmt_off(off)),
+        "adx": ("changes", lambda c: f"{_fmt_off(c['off'])}{_arrow.get(c.get('dir'), '')}"),
+        "sil": ("gaps", lambda g: f"{_fmt_off(g['off'])}.{int(g.get('dur') or 0) / 1000:.1f}s"),
+        "shot": ("cuts", lambda c: f"{_fmt_off(c['off'])}{'!' if c.get('hard') else ''}"),
+    }
+    groups = []
     for code in _LANDMARK_TAG_ORDER:
-        ch = landmarks.get(code)
-        n = int((ch or {}).get("n") or 0)
-        if n <= 0:
-            continue
-        parts.append(f"{code}{n}" if n <= 9 else f"{code}9+")
-    return f" sig:{','.join(parts)}" if parts else ""
+        key, fmt = _channel_fmt[code]
+        entries = (landmarks.get(code) or {}).get(key) or []
+        if entries:
+            groups.append(code + ",".join(fmt(e) for e in entries))
+    return f" sig:{'|'.join(groups)}" if groups else ""
 
 
 _SPEC_MOMENTS_MAX = 5
@@ -830,6 +869,24 @@ def _dedupes_code_tag(spec_value: str, code_value: str) -> bool:
     if not a or not b:
         return False
     return a in b or b in a
+
+
+def _summary_adds_nothing_new(summ: str, primary: str) -> bool:
+    """True when the cut's own `summary` says no MORE than its `primary`
+    quote already does -- an exact match, or `primary` already contains the
+    whole of `summ`. Deliberately ASYMMETRIC, unlike `_dedupes_code_tag`:
+    brain_cut_index_fidelity.plan.md 3 (A2) found that `label` (which
+    becomes `primary` for a shown/done cut) is ALWAYS either identical to or
+    a strict 6-word-capped PREFIX of `summary` (vcut/store.py: label=
+    _short_label(cut.summary), same source, not independent fields) --
+    `primary in summ` (summ is the LONGER, more informative one) must NOT
+    count as redundant, or `summary`'s own extra content would be suppressed
+    every single time it exists, which is exactly the case 3/A2 exists to
+    surface."""
+    a, b = summ.strip().lower(), primary.strip().lower()
+    if not a or not b:
+        return False
+    return a == b or a in b
 
 
 def _spec_groups(spec: Dict[str, Any], m: Dict[str, Any], *, primary_text: str = "") -> List[str]:
@@ -889,11 +946,21 @@ def _spec_groups(spec: Dict[str, Any], m: Dict[str, Any], *, primary_text: str =
 
 
 def _render_moments_list(moments: List[Dict[str, Any]], cut_in_ms: int) -> str:
-    """`+1.2s barista grabs cup; +3.4s pours latte, close; ...` -- the mini
-    shot-list for a merged loose cut (section 1c), one entry per absorbed
-    moment, capped at `_SPEC_MOMENTS_MAX` with a `...+N more` tail. Each
-    moment's own `summary` is preferred; a moment with neither summary nor
-    subject/action contributes nothing (never a bare timestamp)."""
+    """`+1.2s barista grabs cup [piece 1/3]; +3.4s pours latte, close
+    [piece 3/3]; ...` -- the mini shot-list for a merged loose cut (section 1c),
+    one entry per absorbed moment, capped at `_SPEC_MOMENTS_MAX` with a
+    `...+N more` tail. Each moment's own `summary` is preferred; a moment
+    with neither summary nor subject/action contributes nothing (never a
+    bare timestamp).
+
+    brain_cut_index_fidelity.plan.md 5 (A4): `[piece k/N]`, when `_live_
+    moments` supplied one, is the SAME 1-based position `range:`'s piece
+    rows use -- inside: (this list, the survivor subset) and pieces
+    (piece_breakdown, every event) describe the same underlying salience
+    events; this ties an entry named here back to something addressable via
+    `place(ref, piece=k)`, including a non-surviving piece described only in
+    `range:`, never here. Absent (no suffix at all) for the legacy/single-
+    event fallback (`spec["moments"]`), which carries no piece concept."""
     entries: List[str] = []
     for mo in moments[:_SPEC_MOMENTS_MAX]:
         t_ms = mo.get("t_ms")
@@ -906,7 +973,9 @@ def _render_moments_list(moments: List[Dict[str, Any]], cut_in_ms: int) -> str:
         if not summary:
             continue
         delta_s = (int(t_ms) - int(cut_in_ms or 0)) / 1000.0
-        entries.append(f"+{delta_s:.1f}s {_short_gist(summary)}")
+        piece, of = mo.get("piece"), mo.get("of")
+        ref = f" [piece {piece}/{of}]" if piece and of else ""
+        entries.append(f"+{delta_s:.1f}s {_short_gist(summary)}{ref}")
     if not entries:
         return ""
     if len(moments) > _SPEC_MOMENTS_MAX:
@@ -935,8 +1004,21 @@ def _live_moments(spec: Dict[str, Any], m: Dict[str, Any]) -> List[Dict[str, Any
     sharp_energy = cutrecord_map._BAND_ENERGIES[-1]
     survivors = cutrecord_map._prune_events(events, sharp_energy)
     ordered = sorted(survivors, key=lambda e: e.get("peak_ms", 0))
+    # brain_cut_index_fidelity.plan.md 5 (A4): inside: and pieces render the
+    # SAME underlying events as different subsets (survivors vs all) with
+    # nothing tying an inside: entry back to its own addressable piece
+    # position -- recompute piece_breakdown's own 1-based rank (time order
+    # over ALL events, matching it exactly) so a moment named here can be
+    # addressed directly via place(ref, piece=k) instead of being described
+    # but unreachable.
+    rank_by_peak = {
+        ev.get("peak_ms"): pos
+        for pos, ev in enumerate(sorted(events, key=lambda e: e.get("peak_ms", 0)), start=1)
+    }
     return [
-        {"t_ms": e.get("peak_ms"), "summary": e.get("summary") or "", **(e.get("specifics") or {})}
+        {"t_ms": e.get("peak_ms"), "summary": e.get("summary") or "",
+         "piece": rank_by_peak.get(e.get("peak_ms")), "of": len(events),
+         **(e.get("specifics") or {})}
         for e in ordered
     ]
 
@@ -999,17 +1081,42 @@ def _dur_tag(m: Dict[str, Any]) -> str:
     return f"{s:.1f}s" if s < 10 else f"{int(round(s))}s"
 
 
-def _qual(score: float) -> str:
-    """Compact quality/confidence token shared by PIC and alt-PIC parens."""
-    return f"q.{int(round(max(0.0, score) * 100)):02d}"
+# brain_cut_index_fidelity.plan.md 1.2: speech's total_quality (rb.speech_
+# quality, vcut/speech/store.py) is fluency_llm (0-1) + a weighted delivery
+# fusion (vcut/speech/params.py: W_ENERGY 1.0 + W_DYNAMICS 0.6 + W_PACE 1.0 +
+# W_HESITATION 1.0 + W_VISUAL 0.4 = 4.0 over terms each min-max normalized to
+# [0,1] within the take group) -- an UNCLAMPED quantity whose own code-defined
+# ceiling is 1.0 + 4.0 = 5.0, not the [0,1] video's total_quality is already
+# clamped to at write time (vcut/store.py: max(0.0, min(1.0, mean_s))).
+# Confirmed against live data: video total_quality in [0.002, 1.0], speech in
+# [0.0, 4.6] (2026-08-25 measurement) -- consistent with this ceiling, not an
+# empirical coincidence to chase as the data grows.
+_SPEECH_QUALITY_CEILING = 5.0
+
+
+def _qual(score: float, kind: Optional[str] = None) -> str:
+    """Compact rank token shared by PIC and alt-PIC parens -- higher means a
+    better pick, but the two kinds compute it from different things: video's
+    is mean cut-cleanliness of the region (vcut/store.py's seam function,
+    NOT a visual judgment); speech's is a delivery/fluency fusion. Normalizing
+    speech onto the SAME [0,1] scale video already uses (route (a) of 1.2,
+    preferred over a per-kind tag: "a single scale is simpler to explain")
+    keeps the two silently comparable in magnitude only -- what the number
+    MEASURES still differs and is explained once in the legend/provenance
+    text (1.3/B6), not per-line. Renamed away from `q.` (1.2): the letter
+    read as "quality" regardless of what the prompt said, which was
+    precisely false for a video cut."""
+    if kind == "speech":
+        score = score / _SPEECH_QUALITY_CEILING
+    return f"score.{int(round(max(0.0, min(1.0, score)) * 100)):02d}"
 
 
 def _pic_segment(m: Dict[str, Any]) -> str:
-    """PIC leads the beat line: whose face / what scene is on screen (never the
-    speaker), + shot size + quality. '?' when genuinely unresolved -- never a
+    """PIC leads the cut line: whose face / what scene is on screen (never the
+    speaker), + shot size + rank. '?' when genuinely unresolved -- never a
     guess dressed up as a fact."""
     who = _pic_who(m) or "?"
-    bits = [b for b in (_framing_tag(m), _qual(float(m.get("score", 0.0)))) if b]
+    bits = [b for b in (_framing_tag(m), _qual(float(m.get("score", 0.0)), m.get("kind"))) if b]
     return f"PIC:{who} ({', '.join(bits)})"
 
 
@@ -1019,7 +1126,7 @@ _AUDIO_STATE = {"speech": "talk", "sound": "ambient", "silent": "silence"}
 
 
 def _snd_state(m: Dict[str, Any]) -> str:
-    """The audio STATE half of SND -- 'speaking' for a said beat (the content IS
+    """The audio STATE half of SND -- 'speaking' for a said cut (the content IS
     the speech); else the video cut's own source-audio facet, folding in the
     default mute so the brain isn't surprised by a silent play. Unknown audio
     (no signal to judge) defaults to 'silence', the harmless assumption."""
@@ -1048,7 +1155,7 @@ def _snd_segment(m: Dict[str, Any]) -> str:
     a per-still guess. A resolved VOICE with no confident person binding (the
     expected narration/podcast-listener case) renders OFF-CAM with no id --
     never forced to a face. No voice resolved at all (shouldn't happen for a
-    real speech beat, but never fabricated) renders no identity at all."""
+    real speech cut, but never fabricated) renders no identity at all."""
     state = _snd_state(m)
     if m.get("channel") != "said":
         return f"SND:{state}"
@@ -1062,16 +1169,16 @@ def _snd_segment(m: Dict[str, Any]) -> str:
 
 
 def _alt_pic_segment(m: Dict[str, Any]) -> str:
-    """Fact #2 folded onto the beat: every OTHER picture the SAME sound is also
-    available as (this beat's cross-clip take-group members), each a neutral
+    """Fact #2 folded onto the cut: every OTHER picture the SAME sound is also
+    available as (this cut's cross-clip take-group members), each a neutral
     `Px→ref (shot, q)`. Never a verdict -- just where else this sound's picture
     lives. Absent when there is no co-occurrence (`_annotate_dups` sets no
     `alt_pic` in that case) or when no member resolves to a picture distinct
-    from this beat's own.
+    from this cut's own.
 
     OUTLOOK vs TAKE dedupe differs, because the two are distinct kinds:
       * TAKE (retakes of the same content): collapse by on-camera PERSON and
-        drop an alternate that shows the same person as this beat -- offering
+        drop an alternate that shows the same person as this cut -- offering
         the same face twice is noise, the brain wants the distinct alternate.
       * OUTLOOK (alternate CAMERAS of one simultaneous moment): every angle is
         a real, switchable option even when it shows the same person (that's
@@ -1098,7 +1205,7 @@ def _alt_pic_segment(m: Dict[str, Any]) -> str:
                 continue
             seen.add(who)
             label = who
-        bits = [b for b in (f.get("framing"), _qual(float(f.get("score", 0.0)))) if b]
+        bits = [b for b in (f.get("framing"), _qual(float(f.get("score", 0.0)), f.get("kind"))) if b]
         retry = ", retry" if f.get("restart") else ""
         parts.append(f"{label}→{f['cut_id']} ({', '.join(bits)}{retry})")
     return f" ·alt-PIC:{', '.join(parts)}" if parts else ""
@@ -1126,7 +1233,7 @@ def _takes_lines(m: Dict[str, Any]) -> List[str]:
     lines = [f"    takes: {n} other version{'s' if n != 1 else ''} of this line —"]
     for f in facts:
         dur_s = int(f.get("play_ms") or 0) / 1000.0
-        lines.append(f"      {f['cut_id']}  {dur_s:.1f}s {_qual(float(f.get('score', 0.0)))}")
+        lines.append(f"      {f['cut_id']}  {dur_s:.1f}s {_qual(float(f.get('score', 0.0)), f.get('kind'))}")
     return lines
 
 
@@ -1148,7 +1255,7 @@ def _pace_tag(m: Dict[str, Any]) -> str:
       * VIDEO  -> ``pace:LO-HIx``: the reachable playback-speed range (levels
         cross-clip-normalized so the same rung looks smooth against neighbors),
         shown only when there is real speed room.
-    '' when there is no room (a clean speech beat / a video cut pinned to 1x) or
+    '' when there is no room (a clean speech cut / a video cut pinned to 1x) or
     for a legacy hero-cut moment with no envelope."""
     pace = m.get("pace") or {}
     is_speech = m.get("kind") == "speech" or m.get("channel") == "said"
@@ -1173,8 +1280,8 @@ def _pace_tag(m: Dict[str, Any]) -> str:
 
 
 def _continuity_tag(m: Dict[str, Any]) -> str:
-    """This beat's position within its clip's full cut sequence (incl. junk --
-    a gap in cut_no IS the signal a junk beat sits there) + weld marks toward
+    """This cut's position within its clip's full cut sequence (incl. junk --
+    a gap in cut_no IS the signal a junk cut sits there) + weld marks toward
     each neighbor. '' for a legacy hero-cut moment (no continuity block)."""
     cont = m.get("continuity") or {}
     cut_no, of = cont.get("cut_no"), cont.get("of")
@@ -1193,7 +1300,14 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     # content that's skip-by-default.
     if m.get("junk"):
         reason = (m.get("junk_reason") or "").strip() or "unspecified"
-        return (f"  {m['cut_id'].split(':')[-1]} [JUNK: {reason}]{_continuity_tag(m)} "
+        # brain_cut_index_fidelity.plan.md 5 (A6): a bare reason code hides
+        # the entire clip behind it -- the brain has no way to judge whether
+        # the junk call was right without a description. Short, matching
+        # the terse convention every other secondary tag on this line uses
+        # (never the full rich line junk stays deliberately spared from).
+        gist = (m.get("gist") or "").strip().replace("\n", " ")
+        desc = f" \"{_short_gist(gist)}\"" if gist else ""
+        return (f"  {m['cut_id'].split(':')[-1]} [JUNK: {reason}]{desc}{_continuity_tag(m)} "
                 f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])} {_dur_tag(m)}]")
     # brain_material_truth.plan.md Part 3: energy_grade (calm/medium/high,
     # from real mean action energy -- vcut/store.py:_energy_grade) is
@@ -1222,22 +1336,22 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
         ladder = "|".join(L for L in _LEVEL_NAMES if L in levels)
         levels_tag = f" · levels:{ladder}"
     # PIC leads (what actually lands on screen); SND is a co-equal peer, never
-    # the subject -- placing a beat can no longer read as "showing the speaker".
+    # the subject -- placing a cut can no longer read as "showing the speaker".
     pic = _pic_segment(m)
     snd = _snd_segment(m)
     gist = (m.get("gist") or "").strip().replace("\n", " ")
     is_said_beat = m.get("channel") == "said"
-    # beat_transcript.plan.md: a speech beat quotes the VERBATIM words first
+    # beat_transcript.plan.md: a speech cut quotes the VERBATIM words first
     # (what the brain should actually read to choose dialogue/takes) -- the
     # vision-model gist rides along as a short secondary note (vis:"...")
-    # rather than being dropped. A beat with no transcript (older footage, no
+    # rather than being dropped. A cut with no transcript (older footage, no
     # dialogue_segments row) falls back to the gist as the primary quote,
     # exactly like before this plan.
     #
     # brain_mirror_readside.plan.md section 3.2: said_text is now computed
-    # for EVERY channel (not just "said"), so a done/shown beat's own PIC
+    # for EVERY channel (not just "said"), so a done/shown cut's own PIC
     # gist must stay primary -- it describes what's ON SCREEN, which is
-    # still the more useful lead for a visual beat even when incidental
+    # still the more useful lead for a visual cut even when incidental
     # words happen to overlap it in time. Those words still surface, just
     # as a separate `incidental:"..."` tag (below) rather than displacing
     # the visual description.
@@ -1261,13 +1375,23 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     # redundant -- the brain hears it) AND it isn't already the primary quote
     # itself (brain_material_truth.plan.md Part 4.2: `summary` and `gist`/
     # `said_text` are independent DB fields that, on a slide cut, routinely
-    # say the same thing -- rendering both restates one fact as two). Short
-    # tag; full text via inspect_moment.
+    # say the same thing -- rendering both restates one fact as two).
+    #
+    # brain_cut_index_fidelity.plan.md 3 (A2): `summary` is the RICH stored
+    # description (median 11-15 words, up to 93 on real data) -- `gist`/
+    # `label` is a SEPARATE, already-6-word-capped field set at ingest
+    # (vcut/store.py._short_label), not a truncation of this one. Squeezing
+    # `summary` down to 6 more words here on top of that discarded 83-94% of
+    # it and routinely cut it off mid-clause ("A chef uses tongs to stir").
+    # The discriminating detail that tells five similar shots apart is
+    # usually in the discarded tail. Render it in full; this improves
+    # description LENGTH, not distinctness -- five shots all generically
+    # summarized as "chef stirring" still all say roughly that in full.
     gloss = ""
     summ = (m.get("summary") or "").strip().replace("\n", " ")
-    if summ and not m.get("summary_covered_by_speech") and not _dedupes_code_tag(summ, primary):
-        gloss = f" graphic:\"{_short_gist(summ)}\""
-    # Delivery quality (crispness+loudness) for a speech beat -- camera-
+    if summ and not m.get("summary_covered_by_speech") and not _summary_adds_nothing_new(summ, primary):
+        gloss = f" graphic:\"{summ}\""
+    # Delivery quality (crispness+loudness) for a speech cut -- camera-
     # independent, so it's the same across an outlook group's angles: a clean
     # "which take sounds best" signal alongside PIC's own q.XX (visual) score.
     aud_tag = ""
@@ -1304,11 +1428,18 @@ def _moment_line(m: Dict[str, Any], *, compact: bool = False) -> str:
     # other angles (the outlook group's authoritative track), so picture choice
     # is entirely the brain's call and switching angles never jumps the audio.
     outlook_tag = f" outlook:{m['outlook_angle_count']}-angles" if m.get("outlook_angle_count") else ""
+    # brain_cut_index_fidelity.plan.md 5 (A7): this cut's audio is the SAME
+    # underlying recording as another cut on the line(s) named here (same
+    # file, overlapping timestamps) -- placing both plays the identical
+    # words twice.
+    dup_audio_tag = (f" dup-audio:{','.join(m['dup_audio_refs'])}"
+                     if m.get("dup_audio_refs") else "")
     alt = _alt_pic_segment(m)
     line = (f"  {m['cut_id'].split(':')[-1]} {_capture_tag(m)} {pic} {snd} "
             f"[{_fmt_ts(m['in_ms'])}-{_fmt_ts(m['out_ms'])} {_dur_tag(m)}] "
             f"\"{primary}\"{vis_tag}{incidental_tag}{gloss}{scr_tag}{spec_tag}{cut_tag}"
-            f"{energy_tag}{levels_tag}{aud_tag}{pace_tag}{cam_tag}{peak_tag}{landmarks_tag}{outlook_tag}{alt}")
+            f"{energy_tag}{levels_tag}{aud_tag}{pace_tag}{cam_tag}{peak_tag}{landmarks_tag}"
+            f"{outlook_tag}{dup_audio_tag}{alt}")
     piece_lines = _piece_lines(m)
     takes_lines = _takes_lines(m)
     extra = piece_lines + takes_lines
@@ -1385,8 +1516,8 @@ def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     matching needed since the group id already lives on the exact moment it
     belongs to. Tags
     each linked moment in place with its ``dup_group`` plus ``alt_pic`` (Fact
-    #2 folded onto the beat: every OTHER member's raw facts, so
-    ``_moment_line`` can render this beat's alternates without a separate
+    #2 folded onto the cut: every OTHER member's raw facts, so
+    ``_moment_line`` can render this cut's alternates without a separate
     lookup). No winner is crowned -- the brain compares the members and
     decides. Fail-open: a moment with no take_group_id is simply not linked."""
     by_group: Dict[str, List[Dict[str, Any]]] = {}
@@ -1412,6 +1543,12 @@ def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "visible_persons": m.get("visible_persons") or [],
             "speaker_person": m.get("speaker_person"),
             "framing": _framing_tag(m),
+            # brain_cut_index_fidelity.plan.md 1.2: _qual needs to know which
+            # scale THIS member's own score lives on (video's total_quality is
+            # already 0-1; speech's is not) -- carried per-member rather than
+            # assumed group-uniform, since the model (not code) decides take
+            # grouping and nothing guarantees a group never mixes kinds.
+            "kind": m.get("kind"),
             "score": float(m.get("score", 0.0)),
             "play_ms": int(m.get("play_ms") or 0),
             # cuts-v3 has no restart concept at the take-group level (that's a
@@ -1435,15 +1572,15 @@ def _annotate_dups(trees: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def _annotate_outlook_groups(trees: List[Dict[str, Any]]) -> None:
     """Tag each moment in an outlook group with `outlook_angle_count` -- how
-    many distinct ANGLES cover THIS beat (this angle + its alt-PIC alternates),
+    many distinct ANGLES cover THIS cut (this angle + its alt-PIC alternates),
     a purely STRUCTURAL fact (`_moment_line` renders it as `outlook:N-angles`),
     never editorial guidance. It tells the brain "these N angles' picture all
     ride the same authoritative audio track, so switching between them never
     jumps the sound" -- picture choice is still entirely the brain's call.
 
-    Counts per-BEAT (from the beat's own alt-PIC angles), NOT how many moments
+    Counts per-CUT (from the cut's own alt-PIC angles), NOT how many moments
     share the project-wide group id: a group id spans the whole recording, but
-    a given beat is only actually covered by the angles that were rolling then
+    a given cut is only actually covered by the angles that were rolling then
     (a shorter angle drops out for the parts it didn't film). Runs after
     `_annotate_dups`, which populates each moment's `alt_pic`."""
     for t in trees:
@@ -1451,10 +1588,38 @@ def _annotate_outlook_groups(trees: List[Dict[str, Any]]) -> None:
             if m.get("junk") or not m.get("outlook_group_id"):
                 continue
             angles = {g.get("file") for g in (m.get("alt_pic") or []) if g.get("file")}
-            angles.add(m.get("file_id"))   # this beat's own angle
+            angles.add(m.get("file_id"))   # this cut's own angle
             angles.discard(None)
             if len(angles) >= 2:
                 m["outlook_angle_count"] = len(angles)
+
+
+def _annotate_shared_audio(trees: List[Dict[str, Any]]) -> None:
+    """brain_cut_index_fidelity.plan.md 5 (A7): a `shown`/`done` cut that
+    carries incidental words (`said_text` non-empty -- rendered as the
+    `words:` tag) and a `said` cut from the SAME FILE with an OVERLAPPING
+    span are, deterministically, the SAME underlying audio -- same file,
+    same timestamps, not a text-similarity guess. Placing both plays the
+    identical words twice. Nothing on either line said they overlap; tag
+    each side in place with `dup_audio_refs` (the other cut's own ids) so
+    `_moment_line` can render the cross-reference. Junk excluded on both
+    sides (skip-by-default, never a placement risk). Runs independently of
+    `_annotate_dups`/`_annotate_outlook_groups` -- a different relationship
+    (shared source audio between DIFFERENT channels), not a take/outlook
+    group."""
+    for t in trees:
+        moments = t.get("moments", []) or []
+        said = [m for m in moments if m.get("channel") == "said" and not m.get("junk")]
+        others = [m for m in moments
+                 if m.get("channel") != "said" and not m.get("junk") and m.get("said_text")]
+        for s in said:
+            for o in others:
+                if o["file_id"] != s["file_id"]:
+                    continue
+                if _overlap_ms(s["in_ms"], s["out_ms"], o["in_ms"], o["out_ms"]) <= 0:
+                    continue
+                s.setdefault("dup_audio_refs", []).append(o["cut_id"])
+                o.setdefault("dup_audio_refs", []).append(s["cut_id"])
 
 
 def _cast_line(persons: List[Dict[str, Any]]) -> str:
@@ -1506,7 +1671,7 @@ def assemble_map(file_ids: List[str], *, compact: bool = False,
     ``struct`` is the machine-readable trees the arranger/compiler resolve
     placements against. ``compact`` truncates gists for the paged (over-budget)
     path; resident mode emits the full line. Moments are tagged in place with
-    cross-clip duplicate links -- coverage reads INLINE on each beat as
+    cross-clip duplicate links -- coverage reads INLINE on each cut as
     ``·alt-PIC`` (no separate coverage block: dedupe the information, not the
     sequence). ``PIC``/``SND`` read identity DIRECTLY off each cut's own
     ``visible_persons``/``speaker_person`` (voice_first_identity.plan.md,
@@ -1519,6 +1684,7 @@ def assemble_map(file_ids: List[str], *, compact: bool = False,
     ordered = [trees[fid] for fid in file_ids if fid in trees]
     dups = _annotate_dups(ordered)      # tags moments in `ordered` in place
     _annotate_outlook_groups(ordered)   # tags moments in `ordered` in place
+    _annotate_shared_audio(ordered)     # tags moments in `ordered` in place
     cast = _cast_table_for(file_ids, run_id)
     blocks = [_clip_block(t, compact=compact) for t in ordered]
     text = "\n\n".join(([cast] if cast else []) + blocks)
@@ -1551,7 +1717,7 @@ def _as_doc(v: Any) -> Dict[str, Any]:
 def _sentences_for_file(file_id: str) -> Tuple[Dict[str, Any], ...]:
     """This file's `dialogue_segments` sentences (verbatim, speaker-labeled,
     sentence granularity) -- the raw material both `_span_detail` (Tier-1,
-    padded window) and `build_clip_tree` (resident `said_text`, exact beat
+    padded window) and `build_clip_tree` (resident `said_text`, exact cut
     span) join into text. One DB read per file for the life of this process
     (`dialogue_segments` is immutable once L1 writes it, so no invalidation
     concern -- unlike the tree cache, which DOES need one). Best-effort:
@@ -1668,12 +1834,12 @@ def snap_speech_spans_to_sentences(
 
 
 def _said_text_for_span(file_id: str, in_ms: int, out_ms: int) -> str:
-    """Verbatim transcript for a SPEECH beat's own span (no padding, unlike
+    """Verbatim transcript for a SPEECH cut's own span (no padding, unlike
     `_span_detail`'s Tier-1 window) -- the words actually spoken, joined into
-    one string for the resident beat line. Speaker labels are prefixed only
-    when the beat spans more than one speaker (post speaker-change-split,
+    one string for the resident cut line. Speaker labels are prefixed only
+    when the cut spans more than one speaker (post speaker-change-split,
     almost always exactly one) -- otherwise just the words, since repeating
-    a lone speaker's name on every beat would be noise. '' when this file has
+    a lone speaker's name on every cut would be noise. '' when this file has
     no transcript, or none of it overlaps the span (never a fabricated line).
 
     brain_plan_binding.plan.md Part A: this answers "what is spoken across

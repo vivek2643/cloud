@@ -76,17 +76,17 @@ def _specs() -> List[Dict[str, Any]]:
           "Pass seg_id to ALSO resolve that one cut's spoken words down to program-time "
           "offsets -- e.g. to land an overlay precisely on a line; omit it for a plain look.",
           obj({"seg_id": {"type": "string"}})),
-        S("inspect_cut", "Returns the rich per-cut signal detail behind a Beat Index "
-          "line's sig: breadcrumb: a downsampled action-energy curve + hit offsets, a "
-          "downsampled loudness envelope + rise/fall change offsets + silence-gap "
-          "offsets, and internal shot/composition-cut offsets -- all measured from the "
-          "cut's own start. Also returns specifics: the COMPLETE scene_specifics for "
-          "this cut when the vision model has enriched it -- every answered field "
-          "(count, notable_object, continuity_cue, setting, custom-probe answers, and "
-          "the full moments shot-list for a merged loose cut), beyond what the "
-          "beat line's compact spec: tag shows. Omitted when the cut isn't enriched yet. "
-          "Pass ref (a Beat Index moment id, e.g. from a sig: line) to "
-          "inspect a cut not yet placed, or seg_id for an already-placed one.",
+        S("inspect_cut", "The offsets behind a Cut Index line's sig: breadcrumb are "
+          "already resident there (act/adx/sil/shot, each with its own timing) -- this "
+          "returns what sig: does NOT show: a downsampled action-energy curve and a "
+          "downsampled loudness envelope (the SHAPE, not just the hit points), both "
+          "measured from the cut's own start. Also returns specifics: the COMPLETE "
+          "scene_specifics for this cut when the vision model has enriched it -- every "
+          "answered field (count, notable_object, continuity_cue, setting, custom-probe "
+          "answers, and the full moments shot-list for a merged loose cut), beyond what "
+          "the cut line's compact spec: tag shows. Omitted when the cut isn't enriched "
+          "yet. Pass ref (a Cut Index moment id, e.g. from a sig: line) to inspect a cut "
+          "not yet placed, or seg_id for an already-placed one.",
           obj({"ref": {"type": "string"}, "seg_id": {"type": "string"}})),
         S("predict", "Returns the program LENGTH under a proposed change without "
           "applying it: set_level re-takes every main-line cut at that level, drop "
@@ -99,7 +99,7 @@ def _specs() -> List[Dict[str, Any]]:
         S("validate", "Returns STRUCTURAL problems in the edit (spans out of range, "
           "empty cuts, malformed V2 cutaways/layouts). Empty result means clean.", obj({})),
         S("diagnose", "Returns editorial findings computed from the edit (same-speaker "
-          "runs, low-energy runs, distance from any target length, same-beat takes "
+          "runs, low-energy runs, distance from any target length, same-cut takes "
           "that are both on the main line). Observations only.",
           obj({})),
         S("affordances", "Returns what is POSSIBLE: per cut the retake levels "
@@ -124,7 +124,7 @@ def _specs() -> List[Dict[str, Any]]:
           "fix), checked in order against your ask first (a feature you named -- "
           "split screen, a music bed -- that isn't actually in the edit), then the "
           "guidance (a rough head/tail -- wrong-speaker lead-in, filler/backchannel, "
-          "leftover dead air -- or a V2 overlay that overruns/underfills the beat "
+          "leftover dead air -- or a V2 overlay that overruns/underfills the cut "
           "it sits over), then specific craft sharpeners (an audio gap with no "
           "sound at all, or a layer whose loudness sits well off the program's "
           "median). Call this to double-check what you actually built before "
@@ -133,24 +133,24 @@ def _specs() -> List[Dict[str, Any]]:
         S("place", "Adds a cut by its ref. channel 'V1' inserts on the main line "
           "(picture+sound) at index `at` (default append); 'V2' lays a silent video "
           "layer over the ongoing audio at program `from_ms` (audio:'keep' plays its "
-          "own sound). A moment holding several beats (shown in the Beat Index as a "
+          "own sound). A moment holding several cuts (shown in the Cut Index as a "
           "range: line) can be taken three ways: (1) WHOLE -- omit `piece` and use "
           "level 'broad' for the full continuous stretch; (2) TIGHTENED to a level "
           "'broad'\u2192'sharp' via `level` -- tightening keeps only the strongest "
-          "beats and drops the weaker/connective ones (so 'sharp' yields fewer, "
-          "tighter beats than 'broad'); (3) a SINGLE beat via `piece` = the 1-based "
-          "position shown in the Beat Index/read_state, which places just that one "
-          "beat on its own EVEN IF tightening would have dropped it (every listed "
-          "beat stays reachable). `level` is ignored when `piece` is set.",
+          "cuts and drops the weaker/connective ones (so 'sharp' yields fewer, "
+          "tighter cuts than 'broad'); (3) a SINGLE cut via `piece` = the 1-based "
+          "position shown in the Cut Index/read_state, which places just that one "
+          "cut on its own EVEN IF tightening would have dropped it (every listed "
+          "cut stays reachable). `level` is ignored when `piece` is set.",
           obj({"ref": {"type": "string"}, "level": {"type": "string", "enum": list(observe._LEVELS)},
                "channel": {"type": "string", "enum": ["V1", "V2"]},
                "at": {"type": "integer"}, "from_ms": {"type": "integer"},
                "audio": {"type": "string", "enum": ["keep", "mute"]},
                "reason": {"type": "string"},
                "piece": {"type": "integer",
-                         "description": "1-based position of one beat within a "
-                         "multi-beat moment (from the Beat Index range: list); places "
-                         "just that beat, reachable even when tightening would drop "
+                         "description": "1-based position of one cut within a "
+                         "multi-cut moment (from the Cut Index range: list); places "
+                         "just that cut, reachable even when tightening would drop "
                          "it. Omit to place the whole moment / a level take."}}, ["ref"])),
         S("trim", "Changes a cut's SOURCE in/out. Absolute (in_ms/out_ms) or relative "
           "(delta_in_ms/delta_out_ms; delta_in_ms:200 starts 200ms later). Targets a "
@@ -270,7 +270,7 @@ def _specs() -> List[Dict[str, Any]]:
                "audio_offset_ms": {"type": "integer"}},
               ["seam_seg_id", "audio_offset_ms"])),
         S("tighten", "Re-takes main-line cut(s) at a different energy `level` = how "
-          "much of the beat is kept around its peak (broad = the full run-up, sharp = "
+          "much of the cut is kept around its peak (broad = the full run-up, sharp = "
           "just the core). With seg_id -> that cut; without -> every cut that has "
           "that level.",
           obj({"seg_id": {"type": "string"}, "level": {"type": "string", "enum": list(observe._LEVELS)}},
@@ -330,7 +330,7 @@ def _specs() -> List[Dict[str, Any]]:
 
 def _resolve_file(ctx: EditContext, ref: Any) -> str:
     """Resolve a brain-supplied clip id to a full file_id. Accepts a full id or
-    the 8-char 'CLIP <file8>' prefix shown in the beat index. Falls back to the
+    the 8-char 'CLIP <file8>' prefix shown in the cut index. Falls back to the
     raw value (validate/act will no-op on a bad id)."""
     s = str(ref or "").strip()
     if not s:
