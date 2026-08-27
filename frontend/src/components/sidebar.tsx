@@ -1,18 +1,18 @@
 "use client";
 
 import Image from "next/image";
-import { Film, Captions, Download, type LucideIcon } from "lucide-react";
+import { usePathname } from "next/navigation";
+import { Film, Captions, Download, Folder, Clock, type LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { useDriveStore, type ProjectStage } from "@/stores/drive-store";
+import { useDriveStore, type ProjectStage, type HomeView } from "@/stores/drive-store";
 
-type NavItem = {
+type RailEntry = {
   label: string;
-  stage: ProjectStage;
   icon?: LucideIcon;
   logo?: boolean;
 };
 
-const NAV_ITEMS: NavItem[] = [
+const STAGE_ITEMS: (RailEntry & { stage: ProjectStage })[] = [
   { label: "Media", stage: "media", icon: Film },
   { label: "Cuts", stage: "cuts", logo: true },
   // Colour grading is temporarily hidden — re-enable when ready.
@@ -21,9 +21,17 @@ const NAV_ITEMS: NavItem[] = [
   { label: "Export", stage: "export", icon: Download },
 ];
 
+const HOME_ITEMS: (RailEntry & { view: HomeView })[] = [
+  { label: "Projects", view: "projects", icon: Folder },
+  { label: "Recents", view: "recents", icon: Clock },
+];
+
+// The rail is always present, but what it offers depends on where you are:
+// the stages above act on one open project, so at the project list they are
+// replaced by the two lenses that list actually has.
 export function Sidebar() {
-  const projectStage = useDriveStore((s) => s.projectStage);
-  const setProjectStage = useDriveStore((s) => s.setProjectStage);
+  const pathname = usePathname();
+  const isHome = pathname === "/drive";
 
   return (
     <aside
@@ -31,16 +39,45 @@ export function Sidebar() {
       style={{ borderColor: "var(--border)", background: "var(--sidebar)" }}
     >
       <nav className="flex flex-col gap-1 px-1.5">
-        {NAV_ITEMS.map((item) => (
-          <RailItem
-            key={item.stage}
-            item={item}
-            active={projectStage === item.stage}
-            onClick={() => setProjectStage(item.stage)}
-          />
-        ))}
+        {isHome ? <HomeNav /> : <StageNav />}
       </nav>
     </aside>
+  );
+}
+
+function HomeNav() {
+  const homeView = useDriveStore((s) => s.homeView);
+  const setHomeView = useDriveStore((s) => s.setHomeView);
+
+  return (
+    <>
+      {HOME_ITEMS.map((item) => (
+        <RailItem
+          key={item.view}
+          item={item}
+          active={homeView === item.view}
+          onClick={() => setHomeView(item.view)}
+        />
+      ))}
+    </>
+  );
+}
+
+function StageNav() {
+  const projectStage = useDriveStore((s) => s.projectStage);
+  const setProjectStage = useDriveStore((s) => s.setProjectStage);
+
+  return (
+    <>
+      {STAGE_ITEMS.map((item) => (
+        <RailItem
+          key={item.stage}
+          item={item}
+          active={projectStage === item.stage}
+          onClick={() => setProjectStage(item.stage)}
+        />
+      ))}
+    </>
   );
 }
 
@@ -49,7 +86,7 @@ function RailItem({
   active,
   onClick,
 }: {
-  item: NavItem;
+  item: RailEntry;
   active: boolean;
   onClick: () => void;
 }) {

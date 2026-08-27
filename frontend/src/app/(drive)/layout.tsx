@@ -88,9 +88,10 @@ function DriveShell({ children }: { children: React.ReactNode }) {
       <IntroOverlay />
       <Navbar />
       <div className="flex flex-1 overflow-hidden">
-        {/* Stage 4.1: the sidebar (Media/Cuts/Captions/Export) is project-
-            scoped chrome -- none of it means anything at the project list. */}
-        {!isHome && <Sidebar />}
+        {/* The rail stays put on every route so the shell never reflows out
+            from under you; it swaps its own contents for the project list
+            (see Sidebar) rather than being unmounted here. */}
+        <Sidebar />
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
           <div className="flex flex-1 flex-col overflow-y-auto">{children}</div>
           {/* Bottom editor dock slot — AiEditPanel portals the program monitor

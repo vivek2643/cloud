@@ -6,6 +6,10 @@ export type ViewMode = "grid" | "list";
 // The project workspace stages shown in the left sidebar.
 export type ProjectStage = "media" | "cuts" | "color" | "captions" | "export";
 
+// What the left sidebar offers at the project list, where the stages above
+// have no project to apply to.
+export type HomeView = "projects" | "recents";
+
 interface UploadItem {
   id: string;
   file: File;
@@ -22,6 +26,7 @@ interface DriveState {
   loading: boolean;
   viewMode: ViewMode;
   projectStage: ProjectStage;
+  homeView: HomeView;
   selectedIds: Set<string>;
   searchQuery: string;
   uploads: UploadItem[];
@@ -46,6 +51,7 @@ interface DriveState {
   setLoading: (loading: boolean) => void;
   setViewMode: (mode: ViewMode) => void;
   setProjectStage: (stage: ProjectStage) => void;
+  setHomeView: (view: HomeView) => void;
   setSearchQuery: (q: string) => void;
   toggleSelected: (id: string) => void;
   clearSelection: () => void;
@@ -61,6 +67,7 @@ export const useDriveStore = create<DriveState>((set) => ({
   loading: false,
   viewMode: "grid",
   projectStage: "media",
+  homeView: "projects",
   selectedIds: new Set(),
   searchQuery: "",
   uploads: [],
@@ -93,6 +100,7 @@ export const useDriveStore = create<DriveState>((set) => ({
   setLoading: (loading) => set({ loading }),
   setViewMode: (mode) => set({ viewMode: mode }),
   setProjectStage: (stage) => set({ projectStage: stage }),
+  setHomeView: (view) => set({ homeView: view }),
   setSearchQuery: (q) => set({ searchQuery: q }),
   toggleSelected: (id) =>
     set((state) => {

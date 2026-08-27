@@ -3,7 +3,9 @@
 import { DriveContent } from "@/components/drive-content";
 import { CutsView } from "@/components/cuts-view";
 import { ColorGradeView } from "@/components/color-grade-view";
-import { CaptionsView } from "@/components/captions-view";
+// Paired with the commented-out captions branch below; kept here so
+// re-enabling the stage is a two-line change.
+// import { CaptionsView } from "@/components/captions-view";
 import { ExportView } from "@/components/export-view";
 import { useDriveStore } from "@/stores/drive-store";
 
@@ -22,7 +24,10 @@ export function ProjectLenses() {
   if (projectStage === "media") return <DriveContent />;
   if (projectStage === "cuts") return <CutsView />;
   if (projectStage === "color") return <ColorGradeView />;
-  if (projectStage === "captions") return <CaptionsView />;
+  // Captions is temporarily hidden — the view below is intact and re-enabling
+  // it is just uncommenting this line (and its import). Until then the stage
+  // falls through to the ComingSoon placeholder.
+  // if (projectStage === "captions") return <CaptionsView />;
   if (projectStage === "export") return <ExportView />;
   return <ComingSoon label="Coming soon" />;
 }

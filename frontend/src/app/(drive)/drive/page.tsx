@@ -25,6 +25,7 @@ export default function DrivePage() {
     clearSelection,
     searchQuery,
     setSearchQuery,
+    homeView,
   } = useDriveStore();
   const [showNewFolder, setShowNewFolder] = useState(false);
   const [recents, setRecents] = useState<RecentProject[]>([]);
@@ -38,13 +39,16 @@ export default function DrivePage() {
 
   // Resolve each recent id back to its live Folder (dropping any that no
   // longer exist), keeping recents' own most-recent-first order rather than
-  // the folder list's.
+  // the folder list's. Honours the search box too, so the one search bar
+  // means the same thing in both lenses.
   const visibleRecents = useMemo(() => {
     const byId = new Map(folders.map((f) => [f.id, f]));
+    const q = searchQuery.trim().toLowerCase();
     return recents
       .map((r) => byId.get(r.id))
-      .filter((f): f is (typeof folders)[number] => !!f);
-  }, [recents, folders]);
+      .filter((f): f is (typeof folders)[number] => !!f)
+      .filter((f) => !q || f.name.toLowerCase().includes(q));
+  }, [recents, folders, searchQuery]);
 
   const loadContents = useCallback(async () => {
     if (!session?.access_token) return;
@@ -113,28 +117,11 @@ export default function DrivePage() {
           </div>
         </div>
 
-        {/* Recents (Stage 4.2): client-only, most-recent first, reusing
-            ProjectCard so this never grows a second card style. */}
-        {visibleRecents.length > 0 && (
-          <section className="mb-7">
-            <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--muted)" }}>
-              Recents
-            </h2>
-            <div className="grid grid-cols-3 gap-3 sm:grid-cols-4 md:grid-cols-5">
-              {visibleRecents.map((folder) => (
-                <ProjectCard
-                  key={folder.id}
-                  folder={folder}
-                  onOpen={() => router.push(`/drive/folder/${folder.id}`)}
-                />
-              ))}
-            </div>
-          </section>
-        )}
-
         {/* Library actions (projects live in folders; lenses appear inside one) */}
         <div className="mb-6 flex flex-wrap items-center justify-between gap-3 border-b pb-3" style={{ borderColor: "var(--border)" }}>
-          <h1 className="text-xl font-semibold">Projects</h1>
+          <h1 className="text-xl font-semibold">
+            {homeView === "recents" ? "Recents" : "Projects"}
+          </h1>
 
           <div className="flex items-center gap-2">
             {selectedCount > 0 && (
@@ -159,8 +146,30 @@ export default function DrivePage() {
           </div>
         </div>
 
-        {/* Root shows projects (folders) only — lenses live inside a folder. */}
-        <DriveContent />
+        {/* Root shows projects (folders) only — lenses live inside a folder.
+            Recents is the same card grid in most-recently-opened order, so it
+            reuses ProjectCard rather than growing a second card style. */}
+        {homeView === "recents" ? (
+          visibleRecents.length > 0 ? (
+            <div className="grid grid-cols-3 gap-3 sm:grid-cols-4 md:grid-cols-5">
+              {visibleRecents.map((folder) => (
+                <ProjectCard
+                  key={folder.id}
+                  folder={folder}
+                  onOpen={() => router.push(`/drive/folder/${folder.id}`)}
+                />
+              ))}
+            </div>
+          ) : (
+            <p className="py-10 text-center text-sm" style={{ color: "var(--muted)" }}>
+              {searchQuery.trim()
+                ? "No recent projects match your search."
+                : "Projects you open will show up here."}
+            </p>
+          )
+        ) : (
+          <DriveContent />
+        )}
       </div>
 
       <CreateFolderDialog
