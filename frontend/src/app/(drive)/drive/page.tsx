@@ -1,17 +1,21 @@
 "use client";
 
-import { useEffect, useCallback, useState } from "react";
+import { useEffect, useCallback, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import { useDriveStore } from "@/stores/drive-store";
 import { useAuthStore } from "@/stores/auth-store";
 import { getFolders, getFiles, createFolder } from "@/lib/api";
 import { UploadZone } from "@/components/upload-zone";
-import { DriveContent } from "@/components/drive-content";
+import { DriveContent, ProjectCard } from "@/components/drive-content";
 import { CreateFolderDialog } from "@/components/create-folder-dialog";
+import { readRecentProjects, type RecentProject } from "@/lib/recent-projects";
 import { FolderPlus, X, Search } from "lucide-react";
 
 export default function DrivePage() {
+  const router = useRouter();
   const session = useAuthStore((s) => s.session);
   const {
+    folders,
     setFolders,
     setFiles,
     setLoading,
@@ -23,6 +27,24 @@ export default function DrivePage() {
     setSearchQuery,
   } = useDriveStore();
   const [showNewFolder, setShowNewFolder] = useState(false);
+  const [recents, setRecents] = useState<RecentProject[]>([]);
+
+  // Stage 4.2: read on mount only (client-only storage, avoids a hydration
+  // mismatch) -- reconciled against the loaded root folder list below so a
+  // deleted project never lingers here.
+  useEffect(() => {
+    setRecents(readRecentProjects());
+  }, []);
+
+  // Resolve each recent id back to its live Folder (dropping any that no
+  // longer exist), keeping recents' own most-recent-first order rather than
+  // the folder list's.
+  const visibleRecents = useMemo(() => {
+    const byId = new Map(folders.map((f) => [f.id, f]));
+    return recents
+      .map((r) => byId.get(r.id))
+      .filter((f): f is (typeof folders)[number] => !!f);
+  }, [recents, folders]);
 
   const loadContents = useCallback(async () => {
     if (!session?.access_token) return;
@@ -90,6 +112,25 @@ export default function DrivePage() {
             )}
           </div>
         </div>
+
+        {/* Recents (Stage 4.2): client-only, most-recent first, reusing
+            ProjectCard so this never grows a second card style. */}
+        {visibleRecents.length > 0 && (
+          <section className="mb-7">
+            <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--muted)" }}>
+              Recents
+            </h2>
+            <div className="grid grid-cols-3 gap-3 sm:grid-cols-4 md:grid-cols-5">
+              {visibleRecents.map((folder) => (
+                <ProjectCard
+                  key={folder.id}
+                  folder={folder}
+                  onOpen={() => router.push(`/drive/folder/${folder.id}`)}
+                />
+              ))}
+            </div>
+          </section>
+        )}
 
         {/* Library actions (projects live in folders; lenses appear inside one) */}
         <div className="mb-6 flex flex-wrap items-center justify-between gap-3 border-b pb-3" style={{ borderColor: "var(--border)" }}>

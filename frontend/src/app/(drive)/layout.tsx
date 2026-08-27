@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, usePathname } from "next/navigation";
 import { AuthProvider } from "@/components/auth-provider";
 import { Navbar } from "@/components/navbar";
 import { Sidebar } from "@/components/sidebar";
@@ -10,6 +10,7 @@ import { AiEditPanel } from "@/components/ai-edit-panel";
 import { SyncPanel } from "@/components/sync-panel";
 import { IntroOverlay } from "@/components/intro-overlay";
 import { useAuthStore } from "@/stores/auth-store";
+import { useDriveStore } from "@/stores/drive-store";
 import { isSupabaseConfigured } from "@/lib/supabase";
 
 function SetupMessage() {
@@ -65,16 +66,38 @@ function DriveGuard({ children }: { children: React.ReactNode }) {
 }
 
 function DriveShell({ children }: { children: React.ReactNode }) {
+  const pathname = usePathname();
+  const isHome = pathname === "/drive";
+  const closeAiPanel = useDriveStore((s) => s.closeAiPanel);
+  const closeSyncPanel = useDriveStore((s) => s.closeSyncPanel);
+
+  // frontend_project_ux.plan.md Stage 5: leaving a project for home should
+  // close whatever project-scoped chrome was open, not strand it docked
+  // behind a home page that no longer has anywhere to render it. Guarded on
+  // isHome (not every render) so this only fires on the transition TO home,
+  // never re-closes an already-open panel while the user is browsing a project.
+  useEffect(() => {
+    if (isHome) {
+      closeAiPanel();
+      closeSyncPanel();
+    }
+  }, [isHome, closeAiPanel, closeSyncPanel]);
+
   return (
     <div className="flex h-screen flex-col">
       <IntroOverlay />
       <Navbar />
       <div className="flex flex-1 overflow-hidden">
-        <Sidebar />
+        {/* Stage 4.1: the sidebar (Media/Cuts/Captions/Export) is project-
+            scoped chrome -- none of it means anything at the project list. */}
+        {!isHome && <Sidebar />}
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
           <div className="flex flex-1 flex-col overflow-y-auto">{children}</div>
           {/* Bottom editor dock slot — AiEditPanel portals the program monitor
-              + editable timeline here (pro-editor layout). Empty otherwise. */}
+              + editable timeline here (pro-editor layout). Empty otherwise.
+              Kept mounted unconditionally even on home: AiEditPanel portals
+              into it by id, and removing it from the tree risks a null
+              portal target during the route transition. */}
           <div id="ai-editor-dock" className="shrink-0" />
         </main>
         <AiEditPanel />

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime
 
@@ -117,3 +117,56 @@ class AnalysisProxyPresignResponse(BaseModel):
     proxy_a_key: str
     proxy_b_url: str
     proxy_b_key: str
+
+
+# --- Anonymous upload links (frontend_project_ux.plan.md Stage 2) ---
+
+class CreateUploadLinkRequest(BaseModel):
+    # gt=0: an expiry of 0/negative hours or a 0-file cap would mint a link
+    # that's already exhausted -- confusing to create even though
+    # _resolve_link would reject it correctly either way.
+    expires_in_hours: Optional[int] = Field(default=None, gt=0)
+    max_files: Optional[int] = Field(default=None, gt=0)
+
+
+class UploadLinkResponse(BaseModel):
+    id: str
+    token: str
+    folder_id: str
+    expires_at: Optional[datetime]
+    max_files: Optional[int]
+    used_count: int
+    revoked: bool
+    created_at: datetime
+
+
+class PublicUploadLinkInfo(BaseModel):
+    """What an anonymous visitor is allowed to know about a link -- never
+    user_id, folder_id, or anything about other files in the project."""
+    project_name: str
+    expires_at: Optional[datetime]
+    remaining: Optional[int]   # null = unlimited
+
+
+class PublicPresignRequest(BaseModel):
+    """Same as PresignRequest minus folder_id -- that comes from the link
+    row only, never the client, on a public endpoint."""
+    filename: str
+    content_type: str
+    file_size: int
+
+
+class PublicMultipartCreateRequest(BaseModel):
+    filename: str
+    content_type: str
+    file_size: int
+
+
+class PublicMultipartCompleteRequest(BaseModel):
+    file_id: str
+    upload_id: str
+
+
+class PublicMultipartAbortRequest(BaseModel):
+    file_id: str
+    upload_id: str

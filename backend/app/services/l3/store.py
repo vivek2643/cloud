@@ -76,7 +76,8 @@ def list_threads(user_id: str) -> List[dict]:
             """
             select t.id::text, t.title, t.status, t.created_at,
                    coalesce(array_length(t.file_ids, 1), 0),
-                   (select max(version) from edit_documents d where d.thread_id = t.id)
+                   (select max(version) from edit_documents d where d.thread_id = t.id),
+                   t.file_ids::text[]
               from edit_threads t
              where t.user_id = %s
              order by t.updated_at desc
@@ -87,7 +88,7 @@ def list_threads(user_id: str) -> List[dict]:
         {
             "id": r[0], "title": r[1], "status": r[2],
             "created_at": r[3].isoformat(), "clip_count": r[4],
-            "latest_version": r[5],
+            "latest_version": r[5], "file_ids": r[6],
         }
         for r in rows
     ]

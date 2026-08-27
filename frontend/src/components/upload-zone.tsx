@@ -13,10 +13,13 @@ import {
   abortMultipartUpload,
   presignAnalysisProxies,
   completeAnalysisProxies,
+  type PresignResponse,
+  type MultipartCreateResponse,
+  type AnalysisProxyPresignResponse,
 } from "@/lib/api";
 import { generateProxies } from "@/lib/proxy-gen";
 
-const VIDEO_ACCEPT = {
+export const VIDEO_ACCEPT = {
   "video/*": [".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv", ".mxf", ".mts"],
   "audio/*": [".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".oga", ".opus", ".wma", ".aiff"],
 };
@@ -24,6 +27,34 @@ const VIDEO_ACCEPT = {
 // R2's single presigned PUT caps at 5 GiB; route anything large through
 // multipart. The threshold is well under 5 GiB so we never hit EntityTooLarge.
 const MULTIPART_THRESHOLD = 100 * 1024 * 1024; // 100 MiB
+
+// frontend_project_ux.plan.md Stage 2.5: the whole upload lifecycle
+// (single-PUT, multipart, analysis proxies) parameterized over an API
+// binding + progress callbacks, so the authenticated drive UI and the
+// anonymous public upload-link page share this ONE implementation instead
+// of two copies that would silently drift (see upload.py's own 2.2 refactor
+// for the backend half of this same principle).
+export interface UploadApiBinding {
+  presignUpload: (filename: string, contentType: string, fileSize: number) => Promise<PresignResponse>;
+  completeUpload: (fileId: string) => Promise<unknown>;
+  createMultipartUpload: (
+    filename: string, contentType: string, fileSize: number
+  ) => Promise<MultipartCreateResponse>;
+  completeMultipartUpload: (fileId: string, uploadId: string) => Promise<unknown>;
+  abortMultipartUpload: (fileId: string, uploadId: string) => Promise<unknown>;
+  presignAnalysisProxies: (fileId: string) => Promise<AnalysisProxyPresignResponse>;
+  completeAnalysisProxies: (fileId: string) => Promise<unknown>;
+}
+
+export type UploadItemStatus = "pending" | "uploading" | "complete" | "error";
+
+export interface UploadProgressCallbacks {
+  onAdd: (item: { id: string; file: File; progress: number; status: UploadItemStatus }) => void;
+  onUpdate: (
+    id: string,
+    patch: Partial<{ progress: number; status: UploadItemStatus; error: string; fileId: string }>
+  ) => void;
+}
 
 /** PUT a blob with upload progress. Pass contentType only when it was signed
  * (single-PUT); multipart part URLs are signed without a content-type. */
@@ -58,18 +89,14 @@ function putBlob(
  * the raw's own /complete triggers full analysis from the raw as before. This
  * NEVER throws, so it can't break the raw upload it runs alongside.
  */
-async function armAnalysisProxies(
-  fileId: string,
-  file: File,
-  token: string
-): Promise<boolean> {
+async function armAnalysisProxies(api: UploadApiBinding, fileId: string, file: File): Promise<boolean> {
   try {
     const proxies = await generateProxies(file);
     if (!proxies) return false;
-    const pres = await presignAnalysisProxies(fileId, token);
+    const pres = await api.presignAnalysisProxies(fileId);
     await putBlob(pres.proxy_a_url, proxies.proxyA, "video/mp4", () => {});
     await putBlob(pres.proxy_b_url, proxies.proxyB, "video/mp4", () => {});
-    await completeAnalysisProxies(fileId, token);
+    await api.completeAnalysisProxies(fileId);
     return true;
   } catch (err) {
     console.warn("Analysis-proxy fast path unavailable; server will use the raw.", err);
@@ -77,41 +104,27 @@ async function armAnalysisProxies(
   }
 }
 
-export function useUploadFiles() {
-  const currentFolderId = useDriveStore((s) => s.currentFolderId);
-  const addUpload = useDriveStore((s) => s.addUpload);
-  const updateUpload = useDriveStore((s) => s.updateUpload);
-  const session = useAuthStore((s) => s.session);
-
+/** The reusable upload orchestrator: given an API binding (which knows how
+ * to reach either the authenticated /api/upload/* routes or a specific
+ * upload link's /api/public/upload-links/{token}/* routes) and progress
+ * callbacks, returns a function that uploads a batch of Files. */
+export function useUploadFiles(api: UploadApiBinding, callbacks: UploadProgressCallbacks) {
   const uploadFile = useCallback(
     async (file: File) => {
       const uploadId = crypto.randomUUID();
-      addUpload({
-        id: uploadId,
-        file,
-        progress: 0,
-        status: "uploading",
-      });
+      callbacks.onAdd({ id: uploadId, file, progress: 0, status: "uploading" });
 
       try {
-        const token = session?.access_token;
-        if (!token) throw new Error("Not authenticated");
         const contentType = file.type || "video/mp4";
 
         if (file.size > MULTIPART_THRESHOLD) {
           // Large file: chunked multipart upload (handles > 5 GiB).
-          const mp = await createMultipartUpload(
-            file.name,
-            contentType,
-            file.size,
-            currentFolderId,
-            token
-          );
+          const mp = await api.createMultipartUpload(file.name, contentType, file.size);
           try {
             // Decode + upload the analysis proxies in parallel with the raw so
             // analysis can start in seconds. Video only; audio uses the raw path.
             const proxyTask = contentType.startsWith("video/")
-              ? armAnalysisProxies(mp.file_id, file, token)
+              ? armAnalysisProxies(api, mp.file_id, file)
               : Promise.resolve(false);
 
             let uploadedBytes = 0;
@@ -120,7 +133,7 @@ export function useUploadFiles() {
               const end = Math.min(start + mp.part_size, file.size);
               const blob = file.slice(start, end);
               await putBlob(mp.part_urls[i], blob, null, (loaded) => {
-                updateUpload(uploadId, {
+                callbacks.onUpdate(uploadId, {
                   progress: Math.round(((uploadedBytes + loaded) / file.size) * 100),
                 });
               });
@@ -130,46 +143,30 @@ export function useUploadFiles() {
             // armed, raw-complete only makes the editing proxy; otherwise the
             // server runs full analysis from the raw.
             await proxyTask;
-            await completeMultipartUpload(mp.file_id, mp.upload_id, token);
-            updateUpload(uploadId, {
-              status: "complete",
-              progress: 100,
-              fileId: mp.file_id,
-            });
+            await api.completeMultipartUpload(mp.file_id, mp.upload_id);
+            callbacks.onUpdate(uploadId, { status: "complete", progress: 100, fileId: mp.file_id });
           } catch (err) {
             // Best-effort cleanup so no orphaned 'uploading' row / R2 parts linger.
-            abortMultipartUpload(mp.file_id, mp.upload_id, token).catch(() => {});
+            api.abortMultipartUpload(mp.file_id, mp.upload_id).catch(() => {});
             throw err;
           }
         } else {
           // Small file: single presigned PUT.
-          const presign = await presignUpload(
-            file.name,
-            contentType,
-            file.size,
-            currentFolderId,
-            token
-          );
+          const presign = await api.presignUpload(file.name, contentType, file.size);
           await putBlob(presign.upload_url, file, contentType, (loaded) => {
-            updateUpload(uploadId, {
-              progress: Math.round((loaded / file.size) * 100),
-            });
+            callbacks.onUpdate(uploadId, { progress: Math.round((loaded / file.size) * 100) });
           });
-          await completeUpload(presign.file_id, token);
-          updateUpload(uploadId, {
-            status: "complete",
-            progress: 100,
-            fileId: presign.file_id,
-          });
+          await api.completeUpload(presign.file_id);
+          callbacks.onUpdate(uploadId, { status: "complete", progress: 100, fileId: presign.file_id });
         }
       } catch (err) {
-        updateUpload(uploadId, {
+        callbacks.onUpdate(uploadId, {
           status: "error",
           error: err instanceof Error ? err.message : "Upload failed",
         });
       }
     },
-    [session, currentFolderId, addUpload, updateUpload]
+    [api, callbacks]
   );
 
   const uploadFiles = useCallback(
@@ -182,8 +179,60 @@ export function useUploadFiles() {
   return uploadFiles;
 }
 
+/** The authenticated binding: the existing /api/upload/* routes, bound to
+ * the current session token and (for the two file-creating calls) the
+ * currently-open folder. Used by the drive UI's UploadZone/folder page --
+ * the ONLY thing that changed for them is this binding is now explicit
+ * instead of hard-coded inside useUploadFiles itself. */
+export function useAuthenticatedUploadApi(folderId: string | null): UploadApiBinding | null {
+  const token = useAuthStore((s) => s.session?.access_token);
+  if (!token) return null;
+  return {
+    presignUpload: (filename, contentType, fileSize) =>
+      presignUpload(filename, contentType, fileSize, folderId, token),
+    completeUpload: (fileId) => completeUpload(fileId, token),
+    createMultipartUpload: (filename, contentType, fileSize) =>
+      createMultipartUpload(filename, contentType, fileSize, folderId, token),
+    completeMultipartUpload: (fileId, uploadId) => completeMultipartUpload(fileId, uploadId, token),
+    abortMultipartUpload: (fileId, uploadId) => abortMultipartUpload(fileId, uploadId, token),
+    presignAnalysisProxies: (fileId) => presignAnalysisProxies(fileId, token),
+    completeAnalysisProxies: (fileId) => completeAnalysisProxies(fileId, token),
+  };
+}
+
+// A stable (module-level, never recreated) binding for the brief window
+// before a session exists. Every call rejects; useUploadFiles' own
+// try/catch already turns that into a normal per-item "error" status with
+// the message below, so there's no separate no-auth code path to keep in
+// sync with the real one.
+const NOT_AUTHENTICATED_ERROR = "Not authenticated";
+const NOT_AUTHENTICATED_API: UploadApiBinding = {
+  presignUpload: () => Promise.reject(new Error(NOT_AUTHENTICATED_ERROR)),
+  completeUpload: () => Promise.reject(new Error(NOT_AUTHENTICATED_ERROR)),
+  createMultipartUpload: () => Promise.reject(new Error(NOT_AUTHENTICATED_ERROR)),
+  completeMultipartUpload: () => Promise.reject(new Error(NOT_AUTHENTICATED_ERROR)),
+  abortMultipartUpload: () => Promise.reject(new Error(NOT_AUTHENTICATED_ERROR)),
+  presignAnalysisProxies: () => Promise.reject(new Error(NOT_AUTHENTICATED_ERROR)),
+  completeAnalysisProxies: () => Promise.reject(new Error(NOT_AUTHENTICATED_ERROR)),
+};
+
+/** Convenience wrapper matching the pre-Stage-2.5 zero-arg call shape, for
+ * the two authenticated call sites (UploadZone, the folder page's manual
+ * file input) -- reads the current folder + session and reports progress
+ * into the shared drive store, exactly as useUploadFiles() used to do
+ * internally. The public upload page does NOT use this: it supplies its
+ * own link-scoped API binding and local progress state instead. */
+export function useAuthenticatedUploadFiles() {
+  const currentFolderId = useDriveStore((s) => s.currentFolderId);
+  const addUpload = useDriveStore((s) => s.addUpload);
+  const updateUpload = useDriveStore((s) => s.updateUpload);
+  const api = useAuthenticatedUploadApi(currentFolderId);
+  const callbacks: UploadProgressCallbacks = { onAdd: addUpload, onUpdate: updateUpload };
+  return useUploadFiles(api ?? NOT_AUTHENTICATED_API, callbacks);
+}
+
 export function UploadZone({ children }: { children: React.ReactNode }) {
-  const uploadFiles = useUploadFiles();
+  const uploadFiles = useAuthenticatedUploadFiles();
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop: uploadFiles,

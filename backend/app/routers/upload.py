@@ -1,6 +1,7 @@
 import logging
 import math
 import uuid
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -53,38 +54,72 @@ def _maybe_prewarm(content_type: str) -> None:
         runpod_bridge.warm()
 
 
+def _check_folder_ownership(sb, folder_id: Optional[str], user_id: str) -> None:
+    """Shared by every entry point that CREATES a file: the authenticated
+    router's folder_id comes from the client and must be verified; the
+    public router's folder_id comes from the upload_links row, already tied
+    to this same user_id by FK, so this re-check is a harmless no-op UNLESS
+    the project was deleted after the link was minted -- in which case
+    404ing here (rather than orphan-inserting a file under a dead folder) is
+    exactly the right behavior."""
+    if folder_id:
+        folder = sb.table("folders").select("id").eq("id", folder_id).eq("user_id", user_id).execute()
+        if not folder.data:
+            raise HTTPException(status_code=404, detail="Folder not found")
+
+
+def _get_owned_file(sb, file_id: str, user_id: str, folder_id: Optional[str] = None) -> dict:
+    """Fetch a file row owned by user_id -- optionally ALSO constrained to a
+    specific folder_id. frontend_project_ux.plan.md Stage 2.3's safety rule:
+    a public upload-link route must verify the target file actually belongs
+    to THIS link's folder, not just to the same project owner -- otherwise a
+    link for project A becomes a write primitive against any file id the
+    caller can guess in project B (same owner, different folder). The
+    authenticated router never passes folder_id here (it has none to check
+    at these endpoints, and none of its current behavior requires one), so
+    this stays a strict no-op there."""
+    q = sb.table("files").select("*").eq("id", file_id).eq("user_id", user_id)
+    if folder_id is not None:
+        q = q.eq("folder_id", folder_id)
+    result = q.execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="File not found")
+    return result.data[0]
+
+
+def presign_core(
+    user_id: str, folder_id: Optional[str], filename: str, content_type: str, file_size: int,
+) -> PresignResponse:
+    sb = get_supabase()
+    _check_folder_ownership(sb, folder_id, user_id)
+
+    file_id = str(uuid.uuid4())
+    r2_key = f"raw/{user_id}/{file_id}/{filename}"
+
+    sb.table("files").insert({
+        "id": file_id,
+        "user_id": user_id,
+        "folder_id": folder_id,
+        "name": filename,
+        "filename": filename,
+        "mime_type": content_type,
+        "file_size": file_size,
+        "file_type": _detect_file_type(content_type),
+        "r2_key": r2_key,
+        "status": "uploading",
+    }).execute()
+
+    upload_url = generate_presigned_put(r2_key, content_type)
+    return PresignResponse(file_id=file_id, upload_url=upload_url)
+
+
 @router.post("/presign", response_model=PresignResponse)
 def presign_upload(
     body: PresignRequest,
     user_id: str = Depends(get_current_user_id),
 ):
     _maybe_prewarm(body.content_type)
-    sb = get_supabase()
-
-    if body.folder_id:
-        folder = sb.table("folders").select("id").eq("id", body.folder_id).eq("user_id", user_id).execute()
-        if not folder.data:
-            raise HTTPException(status_code=404, detail="Folder not found")
-
-    file_id = str(uuid.uuid4())
-    r2_key = f"raw/{user_id}/{file_id}/{body.filename}"
-
-    sb.table("files").insert({
-        "id": file_id,
-        "user_id": user_id,
-        "folder_id": body.folder_id,
-        "name": body.filename,
-        "filename": body.filename,
-        "mime_type": body.content_type,
-        "file_size": body.file_size,
-        "file_type": _detect_file_type(body.content_type),
-        "r2_key": r2_key,
-        "status": "uploading",
-    }).execute()
-
-    upload_url = generate_presigned_put(r2_key, body.content_type)
-
-    return PresignResponse(file_id=file_id, upload_url=upload_url)
+    return presign_core(user_id, body.folder_id, body.filename, body.content_type, body.file_size)
 
 
 def _analysis_proxy_keys(file_id: str) -> tuple[str, str]:
@@ -180,36 +215,29 @@ def _finalize_upload(sb, file_record: dict) -> dict:
 
 # --- Multipart upload (files > 5 GiB, and any large upload) -------------------
 
-@router.post("/multipart/create", response_model=MultipartCreateResponse)
-def multipart_create(
-    body: MultipartCreateRequest,
-    user_id: str = Depends(get_current_user_id),
-):
-    _maybe_prewarm(body.content_type)
+def multipart_create_core(
+    user_id: str, folder_id: Optional[str], filename: str, content_type: str, file_size: int,
+) -> MultipartCreateResponse:
     sb = get_supabase()
-
-    if body.folder_id:
-        folder = sb.table("folders").select("id").eq("id", body.folder_id).eq("user_id", user_id).execute()
-        if not folder.data:
-            raise HTTPException(status_code=404, detail="Folder not found")
+    _check_folder_ownership(sb, folder_id, user_id)
 
     file_id = str(uuid.uuid4())
-    r2_key = f"raw/{user_id}/{file_id}/{body.filename}"
+    r2_key = f"raw/{user_id}/{file_id}/{filename}"
 
-    upload_id = create_multipart_upload(r2_key, body.content_type)
-    psize = part_size_for(body.file_size)
-    part_count = max(1, math.ceil(body.file_size / psize))
+    upload_id = create_multipart_upload(r2_key, content_type)
+    psize = part_size_for(file_size)
+    part_count = max(1, math.ceil(file_size / psize))
     part_urls = generate_presigned_upload_parts(r2_key, upload_id, part_count)
 
     sb.table("files").insert({
         "id": file_id,
         "user_id": user_id,
-        "folder_id": body.folder_id,
-        "name": body.filename,
-        "filename": body.filename,
-        "mime_type": body.content_type,
-        "file_size": body.file_size,
-        "file_type": _detect_file_type(body.content_type),
+        "folder_id": folder_id,
+        "name": filename,
+        "filename": filename,
+        "mime_type": content_type,
+        "file_size": file_size,
+        "file_type": _detect_file_type(content_type),
         "r2_key": r2_key,
         "status": "uploading",
     }).execute()
@@ -223,26 +251,51 @@ def multipart_create(
     )
 
 
+@router.post("/multipart/create", response_model=MultipartCreateResponse)
+def multipart_create(
+    body: MultipartCreateRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    _maybe_prewarm(body.content_type)
+    return multipart_create_core(
+        user_id, body.folder_id, body.filename, body.content_type, body.file_size)
+
+
+def multipart_complete_core(
+    user_id: str, file_id: str, upload_id: str, *, folder_id: Optional[str] = None,
+) -> dict:
+    sb = get_supabase()
+    file_record = _get_owned_file(sb, file_id, user_id, folder_id)
+    if file_record["status"] != "uploading":
+        raise HTTPException(status_code=400, detail="File is not in uploading state")
+
+    try:
+        complete_multipart_upload(file_record["r2_key"], upload_id)
+    except Exception as e:
+        logger.exception("Multipart complete failed for %s", file_id)
+        raise HTTPException(status_code=400, detail=f"Could not complete upload: {e}")
+
+    return _finalize_upload(sb, file_record)
+
+
 @router.post("/multipart/complete", response_model=FileResponse)
 def multipart_complete(
     body: MultipartCompleteRequest,
     user_id: str = Depends(get_current_user_id),
 ):
+    return multipart_complete_core(user_id, body.file_id, body.upload_id)
+
+
+def multipart_abort_core(
+    user_id: str, file_id: str, upload_id: str, *, folder_id: Optional[str] = None,
+) -> dict:
     sb = get_supabase()
-    file_result = sb.table("files").select("*").eq("id", body.file_id).eq("user_id", user_id).execute()
-    if not file_result.data:
-        raise HTTPException(status_code=404, detail="File not found")
-    file_record = file_result.data[0]
-    if file_record["status"] != "uploading":
-        raise HTTPException(status_code=400, detail="File is not in uploading state")
+    file_record = _get_owned_file(sb, file_id, user_id, folder_id)
 
-    try:
-        complete_multipart_upload(file_record["r2_key"], body.upload_id)
-    except Exception as e:
-        logger.exception("Multipart complete failed for %s", body.file_id)
-        raise HTTPException(status_code=400, detail=f"Could not complete upload: {e}")
-
-    return _finalize_upload(sb, file_record)
+    abort_multipart_upload(file_record["r2_key"], upload_id)
+    # Drop the placeholder row so it doesn't linger as a stuck 'uploading' file.
+    sb.table("files").delete().eq("id", file_id).eq("user_id", user_id).execute()
+    return {"ok": True}
 
 
 @router.post("/multipart/abort")
@@ -250,16 +303,7 @@ def multipart_abort(
     body: MultipartAbortRequest,
     user_id: str = Depends(get_current_user_id),
 ):
-    sb = get_supabase()
-    file_result = sb.table("files").select("*").eq("id", body.file_id).eq("user_id", user_id).execute()
-    if not file_result.data:
-        raise HTTPException(status_code=404, detail="File not found")
-    file_record = file_result.data[0]
-
-    abort_multipart_upload(file_record["r2_key"], body.upload_id)
-    # Drop the placeholder row so it doesn't linger as a stuck 'uploading' file.
-    sb.table("files").delete().eq("id", body.file_id).eq("user_id", user_id).execute()
-    return {"ok": True}
+    return multipart_abort_core(user_id, body.file_id, body.upload_id)
 
 
 # --- Client analysis proxies (see client_proxy.plan.md) ----------------------
@@ -268,15 +312,11 @@ def multipart_abort(
 # upload in seconds while the raw uploads in the background. Analysis fires the
 # moment these land -- no waiting on the multi-GB raw.
 
-@router.post("/{file_id}/analysis-proxies/presign", response_model=AnalysisProxyPresignResponse)
-def presign_analysis_proxies(
-    file_id: str,
-    user_id: str = Depends(get_current_user_id),
-):
+def presign_analysis_proxies_core(
+    user_id: str, file_id: str, *, folder_id: Optional[str] = None,
+) -> AnalysisProxyPresignResponse:
     sb = get_supabase()
-    file_result = sb.table("files").select("id").eq("id", file_id).eq("user_id", user_id).execute()
-    if not file_result.data:
-        raise HTTPException(status_code=404, detail="File not found")
+    _get_owned_file(sb, file_id, user_id, folder_id)
 
     key_a, key_b = _analysis_proxy_keys(file_id)
     return AnalysisProxyPresignResponse(
@@ -287,11 +327,17 @@ def presign_analysis_proxies(
     )
 
 
-@router.post("/{file_id}/analysis-proxies/complete", response_model=FileResponse)
-def complete_analysis_proxies(
+@router.post("/{file_id}/analysis-proxies/presign", response_model=AnalysisProxyPresignResponse)
+def presign_analysis_proxies(
     file_id: str,
     user_id: str = Depends(get_current_user_id),
 ):
+    return presign_analysis_proxies_core(user_id, file_id)
+
+
+def complete_analysis_proxies_core(
+    user_id: str, file_id: str, *, folder_id: Optional[str] = None,
+) -> dict:
     """Register the two uploaded analysis proxies and fire L1 immediately -- this
     is what decouples analysis from the raw upload. The raw's own /complete then
     only has to make the editing proxy. Idempotent: re-registering is harmless,
@@ -302,10 +348,7 @@ def complete_analysis_proxies(
     the file stays 'uploading' until the raw lands, then flips to processing.
     Analysis lifecycle is tracked separately by l1_status."""
     sb = get_supabase()
-    file_result = sb.table("files").select("*").eq("id", file_id).eq("user_id", user_id).execute()
-    if not file_result.data:
-        raise HTTPException(status_code=404, detail="File not found")
-    file_record = file_result.data[0]
+    file_record = _get_owned_file(sb, file_id, user_id, folder_id)
     if file_record["file_type"] != "video":
         raise HTTPException(status_code=400, detail="Analysis proxies are only for video files")
 
@@ -315,9 +358,30 @@ def complete_analysis_proxies(
         "r2_proxy_b_key": key_b,
     }).eq("id", file_id).execute()
 
-    _enqueue_l1(file_id, file_record["r2_key"])
+    # frontend_project_ux.plan.md Stage 2.2: this call was missing user_id
+    # (a pre-existing bug -- _enqueue_l1 requires it and this would have
+    # raised TypeError on every call). Fixed while extracting this function,
+    # since the public flow needs it to actually enqueue L1 for a link
+    # upload the same way the authenticated flow does.
+    _enqueue_l1(file_id, file_record["r2_key"], user_id)
     file_record.update({"r2_proxy_a_key": key_a, "r2_proxy_b_key": key_b})
     return file_record
+
+
+@router.post("/{file_id}/analysis-proxies/complete", response_model=FileResponse)
+def complete_analysis_proxies(
+    file_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    return complete_analysis_proxies_core(user_id, file_id)
+
+
+def complete_upload_core(user_id: str, file_id: str, *, folder_id: Optional[str] = None) -> dict:
+    sb = get_supabase()
+    file_record = _get_owned_file(sb, file_id, user_id, folder_id)
+    if file_record["status"] != "uploading":
+        raise HTTPException(status_code=400, detail="File is not in uploading state")
+    return _finalize_upload(sb, file_record)
 
 
 # NOTE: This dynamic route must be registered AFTER the static /multipart/* routes,
@@ -327,11 +391,4 @@ def complete_upload(
     file_id: str,
     user_id: str = Depends(get_current_user_id),
 ):
-    sb = get_supabase()
-    file_result = sb.table("files").select("*").eq("id", file_id).eq("user_id", user_id).execute()
-    if not file_result.data:
-        raise HTTPException(status_code=404, detail="File not found")
-    file_record = file_result.data[0]
-    if file_record["status"] != "uploading":
-        raise HTTPException(status_code=400, detail="File is not in uploading state")
-    return _finalize_upload(sb, file_record)
+    return complete_upload_core(user_id, file_id)

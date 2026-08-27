@@ -504,6 +504,119 @@ export function completeAnalysisProxies(fileId: string, token: string) {
   );
 }
 
+// --- Upload links (frontend_project_ux.plan.md Stage 2) ---
+
+export interface UploadLink {
+  id: string;
+  token: string;
+  folder_id: string;
+  expires_at: string | null;
+  max_files: number | null;
+  used_count: number;
+  revoked: boolean;
+  created_at: string;
+}
+
+export function createUploadLink(
+  folderId: string,
+  options: { expiresInHours?: number; maxFiles?: number },
+  token: string
+) {
+  return request<UploadLink>(`/api/folders/${folderId}/upload-links`, {
+    method: "POST",
+    body: JSON.stringify({
+      expires_in_hours: options.expiresInHours,
+      max_files: options.maxFiles,
+    }),
+    token,
+  });
+}
+
+export function listUploadLinks(folderId: string, token: string) {
+  return request<UploadLink[]>(`/api/folders/${folderId}/upload-links`, { token });
+}
+
+export function revokeUploadLink(linkId: string, token: string) {
+  return request<{ ok: boolean }>(`/api/upload-links/${linkId}`, {
+    method: "DELETE",
+    token,
+  });
+}
+
+// --- Public upload-link flow (anonymous -- note NO token on any of these) ---
+
+export interface PublicUploadLinkInfo {
+  project_name: string;
+  expires_at: string | null;
+  remaining: number | null;
+}
+
+export function getPublicUploadLinkInfo(linkToken: string) {
+  return request<PublicUploadLinkInfo>(`/api/public/upload-links/${linkToken}`);
+}
+
+export function publicPresignUpload(
+  linkToken: string,
+  filename: string,
+  contentType: string,
+  fileSize: number
+) {
+  return request<PresignResponse>(`/api/public/upload-links/${linkToken}/presign`, {
+    method: "POST",
+    body: JSON.stringify({ filename, content_type: contentType, file_size: fileSize }),
+  });
+}
+
+export function publicCompleteUpload(linkToken: string, fileId: string) {
+  return request<FileRecord>(
+    `/api/public/upload-links/${linkToken}/files/${fileId}/complete`,
+    { method: "POST" }
+  );
+}
+
+export function publicCreateMultipartUpload(
+  linkToken: string,
+  filename: string,
+  contentType: string,
+  fileSize: number
+) {
+  return request<MultipartCreateResponse>(
+    `/api/public/upload-links/${linkToken}/multipart/create`,
+    {
+      method: "POST",
+      body: JSON.stringify({ filename, content_type: contentType, file_size: fileSize }),
+    }
+  );
+}
+
+export function publicCompleteMultipartUpload(linkToken: string, fileId: string, uploadId: string) {
+  return request<FileRecord>(`/api/public/upload-links/${linkToken}/multipart/complete`, {
+    method: "POST",
+    body: JSON.stringify({ file_id: fileId, upload_id: uploadId }),
+  });
+}
+
+export function publicAbortMultipartUpload(linkToken: string, fileId: string, uploadId: string) {
+  return request<{ ok: boolean }>(`/api/public/upload-links/${linkToken}/multipart/abort`, {
+    method: "POST",
+    body: JSON.stringify({ file_id: fileId, upload_id: uploadId }),
+  });
+}
+
+export function publicPresignAnalysisProxies(linkToken: string, fileId: string) {
+  return request<AnalysisProxyPresignResponse>(
+    `/api/public/upload-links/${linkToken}/files/${fileId}/analysis-proxies/presign`,
+    { method: "POST" }
+  );
+}
+
+export function publicCompleteAnalysisProxies(linkToken: string, fileId: string) {
+  return request<FileRecord>(
+    `/api/public/upload-links/${linkToken}/files/${fileId}/analysis-proxies/complete`,
+    { method: "POST" }
+  );
+}
+
 // --- L1 debug ---
 
 export interface L1Index {
@@ -971,6 +1084,7 @@ export interface EditThreadListItem {
   created_at: string;
   clip_count: number;
   latest_version: number | null;
+  file_ids: string[];
 }
 
 export interface EditVersionListItem {

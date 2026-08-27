@@ -4,10 +4,12 @@ import { useEffect, useCallback, useRef, useState, use } from "react";
 import { useDriveStore } from "@/stores/drive-store";
 import { useAuthStore } from "@/stores/auth-store";
 import { getFolders, getFiles, getBreadcrumb, type BreadcrumbItem } from "@/lib/api";
-import { UploadZone, useUploadFiles } from "@/components/upload-zone";
+import { UploadZone, useAuthenticatedUploadFiles } from "@/components/upload-zone";
 import { ProjectLenses } from "@/components/project-lenses";
 import { SearchEditBar } from "@/components/search-edit-bar";
-import { Upload, Link2, Share2 } from "lucide-react";
+import { UploadLinkDialog } from "@/components/upload-link-dialog";
+import { recordRecentProject } from "@/lib/recent-projects";
+import { Upload, Link2 } from "lucide-react";
 
 const VIDEO_EXTENSIONS =
   ".mp4,.mov,.avi,.mkv,.webm,.m4v,.wmv,.flv,.mxf,.mts," +
@@ -19,8 +21,9 @@ export default function FolderPage({ params }: { params: Promise<{ folderId: str
   const { setFolders, setFiles, setLoading, setCurrentFolder, setProjectStage, projectStage, uploads } =
     useDriveStore();
   const [breadcrumb, setBreadcrumb] = useState<BreadcrumbItem[]>([]);
+  const [showUploadLink, setShowUploadLink] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const uploadFiles = useUploadFiles();
+  const uploadFiles = useAuthenticatedUploadFiles();
 
   const loadContents = useCallback(async () => {
     if (!session?.access_token) return;
@@ -34,6 +37,11 @@ export default function FolderPage({ params }: { params: Promise<{ folderId: str
       setFolders(folders);
       setFiles(files);
       setBreadcrumb(bc);
+      // Stage 4.2: record this project as recently opened once we know its
+      // resolved name -- localStorage only (see lib/recent-projects.ts).
+      if (bc.length > 0) {
+        recordRecentProject(folderId, bc[bc.length - 1].name);
+      }
     } catch (err) {
       console.error("Failed to load folder contents:", err);
     } finally {
@@ -72,14 +80,7 @@ export default function FolderPage({ params }: { params: Promise<{ folderId: str
           <div className="flex items-center gap-2">
             <button
               type="button"
-              className="flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm transition-colors hover:opacity-80"
-              style={{ borderColor: "var(--border)" }}
-            >
-              <Share2 size={16} />
-              Share
-            </button>
-            <button
-              type="button"
+              onClick={() => setShowUploadLink(true)}
               className="flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm transition-colors hover:opacity-80"
               style={{ borderColor: "var(--border)" }}
             >
@@ -111,6 +112,12 @@ export default function FolderPage({ params }: { params: Promise<{ folderId: str
 
         <ProjectLenses />
       </div>
+
+      <UploadLinkDialog
+        open={showUploadLink}
+        onClose={() => setShowUploadLink(false)}
+        folderId={folderId}
+      />
     </UploadZone>
   );
 }

@@ -341,7 +341,7 @@ function ClipPanel({
   );
 }
 
-function ProjectCard({
+export function ProjectCard({
   folder,
   deleting = false,
   onOpen,
@@ -350,7 +350,7 @@ function ProjectCard({
   folder: Folder;
   deleting?: boolean;
   onOpen: () => void;
-  onContextMenu: (e: React.MouseEvent) => void;
+  onContextMenu?: (e: React.MouseEvent) => void;
 }) {
   const token = useAuthStore((s) => s.session?.access_token);
   const [covers, setCovers] = useState<string[]>([]);
@@ -385,15 +385,20 @@ function ProjectCard({
         className="relative aspect-[4/3] w-full overflow-hidden rounded-xl border transition-colors group-hover:border-[var(--accent)]"
         style={{ borderColor: "var(--border)", background: "var(--sidebar)" }}
       >
-        {/* Hover "⋯" menu (top-right) — opens Open / Delete. */}
-        <button
-          onClick={(e) => { e.stopPropagation(); onContextMenu(e); }}
-          className="absolute right-1.5 top-1.5 z-20 flex items-center justify-center rounded-md p-1 text-white opacity-0 transition-opacity hover:bg-black/40 group-hover:opacity-100"
-          style={{ background: "rgba(0,0,0,0.55)" }}
-          title="More"
-        >
-          <MoreHorizontal size={15} />
-        </button>
+        {/* Hover "⋯" menu (top-right) — opens Open / Delete. Omitted
+            entirely (not just disabled) when the caller has no menu to
+            show -- a button that does nothing is exactly what this UI
+            pass exists to remove. */}
+        {onContextMenu && (
+          <button
+            onClick={(e) => { e.stopPropagation(); onContextMenu(e); }}
+            className="absolute right-1.5 top-1.5 z-20 flex items-center justify-center rounded-md p-1 text-white opacity-0 transition-opacity hover:bg-black/40 group-hover:opacity-100"
+            style={{ background: "rgba(0,0,0,0.55)" }}
+            title="More"
+          >
+            <MoreHorizontal size={15} />
+          </button>
+        )}
 
         {deleting && (
           <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-2 bg-black/60">

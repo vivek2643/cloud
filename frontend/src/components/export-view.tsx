@@ -4,9 +4,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertCircle, Download, Loader2 } from "lucide-react";
 import { useAuthStore } from "@/stores/auth-store";
 import { useEditDocStore } from "@/stores/edit-doc-store";
+import { useDriveStore } from "@/stores/drive-store";
 import {
   createExport,
   getExport,
+  listEditThreads,
+  type EditThreadListItem,
   type ExportJob,
   type ExportKind,
   type ExportQuality,
@@ -37,8 +40,9 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 }
 
 export function ExportView() {
-  const threadId = useEditDocStore((s) => s.threadId);
+  const storeThreadId = useEditDocStore((s) => s.threadId);
   const token = useAuthStore((s) => s.session?.access_token);
+  const projectFiles = useDriveStore((s) => s.files);
 
   const [kind, setKind] = useState<ExportKind>("mp4");
   const [quality, setQuality] = useState<ExportQuality>("1080");
@@ -47,6 +51,46 @@ export function ExportView() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Stage 3.1: Export previously had no way to find a thread on its own --
+  // threadId is set only by ai-edit-panel.tsx's seed() call, so opening this
+  // lens without opening the AI panel first always hit the empty state below,
+  // even when the project already has an edit. Discover it ourselves: list
+  // this user's threads and keep the ones whose file_ids overlap the current
+  // project's files (list_threads already orders by updated_at desc, so the
+  // first match is the most recent). Only runs while the store doesn't
+  // already have a threadId -- once one exists (via the AI panel), that wins.
+  const [discovered, setDiscovered] = useState<EditThreadListItem[]>([]);
+  const [pickedThreadId, setPickedThreadId] = useState<string | null>(null);
+  useEffect(() => {
+    setPickedThreadId(null);
+    setDiscovered([]);
+    if (storeThreadId || !token || projectFiles.length === 0) return;
+    let cancelled = false;
+    const projectFileIds = new Set(projectFiles.map((f) => f.id));
+    listEditThreads(token)
+      .then((res) => {
+        if (cancelled) return;
+        const matches = res.threads.filter((t) => t.file_ids.some((id) => projectFileIds.has(id)));
+        if (matches.length === 1) {
+          setPickedThreadId(matches[0].id);
+        } else if (matches.length > 1) {
+          setDiscovered(matches);
+        }
+      })
+      .catch(() => {
+        // Discovery is a convenience, not a requirement -- fall through to
+        // today's honest empty state rather than surfacing this as an error.
+      });
+    return () => {
+      cancelled = true;
+    };
+    // projectFiles is derived from the currently-open project; re-run when it
+    // changes (e.g. navigating between projects) but not on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storeThreadId, token, projectFiles.map((f) => f.id).join(",")]);
+
+  const threadId = storeThreadId ?? pickedThreadId;
 
   const stop = useCallback(() => {
     if (pollRef.current) {
@@ -61,9 +105,12 @@ export function ExportView() {
     (id: string) => {
       stop();
       pollRef.current = setInterval(async () => {
-        if (!token) return;
+        // Stage 3.2: a missing token is not a reason to silently stop polling
+        // -- request() already omits the Authorization header when there's
+        // no token, and the backend accepts a tokenless call (dev bypass).
+        // If the call genuinely fails, the catch below surfaces it.
         try {
-          const r = await getExport(id, token);
+          const r = await getExport(id, token ?? "");
           setJob(r);
           if (r.status === "done" || r.status === "failed") {
             stop();
@@ -81,7 +128,9 @@ export function ExportView() {
   );
 
   async function start() {
-    if (!token || !threadId || busy) return;
+    // Stage 3.2: dropped the `!token` no-op (see poll() above for why) --
+    // a missing threadId is still a real reason not to proceed.
+    if (!threadId || busy) return;
     setError(null);
     setBusy(true);
     setJob(null);
@@ -89,7 +138,7 @@ export function ExportView() {
       const r = await createExport(
         threadId,
         { kind, quality, includeMedia: kind === "rough_cut" ? includeMedia : false },
-        token
+        token ?? ""
       );
       setJob(r);
       if (r.status === "done" || r.status === "failed") {
@@ -105,6 +154,34 @@ export function ExportView() {
   }
 
   if (!threadId) {
+    // Stage 3.1: more than one thread in this project touches these files --
+    // ask rather than silently guessing which edit to export.
+    if (discovered.length > 1) {
+      return (
+        <div className="mx-auto max-w-sm space-y-4 py-24 text-center">
+          <p className="text-lg font-semibold">Which edit?</p>
+          <p className="text-sm" style={{ color: "var(--muted)" }}>
+            This project has more than one edit. Pick the one to export.
+          </p>
+          <div className="space-y-2 text-left">
+            {discovered.map((t) => (
+              <button
+                key={t.id}
+                type="button"
+                onClick={() => setPickedThreadId(t.id)}
+                className="flex w-full flex-col items-start gap-0.5 rounded-lg border px-3 py-2.5 text-left transition-colors hover:bg-[var(--border)]"
+                style={{ borderColor: "var(--border)" }}
+              >
+                <span className="text-sm font-medium">{t.title || "Untitled edit"}</span>
+                <span className="text-[11px]" style={{ color: "var(--muted)" }}>
+                  {new Date(t.created_at).toLocaleDateString()} · {t.clip_count} clip{t.clip_count === 1 ? "" : "s"}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="flex flex-col items-center justify-center py-24 text-center">
         <p className="text-lg font-semibold">Export</p>
