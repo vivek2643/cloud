@@ -1,6 +1,17 @@
+from functools import lru_cache
+
 import jwt
 from fastapi import Request, HTTPException
+from jwt import PyJWKClient
+
 from app.config import get_settings
+
+
+@lru_cache(maxsize=1)
+def _jwks() -> PyJWKClient:
+    # Cached: PyJWKClient keeps fetched keys in memory and re-fetches only when
+    # it sees an unknown kid, so key rotation heals itself.
+    return PyJWKClient(f"{get_settings().supabase_url}/auth/v1/.well-known/jwks.json")
 
 
 def get_current_user_id(request: Request) -> str:
@@ -11,9 +22,9 @@ def get_current_user_id(request: Request) -> str:
     and skip all token parsing. This lets the platform run without sign-up/login
     while we work on the rest of the system.
 
-    Production: decode the Supabase JWT from the Authorization header and return
-    its `sub` claim. Re-enabled automatically by clearing dev_user_id (set it to
-    "" in .env or env var DEV_USER_ID).
+    Production: verify the Supabase JWT against the project's published JWKS
+    (ES256) and return its `sub` claim. Re-enabled automatically by clearing
+    dev_user_id (set it to "" in .env or env var DEV_USER_ID).
     """
     settings = get_settings()
 
@@ -27,10 +38,12 @@ def get_current_user_id(request: Request) -> str:
     token = auth.removeprefix("Bearer ")
 
     try:
+        signing_key = _jwks().get_signing_key_from_jwt(token)
         payload = jwt.decode(
             token,
-            options={"verify_signature": False},
-            algorithms=["HS256"],
+            signing_key.key,
+            algorithms=["ES256"],
+            audience="authenticated",
         )
         user_id = payload.get("sub")
         if not user_id:
