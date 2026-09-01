@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
+import { useSearchParams } from "next/navigation";
 
 // Plays the brand logo animation (public/logo_animation.mp4) ONLY when you
 // arrive at /drive from an entry point (sign-in, sign-up, OAuth callback, or a
@@ -12,16 +13,23 @@ import { useEffect, useRef, useState } from "react";
 // and a safety timeout always tears it down.
 const MAX_MS = 7000;
 
-export function IntroOverlay() {
-  const [show, setShow] = useState(false);
+function Intro() {
+  // Read via useSearchParams, not window.location in an effect. An effect runs
+  // after the first paint, so the app was painting first and the logo appeared
+  // on top of it a moment later. useSearchParams is available while the server
+  // renders, so the overlay ships in the initial HTML and is the first thing
+  // drawn.
+  const searchParams = useSearchParams();
+  const [show, setShow] = useState(searchParams.get("intro") === "1");
   const [leaving, setLeaving] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
+    if (!show) return;
+    // Strip the tag so a refresh / back-forward doesn't replay it. Safe to do
+    // after paint: it only rewrites the URL, it doesn't gate what is drawn.
     const params = new URLSearchParams(window.location.search);
     if (params.get("intro") !== "1") return;
-    // Strip the tag so a refresh / back-forward doesn't replay it.
     params.delete("intro");
     const qs = params.toString();
     window.history.replaceState(
@@ -29,8 +37,7 @@ export function IntroOverlay() {
       "",
       window.location.pathname + (qs ? `?${qs}` : "")
     );
-    setShow(true);
-  }, []);
+  }, [show]);
 
   useEffect(() => {
     if (!show) return;
@@ -71,5 +78,16 @@ export function IntroOverlay() {
         Skip
       </button>
     </div>
+  );
+}
+
+export function IntroOverlay() {
+  // useSearchParams needs a Suspense boundary; without one it would opt the
+  // whole drive tree into client-only rendering, which is the very thing that
+  // caused the flash.
+  return (
+    <Suspense fallback={null}>
+      <Intro />
+    </Suspense>
   );
 }
