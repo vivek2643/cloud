@@ -1,15 +1,24 @@
 "use client";
 
-import { useState } from "react";
-import { useRouter } from "next/navigation";
+import { Suspense, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase";
 
-export default function LoginPage() {
+function LoginForm() {
   const router = useRouter();
+  const params = useSearchParams();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState("");
+  // /auth/callback redirects here with ?error=auth when the OAuth exchange
+  // fails. Without surfacing it the page looks completely normal, so the only
+  // signal the user gets is that nothing happened -- which reads as "click it
+  // again" rather than "something went wrong".
+  const [error, setError] = useState(
+    params.get("error") === "auth"
+      ? "We couldn't finish signing you in. Please try again."
+      : ""
+  );
   const [loading, setLoading] = useState(false);
 
   async function handleSubmit(e: React.FormEvent) {
@@ -49,7 +58,6 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center px-4">
       <div className="w-full max-w-sm space-y-6">
         <div className="text-center">
           <h1 className="text-2xl font-bold tracking-tight">Edso</h1>
@@ -135,6 +143,16 @@ export default function LoginPage() {
           </Link>
         </p>
       </div>
+  );
+}
+
+export default function LoginPage() {
+  return (
+    <div className="flex min-h-screen items-center justify-center px-4">
+      {/* useSearchParams needs a Suspense boundary to keep this route static. */}
+      <Suspense fallback={null}>
+        <LoginForm />
+      </Suspense>
     </div>
   );
 }

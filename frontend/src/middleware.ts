@@ -22,9 +22,21 @@ export function middleware(request: NextRequest) {
   if (!pathname.startsWith("/signup")) return NextResponse.next();
 
   // Someone already signed in has no business being bounced to the gate.
+  //
+  // The code-verifier exclusion is load-bearing, not defensive. Supabase names
+  // the in-flight PKCE cookie `sb-<ref>-auth-token-code-verifier`, which any
+  // "starts with sb- and contains auth-token" test matches -- so merely
+  // clicking Continue with Google, without ever completing it, would otherwise
+  // look like a session and open the gate. Only the real session cookie
+  // (`sb-<ref>-auth-token`, possibly chunked .0/.1) should count.
   const signedIn = request.cookies
     .getAll()
-    .some((c) => c.name.startsWith("sb-") && c.name.includes("auth-token"));
+    .some(
+      (c) =>
+        c.name.startsWith("sb-") &&
+        c.name.includes("auth-token") &&
+        !c.name.includes("code-verifier")
+    );
 
   if (signedIn || request.cookies.get(INVITE_COOKIE)) return NextResponse.next();
 
