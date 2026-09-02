@@ -39,7 +39,7 @@ function LoginForm() {
         return;
       }
 
-      router.push("/drive?intro=1");
+      router.push("/welcome");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong");
     } finally {

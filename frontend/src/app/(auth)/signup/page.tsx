@@ -32,7 +32,7 @@ export default function SignupPage() {
       }
 
       if (data.session) {
-        router.push("/drive?intro=1");
+        router.push("/welcome");
       } else {
         setEmailSent(true);
       }

@@ -8,7 +8,6 @@ import { Sidebar } from "@/components/sidebar";
 import { UploadProgress } from "@/components/upload-progress";
 import { AiEditPanel } from "@/components/ai-edit-panel";
 import { SyncPanel } from "@/components/sync-panel";
-import { IntroOverlay } from "@/components/intro-overlay";
 import { useAuthStore } from "@/stores/auth-store";
 import { useDriveStore } from "@/stores/drive-store";
 import { isSupabaseConfigured } from "@/lib/supabase";
@@ -85,7 +84,6 @@ function DriveShell({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="flex h-screen flex-col">
-      <IntroOverlay />
       <Navbar />
       <div className="flex flex-1 overflow-hidden">
         {/* The rail stays put on every route so the shell never reflows out
