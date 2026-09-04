@@ -57,8 +57,14 @@ services:
         value: local
       - key: GPU_WORKERS
         value: "0"        # this box has no GPU; L1 goes to RunPod
+      # Must cover every non-gpu queue in DEV_OWNED_QUEUES (app/config.py).
+      # `grade` was missing here, and nothing else consumes it -- the gpu
+      # dispatcher below takes only `gpu` -- so every colour-grade job deferred
+      # by services/l3/grade/job.py sat in procrastinate as `todo` forever.
+      # Local never caught it: a prefixed dev worker defaults to the full
+      # DEV_OWNED_QUEUES set, so it always had dev-grade covered.
       - key: WORKER_QUEUES
-        value: ingest,cpu,l3,render,export
+        value: ingest,grade,cpu,l3,render,export
 
   - type: worker
     name: edso-gpu-dispatcher
