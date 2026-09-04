@@ -202,6 +202,25 @@ def test_bundle_sanitizes_project_name_for_zip_paths():
     _with_captured_upload(run)
 
 
+def test_download_filename_uses_title_and_the_stored_extension():
+    # Extension comes off the key, never from a kind->extension map, so it
+    # cannot disagree with what was actually uploaded.
+    assert bundle.download_filename("Wedding Reel", "renders/abc123.mp4") == "Wedding Reel.mp4"
+    assert bundle.download_filename("Wedding Reel", "exports/abc123.zip") == "Wedding Reel.zip"
+    assert bundle.download_filename("Wedding Reel", "exports/abc123.srt") == "Wedding Reel.srt"
+
+    # A title is free text and lands in a Content-Disposition header and a
+    # filesystem: separators and quotes must not survive.
+    risky = bundle.download_filename('../../etc/pa"sswd', "renders/abc123.mp4")
+    assert "/" not in risky and '"' not in risky, risky
+    assert risky.endswith(".mp4"), risky
+
+    # Untitled threads and keyless rows still produce something openable.
+    assert bundle.download_filename(None, "renders/abc123.mp4") == "Untitled.mp4"
+    assert bundle.download_filename("   ", "renders/abc123.mp4") == "Untitled.mp4"
+    print("ok  test_download_filename_uses_title_and_the_stored_extension")
+
+
 def main():
     test_bundle_project_only_has_no_media_dir()
     test_bundle_include_media_copies_files_into_media_dir()
@@ -209,6 +228,7 @@ def main():
     test_bundle_manifest_is_well_formed_and_matches_shape()
     test_bundle_zip_uses_store_mode_no_compression()
     test_bundle_sanitizes_project_name_for_zip_paths()
+    test_download_filename_uses_title_and_the_stored_extension()
     print("\nall export_bundle tests passed")
 
 

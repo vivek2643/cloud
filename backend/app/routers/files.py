@@ -166,13 +166,28 @@ def get_download_url(
     file_id: str,
     user_id: str = Depends(get_current_user_id),
 ):
-    """Return a presigned URL for downloading the original file."""
+    """Return a presigned URL for downloading the original file.
+
+    Signed as an attachment under the file's own name. The sibling /playback
+    endpoint deliberately does not do this -- it feeds a <video> element.
+    """
     sb = get_supabase()
-    result = sb.table("files").select("r2_key").eq("id", file_id).eq("user_id", user_id).execute()
+    result = (
+        sb.table("files")
+        .select("r2_key, filename, name")
+        .eq("id", file_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
     if not result.data:
         raise HTTPException(status_code=404, detail="File not found")
 
-    url = generate_presigned_get(result.data[0]["r2_key"], expires_in=7200)
+    f = result.data[0]
+    url = generate_presigned_get(
+        f["r2_key"],
+        expires_in=7200,
+        download_as=f.get("filename") or f.get("name") or None,
+    )
     return {"url": url}
 
 

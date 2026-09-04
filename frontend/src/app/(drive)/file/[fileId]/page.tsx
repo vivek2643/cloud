@@ -44,7 +44,14 @@ export default function FilePage({ params }: { params: Promise<{ fileId: string 
   async function handleDownload() {
     if (!session?.access_token || !file) return;
     const { url } = await getFileDownloadUrl(file.id, session.access_token);
-    window.open(url, "_blank");
+    // Not window.open: the URL is signed as an attachment, so a new tab would
+    // download and then sit there empty. A synthetic click saves in place.
+    const a = document.createElement("a");
+    a.href = url;
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
   }
 
   if (loading) {

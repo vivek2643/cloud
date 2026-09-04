@@ -179,7 +179,9 @@ export function RenderBar({
           {done && (
             <a
               href={job!.output_url!}
-              download
+              /* No `download` attribute: it is ignored cross-origin and R2 is
+                 always another origin. The URL is signed as an attachment
+                 instead, which is what actually saves the file. */
               className="flex items-center justify-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors hover:bg-[var(--accent-soft)]"
               style={{ borderColor: "var(--border)" }}
             >

@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from app.auth import get_current_user_id
 from app.config import get_settings
+from app.services.export import bundle as export_bundle
 from app.services.l3 import store as l3_store
 from app.services.render import compositor, store as render_store
 from app.services.render.tasks import resolve_document
@@ -52,12 +53,20 @@ def _enqueue(render_id: str) -> bool:
         return False
 
 
-def _to_response(row: dict) -> dict:
+def _to_response(row: dict, thread: Optional[dict] = None) -> dict:
     out = dict(row)
     out["output_url"] = None
     if row.get("status") == "done" and row.get("output_r2_key"):
         try:
-            out["output_url"] = compositor.presigned_url_for(row["output_r2_key"])
+            # Same reason as exports: this URL is only ever behind a Download
+            # button, and without the attachment header the browser opens the
+            # mp4 in its player instead of saving it.
+            out["output_url"] = compositor.presigned_url_for(
+                row["output_r2_key"],
+                download_as=export_bundle.download_filename(
+                    (thread or {}).get("title"), row["output_r2_key"]
+                ),
+            )
         except Exception:
             logger.exception("presign failed for render %s", row.get("id"))
     return out
@@ -67,7 +76,7 @@ def _to_response(row: dict) -> dict:
 def create_render(
     thread_id: str, body: CreateRenderBody, user_id: str = Depends(get_current_user_id)
 ):
-    _owned_thread(thread_id, user_id)
+    thread = _owned_thread(thread_id, user_id)
     if body.preset not in compositor.PRESETS:
         raise HTTPException(
             status_code=400,
@@ -92,19 +101,23 @@ def create_render(
     # Short-circuit to an identical successful render if one exists.
     existing = render_store.find_done(thread_id, version, body.preset, rhash)
     if existing:
-        return _to_response(existing)
+        return _to_response(existing, thread)
 
     row = render_store.create_render(thread_id, version, body.preset, rhash)
     if not _enqueue(row["id"]):
         render_store.update_status(row["id"], status="failed", error="Worker unavailable.")
         row = render_store.get_render(row["id"]) or row
-    return _to_response(row)
+    return _to_response(row, thread)
 
 
 @router.get("/api/edit/threads/{thread_id}/renders")
 def list_renders(thread_id: str, user_id: str = Depends(get_current_user_id)):
-    _owned_thread(thread_id, user_id)
-    return {"renders": [_to_response(r) for r in render_store.list_for_thread(thread_id)]}
+    thread = _owned_thread(thread_id, user_id)
+    return {
+        "renders": [
+            _to_response(r, thread) for r in render_store.list_for_thread(thread_id)
+        ]
+    }
 
 
 @router.get("/api/renders/{render_id}")
@@ -112,8 +125,8 @@ def get_render(render_id: str, user_id: str = Depends(get_current_user_id)):
     row = render_store.get_render(render_id)
     if not row:
         raise HTTPException(status_code=404, detail="Render not found")
-    _owned_thread(row["thread_id"], user_id)
-    return _to_response(row)
+    thread = _owned_thread(row["thread_id"], user_id)
+    return _to_response(row, thread)
 
 
 def _load_version(thread_id: str, version: int) -> Optional[dict]:

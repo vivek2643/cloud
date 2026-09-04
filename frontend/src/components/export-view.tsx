@@ -127,6 +127,24 @@ export function ExportView() {
     [token, stop]
   );
 
+  // Finishing an export used to cost two more clicks: one on a Download link,
+  // then another buried in the browser's video player, because a cross-origin
+  // link to an mp4 opens the player rather than saving. The URL now carries
+  // Content-Disposition: attachment (see r2.generate_presigned_get), so one
+  // synthetic click saves the file -- do it the moment the job lands.
+  const autoSaved = useRef<string | null>(null);
+  useEffect(() => {
+    if (!job || job.status !== "done" || !job.output_url) return;
+    if (autoSaved.current === job.id) return; // once per job; also absorbs
+    autoSaved.current = job.id; // StrictMode's double-invoke in dev
+    const a = document.createElement("a");
+    a.href = job.output_url;
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }, [job]);
+
   async function start() {
     // Stage 3.2: dropped the `!token` no-op (see poll() above for why) --
     // a missing threadId is still a real reason not to proceed.
@@ -292,14 +310,20 @@ export function ExportView() {
       )}
 
       {done && (
-        <a
-          href={job!.output_url!}
-          download
-          className="flex w-fit items-center justify-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors hover:bg-[var(--accent-soft)]"
-          style={{ borderColor: "var(--border)" }}
-        >
-          <Download size={13} /> Download
-        </a>
+        <div className="space-y-1.5">
+          <p className="text-[11px]" style={{ color: "var(--muted)" }}>
+            Saved to your downloads.
+          </p>
+          {/* Kept as a manual fallback: a browser that blocks the automatic
+              click, or anyone wanting a second copy, still has a way through. */}
+          <a
+            href={job!.output_url!}
+            className="flex w-fit items-center justify-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors hover:bg-[var(--accent-soft)]"
+            style={{ borderColor: "var(--border)" }}
+          >
+            <Download size={13} /> Download again
+          </a>
+        </div>
       )}
 
       {error && (

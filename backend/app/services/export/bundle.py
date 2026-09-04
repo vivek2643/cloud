@@ -194,5 +194,17 @@ def _zip_dir_store_mode(src_dir: str, dst_zip: str, *, arc_root: str) -> None:
                 zf.write(full, arcname)
 
 
-def presigned_url_for(out_key: str, expires_in: int = 86400) -> str:
-    return generate_presigned_get(out_key, expires_in=expires_in)
+def download_filename(title: Optional[str], out_key: str) -> str:
+    """What the exported file should be called once it lands in Downloads.
+
+    The extension comes off the stored key rather than a kind->extension map,
+    so it cannot drift from what was actually uploaded (.mp4 / .srt / .zip).
+    """
+    ext = os.path.splitext(out_key or "")[1]
+    return f"{_safe_project_name(title or '')}{ext}"
+
+
+def presigned_url_for(
+    out_key: str, expires_in: int = 86400, download_as: Optional[str] = None
+) -> str:
+    return generate_presigned_get(out_key, expires_in=expires_in, download_as=download_as)

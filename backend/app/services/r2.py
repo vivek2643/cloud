@@ -1,5 +1,5 @@
 import math
-from typing import List
+from typing import List, Optional
 
 import boto3
 from botocore.config import Config
@@ -56,15 +56,47 @@ def generate_presigned_put(key: str, content_type: str, expires_in: int = 3600) 
     )
 
 
-def generate_presigned_get(key: str, expires_in: int = 3600) -> str:
+def _content_disposition(filename: str) -> str:
+    """Build an attachment header, safely, from an untrusted name.
+
+    Names reach here from user uploads and free-text edit titles and end up
+    inside a quoted HTTP header, so anything that could close the quote or
+    start a new header line has to go. Non-ASCII is dropped rather than
+    RFC 5987-encoded: a nice filename is a courtesy on top of a working
+    download, not worth risking a malformed header for.
+    """
+    cleaned = "".join(
+        c for c in filename if c.isascii() and c.isprintable() and c not in '"\\'
+    ).strip()
+    return f'attachment; filename="{cleaned or "download"}"'
+
+
+def generate_presigned_get(
+    key: str, expires_in: int = 3600, download_as: Optional[str] = None
+) -> str:
+    """Signed GET for an object.
+
+    `download_as` sets Content-Disposition on the response, which is the only
+    thing that makes a browser save the file instead of rendering it. The HTML
+    `download` attribute cannot do this job: it is ignored cross-origin, and R2
+    is always a different origin to us, so a link to an mp4 opens the built-in
+    player and the user has to go hunting through its menu to save.
+
+    It stays opt-in because most callers here are the opposite case -- source
+    playback, proxies, render previews -- where forcing a download would break
+    the player outright.
+    """
     settings = get_settings()
     client = _get_client()
+    params = {
+        "Bucket": settings.r2_bucket_name,
+        "Key": _full_key(key),
+    }
+    if download_as:
+        params["ResponseContentDisposition"] = _content_disposition(download_as)
     return client.generate_presigned_url(
         "get_object",
-        Params={
-            "Bucket": settings.r2_bucket_name,
-            "Key": _full_key(key),
-        },
+        Params=params,
         ExpiresIn=expires_in,
     )
 

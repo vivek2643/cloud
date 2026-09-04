@@ -233,8 +233,16 @@ def render_resolved(
     return out_key, total_ms
 
 
-def presigned_url_for(out_key: str, expires_in: int = 86400) -> str:
-    return generate_presigned_get(out_key, expires_in=expires_in)
+def presigned_url_for(
+    out_key: str, expires_in: int = 86400, download_as: Optional[str] = None
+) -> str:
+    """`download_as` makes the browser save the file instead of playing it.
+
+    Opt-in, not the default: captions/routers/captions.py signs hero stills
+    through here to show them inline, and an attachment header would turn
+    those thumbnails into downloads.
+    """
+    return generate_presigned_get(out_key, expires_in=expires_in, download_as=download_as)
 
 
 # --------------------------------------------------------------------------

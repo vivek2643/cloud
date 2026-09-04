@@ -46,7 +46,7 @@ def _clear_overrides():
     fastapi_app.dependency_overrides.clear()
 
 
-_THREAD = {"id": "thread-1", "user_id": "user-1"}
+_THREAD = {"id": "thread-1", "user_id": "user-1", "title": "Wedding Reel"}
 _DOCUMENT = {"timeline": [{"seg_id": "s0", "file_id": "f1"}], "operations": []}
 
 
@@ -237,7 +237,13 @@ def test_get_export_returns_presigned_url_when_done():
         "output_r2_key": "exports/abc.srt", "error": None, "created_at": None, "updated_at": None,
     })
     p.set(exports.l3_store, "get_thread", lambda thread_id: dict(_THREAD, id=thread_id))
-    p.set(exports.bundle, "presigned_url_for", lambda key, expires_in=86400: f"https://example.invalid/{key}")
+    signed: list = []
+    p.set(
+        exports.bundle,
+        "presigned_url_for",
+        lambda key, expires_in=86400, download_as=None: signed.append(download_as)
+        or f"https://example.invalid/{key}",
+    )
     _as_user("user-1")
     try:
         client = TestClient(fastapi_app)
@@ -249,6 +255,10 @@ def test_get_export_returns_presigned_url_when_done():
     body = resp.json()
     assert body["status"] == "done"
     assert body["output_url"] == "https://example.invalid/exports/abc.srt"
+    # Signed as an attachment named after the edit. Without a download_as the
+    # browser renders the file inline instead of saving it, which is the whole
+    # reason the extra clicks existed.
+    assert signed == ["Wedding Reel.srt"], signed
     print("ok  test_get_export_returns_presigned_url_when_done")
 
 

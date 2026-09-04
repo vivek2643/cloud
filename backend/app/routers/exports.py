@@ -60,12 +60,19 @@ def _enqueue(export_id: str) -> bool:
         return False
 
 
-def _to_response(row: dict) -> dict:
+def _to_response(row: dict, thread: Optional[dict] = None) -> dict:
     out = dict(row)
     out["output_url"] = None
     if row.get("status") == "done" and row.get("output_r2_key"):
         try:
-            out["output_url"] = bundle.presigned_url_for(row["output_r2_key"])
+            # Signed to download under the edit's own name. Without this the
+            # link opens R2's mp4 in the browser's player instead of saving it.
+            out["output_url"] = bundle.presigned_url_for(
+                row["output_r2_key"],
+                download_as=bundle.download_filename(
+                    (thread or {}).get("title"), row["output_r2_key"]
+                ),
+            )
         except Exception:
             logger.exception("presign failed for export %s", row.get("id"))
     return out
@@ -75,7 +82,7 @@ def _to_response(row: dict) -> dict:
 def create_export(
     thread_id: str, body: CreateExportBody, user_id: str = Depends(get_current_user_id)
 ):
-    _owned_thread(thread_id, user_id)
+    thread = _owned_thread(thread_id, user_id)
     if body.kind not in _KINDS:
         raise HTTPException(status_code=400, detail=f"Unknown kind {body.kind!r}; known: {list(_KINDS)}")
     # quality is only meaningful for 'mp4' (and included media in 'rough_cut'),
@@ -111,20 +118,24 @@ def create_export(
 
     existing = export_store.find_done(thread_id, version, body.kind, body.quality, rhash)
     if existing:
-        return _to_response(existing)
+        return _to_response(existing, thread)
 
     row = export_store.create_export(
         thread_id, version, body.kind, body.quality, body.include_media, rhash)
     if not _enqueue(row["id"]):
         export_store.update_status(row["id"], status="failed", error="Worker unavailable.")
         row = export_store.get_export(row["id"]) or row
-    return _to_response(row)
+    return _to_response(row, thread)
 
 
 @router.get("/api/edit/threads/{thread_id}/exports")
 def list_exports(thread_id: str, user_id: str = Depends(get_current_user_id)):
-    _owned_thread(thread_id, user_id)
-    return {"exports": [_to_response(r) for r in export_store.list_for_thread(thread_id)]}
+    thread = _owned_thread(thread_id, user_id)
+    return {
+        "exports": [
+            _to_response(r, thread) for r in export_store.list_for_thread(thread_id)
+        ]
+    }
 
 
 @router.get("/api/exports/{export_id}")
@@ -132,5 +143,5 @@ def get_export(export_id: str, user_id: str = Depends(get_current_user_id)):
     row = export_store.get_export(export_id)
     if not row:
         raise HTTPException(status_code=404, detail="Export not found")
-    _owned_thread(row["thread_id"], user_id)
-    return _to_response(row)
+    thread = _owned_thread(row["thread_id"], user_id)
+    return _to_response(row, thread)
