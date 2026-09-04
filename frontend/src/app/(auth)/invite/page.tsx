@@ -1,7 +1,7 @@
 "use client";
 
 import { Suspense, useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase";
 
@@ -9,7 +9,6 @@ const INVITE_COOKIE = "edso_invite";
 const COOKIE_MAX_AGE = 60 * 60 * 24 * 30; // 30 days
 
 function InviteForm() {
-  const router = useRouter();
   const params = useSearchParams();
   const [code, setCode] = useState("");
   const [error, setError] = useState("");
@@ -21,27 +20,45 @@ function InviteForm() {
     setLoading(true);
 
     try {
-      const supabase = createClient();
-      const { data, error: rpcError } = await supabase.rpc("redeem_invite_code", {
-        p_code: code,
-      });
+      // A browser holding the cookie has already paid for a seat. Re-entering
+      // a code must not spend a second one: anyone who lands back on this form
+      // for any reason would otherwise burn the code down on every attempt.
+      const alreadyIn = document.cookie
+        .split("; ")
+        .some((c) => c.startsWith(`${INVITE_COOKIE}=`));
 
-      if (rpcError) {
-        setError(rpcError.message);
-        return;
+      if (!alreadyIn) {
+        const supabase = createClient();
+        const { data, error: rpcError } = await supabase.rpc("redeem_invite_code", {
+          p_code: code,
+        });
+
+        if (rpcError) {
+          setError(rpcError.message);
+          return;
+        }
+
+        if (!data?.ok) {
+          setError("That invite code is not valid or has already been used up.");
+          return;
+        }
+
+        document.cookie = `${INVITE_COOKIE}=ok; path=/; max-age=${COOKIE_MAX_AGE}; samesite=lax`;
       }
-
-      if (!data?.ok) {
-        setError("That invite code is not valid or has already been used up.");
-        return;
-      }
-
-      document.cookie = `${INVITE_COOKIE}=ok; path=/; max-age=${COOKIE_MAX_AGE}; samesite=lax`;
 
       // Only ever send them to an in-app path -- never reflect an absolute URL
       // from the query string back into a redirect.
       const next = params.get("next");
-      router.push(next && next.startsWith("/") ? next : "/signup");
+      const dest = next && next.startsWith("/") ? next : "/signup";
+
+      // A full page load, deliberately, not router.push. The App Router keeps
+      // a client-side cache of RSC payloads, and the entry cached for /signup
+      // is the middleware redirect back to this gate -- the very response that
+      // sent the visitor here. router.push replayed that cached redirect
+      // without ever consulting middleware, so a valid code bounced straight
+      // back to this form. assign() forces a real request, which re-runs
+      // middleware, which now sees the cookie.
+      window.location.assign(dest);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong");
     } finally {
